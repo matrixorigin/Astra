@@ -1060,6 +1060,7 @@ mod tests {
                 },
             ),
             calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
+            ..RuntimePromotionSignals::default()
         }
     }
 
@@ -1073,6 +1074,7 @@ mod tests {
                 },
             ),
             calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
+            ..RuntimePromotionSignals::default()
         }
     }
 
