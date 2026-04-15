@@ -282,17 +282,12 @@ fn parse_constraint_op(s: &str) -> Result<ConstraintOp, String> {
 // ── Dependency ───────────────────────────────────────────────────────────────
 
 /// The type of a dependency.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DependencyType {
+    #[default]
     Skill,
     Tool,
-}
-
-impl Default for DependencyType {
-    fn default() -> Self {
-        DependencyType::Skill
-    }
 }
 
 /// A skill dependency with name, version constraint, and type.

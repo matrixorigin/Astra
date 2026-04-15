@@ -8,9 +8,9 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 
-use crate::skills::loader;
-use crate::skills::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
-use crate::skills::traits::{SkillError, SkillProvider};
+use crate::loader;
+use crate::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::traits::{SkillError, SkillProvider};
 
 /// Provides skills from local filesystem directories.
 pub struct LocalSkillProvider {

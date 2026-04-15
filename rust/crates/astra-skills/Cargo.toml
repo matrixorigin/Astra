@@ -1,0 +1,39 @@
+[package]
+name = "astra-skills"
+version = "0.1.0"
+edition = "2024"
+description = "Skill framework types and providers for Astra"
+
+[dependencies]
+# Core serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["io-util", "fs", "time"] }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Hashing
+sha2 = { workspace = true }
+
+# Filesystem
+walkdir = "2.5"
+dirs = "5"
+
+# YAML for manifest parsing
+serde_yaml = "0.9"
+
+# TOML for manifest parsing
+toml = "0.8"
+
+# Tar/gzip for packing
+flate2 = { workspace = true }
+tar = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

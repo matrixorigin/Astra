@@ -254,8 +254,8 @@ pub fn load_all_hooks(
                         parse_all_hooks_yaml(&content, &path)
                     };
                     if !tool_hooks.is_empty() || !session_hooks.is_empty() {
-                        astra_core::agent_warn!(
-                            "hook",
+                        tracing::info!(
+                            target: "hook",
                             "Loaded {} tool + {} session hooks from {}",
                             tool_hooks.len(),
                             session_hooks.len(),
@@ -268,7 +268,7 @@ pub fn load_all_hooks(
                     );
                 }
                 Err(e) => {
-                    astra_core::agent_warn!("hook", "Failed to read {}: {}", path.display(), e);
+                    tracing::warn!(target: "hook", "Failed to read {}: {}", path.display(), e);
                 }
             }
         }
@@ -307,8 +307,8 @@ fn parse_all_hooks_json(
         );
     }
 
-    astra_core::agent_warn!(
-        "hook",
+    tracing::warn!(
+        target: "hook",
         "Failed to parse {}: expected JSON array or {{\"hooks\": [...]}}",
         path.display()
     );
@@ -341,8 +341,8 @@ fn parse_all_hooks_yaml(
         );
     }
 
-    astra_core::agent_warn!(
-        "hook",
+    tracing::warn!(
+        target: "hook",
         "Failed to parse {}: expected YAML list or `hooks:` mapping",
         path.display()
     );
@@ -385,7 +385,7 @@ fn apply_default_timeout_session(
 
 /// Maximum bytes to read from a hook's stdout. Prevents a runaway hook from
 /// consuming unbounded memory. 256 KiB is generous for JSON context output.
-pub(crate) const HOOK_STDOUT_MAX_BYTES: usize = 256 * 1024;
+pub const HOOK_STDOUT_MAX_BYTES: usize = 256 * 1024;
 
 /// Read up to [`HOOK_STDOUT_MAX_BYTES`] from an async reader.
 pub(crate) async fn read_capped(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
@@ -478,8 +478,8 @@ pub async fn evaluate_pre_tool_hooks(
                 unsafe { std::env::set_var(key, value) };
             }
             HookAction::Custom { id, .. } => {
-                astra_core::agent_warn!(
-                    "hook",
+                tracing::warn!(
+                    target: "hook",
                     "Custom hook '{}' matched tool '{}' — not yet implemented",
                     id,
                     tool_name
@@ -558,8 +558,8 @@ pub async fn evaluate_post_tool_hooks(
                 }
             }
             HookAction::Custom { id, .. } => {
-                astra_core::agent_warn!(
-                    "hook",
+                tracing::warn!(
+                    target: "hook",
                     "PostToolUse custom hook '{}' for '{}' — not yet implemented",
                     id,
                     tool_name
@@ -601,7 +601,7 @@ async fn run_shell_pre_hook(
     {
         Ok(c) => c,
         Err(e) => {
-            astra_core::agent_warn!("hook", "Failed to spawn hook '{}': {}", command, e);
+            tracing::warn!(target: "hook", "Failed to spawn hook '{}': {}", command, e);
             return PreToolDecision::Allow;
         }
     };
@@ -633,7 +633,7 @@ async fn run_shell_pre_hook(
         )),
         Ok((buf, Ok(_))) => parse_pre_hook_output(&buf),
         Ok((_, Err(e))) => {
-            astra_core::agent_warn!("hook", "Hook I/O error for '{}': {}", command, e);
+            tracing::warn!(target: "hook", "Hook I/O error for '{}': {}", command, e);
             PreToolDecision::Allow
         }
         Err(_) => {
@@ -673,7 +673,7 @@ async fn run_shell_post_hook(
     {
         Ok(c) => c,
         Err(e) => {
-            astra_core::agent_warn!("hook", "Failed to spawn post-hook '{}': {}", command, e);
+            tracing::warn!(target: "hook", "Failed to spawn post-hook '{}': {}", command, e);
             return None;
         }
     };
@@ -816,7 +816,7 @@ async fn http_post_json(
         parse_http_url(rest, 80)
     } else if url_str.starts_with("https://") {
         // HTTPS not supported without TLS — log warning and skip.
-        astra_core::agent_warn!("hook", "HTTP hook: HTTPS not supported, skipping {}", url);
+        tracing::warn!(target: "hook", "HTTP hook: HTTPS not supported, skipping {}", url);
         return None;
     } else {
         parse_http_url(url_str, 80)
@@ -850,7 +850,7 @@ async fn http_post_json(
     match tokio::time::timeout(timeout, connect_fut).await {
         Ok(Some(body)) => Some(body),
         _ => {
-            astra_core::agent_warn!("hook", "HTTP hook to {} timed out or failed", url);
+            tracing::warn!(target: "hook", "HTTP hook to {} timed out or failed", url);
             None
         }
     }
@@ -1109,8 +1109,8 @@ pub async fn evaluate_session_hooks(
                 output.env_vars.push((key.clone(), value.clone()));
             }
             HookAction::Custom { id, .. } => {
-                astra_core::agent_warn!(
-                    "hook",
+                tracing::warn!(
+                    target: "hook",
                     "Custom session hook '{}' for {:?} — not yet implemented",
                     id,
                     event
@@ -1126,12 +1126,11 @@ pub async fn evaluate_session_hooks(
                     "session_id": session_id,
                     "user_message": user_message,
                 });
-                if let Some(body) = http_post_json(url, headers, &payload, *timeout_secs).await {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(ctx) = v.get("context").and_then(|c| c.as_str()) {
-                            contexts.push(ctx.to_string());
-                        }
-                    }
+                if let Some(body) = http_post_json(url, headers, &payload, *timeout_secs).await
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                    && let Some(ctx) = v.get("context").and_then(|c| c.as_str())
+                {
+                    contexts.push(ctx.to_string());
                 }
             }
         }
@@ -1169,7 +1168,7 @@ async fn run_shell_session_hook(
     {
         Ok(c) => c,
         Err(e) => {
-            astra_core::agent_warn!("hook", "Failed to spawn session hook '{}': {}", command, e);
+            tracing::warn!(target: "hook", "Failed to spawn session hook '{}': {}", command, e);
             return None;
         }
     };
@@ -1195,8 +1194,8 @@ async fn run_shell_session_hook(
     match tokio::time::timeout(timeout, read_fut).await {
         Ok((buf, Ok(status))) if status.success() => Some(parse_session_hook_output(&buf)),
         Ok((_, Ok(status))) => {
-            astra_core::agent_warn!(
-                "hook",
+            tracing::warn!(
+                target: "hook",
                 "Session hook '{}' exited with status {}",
                 command,
                 status.code().unwrap_or(-1)
@@ -1204,13 +1203,13 @@ async fn run_shell_session_hook(
             None
         }
         Ok((_, Err(e))) => {
-            astra_core::agent_warn!("hook", "Session hook I/O error for '{}': {}", command, e);
+            tracing::warn!(target: "hook", "Session hook I/O error for '{}': {}", command, e);
             None
         }
         Err(_) => {
             let _ = child.kill().await;
-            astra_core::agent_warn!(
-                "hook",
+            tracing::warn!(
+                target: "hook",
                 "Session hook '{}' timed out after {}s",
                 command,
                 timeout_secs

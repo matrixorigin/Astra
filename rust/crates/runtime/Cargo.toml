@@ -32,6 +32,8 @@ dirs = "6.0.0"
 fastrand = "2"
 astra-core.workspace = true
 astra-pipeline.workspace = true
+astra-sandbox.workspace = true
+astra-skills.workspace = true
 astra-turn-types.workspace = true
 astra-services.workspace = true
 astra-tools.workspace = true
@@ -60,8 +62,6 @@ tracing-subscriber.workspace = true
 http-body-util.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
-tree-sitter = "0.24"
-tree-sitter-bash = "0.23"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 dashmap = "6.1.0"
 toml = { version = "1.1.2", features = ["preserve_order"] }

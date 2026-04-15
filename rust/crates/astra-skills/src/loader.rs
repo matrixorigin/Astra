@@ -62,7 +62,7 @@ struct RawFrontmatter {
     #[serde(default)]
     output_schema: Option<serde_json::Value>,
     #[serde(default)]
-    success_criteria: Vec<astra_services::VerificationCriterion>,
+    success_criteria: Vec<serde_json::Value>,
     #[serde(default)]
     required_capabilities: Vec<String>,
     #[serde(default)]
@@ -408,10 +408,10 @@ fn load_dir_contents(
         let path = entry.path();
         if path.is_file() {
             // Ensure the file doesn't escape the resource directory via symlinks.
-            if let Ok(canonical) = std::fs::canonicalize(&path) {
-                if !canonical.starts_with(&canonical_dir) {
-                    continue; // symlink escape — skip silently
-                }
+            if let Ok(canonical) = std::fs::canonicalize(&path)
+                && !canonical.starts_with(&canonical_dir)
+            {
+                continue; // symlink escape — skip silently
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 let content = std::fs::read_to_string(&path).map_err(|e| {
@@ -555,7 +555,7 @@ pub fn walk_up_skill_paths(start: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::manifest::EffortLevel;
+    use crate::manifest::EffortLevel;
 
     #[test]
     fn parse_basic_skill() {

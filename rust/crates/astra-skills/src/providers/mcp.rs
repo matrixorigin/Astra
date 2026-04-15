@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::skills::loader;
-use crate::skills::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
-use crate::skills::traits::{SkillError, SkillProvider};
+use crate::loader;
+use crate::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::traits::{SkillError, SkillProvider};
 
 /// A skill discovered from an MCP server.
 #[derive(Clone, Debug)]

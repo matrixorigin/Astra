@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::skills::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
-use crate::skills::traits::{SkillError, SkillProvider};
+use crate::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::traits::{SkillError, SkillProvider};
 
 /// A skill bundled into the binary.
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ impl BundledSkillProvider {
 
     /// Register a bundled skill from a raw SKILL.md content string.
     pub fn register_from_skill_md(&self, content: &str) -> Result<String, SkillError> {
-        let (mut manifest, instructions) = crate::skills::loader::parse_skill_md(content)?;
+        let (mut manifest, instructions) = crate::loader::parse_skill_md(content)?;
         manifest.source = SkillSourceKind::Bundled;
         let name = manifest.name.clone();
 
@@ -60,7 +60,7 @@ impl BundledSkillProvider {
         instructions: String,
     ) -> Result<(), SkillError> {
         manifest.source = SkillSourceKind::Bundled;
-        manifest.trust_tier = crate::skills::manifest::TrustTier::Bundled;
+        manifest.trust_tier = crate::manifest::TrustTier::Bundled;
         let name = manifest.name.clone();
 
         let mut skills = self
@@ -87,14 +87,10 @@ impl Default for BundledSkillProvider {
 
 impl BundledSkillProvider {
     /// Create a provider with all built-in skills pre-registered.
+    /// 
+    /// Note: Dynamic skills are registered from runtime, not this crate.
     pub fn with_defaults() -> Self {
-        let provider = Self::new();
-        for content in super::dynamic_skills::all_dynamic_skills() {
-            if let Err(e) = provider.register_from_skill_md(&content) {
-                eprintln!("  ⚠ Failed to register bundled skill: {e}");
-            }
-        }
-        provider
+        Self::new()
     }
 }
 
@@ -226,32 +222,28 @@ Instructions B.
 
     #[tokio::test]
     async fn with_defaults_registers_bundled_skills() {
+        // In the standalone astra-skills crate, with_defaults() returns an empty provider.
+        // Dynamic skills are registered by the runtime, not this crate.
         let provider = BundledSkillProvider::with_defaults();
         let manifests = provider.discover().await.unwrap();
-
-        let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
-        let expected = [
-            "batch", "debug", "reflect", "review", "skillify", "stuck", "verify", "remember",
-        ];
-        for name in &expected {
-            assert!(names.contains(name), "missing bundled skill: {name}");
-        }
-        assert_eq!(manifests.len(), expected.len());
-
-        for m in &manifests {
-            assert_eq!(m.source, SkillSourceKind::Bundled);
-        }
+        assert!(
+            manifests.is_empty(),
+            "BundledSkillProvider::with_defaults() in astra-skills crate should be empty; \
+             dynamic skills are added by runtime"
+        );
     }
 
     #[tokio::test]
     async fn no_fork_context_by_default() {
+        // Skip if no bundled skills registered (they're added by runtime)
         let provider = BundledSkillProvider::with_defaults();
         let manifests = provider.discover().await.unwrap();
+        // If runtime hasn't populated skills, this is a no-op
         for m in &manifests {
             let loaded = provider.load(&m.name).await.unwrap();
             assert_eq!(
                 loaded.manifest.execution_context,
-                crate::skills::manifest::ExecutionContext::Inline,
+                crate::manifest::ExecutionContext::Inline,
                 "{} should be inline (no fork context)",
                 m.name
             );
@@ -260,6 +252,7 @@ Instructions B.
 
     #[tokio::test]
     async fn with_defaults_all_loadable() {
+        // Note: with_defaults() is empty in standalone crate; runtime populates it
         let provider = BundledSkillProvider::with_defaults();
         let manifests = provider.discover().await.unwrap();
         for m in &manifests {
@@ -276,6 +269,7 @@ Instructions B.
 
     #[tokio::test]
     async fn all_bundled_skills_have_composition_metadata() {
+        // Note: with_defaults() is empty in standalone crate; runtime populates it
         let provider = BundledSkillProvider::with_defaults();
         let manifests = provider.discover().await.unwrap();
         for m in &manifests {

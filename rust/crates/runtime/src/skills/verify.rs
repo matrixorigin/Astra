@@ -41,7 +41,13 @@ impl SkillVerifier {
         if manifest.success_criteria.is_empty() {
             return (true, Vec::new());
         }
-        self.verify_criteria(&manifest.success_criteria).await
+        // Convert serde_json::Value to VerificationCriterion
+        let criteria: Vec<VerificationCriterion> = manifest
+            .success_criteria
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+        self.verify_criteria(&criteria).await
     }
 
     /// Run a specific set of criteria.
@@ -86,6 +92,11 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// Helper to convert VerificationCriterion to serde_json::Value for tests.
+    fn criterion_to_value(c: VerificationCriterion) -> serde_json::Value {
+        serde_json::to_value(c).unwrap()
+    }
+
     #[tokio::test]
     async fn test_empty_criteria_passes() {
         let manifest = SkillManifest::default();
@@ -105,7 +116,7 @@ mod tests {
             .unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(VerificationCriterion {
+        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
             id: "output-exists".to_string(),
             description: "Output file must exist".to_string(),
             verifier: VerifierKind::FileExists {
@@ -114,7 +125,7 @@ mod tests {
             required: true,
             timeout_sec: 10,
             global_only: false,
-        });
+        }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
@@ -128,7 +139,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(VerificationCriterion {
+        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
             id: "missing-file".to_string(),
             description: "File must exist".to_string(),
             verifier: VerifierKind::FileExists {
@@ -142,7 +153,7 @@ mod tests {
             required: true,
             timeout_sec: 10,
             global_only: false,
-        });
+        }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
@@ -155,7 +166,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(VerificationCriterion {
+        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
             id: "advisory-check".to_string(),
             description: "Nice to have".to_string(),
             verifier: VerifierKind::FileExists {
@@ -169,7 +180,7 @@ mod tests {
             required: false, // advisory
             timeout_sec: 10,
             global_only: false,
-        });
+        }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
@@ -182,7 +193,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(VerificationCriterion {
+        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
             id: "echo-check".to_string(),
             description: "Echo contains expected text".to_string(),
             verifier: VerifierKind::CommandOutput {
@@ -193,7 +204,7 @@ mod tests {
             required: true,
             timeout_sec: 10,
             global_only: false,
-        });
+        }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;

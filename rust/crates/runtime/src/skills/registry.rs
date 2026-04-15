@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use astra_skills::providers::mcp::McpSkillProvider;
+
 use super::activation::ConditionalSkillTracker;
 use super::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
-use super::providers::mcp::McpSkillProvider;
 use super::traits::{ResolvedSkill, SkillError, SkillProvider, SkillToolInfo};
 
 // ── Cached skill entry ───────────────────────────────────────────────────────
@@ -504,24 +505,32 @@ impl LegacySkillResolverAdapter {
 impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
     fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
         match self.inner.resolve(name) {
-            Ok(resolved) => Ok(crate::turn::skill_tool::ResolvedSkill {
-                name: resolved.name,
-                instructions: resolved.instructions,
-                model: resolved.model,
-                max_tokens: resolved.max_tokens,
-                allowed_tools: resolved.allowed_tools,
-                execution_context: resolved.execution_context,
-                hooks: resolved.hooks,
-                skill_dir: resolved.skill_dir,
-                source: resolved.source,
-                success_criteria: resolved.success_criteria,
-                composition: resolved.composition,
-                input_schema: resolved.input_schema,
-                aliases: resolved.aliases,
-                effort: resolved.effort,
-                agent_type: resolved.agent_type,
-                trust_tier: resolved.trust_tier,
-            }),
+            Ok(resolved) => {
+                // Convert serde_json::Value to VerificationCriterion
+                let success_criteria: Vec<astra_services::VerificationCriterion> = resolved
+                    .success_criteria
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                Ok(crate::turn::skill_tool::ResolvedSkill {
+                    name: resolved.name,
+                    instructions: resolved.instructions,
+                    model: resolved.model,
+                    max_tokens: resolved.max_tokens,
+                    allowed_tools: resolved.allowed_tools,
+                    execution_context: resolved.execution_context,
+                    hooks: resolved.hooks,
+                    skill_dir: resolved.skill_dir,
+                    source: resolved.source,
+                    success_criteria,
+                    composition: resolved.composition,
+                    input_schema: resolved.input_schema,
+                    aliases: resolved.aliases,
+                    effort: resolved.effort,
+                    agent_type: resolved.agent_type,
+                    trust_tier: resolved.trust_tier,
+                })
+            }
             Err(e) => Err(e.to_string()),
         }
     }

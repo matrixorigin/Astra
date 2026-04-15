@@ -207,23 +207,23 @@ pub fn validate_input(schema: &Value, args: &Value) -> Vec<String> {
     if let (Some(props), Some(args_obj)) = (props, args.as_object()) {
         for (key, val) in args_obj {
             if let Some(prop_schema) = props.get(key) {
-                if let Some(expected_type) = prop_schema.get("type").and_then(Value::as_str) {
-                    if !type_matches(val, expected_type) {
-                        errors.push(format!(
-                            "field '{key}': expected type '{expected_type}', got {}",
-                            json_type_name(val)
-                        ));
-                    }
+                if let Some(expected_type) = prop_schema.get("type").and_then(Value::as_str)
+                    && !type_matches(val, expected_type)
+                {
+                    errors.push(format!(
+                        "field '{key}': expected type '{expected_type}', got {}",
+                        json_type_name(val)
+                    ));
                 }
 
                 // Check enum constraint
-                if let Some(allowed) = prop_schema.get("enum").and_then(Value::as_array) {
-                    if !allowed.contains(val) {
-                        errors.push(format!(
-                            "field '{key}': value not in allowed set {:?}",
-                            allowed
-                        ));
-                    }
+                if let Some(allowed) = prop_schema.get("enum").and_then(Value::as_array)
+                    && !allowed.contains(val)
+                {
+                    errors.push(format!(
+                        "field '{key}': value not in allowed set {:?}",
+                        allowed
+                    ));
                 }
             }
         }

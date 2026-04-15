@@ -343,12 +343,11 @@ fn add_dir_to_tar<W: Write>(
         }
 
         // Verify the canonical path doesn't escape the skill directory (symlink safety)
-        if let Ok(canonical) = path.canonicalize() {
-            if let Ok(dir_canonical) = dir.canonicalize() {
-                if !canonical.starts_with(&dir_canonical) {
-                    continue; // symlink escape — skip
-                }
-            }
+        if let Ok(canonical) = path.canonicalize()
+            && let Ok(dir_canonical) = dir.canonicalize()
+            && !canonical.starts_with(&dir_canonical)
+        {
+            continue; // symlink escape — skip
         }
 
         let file_name = entry.file_name();

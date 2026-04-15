@@ -10,6 +10,8 @@ members = [
     "crates/astra-edge",
     "crates/astra-pipeline",
     "crates/astra-turn-types",
+    "crates/astra-skills",
+    "crates/astra-sandbox",
 ]
 resolver = "2"
 
@@ -20,7 +22,9 @@ edition = "2024"
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
 astra-pipeline = { path = "crates/astra-pipeline" }
+astra-sandbox = { path = "crates/astra-sandbox" }
 astra-turn-types = { path = "crates/astra-turn-types" }
+astra-skills = { path = "crates/astra-skills" }
 astra-tools = { path = "crates/astra-tools" }
 astra-services = { path = "crates/services" }
 astra-runtime = { path = "crates/runtime" }

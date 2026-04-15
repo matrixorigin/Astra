@@ -174,10 +174,10 @@ pub fn parse_arguments(
 
     // Fill in defaults for missing arguments
     for def in arg_defs {
-        if !result.contains_key(&def.name) {
-            if let Some(ref default) = def.default {
-                result.insert(def.name.clone(), default.clone());
-            }
+        if !result.contains_key(&def.name)
+            && let Some(ref default) = def.default
+        {
+            result.insert(def.name.clone(), default.clone());
         }
     }
 
