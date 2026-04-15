@@ -36,7 +36,10 @@ mod tests {
     }
 
     impl ProgressReportingExecutor {
-        fn new() -> (Self, Arc<tokio::sync::Mutex<Vec<(String, Result<(), String>)>>>) {
+        fn new() -> (
+            Self,
+            Arc<tokio::sync::Mutex<Vec<(String, Result<(), String>)>>>,
+        ) {
             let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
             (
                 Self {
@@ -87,8 +90,12 @@ mod tests {
 
     fn setup_profiles() -> Arc<RwLock<AgentProfileRegistry>> {
         let mut reg = AgentProfileRegistry::new();
-        reg.register(AgentProfile::new("orch", "Orchestrator", AgentTier::Orchestrator))
-            .unwrap();
+        reg.register(AgentProfile::new(
+            "orch",
+            "Orchestrator",
+            AgentTier::Orchestrator,
+        ))
+        .unwrap();
         reg.register(AgentProfile::new(
             "team-review-producer",
             "Producer",
@@ -401,10 +408,7 @@ mod tests {
             self.gate.wait().await;
 
             let send_result = if let Some(ref mailbox) = config.mailbox {
-                match mailbox
-                    .send_progress(0, 1, "turn_complete", None)
-                    .await
-                {
+                match mailbox.send_progress(0, 1, "turn_complete", None).await {
                     Ok(()) => Ok(()),
                     Err(e) => Err(format!("{e}")),
                 }
@@ -614,9 +618,7 @@ mod tests {
         let cancel_clone = cancel.clone();
         let engine_handle = {
             let engine = h.engine;
-            tokio::spawn(
-                async move { engine.execute(request, "orch", Some(cancel_clone)).await },
-            )
+            tokio::spawn(async move { engine.execute(request, "orch", Some(cancel_clone)).await })
         };
 
         // Give engine time to register parent and spawn agents.
@@ -750,9 +752,7 @@ mod tests {
         let cancel_clone = cancel.clone();
         let engine_handle = {
             let engine = h.engine;
-            tokio::spawn(
-                async move { engine.execute(request, "orch", Some(cancel_clone)).await },
-            )
+            tokio::spawn(async move { engine.execute(request, "orch", Some(cancel_clone)).await })
         };
 
         // Let agents start.
@@ -760,11 +760,7 @@ mod tests {
         cancel.cancel();
 
         // The collection loop should abort tasks and return promptly.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            engine_handle,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), engine_handle).await;
 
         assert!(
             result.is_ok(),
@@ -793,19 +789,13 @@ mod tests {
         let cancel_clone = cancel.clone();
         let engine_handle = {
             let engine = h.engine;
-            tokio::spawn(
-                async move { engine.execute(request, "orch", Some(cancel_clone)).await },
-            )
+            tokio::spawn(async move { engine.execute(request, "orch", Some(cancel_clone)).await })
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         cancel.cancel();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            engine_handle,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), engine_handle).await;
 
         assert!(
             result.is_ok(),
@@ -829,13 +819,19 @@ mod tests {
         let addr = AgentAddress::new("run-1", "agent-1");
         let result = router.register_if_absent(addr.clone(), None).await;
         assert!(result.is_ok());
-        assert!(result.unwrap().is_some(), "first registration should return Some");
+        assert!(
+            result.unwrap().is_some(),
+            "first registration should return Some"
+        );
 
         // Second registration with same run_id returns None (no clobber).
         let addr2 = AgentAddress::new("run-1", "agent-1");
         let result2 = router.register_if_absent(addr2, None).await;
         assert!(result2.is_ok());
-        assert!(result2.unwrap().is_none(), "second registration should return None");
+        assert!(
+            result2.unwrap().is_none(),
+            "second registration should return None"
+        );
     }
 
     /// register_if_absent with different run_id registers both.
@@ -854,6 +850,9 @@ mod tests {
 
         let addr2 = AgentAddress::new("run-2", "agent-1");
         let r2 = router.register_if_absent(addr2, None).await.unwrap();
-        assert!(r2.is_some(), "different run_id should register successfully");
+        assert!(
+            r2.is_some(),
+            "different run_id should register successfully"
+        );
     }
 }

@@ -737,14 +737,18 @@ mod tests {
         // First 2 calls should have unknown_tool journal records,
         // 3rd should be a duplicate record.
         assert_eq!(pipeline.ctx.tool_call_records.len(), 3);
-        assert!(pipeline.ctx.tool_call_records[0]
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("unknown_tool")));
-        assert!(pipeline.ctx.tool_call_records[1]
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("unknown_tool")));
+        assert!(
+            pipeline.ctx.tool_call_records[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown_tool"))
+        );
+        assert!(
+            pipeline.ctx.tool_call_records[1]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown_tool"))
+        );
         // 3rd record is a dedup, not unknown_tool
         assert!(
             !pipeline.ctx.tool_call_records[2]
@@ -913,16 +917,25 @@ mod tests {
         // execute_execution: ServerToolExecutor doesn't know "outline",
         // returns "Error: Tool 'outline' not available..."
         let executed = pipeline.execute_execution(permitted).await;
-        assert!(executed.is_err, "server executor should return error for unknown tool");
+        assert!(
+            executed.is_err,
+            "server executor should return error for unknown tool"
+        );
 
         // record_execution feeds through append_headless_result_quality_feedback
         // → turn_guard.record_tool_result → health.record_failure
         pipeline.record_execution(executed).await;
 
         let health = pipeline.ctx.turn_guard.health.get("outline");
-        assert!(health.is_some(), "outline should be tracked after server fallback error");
+        assert!(
+            health.is_some(),
+            "outline should be tracked after server fallback error"
+        );
         let h = health.unwrap();
-        assert_eq!(h.total_failures, 1, "server fallback error should count as failure");
+        assert_eq!(
+            h.total_failures, 1,
+            "server fallback error should count as failure"
+        );
         assert_eq!(h.consecutive_failures, 1);
     }
 
