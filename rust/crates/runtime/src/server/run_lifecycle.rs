@@ -96,11 +96,12 @@ fn build_server_skill_executor(
     edge_profile: &Map<String, Value>,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
+    edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
     use crate::skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
 
-    let subrun_executor = ServerSkillSubRunExecutor::new(
+    let mut subrun_executor = ServerSkillSubRunExecutor::new(
         matrixone.clone(),
         Arc::clone(encryptor),
         session_id.to_string(),
@@ -110,6 +111,9 @@ fn build_server_skill_executor(
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
     .with_skill_resolver(skill_resolver);
+    if let Some(pool) = edge_connection_pool {
+        subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
+    }
 
     let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
     let router = SkillExecutionRouter::new(Some(isolated));
@@ -828,6 +832,7 @@ impl AgenticRunLifecycleService {
             &edge_profile,
             skill_resolver.clone(),
             session_id,
+            self.edge_connection_pool.as_ref(),
         );
 
         AgenticLoopState {
@@ -1741,6 +1746,7 @@ pub struct ServerSubRunExecutor {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl ServerSubRunExecutor {
@@ -1754,12 +1760,46 @@ impl ServerSubRunExecutor {
             encryptor,
             shared_pool: None,
             edge_callback_ledger,
+            edge_connection_pool: None,
         }
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
         self
+    }
+
+    pub fn with_edge_connection_pool(
+        mut self,
+        pool: super::edge_connection_pool::EdgeConnectionPool,
+    ) -> Self {
+        self.edge_connection_pool = Some(pool);
+        self
+    }
+}
+
+impl ServerSubRunExecutor {
+    /// Provision a workspace directory for a delegation sub-run.
+    ///
+    /// Sub-runs get a subdirectory under the parent session workspace to
+    /// keep file operations isolated while sharing the same base.
+    fn provision_subrun_workspace(&self, session_id: &str, run_id: &str) -> std::path::PathBuf {
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect()
+        };
+        let safe_session = sanitize(session_id);
+        let safe_run = sanitize(run_id);
+        assert!(!safe_session.is_empty(), "session_id must be non-empty");
+        assert!(!safe_run.is_empty(), "run_id must be non-empty");
+
+        let base = std::env::var("ASTRA_SERVER_WORKSPACES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
+        let workspace = base.join(&safe_session).join(&safe_run);
+        let _ = std::fs::create_dir_all(&workspace);
+        workspace
     }
 }
 
@@ -1932,6 +1972,29 @@ impl SubRunExecutor for ServerSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
         };
+
+        // ── Wire ServerToolExecutor for sub-run tool execution ──────────
+        // Without this, the headless pipeline fallback cannot execute tools
+        // server-side and sub-agents would get edge-protocol errors.
+        {
+            let workspace = self.provision_subrun_workspace(&config.session_id, &config.run_id);
+            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let mut executor = super::server_tool_executor::ServerToolExecutor::new(
+                workspace,
+                config.user_id.clone(),
+                config.session_id.clone(),
+                memoria_base,
+                None,
+            );
+            if let Some(pool) = &self.edge_connection_pool {
+                executor.set_edge_connection_pool(pool.clone());
+            }
+            if let Some(obs) = loop_state.telemetry.observability_session.clone() {
+                executor.set_observability_session(obs);
+            }
+            loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
+        }
+
         let learning_stack = configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
