@@ -30,7 +30,16 @@ jobs:
           workspaces: rust
           shared-key: ci-offline
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
+      # astra-cli is binary-only (no lib target, no crate-root integration tests/).
+      # Split by nextest source filter instead of --lib / --tests.
+      - name: "Test astra-cli (bins: cli, main, src/tests, …)"
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
+          -E 'not source(/edge_tools/)'
+      - name: "Test astra-cli (bins: edge_tools)"
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
+          -E 'source(/edge_tools/)'
 
   test-offline-runtime:
     name: "Offline: astra-runtime"
