@@ -38,6 +38,13 @@ use std::{
     time::Instant,
 };
 
+use astra_core::SharedPool;
+use astra_services::evaluation::SessionQualityAssessmentRequest;
+use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_workspace::{
+    ContextTraceBudgetSignal, ContextTraceSignal, ContextTraceTimingSignal,
+    ContextTraceToolSelection,
+};
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -54,11 +61,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    ChatTurnBridge, FernetTokenEncryptor, MatrixOneSettings, SessionActivityUpdatePlan,
-    TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan,
-    TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
-    TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
-    build_explain_event, build_stream_error_event,
+    ChatTurnBridge, DatabaseEvaluationService, DatabaseEventService, EvaluationService,
+    EventCreateRequestData, EventService, FernetTokenEncryptor, MatrixOneSettings,
+    SessionActivityUpdatePlan, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
+    TurnCorePersistPlan, TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter,
+    TurnReflectionStateStore, TurnSessionActivityWriter, TurnToolEventPersistPlan,
+    TurnToolEventRecord, TurnToolEventWriter, build_explain_event, build_stream_error_event,
     pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder},
     prompts,
     turn::agentic_post_tool_policy::{
@@ -123,6 +131,275 @@ fn render_sse(event: &Value) -> Bytes {
 
 fn render_sse_map(event: &Map<String, Value>) -> Bytes {
     render_sse(&Value::Object(event.clone()))
+}
+
+fn preview_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn build_bridge_tool_call_records(
+    tool_calls: &[Value],
+    tool_results: &[Value],
+) -> Vec<ToolCallRecord> {
+    let mut call_metadata: HashMap<String, (String, Option<String>, Option<u32>)> = HashMap::new();
+    for tool_call in tool_calls {
+        let Some(tool_call) = tool_call.as_object() else {
+            continue;
+        };
+        let request_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let function = tool_call.get("function").and_then(Value::as_object);
+        let tool_name = function
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let arguments = function
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let input_bytes = arguments
+            .as_ref()
+            .map(|arguments| arguments.len().min(u32::MAX as usize) as u32);
+        if !request_id.is_empty() {
+            call_metadata.insert(request_id, (tool_name, arguments, input_bytes));
+        }
+    }
+
+    let mut seen_request_ids = HashSet::new();
+    let mut records = Vec::new();
+    for tool_result in tool_results {
+        let Some(tool_result) = tool_result.as_object() else {
+            continue;
+        };
+        let request_id = tool_result
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !request_id.is_empty() {
+            seen_request_ids.insert(request_id.clone());
+        }
+        let fallback_name = tool_result
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let (tool_name, arguments, input_bytes) = call_metadata
+            .get(&request_id)
+            .cloned()
+            .unwrap_or((fallback_name, None, None));
+        let status = tool_result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("ok");
+        let ok = status.eq_ignore_ascii_case("ok");
+        let output = tool_result.get("output").map(|output| match output {
+            Value::String(output) => output.clone(),
+            other => other.to_string(),
+        });
+        let error = tool_result
+            .get("error")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| (!ok).then(|| output.clone().unwrap_or_else(|| status.to_string())));
+        let output_bytes = output
+            .as_ref()
+            .map(|output| output.len().min(u32::MAX as usize) as u32);
+        records.push(ToolCallRecord {
+            name: tool_name,
+            ok,
+            ms: tool_result
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            error,
+            input_bytes,
+            output_bytes,
+            args_preview: arguments
+                .as_deref()
+                .map(|arguments| preview_chars(arguments, 80)),
+            result_preview: output.as_deref().map(|output| preview_chars(output, 500)),
+        });
+    }
+
+    for (request_id, (tool_name, arguments, input_bytes)) in call_metadata {
+        if seen_request_ids.contains(&request_id) {
+            continue;
+        }
+        records.push(ToolCallRecord {
+            name: tool_name,
+            ok: false,
+            ms: 0,
+            error: Some("missing tool result".to_string()),
+            input_bytes,
+            output_bytes: None,
+            args_preview: arguments
+                .as_deref()
+                .map(|arguments| preview_chars(arguments, 80)),
+            result_preview: None,
+        });
+    }
+
+    records
+}
+
+fn build_legacy_context_trace_signal(
+    turn: u32,
+    turn_id: String,
+    tools_available: usize,
+    selected_tools: Vec<String>,
+    selection_confidence: f64,
+    measured_prompt_tokens: Option<u64>,
+    model_limit: usize,
+    tool_execution_ms: u64,
+    total_ms: u64,
+) -> ContextTraceSignal {
+    let unique_selected = selected_tools.iter().cloned().collect::<HashSet<_>>().len();
+    let budget = measured_prompt_tokens.map(|total_used| ContextTraceBudgetSignal {
+        max_tokens: model_limit.min(u32::MAX as usize) as u32,
+        total_used: total_used.min(u32::MAX as u64) as u32,
+        budget_pressure: if model_limit > 0 {
+            total_used as f64 / model_limit as f64
+        } else {
+            0.0
+        },
+        compression_triggered: false,
+    });
+    let llm_total_ms = total_ms.saturating_sub(tool_execution_ms);
+
+    ContextTraceSignal {
+        turn_id,
+        captured_at: Some(chrono::Utc::now().to_rfc3339()),
+        tool_selection: Some(ContextTraceToolSelection {
+            tools_available: tools_available.min(u32::MAX as usize) as u32,
+            selected_tools,
+            rejected_tools: tools_available.saturating_sub(unique_selected),
+            strategy: "inprocess_bridge".to_string(),
+            confidence: selection_confidence,
+            latency_ms: 0,
+        }),
+        memory: None,
+        history: None,
+        budget,
+        timing: Some(ContextTraceTimingSignal {
+            turn,
+            context_assembly_ms: 0,
+            ttft_ms: 0,
+            llm_total_ms,
+            tool_execution_ms,
+            total_ms,
+        }),
+        explanations: Vec::new(),
+    }
+}
+
+async fn persist_legacy_bridge_trace_and_quality(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<SharedPool>,
+    user_id: String,
+    session_id: String,
+    agent_id: Option<String>,
+    turn_chain_id: String,
+    signal: ContextTraceSignal,
+    evaluation: Option<crate::pipeline::evaluation::TurnEvaluation>,
+    step_count: usize,
+) {
+    let Some(shared_pool) = shared_pool else {
+        return;
+    };
+
+    if let Some(evaluation) = evaluation {
+        let evaluation_service =
+            DatabaseEvaluationService::new(matrixone.clone()).with_pool(shared_pool.clone());
+        let assessment = SessionQualityAssessmentRequest {
+            session_id: session_id.clone(),
+            score: evaluation.quality,
+            step_count: i32::try_from(step_count).unwrap_or(i32::MAX),
+        };
+        if let Err((status, response)) = evaluation_service
+            .record_session_quality_assessment(&user_id, assessment)
+            .await
+        {
+            astra_core::agent_warn!(
+                "legacy-bridge",
+                "Failed to persist session quality assessment for {}: {} {}",
+                session_id,
+                status,
+                response.0.detail
+            );
+        }
+    }
+
+    let event_service = DatabaseEventService::new(matrixone.clone()).with_pool(shared_pool);
+    let mut metadata = match serde_json::to_value(&signal) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            astra_core::agent_warn!(
+                "legacy-bridge",
+                "Failed to serialize context trace signal for {}: {}",
+                session_id,
+                err
+            );
+            return;
+        }
+    };
+    if let Some(metadata_obj) = metadata.as_object_mut() {
+        if let Some(duration_ms) = signal.timing.as_ref().map(|timing| timing.total_ms) {
+            metadata_obj.insert(
+                "duration_ms".to_string(),
+                json!(duration_ms.min(i32::MAX as u64)),
+            );
+        }
+        if let Some(tool_name) = signal
+            .tool_selection
+            .as_ref()
+            .and_then(|selection| selection.selected_tools.first())
+        {
+            metadata_obj.insert("tool_name".to_string(), json!(tool_name));
+        }
+    }
+
+    let content = {
+        let preview = signal.preview();
+        if preview.is_empty() {
+            "context trace signal".to_string()
+        } else {
+            preview
+        }
+    };
+    let turn_id = if signal.turn_id.is_empty() {
+        "latest".to_string()
+    } else {
+        signal.turn_id.clone()
+    };
+    if let Err((status, response)) = event_service
+        .create_event(
+            user_id,
+            EventCreateRequestData {
+                session_id,
+                event_type: "context_trace_signal".to_string(),
+                content,
+                agent_id,
+                agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                parent_event_id: None,
+                parent_event_ids: Some(Vec::new()),
+                causal_chain_id: Some(format!("{turn_chain_id}:context-trace:{turn_id}")),
+                metadata: Some(metadata),
+            },
+        )
+        .await
+    {
+        astra_core::agent_warn!(
+            "legacy-bridge",
+            "Failed to persist context trace signal: {} {}",
+            status,
+            response.0.detail
+        );
+    }
 }
 
 /// Returns `true` if `name` looks like a valid tool function name.
@@ -1131,7 +1408,7 @@ pub struct InProcessChatTurnBridge {
     pub encryptor: Arc<FernetTokenEncryptor>,
     /// Shared DB pool — avoids creating a new connection per turn.
     /// When `None`, falls back to ephemeral single-connection pool.
-    pub shared_pool: Option<Arc<sqlx::Pool<sqlx::MySql>>>,
+    pub shared_pool: Option<SharedPool>,
     /// Pipeline learning writer — auto-updates EntityGraph/PatternLibrary/Calibrator.
     pub turn_learning_writer: Option<Arc<dyn crate::TurnLearningWriter>>,
     /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
@@ -1149,7 +1426,7 @@ impl InProcessChatTurnBridge {
         }
     }
 
-    pub fn with_pool(mut self, pool: Arc<sqlx::Pool<sqlx::MySql>>) -> Self {
+    pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
         self
     }
@@ -1278,7 +1555,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_model name for rate-limit-triggered fallback.
-            let pool_ref = shared_pool.as_deref();
+            let pool_ref = shared_pool.as_ref().map(SharedPool::get);
             let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
@@ -2508,6 +2785,51 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 );
             }
 
+            let tool_call_records =
+                build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results);
+            let verdict_warning = bridge_verdict_events.iter().any(|event| {
+                event.severity.eq_ignore_ascii_case("warning")
+                    || event.severity.eq_ignore_ascii_case("critical")
+            });
+            let recent_tools_for_quality = tool_names_from_tool_calls(&all_round_tool_calls);
+            let budget_pressure = last_measured_prompt.map_or(0.0, |measured| {
+                if budget.model_limit > 0 {
+                    measured as f64 / budget.model_limit as f64
+                } else {
+                    0.0
+                }
+            });
+            let evaluation = (!tool_call_records.is_empty()).then(|| {
+                crate::pipeline::evaluation::evaluate_tool_call_records(
+                    &user_message_for_guard,
+                    &recent_tools_for_quality,
+                    &tool_call_records,
+                    bridge_stall_events.len(),
+                    verdict_warning,
+                    budget_pressure,
+                )
+            });
+            let tool_execution_ms: u64 = merged_tool_results
+                .iter()
+                .filter_map(|tool_result| {
+                    tool_result
+                        .get("duration_ms")
+                        .and_then(Value::as_u64)
+                })
+                .sum();
+            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
+            let trace_signal = build_legacy_context_trace_signal(
+                trace_turn,
+                format!("turn-{trace_turn}"),
+                edge_tools.len(),
+                recent_tools_for_quality.clone(),
+                selection_confidence,
+                last_measured_prompt,
+                budget.model_limit,
+                tool_execution_ms,
+                turn_started.elapsed().as_millis() as u64,
+            );
+
             // Auxiliary events: routing decisions, quality assessments, snapshots
             {
                 let aux_writer = turn_auxiliary_event_writer.clone();
@@ -2516,18 +2838,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let aux_aid = agent_id.clone();
                 let aux_chain = turn_chain_id.clone();
                 let aux_parent = user_query_event_id.clone();
+                let aux_matrixone = matrixone.clone();
+                let aux_pool = shared_pool.clone();
+                let aux_trace_signal = trace_signal.clone();
+                let aux_evaluation = evaluation.clone();
+                let aux_step_count = tool_call_records.len();
                 tokio::spawn(async move {
                     // Routing decision event (inprocess uses default router)
                     let routing_event = crate::TurnAuxiliaryEventRecord {
                         event_id: Uuid::now_v7().to_string(),
                         user_id: aux_uid.clone(),
                         session_id: aux_sid.clone(),
-                        agent_id: aux_aid,
+                        agent_id: aux_aid.clone(),
                         event_type: "routing_decision".to_string(),
                         content: json!({"router": "inprocess-default", "intent": "default"}).to_string(),
                         parent_event_id: Some(aux_parent.clone()),
                         parent_event_ids: vec![aux_parent],
-                        causal_chain_id: aux_chain,
+                        causal_chain_id: aux_chain.clone(),
                         metadata: None,
                         reasoning_content: None,
                     };
@@ -2537,6 +2864,18 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             aux_sid, e
                         );
                     }
+                    persist_legacy_bridge_trace_and_quality(
+                        &aux_matrixone,
+                        aux_pool,
+                        aux_uid,
+                        aux_sid,
+                        aux_aid,
+                        aux_chain,
+                        aux_trace_signal,
+                        aux_evaluation,
+                        aux_step_count,
+                    )
+                    .await;
                 });
             }
 
@@ -2935,6 +3274,32 @@ mod tests {
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
         assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    }
+
+    #[test]
+    fn build_legacy_context_trace_signal_keeps_only_known_timing_values() {
+        let signal = build_legacy_context_trace_signal(
+            3,
+            "turn-3".to_string(),
+            5,
+            vec!["read_file".to_string(), "grep".to_string()],
+            0.82,
+            Some(1200),
+            8000,
+            450,
+            1500,
+        );
+
+        let tool_selection = signal.tool_selection.as_ref().expect("tool selection");
+        assert_eq!(tool_selection.strategy, "inprocess_bridge");
+        assert_eq!(tool_selection.confidence, 0.82);
+
+        let timing = signal.timing.as_ref().expect("timing");
+        assert_eq!(timing.turn, 3);
+        assert_eq!(timing.context_assembly_ms, 0);
+        assert_eq!(timing.llm_total_ms, 1050);
+        assert_eq!(timing.tool_execution_ms, 450);
+        assert_eq!(timing.total_ms, 1500);
     }
 
     // ── Static/dynamic prompt boundary tests ──

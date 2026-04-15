@@ -198,6 +198,7 @@ pub async fn build_server_state(
                     settings.matrixone.clone(),
                     encryptor,
                 )
+                .with_pool(shared_pool.clone())
                 .with_learning_writer(learning_stack.writer.clone())
                 .with_edge_callback_ledger(edge_ledger),
             ))

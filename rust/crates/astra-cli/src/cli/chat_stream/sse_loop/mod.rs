@@ -497,6 +497,7 @@ pub(crate) async fn stream_chat_sse(
             completed_turns_for_tuning: 0,
             runtime_promotion_signals: None,
             evaluation_persistence: None,
+            context_trace_persistence: None,
             promotion_events: Vec::new(),
         },
         skills: SkillState {

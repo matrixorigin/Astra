@@ -14,6 +14,112 @@ use super::harness::{
     row_get_opt_i64, row_get_opt_str, row_get_str, wait_for_agent_event_types,
 };
 
+async fn run_tool_backed_chat_turn(
+    app: &axum::Router,
+    auth_header: &str,
+    session_id: &str,
+    agent_id: &str,
+    test_secret: &str,
+) -> String {
+    let read_file_tool = json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }
+        }
+    });
+    let payload = json!({
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "messages": [{ "role": "user", "content": "read README through a tool" }],
+        "edge_tools": [read_file_tool],
+        "test_llm_rounds": [
+            {
+                "tool_calls": [{
+                    "id": "ctx-trace-tool-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                }]
+            },
+            {
+                "full_text": "tool-backed calibration reply",
+                "reasoning": "",
+                "usage": { "prompt": 7, "completion": 9, "total": 16 }
+            }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", auth_header)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", test_secret)
+        .body(Body::from(payload.to_string()))
+        .expect("tool-backed chat request");
+    let response = app
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("tool-backed chat oneshot");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "tool-backed chat/turn should return 200"
+    );
+
+    let mut stream = response.into_body().into_data_stream();
+    let mut acc = Vec::new();
+    let mut posted_result = false;
+    let mut saw_turn_complete = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("tool-backed sse chunk");
+        acc.extend_from_slice(&chunk);
+        let s = String::from_utf8_lossy(&acc);
+        if !posted_result
+            && s.contains("\"type\":\"tool_request\"")
+            && s.contains("ctx-trace-tool-1")
+        {
+            let (st_result, result_body) = post_json(
+                app,
+                "/tools/result",
+                Some(auth_header),
+                json!({
+                    "request_id": "ctx-trace-tool-1",
+                    "status": "ok",
+                    "output": "# README\nfrom tool-backed matrix e2e\n",
+                }),
+            )
+            .await;
+            assert_eq!(
+                st_result,
+                StatusCode::OK,
+                "POST /tools/result for ctx-trace-tool-1: {result_body}"
+            );
+            posted_result = true;
+        }
+        if s.contains("turn_complete") {
+            saw_turn_complete = true;
+            break;
+        }
+    }
+
+    assert!(posted_result, "tool-backed chat never emitted tool_request");
+    assert!(
+        saw_turn_complete,
+        "tool-backed chat never reached turn_complete"
+    );
+    String::from_utf8_lossy(&acc).into_owned()
+}
+
 pub async fn run_product_matrix_full_journey(
     ctx: &MatrixE2eCtx,
     auth_header: &mut String,
@@ -1157,6 +1263,125 @@ pub async fn run_product_matrix_full_journey(
     assert!(
         ui.contains("matrix journey ping"),
         "turn detail user_input should include user prompt: {td_j}"
+    );
+
+    let tool_turn_sse = run_tool_backed_chat_turn(
+        app,
+        auth_header.as_str(),
+        &session_id,
+        &agent_id,
+        &test_secret,
+    )
+    .await;
+    assert!(
+        tool_turn_sse.contains("\"type\":\"tool_request\""),
+        "tool-backed chat should emit tool_request: {tool_turn_sse}"
+    );
+    wait_for_agent_event_types(
+        pool,
+        &session_id,
+        &["context_trace_signal"],
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+
+    let trace_row = {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(row) = sqlx::query(
+                "SELECT \
+                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.turn_id')) AS turn_id, \
+                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.selected_tools[0]')) AS selected_tool, \
+                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.strategy')) AS strategy, \
+                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.confidence')) AS DOUBLE) AS selection_confidence \
+                 FROM agent_events \
+                 WHERE session_id = ? \
+                   AND event_type = 'context_trace_signal' \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.selected_tools[0]')) IS NOT NULL \
+                 ORDER BY created_at DESC \
+                 LIMIT 1",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("latest tool-backed context_trace_signal event")
+            {
+                break row;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting for tool-backed context_trace_signal for session_id={session_id}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    assert!(
+        trace_row
+            .try_get::<Option<String>, _>("turn_id")
+            .ok()
+            .flatten()
+            .is_some_and(|turn_id| turn_id.starts_with("turn-")),
+        "context trace event should carry turn_id"
+    );
+    assert_eq!(
+        trace_row
+            .try_get::<Option<String>, _>("selected_tool")
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("read_file"),
+        "context trace event should persist selected tool"
+    );
+    assert!(
+        trace_row
+            .try_get::<Option<String>, _>("strategy")
+            .ok()
+            .flatten()
+            .is_some_and(|strategy| !strategy.is_empty()),
+        "context trace event should persist tool selection strategy"
+    );
+    assert!(
+        trace_row
+            .try_get::<Option<f64>, _>("selection_confidence")
+            .ok()
+            .flatten()
+            .is_some_and(|confidence| confidence >= 0.0),
+        "context trace event should persist selection confidence"
+    );
+
+    let assessment_row = sqlx::query(
+        "SELECT score, step_count \
+         FROM eval_quality_assessments \
+         WHERE user_id = ? AND target_id = ? AND level = 'session' \
+         ORDER BY updated_at DESC \
+         LIMIT 1",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_optional(pool)
+    .await
+    .expect("session quality assessment row");
+    let assessment_row = assessment_row.expect("session quality assessment after tool-backed turn");
+    assert!(
+        assessment_row
+            .try_get::<Option<i32>, _>("step_count")
+            .ok()
+            .flatten()
+            .is_some_and(|step_count| step_count >= 1),
+        "session quality assessment should record tool-backed step_count"
+    );
+
+    let (st_cal_after, cal_after_j) =
+        get_json(app, "/evaluation/calibration?days=7", None, xuid).await;
+    assert_eq!(
+        st_cal_after,
+        StatusCode::OK,
+        "evaluation calibration after tool-backed turn: {cal_after_j}"
+    );
+    assert!(
+        cal_after_j["sample_count"].as_u64().unwrap_or(0) >= 1,
+        "calibration should include at least one sample after tool-backed turn: {cal_after_j}"
     );
 
     let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");

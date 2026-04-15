@@ -1,5 +1,6 @@
 use crate::pipeline::step_checkpoint;
 use crate::pipeline::step_protocol::StepCheckpoint;
+use crate::{EventCreateRequestData, EventService};
 
 use super::agentic_adaptive_tuning::{
     record_loop_completion_feedback, record_new_evolution_promotion_events,
@@ -12,7 +13,7 @@ use super::agentic_loop_host::{
 /// Finalize the turn trace collector: record measured token budget, feed to
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
-pub(crate) fn finalize_turn_trace(state: &mut AgenticLoopState) {
+pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
@@ -52,6 +53,7 @@ pub(crate) fn finalize_turn_trace(state: &mut AgenticLoopState) {
             let _ = writer.append(&event);
         }
     }
+    persist_latest_context_trace_signal(state).await;
 }
 
 fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
@@ -63,6 +65,137 @@ fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
         .and_then(|s| s.read().ok().map(|g| g.turn_number))
         .filter(|turn| *turn > 0)
         .unwrap_or(outer_turn)
+}
+
+async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
+    let (session_id, persistence, session) = match (
+        state.current_session_id.as_deref(),
+        state.telemetry.context_trace_persistence.clone(),
+        state.telemetry.observability_session.clone(),
+    ) {
+        (Some(session_id), Some(persistence), Some(session)) if !session_id.is_empty() => {
+            (session_id.to_string(), persistence, session)
+        }
+        _ => return,
+    };
+    let signal = {
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        crate::observability_integration::latest_context_trace_signal(&guard)
+    };
+    let Some(signal) = signal else {
+        return;
+    };
+
+    persist_context_trace_to_workspace_if_present(session_id.clone(), signal.clone()).await;
+
+    let mut metadata = match serde_json::to_value(&signal) {
+        Ok(value) => value,
+        Err(err) => {
+            astra_core::agent_warn!(
+                "context-trace",
+                "Failed to serialize context trace signal for {}: {}",
+                session_id,
+                err
+            );
+            return;
+        }
+    };
+    if let Some(metadata_obj) = metadata.as_object_mut() {
+        if let Some(duration_ms) = signal.timing.as_ref().map(|timing| timing.total_ms) {
+            metadata_obj.insert(
+                "duration_ms".to_string(),
+                serde_json::json!(duration_ms.min(i32::MAX as u64)),
+            );
+        }
+        if let Some(tool_name) = signal
+            .tool_selection
+            .as_ref()
+            .and_then(|selection| selection.selected_tools.first())
+        {
+            metadata_obj.insert("tool_name".to_string(), serde_json::json!(tool_name));
+        }
+    }
+
+    let content = {
+        let preview = signal.preview();
+        if preview.is_empty() {
+            "context trace signal".to_string()
+        } else {
+            preview
+        }
+    };
+    let turn_id = if signal.turn_id.is_empty() {
+        "latest".to_string()
+    } else {
+        signal.turn_id.clone()
+    };
+    if let Err((status, response)) = persistence
+        .event_service
+        .create_event(
+            persistence.user_id.clone(),
+            EventCreateRequestData {
+                session_id: session_id.clone(),
+                event_type: "context_trace_signal".to_string(),
+                content,
+                agent_id: Some(persistence.agent_id),
+                agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                parent_event_id: None,
+                parent_event_ids: Some(Vec::new()),
+                causal_chain_id: Some(format!("{session_id}:context-trace:{turn_id}")),
+                metadata: Some(metadata),
+            },
+        )
+        .await
+    {
+        astra_core::agent_warn!(
+            "context-trace",
+            "Failed to persist context trace signal for {}: {} {}",
+            session_id,
+            status,
+            response.0.detail
+        );
+    }
+}
+
+async fn persist_context_trace_to_workspace_if_present(
+    session_id: String,
+    signal: astra_services::session_workspace::ContextTraceSignal,
+) {
+    let workspace_session_id = session_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let workspace_path =
+            astra_services::session_workspace::workspace_dir_for(&workspace_session_id)
+                .join("workspace.yaml");
+        if !workspace_path.is_file() {
+            return Ok(());
+        }
+        let mut workspace =
+            astra_services::session_workspace::read_workspace(&workspace_session_id)?;
+        workspace.last_context_trace = Some(signal);
+        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        astra_services::session_workspace::write_workspace(&workspace)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            astra_core::agent_warn!(
+                "context-trace",
+                "Failed to persist workspace trace for {}: {}",
+                session_id,
+                err
+            );
+        }
+        Err(err) => {
+            astra_core::agent_warn!(
+                "context-trace",
+                "Workspace trace persistence task failed for {}: {}",
+                session_id,
+                err
+            );
+        }
+    }
 }
 
 /// Best-effort heavy checkpoint write.
@@ -268,8 +401,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 }
 
 /// Render deferred final text if any is buffered, then write heavy checkpoint.
-pub(crate) fn finalize_and_render<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
-    finalize_turn_trace(state);
+pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
+    finalize_turn_trace(state).await;
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() {
         host.render_final_text(&state.final_text);
@@ -334,8 +470,8 @@ mod tests {
         assert_eq!(host.rendered_final_text[0], "Done!");
     }
 
-    #[test]
-    fn finalize_turn_trace_feeds_observability_session() {
+    #[tokio::test]
+    async fn finalize_turn_trace_feeds_observability_session() {
         let mut state = make_state();
         let hub = crate::observability_integration::ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
@@ -350,7 +486,7 @@ mod tests {
         collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 100_000, 0.22);
         state.telemetry.turn_trace_collector = Some(collector);
 
-        finalize_turn_trace(&mut state);
+        finalize_turn_trace(&mut state).await;
 
         assert!(state.telemetry.turn_trace_collector.is_none());
         let guard = session.read().unwrap();
@@ -364,15 +500,15 @@ mod tests {
         assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
     }
 
-    #[test]
-    fn finalize_turn_trace_noop_when_no_collector() {
+    #[tokio::test]
+    async fn finalize_turn_trace_noop_when_no_collector() {
         let mut state = make_state();
         assert!(state.telemetry.turn_trace_collector.is_none());
-        finalize_turn_trace(&mut state);
+        finalize_turn_trace(&mut state).await;
     }
 
-    #[test]
-    fn finalize_turn_trace_updates_on_consecutive_turns() {
+    #[tokio::test]
+    async fn finalize_turn_trace_updates_on_consecutive_turns() {
         let mut state = make_state();
         let hub = crate::observability_integration::ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
@@ -386,7 +522,7 @@ mod tests {
                 "turn-0".to_string(),
                 "s1".to_string(),
             ));
-        finalize_turn_trace(&mut state);
+        finalize_turn_trace(&mut state).await;
 
         session.write().unwrap().turn_number = 2;
         state.last_measured_prompt_tokens = Some(30_000);
@@ -395,7 +531,7 @@ mod tests {
                 "turn-1".to_string(),
                 "s1".to_string(),
             ));
-        finalize_turn_trace(&mut state);
+        finalize_turn_trace(&mut state).await;
 
         let guard = session.read().unwrap();
         assert_eq!(guard.context_traces.len(), 2);
@@ -405,8 +541,8 @@ mod tests {
         assert_eq!(guard.context_traces[1].token_budget.total_used, 30_000);
     }
 
-    #[test]
-    fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
+    #[tokio::test]
+    async fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
 
@@ -424,7 +560,7 @@ mod tests {
         state.max_turn_input_tokens = 100_000;
         state.last_measured_prompt_tokens = Some(42_000);
 
-        finalize_turn_trace(&mut state);
+        finalize_turn_trace(&mut state).await;
 
         let session_guard = session.read().unwrap();
         assert_eq!(session_guard.context_traces.len(), 1);
