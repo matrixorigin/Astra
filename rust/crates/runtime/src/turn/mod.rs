@@ -46,7 +46,10 @@ pub mod confidence_contract;
 pub mod context_assembly_trace;
 pub mod context_compression;
 pub mod contracts;
-pub mod counter;
+/// Re-exported from astra-turn-types
+pub mod counter {
+    pub use astra_turn_types::count_persisted_turn_events;
+}
 pub mod decision_explainer;
 pub mod delegation_tree;
 pub mod edge_executor_id;
@@ -90,7 +93,10 @@ pub mod persist;
 pub mod persist_inputs;
 pub mod prepare_turn_explain_text;
 pub mod progress_display;
-pub mod quality;
+/// Re-exported from astra-turn-types
+pub mod quality {
+    pub use astra_turn_types::build_tool_result_quality_event_payload;
+}
 pub mod refresh;
 pub mod response_guard;
 /// Re-exported from astra-turn-types
