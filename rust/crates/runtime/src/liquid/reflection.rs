@@ -849,6 +849,7 @@ impl SignalSummary {
             EvolutionSignal::ToolFailure {
                 tool_name,
                 error_snippet,
+                failure_category: _,
                 skill_context,
                 turn_id,
             } => Self {
@@ -1179,6 +1180,7 @@ mod tests {
             EvolutionSignal::ToolFailure {
                 tool_name: "bash".into(),
                 error_snippet: "Permission denied: /etc/shadow".into(),
+                failure_category: None,
                 skill_context: Some("file-ops".into()),
                 turn_id: "t1".into(),
             },

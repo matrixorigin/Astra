@@ -516,6 +516,10 @@ fn build_hook_db_persist_from_payload(
     let mut tool_verification_summaries = std::collections::HashMap::new();
     let mut tool_pre_state_snapshots = std::collections::HashMap::new();
     let mut tool_pre_state_snapshot_databases = std::collections::HashMap::new();
+    let mut tool_execution_outcomes: std::collections::HashMap<
+        String,
+        crate::turn::action_compensation::ExecutionOutcomeClassification,
+    > = std::collections::HashMap::new();
     for tool_result in tool_results {
         let Some(tool_call_id) = tool_result
             .get("tool_call_id")
@@ -525,6 +529,37 @@ fn build_hook_db_persist_from_payload(
         else {
             continue;
         };
+
+        // Classify execution outcome from result content
+        let result_text = tool_result
+            .get("result")
+            .or_else(|| tool_result.get("content"))
+            .or_else(|| tool_result.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let is_err = crate::turn::tool_result_semantics::is_tool_error(result_text)
+            || tool_result.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
+        let error_text = tool_result
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let duration_ms = tool_result
+            .get("duration_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let was_rejected = tool_result
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("rejected")
+            || error_text.starts_with("blocked_tool:")
+            || result_text.starts_with("blocked_tool:");
+        let classification = crate::turn::action_compensation::classify_execution_outcome(
+            result_text,
+            is_err,
+            duration_ms,
+            was_rejected,
+        );
+        tool_execution_outcomes.insert(tool_call_id.clone(), classification);
 
         if let Some(summary) = tool_verification_summary_from_tool_result(&tool_result) {
             tool_verification_summaries.insert(tool_call_id.clone(), summary);
@@ -633,6 +668,14 @@ fn build_hook_db_persist_from_payload(
                     "verifier_gap".to_string(),
                     serde_json::Value::String(verifier_gap.to_string()),
                 );
+            }
+            // Attach execution outcome classification when available.
+            if let Some(tool_call_id_str) = tool_call_id.as_str() {
+                if let Some(outcome) = tool_execution_outcomes.get(tool_call_id_str) {
+                    if let Ok(val) = serde_json::to_value(outcome) {
+                        action_profile.insert("execution_outcome".to_string(), val);
+                    }
+                }
             }
             serde_json::Value::Object(action_profile)
         })
@@ -2683,6 +2726,38 @@ mod inprocess_hook_contract_tests {
         ))
     }
 
+    fn build_hook_payload_with_blocked_tool_result(turn: i64) -> Value {
+        let messages = vec![json!({"role": "user", "content": "run the blocked command"})];
+        let tool_results: Vec<Value> = vec![json!({
+            "tool_call_id": "call-1",
+            "name": "bash",
+            "ok": false,
+            "error": "blocked_tool: Explicit approval required: action scope is unbounded."
+        })];
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{\"command\": \"rm -rf tmp\"}"}
+        })];
+        Value::Object(build_turn_hook_args(
+            "user-1",
+            "session-1",
+            &messages,
+            &tool_results,
+            "The command was blocked.",
+            &tool_calls,
+            None,
+            Some("gpt-4"),
+            Some("agent-1"),
+            Some("evt-query-blocked"),
+            turn,
+            None,
+            false,
+            true,
+            true,
+            true,
+        ))
+    }
+
     #[tokio::test]
     async fn hook_persists_decision_audit_and_skill_selection_for_tool_calls() {
         let hook_writer = RecordingHookDbWriter::default();
@@ -2954,6 +3029,35 @@ mod inprocess_hook_contract_tests {
         assert_eq!(
             audit.decision_output["action_profiles"][0]["verifier_gap"],
             json!("no_verifier_signal")
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_marks_blocked_tool_results_as_rejected_execution_outcomes() {
+        let hook_writer = RecordingHookDbWriter::default();
+        let reflection_store = RecordingReflectionStateStore::default();
+        let lesson_writer = RecordingReflectionLessonWriter::default();
+        let observer = RecordingObserverWorker::default();
+
+        run_bridge_hook_side_effects(
+            Some(build_hook_payload_with_blocked_tool_result(7)),
+            Arc::new(hook_writer.clone()),
+            Arc::new(reflection_store),
+            Arc::new(lesson_writer),
+            Arc::new(observer),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        let audit = plans[0]
+            .decision_audit
+            .as_ref()
+            .expect("decision_audit missing");
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["execution_outcome"]["outcome"],
+            json!("rejected")
         );
     }
 

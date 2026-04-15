@@ -6299,6 +6299,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         evo.add_signal(crate::evolution::types::EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "permission denied".into(),
+            failure_category: None,
             skill_context: Some("deploy_script".into()),
             turn_id: "t0".into(),
         })
@@ -6310,6 +6311,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 crate::evolution::types::EvolutionSignal::ToolFailure {
                     tool_name: format!("tool_{i}"),
                     error_snippet: "err".into(),
+                    failure_category: None,
                     skill_context: Some("sk".into()),
                     turn_id: format!("t{}", i + 1),
                 },
@@ -6697,6 +6699,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .add_signal(crate::evolution::types::EvolutionSignal::ToolFailure {
                 tool_name: "bash".into(),
                 error_snippet: "Permission denied".into(),
+                failure_category: None,
                 skill_context: Some("ops".into()),
                 turn_id: "t-reflect".into(),
             })
