@@ -4725,8 +4725,29 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                 }
                 // Inject resume guidance when restoring from an interrupted checkpoint.
                 if let Some(ref irj) = step_restored.interruption {
+                    // Build compaction context from persisted state for richer resume advice.
+                    let compaction_ctx = step_restored.compaction_state.as_ref().map(|cs| {
+                        astra_runtime::turn::interruption::CompactionResumeContext {
+                            compaction_attempts: cs
+                                .get("attempt_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32,
+                            total_tokens_freed: cs
+                                .get("cumulative_tokens_freed")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            last_was_insufficient: cs
+                                .get("last_was_insufficient")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                        }
+                    });
                     if let Some(guidance) =
-                        astra_runtime::turn::interruption::build_resume_guidance(irj)
+                        astra_runtime::turn::interruption::build_resume_guidance_with_context(
+                            irj,
+                            compaction_ctx.as_ref(),
+                        )
                     {
                         state.resume_guidance = Some(guidance);
                     }

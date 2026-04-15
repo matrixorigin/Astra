@@ -59,9 +59,9 @@ pub struct RestoredSession {
     pub approval_overrides: Option<serde_json::Value>,
     /// Consecutive context-window errors counter restored from checkpoint.
     pub consecutive_context_window_errors: u32,
+    /// Serialized CompactionEffectivenessTracker state for enriched resume guidance.
+    pub compaction_state: Option<serde_json::Value>,
 }
-
-/// Error types for session restore.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RestoreError {
     /// No checkpoint found for this session
@@ -144,6 +144,7 @@ fn build_restored_session(
         interruption: heavy.interruption,
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
+        compaction_state: heavy.compaction_state,
     }))
 }
 
@@ -288,6 +289,9 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
     if restored.approval_overrides.is_some() {
         s.push_str(", approval_overrides=yes");
     }
+    if restored.compaction_state.is_some() {
+        s.push_str(", compaction_state=yes");
+    }
     s
 }
 
@@ -394,6 +398,7 @@ mod tests {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }
     }
 
@@ -493,6 +498,7 @@ mod tests {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         };
 
         let summary = restore_summary(&restored);

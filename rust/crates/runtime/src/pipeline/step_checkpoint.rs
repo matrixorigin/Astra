@@ -478,6 +478,7 @@ mod tests {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }
     }
 

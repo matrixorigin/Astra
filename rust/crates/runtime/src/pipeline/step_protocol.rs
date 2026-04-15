@@ -847,9 +847,12 @@ pub struct HeavyCheckpoint {
     /// Persisted so aggressive-tier compaction survives session resume.
     #[serde(default)]
     pub consecutive_context_window_errors: u32,
+    /// Serialized CompactionEffectivenessTracker state for cross-turn persistence.
+    /// Contains cumulative_tokens_freed, attempt_count, last_tokens_freed,
+    /// last_was_insufficient — enabling enriched resume guidance and tier selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_state: Option<serde_json::Value>,
 }
-
-/// Unified checkpoint type (stored in Step)
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationSubRunSummary {
@@ -966,6 +969,7 @@ impl StepCheckpoint {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }))
     }
 
@@ -2939,6 +2943,7 @@ mod tests {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2972,6 +2977,7 @@ mod tests {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }));
         assert!(cp.validate().is_ok());
     }

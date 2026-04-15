@@ -4995,6 +4995,7 @@ mod file_event_store_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         };
         let ckpt = StepCheckpoint::Heavy(Box::new(heavy));
         write_step_checkpoint(&sid, 1, &ckpt).unwrap();
@@ -6145,6 +6146,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         };
 
         // Serialize → deserialize roundtrip
@@ -6193,6 +6195,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         };
 
         // Simulate: slots 0,1 completed; slot 2 failed; slot 3 running; slot 4 pending
@@ -6310,6 +6313,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         };
 
         let summary = restore_summary(&restored);
@@ -6349,6 +6353,7 @@ mod crash_recovery_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         };
 
         // Strict should reject
@@ -7032,6 +7037,7 @@ mod checkpoint_cloud_persistence_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }
     }
 
@@ -7156,6 +7162,7 @@ mod checkpoint_cloud_persistence_proofs {
             interruption: None,
             approval_overrides: None,
             consecutive_context_window_errors: 0,
+            compaction_state: None,
         }));
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();

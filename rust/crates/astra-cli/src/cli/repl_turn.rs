@@ -1903,6 +1903,7 @@ fn build_manual_heavy_step_checkpoint(
         interruption: None,
         approval_overrides: None,
         consecutive_context_window_errors: 0,
+        compaction_state: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }

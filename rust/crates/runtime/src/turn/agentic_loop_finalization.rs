@@ -222,7 +222,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .as_ref()
         .and_then(|ao| ao.to_json());
 
-    let Some(heavy) = state
+    let Some(mut heavy) = state
         .step_recorder
         .build_heavy_checkpoint_with_interruption(
             &state.messages,
@@ -243,6 +243,8 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     else {
         return;
     };
+    // Persist compaction effectiveness state for enriched resume guidance.
+    heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
