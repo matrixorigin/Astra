@@ -31,15 +31,16 @@ jobs:
           shared-key: ci-offline
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # astra-cli is binary-only (no lib target, no crate-root integration tests/).
-      # Split by nextest source filter instead of --lib / --tests.
-      - name: "Test astra-cli (bins: cli, main, src/tests, …)"
+      # Partition by Rust test path: `edge_tools::` marks tests under src/edge_tools/.
+      # `source()` is invalid filterset DSL; `/edge_tools/` alone parses as a broken regex.
+      - name: "Test astra-cli (bins: non-edge_tools modules)"
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'not source(/edge_tools/)' --no-fail-fast
+          -E 'not test(/edge_tools::/)' --no-fail-fast
       - name: "Test astra-cli (bins: edge_tools)"
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'source(/edge_tools/)' --no-fail-fast
+          -E 'test(/edge_tools::/)' --no-fail-fast
 
   test-offline-runtime:
     name: "Offline: astra-runtime"
