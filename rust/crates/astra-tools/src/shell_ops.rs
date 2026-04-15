@@ -552,6 +552,14 @@ fn relative_search_target(workspace_root: &Path, resolved: &Path) -> String {
     }
 }
 
+fn shell_safe_search_target(target: &str) -> String {
+    if target.starts_with('-') {
+        format!("./{target}")
+    } else {
+        target.to_string()
+    }
+}
+
 fn parse_search_output_mode(args: &Value) -> Result<SearchOutputMode, String> {
     match args
         .get("output_mode")
@@ -1410,13 +1418,14 @@ async fn run_glob_with_rg(
     pattern: &str,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    let shell_target = shell_safe_search_target(target);
     let mut cmd = Command::new("rg");
     cmd.current_dir(workspace_root)
         .kill_on_drop(true)
         .arg("--files")
         .arg("--hidden");
     append_default_rg_excludes(&mut cmd);
-    cmd.arg("-g").arg(pattern).arg(target);
+    cmd.arg("-g").arg(pattern).arg(shell_target);
 
     run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT, cancel_token)
         .await
@@ -1436,9 +1445,14 @@ async fn run_search_file_listing_with_find(
     cancel_token: Option<&CancellationToken>,
     timeout: Duration,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    let shell_target = shell_safe_search_target(target);
     let mut cmd = Command::new("find");
     cmd.current_dir(workspace_root).kill_on_drop(true);
-    cmd.arg(target).arg("(").arg("-type").arg("d").arg("(");
+    cmd.arg(shell_target)
+        .arg("(")
+        .arg("-type")
+        .arg("d")
+        .arg("(");
     for (index, dir) in DEFAULT_SEARCH_EXCLUDE_DIRS.iter().enumerate() {
         if index > 0 {
             cmd.arg("-o");
@@ -2177,6 +2191,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_path_starting_with_dash_is_searched_safely() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::create_dir_all(dir.path().join("-src")).unwrap();
+        std::fs::write(dir.path().join("-src").join("sample.txt"), "needle\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": "-src"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(
+            result.output.contains("-src/sample.txt:1:needle"),
+            "grep should handle directories beginning with '-': {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn grep_respects_astraignore_patterns() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -2342,6 +2380,30 @@ mod tests {
             vec!["a-old.txt", "z-new.txt"],
             "got: {}",
             path_result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_path_starting_with_dash_is_listed_safely() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::create_dir_all(dir.path().join("-src")).unwrap();
+        std::fs::write(dir.path().join("-src").join("sample.txt"), "needle\n").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.txt",
+                "path": "-src"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "glob should succeed: {}", result.output);
+        assert!(
+            result.output.contains("-src/sample.txt"),
+            "glob should handle directories beginning with '-': {}",
+            result.output
         );
     }
 
