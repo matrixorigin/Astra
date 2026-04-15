@@ -717,7 +717,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             prep.turn_start_time,
             turn_result.ttft_ms,
         );
-        finalize_and_render(host, state);
+        finalize_and_render(host, state).await;
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }
 
