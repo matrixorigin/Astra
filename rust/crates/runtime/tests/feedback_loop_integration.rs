@@ -8,18 +8,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use astra_runtime::orchestration::permission_sync::PermissionRule;
 use astra_runtime::pipeline::{
     calibration::ProgressiveCalibrator,
     learning::PipelineLearningWriter,
     routing::{DomainHint, TaskType},
 };
-use astra_runtime::turn::approval_fingerprint::{
-    ApprovalFingerprint, DenialAction, DenialTracker,
-};
+use astra_runtime::turn::approval_fingerprint::{ApprovalFingerprint, DenialAction, DenialTracker};
 use astra_runtime::turn::implicit_feedback::{
     detect_implicit_feedback_signal, implicit_feedback_context_injection, implicit_feedback_rating,
 };
-use astra_runtime::orchestration::permission_sync::PermissionRule;
 
 // ─── Phase A + B: Detection → Injection ─────────────────────────────────────
 
@@ -89,12 +87,19 @@ fn end_to_end_repeated_denials_generate_auto_rule() {
     tracker.record_with_reason(&fp2, false, Some("still dangerous"));
 
     let rules = tracker.extract_auto_deny_rules();
-    assert!(!rules.is_empty(), "should generate auto-deny rule after 2 denials");
+    assert!(
+        !rules.is_empty(),
+        "should generate auto-deny rule after 2 denials"
+    );
 
     // Verify the generated rule matches the pattern
-    let bash_rm_rule = rules
-        .iter()
-        .find(|r| r.tool == "bash" && r.pattern.as_ref().map(|p| p.contains("rm")).unwrap_or(false));
+    let bash_rm_rule = rules.iter().find(|r| {
+        r.tool == "bash"
+            && r.pattern
+                .as_ref()
+                .map(|p| p.contains("rm"))
+                .unwrap_or(false)
+    });
     assert!(bash_rm_rule.is_some());
 }
 
@@ -122,8 +127,13 @@ fn end_to_end_varied_denials_generate_bare_tool_rule() {
     let rules = tracker.extract_auto_deny_rules();
 
     // Should generate bare "bash" rule after 3 varied denials
-    let bare_bash = rules.iter().find(|r| r.tool == "bash" && r.pattern.is_none());
-    assert!(bare_bash.is_some(), "should generate bare tool rule after 3 varied denials");
+    let bare_bash = rules
+        .iter()
+        .find(|r| r.tool == "bash" && r.pattern.is_none());
+    assert!(
+        bare_bash.is_some(),
+        "should generate bare tool rule after 3 varied denials"
+    );
 }
 
 #[test]
@@ -240,13 +250,24 @@ fn full_denial_cycle_to_auto_rule() {
     let rules = tracker.extract_auto_deny_rules();
 
     // Verify rules are actionable - should have pattern for "rm -rf"
-    assert!(!rules.is_empty(), "should generate auto-deny rule after 2 similar denials");
+    assert!(
+        !rules.is_empty(),
+        "should generate auto-deny rule after 2 similar denials"
+    );
 
     // Rules should match the "rm -rf" prefix
     let matches_rm = |rule: &PermissionRule| {
-        rule.tool == "bash" && rule.pattern.as_ref().map(|p| p.contains("rm")).unwrap_or(false)
+        rule.tool == "bash"
+            && rule
+                .pattern
+                .as_ref()
+                .map(|p| p.contains("rm"))
+                .unwrap_or(false)
     };
-    assert!(rules.iter().any(matches_rm), "should generate rule for rm commands");
+    assert!(
+        rules.iter().any(matches_rm),
+        "should generate rule for rm commands"
+    );
 }
 
 // ─── Edge Cases: Boundary Conditions ────────────────────────────────────────
@@ -478,22 +499,22 @@ fn concurrent_signal_detection() {
 fn concurrent_denial_tracker_access() {
     // DenialTracker is not Arc<Mutex<>> - this tests that it doesn't have
     // any internal shared mutable state that could cause issues
-    
+
     // Create multiple independent trackers and use them concurrently
     let handles: Vec<_> = (0..10)
         .map(|i| {
             thread::spawn(move || {
                 let mut tracker = DenialTracker::default();
-                
+
                 // Each thread adds denials to its own tracker
                 for j in 0..5 {
                     let fp = ApprovalFingerprint::shell("bash", &format!("cmd_{}_{}", i, j), false);
                     tracker.record_with_reason(&fp, false, Some("reason"));
                 }
-                
+
                 // Extract rules
                 let rules = tracker.extract_auto_deny_rules();
-                
+
                 // Verify state
                 assert_eq!(tracker.total_denials(), 5);
                 rules.len()
@@ -585,15 +606,15 @@ fn concurrent_injection_generation() {
                     2 => "rephrasing",
                     _ => "neutral",
                 };
-                
+
                 let signal = astra_runtime::turn::implicit_feedback::ImplicitSignal {
                     signal_type: signal_type.to_string(),
                     confidence: 0.5 + (i as f64 * 0.02),
                     evidence: format!("evidence {}", i),
                 };
-                
+
                 let injection = implicit_feedback_context_injection(&signal);
-                
+
                 // Verify expected behavior
                 match signal_type {
                     "correction" | "frustration" | "rephrasing" => {

@@ -1026,7 +1026,10 @@ mod tests {
         let c = cal.lock().unwrap();
         // Check that calibrator recorded the intent
         let stats = c.intent_stats("code");
-        assert!(stats.is_some(), "calibrator should have recorded intent 'code'");
+        assert!(
+            stats.is_some(),
+            "calibrator should have recorded intent 'code'"
+        );
         assert!(
             stats.unwrap().correction_rate() > 0.0,
             "correction signal should increase correction rate"
@@ -1044,11 +1047,19 @@ mod tests {
             evidence: "terrible".to_string(),
         };
 
-        writer.record_implicit_feedback(&signal, "fetch", Some(DomainHint::GitHub), TaskType::Fetch);
+        writer.record_implicit_feedback(
+            &signal,
+            "fetch",
+            Some(DomainHint::GitHub),
+            TaskType::Fetch,
+        );
 
         let c = cal.lock().unwrap();
         let stats = c.intent_stats("fetch");
-        assert!(stats.is_some(), "calibrator should have recorded intent 'fetch'");
+        assert!(
+            stats.is_some(),
+            "calibrator should have recorded intent 'fetch'"
+        );
         assert!(
             stats.unwrap().correction_rate() > 0.0,
             "frustration signal should increase correction rate"

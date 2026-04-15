@@ -574,4 +574,416 @@ mod tests {
             pipeline.ctx.tool_results[0]
         );
     }
+
+    // ── Unknown tool health tracking tests ───────────────────────────
+
+    /// Helper: push a server tool_call JSON for an unknown tool and run validate_slot.
+    fn push_unknown_server_tool_call(harness: &mut PipelineHarness, tool_name: &str) {
+        let idx = harness.tool_calls.len();
+        harness.tool_calls.push(json!({
+            "id": format!("call-{tool_name}-{idx}"),
+            "function": {
+                "name": tool_name,
+                "arguments": "{}"
+            }
+        }));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_records_health_failure() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "outline");
+        let mut pipeline = harness.pipeline();
+
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(
+            matches!(result, HeadlessPipelineStage::ShortCircuit),
+            "unknown tool should short-circuit"
+        );
+
+        // The health tracker must have recorded a failure for "outline".
+        let health = pipeline.ctx.turn_guard.health.get("outline");
+        assert!(health.is_some(), "outline should be tracked");
+        let h = health.unwrap();
+        assert_eq!(h.total_calls, 1);
+        assert_eq!(h.total_failures, 1);
+        assert_eq!(h.consecutive_failures, 1);
+        assert!(!h.deprioritized, "1 failure should not deprioritize yet");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_deprioritized_after_consecutive_failures() {
+        let mut harness = PipelineHarness::new();
+        // Push 3 calls with different args so dedup doesn't block them.
+        for i in 0..3 {
+            harness.tool_calls.push(json!({
+                "id": format!("call-outline-{i}"),
+                "function": {
+                    "name": "outline",
+                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
+                }
+            }));
+        }
+        let mut pipeline = harness.pipeline();
+
+        for i in 0..3 {
+            let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
+            assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        }
+
+        // After 3 consecutive failures, the tool must be deprioritized.
+        let health = pipeline.ctx.turn_guard.health.get("outline").unwrap();
+        assert_eq!(health.consecutive_failures, 3);
+        assert!(
+            health.deprioritized,
+            "outline should be deprioritized after 3 consecutive failures"
+        );
+        assert!(
+            pipeline
+                .ctx
+                .turn_guard
+                .health
+                .deprioritized_tools()
+                .contains(&"outline"),
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_journal_records_error_tag() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "nonexistent");
+        let mut pipeline = harness.pipeline();
+
+        pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+
+        assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert_eq!(record.name, "nonexistent");
+        assert!(!record.ok);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown_tool")),
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_error_message_sent_to_llm() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "outline");
+        let mut pipeline = harness.pipeline();
+
+        pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+
+        // The tool result sent back to the LLM should mention "Unknown tool".
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        let result_str = pipeline.ctx.tool_results[0].to_string();
+        assert!(
+            result_str.contains("Unknown tool"),
+            "LLM should see 'Unknown tool' in result, got: {result_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_name_tool_records_health_failure() {
+        let mut harness = PipelineHarness::new();
+        // Push a tool call with empty name.
+        harness.tool_calls.push(json!({
+            "id": "call-empty-0",
+            "function": {
+                "name": "",
+                "arguments": "{}"
+            }
+        }));
+        let mut pipeline = harness.pipeline();
+
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+
+        // Empty-name tool should also be tracked in health.
+        let health = pipeline.ctx.turn_guard.health.get("");
+        assert!(health.is_some(), "empty-name tool should be tracked");
+        assert_eq!(health.unwrap().total_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_with_identical_args_blocked_by_dedup_after_limit() {
+        let mut harness = PipelineHarness::new();
+        // Push 3 calls with IDENTICAL args — dedup should block call #3.
+        for i in 0..3 {
+            harness.tool_calls.push(json!({
+                "id": format!("call-outline-{i}"),
+                "function": {
+                    "name": "outline",
+                    "arguments": "{}"
+                }
+            }));
+        }
+        let mut pipeline = harness.pipeline();
+
+        // Call 1: unknown tool error
+        let r1 = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(r1, HeadlessPipelineStage::ShortCircuit));
+
+        // Call 2: unknown tool error (count=2, at limit)
+        let r2 = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(1));
+        assert!(matches!(r2, HeadlessPipelineStage::ShortCircuit));
+
+        // Call 3: should be blocked by dedup (count=3 > limit=2)
+        let r3 = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(2));
+        assert!(matches!(r3, HeadlessPipelineStage::ShortCircuit));
+
+        // First 2 calls should have unknown_tool journal records,
+        // 3rd should be a duplicate record.
+        assert_eq!(pipeline.ctx.tool_call_records.len(), 3);
+        assert!(
+            pipeline.ctx.tool_call_records[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown_tool"))
+        );
+        assert!(
+            pipeline.ctx.tool_call_records[1]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown_tool"))
+        );
+        // 3rd record is a dedup, not unknown_tool
+        assert!(
+            !pipeline.ctx.tool_call_records[2]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown_tool")),
+            "3rd call should be caught by dedup, not unknown_tool path"
+        );
+
+        // Health should show 2 failures (dedup doesn't add a 3rd failure).
+        let health = pipeline.ctx.turn_guard.health.get("outline").unwrap();
+        assert_eq!(health.total_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn multiple_different_unknown_tools_each_tracked_independently() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls.push(json!({
+            "id": "call-outline-0",
+            "function": { "name": "outline", "arguments": "{}" }
+        }));
+        harness.tool_calls.push(json!({
+            "id": "call-foobar-0",
+            "function": { "name": "foobar", "arguments": "{}" }
+        }));
+        harness.tool_calls.push(json!({
+            "id": "call-outline-1",
+            "function": { "name": "outline", "arguments": "{\"path\": \"a.rs\"}" }
+        }));
+        let mut pipeline = harness.pipeline();
+
+        for i in 0..3 {
+            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
+        }
+
+        let outline_h = pipeline.ctx.turn_guard.health.get("outline").unwrap();
+        assert_eq!(outline_h.consecutive_failures, 2);
+        assert!(!outline_h.deprioritized);
+
+        let foobar_h = pipeline.ctx.turn_guard.health.get("foobar").unwrap();
+        assert_eq!(foobar_h.consecutive_failures, 1);
+        assert!(!foobar_h.deprioritized);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_deprioritize_warning_generated() {
+        let mut harness = PipelineHarness::new();
+        // 3 calls with different args to avoid dedup, trigger deprioritization.
+        for i in 0..3 {
+            harness.tool_calls.push(json!({
+                "id": format!("call-outline-{i}"),
+                "function": {
+                    "name": "outline",
+                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
+                }
+            }));
+        }
+        let mut pipeline = harness.pipeline();
+
+        for i in 0..3 {
+            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
+        }
+
+        let warning = pipeline.ctx.turn_guard.health.deprioritize_warning();
+        assert!(warning.is_some(), "should generate deprioritize warning");
+        assert!(
+            warning.unwrap().contains("outline"),
+            "warning should mention the deprioritized tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_name_abort_round_after_max_consecutive() {
+        let mut harness = PipelineHarness::new();
+        // MAX_CONSECUTIVE_EMPTY_NAME = 3; push 3 empty-name calls.
+        for i in 0..3 {
+            harness.tool_calls.push(json!({
+                "id": format!("call-empty-{i}"),
+                "function": { "name": "", "arguments": "{}" }
+            }));
+        }
+        let mut pipeline = harness.pipeline();
+
+        // First 2 should ShortCircuit (continue processing).
+        let r1 = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(r1, HeadlessPipelineStage::ShortCircuit));
+        let r2 = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(1));
+        assert!(matches!(r2, HeadlessPipelineStage::ShortCircuit));
+
+        // 3rd should AbortRound.
+        let r3 = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(2));
+        assert!(
+            matches!(r3, HeadlessPipelineStage::AbortRound),
+            "3 consecutive empty-name calls should abort the round"
+        );
+
+        // All 3 should have recorded health failures.
+        let health = pipeline.ctx.turn_guard.health.get("").unwrap();
+        assert_eq!(health.total_failures, 3);
+        assert_eq!(health.consecutive_failures, 3);
+    }
+
+    #[tokio::test]
+    async fn deprioritized_unknown_tool_merges_into_restricted() {
+        let mut harness = PipelineHarness::new();
+        for i in 0..3 {
+            harness.tool_calls.push(json!({
+                "id": format!("call-outline-{i}"),
+                "function": {
+                    "name": "outline",
+                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
+                }
+            }));
+        }
+        let mut pipeline = harness.pipeline();
+
+        for i in 0..3 {
+            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
+        }
+
+        // Simulate what the server loop does between turns.
+        assert!(!pipeline.ctx.restricted_tools.contains("outline"));
+        crate::turn::turn_guard::merge_deprioritized_tools_into_restricted(
+            pipeline.ctx.turn_guard,
+            pipeline.ctx.restricted_tools,
+        );
+        assert!(
+            pipeline.ctx.restricted_tools.contains("outline"),
+            "deprioritized unknown tool should be added to restricted_tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_fallback_unknown_tool_records_health_failure() {
+        // Simulates the DefaultToolExecutor "not available" path:
+        // tool passes valid_tool_names but executor returns error.
+        let mut harness = PipelineHarness::new();
+        // Add "outline" to valid_tool_names so it passes validation.
+        harness.valid_tool_names.insert("outline".to_string());
+        harness.tool_calls.push(json!({
+            "id": "call-outline-0",
+            "function": { "name": "outline", "arguments": "{}" }
+        }));
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+
+        // validate_slot should pass (outline is in valid_tool_names).
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(v) => v,
+            _ => panic!("expected Continue"),
+        };
+
+        // permit_execution should pass (no restrictions).
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(p) => p,
+            _ => panic!("expected Continue"),
+        };
+
+        // execute_execution: ServerToolExecutor doesn't know "outline",
+        // returns "Error: Tool 'outline' not available..."
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(
+            executed.is_err,
+            "server executor should return error for unknown tool"
+        );
+
+        // record_execution feeds through append_headless_result_quality_feedback
+        // → turn_guard.record_tool_result → health.record_failure
+        pipeline.record_execution(executed).await;
+
+        let health = pipeline.ctx.turn_guard.health.get("outline");
+        assert!(
+            health.is_some(),
+            "outline should be tracked after server fallback error"
+        );
+        let h = health.unwrap();
+        assert_eq!(
+            h.total_failures, 1,
+            "server fallback error should count as failure"
+        );
+        assert_eq!(h.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_failure_not_reset_by_valid_tool_success() {
+        let mut harness = PipelineHarness::new();
+        // Call 1: unknown tool "outline"
+        harness.tool_calls.push(json!({
+            "id": "call-outline-0",
+            "function": { "name": "outline", "arguments": "{}" }
+        }));
+        // Call 2: valid tool "grep" (via synthetic edge, already in harness)
+        // Call 3: unknown tool "outline" with different args
+        harness.tool_calls.push(json!({
+            "id": "call-outline-1",
+            "function": { "name": "outline", "arguments": "{\"path\": \"b.rs\"}" }
+        }));
+        let mut pipeline = harness.pipeline();
+
+        // Unknown tool failure #1
+        pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+
+        // Valid tool success (grep via synthetic edge)
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(v) => v,
+            _ => panic!("expected Continue for grep"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(p) => p,
+            _ => panic!("expected Continue for grep"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err);
+        pipeline.record_execution(executed).await;
+
+        // Unknown tool failure #2
+        pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(1));
+
+        // grep success should NOT reset outline's consecutive failures.
+        let outline_h = pipeline.ctx.turn_guard.health.get("outline").unwrap();
+        assert_eq!(
+            outline_h.consecutive_failures, 2,
+            "valid tool success should not reset unknown tool's consecutive failures"
+        );
+
+        // grep should show success.
+        let grep_h = pipeline.ctx.turn_guard.health.get("grep").unwrap();
+        assert_eq!(grep_h.consecutive_failures, 0);
+        assert_eq!(grep_h.total_calls, 1);
+    }
 }
