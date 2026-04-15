@@ -71,7 +71,13 @@ pub mod history;
 pub mod history_apply;
 pub mod hook_plans;
 pub mod hydrate_reflect;
-pub mod implicit_feedback;
+/// Re-exported from astra-turn-types
+pub mod implicit_feedback {
+    pub use astra_turn_types::{
+        detect_implicit_feedback_signal, implicit_feedback_context_injection,
+        implicit_feedback_rating, ImplicitSignal,
+    };
+}
 pub mod interruption;
 pub(crate) mod llm_client;
 pub mod llm_request_dump;
@@ -87,7 +93,10 @@ pub mod progress_display;
 pub mod quality;
 pub mod refresh;
 pub mod response_guard;
-pub mod result_quality;
+/// Re-exported from astra-turn-types
+pub mod result_quality {
+    pub use astra_turn_types::{classify_result, quality_feedback, ResultQuality};
+}
 pub mod retrieval;
 pub mod routing;
 pub mod routing_metrics;

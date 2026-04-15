@@ -238,6 +238,7 @@ dependencies = [
  "astra-services",
  "astra-thin-client",
  "astra-tools",
+ "astra-turn-types",
  "async-stream",
  "async-trait",
  "axum",
@@ -353,6 +354,15 @@ dependencies = [
  "tree-sitter-typescript",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "astra-turn-types"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

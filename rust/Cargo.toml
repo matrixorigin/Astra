@@ -9,6 +9,7 @@ members = [
     "crates/astra-thin-client",
     "crates/astra-edge",
     "crates/astra-pipeline",
+    "crates/astra-turn-types",
 ]
 resolver = "2"
 
@@ -19,6 +20,7 @@ edition = "2024"
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
 astra-pipeline = { path = "crates/astra-pipeline" }
+astra-turn-types = { path = "crates/astra-turn-types" }
 astra-tools = { path = "crates/astra-tools" }
 astra-services = { path = "crates/services" }
 astra-runtime = { path = "crates/runtime" }
