@@ -116,11 +116,13 @@ impl PipelineLearningWriter {
     /// The signal's confidence modulates the feedback score (1-5 scale mapped
     /// to 0-100 for the calibrator).
     ///
+    /// `user_text` is the original user message that triggered the signal.
     /// Returns a `StructuredFeedback` if heuristic extraction succeeds, or `None`
     /// if the correction is too complex (caller should use LLM extraction).
     pub fn record_implicit_feedback(
         &self,
         signal: &ImplicitSignal,
+        user_text: &str,
         intent: &str,
         domain: Option<DomainHint>,
         task_type: TaskType,
@@ -146,8 +148,7 @@ impl PipelineLearningWriter {
         // Attempt heuristic structured feedback extraction (no LLM needed)
         if was_corrected {
             crate::pipeline::feedback_extraction::heuristic_extract(
-                &signal.evidence,
-                "",
+                user_text,
                 &signal.signal_type,
                 signal.confidence,
             )
@@ -1041,7 +1042,7 @@ mod tests {
             evidence: "不对".to_string(),
         };
 
-        writer.record_implicit_feedback(&signal, "code", Some(DomainHint::Code), TaskType::Code);
+        writer.record_implicit_feedback(&signal, "不对，这个答案有问题", "code", Some(DomainHint::Code), TaskType::Code);
 
         let c = cal.lock().unwrap();
         // Check that calibrator recorded the intent
@@ -1069,6 +1070,7 @@ mod tests {
 
         writer.record_implicit_feedback(
             &signal,
+            "terrible response",
             "fetch",
             Some(DomainHint::GitHub),
             TaskType::Fetch,
@@ -1097,7 +1099,7 @@ mod tests {
             evidence: String::new(),
         };
 
-        writer.record_implicit_feedback(&signal, "code", None, TaskType::Code);
+        writer.record_implicit_feedback(&signal, "normal question", "code", None, TaskType::Code);
 
         let c = cal.lock().unwrap();
         // Should not have recorded anything since neutral is ignored
@@ -1118,7 +1120,7 @@ mod tests {
             evidence: "thanks".to_string(),
         };
 
-        writer.record_implicit_feedback(&signal, "conversational", None, TaskType::Conversational);
+        writer.record_implicit_feedback(&signal, "thanks for the help", "conversational", None, TaskType::Conversational);
 
         let c = cal.lock().unwrap();
         let stats = c.intent_stats("conversational");

@@ -35,7 +35,7 @@ pub fn build_extraction_message(correction_text: &str, prior_assistant_text: &st
     } else {
         truncate(prior_assistant_text, 500)
     };
-    format!("Prior assistant response:\n{prior}\n\nUser correction:\n{correction_text}",)
+    format!("Prior assistant response:\n{prior}\n\nUser correction:\n{correction_text}")
 }
 
 /// Parse the LLM's JSON response into a `StructuredFeedback`.
@@ -46,19 +46,17 @@ pub fn parse_extraction_response(
     source_signal: &str,
     confidence: f64,
 ) -> Option<StructuredFeedback> {
-    // Strip code fences if present
     let trimmed = raw.trim();
-    let json_str = if trimmed.starts_with("```") {
-        trimmed
-            .strip_prefix("```json")
-            .or_else(|| trimmed.strip_prefix("```"))
-            .and_then(|s| s.strip_suffix("```"))
-            .unwrap_or(trimmed)
+
+    // Strip code fences: ```json ... ``` or ``` ... ```
+    let json_str = if let Some(rest) = trimmed.strip_prefix("```") {
+        let body = rest.strip_prefix("json").unwrap_or(rest);
+        body.trim().strip_suffix("```").unwrap_or(body).trim()
     } else {
         trimmed
     };
 
-    let v: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let obj = v.as_object()?;
 
     let rule = obj.get("rule")?.as_str()?.to_string();
@@ -89,21 +87,25 @@ pub fn parse_extraction_response(
 /// Returns `None` if the correction is too complex for heuristic extraction.
 pub fn heuristic_extract(
     correction_text: &str,
-    _prior_assistant_text: &str,
     source_signal: &str,
     confidence: f64,
 ) -> Option<StructuredFeedback> {
     let lower = correction_text.to_lowercase();
+    let trimmed = lower.trim();
 
-    // Pattern: "don't/不要 X" or "use Y instead/应该/should be"
-    let is_simple_directive = lower.starts_with("don't ")
-        || lower.starts_with("do not ")
-        || lower.starts_with("stop ")
-        || lower.starts_with("不要")
-        || lower.starts_with("别")
-        || lower.contains("instead")
-        || lower.contains("应该")
-        || lower.contains("should be");
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Only match when the directive keyword is at the start of the sentence
+    let is_simple_directive = trimmed.starts_with("don't ")
+        || trimmed.starts_with("do not ")
+        || trimmed.starts_with("stop ")
+        || trimmed.starts_with("never ")
+        || trimmed.starts_with("不要")
+        || trimmed.starts_with("别")
+        || trimmed.starts_with("should be ")
+        || trimmed.starts_with("应该");
 
     if !is_simple_directive {
         return None;
@@ -131,6 +133,8 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    // ── parse_extraction_response ──
+
     #[test]
     fn parse_valid_json() {
         let raw = r#"{"rule": "Use real DB in tests", "reason": "Mocks diverged from prod", "apply_when": "Integration tests"}"#;
@@ -144,9 +148,24 @@ mod tests {
 
     #[test]
     fn parse_json_with_code_fences() {
-        let raw = "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```";
+        let raw =
+            "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```";
         let fb = parse_extraction_response(raw, "frustration", 0.7).unwrap();
         assert_eq!(fb.rule, "No mocks");
+    }
+
+    #[test]
+    fn parse_json_with_bare_code_fences() {
+        let raw = "```\n{\"rule\": \"Run clippy\"}\n```";
+        let fb = parse_extraction_response(raw, "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "Run clippy");
+    }
+
+    #[test]
+    fn parse_json_with_trailing_newline_in_fence() {
+        let raw = "```json\n{\"rule\": \"Check types\"}\n```\n";
+        let fb = parse_extraction_response(raw, "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "Check types");
     }
 
     #[test]
@@ -169,43 +188,112 @@ mod tests {
     }
 
     #[test]
+    fn parse_empty_string_returns_none() {
+        assert!(parse_extraction_response("", "correction", 0.8).is_none());
+    }
+
+    #[test]
+    fn parse_json_array_returns_none() {
+        let raw = r#"[{"rule": "x"}]"#;
+        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
+    }
+
+    #[test]
+    fn parse_rule_is_number_returns_none() {
+        let raw = r#"{"rule": 42}"#;
+        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
+    }
+
+    #[test]
+    fn parse_rule_is_object_returns_none() {
+        let raw = r#"{"rule": {"nested": true}}"#;
+        assert!(parse_extraction_response(raw, "correction", 0.8).is_none());
+    }
+
+    // ── heuristic_extract ──
+
+    #[test]
     fn heuristic_dont_pattern() {
-        let fb = heuristic_extract("don't use mocks in tests", "", "correction", 0.9).unwrap();
+        let fb = heuristic_extract("don't use mocks in tests", "correction", 0.9).unwrap();
         assert_eq!(fb.rule, "don't use mocks in tests");
         assert_eq!(fb.reason, "Not stated");
     }
 
     #[test]
+    fn heuristic_do_not_pattern() {
+        let fb = heuristic_extract("do not run tests in parallel", "correction", 0.8).unwrap();
+        assert!(fb.rule.contains("do not"));
+    }
+
+    #[test]
     fn heuristic_stop_pattern() {
-        let fb = heuristic_extract("stop summarizing at the end", "", "frustration", 0.7).unwrap();
+        let fb = heuristic_extract("stop summarizing at the end", "frustration", 0.7).unwrap();
         assert_eq!(fb.rule, "stop summarizing at the end");
     }
 
     #[test]
-    fn heuristic_chinese_negation() {
-        let fb = heuristic_extract("不要用bash执行git命令", "", "correction", 0.8).unwrap();
+    fn heuristic_never_pattern() {
+        let fb = heuristic_extract("never use force push", "correction", 0.8).unwrap();
+        assert!(fb.rule.contains("never"));
+    }
+
+    #[test]
+    fn heuristic_chinese_bu_yao() {
+        let fb = heuristic_extract("不要用bash执行git命令", "correction", 0.8).unwrap();
         assert!(fb.rule.contains("不要"));
     }
 
     #[test]
-    fn heuristic_instead_pattern() {
-        let fb =
-            heuristic_extract("use cargo test instead of bash", "", "correction", 0.7).unwrap();
-        assert!(fb.rule.contains("instead"));
+    fn heuristic_chinese_bie() {
+        let fb = heuristic_extract("别再用这个方法了", "correction", 0.8).unwrap();
+        assert!(fb.rule.contains("别"));
+    }
+
+    #[test]
+    fn heuristic_should_be_pattern() {
+        let fb = heuristic_extract("should be using cargo test", "correction", 0.7).unwrap();
+        assert!(fb.rule.contains("should be"));
+    }
+
+    #[test]
+    fn heuristic_chinese_ying_gai() {
+        let fb = heuristic_extract("应该用moerr而不是fmt.Errorf", "correction", 0.8).unwrap();
+        assert!(fb.rule.contains("应该"));
     }
 
     #[test]
     fn heuristic_complex_returns_none() {
-        assert!(
-            heuristic_extract(
-                "the approach you took doesn't work well for this codebase",
-                "",
-                "correction",
-                0.7,
-            )
-            .is_none()
-        );
+        assert!(heuristic_extract(
+            "the approach you took doesn't work well for this codebase",
+            "correction",
+            0.7,
+        )
+        .is_none());
     }
+
+    #[test]
+    fn heuristic_empty_returns_none() {
+        assert!(heuristic_extract("", "correction", 0.7).is_none());
+    }
+
+    #[test]
+    fn heuristic_whitespace_returns_none() {
+        assert!(heuristic_extract("   ", "correction", 0.7).is_none());
+    }
+
+    #[test]
+    fn heuristic_instead_mid_sentence_not_matched() {
+        // "instead" in the middle of a complex sentence should NOT match
+        // (removed the overly broad "contains instead" check)
+        assert!(heuristic_extract(
+            "I want to understand the code instead of just running it",
+            "correction",
+            0.7,
+        )
+        .is_none());
+    }
+
+    // ── build_extraction_message ──
 
     #[test]
     fn build_message_with_prior() {
