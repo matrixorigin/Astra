@@ -74,8 +74,8 @@ pub mod hydrate_reflect;
 /// Re-exported from astra-turn-types
 pub mod implicit_feedback {
     pub use astra_turn_types::{
-        detect_implicit_feedback_signal, implicit_feedback_context_injection,
-        implicit_feedback_rating, ImplicitSignal,
+        ImplicitSignal, detect_implicit_feedback_signal, implicit_feedback_context_injection,
+        implicit_feedback_rating,
     };
 }
 pub mod interruption;
@@ -95,7 +95,7 @@ pub mod refresh;
 pub mod response_guard;
 /// Re-exported from astra-turn-types
 pub mod result_quality {
-    pub use astra_turn_types::{classify_result, quality_feedback, ResultQuality};
+    pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
 }
 pub mod retrieval;
 pub mod routing;

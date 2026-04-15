@@ -403,7 +403,12 @@ impl AgentMailboxRouter {
         // but register() handles re-registration gracefully (overwrites with
         // warning), and in practice the same parent_run_id (UUID) is never
         // registered concurrently.
-        if self.address_registry.read().await.contains_key(&addr.run_id) {
+        if self
+            .address_registry
+            .read()
+            .await
+            .contains_key(&addr.run_id)
+        {
             return Ok(None);
         }
         self.register(addr, delegation_id).await.map(Some)

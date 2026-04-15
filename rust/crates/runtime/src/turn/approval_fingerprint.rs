@@ -665,7 +665,11 @@ mod tests {
 
         let rules = tracker.extract_auto_deny_rules();
         // Should have bare "bash" rule since 3+ different denials
-        assert!(rules.iter().any(|r| r.tool == "bash" && r.pattern.is_none()));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.tool == "bash" && r.pattern.is_none())
+        );
     }
 
     #[test]
