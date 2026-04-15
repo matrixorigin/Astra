@@ -1114,6 +1114,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
+            if let Some(observability_session) = loop_state.telemetry.observability_session.clone()
+            {
+                executor.set_observability_session(observability_session);
+            }
 
             // ── Phase E: Wire WebSocket approval gate ───────────────
             let (approval_tx, approval_rx) = mpsc::unbounded_channel();

@@ -29,6 +29,7 @@ pub enum CompensationKind {
     GitRestoreWorktree,
     GitRevertCommit,
     RestoreDatabaseSnapshot,
+    RestoreSessionState,
     Manual,
 }
 
@@ -353,6 +354,7 @@ fn compensation_kind_label(kind: CompensationKind) -> String {
         CompensationKind::GitRestoreWorktree => "git_restore_worktree",
         CompensationKind::GitRevertCommit => "git_revert_commit",
         CompensationKind::RestoreDatabaseSnapshot => "restore_database_snapshot",
+        CompensationKind::RestoreSessionState => "restore_session_state",
         CompensationKind::Manual => "manual",
     }
     .to_string()
@@ -475,6 +477,19 @@ fn task_update_compensation_summary() -> &'static str {
 
 fn task_stop_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task_update` with the `previous_status` from the tool result to reopen the task manually"
+}
+
+fn session_state_action_profile(
+    category: ActionCategory,
+    compensation_summary: impl Into<String>,
+) -> ActionCompensationProfile {
+    ActionCompensationProfile::compensated(
+        true,
+        category,
+        false,
+        CompensationKind::RestoreSessionState,
+        compensation_summary.into(),
+    )
 }
 
 fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {
@@ -619,38 +634,31 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             CompensationKind::RestoreOrDeleteFile,
             restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
         ),
-        "adjust_config" => ActionCompensationProfile::manual(
-            true,
+        "adjust_config" => session_state_action_profile(
             ActionCategory::Write,
-            &adjust_config_compensation_summary(string_arg(&normalized_args, "path")),
+            adjust_config_compensation_summary(string_arg(&normalized_args, "path")),
         ),
-        "prioritize_tool" | "deprioritize_tool" => ActionCompensationProfile::manual(
-            true,
+        "prioritize_tool" | "deprioritize_tool" => session_state_action_profile(
             ActionCategory::Write,
-            &tool_priority_compensation_summary(string_arg(&normalized_args, "tool")),
+            tool_priority_compensation_summary(string_arg(&normalized_args, "tool")),
         ),
-        "set_goal" => ActionCompensationProfile::manual(
-            true,
+        "set_goal" => session_state_action_profile(
             ActionCategory::Destructive,
             set_goal_compensation_summary(),
         ),
-        "compress_context" => ActionCompensationProfile::manual(
-            true,
+        "compress_context" => session_state_action_profile(
             ActionCategory::Write,
             compress_context_compensation_summary(),
         ),
-        "task_create" => ActionCompensationProfile::manual(
-            true,
+        "task_create" => session_state_action_profile(
             ActionCategory::Write,
             task_create_compensation_summary(),
         ),
-        "task_update" => ActionCompensationProfile::manual(
-            true,
+        "task_update" => session_state_action_profile(
             ActionCategory::Write,
             task_update_compensation_summary(),
         ),
-        "task_stop" => ActionCompensationProfile::manual(
-            true,
+        "task_stop" => session_state_action_profile(
             ActionCategory::Destructive,
             task_stop_compensation_summary(),
         ),
@@ -965,28 +973,50 @@ mod tests {
     }
 
     #[test]
-    fn session_state_tools_are_not_treated_as_reads() {
+    fn session_state_tools_use_session_rollback_compensation() {
         let adjust = tool_action_profile(
             "adjust_config",
             &json!({"path": "memory.retrieval_top_k", "value": 6}),
         );
         assert!(adjust.bounded);
         assert_eq!(adjust.category, ActionCategory::Write);
-        assert!(!adjust.reversible);
-        assert_eq!(adjust.compensation_kind, Some(CompensationKind::Manual));
+        assert!(adjust.reversible);
+        assert_eq!(
+            adjust.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
         assert!(
             adjust
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("adjust_config")
+                .contains("rollback_session_state")
+        );
+
+        let prioritize = tool_action_profile("prioritize_tool", &json!({"tool": "bash"}));
+        assert!(prioritize.bounded);
+        assert_eq!(prioritize.category, ActionCategory::Write);
+        assert!(prioritize.reversible);
+        assert_eq!(
+            prioritize.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
+        assert!(
+            prioritize
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("prior preference state")
         );
 
         let set_goal = tool_action_profile("set_goal", &json!({"goal": "ship rollback shell"}));
         assert!(set_goal.bounded);
         assert_eq!(set_goal.category, ActionCategory::Destructive);
-        assert!(!set_goal.reversible);
-        assert_eq!(set_goal.compensation_kind, Some(CompensationKind::Manual));
+        assert!(set_goal.reversible);
+        assert_eq!(
+            set_goal.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
         assert!(
             set_goal
                 .compensation_summary
@@ -994,28 +1024,69 @@ mod tests {
                 .unwrap_or_default()
                 .contains("previous_goal")
         );
+
+        let compress = tool_action_profile("compress_context", &json!({"turns": 4}));
+        assert!(compress.bounded);
+        assert_eq!(compress.category, ActionCategory::Write);
+        assert!(compress.reversible);
+        assert_eq!(
+            compress.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
+        assert!(
+            compress
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("session-local compression state")
+        );
     }
 
     #[test]
-    fn task_mutators_are_bounded_manual_actions() {
+    fn task_mutators_use_session_rollback_compensation() {
         let create = tool_action_profile("task_create", &json!({"title": "demo"}));
         assert!(create.bounded);
         assert_eq!(create.category, ActionCategory::Write);
-        assert!(!create.reversible);
-        assert_eq!(create.compensation_kind, Some(CompensationKind::Manual));
+        assert!(create.reversible);
+        assert_eq!(
+            create.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
         assert!(
             create
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("task_stop")
+                .contains("rollback_session_state")
+        );
+
+        let update = tool_action_profile(
+            "task_update",
+            &json!({"task_id": "task-1", "status": "done"}),
+        );
+        assert!(update.bounded);
+        assert_eq!(update.category, ActionCategory::Write);
+        assert!(update.reversible);
+        assert_eq!(
+            update.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
+        assert!(
+            update
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pre-update task snapshot")
         );
 
         let stop = tool_action_profile("task_stop", &json!({"task_id": "task-1"}));
         assert!(stop.bounded);
         assert_eq!(stop.category, ActionCategory::Destructive);
-        assert!(!stop.reversible);
-        assert_eq!(stop.compensation_kind, Some(CompensationKind::Manual));
+        assert!(stop.reversible);
+        assert_eq!(
+            stop.compensation_kind,
+            Some(CompensationKind::RestoreSessionState)
+        );
         assert!(
             stop.compensation_summary
                 .as_deref()
@@ -1225,6 +1296,30 @@ mod tests {
         assert_eq!(
             policy.compensation_kind.as_deref(),
             Some("restore_or_delete_file")
+        );
+    }
+
+    #[test]
+    fn session_state_profile_bridges_to_restore_session_state_policy() {
+        let policy = tool_action_profile(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": 6}),
+        )
+        .mutation_compensation_policy();
+        assert!(policy.bounded);
+        assert!(policy.reversible);
+        assert!(!policy.requires_pre_state);
+        assert_eq!(policy.action_category, MutationActionCategory::Write);
+        assert_eq!(
+            policy.compensation_kind.as_deref(),
+            Some("restore_session_state")
+        );
+        assert!(
+            policy
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_session_state")
         );
     }
 

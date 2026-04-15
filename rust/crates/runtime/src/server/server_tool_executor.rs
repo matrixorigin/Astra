@@ -4,7 +4,7 @@
 //! tools directly using the shared `astra-tools` library. This module
 //! provides the `ServerToolExecutor` that wraps tool execution with:
 //! - Per-session workspace isolation (sandbox)
-//! - Per-session file and git journals
+//! - Per-session file journals with rollback support
 //! - Circuit-breaker for external services (Memoria)
 //!
 //! # Integration
@@ -15,11 +15,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::{ToolContext, ToolExecutor};
@@ -28,7 +29,880 @@ use crate::tool_sandbox::{
     IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier, execute_isolated,
     filter_environment,
 };
-use crate::turn::file_edit_journal::FileEditJournal;
+use crate::turn::file_edit_journal::{EditType, FileEditJournal};
+
+const MO_CONNECT_TIMEOUT_SECS: u32 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseSnapshotRollbackEntry {
+    sequence: u64,
+    snapshot_id: String,
+    database: Option<String>,
+    turn_index: u32,
+}
+
+#[derive(Debug, Default)]
+struct DatabaseSnapshotRollbackJournal {
+    entries: Vec<DatabaseSnapshotRollbackEntry>,
+    next_sequence: u64,
+}
+
+impl DatabaseSnapshotRollbackJournal {
+    fn record(
+        &mut self,
+        snapshot_id: impl Into<String>,
+        database: Option<String>,
+        turn_index: u32,
+    ) {
+        self.entries.push(DatabaseSnapshotRollbackEntry {
+            sequence: self.next_sequence,
+            snapshot_id: snapshot_id.into(),
+            database,
+            turn_index,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    fn list(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
+        self.entries.iter().rev().cloned().collect()
+    }
+
+    fn entry_for_snapshot(&self, snapshot_id: &str) -> Option<DatabaseSnapshotRollbackEntry> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.snapshot_id == snapshot_id)
+            .cloned()
+    }
+
+    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<DatabaseSnapshotRollbackEntry> {
+        self.restore_plan_for_turn_since(turn_index, 0)
+    }
+
+    fn restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<DatabaseSnapshotRollbackEntry> {
+        let mut seen_databases = std::collections::HashSet::new();
+        let mut plan = Vec::new();
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
+        {
+            if seen_databases.insert(entry.database.clone()) {
+                plan.push(entry.clone());
+            }
+        }
+        plan
+    }
+
+    fn remove_snapshot(&mut self, snapshot_id: &str) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.snapshot_id == snapshot_id)
+        {
+            self.entries.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionTask {
+    id: String,
+    title: String,
+    description: Option<String>,
+    status: String,
+    subtasks: Vec<SessionSubtask>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SessionSubtask {
+    id: String,
+    title: String,
+    description: Option<String>,
+    status: String,
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ServerTaskManager {
+    tasks: Mutex<Vec<SessionTask>>,
+    id_counter: AtomicU32,
+}
+
+#[derive(Debug, Clone)]
+struct TaskManagerSnapshot {
+    tasks: Vec<SessionTask>,
+    next_task_id: u32,
+}
+
+impl ServerTaskManager {
+    fn new() -> Self {
+        Self {
+            tasks: Mutex::new(Vec::new()),
+            id_counter: AtomicU32::new(1),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<SessionTask> {
+        self.tasks
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn snapshot_state(&self) -> TaskManagerSnapshot {
+        TaskManagerSnapshot {
+            tasks: self.snapshot(),
+            next_task_id: self.id_counter.load(Ordering::SeqCst),
+        }
+    }
+
+    fn restore_snapshot(&self, snapshot: &TaskManagerSnapshot) -> Result<(), String> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "failed to access task list".to_string())?;
+        *tasks = snapshot.tasks.clone();
+        self.id_counter
+            .store(snapshot.next_task_id, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn create(&self, args: &Value) -> String {
+        let title = match args.get("title").and_then(Value::as_str) {
+            Some(title) if !title.is_empty() => title.to_string(),
+            _ => return "Error: 'title' is required".to_string(),
+        };
+
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let subtasks: Vec<SessionSubtask> = args
+            .get("subtasks")
+            .and_then(Value::as_array)
+            .map(|subtasks| {
+                subtasks
+                    .iter()
+                    .filter_map(|subtask| {
+                        let id = subtask.get("id").and_then(Value::as_str)?;
+                        let title = subtask.get("title").and_then(Value::as_str)?;
+                        Some(SessionSubtask {
+                            id: id.to_string(),
+                            title: title.to_string(),
+                            description: subtask
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            status: "pending".to_string(),
+                            depends_on: subtask
+                                .get("depends_on")
+                                .and_then(Value::as_array)
+                                .map(|deps| {
+                                    deps.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(ToString::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let task_id = format!("task-{}", self.id_counter.fetch_add(1, Ordering::SeqCst));
+        let task = SessionTask {
+            id: task_id.clone(),
+            title: title.clone(),
+            description,
+            status: "pending".to_string(),
+            subtasks,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        if let Ok(mut tasks) = self.tasks.lock() {
+            tasks.push(task);
+        }
+
+        json!({
+            "success": true,
+            "task_id": task_id,
+            "message": format!("Task '{title}' created successfully"),
+        })
+        .to_string()
+    }
+
+    fn list(&self, args: &Value) -> String {
+        let status_filter = args.get("status").and_then(Value::as_str).unwrap_or("all");
+
+        let tasks = match self.tasks.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        let filtered: Vec<_> = tasks
+            .iter()
+            .filter(|task| match status_filter {
+                "all" => true,
+                "active" => task.status == "pending" || task.status == "in_progress",
+                other => task.status == other,
+            })
+            .map(|task| {
+                let subtask_summary = if task.subtasks.is_empty() {
+                    String::new()
+                } else {
+                    let done = task
+                        .subtasks
+                        .iter()
+                        .filter(|subtask| subtask.status == "completed")
+                        .count();
+                    format!(" [{done}/{}]", task.subtasks.len())
+                };
+                json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "status": task.status,
+                    "subtasks": subtask_summary,
+                    "updated_at": task.updated_at,
+                })
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return format!("No tasks found with status '{status_filter}'");
+        }
+
+        json!({
+            "count": filtered.len(),
+            "tasks": filtered,
+        })
+        .to_string()
+    }
+
+    fn get(&self, args: &Value) -> String {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(task_id) if !task_id.is_empty() => task_id,
+            _ => return "Error: 'task_id' is required".to_string(),
+        };
+
+        let tasks = match self.tasks.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        match tasks.iter().find(|task| task.id == task_id) {
+            Some(task) => serde_json::to_string_pretty(task)
+                .unwrap_or_else(|_| "Error: serialization failed".to_string()),
+            None => format!("Error: task '{task_id}' not found"),
+        }
+    }
+
+    fn update(&self, args: &Value) -> String {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(task_id) if !task_id.is_empty() => task_id,
+            _ => return "Error: 'task_id' is required".to_string(),
+        };
+
+        let new_status = args.get("status").and_then(Value::as_str);
+        let subtask_id = args.get("subtask_id").and_then(Value::as_str);
+        let error_message = args.get("error_message").and_then(Value::as_str);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tasks = match self.tasks.lock() {
+            Ok(guard) => guard,
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        let task = match tasks.iter_mut().find(|task| task.id == task_id) {
+            Some(task) => task,
+            None => return format!("Error: task '{task_id}' not found"),
+        };
+
+        if let Some(subtask_id) = subtask_id {
+            match task
+                .subtasks
+                .iter_mut()
+                .find(|subtask| subtask.id == subtask_id)
+            {
+                Some(subtask) => {
+                    let previous_status = subtask.status.clone();
+                    if let Some(status) = new_status {
+                        subtask.status = status.to_string();
+                    }
+                    task.updated_at = now;
+                    return json!({
+                        "success": true,
+                        "task_id": task_id,
+                        "subtask_id": subtask_id,
+                        "previous_status": previous_status,
+                        "status": subtask.status,
+                        "message": format!("Subtask '{subtask_id}' updated to '{}'", subtask.status),
+                    })
+                    .to_string();
+                }
+                None => {
+                    return format!("Error: subtask '{subtask_id}' not found in task '{task_id}'");
+                }
+            }
+        }
+
+        let previous_status = task.status.clone();
+        if let Some(status) = new_status {
+            task.status = status.to_string();
+        }
+        if let Some(error_message) = error_message {
+            task.description = Some(format!(
+                "{}\n\nError: {error_message}",
+                task.description.as_deref().unwrap_or(""),
+            ));
+        }
+        task.updated_at = now;
+
+        if !task.subtasks.is_empty()
+            && task
+                .subtasks
+                .iter()
+                .all(|subtask| subtask.status == "completed")
+        {
+            task.status = "completed".to_string();
+        }
+
+        json!({
+            "success": true,
+            "task_id": task_id,
+            "previous_status": previous_status,
+            "status": task.status,
+            "message": format!("Task '{task_id}' updated to '{}'", task.status),
+        })
+        .to_string()
+    }
+
+    fn stop(&self, args: &Value) -> String {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(task_id) if !task_id.is_empty() => task_id,
+            _ => return "Error: 'task_id' is required".to_string(),
+        };
+
+        let reason = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("user requested");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tasks = match self.tasks.lock() {
+            Ok(guard) => guard,
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        let task = match tasks.iter_mut().find(|task| task.id == task_id) {
+            Some(task) => task,
+            None => return format!("Error: task '{task_id}' not found"),
+        };
+
+        if task.status != "pending" && task.status != "in_progress" {
+            return json!({
+                "success": false,
+                "message": format!(
+                    "Cannot stop task '{task_id}': status is '{}' (only 'pending' or 'in_progress' can be stopped)",
+                    task.status
+                ),
+            })
+            .to_string();
+        }
+
+        let previous_status = task.status.clone();
+        task.status = "cancelled".to_string();
+        task.description = Some(format!(
+            "{}\n\nCancelled: {reason} (was: {previous_status})",
+            task.description.as_deref().unwrap_or(""),
+        ));
+        task.updated_at = now;
+
+        let mut cancelled_subtasks = 0;
+        for subtask in &mut task.subtasks {
+            if subtask.status == "pending" || subtask.status == "in_progress" {
+                subtask.status = "cancelled".to_string();
+                cancelled_subtasks += 1;
+            }
+        }
+
+        json!({
+            "success": true,
+            "task_id": task_id,
+            "previous_status": previous_status,
+            "reason": reason,
+            "cancelled_subtasks": cancelled_subtasks,
+            "message": format!("Task '{task_id}' cancelled (was: {previous_status})"),
+        })
+        .to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SessionStateRollbackAction {
+    ToolPreferences {
+        previous_pinned_tools: Vec<String>,
+        previous_deprioritized_tools: Vec<String>,
+    },
+    ConfigOverride {
+        path: String,
+        old_value: Value,
+        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    },
+    GoalOverride {
+        previous_goal: Option<String>,
+        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    },
+    Compression {
+        turn: u32,
+        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    },
+    TaskState {
+        snapshot: TaskManagerSnapshot,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct SessionStateRollbackEntry {
+    sequence: u64,
+    turn_index: u32,
+    timestamp: SystemTime,
+    label: String,
+    action: SessionStateRollbackAction,
+}
+
+#[derive(Debug, Default)]
+struct SessionStateRollbackJournal {
+    entries: Vec<SessionStateRollbackEntry>,
+    next_sequence: u64,
+}
+
+impl SessionStateRollbackJournal {
+    fn record(&mut self, turn_index: u32, label: String, action: SessionStateRollbackAction) {
+        self.entries.push(SessionStateRollbackEntry {
+            sequence: self.next_sequence,
+            turn_index,
+            timestamp: SystemTime::now(),
+            label,
+            action,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    fn list(&self) -> Vec<SessionStateRollbackEntry> {
+        self.entries.iter().rev().cloned().collect()
+    }
+
+    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<SessionStateRollbackEntry> {
+        self.restore_plan_for_turn_since(turn_index, 0)
+    }
+
+    fn restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<SessionStateRollbackEntry> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
+            .cloned()
+            .collect()
+    }
+
+    fn checkpoint(&self) -> u64 {
+        self.next_sequence
+    }
+
+    fn remove_sequence(&mut self, sequence: u64) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.sequence == sequence)
+        {
+            self.entries.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
+    match action {
+        SessionStateRollbackAction::ToolPreferences { .. } => "tool_preferences",
+        SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
+        SessionStateRollbackAction::GoalOverride { .. } => "goal_override",
+        SessionStateRollbackAction::Compression { .. } => "compression",
+        SessionStateRollbackAction::TaskState { .. } => "task_state",
+    }
+}
+
+fn normalized_drift(old: f64, new: f64) -> Option<f64> {
+    let denom = old.abs();
+    if denom < f64::EPSILON {
+        return None;
+    }
+    Some((new - old).abs() / denom)
+}
+
+fn extract_tool_name(args: &Value) -> Option<String> {
+    args.get("tool")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+        .map(ToString::to_string)
+}
+
+fn effective_runtime_config(
+    workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
+) -> Result<crate::runtime_config::RuntimeConfig, String> {
+    match workspace.and_then(|workspace| workspace.tuned_config_json.as_deref()) {
+        Some(json) => serde_json::from_str(json).map_err(|error| error.to_string()),
+        None => Ok(crate::runtime_config::RuntimeConfig::load()),
+    }
+}
+
+fn replace_json_path(root: &mut Value, path: &str, new_value: Value) -> Result<Value, String> {
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return Err("mutation path cannot be empty".to_string());
+    }
+
+    let mut current = root;
+    for segment in &segments[..segments.len() - 1] {
+        current = current
+            .get_mut(*segment)
+            .ok_or_else(|| format!("unknown config path segment '{segment}'"))?;
+    }
+
+    let last = segments.last().expect("checked non-empty");
+    let object = current
+        .as_object_mut()
+        .ok_or_else(|| format!("config path '{path}' does not point to an object parent"))?;
+    let slot = object
+        .get_mut(*last)
+        .ok_or_else(|| format!("unknown config leaf '{last}'"))?;
+    let old_value = slot.clone();
+    *slot = new_value;
+    Ok(old_value)
+}
+
+fn append_config_change_event(
+    session_id: &str,
+    turn: u32,
+    key: &str,
+    new_value: &Value,
+    old_value: Option<Value>,
+    source: &str,
+) -> Result<(), String> {
+    let writer = astra_services::session_journal::JournalWriter::new(session_id)
+        .map_err(|e| e.to_string())?;
+    let mut event = astra_services::session_journal::JournalEvent::config_change(
+        Some(session_id),
+        key,
+        &new_value.to_string(),
+    );
+    event.turn = Some(turn);
+    let mut metadata =
+        serde_json::Map::from_iter([("source".to_string(), Value::String(source.to_string()))]);
+    if let Some(old_value) = old_value {
+        metadata.insert("old_value".to_string(), old_value);
+    }
+    event.metadata = Some(Value::Object(metadata));
+    writer.append(&event).map_err(|e| e.to_string())
+}
+
+fn persist_config_override(
+    session_id: &str,
+    path: &str,
+    new_value: Value,
+    source: &str,
+) -> Result<(), String> {
+    let mut workspace =
+        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
+    let base_config = effective_runtime_config(Some(&workspace))?;
+    let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
+    let old_value = replace_json_path(&mut value, path, new_value.clone())?;
+    let candidate_config: crate::runtime_config::RuntimeConfig =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let baseline_json = serde_json::to_value(crate::runtime_config::RuntimeConfig::load())
+        .map_err(|e| e.to_string())?;
+    workspace.tuned_config_json = if value == baseline_json {
+        None
+    } else {
+        Some(serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?)
+    };
+    workspace.updated_at = chrono::Utc::now().to_rfc3339();
+    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
+    append_config_change_event(
+        session_id,
+        workspace.turn_count,
+        path,
+        &new_value,
+        Some(old_value),
+        source,
+    )
+}
+
+fn persist_goal_override(session_id: &str, goal: &str, source: &str) -> Result<(), String> {
+    let mut workspace =
+        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
+    let previous_goal = workspace.session_goal.clone();
+    workspace.session_goal = Some(goal.to_string());
+    workspace.goal_progress = None;
+    workspace.updated_at = chrono::Utc::now().to_rfc3339();
+    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
+    append_config_change_event(
+        session_id,
+        workspace.turn_count,
+        "session_goal",
+        &Value::String(goal.to_string()),
+        previous_goal.clone().map(Value::String),
+        source,
+    )?;
+    if previous_goal.as_deref() != Some(goal) {
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .map_err(|e| e.to_string())?;
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::goal_steered(
+                    Some(session_id),
+                    workspace.turn_count,
+                    source,
+                    previous_goal.as_deref(),
+                    goal,
+                    None,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn clear_persisted_goal_override(session_id: &str) -> Result<(), String> {
+    let mut workspace =
+        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
+    workspace.session_goal = None;
+    workspace.goal_progress = None;
+    workspace.updated_at = chrono::Utc::now().to_rfc3339();
+    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())
+}
+
+fn persist_tool_preferences(
+    session_id: &str,
+    pinned_tools: &[String],
+    deprioritized_tools: &[String],
+    source: &str,
+) -> Result<(), String> {
+    let mut workspace =
+        astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
+    let mut pinned = pinned_tools.to_vec();
+    pinned.sort();
+    pinned.dedup();
+    let mut deprioritized = deprioritized_tools.to_vec();
+    deprioritized.sort();
+    deprioritized.dedup();
+
+    let old_pinned = workspace.pinned_tools.clone();
+    let old_deprioritized = workspace.deprioritized_tools.clone();
+    workspace.pinned_tools = pinned.clone();
+    workspace.deprioritized_tools = deprioritized.clone();
+    workspace.updated_at = chrono::Utc::now().to_rfc3339();
+    astra_services::session_workspace::write_workspace(&workspace).map_err(|e| e.to_string())?;
+
+    if old_pinned != pinned {
+        append_config_change_event(
+            session_id,
+            workspace.turn_count,
+            "pinned_tools",
+            &json!(pinned),
+            Some(json!(old_pinned)),
+            source,
+        )?;
+    }
+    if old_deprioritized != deprioritized {
+        append_config_change_event(
+            session_id,
+            workspace.turn_count,
+            "deprioritized_tools",
+            &json!(deprioritized),
+            Some(json!(old_deprioritized)),
+            source,
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_manual_compression(
+    session_id: &str,
+    turn: u32,
+    reason: &str,
+    source: &str,
+) -> Result<(), String> {
+    let writer = astra_services::session_journal::JournalWriter::new(session_id)
+        .map_err(|e| e.to_string())?;
+    let mut event = astra_services::session_journal::JournalEvent::compact_with_summary(
+        Some(session_id),
+        turn,
+        1,
+        0,
+        Some(reason),
+    );
+    event.metadata = Some(json!({
+        "source": source,
+        "reason": reason,
+        "manual": true,
+    }));
+    writer.append(&event).map_err(|e| e.to_string())
+}
+
+fn supports_server_tool_name(tool: &str) -> bool {
+    astra_tools::schemas::SERVER_EXECUTOR_TOOL_NAMES.contains(&tool)
+}
+
+fn mo_current_account() -> &'static str {
+    use std::sync::OnceLock;
+
+    static ACCOUNT: OnceLock<String> = OnceLock::new();
+    ACCOUNT.get_or_init(|| {
+        let out = mo_execute_sql("SELECT current_account_name() AS name", None);
+        out.lines()
+            .filter(|line| !line.starts_with('+') && !line.contains("name"))
+            .find_map(|line| {
+                let trimmed = line.trim().trim_matches('|').trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .unwrap_or_else(|| "sys".to_string())
+    })
+}
+
+fn mo_database() -> &'static str {
+    use std::sync::OnceLock;
+
+    static DB: OnceLock<String> = OnceLock::new();
+    DB.get_or_init(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()))
+}
+
+fn resolved_mo_database(database: Option<&str>) -> String {
+    database
+        .map(str::trim)
+        .filter(|database| !database.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| mo_database().to_string())
+}
+
+fn mo_create_snapshot_sql(name: &str, database: Option<&str>) -> String {
+    format!(
+        "CREATE SNAPSHOT `{name}` FOR DATABASE `{}`",
+        resolved_mo_database(database)
+    )
+}
+
+fn mo_restore_snapshot_sql(name: &str, database: Option<&str>) -> String {
+    let account = mo_current_account();
+    format!(
+        "RESTORE ACCOUNT `{account}` DATABASE `{}` FROM SNAPSHOT `{name}`",
+        resolved_mo_database(database)
+    )
+}
+
+fn mo_query_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> bool {
+    match sql
+        .split_whitespace()
+        .next()
+        .map(|keyword| keyword.trim_matches(|c: char| c == '(' || c == ';'))
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("INSERT" | "UPDATE" | "REPLACE" | "CREATE") => true,
+        Some("DROP" | "DELETE" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE") => true,
+        _ => allow_destructive,
+    }
+}
+
+fn mo_pre_state_snapshot_name() -> String {
+    format!("moq_{}", uuid::Uuid::now_v7().simple())
+}
+
+fn is_valid_snapshot_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn is_mo_error(output: &str) -> bool {
+    output.trim_start().starts_with("Error:")
+}
+
+fn mo_mysql_cmd(database: Option<&str>) -> Command {
+    astra_core::warn_default_credentials_once();
+    let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
+    let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
+    let password = std::env::var("MATRIXONE_PASSWORD")
+        .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string());
+    let db = database
+        .map(ToString::to_string)
+        .unwrap_or_else(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()));
+
+    let mut cmd = Command::new("mysql");
+    cmd.arg(format!("-h{host}"))
+        .arg(format!("-P{port}"))
+        .arg(format!("-u{user}"))
+        .env("MYSQL_PWD", &password)
+        .arg(db)
+        .arg(format!("--connect-timeout={MO_CONNECT_TIMEOUT_SECS}"))
+        .arg("--table");
+    cmd
+}
+
+fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
+    let mut cmd = mo_mysql_cmd(database);
+    cmd.arg("-e").arg(sql);
+
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success() {
+                let err = if stderr.is_empty() {
+                    stdout.to_string()
+                } else {
+                    stderr.to_string()
+                };
+                format!("Error: {}", err.trim())
+            } else if stdout.is_empty() {
+                "OK (no results)".to_string()
+            } else {
+                stdout.to_string()
+            }
+        }
+        Err(error) => format!("Error: failed to execute mysql client: {error}"),
+    }
+}
 
 /// Server-side tool executor for web agent sessions.
 ///
@@ -45,6 +919,12 @@ pub struct ServerToolExecutor {
     sandbox_policy: SandboxPolicy,
     /// File edit journal for undo support.
     file_journal: Arc<Mutex<FileEditJournal>>,
+    /// Database snapshot journal for MatrixOne rollback support.
+    database_snapshot_journal: Arc<Mutex<DatabaseSnapshotRollbackJournal>>,
+    /// Session-state rollback journal for bounded self-mod and task undo.
+    session_state_journal: Arc<Mutex<SessionStateRollbackJournal>>,
+    /// In-memory task manager for session-local task tools.
+    task_manager: Arc<ServerTaskManager>,
     /// Current turn index for journal entries.
     journal_turn_index: AtomicU32,
     /// Aggregate output bytes this turn.
@@ -75,6 +955,15 @@ pub struct ServerToolExecutor {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Optional edge connection pool for routing to remote edge agents.
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    /// Optional observability session for self-mod and rollback-backed session state.
+    observability_session:
+        Option<Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>>,
+    /// Self-modification pinned tool preferences.
+    self_mod_pinned_tools: Mutex<Vec<String>>,
+    /// Self-modification deprioritized tool preferences.
+    self_mod_deprioritized_tools: Mutex<Vec<String>>,
+    /// Per-turn mutation accounting for adjust_config governor.
+    self_mod_mutation_counter: Mutex<(u32, u32)>,
     /// Shared default executor for delegating common tool logic.
     default_executor: DefaultToolExecutor,
 }
@@ -100,6 +989,10 @@ impl ServerToolExecutor {
 
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
+        let (pinned_tools, deprioritized_tools) =
+            astra_services::session_workspace::read_workspace(&session_id)
+                .map(|workspace| (workspace.pinned_tools, workspace.deprioritized_tools))
+                .unwrap_or_else(|_| (Vec::new(), Vec::new()));
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -136,6 +1029,11 @@ impl ServerToolExecutor {
             sandbox_policy,
             default_executor,
             file_journal: Arc::new(Mutex::new(FileEditJournal::new(500))),
+            database_snapshot_journal: Arc::new(Mutex::new(
+                DatabaseSnapshotRollbackJournal::default(),
+            )),
+            session_state_journal: Arc::new(Mutex::new(SessionStateRollbackJournal::default())),
+            task_manager: Arc::new(ServerTaskManager::new()),
             journal_turn_index: AtomicU32::new(0),
             aggregate_output_bytes: AtomicUsize::new(0),
             memoria_client,
@@ -148,6 +1046,10 @@ impl ServerToolExecutor {
             progress_callback: None,
             resource_governor: None,
             edge_connection_pool: None,
+            observability_session: None,
+            self_mod_pinned_tools: Mutex::new(pinned_tools),
+            self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
+            self_mod_mutation_counter: Mutex::new((0, 0)),
         }
     }
 
@@ -177,16 +1079,33 @@ impl ServerToolExecutor {
         self.resource_governor = Some(governor);
     }
 
+    /// Set the observability session for rollback-backed session-state tools.
+    pub fn set_observability_session(
+        &mut self,
+        session: Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
+    ) {
+        self.observability_session = Some(session);
+    }
+
     /// Execute a tool call and return the result string.
     ///
     /// Routing order:
     /// 1. Try remote edge agent (if connected via WebSocket)
     /// 2. Fall back to local server-side execution
     pub async fn execute(&self, name: &str, args: &Value) -> String {
+        self.execute_with_metadata(name, args).await.output
+    }
+
+    /// Execute a tool call and preserve structured metadata for server-side fallback paths.
+    pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         // ── Try remote edge agent first ──────────────────────────────
         if let Some(pool) = &self.edge_connection_pool {
             if let Some(result) = pool.execute_tool_any_edge(&self.user_id, name, args).await {
-                return result.output;
+                return astra_tools::ToolResult {
+                    output: result.output,
+                    metadata: None,
+                    is_error: result.is_error,
+                };
             }
         }
         // ── Fire-and-forget resource usage recording (Phase 5) ────────
@@ -198,11 +1117,15 @@ impl ServerToolExecutor {
             });
         }
 
-        self.execute_local(name, args).await
+        self.execute_local_with_metadata(name, args).await
     }
 
     /// Execute a tool locally on the server (no edge routing).
-    async fn execute_local(&self, name: &str, args: &Value) -> String {
+    async fn execute_local_with_metadata(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> astra_tools::ToolResult {
         // ── Approval gate check ──────────────────────────────────────
         if let Some(gate) = &self.approval_gate {
             if gate.requires_approval(name) {
@@ -212,10 +1135,14 @@ impl ServerToolExecutor {
                     astra_tools::ApprovalDecision::Approved => { /* proceed */ }
                     astra_tools::ApprovalDecision::Denied { reason } => {
                         let msg = reason.unwrap_or_else(|| "User denied execution".into());
-                        return format!("Tool execution denied: {msg}");
+                        return astra_tools::ToolResult::error(format!(
+                            "Tool execution denied: {msg}"
+                        ));
                     }
                     astra_tools::ApprovalDecision::Timeout => {
-                        return "Tool execution denied: approval request timed out".into();
+                        return astra_tools::ToolResult::error(
+                            "Tool execution denied: approval request timed out".into(),
+                        );
                     }
                 }
             }
@@ -227,7 +1154,7 @@ impl ServerToolExecutor {
             cb.tool_started(&call_id, name, args).await;
         }
 
-        let output = match name {
+        let mut result = match name {
             // ── Memory tools (HTTP proxy) ──────────────────────────────
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
             | "memory_correct" | "memory_profile" => {
@@ -242,78 +1169,98 @@ impl ServerToolExecutor {
                     );
                     obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
                 }
-                self.memoria_client.call(op, &isolated_args).await
+                let output = self.memoria_client.call(op, &isolated_args).await;
+                if output.starts_with("Error") {
+                    astra_tools::ToolResult::error(output)
+                } else {
+                    astra_tools::ToolResult::text(output)
+                }
             }
             // ── Web search (standalone function) ───────────────────────
-            "web_search" => astra_tools::web_search::web_search(args),
+            "web_search" => {
+                let output = astra_tools::web_search::web_search(args);
+                if output.starts_with("Error") {
+                    astra_tools::ToolResult::error(output)
+                } else {
+                    astra_tools::ToolResult::text(output)
+                }
+            }
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
-            "read_file" => {
-                self.default_executor
-                    .execute("read_file", args)
-                    .await
-                    .output
+            "read_file" => self.default_executor.execute("read_file", args).await,
+            "write_file" => tool_result_from_output(self.server_write_file(args)),
+            "str_replace" => tool_result_from_output(self.server_str_replace(args)),
+            "delete_file" => tool_result_from_output(self.server_delete_file(args)),
+            "rollback_file_edits" => tool_result_from_output(self.rollback_file_edits(args)),
+            "list_dir" => self.default_executor.execute("list_dir", args).await,
+            // ── Session-state tools ─────────────────────────────────────
+            "adjust_config" => tool_result_from_output(self.adjust_config(args)),
+            "prioritize_tool" => tool_result_from_output(self.prioritize_tool(args)),
+            "deprioritize_tool" => tool_result_from_output(self.deprioritize_tool(args)),
+            "set_goal" => tool_result_from_output(self.set_goal(args)),
+            "compress_context" => tool_result_from_output(self.compress_context(args)),
+            "rollback_session_state" => tool_result_from_output(self.rollback_session_state(args)),
+            "task_create" => tool_result_from_output(self.task_create(args)),
+            "task_list" => tool_result_from_output(self.task_list(args)),
+            "task_get" => tool_result_from_output(self.task_get(args)),
+            "task_update" => tool_result_from_output(self.task_update(args)),
+            "task_stop" => tool_result_from_output(self.task_stop(args)),
+            // ── MatrixOne operations ────────────────────────────────────
+            "mo_query" => self.server_mo_query(args),
+            "rollback_database_snapshots" => {
+                tool_result_from_output(self.rollback_database_snapshots(args))
             }
-            "write_file" => self.server_write_file(args),
-            "str_replace" => self.server_str_replace(args),
-            "delete_file" => self.server_delete_file(args),
-            "list_dir" => self.default_executor.execute("list_dir", args).await.output,
             // ── Shell operations ───────────────────────────────────────
             // bash uses tiered process isolation (server-specific).
             // grep + glob delegate to DefaultToolExecutor.
-            "bash" => self.server_bash(args).await,
-            "grep" => self.default_executor.execute("grep", args).await.output,
-            "glob" => self.default_executor.execute("glob", args).await.output,
+            "bash" => tool_result_from_output(self.server_bash(args).await),
+            "grep" => self.default_executor.execute("grep", args).await,
+            "glob" => self.default_executor.execute("glob", args).await,
             // ── Git operations ─────────────────────────────────────────
             // All git ops delegate to DefaultToolExecutor.
-            "git_status" => {
+            "git_status" => self.default_executor.execute("git_status", args).await,
+            "git_diff" => self.default_executor.execute("git_diff", args).await,
+            "git_log" => self.default_executor.execute("git_log", args).await,
+            "git_show" => self.default_executor.execute("git_show", args).await,
+            "git_blame" => self.default_executor.execute("git_blame", args).await,
+            "git_commit" => self.default_executor.execute("git_commit", args).await,
+            "git_revert_commit" => {
                 self.default_executor
-                    .execute("git_status", args)
+                    .execute("git_revert_commit", args)
                     .await
-                    .output
-            }
-            "git_diff" => self.default_executor.execute("git_diff", args).await.output,
-            "git_log" => self.default_executor.execute("git_log", args).await.output,
-            "git_show" => self.default_executor.execute("git_show", args).await.output,
-            "git_blame" => {
-                self.default_executor
-                    .execute("git_blame", args)
-                    .await
-                    .output
-            }
-            "git_commit" => {
-                self.default_executor
-                    .execute("git_commit", args)
-                    .await
-                    .output
             }
             // ── Delegation placeholder ─────────────────────────────────
-            "delegate" => "Delegation request acknowledged. The delegation engine will execute \
-                this request and provide results in the next round."
-                .to_string(),
-            // ── Delegate to DefaultToolExecutor for all other tools ────
-            // Covers: git_file_history, git_log_search, git_contributors,
-            // git_revert_commit, git_stash, github_*, symbols, task_*,
-            // tool_search, env, config, multi_edit, sleep, web_fetch, etc.
-            _ => self.default_executor.execute(name, args).await.output,
+            "delegate" => astra_tools::ToolResult::text(
+                "Delegation request acknowledged. The delegation engine will execute \
+                 this request and provide results in the next round."
+                    .to_string(),
+            ),
+            // ── Unknown tool fallback ──────────────────────────────────
+            _ => astra_tools::ToolResult::error(format!(
+                "Error: Tool '{name}' is not available in server-side execution mode. \
+                     Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
+                     list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
+                     rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
+                     git_diff, git_log, git_show, git_blame, git_commit, git_revert_commit, memory_*, web_search"
+            )),
         };
 
-        let output = astra_tools::normalize_empty_output(output, name);
+        result.output = astra_tools::normalize_empty_output(result.output, name);
         let limit = astra_tools::per_tool_output_limit(name);
-        let output = astra_tools::truncate_output(output, limit);
+        result.output = astra_tools::truncate_output(result.output, limit);
         let agg = self
             .aggregate_output_bytes
-            .fetch_add(output.len(), Ordering::Relaxed);
-        let output = astra_tools::maybe_persist_large_output(output, agg, name);
+            .fetch_add(result.output.len(), Ordering::Relaxed);
+        result.output = astra_tools::maybe_persist_large_output(result.output, agg, name);
 
         // ── Progress: tool completed ─────────────────────────────────
         if let Some(cb) = &self.progress_callback {
-            let success = !output.starts_with("Error:");
-            cb.tool_completed(&call_id, &output, success).await;
+            cb.tool_completed(&call_id, &result.output, !result.is_error)
+                .await;
         }
 
-        output
+        result
     }
 
     /// Set the current turn index for journal entries.
@@ -329,6 +1276,1279 @@ impl ServerToolExecutor {
     /// Get the workspace root path.
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
+        match self.file_journal.lock() {
+            Ok(journal) => journal.checkpoint(),
+            Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
+    fn record_database_snapshot_rollback(
+        &self,
+        snapshot_id: impl Into<String>,
+        database: Option<String>,
+    ) {
+        let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
+        match self.database_snapshot_journal.lock() {
+            Ok(mut journal) => journal.record(snapshot_id, database, turn_index),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .record(snapshot_id, database, turn_index),
+        }
+    }
+
+    fn database_snapshot_entries(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
+        match self.database_snapshot_journal.lock() {
+            Ok(journal) => journal.list(),
+            Err(poisoned) => poisoned.into_inner().list(),
+        }
+    }
+
+    fn database_snapshot_entry_for_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Option<DatabaseSnapshotRollbackEntry> {
+        match self.database_snapshot_journal.lock() {
+            Ok(journal) => journal.entry_for_snapshot(snapshot_id),
+            Err(poisoned) => poisoned.into_inner().entry_for_snapshot(snapshot_id),
+        }
+    }
+
+    fn database_snapshot_restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<DatabaseSnapshotRollbackEntry> {
+        match self.database_snapshot_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .restore_plan_for_turn_since(turn_index, checkpoint),
+        }
+    }
+
+    fn remove_database_snapshot_rollback(&self, snapshot_id: &str) {
+        match self.database_snapshot_journal.lock() {
+            Ok(mut journal) => {
+                journal.remove_snapshot(snapshot_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove_snapshot(snapshot_id);
+            }
+        }
+    }
+
+    fn rollback_database_snapshot_entry_json(entry: &DatabaseSnapshotRollbackEntry) -> Value {
+        let mut value = serde_json::Map::from_iter([
+            (
+                "snapshot_id".to_string(),
+                Value::String(entry.snapshot_id.clone()),
+            ),
+            (
+                "turn_index".to_string(),
+                Value::Number(serde_json::Number::from(entry.turn_index)),
+            ),
+        ]);
+        if let Some(database) = entry.database.as_ref() {
+            value.insert("database".to_string(), Value::String(database.clone()));
+        }
+        Value::Object(value)
+    }
+
+    fn restore_database_snapshot_entry(
+        &self,
+        entry: &DatabaseSnapshotRollbackEntry,
+    ) -> Result<(), String> {
+        let output = mo_execute_sql(
+            &mo_restore_snapshot_sql(&entry.snapshot_id, entry.database.as_deref()),
+            None,
+        );
+        if is_mo_error(&output) {
+            Err(output)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn server_mo_query(&self, args: &Value) -> astra_tools::ToolResult {
+        let sql = match args.get("sql").and_then(Value::as_str) {
+            Some(sql) if !sql.trim().is_empty() => sql.trim(),
+            _ => return astra_tools::ToolResult::error("Error: Missing 'sql' parameter".into()),
+        };
+
+        let allow_destructive = args
+            .get("allow_destructive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !allow_destructive
+            && let Some(kind) = crate::turn::safety_middleware::check_sql_safety(sql)
+        {
+            return astra_tools::ToolResult::error(format!(
+                "Error: {kind} statements are blocked by default. Pass \"allow_destructive\": true to confirm execution."
+            ));
+        }
+
+        let database = args.get("database").and_then(Value::as_str);
+        let resolved_database = resolved_mo_database(database);
+        let mut metadata = None;
+        if mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
+            let snapshot_id = mo_pre_state_snapshot_name();
+            let snapshot_output =
+                mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None);
+            if is_mo_error(&snapshot_output) {
+                return astra_tools::ToolResult::error(format!(
+                    "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"
+                ));
+            }
+            self.record_database_snapshot_rollback(
+                snapshot_id.clone(),
+                Some(resolved_database.clone()),
+            );
+            metadata = Some(serde_json::Map::from_iter([
+                (
+                    "pre_state_snapshot_id".to_string(),
+                    Value::String(snapshot_id),
+                ),
+                (
+                    "pre_state_snapshot_database".to_string(),
+                    Value::String(resolved_database),
+                ),
+            ]));
+        }
+
+        let output = mo_execute_sql(sql, database);
+        astra_tools::ToolResult {
+            is_error: is_mo_error(&output),
+            output,
+            metadata,
+        }
+    }
+
+    pub(crate) fn rollback_database_snapshots(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                if args.get("snapshot_id").is_some() {
+                    Some("snapshot")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("current_turn");
+
+        match scope {
+            "list" => {
+                let entries = self
+                    .database_snapshot_entries()
+                    .into_iter()
+                    .map(|entry| Self::rollback_database_snapshot_entry_json(&entry))
+                    .collect::<Vec<_>>();
+                json!({
+                    "success": true,
+                    "scope": "list",
+                    "total_entries": entries.len(),
+                    "entries": entries,
+                })
+                .to_string()
+            }
+            "snapshot" => {
+                let snapshot_id = match args.get("snapshot_id").and_then(Value::as_str) {
+                    Some(snapshot_id) if is_valid_snapshot_name(snapshot_id) => snapshot_id,
+                    Some(snapshot_id) => {
+                        return json!({
+                            "success": false,
+                            "scope": "snapshot",
+                            "error": format!("invalid snapshot_id `{snapshot_id}`"),
+                        })
+                        .to_string();
+                    }
+                    None => {
+                        return json!({
+                            "success": false,
+                            "scope": "snapshot",
+                            "error": "missing 'snapshot_id' for scope=snapshot",
+                        })
+                        .to_string();
+                    }
+                };
+                let journal_entry = self.database_snapshot_entry_for_snapshot(snapshot_id);
+                let database = args
+                    .get("database")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|database| !database.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        journal_entry
+                            .as_ref()
+                            .and_then(|entry| entry.database.clone())
+                    });
+                let entry = DatabaseSnapshotRollbackEntry {
+                    sequence: journal_entry.as_ref().map_or(0, |entry| entry.sequence),
+                    snapshot_id: snapshot_id.to_string(),
+                    database,
+                    turn_index: journal_entry.as_ref().map_or_else(
+                        || self.journal_turn_index.load(Ordering::Relaxed),
+                        |entry| entry.turn_index,
+                    ),
+                };
+                match self.restore_database_snapshot_entry(&entry) {
+                    Ok(()) => {
+                        self.remove_database_snapshot_rollback(snapshot_id);
+                        let database = entry.database.clone();
+                        json!({
+                            "success": true,
+                            "scope": "snapshot",
+                            "snapshot_id": snapshot_id,
+                            "database": database,
+                            "summary": format!(
+                                "Restored MatrixOne snapshot `{}`{}",
+                                snapshot_id,
+                                database
+                                    .as_deref()
+                                    .map(|database| format!(" for database `{database}`"))
+                                    .unwrap_or_default()
+                            ),
+                        })
+                        .to_string()
+                    }
+                    Err(error) => json!({
+                        "success": false,
+                        "scope": "snapshot",
+                        "snapshot_id": snapshot_id,
+                        "database": entry.database.clone(),
+                        "error": error,
+                    })
+                    .to_string(),
+                }
+            }
+            "turn" | "current_turn" => {
+                let turn_index = if scope == "turn" {
+                    match args.get("turn_index").and_then(Value::as_u64) {
+                        Some(turn_index) => turn_index as u32,
+                        None => {
+                            return json!({
+                                "success": false,
+                                "scope": "turn",
+                                "error": "missing 'turn_index' for scope=turn",
+                            })
+                            .to_string();
+                        }
+                    }
+                } else {
+                    self.journal_turn_index.load(Ordering::Relaxed)
+                };
+                let checkpoint = args
+                    .get("database_after_sequence")
+                    .or_else(|| args.get("after_sequence"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let plan = if checkpoint > 0 {
+                    self.database_snapshot_restore_plan_for_turn_since(turn_index, checkpoint)
+                } else {
+                    match self.database_snapshot_journal.lock() {
+                        Ok(journal) => journal.restore_plan_for_turn(turn_index),
+                        Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
+                    }
+                };
+                let mut restored = Vec::new();
+                let mut failed = Vec::new();
+                for entry in &plan {
+                    match self.restore_database_snapshot_entry(entry) {
+                        Ok(()) => {
+                            self.remove_database_snapshot_rollback(&entry.snapshot_id);
+                            restored.push(Self::rollback_database_snapshot_entry_json(entry));
+                        }
+                        Err(error) => {
+                            let mut failed_entry =
+                                Self::rollback_database_snapshot_entry_json(entry)
+                                    .as_object()
+                                    .cloned()
+                                    .unwrap_or_default();
+                            failed_entry.insert("error".to_string(), Value::String(error));
+                            failed.push(Value::Object(failed_entry));
+                        }
+                    }
+                }
+                let success = !restored.is_empty() && failed.is_empty();
+                let summary = if plan.is_empty() {
+                    format!("No recorded MatrixOne snapshots found for turn {turn_index}")
+                } else if failed.is_empty() {
+                    format!(
+                        "Restored {} MatrixOne snapshot{} for turn {turn_index}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "Restored {} MatrixOne snapshot{} for turn {turn_index} with {} failure{}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "s" },
+                        failed.len(),
+                        if failed.len() == 1 { "" } else { "s" }
+                    )
+                };
+                json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "restored": restored,
+                    "failed": failed,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => json!({
+                "success": false,
+                "error": format!(
+                    "unknown scope `{other}`. Supported: current_turn, turn, snapshot, list"
+                ),
+            })
+            .to_string(),
+        }
+    }
+
+    pub(crate) fn session_state_journal_checkpoint(&self) -> u64 {
+        match self.session_state_journal.lock() {
+            Ok(journal) => journal.checkpoint(),
+            Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
+    fn record_session_state_rollback(&self, label: String, action: SessionStateRollbackAction) {
+        let turn_index = self.journal_turn_index.load(Ordering::Relaxed);
+        match self.session_state_journal.lock() {
+            Ok(mut journal) => journal.record(turn_index, label, action),
+            Err(poisoned) => poisoned.into_inner().record(turn_index, label, action),
+        }
+    }
+
+    fn record_tool_preferences_rollback(
+        &self,
+        previous_pinned_tools: Vec<String>,
+        previous_deprioritized_tools: Vec<String>,
+        label: impl Into<String>,
+    ) {
+        self.record_session_state_rollback(
+            label.into(),
+            SessionStateRollbackAction::ToolPreferences {
+                previous_pinned_tools,
+                previous_deprioritized_tools,
+            },
+        );
+    }
+
+    fn record_adjust_config_rollback(
+        &self,
+        path: impl Into<String>,
+        old_value: Value,
+        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    ) {
+        let path = path.into();
+        self.record_session_state_rollback(
+            format!("adjust_config:{path}"),
+            SessionStateRollbackAction::ConfigOverride {
+                path,
+                old_value,
+                snapshot,
+            },
+        );
+    }
+
+    fn record_goal_rollback(
+        &self,
+        previous_goal: Option<String>,
+        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    ) {
+        self.record_session_state_rollback(
+            "set_goal".to_string(),
+            SessionStateRollbackAction::GoalOverride {
+                previous_goal,
+                snapshot,
+            },
+        );
+    }
+
+    fn record_compression_rollback(
+        &self,
+        turn: u32,
+        snapshot: crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    ) {
+        self.record_session_state_rollback(
+            format!("compress_context:turn-{turn}"),
+            SessionStateRollbackAction::Compression { turn, snapshot },
+        );
+    }
+
+    fn record_task_state_rollback(&self, snapshot: TaskManagerSnapshot, label: impl Into<String>) {
+        self.record_session_state_rollback(
+            label.into(),
+            SessionStateRollbackAction::TaskState { snapshot },
+        );
+    }
+
+    fn session_state_entries(&self) -> Vec<SessionStateRollbackEntry> {
+        match self.session_state_journal.lock() {
+            Ok(journal) => journal.list(),
+            Err(poisoned) => poisoned.into_inner().list(),
+        }
+    }
+
+    fn session_state_restore_plan_for_turn(
+        &self,
+        turn_index: u32,
+    ) -> Vec<SessionStateRollbackEntry> {
+        match self.session_state_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn(turn_index),
+            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
+        }
+    }
+
+    fn session_state_restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<SessionStateRollbackEntry> {
+        match self.session_state_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .restore_plan_for_turn_since(turn_index, checkpoint),
+        }
+    }
+
+    fn remove_session_state_rollback(&self, sequence: u64) {
+        match self.session_state_journal.lock() {
+            Ok(mut journal) => {
+                journal.remove_sequence(sequence);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove_sequence(sequence);
+            }
+        }
+    }
+
+    fn restore_observability_snapshot(
+        &self,
+        snapshot: &crate::observability_integration::ObservabilitySessionRollbackSnapshot,
+    ) -> Result<(), String> {
+        let Some(observability_session) = self.observability_session.as_ref() else {
+            return Err("No observability session available".to_string());
+        };
+        let mut session = observability_session
+            .write()
+            .map_err(|_| "Failed to acquire observability session".to_string())?;
+        session.restore_rollback_snapshot(snapshot);
+        Ok(())
+    }
+
+    fn rollback_session_state_entry_json(entry: &SessionStateRollbackEntry) -> Value {
+        let timestamp_ms = entry
+            .timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis())
+            .and_then(|millis| u64::try_from(millis).ok());
+        let mut value = serde_json::Map::from_iter([
+            ("label".to_string(), Value::String(entry.label.clone())),
+            (
+                "kind".to_string(),
+                Value::String(action_kind(&entry.action).to_string()),
+            ),
+            (
+                "turn_index".to_string(),
+                Value::Number(serde_json::Number::from(entry.turn_index)),
+            ),
+        ]);
+        if let Some(timestamp_ms) = timestamp_ms {
+            value.insert(
+                "timestamp_ms".to_string(),
+                Value::Number(serde_json::Number::from(timestamp_ms)),
+            );
+        }
+        match &entry.action {
+            SessionStateRollbackAction::ConfigOverride { path, .. } => {
+                value.insert("path".to_string(), Value::String(path.clone()));
+            }
+            SessionStateRollbackAction::GoalOverride { previous_goal, .. } => {
+                value.insert(
+                    "previous_goal".to_string(),
+                    previous_goal
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            SessionStateRollbackAction::Compression { turn, .. } => {
+                value.insert(
+                    "turn".to_string(),
+                    Value::Number(serde_json::Number::from(*turn)),
+                );
+            }
+            SessionStateRollbackAction::ToolPreferences { .. }
+            | SessionStateRollbackAction::TaskState { .. } => {}
+        }
+        Value::Object(value)
+    }
+
+    fn rollback_session_state_entry(
+        &self,
+        entry: &SessionStateRollbackEntry,
+    ) -> Result<(), String> {
+        match &entry.action {
+            SessionStateRollbackAction::ToolPreferences {
+                previous_pinned_tools,
+                previous_deprioritized_tools,
+            } => {
+                let mut pinned = self
+                    .self_mod_pinned_tools
+                    .lock()
+                    .map_err(|_| "Failed to access pinned tools".to_string())?;
+                let mut deprioritized = self
+                    .self_mod_deprioritized_tools
+                    .lock()
+                    .map_err(|_| "Failed to access deprioritized tools".to_string())?;
+                let current_pinned = pinned.clone();
+                let current_deprioritized = deprioritized.clone();
+                *pinned = previous_pinned_tools.clone();
+                *deprioritized = previous_deprioritized_tools.clone();
+                if let Err(error) = persist_tool_preferences(
+                    &self.session_id,
+                    &pinned,
+                    &deprioritized,
+                    "server_tool_executor:rollback_session_state",
+                ) {
+                    *pinned = current_pinned;
+                    *deprioritized = current_deprioritized;
+                    return Err(format!(
+                        "failed to persist restored tool preferences: {error}"
+                    ));
+                }
+                Ok(())
+            }
+            SessionStateRollbackAction::ConfigOverride {
+                path,
+                old_value,
+                snapshot,
+            } => {
+                self.restore_observability_snapshot(snapshot)?;
+                persist_config_override(
+                    &self.session_id,
+                    path,
+                    old_value.clone(),
+                    "server_tool_executor:rollback_session_state",
+                )
+                .map_err(|error| {
+                    format!("failed to persist restored config override for {path}: {error}")
+                })
+            }
+            SessionStateRollbackAction::GoalOverride {
+                previous_goal,
+                snapshot,
+            } => {
+                self.restore_observability_snapshot(snapshot)?;
+                match previous_goal.as_deref() {
+                    Some(goal) => persist_goal_override(
+                        &self.session_id,
+                        goal,
+                        "server_tool_executor:rollback_session_state",
+                    )
+                    .map_err(|error| {
+                        format!("failed to persist restored goal override: {error}")
+                    })?,
+                    None => clear_persisted_goal_override(&self.session_id)?,
+                }
+                Ok(())
+            }
+            SessionStateRollbackAction::Compression { snapshot, .. } => {
+                self.restore_observability_snapshot(snapshot)
+            }
+            SessionStateRollbackAction::TaskState { snapshot } => {
+                self.task_manager.restore_snapshot(snapshot)
+            }
+        }
+    }
+
+    fn task_create(&self, args: &Value) -> String {
+        let snapshot = self.task_manager.snapshot_state();
+        let output = self.task_manager.create(args);
+        if !output.starts_with("Error:") {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task_create:{}",
+                    args.get("title").and_then(Value::as_str).unwrap_or("task")
+                ),
+            );
+        }
+        output
+    }
+
+    fn task_list(&self, args: &Value) -> String {
+        self.task_manager.list(args)
+    }
+
+    fn task_get(&self, args: &Value) -> String {
+        self.task_manager.get(args)
+    }
+
+    fn task_update(&self, args: &Value) -> String {
+        let snapshot = self.task_manager.snapshot_state();
+        let output = self.task_manager.update(args);
+        if !output.starts_with("Error:")
+            && serde_json::from_str::<Value>(&output)
+                .ok()
+                .and_then(|value| value.get("success").and_then(Value::as_bool))
+                .unwrap_or(false)
+        {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task_update:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
+                ),
+            );
+        }
+        output
+    }
+
+    fn task_stop(&self, args: &Value) -> String {
+        let snapshot = self.task_manager.snapshot_state();
+        let output = self.task_manager.stop(args);
+        if !output.starts_with("Error:")
+            && serde_json::from_str::<Value>(&output)
+                .ok()
+                .and_then(|value| value.get("success").and_then(Value::as_bool))
+                .unwrap_or(false)
+        {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task_stop:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
+                ),
+            );
+        }
+        output
+    }
+
+    fn adjust_config(&self, args: &Value) -> String {
+        let path = match args.get("path").and_then(Value::as_str) {
+            Some(path) if !path.trim().is_empty() => path.trim(),
+            _ => return json!({"error": "Missing required parameter: path"}).to_string(),
+        };
+        let value = match args.get("value") {
+            Some(value) => value,
+            None => return json!({"error": "Missing required parameter: value"}).to_string(),
+        };
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+
+        let Some(observability_session) = self.observability_session.as_ref() else {
+            return json!({"error": "No observability session available"}).to_string();
+        };
+        let mut session = match observability_session.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return json!({"error": "Failed to acquire observability session"}).to_string();
+            }
+        };
+
+        let turn = session.turn_number;
+        let constraints = crate::self_model::ConstraintSet::default();
+        let mut counter = match self.self_mod_mutation_counter.lock() {
+            Ok(counter) => counter,
+            Err(_) => return json!({"error": "Failed to access mutation counter"}).to_string(),
+        };
+        if counter.0 != turn {
+            *counter = (turn, 0);
+        }
+        if !force && counter.1 >= constraints.max_mutations_per_turn {
+            return json!({
+                "error": "mutation_limit_exceeded",
+                "turn": turn,
+                "max_mutations_per_turn": constraints.max_mutations_per_turn,
+                "hint": "Set force=true to override governor once.",
+            })
+            .to_string();
+        }
+
+        let parse_u32 =
+            |value: &Value| value.as_u64().and_then(|number| u32::try_from(number).ok());
+        let parse_f64 = |value: &Value| value.as_f64();
+        let ceiling = constraints.config_drift_ceiling;
+        let session_snapshot = session.rollback_snapshot();
+        let (old_value, new_value, drift) = match path {
+            "compression.compression_threshold" => {
+                let Some(new) = parse_f64(value) else {
+                    return json!({"error": "value must be a number"}).to_string();
+                };
+                if !(0.5..=0.98).contains(&new) {
+                    return json!({"error": "compression.compression_threshold must be within [0.5, 0.98]"}).to_string();
+                }
+                let old = session.config.compression.compression_threshold;
+                let drift = normalized_drift(old, new);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.compression.compression_threshold = new;
+                (json!(old), json!(new), drift)
+            }
+            "memory.retrieval_top_k" => {
+                let Some(new) = parse_u32(value) else {
+                    return json!({"error": "value must be an integer"}).to_string();
+                };
+                if !(1..=20).contains(&new) {
+                    return json!({"error": "memory.retrieval_top_k must be within [1, 20]"})
+                        .to_string();
+                }
+                let old = session.config.memory.retrieval_top_k;
+                let drift = normalized_drift(old as f64, new as f64);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.memory.retrieval_top_k = new;
+                (json!(old), json!(new), drift)
+            }
+            "tool_selection.max_tools" => {
+                let Some(new) = parse_u32(value) else {
+                    return json!({"error": "value must be an integer"}).to_string();
+                };
+                if !(5..=80).contains(&new) {
+                    return json!({"error": "tool_selection.max_tools must be within [5, 80]"})
+                        .to_string();
+                }
+                let old = session.config.tool_selection.max_tools;
+                let drift = normalized_drift(old as f64, new as f64);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.tool_selection.max_tools = new;
+                (json!(old), json!(new), drift)
+            }
+            "tool_selection.tool_budget_tokens" => {
+                let Some(new) = parse_u32(value) else {
+                    return json!({"error": "value must be an integer"}).to_string();
+                };
+                if new > 40_000 {
+                    return json!({"error": "tool_selection.tool_budget_tokens must be within [0, 40000]"}).to_string();
+                }
+                let old = session.config.tool_selection.tool_budget_tokens;
+                let drift = normalized_drift(old as f64, new as f64);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.tool_selection.tool_budget_tokens = new;
+                (json!(old), json!(new), drift)
+            }
+            "token_budget.max_turn_input_tokens" => {
+                let Some(new) = parse_u32(value) else {
+                    return json!({"error": "value must be an integer"}).to_string();
+                };
+                if !(8_000..=200_000).contains(&new) {
+                    return json!({"error": "token_budget.max_turn_input_tokens must be within [8000, 200000]"}).to_string();
+                }
+                let old = session.config.token_budget.max_turn_input_tokens;
+                let drift = normalized_drift(old as f64, new as f64);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.token_budget.max_turn_input_tokens = new;
+                (json!(old), json!(new), drift)
+            }
+            "token_budget.tools_reserve" => {
+                let Some(new) = parse_u32(value) else {
+                    return json!({"error": "value must be an integer"}).to_string();
+                };
+                if !(1_000..=40_000).contains(&new) {
+                    return json!({"error": "token_budget.tools_reserve must be within [1000, 40000]"}).to_string();
+                }
+                let old = session.config.token_budget.tools_reserve;
+                let drift = normalized_drift(old as f64, new as f64);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.token_budget.tools_reserve = new;
+                (json!(old), json!(new), drift)
+            }
+            "verification.strictness" => {
+                let Some(new) = parse_f64(value) else {
+                    return json!({"error": "value must be a number"}).to_string();
+                };
+                if !(0.2..=0.95).contains(&new) {
+                    return json!({"error": "verification.strictness must be within [0.2, 0.95]"})
+                        .to_string();
+                }
+                let old = session.config.verification.strictness;
+                let drift = normalized_drift(old, new);
+                if let Some(drift_value) = drift
+                    && !force
+                    && drift_value > ceiling
+                {
+                    return json!({
+                        "error": "config_drift_ceiling_exceeded",
+                        "path": path,
+                        "old": old,
+                        "new": new,
+                        "drift": drift_value,
+                        "ceiling": ceiling,
+                    })
+                    .to_string();
+                }
+                session.config.verification.strictness = new;
+                (json!(old), json!(new), drift)
+            }
+            _ => {
+                return json!({
+                    "error": "Unsupported config path",
+                    "path": path,
+                    "supported_paths": [
+                        "compression.compression_threshold",
+                        "memory.retrieval_top_k",
+                        "tool_selection.max_tools",
+                        "tool_selection.tool_budget_tokens",
+                        "token_budget.max_turn_input_tokens",
+                        "token_budget.tools_reserve",
+                        "verification.strictness",
+                    ],
+                })
+                .to_string();
+            }
+        };
+
+        if let Err(error) = persist_config_override(
+            &self.session_id,
+            path,
+            new_value.clone(),
+            "server_tool_executor:adjust_config",
+        ) {
+            session.restore_rollback_snapshot(&session_snapshot);
+            return json!({
+                "error": "failed_to_persist_config_override",
+                "path": path,
+                "detail": error,
+            })
+            .to_string();
+        }
+
+        counter.1 += 1;
+        self.record_adjust_config_rollback(path.to_string(), old_value.clone(), session_snapshot);
+        json!({
+            "status": "ok",
+            "path": path,
+            "old": old_value,
+            "new": new_value,
+            "turn": turn,
+            "mutations_this_turn": counter.1,
+            "max_mutations_per_turn": constraints.max_mutations_per_turn,
+            "drift": drift,
+            "drift_ceiling": ceiling,
+        })
+        .to_string()
+    }
+
+    fn prioritize_tool(&self, args: &Value) -> String {
+        let Some(tool) = extract_tool_name(args) else {
+            return json!({"error": "Missing required parameter: tool"}).to_string();
+        };
+        if !supports_server_tool_name(&tool) {
+            return json!({"error": format!("Unknown tool: {tool}")}).to_string();
+        }
+
+        let mut pinned = match self.self_mod_pinned_tools.lock() {
+            Ok(pinned) => pinned,
+            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
+        };
+        let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
+            Ok(deprioritized) => deprioritized,
+            Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
+        };
+        let original_pinned = pinned.clone();
+        let original_deprioritized = deprioritized.clone();
+
+        if !pinned.contains(&tool) {
+            pinned.push(tool.clone());
+        }
+        pinned.sort();
+        deprioritized.retain(|entry| entry != &tool);
+
+        if let Err(error) = persist_tool_preferences(
+            &self.session_id,
+            &pinned,
+            &deprioritized,
+            "server_tool_executor:prioritize_tool",
+        ) {
+            *pinned = original_pinned;
+            *deprioritized = original_deprioritized;
+            return json!({
+                "error": "failed_to_persist_tool_preferences",
+                "detail": error,
+                "tool": tool,
+            })
+            .to_string();
+        }
+
+        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
+        if changed {
+            self.record_tool_preferences_rollback(
+                original_pinned.clone(),
+                original_deprioritized.clone(),
+                format!("prioritize_tool:{tool}"),
+            );
+        }
+        json!({
+            "status": "ok",
+            "prioritized_tool": tool,
+            "previous_pinned_tools": original_pinned,
+            "previous_deprioritized_tools": original_deprioritized,
+            "pinned_tools": pinned.clone(),
+            "deprioritized_tools": deprioritized.clone(),
+        })
+        .to_string()
+    }
+
+    fn deprioritize_tool(&self, args: &Value) -> String {
+        let Some(tool) = extract_tool_name(args) else {
+            return json!({"error": "Missing required parameter: tool"}).to_string();
+        };
+        if !supports_server_tool_name(&tool) {
+            return json!({"error": format!("Unknown tool: {tool}")}).to_string();
+        }
+
+        let mut pinned = match self.self_mod_pinned_tools.lock() {
+            Ok(pinned) => pinned,
+            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
+        };
+        let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
+            Ok(deprioritized) => deprioritized,
+            Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
+        };
+        let original_pinned = pinned.clone();
+        let original_deprioritized = deprioritized.clone();
+
+        if !deprioritized.contains(&tool) {
+            deprioritized.push(tool.clone());
+        }
+        deprioritized.sort();
+        pinned.retain(|entry| entry != &tool);
+
+        if let Err(error) = persist_tool_preferences(
+            &self.session_id,
+            &pinned,
+            &deprioritized,
+            "server_tool_executor:deprioritize_tool",
+        ) {
+            *pinned = original_pinned;
+            *deprioritized = original_deprioritized;
+            return json!({
+                "error": "failed_to_persist_tool_preferences",
+                "detail": error,
+                "tool": tool,
+            })
+            .to_string();
+        }
+
+        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
+        if changed {
+            self.record_tool_preferences_rollback(
+                original_pinned.clone(),
+                original_deprioritized.clone(),
+                format!("deprioritize_tool:{tool}"),
+            );
+        }
+        json!({
+            "status": "ok",
+            "deprioritized_tool": tool,
+            "previous_pinned_tools": original_pinned,
+            "previous_deprioritized_tools": original_deprioritized,
+            "pinned_tools": pinned.clone(),
+            "deprioritized_tools": deprioritized.clone(),
+        })
+        .to_string()
+    }
+
+    fn set_goal(&self, args: &Value) -> String {
+        let goal = match args.get("goal").and_then(Value::as_str) {
+            Some(goal) if !goal.trim().is_empty() => goal.trim(),
+            _ => return json!({"error": "Missing required parameter: goal"}).to_string(),
+        };
+        let Some(observability_session) = self.observability_session.as_ref() else {
+            return json!({"error": "No observability session available"}).to_string();
+        };
+        let mut session = match observability_session.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return json!({"error": "Failed to acquire observability session"}).to_string();
+            }
+        };
+        let session_snapshot = session.rollback_snapshot();
+        let previous_goal = session
+            .goal_tracker
+            .as_ref()
+            .map(|tracker| tracker.goal().to_string())
+            .or_else(|| session.original_query.clone());
+
+        if let Err(error) =
+            persist_goal_override(&self.session_id, goal, "server_tool_executor:set_goal")
+        {
+            return json!({
+                "error": "failed_to_persist_goal",
+                "detail": error,
+                "goal": goal,
+            })
+            .to_string();
+        }
+
+        let goal_changed = session.steer_goal(goal);
+        if goal_changed {
+            self.record_goal_rollback(previous_goal.clone(), session_snapshot);
+        }
+
+        json!({
+            "status": "ok",
+            "previous_goal": previous_goal,
+            "goal": goal,
+            "goal_changed": goal_changed,
+            "turn": session.turn_number,
+        })
+        .to_string()
+    }
+
+    fn compress_context(&self, args: &Value) -> String {
+        let reason = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("manual_request");
+        let Some(observability_session) = self.observability_session.as_ref() else {
+            return json!({"error": "No observability session available"}).to_string();
+        };
+        let mut session = match observability_session.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return json!({"error": "Failed to acquire observability session"}).to_string();
+            }
+        };
+        let session_snapshot = session.rollback_snapshot();
+
+        let turn = if session.turn_number == 0 {
+            1
+        } else {
+            session.turn_number
+        };
+        let previous_compression_count = session.compressed_turns.len();
+        let already_compressed_this_turn = session.compressed_turns.contains(&turn);
+
+        if let Err(error) = persist_manual_compression(
+            &self.session_id,
+            turn,
+            reason,
+            "server_tool_executor:compress_context",
+        ) {
+            return json!({
+                "error": "failed_to_persist_manual_compression",
+                "detail": error,
+                "turn": turn,
+                "reason": reason,
+            })
+            .to_string();
+        }
+
+        session.record_compression(turn);
+        self.record_compression_rollback(turn, session_snapshot);
+
+        json!({
+            "status": "ok",
+            "turn": turn,
+            "reason": reason,
+            "previous_compression_count": previous_compression_count,
+            "already_compressed_this_turn": already_compressed_this_turn,
+            "compression_count": session.compressed_turns.len(),
+        })
+        .to_string()
+    }
+
+    pub(crate) fn rollback_session_state(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("current_turn");
+        let explicit_turn_index = if scope == "turn" {
+            match args.get("turn_index").and_then(Value::as_u64) {
+                Some(turn_index) => Some(turn_index),
+                None => {
+                    return json!({
+                        "success": false,
+                        "error": "missing 'turn_index' for scope=turn",
+                    })
+                    .to_string();
+                }
+            }
+        } else {
+            None
+        };
+        let checkpoint = args
+            .get("session_state_after_sequence")
+            .or_else(|| args.get("after_sequence"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        match scope {
+            "list" => {
+                let entries = self
+                    .session_state_entries()
+                    .into_iter()
+                    .map(|entry| Self::rollback_session_state_entry_json(&entry))
+                    .collect::<Vec<_>>();
+                json!({
+                    "success": true,
+                    "scope": "list",
+                    "total_entries": entries.len(),
+                    "entries": entries,
+                    "summary": format!(
+                        "Listed {} recorded session-state rollback entr{}",
+                        entries.len(),
+                        if entries.len() == 1 { "y" } else { "ies" },
+                    ),
+                })
+                .to_string()
+            }
+            "turn" | "current_turn" => {
+                let turn_index = explicit_turn_index
+                    .unwrap_or_else(|| self.journal_turn_index.load(Ordering::Relaxed) as u64)
+                    as u32;
+                let plan = if checkpoint > 0 {
+                    self.session_state_restore_plan_for_turn_since(turn_index, checkpoint)
+                } else {
+                    self.session_state_restore_plan_for_turn(turn_index)
+                };
+                let mut restored = Vec::new();
+                let mut failed = Vec::new();
+                for entry in &plan {
+                    match self.rollback_session_state_entry(entry) {
+                        Ok(()) => {
+                            self.remove_session_state_rollback(entry.sequence);
+                            restored.push(Self::rollback_session_state_entry_json(entry));
+                        }
+                        Err(error) => {
+                            let mut failed_entry = Self::rollback_session_state_entry_json(entry)
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default();
+                            failed_entry.insert("error".to_string(), Value::String(error));
+                            failed.push(Value::Object(failed_entry));
+                        }
+                    }
+                }
+                let success = !restored.is_empty() && failed.is_empty();
+                let summary = if plan.is_empty() {
+                    format!(
+                        "No recorded session-state rollback handles found for turn {turn_index}"
+                    )
+                } else if failed.is_empty() {
+                    format!(
+                        "Restored {} recorded session-state mutation{} for turn {turn_index}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "s" },
+                    )
+                } else {
+                    format!(
+                        "Restored {} recorded session-state mutation{} for turn {turn_index} with {} failure{}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "s" },
+                        failed.len(),
+                        if failed.len() == 1 { "" } else { "s" },
+                    )
+                };
+                json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "restored": restored,
+                    "failed": failed,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => json!({
+                "success": false,
+                "error": format!(
+                    "unknown scope `{other}`. Supported: current_turn, turn, list"
+                ),
+            })
+            .to_string(),
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -450,7 +2670,7 @@ impl ServerToolExecutor {
         // Record journal entry
         if let Ok(mut journal) = self.file_journal.lock() {
             let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before(&path, "server-str-replace", turn_idx);
+            journal.record_before_patch(&path, "server-str-replace", turn_idx);
         }
 
         let new_content = content.replacen(old_str, new_str, 1);
@@ -479,14 +2699,190 @@ impl ServerToolExecutor {
             return format!("Error: File not found: {path_str}");
         }
 
-        if let Ok(mut journal) = self.file_journal.lock() {
-            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before(&path, "server-delete", turn_idx);
-        }
+        let before_content = match std::fs::read(&path) {
+            Ok(content) => content,
+            Err(e) => return format!("Error: Cannot read file before delete: {e}"),
+        };
+        let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
 
         match std::fs::remove_file(&path) {
-            Ok(()) => format!("Successfully deleted {path_str}"),
+            Ok(()) => {
+                if let Ok(mut journal) = self.file_journal.lock() {
+                    journal.record_delete(&path, "server-delete", turn_idx, before_content);
+                }
+                format!("Successfully deleted {path_str}")
+            }
             Err(e) => format!("Error: Cannot delete file: {e}"),
+        }
+    }
+
+    fn rollback_display_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.workspace_root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
+    pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                if args.get("path").is_some() {
+                    Some("file")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("current_turn");
+
+        match scope {
+            "list" => {
+                let summary = match self.file_journal.lock() {
+                    Ok(journal) => journal.summary(),
+                    Err(poisoned) => poisoned.into_inner().summary(),
+                };
+                let entries: Vec<Value> = summary
+                    .into_iter()
+                    .map(|(path, turn_index, edit_type)| {
+                        json!({
+                            "path": self.rollback_display_path(&path),
+                            "turn_index": turn_index,
+                            "edit_type": edit_type_label(edit_type),
+                        })
+                    })
+                    .collect();
+                json!({
+                    "success": true,
+                    "scope": "list",
+                    "total_entries": entries.len(),
+                    "entries": entries,
+                })
+                .to_string()
+            }
+            "file" => {
+                let raw_path = match args.get("path").and_then(Value::as_str) {
+                    Some(path) => path,
+                    None => {
+                        return json!({
+                            "success": false,
+                            "error": "missing 'path' for scope=file",
+                        })
+                        .to_string();
+                    }
+                };
+                let path = match self.resolve_path(raw_path) {
+                    Ok(path) => path,
+                    Err(error) => return error,
+                };
+                let undo_result = match self.file_journal.lock() {
+                    Ok(journal) => journal.undo_file(&path),
+                    Err(poisoned) => poisoned.into_inner().undo_file(&path),
+                };
+                match undo_result {
+                    Ok(Some(edit_type)) => json!({
+                        "success": true,
+                        "scope": "file",
+                        "path": self.rollback_display_path(&path),
+                        "edit_type": edit_type_label(edit_type),
+                        "summary": format!(
+                            "Rolled back the latest recorded edit for {}",
+                            self.rollback_display_path(&path)
+                        ),
+                    })
+                    .to_string(),
+                    Ok(None) => json!({
+                        "success": false,
+                        "scope": "file",
+                        "path": self.rollback_display_path(&path),
+                        "error": "no recorded file edit found for that path",
+                    })
+                    .to_string(),
+                    Err(error) => json!({
+                        "success": false,
+                        "scope": "file",
+                        "path": self.rollback_display_path(&path),
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                }
+            }
+            "turn" | "current_turn" => {
+                let turn_index = if scope == "turn" {
+                    match args.get("turn_index").and_then(Value::as_u64) {
+                        Some(turn_index) => turn_index as u32,
+                        None => {
+                            return json!({
+                                "success": false,
+                                "error": "missing 'turn_index' for scope=turn",
+                            })
+                            .to_string();
+                        }
+                    }
+                } else {
+                    self.journal_turn_index.load(Ordering::Relaxed)
+                };
+                let checkpoint = args
+                    .get("file_after_sequence")
+                    .or_else(|| args.get("after_sequence"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let result = match self.file_journal.lock() {
+                    Ok(journal) => journal.undo_turn_since(turn_index, checkpoint),
+                    Err(poisoned) => poisoned
+                        .into_inner()
+                        .undo_turn_since(turn_index, checkpoint),
+                };
+                let reverted: Vec<String> = result
+                    .reverted
+                    .iter()
+                    .map(|path| self.rollback_display_path(path))
+                    .collect();
+                let failed: Vec<Value> = result
+                    .failed
+                    .iter()
+                    .map(|(path, error)| {
+                        json!({
+                            "path": self.rollback_display_path(path),
+                            "error": error,
+                        })
+                    })
+                    .collect();
+                let success = !reverted.is_empty() && failed.is_empty();
+                let summary = if reverted.is_empty() {
+                    format!("No recorded file edits found for turn {turn_index}")
+                } else if failed.is_empty() {
+                    format!(
+                        "Rolled back {} file edit{} from turn {turn_index}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "Rolled back {} file edit{} from turn {turn_index} with {} failure{}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" },
+                        failed.len(),
+                        if failed.len() == 1 { "" } else { "s" }
+                    )
+                };
+                json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "reverted": reverted,
+                    "failed": failed,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => json!({
+                "success": false,
+                "error": format!(
+                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
+                ),
+            })
+            .to_string(),
         }
     }
 
@@ -575,11 +2971,109 @@ fn uuid_v4_short() -> String {
     format!("{:08x}", (ts & 0xFFFF_FFFF) as u32)
 }
 
+fn edit_type_label(edit_type: EditType) -> &'static str {
+    match edit_type {
+        EditType::Create => "create",
+        EditType::Overwrite => "overwrite",
+        EditType::Patch => "patch",
+        EditType::Delete => "delete",
+    }
+}
+
+fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
+    let parsed = serde_json::from_str::<Value>(&output).ok();
+    let json_error = parsed
+        .as_ref()
+        .and_then(|value| value.get("success").and_then(Value::as_bool))
+        .is_some_and(|success| !success)
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .is_some();
+    if output.starts_with("Error:") || output.starts_with("SANDBOX_DENIED:") || json_error {
+        astra_tools::ToolResult::error(output)
+    } else {
+        astra_tools::ToolResult::text(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
+
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn set_env_var(key: &'static str, value: impl Into<OsString>) -> EnvVarGuard {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value.into());
+        }
+        EnvVarGuard { key, previous }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_mysql(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("mysql");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$*" in
+  *"SELECT current_account_name() AS name"*)
+    printf '+------+\n| name |\n+------+\n| sys  |\n+------+\n'
+    ;;
+  *"CREATE SNAPSHOT"*)
+    printf 'Query OK, 1 row affected\n'
+    ;;
+  *"RESTORE ACCOUNT"*)
+    printf 'Query OK, 1 row affected\n'
+    ;;
+  *"UPDATE metrics SET value = 1"*)
+    printf 'Query OK, 1 row affected\n'
+    ;;
+  *"SELECT 1"*)
+    printf '+---+\n| 1 |\n+---+\n| 1 |\n+---+\n'
+    ;;
+  *)
+    printf 'Query OK, 1 row affected\n'
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
 
     fn test_executor() -> (ServerToolExecutor, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -591,6 +3085,44 @@ mod tests {
             None,
         );
         (exec, dir)
+    }
+
+    fn cleanup_session_artifacts(session_id: &str) {
+        std::fs::remove_dir_all(
+            astra_services::session_journal::local_sessions_dir().join(session_id),
+        )
+        .ok();
+    }
+
+    fn session_state_test_executor(
+        turn_index: u32,
+    ) -> (
+        ServerToolExecutor,
+        TempDir,
+        String,
+        std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let session_id = format!("test-session-{}", uuid::Uuid::new_v4());
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(&session_id, "test-model");
+        workspace.cwd = dir.path().display().to_string();
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let mut exec = ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            session_id.clone(),
+            None,
+            None,
+        );
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::observability_integration::ObservabilitySession::new_simple(&session_id),
+        ));
+        session.write().unwrap().turn_number = turn_index;
+        exec.set_observability_session(session.clone());
+        exec.set_turn_index(turn_index);
+        (exec, dir, session_id, session)
     }
 
     // ── Path traversal security ────────────────────────────────────────
@@ -824,6 +3356,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_file_edits_current_turn_reverts_server_writes() {
+        let (exec, dir) = test_executor();
+        exec.set_turn_index(7);
+
+        let first = exec
+            .execute("write_file", &json!({"path": "a.txt", "content": "A"}))
+            .await;
+        let second = exec
+            .execute("write_file", &json!({"path": "b.txt", "content": "B"}))
+            .await;
+        assert!(first.contains("Successfully wrote"));
+        assert!(second.contains("Successfully wrote"));
+
+        let rollback = exec
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .await;
+        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(
+            rollback_json["success"].as_bool(),
+            Some(true),
+            "got: {rollback}"
+        );
+        assert_eq!(rollback_json["turn_index"].as_u64(), Some(7));
+        assert_eq!(rollback_json["reverted"].as_array().map(Vec::len), Some(2));
+
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_file_edits_file_scope_restores_deleted_file() {
+        let (exec, dir) = test_executor();
+        let target = dir.path().join("gone.txt");
+        std::fs::write(&target, "restore me").unwrap();
+
+        let deleted = exec
+            .execute("delete_file", &json!({"path": "gone.txt"}))
+            .await;
+        assert!(deleted.contains("Successfully deleted"));
+        assert!(!target.exists());
+
+        let rollback = exec
+            .execute(
+                "rollback_file_edits",
+                &json!({"scope": "file", "path": "gone.txt"}),
+            )
+            .await;
+        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(
+            rollback_json["success"].as_bool(),
+            Some(true),
+            "got: {rollback}"
+        );
+        assert_eq!(rollback_json["scope"].as_str(), Some("file"));
+        assert_eq!(rollback_json["path"].as_str(), Some("gone.txt"));
+        assert_eq!(rollback_json["edit_type"].as_str(), Some("delete"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "restore me");
+    }
+
+    #[tokio::test]
     async fn list_dir_shows_files_and_dirs() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
@@ -962,6 +3554,169 @@ mod tests {
         // Request 999 — should be capped at 100
         let result = exec.execute("git_log", &json!({"n": 999})).await;
         assert!(result.contains("initial"));
+    }
+
+    #[tokio::test]
+    async fn rollback_database_snapshots_snapshot_scope_requires_snapshot_id() {
+        let (exec, _dir) = test_executor();
+        let value: Value =
+            serde_json::from_str(&exec.rollback_database_snapshots(&json!({"scope": "snapshot"})))
+                .expect("rollback_database_snapshots json");
+        assert_eq!(value["success"].as_bool(), Some(false));
+        assert_eq!(value["scope"].as_str(), Some("snapshot"));
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing 'snapshot_id'")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mo_query_records_snapshot_and_rollback_restores_current_turn() {
+        let _guard = env_guard();
+        let fake_bin = TempDir::new().unwrap();
+        write_fake_mysql(fake_bin.path());
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let joined = std::env::join_paths(
+            std::iter::once(fake_bin.path().to_path_buf()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        let _path_guard = set_env_var("PATH", joined);
+
+        let (exec, _dir) = test_executor();
+        exec.set_turn_index(11);
+
+        let result = exec
+            .execute_with_metadata("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
+            .await;
+        assert!(!result.is_error, "got: {}", result.output);
+        let fields = result.metadata.as_ref().expect("mo_query metadata");
+        assert!(
+            fields["pre_state_snapshot_id"]
+                .as_str()
+                .is_some_and(|snapshot_id| snapshot_id.starts_with("moq_"))
+        );
+        let expected_database =
+            astra_core::resolve_matrixone_database_name(&|key| std::env::var(key).ok());
+        assert_eq!(
+            fields["pre_state_snapshot_database"].as_str(),
+            Some(expected_database.as_str())
+        );
+
+        let rollback = exec
+            .execute(
+                "rollback_database_snapshots",
+                &json!({"scope": "current_turn"}),
+            )
+            .await;
+        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(
+            rollback_json["success"].as_bool(),
+            Some(true),
+            "got: {rollback}"
+        );
+        assert_eq!(rollback_json["turn_index"].as_u64(), Some(11));
+        assert_eq!(rollback_json["restored"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn rollback_session_state_current_turn_restores_server_self_mod_and_tasks() {
+        let (exec, _dir, session_id, session) = session_state_test_executor(13);
+        let original_top_k = session.read().unwrap().config.memory.retrieval_top_k;
+        let new_top_k = if original_top_k < 20 {
+            original_top_k + 1
+        } else {
+            original_top_k.saturating_sub(1)
+        };
+
+        let adjust: Value = serde_json::from_str(
+            &exec
+                .execute(
+                    "adjust_config",
+                    &json!({"path": "memory.retrieval_top_k", "value": new_top_k}),
+                )
+                .await,
+        )
+        .unwrap();
+        assert_eq!(adjust["status"].as_str(), Some("ok"));
+
+        let prioritize: Value = serde_json::from_str(
+            &exec
+                .execute("prioritize_tool", &json!({"tool": "bash"}))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(prioritize["status"].as_str(), Some("ok"));
+
+        let goal: Value = serde_json::from_str(
+            &exec
+                .execute("set_goal", &json!({"goal": "ship parity"}))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(goal["status"].as_str(), Some("ok"));
+
+        let compress: Value = serde_json::from_str(
+            &exec
+                .execute("compress_context", &json!({"reason": "manual"}))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(compress["status"].as_str(), Some("ok"));
+
+        let created: Value =
+            serde_json::from_str(&exec.execute("task_create", &json!({"title": "demo"})).await)
+                .unwrap();
+        let task_id = created["task_id"].as_str().unwrap().to_string();
+
+        let updated: Value = serde_json::from_str(
+            &exec
+                .execute(
+                    "task_update",
+                    &json!({"task_id": task_id.as_str(), "status": "in_progress"}),
+                )
+                .await,
+        )
+        .unwrap();
+        assert_eq!(updated["success"].as_bool(), Some(true));
+
+        let stopped: Value = serde_json::from_str(
+            &exec
+                .execute(
+                    "task_stop",
+                    &json!({"task_id": task_id.as_str(), "reason": "rollback test"}),
+                )
+                .await,
+        )
+        .unwrap();
+        assert_eq!(stopped["success"].as_bool(), Some(true));
+
+        let rollback: Value =
+            serde_json::from_str(&exec.execute("rollback_session_state", &json!({})).await)
+                .unwrap();
+        assert_eq!(rollback["success"].as_bool(), Some(true), "got: {rollback}");
+        assert_eq!(rollback["turn_index"].as_u64(), Some(13));
+        assert_eq!(rollback["restored"].as_array().map(Vec::len), Some(7));
+
+        let session = session.read().unwrap();
+        assert_eq!(session.config.memory.retrieval_top_k, original_top_k);
+        assert!(session.original_query.is_none());
+        assert!(session.goal_tracker.is_none());
+        assert!(session.compressed_turns.is_empty());
+        drop(session);
+
+        let task_list = exec.execute("task_list", &json!({})).await;
+        assert!(task_list.contains("No tasks found"));
+
+        let workspace = astra_services::session_workspace::read_workspace(&session_id).unwrap();
+        assert!(workspace.session_goal.is_none());
+        assert!(workspace.pinned_tools.is_empty());
+        assert!(workspace.deprioritized_tools.is_empty());
+        assert!(workspace.tuned_config_json.is_none());
+
+        cleanup_session_artifacts(&session_id);
     }
 
     // ── Memory tool user isolation ─────────────────────────────────────

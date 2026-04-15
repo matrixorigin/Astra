@@ -225,12 +225,32 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use serde_json::json;
 
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
     use crate::turn::sse_stream_host::EdgeToolExecResult;
+
+    fn init_git_repo(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
 
     struct PipelineHarness {
         api: ThinClient,
@@ -284,9 +304,19 @@ mod tests {
         }
 
         fn pipeline(&mut self) -> HeadlessToolExecutionPipeline<'_, EdgeToolExecResult> {
+            self.pipeline_with_server_executor(0, None)
+        }
+
+        fn pipeline_with_server_executor<'a>(
+            &'a mut self,
+            turn_index: usize,
+            server_tool_executor: Option<
+                &'a crate::server::server_tool_executor::ServerToolExecutor,
+            >,
+        ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             HeadlessToolExecutionPipeline::new(
                 HeadlessToolExecutionCtx {
-                    turn_index: 0,
+                    turn_index,
                     quiet: true,
                     api: &self.api,
                     token: "",
@@ -313,7 +343,7 @@ mod tests {
                     permission_context: None,
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
-                    server_tool_executor: None,
+                    server_tool_executor,
                 },
                 vec![false; self.edge_tool_round.len()],
             )
@@ -445,6 +475,103 @@ mod tests {
             pipeline.ctx.tool_results[0]
                 .to_string()
                 .contains("hooked result")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_fallback_sets_turn_index_for_current_turn_rollback() {
+        let mut harness = PipelineHarness::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let mut pipeline = harness.pipeline_with_server_executor(7, Some(&server_exec));
+        let args = json!({"path": "turn.txt", "content": "hello"});
+        let permitted = PermittedExecution {
+            execution: HeadlessResolvedExecution {
+                id: "call-1".into(),
+                name: "write_file".into(),
+                args: args.clone(),
+                result_str: "Error: headless edge protocol: no matching edge result".into(),
+                tool_result_fields: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                early_exit_ms: 0,
+            },
+            idem_key: IdempotencyKey::semantic("write_file", &args),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err);
+        assert!(dir.path().join("turn.txt").exists());
+
+        let rollback = server_exec
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .await;
+        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(
+            rollback_json["success"].as_bool(),
+            Some(true),
+            "got: {rollback}"
+        );
+        assert_eq!(rollback_json["turn_index"].as_u64(), Some(7));
+        assert_eq!(rollback_json["reverted"].as_array().map(Vec::len), Some(1));
+        assert!(!dir.path().join("turn.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn server_fallback_preserves_tool_result_fields() {
+        let mut harness = PipelineHarness::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "hello\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
+        let args = json!({"message": "initial"});
+        let permitted = PermittedExecution {
+            execution: HeadlessResolvedExecution {
+                id: "call-git-commit".into(),
+                name: "git_commit".into(),
+                args: args.clone(),
+                result_str: "Error: headless edge protocol: no matching edge result".into(),
+                tool_result_fields: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                early_exit_ms: 0,
+            },
+            idem_key: IdempotencyKey::semantic("git_commit", &args),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        let result_fields = executed
+            .execution
+            .tool_result_fields
+            .as_ref()
+            .expect("server fallback metadata");
+        assert!(result_fields["commit_sha"].as_str().is_some());
+        pipeline.record_execution(executed).await;
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("\"commit_sha\""),
+            "got: {}",
+            pipeline.ctx.tool_results[0]
         );
     }
 }
