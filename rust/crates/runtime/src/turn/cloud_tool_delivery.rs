@@ -141,9 +141,23 @@ fn parse_cloud_approval_outcome_with_decision(
 }
 
 fn denied_tool_content(reason: Option<&str>) -> String {
+    let mut parts = vec![
+        "The user REJECTED this tool call. The tool was NOT executed.",
+    ];
+    let feedback_line;
+    if let Some(r) = reason.filter(|s| !s.is_empty()) {
+        feedback_line = format!("User feedback: \"{r}\"");
+        parts.push(&feedback_line);
+    }
+    parts.push(
+        "IMPORTANT: Do NOT retry this exact approach. \
+         Ask the user how to proceed, or try a safer alternative.",
+    );
+    let directive = parts.join("\n");
     json!({
         "error": "user_denied",
         "reason": reason.unwrap_or(""),
+        "directive": directive,
     })
     .to_string()
 }
@@ -1217,12 +1231,17 @@ mod tests {
         let s = denied_tool_content(Some("policy violation"));
         assert!(s.contains("user_denied"));
         assert!(s.contains("policy violation"));
+        assert!(s.contains("REJECTED"));
+        assert!(s.contains("Do NOT retry"));
     }
 
     #[test]
     fn denied_tool_content_without_reason() {
         let s = denied_tool_content(None);
         assert!(s.contains("user_denied"));
+        assert!(s.contains("REJECTED"));
+        // No "User feedback" line when reason is absent
+        assert!(!s.contains("User feedback"));
     }
 
     // ──────────────────────────────────────────────────────────

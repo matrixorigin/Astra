@@ -101,6 +101,38 @@ pub fn implicit_feedback_rating(signal_type: &str) -> i64 {
     }
 }
 
+/// Build a context injection message for negative implicit feedback signals.
+/// Returns `Some(directive)` for correction/frustration/rephrasing; `None` for positive/neutral.
+pub fn implicit_feedback_context_injection(signal: &ImplicitSignal) -> Option<String> {
+    match signal.signal_type.as_str() {
+        "correction" => Some(format!(
+            "[Session Feedback] The user's message suggests the previous response was incorrect or off-target.\n\
+             Signal: correction (confidence: {:.1})\n\
+             Be more careful, double-check assumptions, and consider asking clarifying questions before acting.",
+            signal.confidence
+        )),
+        "frustration" => Some(format!(
+            "[Session Feedback] The user expressed dissatisfaction with the previous response.\n\
+             Signal: frustration (confidence: {:.1})\n\
+             Slow down, acknowledge the issue, and adjust your approach. Ask what would help.",
+            signal.confidence
+        )),
+        "rephrasing" => Some(format!(
+            "[Session Feedback] The user is rephrasing their request, suggesting the previous response missed the point.\n\
+             Signal: rephrasing (confidence: {:.1})\n\
+             Pay close attention to what they're emphasizing differently this time.",
+            signal.confidence
+        )),
+        "clarification" => Some(format!(
+            "[Session Feedback] The user is asking for more detail or specificity.\n\
+             Signal: clarification (confidence: {:.1})\n\
+             Provide more concrete examples or step-by-step detail.",
+            signal.confidence
+        )),
+        _ => None, // positive, neutral, unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +568,54 @@ mod tests {
     fn evidence_empty_on_neutral() {
         let s = detect("just a normal question");
         assert!(s.evidence.is_empty());
+    }
+
+    // ── Context injection ───────────────────────────────────────────
+
+    #[test]
+    fn context_injection_correction() {
+        let signal = ImplicitSignal {
+            signal_type: "correction".to_string(),
+            confidence: 0.9,
+            evidence: String::new(),
+        };
+        let ctx = implicit_feedback_context_injection(&signal);
+        assert!(ctx.is_some());
+        let text = ctx.unwrap();
+        assert!(text.contains("[Session Feedback]"));
+        assert!(text.contains("correction"));
+        assert!(text.contains("0.9"));
+    }
+
+    #[test]
+    fn context_injection_frustration() {
+        let signal = ImplicitSignal {
+            signal_type: "frustration".to_string(),
+            confidence: 0.7,
+            evidence: String::new(),
+        };
+        let ctx = implicit_feedback_context_injection(&signal);
+        assert!(ctx.is_some());
+        assert!(ctx.unwrap().contains("dissatisfaction"));
+    }
+
+    #[test]
+    fn context_injection_neutral_returns_none() {
+        let signal = ImplicitSignal {
+            signal_type: "neutral".to_string(),
+            confidence: 0.3,
+            evidence: String::new(),
+        };
+        assert!(implicit_feedback_context_injection(&signal).is_none());
+    }
+
+    #[test]
+    fn context_injection_positive_returns_none() {
+        let signal = ImplicitSignal {
+            signal_type: "positive".to_string(),
+            confidence: 0.6,
+            evidence: String::new(),
+        };
+        assert!(implicit_feedback_context_injection(&signal).is_none());
     }
 }
