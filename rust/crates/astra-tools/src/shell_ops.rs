@@ -64,7 +64,7 @@ struct GrepRequest<'a> {
     workspace_root: &'a Path,
     target: &'a str,
     pattern: &'a str,
-    include: Option<&'a str>,
+    include_globs: Vec<String>,
     case_sensitive: bool,
     context_lines: Option<usize>,
     max_matches: Option<usize>,
@@ -140,7 +140,26 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         Err(e) => return ToolResult::error(e),
     };
     let target = relative_search_target(workspace_root, &resolved);
-    let include = args.get("include").and_then(|v| v.as_str());
+    let mut include_globs = Vec::new();
+    if let Some(value) = args.get("include") {
+        match parse_search_globs(value, "include") {
+            Ok(globs) => include_globs.extend(globs),
+            Err(e) => return ToolResult::error(e),
+        }
+    }
+    if let Some(value) = args.get("glob") {
+        match parse_search_globs(value, "glob") {
+            Ok(globs) => include_globs.extend(globs),
+            Err(e) => return ToolResult::error(e),
+        }
+    }
+    if let Some(value) = args.get("type") {
+        match parse_search_type_globs(value) {
+            Ok(globs) => include_globs.extend(globs),
+            Err(e) => return ToolResult::error(e),
+        }
+    }
+    dedup_preserve_order(&mut include_globs);
     let case_sensitive = args
         .get("case_sensitive")
         .and_then(|v| v.as_bool())
@@ -171,7 +190,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         workspace_root,
         target: &target,
         pattern,
-        include,
+        include_globs,
         case_sensitive,
         context_lines,
         max_matches,
@@ -209,7 +228,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         }
         if timed_out {
             return ToolResult::error(
-                "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include', or a more specific pattern.".into(),
+                "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
             );
         }
 
@@ -273,7 +292,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     } else if timed_out {
         if !result_text.is_empty() {
             result_text.push_str(
-                "\n\n[grep timed out after 20s — showing partial results. Narrow the search with 'path' or 'include'.]",
+                "\n\n[grep timed out after 20s — showing partial results. Narrow the search with 'path', 'include'/'glob', or 'type'.]",
             );
         } else {
             result_text = "[grep timed out after 20s — no partial results captured]".into();
@@ -440,6 +459,92 @@ fn parse_search_output_mode(args: &Value) -> Result<SearchOutputMode, String> {
     }
 }
 
+fn parse_search_globs(value: &Value, arg_name: &str) -> Result<Vec<String>, String> {
+    match value {
+        Value::String(glob) => parse_single_search_glob(glob, arg_name).map(|glob| vec![glob]),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(glob) => parse_single_search_glob(glob, arg_name),
+                None => Err(format!(
+                    "Error: '{arg_name}' entries must be strings when provided as an array."
+                )),
+            })
+            .collect(),
+        _ => Err(format!(
+            "Error: '{arg_name}' must be a string or array of strings."
+        )),
+    }
+}
+
+fn parse_single_search_glob(glob: &str, arg_name: &str) -> Result<String, String> {
+    let trimmed = glob.trim();
+    if trimmed.is_empty() {
+        return Err(format!("Error: '{arg_name}' must not be empty."));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_search_type_globs(value: &Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::String(name) => Ok(search_type_globs(name)?
+            .iter()
+            .map(|glob| (*glob).to_string())
+            .collect()),
+        Value::Array(items) => {
+            let mut globs = Vec::new();
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(
+                        "Error: 'type' entries must be strings when provided as an array.".into(),
+                    );
+                };
+                globs.extend(
+                    search_type_globs(name)?
+                        .iter()
+                        .map(|glob| (*glob).to_string()),
+                );
+            }
+            Ok(globs)
+        }
+        _ => Err("Error: 'type' must be a string or array of strings.".into()),
+    }
+}
+
+fn search_type_globs(type_name: &str) -> Result<&'static [&'static str], String> {
+    let normalized = type_name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "rust" | "rs" => Ok(&["*.rs"]),
+        "python" | "py" => Ok(&["*.py"]),
+        "typescript" => Ok(&["*.ts", "*.tsx", "*.mts", "*.cts"]),
+        "ts" => Ok(&["*.ts", "*.mts", "*.cts"]),
+        "tsx" | "typescriptreact" => Ok(&["*.tsx"]),
+        "javascript" => Ok(&["*.js", "*.jsx", "*.mjs", "*.cjs"]),
+        "js" => Ok(&["*.js", "*.mjs", "*.cjs"]),
+        "jsx" | "javascriptreact" => Ok(&["*.jsx"]),
+        "go" => Ok(&["*.go"]),
+        "java" => Ok(&["*.java"]),
+        "c" => Ok(&["*.c", "*.h"]),
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
+            Ok(&["*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hxx", "*.hh"])
+        }
+        "ruby" | "rb" => Ok(&["*.rb"]),
+        "shell" | "sh" | "bash" => Ok(&["*.sh", "*.bash"]),
+        "json" => Ok(&["*.json"]),
+        "yaml" | "yml" => Ok(&["*.yaml", "*.yml"]),
+        "toml" => Ok(&["*.toml"]),
+        "markdown" | "md" => Ok(&["*.md"]),
+        _ => Err(format!(
+            "Error: unsupported grep type '{type_name}'. Use a common type like rust, python, typescript, tsx, javascript, jsx, go, java, c, cpp, ruby, shell, json, yaml, toml, or markdown."
+        )),
+    }
+}
+
+fn dedup_preserve_order(values: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
 async fn run_grep_with_rg(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
@@ -475,7 +580,7 @@ async fn run_grep_with_rg(
     if let Some(max) = request.max_matches {
         cmd.arg("-m").arg(max.to_string());
     }
-    if let Some(include) = request.include {
+    for include in &request.include_globs {
         cmd.arg("-g").arg(include);
     }
     append_default_rg_excludes(&mut cmd);
@@ -516,7 +621,7 @@ async fn run_grep_with_grep(
     if let Some(max) = request.max_matches {
         cmd.arg(format!("-m{max}"));
     }
-    if let Some(include) = request.include {
+    for include in &request.include_globs {
         cmd.arg("--include").arg(include);
     }
     append_default_grep_excludes(&mut cmd);
@@ -990,6 +1095,80 @@ mod tests {
         assert!(
             result.output.contains("// in alpha"),
             "expected scope annotation, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_glob_alias_filters_files() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("keep.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(dir.path().join("skip.py"), "needle = 1\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "glob": "*.rs"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(result.output.contains("keep.rs"), "got: {}", result.output);
+        assert!(
+            !result.output.contains("skip.py"),
+            "glob alias should filter non-matching files: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_type_filter_limits_results() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("main.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(dir.path().join("main.py"), "needle = 1\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "type": "python"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(result.output.contains("main.py"), "got: {}", result.output);
+        assert!(
+            !result.output.contains("main.rs"),
+            "type filter should exclude other languages: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_unknown_type_filter() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "type": "elixir"
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "unexpected success: {}", result.output);
+        assert!(
+            result.output.contains("unsupported grep type"),
+            "got: {}",
             result.output
         );
     }

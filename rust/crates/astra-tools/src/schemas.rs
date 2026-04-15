@@ -347,6 +347,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "pattern": {"type": "string", "description": "Regex pattern to search for"},
                         "path": {"type": "string", "description": "Directory or file to search (default: project root)"},
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs'"},
+                        "glob": {"type": "string", "description": "Alias of include using ripgrep-style glob syntax, e.g. '**/*.rs'"},
+                        "type": {"type": "string", "description": "Common file type filter, e.g. rust, python, typescript, tsx, javascript, jsx, go, java, c, cpp, ruby, shell, json, yaml, toml, markdown"},
                         "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
                         "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
                         "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
