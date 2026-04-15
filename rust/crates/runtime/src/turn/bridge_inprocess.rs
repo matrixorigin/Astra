@@ -1422,6 +1422,9 @@ pub struct InProcessChatTurnBridge {
     pub turn_learning_writer: Option<Arc<dyn crate::TurnLearningWriter>>,
     /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
     pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    /// Session-scoped structured feedback store — accumulates correction rules
+    /// and injects them into subsequent turn system prompts.
+    pub feedback_store: Arc<crate::pipeline::feedback_store::FeedbackStore>,
 }
 
 impl InProcessChatTurnBridge {
@@ -1432,6 +1435,7 @@ impl InProcessChatTurnBridge {
             shared_pool: None,
             turn_learning_writer: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            feedback_store: Arc::new(crate::pipeline::feedback_store::FeedbackStore::new()),
         }
     }
 
@@ -1549,6 +1553,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
         let client_cancel_capture = client_cancel.clone();
+        let feedback_store_capture = self.feedback_store.clone();
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
@@ -1821,18 +1826,37 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // ── Implicit feedback detection: inject correction/frustration context ──
             // When user expresses dissatisfaction (correction, frustration, rephrasing),
             // inject a directive so the model adjusts its approach immediately.
+            let feedback_store = feedback_store_capture.clone();
             let implicit_feedback_hint = {
                 let signal = crate::turn::implicit_feedback::detect_implicit_feedback_signal(
                     user_content_for_signal,
                     latest_assistant_message_text(&messages),
                 );
+                // Attempt heuristic structured feedback extraction and store it
+                if let Some(fb) = crate::pipeline::feedback_extraction::heuristic_extract(
+                    user_content_for_signal,
+                    &signal.signal_type,
+                    signal.confidence,
+                ) {
+                    feedback_store.add(fb);
+                }
                 crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
                     .map(|s| format!("\n\n{s}"))
                     .unwrap_or_default()
             };
 
-            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{self_awareness_hint}");
+            // ── Learned feedback rules: inject accumulated correction rules ──
+            let feedback_rules_hint = {
+                let injection = feedback_store.build_injection();
+                if injection.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n{injection}")
+                }
+            };
+
+            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;

@@ -229,3 +229,100 @@ fn malformed_llm_response_produces_nothing() {
     assert!(parse_extraction_response("", "correction", 0.9).is_none());
     assert!(parse_extraction_response(r#"{"rule": ""}"#, "correction", 0.9).is_none());
 }
+
+// ─── Bridge wiring: FeedbackStore on InProcessChatTurnBridge ────────────────
+
+#[test]
+fn bridge_feedback_store_is_shared_across_clones() {
+    use astra_runtime::turn::bridge_inprocess::InProcessChatTurnBridge;
+    use astra_runtime::FernetTokenEncryptor;
+
+    let encryptor = std::sync::Arc::new(
+        FernetTokenEncryptor::new("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=")
+            .unwrap(),
+    );
+    let matrixone = astra_runtime::MatrixOneSettings {
+        host: "localhost".into(),
+        port: 6001,
+        user: "test".into(),
+        password: "test".into(),
+        database: "test".into(),
+    };
+    let bridge = InProcessChatTurnBridge::new(matrixone, encryptor);
+
+    // Clone the bridge (as happens when shared across turns)
+    let bridge2 = bridge.clone();
+
+    // Add feedback via one clone
+    bridge.feedback_store.add(astra_turn_types::StructuredFeedback {
+        rule: "don't use mocks".into(),
+        reason: "Not stated".into(),
+        apply_when: "General".into(),
+        source_signal: "correction".into(),
+        confidence: 0.9,
+    });
+
+    // Verify visible from the other clone (Arc sharing)
+    assert_eq!(bridge2.feedback_store.len(), 1);
+    let injection = bridge2.feedback_store.build_injection();
+    assert!(injection.contains("don't use mocks"));
+}
+
+#[test]
+fn bridge_feedback_store_starts_empty() {
+    use astra_runtime::turn::bridge_inprocess::InProcessChatTurnBridge;
+    use astra_runtime::FernetTokenEncryptor;
+
+    let encryptor = std::sync::Arc::new(
+        FernetTokenEncryptor::new("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=")
+            .unwrap(),
+    );
+    let matrixone = astra_runtime::MatrixOneSettings {
+        host: "localhost".into(),
+        port: 6001,
+        user: "test".into(),
+        password: "test".into(),
+        database: "test".into(),
+    };
+    let bridge = InProcessChatTurnBridge::new(matrixone, encryptor);
+
+    assert!(bridge.feedback_store.is_empty());
+    assert!(bridge.feedback_store.build_injection().is_empty());
+}
+
+#[test]
+fn bridge_feedback_store_accumulates_across_simulated_turns() {
+    use astra_runtime::pipeline::feedback_store::FeedbackStore;
+    use astra_runtime::pipeline::feedback_extraction::heuristic_extract;
+    use astra_runtime::turn::implicit_feedback::detect_implicit_feedback_signal;
+
+    let store = std::sync::Arc::new(FeedbackStore::new());
+
+    // Simulate 3 turns with corrections
+    let corrections = [
+        ("wrong, don't use mocks in tests", "don't use mocks in tests"),
+        ("incorrect, never force push on main", "never force push on main"),
+        ("that's not right, stop using SELECT *", "stop using SELECT *"),
+    ];
+
+    for (user_msg, directive) in &corrections {
+        let signal = detect_implicit_feedback_signal(user_msg, Some("prior response"));
+        // Only process if signal detected a correction
+        if signal.signal_type == "correction" || signal.signal_type == "frustration" {
+            if let Some(fb) = heuristic_extract(directive, &signal.signal_type, signal.confidence) {
+                store.add(fb);
+            }
+        }
+    }
+
+    assert_eq!(store.len(), 3);
+    let injection = store.build_injection();
+    assert!(injection.contains("don't use mocks"));
+    assert!(injection.contains("never force push"));
+    assert!(injection.contains("stop using SELECT"));
+
+    // Verify the injection is a single block suitable for system prompt
+    assert!(injection.starts_with("[Learned Feedback Rules]"));
+    let line_count = injection.lines().count();
+    assert_eq!(line_count, 4, "header + 3 rules = 4 lines, got {line_count}");
+}
