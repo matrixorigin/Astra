@@ -58,6 +58,8 @@ pub struct ServerSkillSubRunExecutor {
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Session ID for the parent run.
     session_id: String,
+    /// Edge connection pool for routing tool calls to connected edges.
+    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -76,6 +78,7 @@ impl ServerSkillSubRunExecutor {
             skill_resolver: None,
             cancel_token: None,
             session_id,
+            edge_connection_pool: None,
         }
     }
 
@@ -113,6 +116,40 @@ impl ServerSkillSubRunExecutor {
     ) -> Self {
         self.cancel_token = token;
         self
+    }
+
+    pub fn with_edge_connection_pool(
+        mut self,
+        pool: super::edge_connection_pool::EdgeConnectionPool,
+    ) -> Self {
+        self.edge_connection_pool = Some(pool);
+        self
+    }
+}
+
+impl ServerSkillSubRunExecutor {
+    /// Provision a workspace directory for a skill sub-run.
+    fn provision_skill_workspace(&self, skill_name: &str, session_id: &str) -> std::path::PathBuf {
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect()
+        };
+        let safe_session = sanitize(session_id);
+        let safe_skill = sanitize(skill_name);
+        assert!(!safe_session.is_empty(), "session_id must be non-empty");
+
+        let base = std::env::var("ASTRA_SERVER_WORKSPACES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
+        let dir_name = if safe_skill.is_empty() {
+            safe_session.clone()
+        } else {
+            format!("{}-skill-{}", safe_session, safe_skill)
+        };
+        let workspace = base.join(&dir_name);
+        let _ = std::fs::create_dir_all(&workspace);
+        workspace
     }
 }
 
@@ -304,6 +341,23 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
         };
+
+        // ── Wire ServerToolExecutor for skill sub-run tool execution ────
+        {
+            let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id);
+            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let mut executor = super::server_tool_executor::ServerToolExecutor::new(
+                workspace,
+                String::new(), // skill sub-runs don't track user_id
+                subrun_session_id.clone(),
+                memoria_base,
+                None,
+            );
+            if let Some(pool) = &self.edge_connection_pool {
+                executor.set_edge_connection_pool(pool.clone());
+            }
+            state.server_tool_executor = Some(std::sync::Arc::new(executor));
+        }
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
             return Err(format!(
