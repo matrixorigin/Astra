@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
@@ -267,13 +268,9 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         multiline,
     };
 
-    let command_output = if request.multiline {
-        run_grep_multiline_locally(&request, ctx.cancel_token.as_deref()).await
-    } else if ripgrep_available() {
-        run_grep_with_rg(&request, ctx.cancel_token.as_deref()).await
-    } else {
-        run_grep_with_grep(&request, ctx.cancel_token.as_deref()).await
-    };
+    let command_output =
+        run_grep_with_preferred_backend(&request, ctx.cancel_token.as_deref(), ripgrep_available())
+            .await;
 
     let ReadOnlyCommandOutput {
         stdout,
@@ -443,17 +440,14 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         };
     }
 
-    let command_output = if ripgrep_available() {
-        run_glob_with_rg(
-            workspace_root,
-            &target,
-            pattern,
-            ctx.cancel_token.as_deref(),
-        )
-        .await
-    } else {
-        run_glob_with_find(workspace_root, &target, ctx.cancel_token.as_deref()).await
-    };
+    let command_output = run_glob_with_preferred_backend(
+        workspace_root,
+        &target,
+        pattern,
+        ctx.cancel_token.as_deref(),
+        ripgrep_available(),
+    )
+    .await;
 
     let ReadOnlyCommandOutput {
         stdout,
@@ -519,15 +513,60 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
 }
 
 fn ripgrep_available() -> bool {
-    *RIPGREP_AVAILABLE.get_or_init(|| {
-        StdCommand::new("rg")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    })
+    *RIPGREP_AVAILABLE.get_or_init(|| probe_ripgrep_command("rg"))
+}
+
+fn probe_ripgrep_command(program: &str) -> bool {
+    let probe_root = std::env::temp_dir().join(format!("astra-rg-probe-{}", Uuid::new_v4()));
+    let probed = (|| {
+        std::fs::create_dir_all(&probe_root).ok()?;
+        std::fs::write(probe_root.join("probe.txt"), "needle\n").ok()?;
+
+        if !run_ripgrep_probe(
+            program,
+            &probe_root,
+            &["--files", "--hidden", "-g", "*.txt", "."],
+            "probe.txt",
+        ) {
+            return Some(false);
+        }
+
+        Some(run_ripgrep_probe(
+            program,
+            &probe_root,
+            &[
+                "--line-number",
+                "--with-filename",
+                "--color",
+                "never",
+                "--max-columns",
+                "500",
+                "--max-columns-preview",
+                "-e",
+                "needle",
+                "--",
+                "probe.txt",
+            ],
+            "probe.txt:1:needle",
+        ))
+    })()
+    .unwrap_or(false);
+
+    let _ = std::fs::remove_dir_all(&probe_root);
+    probed
+}
+
+fn run_ripgrep_probe(program: &str, cwd: &Path, args: &[&str], expected: &str) -> bool {
+    StdCommand::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected)
+        })
+        .unwrap_or(false)
 }
 
 fn resolve_existing_search_path(
@@ -985,11 +1024,12 @@ fn build_search_regex(request: &GrepRequest<'_>, multiline: bool) -> Result<rege
         .map_err(|e| format!("Error: invalid regex: {e}"))
 }
 
-async fn run_grep_with_rg(
+async fn run_grep_with_rg_program(
+    program: &str,
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
-    let mut cmd = Command::new("rg");
+    let mut cmd = Command::new(program);
     cmd.current_dir(request.workspace_root)
         .kill_on_drop(true)
         .arg("--hidden")
@@ -1039,6 +1079,36 @@ async fn run_grep_with_rg(
 
     run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT, cancel_token)
         .await
+}
+
+async fn run_grep_with_preferred_backend(
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+    prefer_rg: bool,
+) -> Result<ReadOnlyCommandOutput, String> {
+    run_grep_with_preferred_backend_program("rg", request, cancel_token, prefer_rg).await
+}
+
+async fn run_grep_with_preferred_backend_program(
+    program: &str,
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+    prefer_rg: bool,
+) -> Result<ReadOnlyCommandOutput, String> {
+    if request.multiline {
+        return run_grep_multiline_locally(request, cancel_token).await;
+    }
+    if !prefer_rg {
+        return run_grep_with_grep(request, cancel_token).await;
+    }
+
+    match run_grep_with_rg_program(program, request, cancel_token).await {
+        Ok(output) if should_fallback_from_rg_grep_output(&output) => {
+            run_grep_with_grep(request, cancel_token).await
+        }
+        Ok(output) => Ok(output),
+        Err(_) => run_grep_with_grep(request, cancel_token).await,
+    }
 }
 
 async fn run_grep_with_grep(
@@ -1412,14 +1482,15 @@ fn append_output_chunk(output: &mut String, chunk: &str, max_bytes: usize, cappe
     append_capped(output, chunk, max_bytes, capped);
 }
 
-async fn run_glob_with_rg(
+async fn run_glob_with_rg_program(
+    program: &str,
     workspace_root: &Path,
     target: &str,
     pattern: &str,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
     let shell_target = shell_safe_search_target(target);
-    let mut cmd = Command::new("rg");
+    let mut cmd = Command::new(program);
     cmd.current_dir(workspace_root)
         .kill_on_drop(true)
         .arg("--files")
@@ -1429,6 +1500,45 @@ async fn run_glob_with_rg(
 
     run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT, cancel_token)
         .await
+}
+
+async fn run_glob_with_preferred_backend(
+    workspace_root: &Path,
+    target: &str,
+    pattern: &str,
+    cancel_token: Option<&CancellationToken>,
+    prefer_rg: bool,
+) -> Result<ReadOnlyCommandOutput, String> {
+    run_glob_with_preferred_backend_program(
+        "rg",
+        workspace_root,
+        target,
+        pattern,
+        cancel_token,
+        prefer_rg,
+    )
+    .await
+}
+
+async fn run_glob_with_preferred_backend_program(
+    program: &str,
+    workspace_root: &Path,
+    target: &str,
+    pattern: &str,
+    cancel_token: Option<&CancellationToken>,
+    prefer_rg: bool,
+) -> Result<ReadOnlyCommandOutput, String> {
+    if !prefer_rg {
+        return run_glob_with_find(workspace_root, target, cancel_token).await;
+    }
+
+    match run_glob_with_rg_program(program, workspace_root, target, pattern, cancel_token).await {
+        Ok(output) if output.exit_code > 1 && !output.timed_out && !output.cancelled => {
+            run_glob_with_find(workspace_root, target, cancel_token).await
+        }
+        Ok(output) => Ok(output),
+        Err(_) => run_glob_with_find(workspace_root, target, cancel_token).await,
+    }
 }
 
 async fn run_glob_with_find(
@@ -1482,6 +1592,20 @@ fn append_default_grep_excludes(cmd: &mut Command) {
     for dir in DEFAULT_SEARCH_EXCLUDE_DIRS {
         cmd.arg("--exclude-dir").arg(dir);
     }
+}
+
+fn should_fallback_from_rg_grep_output(output: &ReadOnlyCommandOutput) -> bool {
+    output.exit_code > 1
+        && !output.timed_out
+        && !output.cancelled
+        && !looks_like_rg_regex_error(&output.stderr)
+}
+
+fn looks_like_rg_regex_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("regex parse error")
+        || lower.contains("error parsing regex")
+        || lower.contains("pcre2")
 }
 
 fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<usize>) {
@@ -1830,6 +1954,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn write_fake_rg_script(dir: &Path, body: &str) -> PathBuf {
+        let script = dir.join("fake-rg");
+        std::fs::write(&script, format!("#!/usr/bin/env bash\nset -eu\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
 
     #[tokio::test]
     async fn grep_default_head_limit_applies() {
@@ -1911,6 +2047,125 @@ mod tests {
             result.output.contains("// in alpha"),
             "expected scope annotation, got: {}",
             result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ripgrep_probe_accepts_supported_backend() {
+        let bin_dir = tempdir().unwrap();
+        let fake_rg = write_fake_rg_script(
+            bin_dir.path(),
+            r#"
+for arg in "$@"; do
+  if [ "$arg" = "--files" ]; then
+    printf 'probe.txt\n'
+    exit 0
+  fi
+done
+printf 'probe.txt:1:needle\n'
+"#,
+        );
+
+        assert!(
+            probe_ripgrep_command(fake_rg.to_str().unwrap()),
+            "expected fake rg backend probe to succeed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ripgrep_probe_rejects_broken_backend() {
+        let bin_dir = tempdir().unwrap();
+        let fake_rg = write_fake_rg_script(
+            bin_dir.path(),
+            "echo 'simulated rg backend failure' >&2\nexit 2",
+        );
+
+        assert!(
+            !probe_ripgrep_command(fake_rg.to_str().unwrap()),
+            "expected fake rg backend probe to fail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_falls_back_when_rg_backend_errors() {
+        let bin_dir = tempdir().unwrap();
+        let fake_rg = write_fake_rg_script(
+            bin_dir.path(),
+            "echo 'simulated rg backend failure' >&2\nexit 2",
+        );
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("sample.txt"), "needle\n").unwrap();
+        let request = GrepRequest {
+            workspace_root: workspace.path(),
+            target: ".",
+            pattern: "needle",
+            include_globs: Vec::new(),
+            ignore_rules: Vec::new(),
+            case_sensitive: false,
+            fixed_strings: false,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Content,
+            multiline: false,
+        };
+
+        let output = run_grep_with_preferred_backend_program(
+            fake_rg.to_str().unwrap(),
+            &request,
+            None,
+            true,
+        )
+        .await
+        .expect("grep fallback should succeed");
+
+        assert_eq!(
+            output.exit_code, 0,
+            "stdout={}, stderr={}",
+            output.stdout, output.stderr
+        );
+        assert!(
+            output.stdout.contains("sample.txt:1:needle"),
+            "expected fallback grep output, got: {}",
+            output.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_falls_back_when_rg_backend_errors() {
+        let bin_dir = tempdir().unwrap();
+        let fake_rg = write_fake_rg_script(
+            bin_dir.path(),
+            "echo 'simulated rg backend failure' >&2\nexit 2",
+        );
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("sample.txt"), "").unwrap();
+
+        let output = run_glob_with_preferred_backend_program(
+            fake_rg.to_str().unwrap(),
+            workspace.path(),
+            ".",
+            "*.txt",
+            None,
+            true,
+        )
+        .await
+        .expect("glob fallback should succeed");
+
+        assert_eq!(
+            output.exit_code, 0,
+            "stdout={}, stderr={}",
+            output.stdout, output.stderr
+        );
+        assert!(
+            output.stdout.contains("sample.txt"),
+            "expected fallback glob output, got: {}",
+            output.stdout
         );
     }
 
