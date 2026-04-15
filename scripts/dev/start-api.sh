@@ -107,7 +107,7 @@ for i in {1..30}; do
     if ! kill -0 "$PID" 2>/dev/null; then
         break
     fi
-    HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s http://127.0.0.1:8000/health 2>/dev/null || true)
+    HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 http://127.0.0.1:8000/health 2>/dev/null || true)
     if echo "$HEALTH" | grep -q '"status":"healthy"' && \
        echo "$HEALTH" | grep -q '"database":"connected"'; then
         echo "✅ API server started (PID: $PID)"

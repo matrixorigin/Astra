@@ -1682,8 +1682,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 if bridge_remaining_turns == 0 {
                     yield render_sse_map(&build_stream_error_event(
                         &format!(
-                            "{} ({} rounds used)",
-                            cli_agentic_tool_round_budget_abort_msg(),
+                            "{} (round limit: {})",
+                            cli_agentic_tool_round_budget_abort_msg(round_limit as usize),
                             round_limit
                         ),
                         "TURN_BUDGET_EXHAUSTED",
