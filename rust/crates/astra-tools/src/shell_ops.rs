@@ -83,11 +83,18 @@ struct SearchResultGroup {
     lines: Vec<String>,
 }
 
+#[derive(Clone)]
+struct SearchIgnoreRule {
+    pattern: String,
+    negated: bool,
+}
+
 struct GrepRequest<'a> {
     workspace_root: &'a Path,
     target: &'a str,
     pattern: &'a str,
     include_globs: Vec<String>,
+    ignore_rules: Vec<SearchIgnoreRule>,
     case_sensitive: bool,
     before_context_lines: Option<usize>,
     after_context_lines: Option<usize>,
@@ -165,6 +172,10 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         Err(e) => return ToolResult::error(e),
     };
     let target = relative_search_target(workspace_root, &resolved);
+    let ignore_rules = match load_search_ignore_rules(workspace_root) {
+        Ok(rules) => rules,
+        Err(e) => return ToolResult::error(e),
+    };
     let mut include_globs = Vec::new();
     if let Some(value) = args.get("include") {
         match parse_search_globs(value, "include") {
@@ -234,6 +245,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         target: &target,
         pattern,
         include_globs,
+        ignore_rules,
         case_sensitive,
         before_context_lines,
         after_context_lines,
@@ -300,7 +312,13 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .lines()
         .map(|line| normalize_grep_output_line(line, output_mode))
         .collect();
-    sort_grep_result_lines(&mut lines, workspace_root, output_mode, sort_mode);
+    sort_grep_result_lines(
+        &mut lines,
+        workspace_root,
+        output_mode,
+        sort_mode,
+        &request.ignore_rules,
+    );
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
             return ToolResult::text(format!(
@@ -387,9 +405,15 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         Ok(mode) => mode,
         Err(e) => return ToolResult::error(e),
     };
+    let ignore_rules = match load_search_ignore_rules(workspace_root) {
+        Ok(rules) => rules,
+        Err(e) => return ToolResult::error(e),
+    };
 
     if resolved.is_file() {
-        return if glob_matches_path(pattern, &target) {
+        return if glob_matches_path(pattern, &target)
+            && !should_ignore_search_path(&target, &ignore_rules)
+        {
             ToolResult::text(target)
         } else {
             ToolResult::text("No files found".into())
@@ -432,6 +456,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
         .filter(|line| glob_matches_path(pattern, line))
+        .filter(|line| !should_ignore_search_path(line, &ignore_rules))
         .collect();
     dedup_preserve_order(&mut files);
     sort_search_paths(&mut files, workspace_root, sort_mode);
@@ -654,12 +679,23 @@ fn sort_grep_result_lines(
     workspace_root: &Path,
     output_mode: SearchOutputMode,
     sort_mode: SearchSortMode,
+    ignore_rules: &[SearchIgnoreRule],
 ) {
     if lines.len() < 2 {
+        lines.retain(|line| {
+            extract_search_result_path(line, output_mode)
+                .is_none_or(|path| !should_ignore_search_path(&path, ignore_rules))
+        });
         return;
     }
 
     let mut groups = group_grep_result_lines(lines, output_mode);
+    groups.retain(|group| {
+        group
+            .path
+            .as_ref()
+            .is_none_or(|path| !should_ignore_search_path(path, ignore_rules))
+    });
     let mut cache = std::collections::HashMap::new();
     groups.sort_by(|left, right| match (&left.path, &right.path) {
         (Some(left_path), Some(right_path)) => match sort_mode {
@@ -759,6 +795,75 @@ fn normalize_grep_output_line(line: &str, output_mode: SearchOutputMode) -> Stri
             line.strip_prefix("./").unwrap_or(line).to_string()
         }
     }
+}
+
+fn load_search_ignore_rules(workspace_root: &Path) -> Result<Vec<SearchIgnoreRule>, String> {
+    let ignore_path = workspace_root.join(".astraignore");
+    if !ignore_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&ignore_path)
+        .map_err(|e| format!("Error: failed to read {}: {e}", ignore_path.display()))?;
+    let mut rules = Vec::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (negated, pattern) = if let Some(rest) = trimmed.strip_prefix('!') {
+            (true, rest)
+        } else {
+            (false, trimmed)
+        };
+        let normalized = normalize_search_ignore_pattern(pattern).map_err(|e| {
+            format!(
+                "Error: invalid .astraignore pattern on line {}: {e}",
+                index + 1
+            )
+        })?;
+        rules.push(SearchIgnoreRule {
+            pattern: normalized,
+            negated,
+        });
+    }
+
+    Ok(rules)
+}
+
+fn normalize_search_ignore_pattern(pattern: &str) -> Result<String, String> {
+    let trimmed = pattern.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("pattern must not be empty".into());
+    }
+    if contains_path_traversal(trimmed) {
+        return Err("pattern must not escape the workspace".into());
+    }
+
+    if let Some(dir_pattern) = trimmed.strip_suffix('/') {
+        if dir_pattern.is_empty() {
+            return Err("pattern must not be empty".into());
+        }
+        return Ok(if dir_pattern.contains('/') {
+            format!("{dir_pattern}/**")
+        } else {
+            format!("**/{dir_pattern}/**")
+        });
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn should_ignore_search_path(path: &str, rules: &[SearchIgnoreRule]) -> bool {
+    let mut ignored = false;
+    for rule in rules {
+        if glob_matches_path(&rule.pattern, path) {
+            ignored = !rule.negated;
+        }
+    }
+    ignored
 }
 
 async fn run_grep_with_rg(
@@ -977,6 +1082,7 @@ async fn enumerate_search_files(
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
         .filter(|line| matches_search_file_filters(line, &request.include_globs))
+        .filter(|line| !should_ignore_search_path(line, &request.ignore_rules))
         .collect::<Vec<_>>();
     files.sort();
     files.dedup();
@@ -1808,6 +1914,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_respects_astraignore_patterns() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join(".astraignore"), "ignored.rs\n").unwrap();
+        std::fs::write(dir.path().join("ignored.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("shown.rs"), "needle\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "output_mode": "files_with_matches",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert_eq!(result.output.lines().collect::<Vec<_>>(), vec!["shown.rs"]);
+    }
+
+    #[tokio::test]
+    async fn grep_astraignore_negation_reincludes_matching_path() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join(".astraignore"), "*.rs\n!shown.rs\n").unwrap();
+        std::fs::write(dir.path().join("ignored.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("shown.rs"), "needle\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "output_mode": "files_with_matches",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert_eq!(result.output.lines().collect::<Vec<_>>(), vec!["shown.rs"]);
+    }
+
+    #[tokio::test]
     async fn glob_skips_default_generated_directories() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -1895,6 +2047,39 @@ mod tests {
             vec!["a-old.txt", "z-new.txt"],
             "got: {}",
             path_result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_respects_astraignore_patterns() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join(".astraignore"), "dist/\n").unwrap();
+        std::fs::write(dir.path().join("dist").join("bundle.js"), "").unwrap();
+        std::fs::write(dir.path().join("src").join("app.js"), "").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.js",
+                "path": ".",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "glob should succeed: {}", result.output);
+        assert!(
+            result.output.contains("src/app.js"),
+            "expected non-ignored file, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("dist/bundle.js"),
+            "ignored file should be filtered out: {}",
+            result.output
         );
     }
 
