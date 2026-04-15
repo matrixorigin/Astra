@@ -340,7 +340,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max). Use scope_context=true to see which function/class each match is in. For large codebases, narrow path or pattern for complete results.",
+                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max by default). Supports content/files_with_matches/count modes, pagination via offset, and optional scope_context annotations. For large codebases, narrow path or pattern for complete results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -352,7 +352,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
                         "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"},
                         "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output mode: 'content' (default, matching lines), 'files_with_matches' (file paths only), 'count' (match counts per file)"},
-                        "offset": {"type": "integer", "minimum": 0, "description": "Skip first N result lines (for pagination)"}
+                        "offset": {"type": "integer", "minimum": 0, "description": "Skip first N result lines (for pagination)"},
+                        "head_limit": {"type": "integer", "minimum": 0, "description": "Max result lines to return after offset. Defaults to 100; set 0 for unlimited."}
                     },
                     "required": ["pattern"]
                 }

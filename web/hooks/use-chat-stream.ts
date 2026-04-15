@@ -11,6 +11,7 @@ import type {
   TokenUsage,
 } from '@/lib/workspace/types';
 import type { StreamEvent } from '@/lib/streaming/types';
+import { SSEClient } from '@/lib/streaming/sse-client';
 import { suggestFollowupPrompt } from '@/lib/workspace/followup-suggestion';
 
 let nextId = 0;
@@ -37,7 +38,8 @@ type UseChatStreamReturn = WorkspaceState & {
 
 /**
  * Hook that manages a streaming chat conversation via POST /chat/stream (SSE).
- * Handles text, thinking, tool calls, plan events, and token usage.
+ * Uses @astra/sdk SSEClient for stream parsing; routes through the Next.js
+ * backend proxy so cookie-based auth stays server-side.
  */
 export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -53,7 +55,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [followupSuggestion, setFollowupSuggestion] = useState<string | null>(null);
 
   // Refs for mutable state during stream processing
-  const controllerRef = useRef<AbortController | null>(null);
+  const sseClientRef = useRef<SSEClient | null>(null);
   const assistantIdRef = useRef<string>('');
   const accumulatedTextRef = useRef('');
   const accumulatedThinkingRef = useRef('');
@@ -67,10 +69,8 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   useEffect(() => {
     if (configSessionIdRef.current !== config.sessionId) {
       configSessionIdRef.current = config.sessionId;
-      // Abort any in-flight request
-      controllerRef.current?.abort();
-      controllerRef.current = null;
-      // Clear all state for the new session
+      sseClientRef.current?.close();
+      sseClientRef.current = null;
       setMessages([]);
       setToolCalls([]);
       setSessionId(config.sessionId ?? null);
@@ -90,11 +90,11 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     }
   }, [config.sessionId]);
 
-  // Abort in-flight request on unmount
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      controllerRef.current?.abort();
-      controllerRef.current = null;
+      sseClientRef.current?.close();
+      sseClientRef.current = null;
     };
   }, []);
 
@@ -296,8 +296,8 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   );
 
   const stop = useCallback(() => {
-    controllerRef.current?.abort();
-    controllerRef.current = null;
+    sseClientRef.current?.close();
+    sseClientRef.current = null;
     // Mark the current assistant message as done
     const id = assistantIdRef.current;
     if (id) {
@@ -346,94 +346,46 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
 
       setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
-      const controller = new AbortController();
-      controllerRef.current = controller;
+      // Close any previous SSE client
+      sseClientRef.current?.close();
 
-      const body = JSON.stringify({
-        message: content,
-        session_id: sessionId,
-        agent_id: config.agentId ?? undefined,
-        model: config.model ?? undefined,
+      const client = new SSEClient({
+        url: `/api/backend/chat/stream`,
+        method: 'POST',
+        body: JSON.stringify({
+          message: content,
+          session_id: sessionId,
+          agent_id: config.agentId ?? undefined,
+          model: config.model ?? undefined,
+        }),
+        onEvent: processEvent,
+        onStateChange: (state) => {
+          if (state === 'error') {
+            setConnectionState('error');
+          } else if (state === 'disconnected') {
+            setIsStreaming(false);
+            if (!sawErrorEventRef.current) {
+              setConnectionState('idle');
+            }
+          }
+        },
+        maxRetries: 0, // Chat requests should not auto-retry
       });
 
-      // Route through Next.js so auth stays server-side and the browser stays same-origin.
-      const streamUrl = `/api/backend/chat/stream`;
-
-      fetch(streamUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        body,
-        signal: controller.signal,
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            const text = await response.text().catch(() => '');
-            throw new Error(`Chat request failed: ${response.status} ${text}`);
-          }
-
-          if (!response.body) {
-            throw new Error('No response body');
-          }
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-          const processSSEPart = (part: string) => {
-            for (const line of part.split('\n')) {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('data: ')) {
-                try {
-                  const event = JSON.parse(trimmed.slice(6)) as StreamEvent;
-                  processEvent(event);
-                } catch {
-                  // Non-JSON data line
-                }
-              }
-            }
-          };
-
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const parts = buffer.split('\n\n');
-            buffer = parts.pop() ?? '';
-
-            for (const part of parts) {
-              processSSEPart(part);
-            }
-          }
-
-          buffer += decoder.decode();
-          if (buffer.trim().length > 0) {
-            processSSEPart(buffer);
-          }
-
-          setIsStreaming(false);
-          if (!sawErrorEventRef.current) {
-            setConnectionState('idle');
-          }
-        })
-        .catch((err) => {
-          if (err instanceof DOMException && err.name === 'AbortError') {
-            // User stopped — don't show as error
-            return;
-          }
-          setError(err instanceof Error ? err.message : 'Unknown streaming error');
-          setIsStreaming(false);
-          setConnectionState('error');
-        });
+      sseClientRef.current = client;
+      client.connect().catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setError(err instanceof Error ? err.message : 'Unknown streaming error');
+        setIsStreaming(false);
+        setConnectionState('error');
+      });
     },
     [isStreaming, sessionId, config, processEvent],
   );
 
   const reset = useCallback(() => {
-    controllerRef.current?.abort();
-    controllerRef.current = null;
+    sseClientRef.current?.close();
+    sseClientRef.current = null;
     setMessages([]);
     setToolCalls([]);
     setSessionId(config.sessionId ?? null);

@@ -96,6 +96,25 @@ describe('SSEClient — Connection', () => {
     const call = (globalThis.fetch as jest.Mock).mock.calls[0];
     expect(call[1].headers['X-Custom']).toBe('value');
   });
+
+  test('POST method sends body and Content-Type', async () => {
+    const chunks = ['data: {"type":"text_delta","content":"x"}\n\n'];
+    globalThis.fetch = mockFetchStream(chunks);
+
+    const body = JSON.stringify({ message: 'hello' });
+    const client = new SSEClient({
+      url: 'http://localhost/stream',
+      method: 'POST',
+      body,
+      onEvent: () => {},
+    });
+    await client.connect();
+
+    const call = (globalThis.fetch as jest.Mock).mock.calls[0];
+    expect(call[1].method).toBe('POST');
+    expect(call[1].body).toBe(body);
+    expect(call[1].headers['Content-Type']).toBe('application/json');
+  });
 });
 
 // ─── Event Parsing ─────────────────────────────────────────────────

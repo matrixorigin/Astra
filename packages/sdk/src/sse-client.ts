@@ -40,9 +40,14 @@ export class SSEClient {
       if (this.options.token) {
         headers['Authorization'] = `Bearer ${this.options.token}`;
       }
+      if (this.options.method === 'POST' && !headers['Content-Type']) {
+        headers['Content-Type'] = 'application/json';
+      }
 
       const response = await fetch(this.options.url, {
+        method: this.options.method ?? 'GET',
         headers,
+        body: this.options.body,
         signal: linkedSignal,
       });
 
@@ -61,7 +66,13 @@ export class SSEClient {
       }
     } catch (err) {
       if (this.closed || linkedSignal.aborted) return;
+      const message = err instanceof Error ? err.message : 'Unknown error';
       this.options.onStateChange?.('error');
+      this.options.onEvent({
+        type: 'error',
+        message: `Connection error: ${message}`,
+        retryable: this.retryCount < this.options.maxRetries,
+      } as StreamEvent);
       await this.maybeRetry();
     }
   }
@@ -92,6 +103,11 @@ export class SSEClient {
         }
       }
     } finally {
+      // Flush remaining buffer (handles events without trailing \n\n)
+      buffer += decoder.decode();
+      if (buffer.trim().length > 0) {
+        this.processSSEChunk(buffer);
+      }
       reader.releaseLock();
     }
   }
