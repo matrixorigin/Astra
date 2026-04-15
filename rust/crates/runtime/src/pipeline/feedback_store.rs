@@ -91,6 +91,15 @@ impl FeedbackStore {
 
     /// Build a context injection string for a specific session.
     pub fn build_injection(&self, session_id: &str) -> String {
+        self.build_injection_filtered(session_id, None)
+    }
+
+    /// Build injection text, optionally filtering rules by relevance to the
+    /// current user message. When `user_message` is provided, rules whose
+    /// keywords overlap with the message are injected first ("relevant"),
+    /// followed by up to `MAX_IRRELEVANT_RULES` others so the model still
+    /// has background context without unbounded token growth.
+    pub fn build_injection_filtered(&self, session_id: &str, user_message: Option<&str>) -> String {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = inner.sessions.get(session_id) else {
             return String::new();
@@ -98,8 +107,18 @@ impl FeedbackStore {
         if entry.rules.is_empty() {
             return String::new();
         }
+
+        let rules: Vec<&StructuredFeedback> = match user_message {
+            Some(msg) => Self::filter_relevant(&entry.rules, msg),
+            None => entry.rules.iter().collect(),
+        };
+
+        if rules.is_empty() {
+            return String::new();
+        }
+
         let mut lines = vec!["[Learned Feedback Rules]".to_string()];
-        for fb in &entry.rules {
+        for fb in &rules {
             let mut line = format!("- Rule: {}", fb.rule);
             if fb.reason != "Not stated" {
                 line.push_str(&format!(" | Why: {}", fb.reason));
@@ -110,6 +129,43 @@ impl FeedbackStore {
             lines.push(line);
         }
         lines.join("\n")
+    }
+
+    /// Maximum number of non-matching rules to include as background context.
+    const MAX_IRRELEVANT_RULES: usize = 3;
+
+    /// Select rules relevant to the current user message. Rules with keyword
+    /// overlap are always included; up to `MAX_IRRELEVANT_RULES` others are
+    /// appended so the model retains some background awareness.
+    fn filter_relevant<'a>(
+        rules: &'a [StructuredFeedback],
+        user_message: &str,
+    ) -> Vec<&'a StructuredFeedback> {
+        let msg_words: std::collections::HashSet<&str> = user_message
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|w| w.len() >= 3)
+            .collect();
+
+        let mut relevant = Vec::new();
+        let mut irrelevant = Vec::new();
+
+        for fb in rules {
+            let rule_text = format!("{} {}", fb.rule, fb.apply_when);
+            let has_overlap = rule_text
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .filter(|w| w.len() >= 3)
+                .any(|w| msg_words.contains(w));
+
+            if has_overlap {
+                relevant.push(fb);
+            } else {
+                irrelevant.push(fb);
+            }
+        }
+
+        // Always include all relevant rules + a few irrelevant for background
+        relevant.extend(irrelevant.into_iter().take(Self::MAX_IRRELEVANT_RULES));
+        relevant
     }
 
     /// Get a snapshot of rules for a session.
@@ -249,7 +305,10 @@ mod tests {
     #[test]
     fn injection_includes_reason_when_stated() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb_full("use real DB", "mocks diverged", "General"));
+        store.add(
+            "s1",
+            make_fb_full("use real DB", "mocks diverged", "General"),
+        );
         let inj = store.build_injection("s1");
         assert!(inj.contains("Why: mocks diverged"));
     }
@@ -265,7 +324,10 @@ mod tests {
     #[test]
     fn injection_includes_apply_when_when_specific() {
         let store = FeedbackStore::new();
-        store.add("s1", make_fb_full("use real DB", "Not stated", "integration tests"));
+        store.add(
+            "s1",
+            make_fb_full("use real DB", "Not stated", "integration tests"),
+        );
         let inj = store.build_injection("s1");
         assert!(inj.contains("When: integration tests"));
     }
@@ -299,6 +361,109 @@ mod tests {
         store.add("s1", make_fb("rule A"));
         store.clear_session("nonexistent");
         assert_eq!(store.session_count(), 1);
+    }
+
+    // ── Relevance filtering ──
+
+    fn make_fb_with_apply(rule: &str, apply_when: &str) -> StructuredFeedback {
+        StructuredFeedback {
+            rule: rule.to_string(),
+            reason: "Not stated".to_string(),
+            apply_when: apply_when.to_string(),
+            source_signal: "correction".to_string(),
+            confidence: 0.8,
+        }
+    }
+
+    #[test]
+    fn filtered_injection_includes_relevant_rules_first() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb_with_apply("don't use mocks", "testing"));
+        store.add("s1", make_fb_with_apply("use JSON output", "API responses"));
+        store.add("s1", make_fb_with_apply("prefer async", "database queries"));
+
+        let injection = store.build_injection_filtered("s1", Some("write tests without mocks"));
+        assert!(
+            injection.contains("don't use mocks"),
+            "relevant rule should be included"
+        );
+    }
+
+    #[test]
+    fn filtered_injection_caps_irrelevant_rules() {
+        let store = FeedbackStore::new();
+        for i in 0..6 {
+            store.add(
+                "s1",
+                make_fb_with_apply(&format!("rule about topic{i}"), "General"),
+            );
+        }
+        let injection = store.build_injection_filtered("s1", Some("deploy to production"));
+        let rule_count = injection.matches("- Rule:").count();
+        assert_eq!(
+            rule_count, 3,
+            "should cap irrelevant rules at 3, got {rule_count}"
+        );
+    }
+
+    #[test]
+    fn filtered_injection_all_relevant_bypass_cap() {
+        let store = FeedbackStore::new();
+        store.add(
+            "s1",
+            make_fb_with_apply("always deploy with --dry-run", "General"),
+        );
+        store.add(
+            "s1",
+            make_fb_with_apply("deploy to staging first", "General"),
+        );
+        store.add(
+            "s1",
+            make_fb_with_apply("check deploy logs after", "General"),
+        );
+        store.add("s1", make_fb_with_apply("deploy needs approval", "General"));
+        store.add(
+            "s1",
+            make_fb_with_apply("run deploy in background", "General"),
+        );
+        store.add(
+            "s1",
+            make_fb_with_apply("deploy only from main branch", "General"),
+        );
+        let injection = store.build_injection_filtered("s1", Some("deploy the service"));
+        let rule_count = injection.matches("- Rule:").count();
+        assert_eq!(
+            rule_count, 6,
+            "all relevant rules should be included, got {rule_count}"
+        );
+    }
+
+    #[test]
+    fn filtered_injection_without_message_returns_all() {
+        let store = FeedbackStore::new();
+        for i in 0..6 {
+            store.add(
+                "s1",
+                make_fb_with_apply(&format!("rule about topic{i}"), "General"),
+            );
+        }
+        let injection = store.build_injection_filtered("s1", None);
+        let rule_count = injection.matches("- Rule:").count();
+        assert_eq!(rule_count, 6, "no filter should return all rules");
+    }
+
+    #[test]
+    fn unfiltered_build_injection_still_returns_all() {
+        let store = FeedbackStore::new();
+        for i in 0..6 {
+            store.add(
+                "s1",
+                make_fb_with_apply(&format!("rule about topic{i}"), "General"),
+            );
+        }
+        let injection = store.build_injection("s1");
+        let rule_count = injection.matches("- Rule:").count();
+        assert_eq!(rule_count, 6, "unfiltered should return all rules");
     }
 
     #[test]

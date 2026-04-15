@@ -1835,7 +1835,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 if session_id.is_empty() {
                     String::new()
                 } else {
-                    let injection = feedback_store.build_injection(&session_id);
+                    let injection = feedback_store.build_injection_filtered(&session_id, Some(user_content_for_signal));
                     if injection.is_empty() {
                         String::new()
                     } else {
@@ -3531,15 +3531,24 @@ mod tests {
         // Last block should contain the feedback rules but have NO cache_control
         let last = blocks.last().unwrap();
         let text = last["text"].as_str().unwrap();
-        assert!(text.contains("[Learned Feedback Rules]"), "dynamic block should contain rules");
-        assert!(text.contains("don't use mocks"), "dynamic block should contain rule text");
+        assert!(
+            text.contains("[Learned Feedback Rules]"),
+            "dynamic block should contain rules"
+        );
+        assert!(
+            text.contains("don't use mocks"),
+            "dynamic block should contain rule text"
+        );
         assert!(
             last.get("cache_control").is_none() || last["cache_control"].is_null(),
             "dynamic block with feedback rules must NOT have cache_control"
         );
 
         // Stable blocks with cache_control should NOT contain feedback rules
-        for block in blocks.iter().filter(|b| b.get("cache_control").is_some() && !b["cache_control"].is_null()) {
+        for block in blocks
+            .iter()
+            .filter(|b| b.get("cache_control").is_some() && !b["cache_control"].is_null())
+        {
             let block_text = block["text"].as_str().unwrap_or("");
             assert!(
                 !block_text.contains("[Learned Feedback Rules]"),

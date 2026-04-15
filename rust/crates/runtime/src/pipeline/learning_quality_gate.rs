@@ -180,7 +180,12 @@ mod tests {
 
     #[test]
     fn allows_mixed_read_write_tools() {
-        let o = make_outcome("update the config", &["read_file", "write_file"], 0.9, false);
+        let o = make_outcome(
+            "update the config",
+            &["read_file", "write_file"],
+            0.9,
+            false,
+        );
         assert!(evaluate(&o).is_ok());
     }
 
@@ -254,7 +259,12 @@ mod tests {
 
     #[test]
     fn does_not_reject_ok_in_longer_query() {
-        let o = make_outcome("ok let's refactor the auth module", &["write_file"], 0.8, false);
+        let o = make_outcome(
+            "ok let's refactor the auth module",
+            &["write_file"],
+            0.8,
+            false,
+        );
         assert!(evaluate(&o).is_ok());
     }
 }

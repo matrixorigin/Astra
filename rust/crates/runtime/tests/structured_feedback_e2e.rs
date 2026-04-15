@@ -5,8 +5,7 @@
 //! not through record_implicit_feedback. No LLM calls.
 
 use astra_runtime::pipeline::{
-    feedback_extraction::heuristic_extract,
-    feedback_store::FeedbackStore,
+    feedback_extraction::heuristic_extract, feedback_store::FeedbackStore,
 };
 use astra_runtime::turn::implicit_feedback::{
     detect_implicit_feedback_signal, implicit_feedback_context_injection,
@@ -47,7 +46,11 @@ fn full_cycle_chinese_correction() {
     let fb = heuristic_extract(user_text, &signal.signal_type, signal.confidence);
     assert!(fb.is_some());
     store.add("s1", fb.unwrap());
-    assert!(store.build_injection("s1").contains("不要用bash执行git命令"));
+    assert!(
+        store
+            .build_injection("s1")
+            .contains("不要用bash执行git命令")
+    );
 }
 
 #[test]
@@ -83,20 +86,26 @@ fn full_cycle_neutral_signal_no_extraction() {
 #[test]
 fn sessions_are_isolated() {
     let store = FeedbackStore::new();
-    store.add("user-A-session", astra_turn_types::StructuredFeedback {
-        rule: "rule for user A".into(),
-        reason: "Not stated".into(),
-        apply_when: "General".into(),
-        source_signal: "correction".into(),
-        confidence: 0.9,
-    });
-    store.add("user-B-session", astra_turn_types::StructuredFeedback {
-        rule: "rule for user B".into(),
-        reason: "Not stated".into(),
-        apply_when: "General".into(),
-        source_signal: "correction".into(),
-        confidence: 0.9,
-    });
+    store.add(
+        "user-A-session",
+        astra_turn_types::StructuredFeedback {
+            rule: "rule for user A".into(),
+            reason: "Not stated".into(),
+            apply_when: "General".into(),
+            source_signal: "correction".into(),
+            confidence: 0.9,
+        },
+    );
+    store.add(
+        "user-B-session",
+        astra_turn_types::StructuredFeedback {
+            rule: "rule for user B".into(),
+            reason: "Not stated".into(),
+            apply_when: "General".into(),
+            source_signal: "correction".into(),
+            confidence: 0.9,
+        },
+    );
 
     let inj_a = store.build_injection("user-A-session");
     let inj_b = store.build_injection("user-B-session");
@@ -146,8 +155,14 @@ fn injection_ordering_rule_not_injected_on_same_turn() {
 
     // Turn 2: user corrects again — build injection first (has turn 1's rule), then store
     let turn2_injection = store.build_injection(sid);
-    assert!(turn2_injection.contains("don't use mocks"), "turn 1 rule visible on turn 2");
-    assert!(!turn2_injection.contains("never force push"), "turn 2 rule not yet stored");
+    assert!(
+        turn2_injection.contains("don't use mocks"),
+        "turn 1 rule visible on turn 2"
+    );
+    assert!(
+        !turn2_injection.contains("never force push"),
+        "turn 2 rule not yet stored"
+    );
     let fb2 = heuristic_extract("no, never force push on main", "correction", 0.9).unwrap();
     store.add(sid, fb2);
 
@@ -163,7 +178,11 @@ fn duplicate_rules_deduplicated() {
 
     for _ in 0..3 {
         let signal = detect_implicit_feedback_signal("wrong, don't use mocks", Some("mock"));
-        if let Some(fb) = heuristic_extract("wrong, don't use mocks", &signal.signal_type, signal.confidence) {
+        if let Some(fb) = heuristic_extract(
+            "wrong, don't use mocks",
+            &signal.signal_type,
+            signal.confidence,
+        ) {
             store.add("s1", fb);
         }
     }
@@ -175,13 +194,16 @@ fn duplicate_rules_deduplicated() {
 #[test]
 fn injection_format_is_llm_friendly() {
     let store = FeedbackStore::new();
-    store.add("s1", astra_turn_types::StructuredFeedback {
-        rule: "Use moerr instead of fmt.Errorf".into(),
-        reason: "MatrixOne coding standard".into(),
-        apply_when: "Go error handling".into(),
-        source_signal: "correction".into(),
-        confidence: 0.9,
-    });
+    store.add(
+        "s1",
+        astra_turn_types::StructuredFeedback {
+            rule: "Use moerr instead of fmt.Errorf".into(),
+            reason: "MatrixOne coding standard".into(),
+            apply_when: "Go error handling".into(),
+            source_signal: "correction".into(),
+            confidence: 0.9,
+        },
+    );
 
     let injection = store.build_injection("s1");
     assert!(injection.starts_with("[Learned Feedback Rules]"));
@@ -220,26 +242,32 @@ fn malformed_llm_response_produces_nothing() {
 
 #[test]
 fn bridge_feedback_store_is_shared_across_clones() {
-    use astra_runtime::turn::bridge_inprocess::InProcessChatTurnBridge;
     use astra_runtime::FernetTokenEncryptor;
+    use astra_runtime::turn::bridge_inprocess::InProcessChatTurnBridge;
 
     let encryptor = std::sync::Arc::new(
         FernetTokenEncryptor::new("dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=").unwrap(),
     );
     let matrixone = astra_runtime::MatrixOneSettings {
-        host: "localhost".into(), port: 6001,
-        user: "test".into(), password: "test".into(), database: "test".into(),
+        host: "localhost".into(),
+        port: 6001,
+        user: "test".into(),
+        password: "test".into(),
+        database: "test".into(),
     };
     let bridge = InProcessChatTurnBridge::new(matrixone, encryptor);
     let bridge2 = bridge.clone();
 
-    bridge.feedback_store.add("s1", astra_turn_types::StructuredFeedback {
-        rule: "don't use mocks".into(),
-        reason: "Not stated".into(),
-        apply_when: "General".into(),
-        source_signal: "correction".into(),
-        confidence: 0.9,
-    });
+    bridge.feedback_store.add(
+        "s1",
+        astra_turn_types::StructuredFeedback {
+            rule: "don't use mocks".into(),
+            reason: "Not stated".into(),
+            apply_when: "General".into(),
+            source_signal: "correction".into(),
+            confidence: 0.9,
+        },
+    );
 
     // Visible from clone (Arc sharing)
     assert_eq!(bridge2.feedback_store.len("s1"), 1);
@@ -256,15 +284,18 @@ fn bridge_feedback_store_multi_turn_simulation() {
     let corrections = [
         ("wrong, don't use mocks in tests", "I'll mock the DB"),
         ("incorrect, never force push on main", "I'll force push"),
-        ("that's not right, stop using SELECT *", "SELECT * FROM users"),
+        (
+            "that's not right, stop using SELECT *",
+            "SELECT * FROM users",
+        ),
     ];
 
     for (user_msg, prior) in &corrections {
         let signal = detect_implicit_feedback_signal(user_msg, Some(prior));
-        if matches!(signal.signal_type.as_str(), "correction" | "frustration") {
-            if let Some(fb) = heuristic_extract(user_msg, &signal.signal_type, signal.confidence) {
-                store.add(sid, fb);
-            }
+        if matches!(signal.signal_type.as_str(), "correction" | "frustration")
+            && let Some(fb) = heuristic_extract(user_msg, &signal.signal_type, signal.confidence)
+        {
+            store.add(sid, fb);
         }
     }
 
@@ -287,13 +318,16 @@ fn empty_session_id_does_not_store_feedback() {
     let store = FeedbackStore::new();
     let empty_sid = "";
 
-    store.add(empty_sid, astra_turn_types::StructuredFeedback {
-        rule: "leaked rule".into(),
-        reason: "Not stated".into(),
-        apply_when: "General".into(),
-        source_signal: "correction".into(),
-        confidence: 0.9,
-    });
+    store.add(
+        empty_sid,
+        astra_turn_types::StructuredFeedback {
+            rule: "leaked rule".into(),
+            reason: "Not stated".into(),
+            apply_when: "General".into(),
+            source_signal: "correction".into(),
+            confidence: 0.9,
+        },
+    );
 
     // The store accepts it (it's the bridge's job to guard), but verify
     // that different sessions don't see it

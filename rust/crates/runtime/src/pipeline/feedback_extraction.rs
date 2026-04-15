@@ -87,8 +87,16 @@ pub fn parse_extraction_response(
 
 /// Directive keywords that indicate an actionable rule.
 const DIRECTIVE_PREFIXES: &[&str] = &[
-    "don't ", "do not ", "stop ", "never ", "should be ", "always ", "use ",
-    "不要", "别", "应该",
+    "don't ",
+    "do not ",
+    "stop ",
+    "never ",
+    "should be ",
+    "always ",
+    "use ",
+    "不要",
+    "别",
+    "应该",
 ];
 
 /// Heuristic extraction — extracts structured feedback without LLM when the
@@ -187,8 +195,7 @@ mod tests {
 
     #[test]
     fn parse_json_with_code_fences() {
-        let raw =
-            "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```";
+        let raw = "```json\n{\"rule\": \"No mocks\", \"reason\": \"Past incident\", \"apply_when\": \"Tests\"}\n```";
         let fb = parse_extraction_response(raw, "frustration", 0.7).unwrap();
         assert_eq!(fb.rule, "No mocks");
     }
@@ -349,8 +356,7 @@ mod tests {
 
     #[test]
     fn heuristic_semicolon_separator() {
-        let fb =
-            heuristic_extract("incorrect; always run tests first", "correction", 0.8).unwrap();
+        let fb = heuristic_extract("incorrect; always run tests first", "correction", 0.8).unwrap();
         assert_eq!(fb.rule, "always run tests first");
     }
 
@@ -364,12 +370,14 @@ mod tests {
 
     #[test]
     fn heuristic_complex_returns_none() {
-        assert!(heuristic_extract(
-            "the approach you took doesn't work well for this codebase",
-            "correction",
-            0.7,
-        )
-        .is_none());
+        assert!(
+            heuristic_extract(
+                "the approach you took doesn't work well for this codebase",
+                "correction",
+                0.7,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -384,23 +392,20 @@ mod tests {
 
     #[test]
     fn heuristic_instead_mid_sentence_not_matched() {
-        assert!(heuristic_extract(
-            "I want to understand the code instead of just running it",
-            "correction",
-            0.7,
-        )
-        .is_none());
+        assert!(
+            heuristic_extract(
+                "I want to understand the code instead of just running it",
+                "correction",
+                0.7,
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn heuristic_no_directive_after_prefix() {
         // "wrong, the approach is bad" — no directive keyword after comma
-        assert!(heuristic_extract(
-            "wrong, the approach is bad",
-            "correction",
-            0.7,
-        )
-        .is_none());
+        assert!(heuristic_extract("wrong, the approach is bad", "correction", 0.7,).is_none());
     }
 
     // ── extract_directive unit tests ──
