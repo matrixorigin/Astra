@@ -28,69 +28,10 @@
 use crate::tool_registry::state::ConversationState;
 use crate::turn::routing_metrics::{DisambiguationAction, IntentDisambiguation};
 
-// ─── Task Type ───────────────────────────────────────────────────────────────
-
-/// Enriched task classification — 7 types vs. the old 3 (code/reasoning/None).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum TaskType {
-    /// Code editing, generation, or file manipulation.
-    Code,
-    /// Analysis, explanation, comparison.
-    Reasoning,
-    /// Read-only data retrieval (list PRs, show status, etc.)
-    Fetch,
-    /// Create/update/delete operations.
-    Mutate,
-    /// Store or retrieve user preferences (关注/跟踪/bookmark).
-    Memory,
-    /// Greeting, chit-chat, simple questions.
-    Conversational,
-    /// Multiple task types combined (e.g., "show me PRs and fix the failing one").
-    Compound,
-    /// Cannot determine task type.
-    Unknown,
-}
-
-// ─── Domain Hint ─────────────────────────────────────────────────────────────
-
-/// Domain extracted from signals + memory hints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum DomainHint {
-    GitHub,
-    Git,
-    Code,
-    Memory,
-    Web,
-    System,
-    Database,
-}
-
-/// JSON / journal label for [`DomainHint`] (aligned with `pipeline::learning` payloads).
-#[must_use]
-pub fn domain_hint_to_label(d: DomainHint) -> &'static str {
-    match d {
-        DomainHint::GitHub => "github",
-        DomainHint::Git => "git",
-        DomainHint::Code => "code",
-        DomainHint::Memory => "memory",
-        DomainHint::Web => "web",
-        DomainHint::System => "system",
-        DomainHint::Database => "database",
-    }
-}
-
-// ─── Tool Filter ─────────────────────────────────────────────────────────────
-
-/// Recommended tool selection strategy based on routing analysis.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ToolFilter {
-    /// Low confidence → include all tools, let LLM decide.
-    Wide,
-    /// Domain-focused → filter to specific tool categories.
-    Domain(Vec<String>),
-    /// Conversational → minimal tools (only pinned).
-    Minimal,
-}
+// Re-export core types from astra-pipeline
+pub use astra_pipeline::routing::{
+    CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label,
+};
 
 // ─── RoutingDecision ─────────────────────────────────────────────────────────
 

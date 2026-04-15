@@ -1,0 +1,14 @@
+[package]
+name = "astra-pipeline"
+version.workspace = true
+edition = "2021"
+description = "Astra agent learning pipeline — calibration, routing, patterns"
+license = "MIT"
+
+[features]
+default = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]

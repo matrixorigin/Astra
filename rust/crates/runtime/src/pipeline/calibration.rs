@@ -37,8 +37,7 @@
 //! );
 //! ```
 
-use super::routing::{DomainHint, TaskType};
-use crate::evolution::types::CalibrationAxis;
+use super::routing::{CalibrationAxis, DomainHint, TaskType};
 use std::collections::HashMap;
 
 /// Get current Unix timestamp in seconds.

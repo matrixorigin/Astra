@@ -223,10 +223,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-pipeline"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "astra-runtime"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-pipeline",
  "astra-services",
  "astra-thin-client",
  "astra-tools",

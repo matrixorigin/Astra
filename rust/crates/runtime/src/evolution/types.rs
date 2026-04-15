@@ -3,6 +3,9 @@
 use crate::pipeline::routing::{DomainHint, TaskType};
 use crate::turn::action_compensation::FailureCategory;
 
+// Re-export CalibrationAxis from pipeline::routing (defined in astra-pipeline)
+pub use crate::pipeline::routing::CalibrationAxis;
+
 // ── Signals ──
 
 /// A typed evolution signal detected from runtime events.
@@ -147,13 +150,6 @@ pub enum PatternAction {
     Demote,
     Boost,
     Block,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum CalibrationAxis {
-    Intent(String),
-    Domain(DomainHint),
-    Task(TaskType),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
