@@ -128,7 +128,12 @@ impl ToolExecutor for DefaultToolExecutor {
                 crate::ApprovalDecision::Approved => {}
                 crate::ApprovalDecision::Denied { reason } => {
                     let msg = reason.unwrap_or_else(|| "denied by user".into());
-                    return ToolResult::error(format!("Tool execution denied: {msg}"));
+                    return ToolResult::error(format!(
+                        "The user REJECTED this tool call. The tool was NOT executed.\n\
+                         User feedback: \"{msg}\"\n\
+                         IMPORTANT: Do NOT retry this exact approach. \
+                         Ask the user how to proceed, or try a safer alternative."
+                    ));
                 }
                 crate::ApprovalDecision::Timeout => {
                     return ToolResult::error(

@@ -494,6 +494,15 @@ fn latest_user_message_text(messages: &[Value]) -> Option<&str> {
         .and_then(|m| m.get("content").and_then(Value::as_str))
 }
 
+fn latest_assistant_message_text(messages: &[Value]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+}
+
 fn turn_count_from_messages(messages: &[Value]) -> i64 {
     messages
         .iter()
@@ -1809,8 +1818,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 String::new()
             };
 
-            // Build per-turn dynamic content (profile + skills + memory signal + self-awareness)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{self_awareness_hint}");
+            // ── Implicit feedback detection: inject correction/frustration context ──
+            // When user expresses dissatisfaction (correction, frustration, rephrasing),
+            // inject a directive so the model adjusts its approach immediately.
+            let implicit_feedback_hint = {
+                let signal = crate::turn::implicit_feedback::detect_implicit_feedback_signal(
+                    user_content_for_signal,
+                    latest_assistant_message_text(&messages),
+                );
+                crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
+                    .map(|s| format!("\n\n{s}"))
+                    .unwrap_or_default()
+            };
+
+            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{self_awareness_hint}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;

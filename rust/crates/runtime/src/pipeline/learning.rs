@@ -4,6 +4,9 @@
 //! - EntityGraph: entity → domain → tools associations
 //! - PatternLibrary: tool chain success/failure patterns
 //! - ProgressiveCalibrator: per-intent/domain/task correction rates
+//!
+//! Phase D enhancement: `record_implicit_feedback()` bridges ImplicitSignal
+//! into the calibrator, converting signal type + confidence to correction events.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +17,7 @@ use crate::pipeline::entity::{EntityGraph, extract_entities};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::pipeline::routing::{DomainHint, TaskType};
 use crate::turn::contracts::{TurnLearningOutcome, TurnLearningWriter};
+use crate::turn::implicit_feedback::{ImplicitSignal, implicit_feedback_rating};
 use crate::turn::result_quality::{ResultQuality, classify_result};
 use crate::turn::stall::{assess_reward_hacking, dampen_quality_for_reward_hacking};
 
@@ -99,6 +103,41 @@ impl PipelineLearningWriter {
             for entity in &entities {
                 graph.record_failure(entity, &outcome.tools_attempted);
             }
+        }
+    }
+
+    /// Record implicit feedback signal into the learning pipeline.
+    ///
+    /// Bridges `ImplicitSignal` detected at turn start into the calibrator:
+    /// - Correction/frustration → treated as was_corrected=true
+    /// - Positive → treated as was_corrected=false (confirmation)
+    /// - Neutral/rephrasing/clarification → no calibration update
+    ///
+    /// The signal's confidence modulates the feedback score (1-5 scale mapped
+    /// to 0-100 for the calibrator).
+    pub fn record_implicit_feedback(
+        &self,
+        signal: &ImplicitSignal,
+        intent: &str,
+        domain: Option<DomainHint>,
+        task_type: TaskType,
+    ) {
+        // Only calibrate on actionable signals
+        let was_corrected = match signal.signal_type.as_str() {
+            "correction" | "frustration" => true,
+            "positive" => false,
+            _ => return, // neutral/rephrasing/clarification don't affect calibration
+        };
+
+        // Convert 1-5 rating to 0-100 feedback score
+        let rating = implicit_feedback_rating(&signal.signal_type);
+        let base_score = ((rating - 1) as i64) * 25; // 1→0, 2→25, 3→50, 4→75, 5→100
+        let confidence_factor = signal.confidence;
+        let feedback_score = Some((base_score as f64 * confidence_factor).round() as i64);
+
+        if let Some(pc) = &self.progressive_calibrator {
+            let mut cal = pc.lock().unwrap_or_else(|e| e.into_inner());
+            cal.record(intent, domain, task_type, was_corrected, feedback_score);
         }
     }
 }
@@ -967,5 +1006,96 @@ mod tests {
 
         let g = graph.lock().unwrap();
         assert!(g.boost_for("matrixorigin").is_empty());
+    }
+
+    // ─── Phase D: Implicit feedback → learning pipeline ──────────────
+
+    #[test]
+    fn implicit_feedback_correction_triggers_calibrator() {
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+        let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+        let signal = ImplicitSignal {
+            signal_type: "correction".to_string(),
+            confidence: 0.9,
+            evidence: "不对".to_string(),
+        };
+
+        writer.record_implicit_feedback(&signal, "code", Some(DomainHint::Code), TaskType::Code);
+
+        let c = cal.lock().unwrap();
+        // Check that calibrator recorded the intent
+        let stats = c.intent_stats("code");
+        assert!(stats.is_some(), "calibrator should have recorded intent 'code'");
+        assert!(
+            stats.unwrap().correction_rate() > 0.0,
+            "correction signal should increase correction rate"
+        );
+    }
+
+    #[test]
+    fn implicit_feedback_frustration_triggers_calibrator() {
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+        let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+        let signal = ImplicitSignal {
+            signal_type: "frustration".to_string(),
+            confidence: 0.7,
+            evidence: "terrible".to_string(),
+        };
+
+        writer.record_implicit_feedback(&signal, "fetch", Some(DomainHint::GitHub), TaskType::Fetch);
+
+        let c = cal.lock().unwrap();
+        let stats = c.intent_stats("fetch");
+        assert!(stats.is_some(), "calibrator should have recorded intent 'fetch'");
+        assert!(
+            stats.unwrap().correction_rate() > 0.0,
+            "frustration signal should increase correction rate"
+        );
+    }
+
+    #[test]
+    fn implicit_feedback_neutral_does_not_affect_calibrator() {
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+        let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+        let signal = ImplicitSignal {
+            signal_type: "neutral".to_string(),
+            confidence: 0.5,
+            evidence: String::new(),
+        };
+
+        writer.record_implicit_feedback(&signal, "code", None, TaskType::Code);
+
+        let c = cal.lock().unwrap();
+        // Should not have recorded anything since neutral is ignored
+        assert!(
+            c.intent_stats("code").is_none(),
+            "neutral signal should not affect calibrator"
+        );
+    }
+
+    #[test]
+    fn implicit_feedback_positive_records_success() {
+        let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+        let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+        let signal = ImplicitSignal {
+            signal_type: "positive".to_string(),
+            confidence: 0.8,
+            evidence: "thanks".to_string(),
+        };
+
+        writer.record_implicit_feedback(&signal, "conversational", None, TaskType::Conversational);
+
+        let c = cal.lock().unwrap();
+        let stats = c.intent_stats("conversational");
+        assert!(stats.is_some(), "calibrator should have recorded intent");
+        // Positive records was_corrected=false, so correction_rate should be 0
+        assert!(
+            stats.unwrap().correction_rate() == 0.0,
+            "positive signal should record success (no correction)"
+        );
     }
 }
