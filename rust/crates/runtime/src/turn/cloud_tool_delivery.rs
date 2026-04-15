@@ -141,9 +141,7 @@ fn parse_cloud_approval_outcome_with_decision(
 }
 
 fn denied_tool_content(reason: Option<&str>) -> String {
-    let mut parts = vec![
-        "The user REJECTED this tool call. The tool was NOT executed.",
-    ];
+    let mut parts = vec!["The user REJECTED this tool call. The tool was NOT executed."];
     let feedback_line;
     if let Some(r) = reason.filter(|s| !s.is_empty()) {
         feedback_line = format!("User feedback: \"{r}\"");

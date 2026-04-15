@@ -7,7 +7,7 @@ mod implicit_feedback;
 mod result_quality;
 
 pub use implicit_feedback::{
-    detect_implicit_feedback_signal, implicit_feedback_context_injection, implicit_feedback_rating,
-    ImplicitSignal,
+    ImplicitSignal, detect_implicit_feedback_signal, implicit_feedback_context_injection,
+    implicit_feedback_rating,
 };
-pub use result_quality::{classify_result, quality_feedback, ResultQuality};
+pub use result_quality::{ResultQuality, classify_result, quality_feedback};

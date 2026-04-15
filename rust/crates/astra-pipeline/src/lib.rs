@@ -12,4 +12,4 @@
 
 pub mod routing;
 
-pub use routing::{CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label};
+pub use routing::{domain_hint_to_label, CalibrationAxis, DomainHint, TaskType, ToolFilter};
