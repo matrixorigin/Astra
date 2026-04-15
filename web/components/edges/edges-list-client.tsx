@@ -18,7 +18,7 @@ function formatUptime(secs: number): string {
 
 function edgeStatus(secs: number): 'connected' | 'stale' {
   // If heartbeat is older than 2 min, mark stale
-  return secs < 120 ? 'connected' : 'connected';
+  return secs < 120 ? 'connected' : 'stale';
 }
 
 export function EdgesListClient({
