@@ -18,7 +18,7 @@ use serde_json::Value;
 /// After this many consecutive context-window errors *within the same turn*,
 /// we stop retrying and let the error propagate with a structured
 /// `InterruptionRecord`.
-pub(crate) const MAX_COMPACT_RETRIES: u32 = 2;
+pub(crate) const MAX_COMPACT_RETRIES: u32 = 3;
 
 /// Outcome of a compaction-replay attempt.
 #[derive(Debug)]
@@ -36,6 +36,70 @@ pub(crate) struct CompactionReplayResult {
     pub budget_likely_satisfied: bool,
     /// Full pipeline outcome (for trace/journal).
     pub pipeline_outcome: PipelineOutcome,
+    /// Which compaction tier was used.
+    pub tier: CompactionTier,
+}
+
+/// Compaction tier label for telemetry and escalation tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionTier {
+    Default,
+    Aggressive,
+    Emergency,
+}
+
+impl CompactionTier {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Aggressive => "aggressive",
+            Self::Emergency => "emergency",
+        }
+    }
+}
+
+/// Tracks compaction effectiveness across retries within a turn.
+///
+/// When compaction frees tokens but the next LLM call still fails with a
+/// context-window error, this indicates "insufficient compaction" — the freed
+/// amount wasn't enough. Tracking this enables escalation to more aggressive
+/// tiers and telemetry for diagnosing chronic context pressure.
+#[derive(Debug, Default)]
+pub struct CompactionEffectivenessTracker {
+    /// Tokens freed by the last compaction attempt.
+    pub last_tokens_freed: u64,
+    /// Whether the last compaction was followed by another context-window error.
+    pub last_was_insufficient: bool,
+    /// Cumulative tokens freed across all compaction attempts in this turn.
+    pub cumulative_tokens_freed: u64,
+    /// Number of compaction attempts in this turn.
+    pub attempt_count: u32,
+}
+
+impl CompactionEffectivenessTracker {
+    /// Record a compaction result.
+    pub fn record_compaction(&mut self, tokens_freed: u64) {
+        self.last_tokens_freed = tokens_freed;
+        self.last_was_insufficient = false;
+        self.cumulative_tokens_freed += tokens_freed;
+        self.attempt_count += 1;
+    }
+
+    /// Mark that the last compaction was insufficient (still got a 413).
+    pub fn mark_insufficient(&mut self) {
+        self.last_was_insufficient = true;
+    }
+
+    /// Build a summary for telemetry.
+    #[allow(dead_code)] // Used by future telemetry emission.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cumulative_tokens_freed": self.cumulative_tokens_freed,
+            "attempt_count": self.attempt_count,
+            "last_tokens_freed": self.last_tokens_freed,
+            "last_was_insufficient": self.last_was_insufficient,
+        })
+    }
 }
 
 /// Run the compression pipeline on the message list after a context-window error.
@@ -90,11 +154,22 @@ pub(crate) fn try_compact_for_retry_tiered(
         return None;
     }
 
-    // Tiered escalation: default pipeline on first retry, aggressive on subsequent.
-    let pipeline = if retry_count <= 1 {
-        CompressionPipeline::default_pipeline()
+    // Tiered escalation: default → aggressive → emergency.
+    let (pipeline, tier) = if retry_count <= 1 {
+        (
+            CompressionPipeline::default_pipeline(),
+            CompactionTier::Default,
+        )
+    } else if retry_count == 2 {
+        (
+            CompressionPipeline::aggressive_pipeline(),
+            CompactionTier::Aggressive,
+        )
     } else {
-        CompressionPipeline::aggressive_pipeline()
+        (
+            CompressionPipeline::emergency_pipeline(),
+            CompactionTier::Emergency,
+        )
     };
     let outcome = pipeline.compress_if_needed(messages, &budget);
 
@@ -120,6 +195,7 @@ pub(crate) fn try_compact_for_retry_tiered(
         layer_descriptions,
         budget_likely_satisfied: outcome.budget_satisfied,
         pipeline_outcome: outcome,
+        tier,
     })
 }
 
@@ -213,6 +289,7 @@ mod tests {
             messages_removed: 12,
             layer_descriptions: vec!["ToolResultTruncation: ~2000 tokens".into()],
             budget_likely_satisfied: true,
+            tier: CompactionTier::Default,
             pipeline_outcome: PipelineOutcome {
                 layer_results: Vec::new(),
                 total_tokens_freed: 5000,
@@ -242,12 +319,55 @@ mod tests {
         assert!(r1.is_some(), "tier-1 should compact");
         assert!(r2.is_some(), "tier-2 should compact");
 
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        assert_eq!(r1.tier, CompactionTier::Default);
+        assert_eq!(r2.tier, CompactionTier::Aggressive);
+
         // Aggressive pipeline should free at least as many tokens
-        let freed_1 = r1.unwrap().tokens_freed;
-        let freed_2 = r2.unwrap().tokens_freed;
         assert!(
-            freed_2 >= freed_1,
-            "aggressive tier ({freed_2}) should free >= default ({freed_1})"
+            r2.tokens_freed >= r1.tokens_freed,
+            "aggressive tier ({}) should free >= default ({})",
+            r2.tokens_freed,
+            r1.tokens_freed,
         );
+    }
+
+    #[test]
+    fn emergency_tier_on_retry_3() {
+        let mut msgs = make_messages(20);
+        let r = try_compact_for_retry_tiered(&mut msgs, Some(200_000), 100_000, 3);
+        assert!(r.is_some(), "emergency tier should compact");
+        let r = r.unwrap();
+        assert_eq!(r.tier, CompactionTier::Emergency);
+    }
+
+    #[test]
+    fn effectiveness_tracker_records_compaction() {
+        let mut tracker = CompactionEffectivenessTracker::default();
+        tracker.record_compaction(5000);
+        assert_eq!(tracker.cumulative_tokens_freed, 5000);
+        assert_eq!(tracker.attempt_count, 1);
+        assert!(!tracker.last_was_insufficient);
+
+        tracker.mark_insufficient();
+        assert!(tracker.last_was_insufficient);
+        assert_eq!(tracker.last_tokens_freed, 5000);
+
+        tracker.record_compaction(3000);
+        assert_eq!(tracker.cumulative_tokens_freed, 8000);
+        assert_eq!(tracker.attempt_count, 2);
+        assert!(!tracker.last_was_insufficient);
+    }
+
+    #[test]
+    fn effectiveness_tracker_telemetry() {
+        let mut tracker = CompactionEffectivenessTracker::default();
+        tracker.record_compaction(5000);
+        tracker.mark_insufficient();
+        let json = tracker.to_json();
+        assert_eq!(json["cumulative_tokens_freed"], 5000);
+        assert_eq!(json["attempt_count"], 1);
+        assert_eq!(json["last_was_insufficient"], true);
     }
 }

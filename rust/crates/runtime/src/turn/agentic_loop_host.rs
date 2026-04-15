@@ -610,6 +610,11 @@ pub struct AgenticLoopState {
     /// Consecutive fatal ingests whose error matched context-window / PTL patterns.
     pub consecutive_context_window_errors: u32,
 
+    /// Tracks compaction effectiveness across retries within a turn.
+    /// Records tokens freed per attempt and detects "insufficient compaction"
+    /// patterns where compaction runs but the next call still fails.
+    pub compaction_effectiveness: super::compaction_replay::CompactionEffectivenessTracker,
+
     // ── Per-turn token budget ──
     /// Maximum LLM input tokens before the loop forces a graceful wind-down.
     /// 0 = unlimited (legacy).  Set from `RuntimeLimits::max_turn_input_tokens`.
@@ -1130,6 +1135,7 @@ pub(crate) mod tests {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            compaction_effectiveness: Default::default(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             skill_produced_output: false,

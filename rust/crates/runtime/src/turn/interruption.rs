@@ -205,6 +205,16 @@ pub struct InterruptionStateSummary {
 /// Returns `None` if the interruption JSON is missing or unparseable.
 #[must_use]
 pub fn build_resume_guidance(interruption_json: &serde_json::Value) -> Option<String> {
+    build_resume_guidance_with_context(interruption_json, None)
+}
+
+/// Like [`build_resume_guidance`] but accepts optional compaction context for
+/// richer context-overflow recovery advice.
+#[must_use]
+pub fn build_resume_guidance_with_context(
+    interruption_json: &serde_json::Value,
+    compaction_context: Option<&CompactionResumeContext>,
+) -> Option<String> {
     let kind = interruption_json.get("kind")?.as_str()?;
     let resumable = interruption_json
         .get("resumable")
@@ -260,6 +270,24 @@ pub fn build_resume_guidance(interruption_json: &serde_json::Value) -> Option<St
                 "  Action: Context was compacted. Some older tool results may be \
                  summarized. Re-read any files you need before making edits.\n",
             );
+            // Enrich with compaction effectiveness context if available.
+            if let Some(ctx) = compaction_context {
+                if ctx.compaction_attempts > 0 {
+                    guidance.push_str(&format!(
+                        "  Compaction: {} attempt(s), ~{} tokens freed total",
+                        ctx.compaction_attempts, ctx.total_tokens_freed
+                    ));
+                    if ctx.last_was_insufficient {
+                        guidance.push_str(
+                            " (last compaction was insufficient — context may still be tight)",
+                        );
+                    }
+                    guidance.push('\n');
+                    guidance.push_str(
+                        "  Tip: Keep responses concise and avoid requesting large file dumps.\n",
+                    );
+                }
+            }
         }
         "user_cancelled" => {
             guidance.push_str(
@@ -291,6 +319,17 @@ pub fn build_resume_guidance(interruption_json: &serde_json::Value) -> Option<St
     Some(guidance)
 }
 
+/// Context about compaction history for enriching resume guidance.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionResumeContext {
+    /// How many compaction attempts were made before interruption.
+    pub compaction_attempts: u32,
+    /// Total tokens freed across all compaction attempts.
+    pub total_tokens_freed: u64,
+    /// Whether the last compaction was insufficient (still got a context error after).
+    pub last_was_insufficient: bool,
+}
+
 /// Classify a streaming/API error string into an [`InterruptionKind`] and
 /// [`ResumeAction`], if the error matches a known pattern.
 ///
@@ -313,6 +352,34 @@ pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
             ResumeAction::RequiresIntervention {
                 description: "API key or credentials are invalid — please refresh.".into(),
             },
+        ));
+    }
+
+    // Rate limiting (429 / TPM / RPM)
+    if lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || lower.contains("tpm")
+        || lower.contains("rpm")
+    {
+        return Some((
+            InterruptionKind::RateLimited,
+            ResumeAction::WaitAndRetry { delay_seconds: 30 },
+        ));
+    }
+
+    // Context window overflow
+    if lower.contains("context_length_exceeded")
+        || lower.contains("context window")
+        || lower.contains("context_window")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("maximum context length")
+    {
+        return Some((
+            InterruptionKind::ContextOverflow,
+            ResumeAction::CompactAndRetry,
         ));
     }
 
@@ -524,6 +591,26 @@ mod tests {
         assert!(classify_error("some random error").is_none());
     }
 
+    #[test]
+    fn classify_error_rate_limit_429() {
+        let (kind, action) = classify_error("Error 429: Too Many Requests").unwrap();
+        assert_eq!(kind, InterruptionKind::RateLimited);
+        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+    }
+
+    #[test]
+    fn classify_error_context_overflow() {
+        let (kind, action) = classify_error("context_length_exceeded: prompt is too long").unwrap();
+        assert_eq!(kind, InterruptionKind::ContextOverflow);
+        assert!(matches!(action, ResumeAction::CompactAndRetry));
+    }
+
+    #[test]
+    fn classify_error_maximum_context_length() {
+        let (kind, _) = classify_error("maximum context length exceeded").unwrap();
+        assert_eq!(kind, InterruptionKind::ContextOverflow);
+    }
+
     // ── new interruption kind tests ──
 
     #[test]
@@ -623,5 +710,66 @@ mod tests {
                 "label should be snake_case: {label}"
             );
         }
+    }
+
+    #[test]
+    fn resume_guidance_with_compaction_context() {
+        let irj = serde_json::json!({
+            "kind": "context_overflow",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 10,
+            "turns_completed": 5,
+            "remaining_turns": 5,
+            "user_message": ""
+        });
+        let ctx = CompactionResumeContext {
+            compaction_attempts: 3,
+            total_tokens_freed: 15000,
+            last_was_insufficient: true,
+        };
+        let guidance = build_resume_guidance_with_context(&irj, Some(&ctx)).unwrap();
+        assert!(guidance.contains("3 attempt(s)"));
+        assert!(guidance.contains("15000 tokens freed"));
+        assert!(guidance.contains("insufficient"));
+        assert!(guidance.contains("concise"));
+    }
+
+    #[test]
+    fn resume_guidance_with_compaction_context_sufficient() {
+        let irj = serde_json::json!({
+            "kind": "context_overflow",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 5,
+            "turns_completed": 3,
+            "remaining_turns": 7,
+            "user_message": ""
+        });
+        let ctx = CompactionResumeContext {
+            compaction_attempts: 1,
+            total_tokens_freed: 8000,
+            last_was_insufficient: false,
+        };
+        let guidance = build_resume_guidance_with_context(&irj, Some(&ctx)).unwrap();
+        assert!(guidance.contains("1 attempt(s)"));
+        assert!(guidance.contains("8000 tokens freed"));
+        assert!(!guidance.contains("insufficient"));
+    }
+
+    #[test]
+    fn resume_guidance_without_compaction_context_unchanged() {
+        let irj = serde_json::json!({
+            "kind": "context_overflow",
+            "resumable": true,
+            "has_checkpoint": false,
+            "tool_calls_completed": 0,
+            "turns_completed": 1,
+            "remaining_turns": 9,
+            "user_message": ""
+        });
+        let with = build_resume_guidance_with_context(&irj, None).unwrap();
+        let without = build_resume_guidance(&irj).unwrap();
+        assert_eq!(with, without);
     }
 }

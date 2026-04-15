@@ -45,6 +45,17 @@ pub struct SessionReplayMetrics {
     pub high_failure_turns: Vec<(u32, f64)>,
     /// Consecutive turns where confidence was at or below the floor.
     pub max_consecutive_low_confidence: usize,
+    /// Number of context-window error events (413 / prompt-too-long).
+    pub context_window_error_count: usize,
+    /// Compaction events that were followed by another context-window error
+    /// on the same turn (compaction was insufficient).
+    pub ineffective_compaction_count: usize,
+    /// Total tokens_in across all turns (for cost tracking).
+    pub total_tokens_in: u64,
+    /// Total tokens_out across all turns.
+    pub total_tokens_out: u64,
+    /// Number of turns that had stall_detected events.
+    pub stall_count: usize,
 }
 
 impl SessionReplayMetrics {
@@ -94,6 +105,9 @@ pub fn extract_metrics(events: &[JournalEvent]) -> SessionReplayMetrics {
     let mut error_turns: Vec<u32> = Vec::new();
     let mut approval_by_turn: std::collections::HashMap<u32, usize> =
         std::collections::HashMap::new();
+    // Track compaction and context-window events per turn for effectiveness analysis.
+    let mut compact_turns: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut context_error_turns: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     for event in events {
         match event.event_type {
@@ -103,6 +117,13 @@ pub fn extract_metrics(events: &[JournalEvent]) -> SessionReplayMetrics {
                     if let Some(turn) = event.turn {
                         m.confidence_values.push((turn, conf));
                     }
+                }
+                // Accumulate token usage.
+                if let Some(ti) = event.tokens_in {
+                    m.total_tokens_in += ti;
+                }
+                if let Some(to) = event.tokens_out {
+                    m.total_tokens_out += to;
                 }
                 // Check tool failure rate from tool_calls.
                 if let Some(ref calls) = event.tool_calls {
@@ -122,6 +143,20 @@ pub fn extract_metrics(events: &[JournalEvent]) -> SessionReplayMetrics {
                 m.turn_error_count += 1;
                 if let Some(turn) = event.turn {
                     error_turns.push(turn);
+                }
+                // Detect context-window errors from error message.
+                if let Some(ref err) = event.error {
+                    let lower = err.to_lowercase();
+                    if lower.contains("context_window")
+                        || lower.contains("context window")
+                        || lower.contains("prompt is too long")
+                        || lower.contains("too many tokens")
+                    {
+                        m.context_window_error_count += 1;
+                        if let Some(turn) = event.turn {
+                            context_error_turns.insert(turn);
+                        }
+                    }
                 }
             }
             JournalEventType::Checkpoint => {
@@ -144,6 +179,12 @@ pub fn extract_metrics(events: &[JournalEvent]) -> SessionReplayMetrics {
             }
             JournalEventType::Compact => {
                 m.compact_count += 1;
+                if let Some(turn) = event.turn {
+                    compact_turns.insert(turn);
+                }
+            }
+            JournalEventType::StallDetected => {
+                m.stall_count += 1;
             }
             _ => {}
         }
@@ -153,6 +194,13 @@ pub fn extract_metrics(events: &[JournalEvent]) -> SessionReplayMetrics {
     for &t in &error_turns {
         if !checkpoint_turns.contains(&t) && (t == 0 || !checkpoint_turns.contains(&(t - 1))) {
             m.unsalvaged_error_turns.push(t);
+        }
+    }
+
+    // Ineffective compaction: turns that had compaction AND a subsequent context-window error.
+    for &t in &compact_turns {
+        if context_error_turns.contains(&t) {
+            m.ineffective_compaction_count += 1;
         }
     }
 
@@ -188,6 +236,10 @@ pub struct ReplayInvariantConfig {
     pub max_consecutive_low_confidence: usize,
     /// Tool failure rate threshold (0.0–1.0) for flagging turns.
     pub tool_failure_rate_threshold: f64,
+    /// Maximum allowed stall events before flagging.
+    pub max_stall_count: usize,
+    /// Maximum allowed ineffective compaction events (compacted but still hit 413).
+    pub max_ineffective_compactions: usize,
 }
 
 impl Default for ReplayInvariantConfig {
@@ -196,6 +248,8 @@ impl Default for ReplayInvariantConfig {
             max_approvals_per_turn: 15,
             max_consecutive_low_confidence: 4,
             tool_failure_rate_threshold: 0.3,
+            max_stall_count: 3,
+            max_ineffective_compactions: 2,
         }
     }
 }
@@ -280,6 +334,30 @@ pub fn check_invariants(
                     .iter()
                     .map(|(t, r)| format!("T{}: {:.0}%", t, r * 100.0))
                     .collect::<Vec<_>>()
+            ),
+        });
+    }
+
+    // 6. Compaction effectiveness — compaction ran but didn't prevent a subsequent 413.
+    if metrics.ineffective_compaction_count > config.max_ineffective_compactions {
+        violations.push(InvariantViolation {
+            invariant: "compaction_effectiveness",
+            severity: "warning",
+            description: format!(
+                "{} compaction events were followed by another context-window error (max allowed: {})",
+                metrics.ineffective_compaction_count, config.max_ineffective_compactions
+            ),
+        });
+    }
+
+    // 7. Stall cascade — too many stall/drift events indicate the model is stuck.
+    if metrics.stall_count > config.max_stall_count {
+        violations.push(InvariantViolation {
+            invariant: "stall_cascade",
+            severity: "warning",
+            description: format!(
+                "{} stall events detected (max allowed: {})",
+                metrics.stall_count, config.max_stall_count
             ),
         });
     }
@@ -474,5 +552,117 @@ not valid json
         assert_eq!(metrics.turn_error_count, 1);
         assert!(metrics.has_unsalvaged_errors());
         assert!(violations.len() >= 2); // checkpoint + confidence + interruption
+    }
+
+    fn make_compact_event(turn: u32) -> JournalEvent {
+        let mut e = make_event(JournalEventType::Compact);
+        e.turn = Some(turn);
+        e
+    }
+
+    fn make_context_error_event(turn: u32) -> JournalEvent {
+        let mut e = make_event(JournalEventType::TurnError);
+        e.turn = Some(turn);
+        e.error = Some("context_window overflow: prompt is too long".into());
+        e
+    }
+
+    fn make_stall_event(turn: u32) -> JournalEvent {
+        let mut e = make_event(JournalEventType::StallDetected);
+        e.turn = Some(turn);
+        e
+    }
+
+    fn make_turn_with_tokens(turn: u32, tokens_in: u64, tokens_out: u64) -> JournalEvent {
+        let mut e = make_turn_event(turn, Some(0.5));
+        e.tokens_in = Some(tokens_in);
+        e.tokens_out = Some(tokens_out);
+        e
+    }
+
+    #[test]
+    fn compaction_effectiveness_invariant() {
+        // Compact on turn 2, then another context-window error on same turn.
+        let events = vec![
+            make_turn_event(1, Some(0.5)),
+            make_compact_event(2),
+            make_context_error_event(2),
+            make_compact_event(3),
+            make_context_error_event(3),
+            make_compact_event(4),
+            make_context_error_event(4),
+        ];
+        let metrics = extract_metrics(&events);
+        assert_eq!(metrics.compact_count, 3);
+        assert_eq!(metrics.context_window_error_count, 3);
+        assert_eq!(metrics.ineffective_compaction_count, 3);
+
+        let config = ReplayInvariantConfig {
+            max_ineffective_compactions: 2,
+            ..Default::default()
+        };
+        let violations = check_invariants(&metrics, &config);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.invariant == "compaction_effectiveness")
+        );
+    }
+
+    #[test]
+    fn effective_compaction_no_violation() {
+        // Compact on turn 2, error on turn 3 (different turn) — not ineffective.
+        let events = vec![
+            make_turn_event(1, Some(0.5)),
+            make_compact_event(2),
+            make_context_error_event(3),
+        ];
+        let metrics = extract_metrics(&events);
+        assert_eq!(metrics.compact_count, 1);
+        assert_eq!(metrics.context_window_error_count, 1);
+        assert_eq!(metrics.ineffective_compaction_count, 0);
+    }
+
+    #[test]
+    fn stall_cascade_invariant() {
+        let events = vec![
+            make_turn_event(1, Some(0.5)),
+            make_stall_event(1),
+            make_stall_event(2),
+            make_stall_event(3),
+            make_stall_event(4),
+        ];
+        let metrics = extract_metrics(&events);
+        assert_eq!(metrics.stall_count, 4);
+
+        let config = ReplayInvariantConfig {
+            max_stall_count: 3,
+            ..Default::default()
+        };
+        let violations = check_invariants(&metrics, &config);
+        assert!(violations.iter().any(|v| v.invariant == "stall_cascade"));
+    }
+
+    #[test]
+    fn token_usage_tracking() {
+        let events = vec![
+            make_turn_with_tokens(1, 1000, 500),
+            make_turn_with_tokens(2, 2000, 800),
+            make_turn_with_tokens(3, 1500, 700),
+        ];
+        let metrics = extract_metrics(&events);
+        assert_eq!(metrics.total_tokens_in, 4500);
+        assert_eq!(metrics.total_tokens_out, 2000);
+    }
+
+    #[test]
+    fn context_window_error_detected_from_error_msg() {
+        let events = vec![
+            make_context_error_event(1),
+            make_error_event(2), // regular error, not context-window
+        ];
+        let metrics = extract_metrics(&events);
+        assert_eq!(metrics.context_window_error_count, 1);
+        assert_eq!(metrics.turn_error_count, 2);
     }
 }
