@@ -1080,6 +1080,19 @@ impl PermissionManager {
             return false;
         }
 
+        if side_effect == SideEffect::Read && explicit_approval_reason(name, args).is_none() {
+            return true;
+        }
+
+        // Step 5: Session overrides (AFTER bypass-immune safety checks, BEFORE
+        // explicit-approval and mode gating so a prior approval isn't re-prompted).
+        if let Some(allowed) = self
+            .session_overrides
+            .check(&content_aware_fingerprint(name, args))
+        {
+            return allowed;
+        }
+
         if let Some(reason) = explicit_approval_reason(name, args) {
             if self.mode == PermissionMode::Deny {
                 eprintln!("  {}", reason.red());
@@ -1091,18 +1104,6 @@ impl PermissionManager {
                 eprintln!("{}", detail.dim());
             }
             return Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) == 'y';
-        }
-
-        if side_effect == SideEffect::Read {
-            return true;
-        }
-
-        // Step 5: Session overrides (AFTER bypass-immune safety checks).
-        if let Some(allowed) = self
-            .session_overrides
-            .check(&content_aware_fingerprint(name, args))
-        {
-            return allowed;
         }
 
         // Step 6: Persistent allow rules.
@@ -1293,6 +1294,23 @@ impl PermissionManager {
             return PermissionDecision::Deny("Dangerous pattern".into());
         }
 
+        if side_effect == SideEffect::Read && explicit_approval_reason(name, args).is_none() {
+            return PermissionDecision::Allow;
+        }
+
+        // Step 5: Session overrides (AFTER bypass-immune safety checks, BEFORE
+        // explicit-approval and mode gating so a prior approval isn't re-prompted).
+        if let Some(allowed) = self
+            .session_overrides
+            .check(&content_aware_fingerprint(name, args))
+        {
+            return if allowed {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny("Skipped for session".into())
+            };
+        }
+
         if let Some(reason) = explicit_approval_reason(name, args) {
             match self.mode {
                 PermissionMode::Deny => {
@@ -1309,22 +1327,6 @@ impl PermissionManager {
                 header,
                 detail,
                 reason,
-            };
-        }
-
-        if side_effect == SideEffect::Read {
-            return PermissionDecision::Allow;
-        }
-
-        // Step 5: Session overrides (AFTER bypass-immune safety checks).
-        if let Some(allowed) = self
-            .session_overrides
-            .check(&content_aware_fingerprint(name, args))
-        {
-            return if allowed {
-                PermissionDecision::Allow
-            } else {
-                PermissionDecision::Deny("Skipped for session".into())
             };
         }
 
@@ -1363,8 +1365,16 @@ impl PermissionManager {
     }
 
     /// Record a session override from an async approval response.
-    pub(super) fn record_approval(&mut self, name: &str, allowed: bool) {
-        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
+    pub(super) fn record_approval(
+        &mut self,
+        name: &str,
+        args: Option<&serde_json::Value>,
+        allowed: bool,
+    ) {
+        let fp = match args {
+            Some(a) => content_aware_fingerprint(name, a),
+            None => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name),
+        };
         self.session_overrides.insert(fp.clone(), allowed);
         if !allowed {
             self.denial_tracker.record(&fp, false);
@@ -1453,45 +1463,29 @@ pub(crate) enum ApprovalPromptKind {
 }
 
 fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
+    use astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only;
+
     let cmd = lower_cmd.trim();
     if cmd.is_empty() {
         return false;
     }
 
-    // Reject obvious composition primitives: once present, we require an explicit prompt.
-    if cmd.contains('|')
-        || cmd.contains('>')
-        || cmd.contains('<')
+    // Reject code-injection vectors unconditionally — these can hide arbitrary
+    // commands inside otherwise-read-only wrappers.
+    if cmd.contains("$(")
+        || cmd.contains('`')
         || cmd.contains("&&")
         || cmd.contains("||")
         || cmd.contains(';')
-        || cmd.contains("$(")
-        || cmd.contains('`')
     {
         return false;
     }
 
-    // Minimal allowlist of read-only commands.
-    // Kept deliberately small to avoid silently allowing write-capable commands.
-    let prefixes = [
-        "git status",
-        "git diff",
-        "git log",
-        "git show",
-        "git rev-parse",
-        "git branch -l",
-        "git branch --list",
-        "rg ",
-        "rg\t",
-        "grep ",
-        "grep\t",
-        "ls",
-        "pwd",
-        "whoami",
-        "uname",
-    ];
-
-    prefixes.iter().any(|p| cmd == *p || cmd.starts_with(p))
+    // Delegate to the runtime's pipe-aware read-only classifier which:
+    //  1. Normalizes harmless fd redirects (2>&1, >/dev/null, etc.)
+    //  2. Splits pipelines and checks each segment independently
+    //  3. Rejects segments with write indicators
+    bash_command_is_read_only(cmd)
 }
 
 #[cfg(test)]
@@ -1620,11 +1614,12 @@ mod tests {
     }
 
     #[test]
-    fn execute_allowlist_rejects_composition_primitives() {
+    fn execute_allowlist_allows_read_only_pipes() {
+        // Read-only pipes are now auto-approved (via bash_command_is_read_only).
         let piped = serde_json::json!({"command": "git status | cat"});
         assert_eq!(
             PermissionManager::execute_decision("bash", &piped),
-            ExecuteDecision::Ask
+            ExecuteDecision::AllowSilent
         );
         // Output redirection is Ask (not Deny) — common AI pattern for creating files
         let redirected = serde_json::json!({"command": "git status > out.txt"});
@@ -1653,10 +1648,10 @@ mod tests {
     }
 
     #[test]
-    fn find_without_delete_is_ask_not_deny() {
+    fn find_without_delete_is_allowlisted() {
         let cmd = serde_json::json!({"command": "find . -maxdepth 2 -type f"});
         let d = PermissionManager::execute_decision("bash", &cmd);
-        assert_eq!(d, ExecuteDecision::Ask);
+        assert_eq!(d, ExecuteDecision::AllowSilent);
     }
 
     #[test]
@@ -1720,7 +1715,8 @@ mod tests {
     fn session_override_skip_persists() {
         let mut pm = PermissionManager::new(false);
         pm.session_overrides.insert(bare_fp("bash"), false);
-        let args = serde_json::json!({"command": "echo hello"});
+        // Use a non-read-only command so it reaches the session override check.
+        let args = serde_json::json!({"command": "cargo build"});
         assert!(!pm.check("bash", &args));
         assert!(!pm.check("bash", &args));
     }
@@ -2052,7 +2048,7 @@ mod tests {
     fn sandbox_expand_session_override_remembered() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        pm.record_approval("sandbox_expand:read_file", true);
+        pm.record_approval("sandbox_expand:read_file", None, true);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(matches!(decision, PermissionDecision::Allow));
@@ -2062,7 +2058,7 @@ mod tests {
     fn sandbox_expand_session_deny_remembered() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        pm.record_approval("sandbox_expand:read_file", false);
+        pm.record_approval("sandbox_expand:read_file", None, false);
         let args = serde_json::json!({"reason": "path outside project"});
         let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
         assert!(matches!(decision, PermissionDecision::Deny(_)));
@@ -2335,7 +2331,7 @@ mod tests {
         )
         .unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, root);
-        pm.record_approval("edit_file", true);
+        pm.record_approval("edit_file", None, true);
         let summary = pm.rules_summary();
         assert!(summary.contains("prompt"), "should show mode");
         assert!(summary.contains("cargo"), "should show allow rule");
@@ -2709,5 +2705,101 @@ mod tests {
                 "parity failed for mode={mode:?} quiet={quiet} override={override_val:?}"
             );
         }
+    }
+
+    // ── is_read_only_allowlisted: pipe-aware classifier ───────────────────────
+
+    #[test]
+    fn read_only_allowlisted_simple_commands() {
+        assert!(is_read_only_allowlisted("git status"));
+        assert!(is_read_only_allowlisted("git diff --cached"));
+        assert!(is_read_only_allowlisted("ls -la"));
+        assert!(is_read_only_allowlisted("cat README.md"));
+        assert!(!is_read_only_allowlisted(""));
+        assert!(!is_read_only_allowlisted("rm -rf /"));
+    }
+
+    #[test]
+    fn read_only_allowlisted_handles_pipes() {
+        // Previously rejected all pipes; now delegates to runtime classifier.
+        assert!(is_read_only_allowlisted("cargo check 2>&1 | head -50"));
+        assert!(is_read_only_allowlisted("git diff | head -100"));
+        assert!(is_read_only_allowlisted("ls -la | grep foo"));
+        // Dangerous pipes must still be rejected.
+        assert!(!is_read_only_allowlisted("echo foo | sudo tee /etc/passwd"));
+    }
+
+    #[test]
+    fn read_only_allowlisted_handles_fd_redirects() {
+        assert!(is_read_only_allowlisted("cargo check 2>&1"));
+        assert!(is_read_only_allowlisted("git status 2>/dev/null"));
+    }
+
+    // ── session override ordering (before explicit_approval_reason) ───────────
+
+    #[test]
+    fn session_override_skips_explicit_approval_reprompt() {
+        // Bug: explicit_approval_reason was checked BEFORE session overrides,
+        // causing approved tools to be re-prompted every call.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"file_path": "src/main.rs", "content": "hello"});
+
+        // First call should need approval (no override yet).
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "first call should need approval"
+        );
+
+        // Simulate user approving with content-aware fingerprint.
+        pm.record_approval("write_file", Some(&args), true);
+
+        // Second call with same tool+path should be auto-approved via session override.
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "second call should be auto-approved via session override, got: {decision:?}"
+        );
+    }
+
+    // ── record_approval: content-aware fingerprints ───────────────────────────
+
+    #[test]
+    fn record_approval_with_args_creates_content_aware_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args_a = serde_json::json!({"path": "src/foo.rs", "content": "a"});
+        let args_b = serde_json::json!({"path": "tests/bar.rs", "content": "b"});
+
+        // Approve write_file for src/foo.rs.
+        pm.record_approval("write_file", Some(&args_a), true);
+
+        // Same directory pattern should match.
+        let decision = pm.check_nonblocking("write_file", &args_a);
+        assert!(matches!(decision, PermissionDecision::Allow));
+
+        // Different directory should NOT be auto-approved (content-aware, not bare).
+        let decision = pm.check_nonblocking("write_file", &args_b);
+        assert!(
+            !matches!(decision, PermissionDecision::Allow),
+            "different path should not be auto-approved by content-aware fingerprint"
+        );
+    }
+
+    #[test]
+    fn record_approval_without_args_falls_back_to_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Record with no args → bare fingerprint (subsumes everything).
+        pm.record_approval("write_file", None, true);
+
+        let args = serde_json::json!({"path": "any/path.rs", "content": "x"});
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "bare override should subsume any content-aware check"
+        );
     }
 }

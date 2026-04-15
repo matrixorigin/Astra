@@ -1605,7 +1605,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(pm) = self.perm_manager.as_mut()
                         && result
                     {
-                        pm.record_approval(&t, true);
+                        pm.record_approval(&t, Some(args), true);
                     }
                     result
                 } else if self.render_policy.is_silent() {
@@ -1614,7 +1614,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         "Auto-denied {t} in sub-run mode (no interactive terminal): {reason}"
                     );
                     if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&t, false);
+                        pm.record_approval(&t, Some(args), false);
                     }
                     false
                 } else {
@@ -1638,7 +1638,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let approved = matches!(ch, 'y' | 'a' | '!');
                     if let Some(pm) = self.perm_manager.as_mut() {
                         if approved {
-                            pm.record_approval(&t, true);
+                            pm.record_approval(&t, Some(args), true);
                         }
                         if ch == '!' {
                             pm.set_mode(crate::permission_manager::PermissionMode::Auto);
@@ -1665,7 +1665,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             );
                         }
                         if ch == 's' {
-                            pm.record_approval(&t, false);
+                            pm.record_approval(&t, Some(args), false);
                             eprintln!("  {}", format!("  ✗ {t}: skipped for session").dim());
                         }
                     }
@@ -1776,7 +1776,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         resp_rx.await.unwrap_or(false)
                                     };
                                     if grant {
-                                        pm.record_approval(&sandbox_tool_key, true);
+                                        pm.record_approval(&sandbox_tool_key, Some(args), true);
                                     }
                                     grant
                                 } else if self.render_policy.is_silent() {
@@ -1785,7 +1785,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         "permission",
                                         "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
                                     );
-                                    pm.record_approval(&sandbox_tool_key, false);
+                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
                                     false
                                 } else {
                                     // Interactive mode: prompt directly
@@ -1810,7 +1810,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     .unwrap_or('n');
                                     let grant = matches!(ch, 'y' | 'a' | '!');
                                     if grant {
-                                        pm.record_approval(&sandbox_tool_key, true);
+                                        pm.record_approval(&sandbox_tool_key, Some(args), true);
                                     }
                                     if ch == '!' {
                                         pm.set_mode(
@@ -1824,7 +1824,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         );
                                     }
                                     if ch == 's' {
-                                        pm.record_approval(&sandbox_tool_key, false);
+                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
                                     }
                                     grant
                                 }
