@@ -248,3 +248,161 @@ fn full_denial_cycle_to_auto_rule() {
     };
     assert!(rules.iter().any(matches_rm), "should generate rule for rm commands");
 }
+
+// ─── Edge Cases: Boundary Conditions ────────────────────────────────────────
+
+#[test]
+fn edge_case_empty_input_is_neutral() {
+    let signal = detect_implicit_feedback_signal("", None);
+    assert_eq!(signal.signal_type, "neutral");
+    assert!(signal.evidence.is_empty());
+
+    // Empty input should not generate injection
+    let injection = implicit_feedback_context_injection(&signal);
+    assert!(injection.is_none());
+}
+
+#[test]
+fn edge_case_whitespace_only_is_neutral() {
+    let signal = detect_implicit_feedback_signal("   \t\n  ", None);
+    assert_eq!(signal.signal_type, "neutral");
+}
+
+#[test]
+fn edge_case_very_long_input_still_detects() {
+    // 1000 chars of padding followed by correction keyword
+    let padding = "a".repeat(1000);
+    let input = format!("{} 不对 this is wrong {}", padding, padding);
+
+    let signal = detect_implicit_feedback_signal(&input, None);
+    assert_eq!(signal.signal_type, "correction");
+}
+
+#[test]
+fn edge_case_unicode_characters_handled() {
+    // Emojis and special unicode
+    let signal = detect_implicit_feedback_signal("🤬 terrible! 💢", None);
+    assert_eq!(signal.signal_type, "frustration");
+
+    // Chinese characters with unicode punctuation
+    let signal2 = detect_implicit_feedback_signal("『不对』，请重试", None);
+    assert_eq!(signal2.signal_type, "correction");
+}
+
+#[test]
+fn edge_case_mixed_case_detection() {
+    // Mixed case should still match (case insensitive)
+    let signal = detect_implicit_feedback_signal("WRONG answer", None);
+    assert_eq!(signal.signal_type, "correction");
+
+    let signal2 = detect_implicit_feedback_signal("TeRrIbLe response", None);
+    assert_eq!(signal2.signal_type, "frustration");
+}
+
+#[test]
+fn edge_case_special_regex_characters() {
+    // Input with regex special chars should not crash
+    let signal = detect_implicit_feedback_signal("test [abc] (def) {ghi} .* + ? | \\ ^ $", None);
+    assert_eq!(signal.signal_type, "neutral");
+}
+
+#[test]
+fn edge_case_denial_with_empty_reason() {
+    let mut tracker = DenialTracker::default();
+    let fp = ApprovalFingerprint::shell("bash", "some cmd", false);
+
+    // Empty string reason should not crash
+    tracker.record_with_reason(&fp, false, Some(""));
+    tracker.record_with_reason(&fp, false, Some(""));
+
+    let rules = tracker.extract_auto_deny_rules();
+    assert!(!rules.is_empty());
+}
+
+#[test]
+fn edge_case_denial_with_none_reason() {
+    let mut tracker = DenialTracker::default();
+    let fp = ApprovalFingerprint::shell("bash", "cmd", false);
+
+    // None reason should work fine
+    tracker.record_with_reason(&fp, false, None);
+    tracker.record_with_reason(&fp, false, None);
+
+    let rules = tracker.extract_auto_deny_rules();
+    assert!(!rules.is_empty());
+}
+
+#[test]
+fn edge_case_very_long_command_prefix() {
+    let long_cmd = format!("verylongcommandname{}", "x".repeat(500));
+    let fp = ApprovalFingerprint::shell("bash", &long_cmd, false);
+
+    let mut tracker = DenialTracker::default();
+    tracker.record_with_reason(&fp, false, None);
+    tracker.record_with_reason(&fp, false, None);
+
+    // Should still generate rules without crashing
+    let rules = tracker.extract_auto_deny_rules();
+    assert!(!rules.is_empty());
+}
+
+#[test]
+fn edge_case_calibrator_with_empty_intent() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    let signal = detect_implicit_feedback_signal("wrong", None);
+
+    // Empty intent string should not crash
+    writer.record_implicit_feedback(&signal, "", None, TaskType::Unknown);
+
+    let c = cal.lock().unwrap();
+    // Should still record (with empty string as key)
+    assert!(c.intent_stats("").is_some());
+}
+
+#[test]
+fn edge_case_injection_text_content() {
+    // Verify injection text is well-formed
+    let signal = detect_implicit_feedback_signal("错了，不是这样", None);
+    let injection = implicit_feedback_context_injection(&signal);
+
+    let text = injection.expect("should have injection");
+
+    // Check structure
+    assert!(text.starts_with("[Session Feedback]"));
+    assert!(text.contains("correction"));
+    assert!(text.contains("0.7")); // confidence
+
+    // Should be reasonable length (not too long)
+    assert!(text.len() < 500, "injection should be concise");
+}
+
+#[test]
+fn edge_case_prev_response_very_long() {
+    // Very long previous response should still work
+    let long_response = "The assistant said something ".repeat(100);
+    let signal = detect_implicit_feedback_signal("wrong", Some(&long_response));
+
+    assert_eq!(signal.signal_type, "correction");
+}
+
+#[test]
+fn edge_case_approval_reset_clears_all_state() {
+    let mut tracker = DenialTracker::default();
+
+    // Add some denials
+    for i in 0..5 {
+        let fp = ApprovalFingerprint::shell("bash", &format!("cmd{}", i), false);
+        tracker.record_with_reason(&fp, false, Some("reason"));
+    }
+
+    assert!(!tracker.extract_auto_deny_rules().is_empty());
+    assert!(tracker.total_denials() > 0);
+
+    // Reset should clear everything
+    tracker.reset();
+
+    assert!(tracker.extract_auto_deny_rules().is_empty());
+    assert_eq!(tracker.total_denials(), 0);
+}
