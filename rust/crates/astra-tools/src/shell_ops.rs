@@ -97,6 +97,8 @@ struct GrepRequest<'a> {
     include_globs: Vec<String>,
     ignore_rules: Vec<SearchIgnoreRule>,
     case_sensitive: bool,
+    fixed_strings: bool,
+    word_match: bool,
     before_context_lines: Option<usize>,
     after_context_lines: Option<usize>,
     max_matches: Option<usize>,
@@ -201,6 +203,14 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .get("case_sensitive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let fixed_strings = args
+        .get("fixed_strings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let word_match = args
+        .get("word_match")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let context_lines = args
         .get("context_lines")
         .and_then(|v| v.as_u64())
@@ -248,6 +258,8 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         include_globs,
         ignore_rules,
         case_sensitive,
+        fixed_strings,
+        word_match,
         before_context_lines,
         after_context_lines,
         max_matches,
@@ -945,6 +957,26 @@ async fn load_gitignored_search_paths(
     })
 }
 
+fn build_search_regex(request: &GrepRequest<'_>, multiline: bool) -> Result<regex::Regex, String> {
+    let mut pattern = if request.fixed_strings {
+        regex::escape(request.pattern)
+    } else {
+        request.pattern.to_string()
+    };
+    if request.word_match {
+        pattern = format!(r"\b(?:{pattern})\b");
+    }
+
+    let mut builder = regex::RegexBuilder::new(&pattern);
+    builder.case_insensitive(!request.case_sensitive);
+    if multiline {
+        builder.multi_line(true).dot_matches_new_line(true);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Error: invalid regex: {e}"))
+}
+
 async fn run_grep_with_rg(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
@@ -973,6 +1005,12 @@ async fn run_grep_with_rg(
 
     if !request.case_sensitive {
         cmd.arg("-i");
+    }
+    if request.fixed_strings {
+        cmd.arg("-F");
+    }
+    if request.word_match {
+        cmd.arg("-w");
     }
     append_context_flags(
         &mut cmd,
@@ -1034,17 +1072,23 @@ async fn run_grep_with_grep(
         cmd.current_dir(request.workspace_root).kill_on_drop(true);
         match request.output_mode {
             SearchOutputMode::Content => {
-                cmd.arg("-nHE");
+                cmd.arg(if request.fixed_strings { "-nH" } else { "-nHE" });
             }
             SearchOutputMode::FilesWithMatches => {
-                cmd.arg("-lHE");
+                cmd.arg(if request.fixed_strings { "-lH" } else { "-lHE" });
             }
             SearchOutputMode::Count => {
-                cmd.arg("-cHE");
+                cmd.arg(if request.fixed_strings { "-cH" } else { "-cHE" });
             }
         }
         if !request.case_sensitive {
             cmd.arg("-i");
+        }
+        if request.fixed_strings {
+            cmd.arg("-F");
+        }
+        if request.word_match {
+            cmd.arg("-w");
         }
         append_context_flags(
             &mut cmd,
@@ -1112,12 +1156,7 @@ async fn run_grep_multiline_locally(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
-    let regex = regex::RegexBuilder::new(request.pattern)
-        .case_insensitive(!request.case_sensitive)
-        .multi_line(true)
-        .dot_matches_new_line(true)
-        .build()
-        .map_err(|e| format!("Error: invalid regex: {e}"))?;
+    let regex = build_search_regex(request, true)?;
 
     let deadline = tokio::time::Instant::now() + GREP_TIMEOUT;
     let mut stdout = String::new();
@@ -1909,6 +1948,64 @@ mod tests {
         assert!(
             !result.output.contains("main.rs"),
             "type filter should exclude other languages: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_fixed_strings_treats_metacharacters_literally() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("sample.txt"), "foo.bar\nfooXbar\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "foo.bar",
+                "path": ".",
+                "fixed_strings": true
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(
+            result.output.contains("sample.txt:1:foo.bar"),
+            "expected literal match, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("sample.txt:2:fooXbar"),
+            "regex metacharacters should be treated literally: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_word_match_avoids_partial_identifier_hits() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("sample.txt"), "needle\nneedleish\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "word_match": true
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(
+            result.output.contains("sample.txt:1:needle"),
+            "expected whole-word match, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("sample.txt:2:needleish"),
+            "whole-word search should skip partial identifiers: {}",
             result.output
         );
     }

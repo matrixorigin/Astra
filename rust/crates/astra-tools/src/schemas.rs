@@ -350,6 +350,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "glob": {"type": "string", "description": "Alias of include using ripgrep-style glob syntax, e.g. '**/*.rs'"},
                         "type": {"type": "string", "description": "Common file type filter, e.g. rust, python, typescript, tsx, javascript, jsx, go, java, c, cpp, ruby, shell, json, yaml, toml, markdown"},
                         "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
+                        "fixed_strings": {"type": "boolean", "description": "Treat pattern as a literal string instead of a regex (like grep -F / rg -F)."},
+                        "word_match": {"type": "boolean", "description": "Require whole-word matches only (like grep -w / rg -w)."},
                         "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
                         "before_context_lines": {"type": "integer", "description": "Lines of context before each match (like grep -B). Overrides the 'before' side of context_lines when provided."},
                         "after_context_lines": {"type": "integer", "description": "Lines of context after each match (like grep -A). Overrides the 'after' side of context_lines when provided."},
