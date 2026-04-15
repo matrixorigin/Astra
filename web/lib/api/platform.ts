@@ -1,6 +1,7 @@
 export * from './platform-types';
 export * from './platform-overview';
 export * from './platform-agents';
+export * from './platform-edges';
 export * from './platform-sessions';
 export * from './platform-events';
 export * from './platform-runs';
