@@ -1833,7 +1833,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     latest_assistant_message_text(&messages),
                 );
                 // Store heuristic-extracted feedback only on correction/frustration signals
-                if matches!(signal.signal_type.as_str(), "correction" | "frustration") {
+                // and only when we have a valid session_id (avoid cross-session leakage)
+                if !session_id.is_empty()
+                    && matches!(signal.signal_type.as_str(), "correction" | "frustration")
+                {
                     if let Some(fb) = crate::pipeline::feedback_extraction::heuristic_extract(
                         user_content_for_signal,
                         &signal.signal_type,
@@ -1849,11 +1852,15 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             // ── Learned feedback rules: inject accumulated correction rules ──
             let feedback_rules_hint = {
-                let injection = feedback_store.build_injection(&session_id);
-                if injection.is_empty() {
+                if session_id.is_empty() {
                     String::new()
                 } else {
-                    format!("\n\n{injection}")
+                    let injection = feedback_store.build_injection(&session_id);
+                    if injection.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\n{injection}")
+                    }
                 }
             };
 

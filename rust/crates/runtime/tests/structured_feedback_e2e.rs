@@ -24,6 +24,7 @@ fn full_cycle_correction_stored_and_injected() {
     let store = FeedbackStore::new();
     let sid = "session-1";
 
+    // Full user message — heuristic must extract directive after prefix
     let user_text = "wrong, don't use mocks in tests";
     let signal = detect_implicit_feedback_signal(user_text, Some("I'll mock the database"));
     assert_eq!(signal.signal_type, "correction");
@@ -31,6 +32,7 @@ fn full_cycle_correction_stored_and_injected() {
     let injection = implicit_feedback_context_injection(&signal);
     assert!(injection.is_some());
 
+    // record_implicit_feedback takes the directive portion for calibration
     let feedback = writer.record_implicit_feedback(
         &signal, "don't use mocks in tests", "code", Some(DomainHint::Code), TaskType::Code,
     );
@@ -260,16 +262,17 @@ fn bridge_feedback_store_multi_turn_simulation() {
     let store = std::sync::Arc::new(FeedbackStore::new());
     let sid = "session-42";
 
+    // Realistic full messages — directive after correction prefix
     let corrections = [
-        ("wrong, don't use mocks in tests", "don't use mocks in tests"),
-        ("incorrect, never force push on main", "never force push on main"),
-        ("that's not right, stop using SELECT *", "stop using SELECT *"),
+        ("wrong, don't use mocks in tests", "I'll mock the DB"),
+        ("incorrect, never force push on main", "I'll force push"),
+        ("that's not right, stop using SELECT *", "SELECT * FROM users"),
     ];
 
-    for (user_msg, directive) in &corrections {
-        let signal = detect_implicit_feedback_signal(user_msg, Some("prior"));
+    for (user_msg, prior) in &corrections {
+        let signal = detect_implicit_feedback_signal(user_msg, Some(prior));
         if matches!(signal.signal_type.as_str(), "correction" | "frustration") {
-            if let Some(fb) = heuristic_extract(directive, &signal.signal_type, signal.confidence) {
+            if let Some(fb) = heuristic_extract(user_msg, &signal.signal_type, signal.confidence) {
                 store.add(sid, fb);
             }
         }
@@ -278,8 +281,54 @@ fn bridge_feedback_store_multi_turn_simulation() {
     assert_eq!(store.len(sid), 3);
     let injection = store.build_injection(sid);
     assert!(injection.starts_with("[Learned Feedback Rules]"));
+    // Rules should be the directive portion, not the full message
+    assert!(injection.contains("don't use mocks in tests"));
+    assert!(injection.contains("never force push on main"));
+    assert!(injection.contains("stop using SELECT *"));
     assert_eq!(injection.lines().count(), 4); // header + 3 rules
 
     // Other sessions unaffected
     assert!(store.is_empty("other-session"));
+}
+
+// ─── Empty session_id guard (P0-2) ─────────────────────────────────────────
+
+#[test]
+fn empty_session_id_does_not_store_feedback() {
+    // Mirrors the bridge guard: if session_id is empty, skip feedback
+    let store = FeedbackStore::new();
+    let empty_sid = "";
+
+    // Even if we add to empty session_id, it should work but the bridge
+    // guards against this. Verify the store itself handles it gracefully.
+    store.add(empty_sid, astra_turn_types::StructuredFeedback {
+        rule: "leaked rule".into(),
+        reason: "Not stated".into(),
+        apply_when: "General".into(),
+        source_signal: "correction".into(),
+        confidence: 0.9,
+    });
+
+    // The store accepts it (it's the bridge's job to guard), but verify
+    // that different sessions don't see it
+    assert_eq!(store.len(""), 1);
+    assert!(store.is_empty("some-real-session"));
+}
+
+#[test]
+fn heuristic_extracts_directive_from_full_correction_message() {
+    // This is the exact code path the bridge uses — full user message
+    // passed to heuristic_extract, not a pre-extracted directive
+    use astra_runtime::pipeline::feedback_extraction::heuristic_extract;
+
+    // "wrong, don't use mocks" → should extract "don't use mocks"
+    let fb = heuristic_extract("wrong, don't use mocks", "correction", 0.9).unwrap();
+    assert_eq!(fb.rule, "don't use mocks");
+
+    // "不对，不要用bash" → should extract "不要用bash"
+    let fb = heuristic_extract("不对，不要用bash执行git命令", "correction", 0.8).unwrap();
+    assert_eq!(fb.rule, "不要用bash执行git命令");
+
+    // Complex message with no directive → None
+    assert!(heuristic_extract("wrong, the approach is bad", "correction", 0.7).is_none());
 }

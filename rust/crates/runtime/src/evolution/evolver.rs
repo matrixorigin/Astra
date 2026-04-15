@@ -344,8 +344,6 @@ mod tests {
                 prior_assistant_text: "".into(),
                 skill_context: None,
                 turn_id: "t2".into(),
-                reason: None,
-                apply_when: None,
             },
         ];
         let proposals = generate_fast_proposals(&signals);

@@ -25,10 +25,6 @@ pub enum EvolutionSignal {
         prior_assistant_text: String,
         skill_context: Option<String>,
         turn_id: String,
-        /// Why the user corrected — extracted by LLM or heuristic.
-        reason: Option<String>,
-        /// When/where this correction applies (domain, task type, tool).
-        apply_when: Option<String>,
     },
     /// A tool chain pattern's recent success rate dropped significantly.
     PatternDrift {
@@ -297,8 +293,6 @@ mod tests {
             prior_assistant_text: "".into(),
             skill_context: None,
             turn_id: "t1".into(),
-            reason: None,
-            apply_when: None,
         };
         assert_ne!(s1.dedup_key(), s2.dedup_key());
     }

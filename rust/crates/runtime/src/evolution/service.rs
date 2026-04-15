@@ -1357,8 +1357,6 @@ mod tests {
             prior_assistant_text: "draft".into(),
             skill_context: None,
             turn_id: "t1".into(),
-            reason: None,
-            apply_when: None,
         })
         .await;
         let (_auto, _llm) = svc.flush().await;
@@ -1375,8 +1373,6 @@ mod tests {
             prior_assistant_text: "draft".into(),
             skill_context: None,
             turn_id: "t2".into(),
-            reason: None,
-            apply_when: None,
         })
         .await;
         let (_auto, _llm) = svc.flush().await;

@@ -81,8 +81,18 @@ pub fn parse_extraction_response(
     })
 }
 
+/// Directive keywords that indicate an actionable rule.
+const DIRECTIVE_PREFIXES: &[&str] = &[
+    "don't ", "do not ", "stop ", "never ", "should be ", "always ", "use ",
+    "不要", "别", "应该",
+];
+
 /// Heuristic extraction — extracts structured feedback without LLM when the
 /// correction is simple enough (e.g., "don't use X", "use Y instead").
+///
+/// Scans for directive keywords after common correction prefixes like
+/// "wrong, ", "no, ", "that's incorrect, " etc. Extracts the directive
+/// portion as the rule, not the full message.
 ///
 /// Returns `None` if the correction is too complex for heuristic extraction.
 pub fn heuristic_extract(
@@ -90,34 +100,52 @@ pub fn heuristic_extract(
     source_signal: &str,
     confidence: f64,
 ) -> Option<StructuredFeedback> {
-    let lower = correction_text.to_lowercase();
-    let trimmed = lower.trim();
-
+    let trimmed = correction_text.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    // Only match when the directive keyword is at the start of the sentence
-    let is_simple_directive = trimmed.starts_with("don't ")
-        || trimmed.starts_with("do not ")
-        || trimmed.starts_with("stop ")
-        || trimmed.starts_with("never ")
-        || trimmed.starts_with("不要")
-        || trimmed.starts_with("别")
-        || trimmed.starts_with("should be ")
-        || trimmed.starts_with("应该");
-
-    if !is_simple_directive {
-        return None;
-    }
+    let (rule, _offset) = extract_directive(trimmed)?;
 
     Some(StructuredFeedback {
-        rule: correction_text.to_string(),
+        rule,
         reason: "Not stated".to_string(),
         apply_when: "General".to_string(),
         source_signal: source_signal.to_string(),
         confidence,
     })
+}
+
+/// Find a directive keyword in the text. Returns the directive portion
+/// (from the keyword to end of text) and its byte offset.
+///
+/// Checks the start of the text first, then scans after punctuation
+/// boundaries (", ", ". ", "，", "。") to handle "wrong, don't use X".
+fn extract_directive(text: &str) -> Option<(String, usize)> {
+    let lower = text.to_lowercase();
+
+    // Check if text starts with a directive
+    for prefix in DIRECTIVE_PREFIXES {
+        if lower.starts_with(prefix) {
+            return Some((text.to_string(), 0));
+        }
+    }
+
+    // Scan after punctuation boundaries
+    for sep in &[", ", ". ", "，", "。", "; "] {
+        for (i, _) in lower.match_indices(sep) {
+            let after = i + sep.len();
+            let rest_lower = &lower[after..];
+            for prefix in DIRECTIVE_PREFIXES {
+                if rest_lower.starts_with(prefix) {
+                    // Return the original-case text from the directive onward
+                    return Some((text[after..].trim().to_string(), after));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -222,7 +250,7 @@ mod tests {
     #[test]
     fn heuristic_do_not_pattern() {
         let fb = heuristic_extract("do not run tests in parallel", "correction", 0.8).unwrap();
-        assert!(fb.rule.contains("do not"));
+        assert_eq!(fb.rule, "do not run tests in parallel");
     }
 
     #[test]
@@ -234,32 +262,94 @@ mod tests {
     #[test]
     fn heuristic_never_pattern() {
         let fb = heuristic_extract("never use force push", "correction", 0.8).unwrap();
-        assert!(fb.rule.contains("never"));
+        assert_eq!(fb.rule, "never use force push");
+    }
+
+    #[test]
+    fn heuristic_always_pattern() {
+        let fb = heuristic_extract("always run clippy before commit", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "always run clippy before commit");
+    }
+
+    #[test]
+    fn heuristic_use_pattern() {
+        let fb = heuristic_extract("use moerr instead of fmt.Errorf", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "use moerr instead of fmt.Errorf");
     }
 
     #[test]
     fn heuristic_chinese_bu_yao() {
         let fb = heuristic_extract("不要用bash执行git命令", "correction", 0.8).unwrap();
-        assert!(fb.rule.contains("不要"));
+        assert_eq!(fb.rule, "不要用bash执行git命令");
     }
 
     #[test]
     fn heuristic_chinese_bie() {
         let fb = heuristic_extract("别再用这个方法了", "correction", 0.8).unwrap();
-        assert!(fb.rule.contains("别"));
+        assert_eq!(fb.rule, "别再用这个方法了");
     }
 
     #[test]
     fn heuristic_should_be_pattern() {
         let fb = heuristic_extract("should be using cargo test", "correction", 0.7).unwrap();
-        assert!(fb.rule.contains("should be"));
+        assert_eq!(fb.rule, "should be using cargo test");
     }
 
     #[test]
     fn heuristic_chinese_ying_gai() {
         let fb = heuristic_extract("应该用moerr而不是fmt.Errorf", "correction", 0.8).unwrap();
-        assert!(fb.rule.contains("应该"));
+        assert_eq!(fb.rule, "应该用moerr而不是fmt.Errorf");
     }
+
+    // ── P0-1: directive after correction prefix ──
+
+    #[test]
+    fn heuristic_wrong_comma_dont() {
+        // Real-world pattern: "wrong, don't use mocks"
+        let fb = heuristic_extract("wrong, don't use mocks", "correction", 0.9).unwrap();
+        assert_eq!(fb.rule, "don't use mocks");
+    }
+
+    #[test]
+    fn heuristic_no_comma_never() {
+        let fb = heuristic_extract("no, never force push on main", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "never force push on main");
+    }
+
+    #[test]
+    fn heuristic_thats_incorrect_stop() {
+        let fb =
+            heuristic_extract("that's incorrect, stop using SELECT *", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "stop using SELECT *");
+    }
+
+    #[test]
+    fn heuristic_chinese_prefix_bu_dui() {
+        let fb = heuristic_extract("不对，不要用bash执行git命令", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "不要用bash执行git命令");
+    }
+
+    #[test]
+    fn heuristic_period_separator() {
+        let fb =
+            heuristic_extract("That's wrong. Don't use mocks here.", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "Don't use mocks here.");
+    }
+
+    #[test]
+    fn heuristic_semicolon_separator() {
+        let fb =
+            heuristic_extract("incorrect; always run tests first", "correction", 0.8).unwrap();
+        assert_eq!(fb.rule, "always run tests first");
+    }
+
+    #[test]
+    fn heuristic_preserves_original_case() {
+        let fb = heuristic_extract("wrong, Don't Use Mocks", "correction", 0.9).unwrap();
+        assert_eq!(fb.rule, "Don't Use Mocks");
+    }
+
+    // ── Negative cases ──
 
     #[test]
     fn heuristic_complex_returns_none() {
@@ -283,14 +373,43 @@ mod tests {
 
     #[test]
     fn heuristic_instead_mid_sentence_not_matched() {
-        // "instead" in the middle of a complex sentence should NOT match
-        // (removed the overly broad "contains instead" check)
         assert!(heuristic_extract(
             "I want to understand the code instead of just running it",
             "correction",
             0.7,
         )
         .is_none());
+    }
+
+    #[test]
+    fn heuristic_no_directive_after_prefix() {
+        // "wrong, the approach is bad" — no directive keyword after comma
+        assert!(heuristic_extract(
+            "wrong, the approach is bad",
+            "correction",
+            0.7,
+        )
+        .is_none());
+    }
+
+    // ── extract_directive unit tests ──
+
+    #[test]
+    fn extract_directive_at_start() {
+        let (rule, offset) = extract_directive("don't use mocks").unwrap();
+        assert_eq!(rule, "don't use mocks");
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn extract_directive_after_comma() {
+        let (rule, _) = extract_directive("wrong, don't use mocks").unwrap();
+        assert_eq!(rule, "don't use mocks");
+    }
+
+    #[test]
+    fn extract_directive_none_for_complex() {
+        assert!(extract_directive("the approach doesn't work").is_none());
     }
 
     // ── build_extraction_message ──
