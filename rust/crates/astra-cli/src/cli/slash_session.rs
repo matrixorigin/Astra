@@ -4732,6 +4732,10 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                         state.resume_guidance = Some(guidance);
                     }
                 }
+                // Restore approval overrides so previously-approved tools stay approved.
+                if let Some(ref ao_json) = step_restored.approval_overrides {
+                    state.perm_manager.merge_restored_overrides(ao_json);
+                }
                 eprintln!("  {} {}", "↻".cyan(), summary.dim());
             } else if let Ok(Some(heavy)) =
                 astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(

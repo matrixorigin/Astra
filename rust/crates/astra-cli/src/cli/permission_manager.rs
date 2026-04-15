@@ -1412,6 +1412,23 @@ impl PermissionManager {
         }
         out
     }
+
+    /// Merge restored approval overrides from a checkpoint into this session.
+    /// Existing live overrides take priority (session-priority merge).
+    pub(super) fn merge_restored_overrides(&mut self, json: &serde_json::Value) {
+        self.session_overrides.merge_from_json(json);
+    }
+
+    /// Export session overrides as a `FingerprintedOverrides` clone for checkpoint persistence.
+    pub(super) fn export_session_overrides(
+        &self,
+    ) -> Option<astra_runtime::turn::approval_fingerprint::FingerprintedOverrides> {
+        if self.session_overrides.is_empty() {
+            None
+        } else {
+            Some(self.session_overrides.clone())
+        }
+    }
 }
 
 /// Result of a non-blocking permission check.

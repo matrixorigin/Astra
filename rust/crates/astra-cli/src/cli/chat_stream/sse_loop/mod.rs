@@ -311,6 +311,9 @@ pub(crate) async fn stream_chat_sse(
     let parent_perm_mode = p.perm_manager.mode();
     let parent_cancel_token = p.cancel_token.clone();
 
+    // Snapshot approval overrides for checkpoint persistence.
+    let initial_approval_overrides = p.perm_manager.export_session_overrides();
+
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliAgenticLoopHost {
         api: p.api,
@@ -576,7 +579,7 @@ pub(crate) async fn stream_chat_sse(
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
-        approval_overrides: None,
+        approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
     };
