@@ -406,3 +406,210 @@ fn edge_case_approval_reset_clears_all_state() {
     assert!(tracker.extract_auto_deny_rules().is_empty());
     assert_eq!(tracker.total_denials(), 0);
 }
+
+// ─── Concurrent Access Tests ────────────────────────────────────────────────
+
+use std::thread;
+
+#[test]
+fn concurrent_calibrator_writes() {
+    // Multiple threads writing to calibrator simultaneously
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+    let writer = Arc::new(PipelineLearningWriter::new().with_progressive_calibrator(cal.clone()));
+
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            let writer_clone = writer.clone();
+            thread::spawn(move || {
+                let signal_type = if i % 2 == 0 { "correction" } else { "positive" };
+                let signal = astra_runtime::turn::implicit_feedback::ImplicitSignal {
+                    signal_type: signal_type.to_string(),
+                    confidence: 0.8,
+                    evidence: format!("thread {}", i),
+                };
+                let intent = format!("intent_{}", i % 3);
+                writer_clone.record_implicit_feedback(&signal, &intent, None, TaskType::Code);
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("thread should complete");
+    }
+
+    // Verify calibrator is still in valid state
+    let c = cal.lock().unwrap();
+    // At least some intents should have been recorded
+    let total = c.tracked_intent_count();
+    assert!(total > 0, "calibrator should have recorded intents");
+}
+
+#[test]
+fn concurrent_signal_detection() {
+    // Multiple threads detecting signals simultaneously
+    let inputs = vec![
+        ("错了", "correction"),
+        ("perfect", "positive"),
+        ("terrible", "frustration"),
+        ("normal message", "neutral"),
+    ];
+
+    let handles: Vec<_> = inputs
+        .into_iter()
+        .cycle()
+        .take(20)
+        .map(|(input, expected)| {
+            thread::spawn(move || {
+                let signal = detect_implicit_feedback_signal(input, None);
+                assert_eq!(
+                    signal.signal_type, expected,
+                    "concurrent detection should be consistent"
+                );
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("thread should complete");
+    }
+}
+
+#[test]
+fn concurrent_denial_tracker_access() {
+    // DenialTracker is not Arc<Mutex<>> - this tests that it doesn't have
+    // any internal shared mutable state that could cause issues
+    
+    // Create multiple independent trackers and use them concurrently
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            thread::spawn(move || {
+                let mut tracker = DenialTracker::default();
+                
+                // Each thread adds denials to its own tracker
+                for j in 0..5 {
+                    let fp = ApprovalFingerprint::shell("bash", &format!("cmd_{}_{}", i, j), false);
+                    tracker.record_with_reason(&fp, false, Some("reason"));
+                }
+                
+                // Extract rules
+                let rules = tracker.extract_auto_deny_rules();
+                
+                // Verify state
+                assert_eq!(tracker.total_denials(), 5);
+                rules.len()
+            })
+        })
+        .collect();
+
+    let rule_counts: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread should complete"))
+        .collect();
+
+    // Each tracker should produce rules (since all denials have same prefix pattern)
+    for count in rule_counts {
+        assert!(count > 0, "each tracker should produce rules");
+    }
+}
+
+#[test]
+fn concurrent_shared_calibrator_mixed_operations() {
+    // Simulates real-world scenario: multiple turns writing to shared calibrator
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+
+    let handles: Vec<_> = (0..20)
+        .map(|i| {
+            let cal_clone = cal.clone();
+            thread::spawn(move || {
+                // Simulate different operations
+                match i % 4 {
+                    0 => {
+                        // Write correction
+                        let mut c = cal_clone.lock().unwrap();
+                        c.record(
+                            &format!("intent_{}", i % 5),
+                            Some(DomainHint::Code),
+                            TaskType::Code,
+                            true, // was_corrected
+                            Some(25),
+                        );
+                    }
+                    1 => {
+                        // Write success
+                        let mut c = cal_clone.lock().unwrap();
+                        c.record(
+                            &format!("intent_{}", i % 5),
+                            Some(DomainHint::GitHub),
+                            TaskType::Fetch,
+                            false,
+                            Some(80),
+                        );
+                    }
+                    2 => {
+                        // Read threshold
+                        let c = cal_clone.lock().unwrap();
+                        let _threshold = c.calibrated_threshold(
+                            &format!("intent_{}", i % 5),
+                            Some(DomainHint::Code),
+                            TaskType::Code,
+                        );
+                    }
+                    _ => {
+                        // Read stats
+                        let c = cal_clone.lock().unwrap();
+                        let _count = c.tracked_intent_count();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("thread should complete");
+    }
+
+    // Final validation
+    let c = cal.lock().unwrap();
+    assert!(c.tracked_intent_count() > 0);
+}
+
+#[test]
+fn concurrent_injection_generation() {
+    // Injection generation should be pure and thread-safe
+    let handles: Vec<_> = (0..20)
+        .map(|i| {
+            thread::spawn(move || {
+                let signal_type = match i % 4 {
+                    0 => "correction",
+                    1 => "frustration",
+                    2 => "rephrasing",
+                    _ => "neutral",
+                };
+                
+                let signal = astra_runtime::turn::implicit_feedback::ImplicitSignal {
+                    signal_type: signal_type.to_string(),
+                    confidence: 0.5 + (i as f64 * 0.02),
+                    evidence: format!("evidence {}", i),
+                };
+                
+                let injection = implicit_feedback_context_injection(&signal);
+                
+                // Verify expected behavior
+                match signal_type {
+                    "correction" | "frustration" | "rephrasing" => {
+                        assert!(injection.is_some());
+                        let text = injection.unwrap();
+                        assert!(text.contains("[Session Feedback]"));
+                    }
+                    _ => {
+                        assert!(injection.is_none());
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("thread should complete");
+    }
+}
