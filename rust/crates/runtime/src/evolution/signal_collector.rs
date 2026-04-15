@@ -108,6 +108,8 @@ impl SignalCollector {
             prior_assistant_text: truncate(prior_assistant.unwrap_or(""), MAX_SNIPPET_LEN),
             skill_context: active_skill.map(String::from),
             turn_id: turn_id.to_string(),
+            reason: None,
+            apply_when: None,
         };
         self.push(signal);
     }

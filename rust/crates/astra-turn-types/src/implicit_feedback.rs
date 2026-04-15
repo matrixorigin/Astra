@@ -9,6 +9,25 @@ pub struct ImplicitSignal {
     pub evidence: String,
 }
 
+/// Structured feedback extracted from a correction signal.
+///
+/// Inspired by Claude Code's feedback memory format: captures *why* the user
+/// corrected and *when* the rule applies, so the system can judge edge cases
+/// rather than blindly following statistical patterns.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StructuredFeedback {
+    /// The rule itself — what the user wants changed.
+    pub rule: String,
+    /// Why the user gave this feedback (incident, preference, past failure).
+    pub reason: String,
+    /// When/where this guidance applies (specific domain, task type, tool).
+    pub apply_when: String,
+    /// Source signal type that triggered extraction.
+    pub source_signal: String,
+    /// Confidence from the original signal detection.
+    pub confidence: f64,
+}
+
 fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
     patterns
         .iter()

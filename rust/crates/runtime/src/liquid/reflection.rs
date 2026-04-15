@@ -1189,6 +1189,8 @@ mod tests {
                 prior_assistant_text: "cat /etc/shadow".into(),
                 skill_context: Some("file-ops".into()),
                 turn_id: "t2".into(),
+                reason: None,
+                apply_when: None,
             },
             EvolutionSignal::PatternDrift {
                 pattern_signature: "bash→grep→sed".into(),

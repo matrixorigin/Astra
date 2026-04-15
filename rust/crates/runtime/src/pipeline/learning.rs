@@ -115,18 +115,21 @@ impl PipelineLearningWriter {
     ///
     /// The signal's confidence modulates the feedback score (1-5 scale mapped
     /// to 0-100 for the calibrator).
+    ///
+    /// Returns a `StructuredFeedback` if heuristic extraction succeeds, or `None`
+    /// if the correction is too complex (caller should use LLM extraction).
     pub fn record_implicit_feedback(
         &self,
         signal: &ImplicitSignal,
         intent: &str,
         domain: Option<DomainHint>,
         task_type: TaskType,
-    ) {
+    ) -> Option<astra_turn_types::StructuredFeedback> {
         // Only calibrate on actionable signals
         let was_corrected = match signal.signal_type.as_str() {
             "correction" | "frustration" => true,
             "positive" => false,
-            _ => return, // neutral/rephrasing/clarification don't affect calibration
+            _ => return None, // neutral/rephrasing/clarification don't affect calibration
         };
 
         // Convert 1-5 rating to 0-100 feedback score
@@ -138,6 +141,18 @@ impl PipelineLearningWriter {
         if let Some(pc) = &self.progressive_calibrator {
             let mut cal = pc.lock().unwrap_or_else(|e| e.into_inner());
             cal.record(intent, domain, task_type, was_corrected, feedback_score);
+        }
+
+        // Attempt heuristic structured feedback extraction (no LLM needed)
+        if was_corrected {
+            crate::pipeline::feedback_extraction::heuristic_extract(
+                &signal.evidence,
+                "",
+                &signal.signal_type,
+                signal.confidence,
+            )
+        } else {
+            None
         }
     }
 }
@@ -179,6 +194,11 @@ fn parse_domain_hint(label: Option<&str>) -> Option<DomainHint> {
 #[async_trait]
 impl TurnLearningWriter for PipelineLearningWriter {
     async fn record_outcome(&self, outcome: TurnLearningOutcome) -> Result<(), String> {
+        // Quality gate: filter out trivial, derivable, or ambiguous outcomes
+        if let Err(_rejection) = crate::pipeline::learning_quality_gate::evaluate(&outcome) {
+            return Ok(());
+        }
+
         let task_type = parse_task_type(outcome.task_type_label.as_deref());
         let domain = parse_domain_hint(outcome.domain_hint_label.as_deref());
         let feedback = outcome.user_feedback_score;
