@@ -1803,9 +1803,8 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0);
                                 eprintln!(
-                                    "  {} {} T{} compaction retry #{} (freed {} tokens)",
+                                    "  {} 🗜️ T{} compaction retry #{} (freed {} tokens)",
                                     ts_short.dim(),
-                                    "🗜️",
                                     evt.turn.unwrap_or(0),
                                     retry_count,
                                     tokens_freed,
