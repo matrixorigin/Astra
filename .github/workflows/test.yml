@@ -48,6 +48,20 @@ jobs:
       - run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime
       - name: Run trusted_moi auth integration tests
         run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test trusted_moi_auth_integration -- --nocapture
+
+  test-offline-runtime-e2e:
+    name: "Offline: bridge-e2e-hooks"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
       - name: Run bridge-e2e-hooks tests
         run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks
 
@@ -79,7 +93,10 @@ jobs:
           workspaces: rust
           shared-key: ci-offline
           save-if: false
-      - run: cargo test --manifest-path rust/Cargo.toml -p astra-core -p astra-thin-client -p astra-admin-cli
+      - name: Test foundational crates
+        run: cargo test --manifest-path rust/Cargo.toml -p astra-core -p astra-thin-client -p astra-admin-cli
+      - name: Test extracted crates
+        run: cargo test --manifest-path rust/Cargo.toml -p astra-tools -p astra-pipeline -p astra-turn-types -p astra-skills -p astra-sandbox
 
   # ── Online: needs MatrixOne + Memoria ─────────────────────────────────
   test-online:
