@@ -348,6 +348,10 @@ export type SSEClientOptions = {
   maxRetries?: number;
   retryDelayMs?: number;
   signal?: AbortSignal;
+  /** HTTP method. Defaults to 'GET'. Use 'POST' for streaming chat endpoints. */
+  method?: 'GET' | 'POST';
+  /** Request body for POST requests. */
+  body?: string;
 };
 
 // ─── API Types ─────────────────────────────────────────────────────

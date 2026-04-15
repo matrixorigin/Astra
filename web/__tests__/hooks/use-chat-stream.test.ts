@@ -24,6 +24,7 @@ function makeReader(chunks: Uint8Array[]) {
       }
       return { done: true, value: undefined };
     }),
+    releaseLock: jest.fn(),
   };
 }
 
