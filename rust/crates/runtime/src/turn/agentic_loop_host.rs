@@ -52,6 +52,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use astra_services::DatabaseEvaluationService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
@@ -417,6 +418,8 @@ pub struct TelemetryState {
     /// Optional preloaded evaluation summaries used to damp runtime promotions.
     pub runtime_promotion_signals:
         Option<crate::runtime_promotion_signals::RuntimePromotionSignals>,
+    /// Optional evaluation persistence context for refreshing DB-backed runtime signals.
+    pub evaluation_persistence: Option<EvaluationPersistenceContext>,
     /// Runtime promotion verdicts captured for later audit/report persistence.
     pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
@@ -425,6 +428,12 @@ pub struct TelemetryState {
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
     /// Number of turns completed in this loop invocation (for tuning cycle trigger).
     pub completed_turns_for_tuning: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvaluationPersistenceContext {
+    pub user_id: String,
+    pub evaluation_service: DatabaseEvaluationService,
 }
 
 /// Stall and verdict tracking state for the agentic loop.

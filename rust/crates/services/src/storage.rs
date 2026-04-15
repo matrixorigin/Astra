@@ -2,12 +2,54 @@ use crate::auth::DatabaseUserRecord;
 use crate::auth::session::SessionRecord;
 use astra_core::{ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error};
 use axum::{Json, http::StatusCode};
+use fs2::FileExt;
 use sqlx::{MySql, QueryBuilder, Row, query};
 use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
+use std::fs::OpenOptions;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
+static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+struct CoreSchemaFileLock {
+    file: std::fs::File,
+}
+
+impl Drop for CoreSchemaFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn schema_lock_component(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn acquire_core_schema_file_lock(
+    settings: &MatrixOneSettings,
+) -> Result<CoreSchemaFileLock, sqlx::Error> {
+    let lock_dir = std::env::temp_dir().join("astra-engine-locks");
+    std::fs::create_dir_all(&lock_dir).map_err(sqlx::Error::Io)?;
+    let lock_path = lock_dir.join(format!(
+        "core-schema-{}-{}-{}.lock",
+        schema_lock_component(&settings.host),
+        settings.port,
+        schema_lock_component(&settings.database),
+    ));
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(sqlx::Error::Io)?;
+    file.lock_exclusive().map_err(sqlx::Error::Io)?;
+    Ok(CoreSchemaFileLock { file })
+}
 
 fn unique_event_ids(event_ids: &[String]) -> Vec<&str> {
     let mut seen = HashSet::new();
@@ -182,6 +224,14 @@ async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Resul
 }
 
 pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
+    // Tests and startup paths can race on schema bootstrap inside the same process.
+    // Serialize schema setup so migration markers and DDL stay idempotent.
+    let _init_guard = CORE_SCHEMA_INIT_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _file_lock = acquire_core_schema_file_lock(settings)?;
+
     if std::env::var("MATRIXONE_AUTO_CREATE_DATABASE")
         .map(|v| v == "1")
         .unwrap_or(false)
@@ -1237,7 +1287,7 @@ async fn run_migration(
 
     query(sql).execute(pool).await?;
 
-    query("INSERT INTO schema_migrations (version, description) VALUES (?, ?)")
+    query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
         .bind(version)
         .bind(description)
         .execute(pool)

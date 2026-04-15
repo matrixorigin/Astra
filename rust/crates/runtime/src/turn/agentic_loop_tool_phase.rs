@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use astra_services::EvaluationService;
+use astra_services::evaluation::SessionQualityAssessmentRequest;
+
 use super::agentic_adaptive_tuning::{
     apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
 };
@@ -34,6 +37,81 @@ use crate::runtime_promotion_signals::{RuntimePromotionSignals, RuntimeTurnEvalu
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
     Return(AgenticLoopOutcome),
+}
+
+fn build_runtime_session_quality_assessment(
+    session_id: &str,
+    quality: f64,
+    total_tools: usize,
+) -> SessionQualityAssessmentRequest {
+    SessionQualityAssessmentRequest {
+        session_id: session_id.to_string(),
+        score: quality,
+        step_count: i32::try_from(total_tools).unwrap_or(i32::MAX),
+    }
+}
+
+async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState) {
+    let (session_id, persistence) = match (
+        state.current_session_id.as_deref(),
+        state.telemetry.evaluation_persistence.clone(),
+    ) {
+        (Some(session_id), Some(persistence)) if !session_id.is_empty() => {
+            (session_id.to_string(), persistence)
+        }
+        _ => return,
+    };
+    let verdict_warning =
+        crate::server::run_lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
+    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records(
+        &state.message,
+        &state.recent_tools,
+        &state.stall.tool_call_records,
+        state.stall.events.len(),
+        verdict_warning,
+        state.telemetry.first_budget_pressure,
+    );
+    let assessment = build_runtime_session_quality_assessment(
+        &session_id,
+        evaluation.quality,
+        state.step_recorder.summary().total_tools,
+    );
+
+    if let Err((status, response)) = persistence
+        .evaluation_service
+        .record_session_quality_assessment(&persistence.user_id, assessment)
+        .await
+    {
+        astra_core::agent_warn!(
+            "promotion-signals",
+            "Failed to persist session quality assessment for {}: {} {}",
+            session_id,
+            status,
+            response.0.detail
+        );
+        return;
+    }
+
+    match crate::server::run_lifecycle::load_runtime_promotion_signals_with_service(
+        &persistence.evaluation_service,
+        &persistence.user_id,
+    )
+    .await
+    {
+        Ok(signals) => {
+            state.telemetry.runtime_promotion_signals = Some(signals.clone());
+            if let Some(evolution_service) = state.evolution_service.as_ref() {
+                evolution_service.set_runtime_promotion_signals(Some(signals));
+            }
+        }
+        Err((status, response)) => astra_core::agent_warn!(
+            "promotion-signals",
+            "Failed to refresh runtime promotion signals for {}: {} {}",
+            session_id,
+            status,
+            response.0.detail
+        ),
+    }
 }
 
 fn tool_record_result_text(rec: &astra_services::session_journal::ToolCallRecord) -> &str {
@@ -983,6 +1061,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     state.telemetry.runtime_promotion_signals = updated_promotion_signals;
                     observe_gate_cancelled(state, turn_index, prep.turn_start_time, &turn_result);
                     state.step_recorder.end_turn(true);
+                    refresh_runtime_promotion_signals_from_db(state).await;
                     finalize_turn_trace(state);
                     return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Cancelled));
                 }
@@ -1025,6 +1104,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 state.telemetry.first_budget_pressure,
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
+            state.step_recorder.end_turn(true);
+            refresh_runtime_promotion_signals_from_db(state).await;
             finalize_turn_trace(state);
             return Err(e);
         }
@@ -1108,6 +1189,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             finalize_turn_trace(state);
             state.step_recorder.end_turn(false);
+            refresh_runtime_promotion_signals_from_db(state).await;
             state.telemetry.completed_turns_for_tuning += 1;
             maybe_run_tuning_cycle(state);
             maybe_trigger_auto_reflection(host, state).await;
@@ -1188,6 +1270,26 @@ mod tests {
         let rec = summary_tool_record(false, Some("Error: command failed"), Some("stderr preview"));
         assert_eq!(tool_record_result_text(&rec), "stderr preview");
         assert!(!tool_record_was_rejected(&rec));
+    }
+
+    #[test]
+    fn runtime_session_quality_assessment_uses_session_score_and_tools() {
+        assert_eq!(
+            build_runtime_session_quality_assessment("sess-9", 0.63, 7),
+            SessionQualityAssessmentRequest {
+                session_id: "sess-9".to_string(),
+                score: 0.63,
+                step_count: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_session_quality_assessment_saturates_large_tool_counts() {
+        assert_eq!(
+            build_runtime_session_quality_assessment("sess-9", 0.63, usize::MAX).step_count,
+            i32::MAX
+        );
     }
 
     fn tool_record(name: &str, ok: bool) -> ToolCallRecord {

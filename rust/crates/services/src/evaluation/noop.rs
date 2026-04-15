@@ -39,6 +39,13 @@ impl EvaluationService for UnconfiguredEvaluationService {
     ) -> ServiceResult<SessionScoresListResponse> {
         Err(internal_error("evaluation service not configured"))
     }
+    async fn record_session_quality_assessment(
+        &self,
+        _: &str,
+        _: SessionQualityAssessmentRequest,
+    ) -> ServiceResult<()> {
+        Err(internal_error("evaluation service not configured"))
+    }
     async fn validate_gate(
         &self,
         _: &str,

@@ -23,6 +23,17 @@ const LOOP_QUALITY_THRESHOLD: f64 = 0.70;
 const LOOP_DRIFT_DELTA_THRESHOLD: f64 = 0.10;
 const TRUST_SLO_TARGET: f64 = 0.95;
 const ZERO_IQR_NOISE_BAND: f64 = 0.05;
+const SESSION_QUALITY_LEVEL: &str = "session";
+const UPSERT_SESSION_QUALITY_ASSESSMENT_SQL: &str = "INSERT INTO eval_quality_assessments \
+     (assessment_id, user_id, target_id, score, step_count, level) \
+     VALUES (?, ?, ?, ?, ?, ?) \
+     ON DUPLICATE KEY UPDATE \
+       user_id = VALUES(user_id), \
+       target_id = VALUES(target_id), \
+       score = VALUES(score), \
+       step_count = VALUES(step_count), \
+       level = VALUES(level), \
+       updated_at = CURRENT_TIMESTAMP(6)";
 
 fn clamp_eval_limit(limit: i32) -> i32 {
     limit.clamp(1, MAX_EVALUATION_ROWS)
@@ -34,6 +45,10 @@ fn clamp_eval_days(days: i32) -> i32 {
 
 fn clamp_extract_limit(limit: i32) -> i32 {
     limit.clamp(1, MAX_EXTRACT_SAMPLES)
+}
+
+fn session_quality_assessment_id(session_id: &str) -> String {
+    format!("session:{session_id}")
 }
 
 fn classify_drift_severity(delta: f64) -> Option<DriftSeverity> {
@@ -1287,6 +1302,30 @@ impl EvaluationService for DatabaseEvaluationService {
         Ok(SessionScoresListResponse { sessions, total })
     }
 
+    async fn record_session_quality_assessment(
+        &self,
+        user_id: &str,
+        request: SessionQualityAssessmentRequest,
+    ) -> ServiceResult<()> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let assessment_id = session_quality_assessment_id(&request.session_id);
+        let score = request.score.clamp(0.0, 1.0);
+        let step_count = request.step_count.max(0);
+
+        query(UPSERT_SESSION_QUALITY_ASSESSMENT_SQL)
+            .bind(&assessment_id)
+            .bind(user_id)
+            .bind(&request.session_id)
+            .bind(score)
+            .bind(step_count)
+            .bind(SESSION_QUALITY_LEVEL)
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?;
+
+        Ok(())
+    }
+
     async fn validate_gate(
         &self,
         user_id: &str,
@@ -2398,6 +2437,22 @@ mod tests {
         assert!(sql.contains("EXISTS ("));
         assert!(sql.contains("e.session_id = qa.target_id"));
         assert!(sql.contains("e.llm_model_used = ?"));
+    }
+
+    #[test]
+    fn session_quality_assessment_id_is_stable() {
+        assert_eq!(
+            session_quality_assessment_id("sess-123"),
+            "session:sess-123".to_string()
+        );
+    }
+
+    #[test]
+    fn session_quality_assessment_upsert_query_updates_existing_rows() {
+        assert!(UPSERT_SESSION_QUALITY_ASSESSMENT_SQL.contains("ON DUPLICATE KEY UPDATE"));
+        assert!(
+            UPSERT_SESSION_QUALITY_ASSESSMENT_SQL.contains("updated_at = CURRENT_TIMESTAMP(6)")
+        );
     }
 
     #[test]
