@@ -424,6 +424,23 @@ fn record_tool_selection(
         }
 
         state.last_confidence_diagnosis = Some(diagnosis);
+
+        // Emit journal event for actionable (low/very-low) confidence diagnoses.
+        if let Some(ref diag) = state.last_confidence_diagnosis {
+            if diag.is_actionable() {
+                if let Some(ref sid) = state.current_session_id {
+                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                        let evt = astra_services::session_journal::JournalEvent::confidence_diagnosis_recorded(
+                            Some(sid),
+                            turn_index as u32,
+                            conf,
+                            diag.to_json(),
+                        );
+                        let _ = writer.append(&evt);
+                    }
+                }
+            }
+        }
     }
 
     if let Some(session) = &state.telemetry.observability_session {

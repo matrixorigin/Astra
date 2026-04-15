@@ -1769,6 +1769,24 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     resumable,
                                 );
                             }
+                            session_journal::JournalEventType::ConfidenceDiagnosisRecorded => {
+                                let conf = evt.selector_confidence.unwrap_or(0.0);
+                                let tier = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("confidence_diagnosis"))
+                                    .and_then(|v| v.get("tier"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                eprintln!(
+                                    "  {} {} T{} confidence: {:.2} ({})",
+                                    ts_short.dim(),
+                                    "🔍".yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    conf,
+                                    tier,
+                                );
+                            }
                         }
                     }
                     // Summary stats
