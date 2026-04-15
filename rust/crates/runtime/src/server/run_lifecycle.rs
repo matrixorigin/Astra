@@ -210,6 +210,7 @@ async fn load_runtime_promotion_signals(
             score_delta: Some(gate.score_delta_interval),
         }),
         calibration_error: Some(calibration_error),
+        recent_turn: None,
     })
 }
 

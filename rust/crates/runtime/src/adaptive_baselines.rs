@@ -793,6 +793,7 @@ mod tests {
                 score_delta: Some(ValueInterval::exact(-0.11)),
             }),
             calibration_error: Some(ValueInterval::exact(0.24)),
+            ..RuntimePromotionSignals::default()
         };
 
         let verdict =
