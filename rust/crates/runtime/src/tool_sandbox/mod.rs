@@ -2,33 +2,25 @@
 //!
 //! Security boundary enforcement for agent tool execution.
 //!
+//! This module re-exports from the `astra-sandbox` crate.
+//!
 //! ## Layers
 //!
 //! 1. **Path validation** — canonicalize and check against project boundary
 //! 2. **Command sandboxing** — env filtering, resource limits, restricted bash
 //! 3. **Policy engine** — configurable per-session security rules
 
-mod bash_ast;
-mod command;
-mod git_safety;
-mod path;
-mod policy;
-mod process_isolation;
-mod shell_hardening;
-mod tier;
+// Re-export everything from astra-sandbox
+pub use astra_sandbox::*;
 
-pub use command::{
-    CommandRisk, SandboxCommandError, analyze_command_risks, filter_environment, sandbox_command,
-    wrap_command_with_limits,
-};
-pub use git_safety::{
-    GitSafetyViolation, is_bare_git_repo, is_soft_violation, validate_git_command,
-};
-pub use path::{SandboxPathError, validate_path};
-pub use policy::{SandboxMode, SandboxPolicy};
-pub use process_isolation::{IsolatedOutput, IsolationConfig, execute_isolated};
-pub use shell_hardening::{
-    DANGEROUS_FILE_PATHS, SENSITIVE_ENV_VARS, ShellHardeningConfig, build_hardened_command,
-    is_dangerous_file_path, scrub_secrets_from_env,
-};
-pub use tier::{ToolTier, classify_tool, effective_tier};
+// Re-export TrustTier conversion from skills manifest to sandbox TrustTier
+impl From<&crate::skills::manifest::TrustTier> for astra_sandbox::TrustTier {
+    fn from(tier: &crate::skills::manifest::TrustTier) -> Self {
+        match tier {
+            crate::skills::manifest::TrustTier::Bundled => astra_sandbox::TrustTier::Bundled,
+            crate::skills::manifest::TrustTier::Verified => astra_sandbox::TrustTier::Verified,
+            crate::skills::manifest::TrustTier::Community => astra_sandbox::TrustTier::Community,
+            crate::skills::manifest::TrustTier::Unverified => astra_sandbox::TrustTier::Unverified,
+        }
+    }
+}

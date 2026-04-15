@@ -1626,8 +1626,9 @@ fn run_hooks(actions: &[HookAction], skip_shell: bool) {
 fn build_activation(skill: &ResolvedSkill) -> SkillActivation {
     let sandbox_policy = {
         let root = std::env::current_dir().unwrap_or_default();
+        let sandbox_tier: crate::tool_sandbox::TrustTier = (&skill.trust_tier).into();
         Some(crate::tool_sandbox::SandboxPolicy::for_trust_tier(
-            &skill.trust_tier,
+            &sandbox_tier,
             root,
         ))
     };

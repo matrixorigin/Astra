@@ -235,6 +235,7 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-pipeline",
+ "astra-sandbox",
  "astra-services",
  "astra-thin-client",
  "astra-tools",
@@ -272,6 +273,19 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "astra-sandbox"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",

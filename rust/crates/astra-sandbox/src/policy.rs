@@ -138,10 +138,10 @@ impl SandboxPolicy {
     /// - Community → Standard + env allowlist (automated scan only)
     /// - Unverified → Strict (no verification, full isolation)
     pub fn for_trust_tier(
-        tier: &crate::skills::manifest::TrustTier,
+        tier: &crate::TrustTier,
         project_root: impl Into<PathBuf>,
     ) -> Self {
-        use crate::skills::manifest::TrustTier;
+        use crate::TrustTier;
         let root = project_root.into();
         match tier {
             TrustTier::Bundled => Self::permissive(root),
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn trust_tier_bundled_is_permissive() {
-        use crate::skills::manifest::TrustTier;
+        use crate::TrustTier;
         let p = SandboxPolicy::for_trust_tier(&TrustTier::Bundled, "/proj");
         assert_eq!(p.mode, SandboxMode::Permissive);
         assert!(p.network_allowed);
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn trust_tier_verified_is_standard() {
-        use crate::skills::manifest::TrustTier;
+        use crate::TrustTier;
         let p = SandboxPolicy::for_trust_tier(&TrustTier::Verified, "/proj");
         assert_eq!(p.mode, SandboxMode::Standard);
         assert!(p.network_allowed);
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn trust_tier_community_has_env_filter() {
-        use crate::skills::manifest::TrustTier;
+        use crate::TrustTier;
         let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
         assert_eq!(p.mode, SandboxMode::Standard);
         // Community gets env allowlist (only baseline vars)
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn trust_tier_unverified_is_strict() {
-        use crate::skills::manifest::TrustTier;
+        use crate::TrustTier;
         let p = SandboxPolicy::for_trust_tier(&TrustTier::Unverified, "/proj");
         assert_eq!(p.mode, SandboxMode::Strict);
         assert!(!p.network_allowed);
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn community_tier_allows_network() {
-        use crate::skills::manifest::TrustTier;
+        use crate::TrustTier;
         let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
         // Community uses Standard mode which allows network
         assert!(p.network_allowed);
