@@ -248,6 +248,7 @@ fn build_bridge_tool_call_records(
 }
 
 fn build_legacy_context_trace_signal(
+    turn: u32,
     turn_id: String,
     tools_available: usize,
     selected_tools: Vec<String>,
@@ -268,7 +269,7 @@ fn build_legacy_context_trace_signal(
         },
         compression_triggered: false,
     });
-    let context_assembly_ms = total_ms.saturating_sub(tool_execution_ms);
+    let llm_total_ms = total_ms.saturating_sub(tool_execution_ms);
 
     ContextTraceSignal {
         turn_id,
@@ -277,7 +278,7 @@ fn build_legacy_context_trace_signal(
             tools_available: tools_available.min(u32::MAX as usize) as u32,
             selected_tools,
             rejected_tools: tools_available.saturating_sub(unique_selected),
-            strategy: "legacy_bridge".to_string(),
+            strategy: "inprocess_bridge".to_string(),
             confidence: selection_confidence,
             latency_ms: 0,
         }),
@@ -285,10 +286,10 @@ fn build_legacy_context_trace_signal(
         history: None,
         budget,
         timing: Some(ContextTraceTimingSignal {
-            turn: 1,
-            context_assembly_ms,
+            turn,
+            context_assembly_ms: 0,
             ttft_ms: 0,
-            llm_total_ms: total_ms.saturating_sub(context_assembly_ms),
+            llm_total_ms,
             tool_execution_ms,
             total_ms,
         }),
@@ -2816,8 +2817,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .and_then(Value::as_u64)
                 })
                 .sum();
+            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
             let trace_signal = build_legacy_context_trace_signal(
-                format!("turn-{}", turn_count_from_messages(&messages).max(1)),
+                trace_turn,
+                format!("turn-{trace_turn}"),
                 edge_tools.len(),
                 recent_tools_for_quality.clone(),
                 selection_confidence,
@@ -3271,6 +3274,32 @@ mod tests {
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
         assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    }
+
+    #[test]
+    fn build_legacy_context_trace_signal_keeps_only_known_timing_values() {
+        let signal = build_legacy_context_trace_signal(
+            3,
+            "turn-3".to_string(),
+            5,
+            vec!["read_file".to_string(), "grep".to_string()],
+            0.82,
+            Some(1200),
+            8000,
+            450,
+            1500,
+        );
+
+        let tool_selection = signal.tool_selection.as_ref().expect("tool selection");
+        assert_eq!(tool_selection.strategy, "inprocess_bridge");
+        assert_eq!(tool_selection.confidence, 0.82);
+
+        let timing = signal.timing.as_ref().expect("timing");
+        assert_eq!(timing.turn, 3);
+        assert_eq!(timing.context_assembly_ms, 0);
+        assert_eq!(timing.llm_total_ms, 1050);
+        assert_eq!(timing.tool_execution_ms, 450);
+        assert_eq!(timing.total_ms, 1500);
     }
 
     // ── Static/dynamic prompt boundary tests ──
