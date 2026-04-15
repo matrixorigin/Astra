@@ -87,7 +87,7 @@ impl Default for BundledSkillProvider {
 
 impl BundledSkillProvider {
     /// Create a provider with all built-in skills pre-registered.
-    /// 
+    ///
     /// Note: Dynamic skills are registered from runtime, not this crate.
     pub fn with_defaults() -> Self {
         Self::new()

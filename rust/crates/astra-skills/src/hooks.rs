@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn lifecycle_event_variants_constructible() {
-        let events = vec![
+        let events = [
             SkillLifecycleEvent::Discovered {
                 name: "test".into(),
                 source: super::super::manifest::SkillSourceKind::Local,

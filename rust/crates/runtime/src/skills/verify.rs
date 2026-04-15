@@ -116,16 +116,18 @@ mod tests {
             .unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
-            id: "output-exists".to_string(),
-            description: "Output file must exist".to_string(),
-            verifier: VerifierKind::FileExists {
-                paths: vec![file_path.to_string_lossy().to_string()],
-            },
-            required: true,
-            timeout_sec: 10,
-            global_only: false,
-        }));
+        manifest
+            .success_criteria
+            .push(criterion_to_value(VerificationCriterion {
+                id: "output-exists".to_string(),
+                description: "Output file must exist".to_string(),
+                verifier: VerifierKind::FileExists {
+                    paths: vec![file_path.to_string_lossy().to_string()],
+                },
+                required: true,
+                timeout_sec: 10,
+                global_only: false,
+            }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
@@ -139,21 +141,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
-            id: "missing-file".to_string(),
-            description: "File must exist".to_string(),
-            verifier: VerifierKind::FileExists {
-                paths: vec![
-                    dir.path()
-                        .join("nonexistent.txt")
-                        .to_string_lossy()
-                        .to_string(),
-                ],
-            },
-            required: true,
-            timeout_sec: 10,
-            global_only: false,
-        }));
+        manifest
+            .success_criteria
+            .push(criterion_to_value(VerificationCriterion {
+                id: "missing-file".to_string(),
+                description: "File must exist".to_string(),
+                verifier: VerifierKind::FileExists {
+                    paths: vec![
+                        dir.path()
+                            .join("nonexistent.txt")
+                            .to_string_lossy()
+                            .to_string(),
+                    ],
+                },
+                required: true,
+                timeout_sec: 10,
+                global_only: false,
+            }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
@@ -166,21 +170,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
-            id: "advisory-check".to_string(),
-            description: "Nice to have".to_string(),
-            verifier: VerifierKind::FileExists {
-                paths: vec![
-                    dir.path()
-                        .join("optional.txt")
-                        .to_string_lossy()
-                        .to_string(),
-                ],
-            },
-            required: false, // advisory
-            timeout_sec: 10,
-            global_only: false,
-        }));
+        manifest
+            .success_criteria
+            .push(criterion_to_value(VerificationCriterion {
+                id: "advisory-check".to_string(),
+                description: "Nice to have".to_string(),
+                verifier: VerifierKind::FileExists {
+                    paths: vec![
+                        dir.path()
+                            .join("optional.txt")
+                            .to_string_lossy()
+                            .to_string(),
+                    ],
+                },
+                required: false, // advisory
+                timeout_sec: 10,
+                global_only: false,
+            }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
@@ -193,18 +199,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut manifest = SkillManifest::default();
-        manifest.success_criteria.push(criterion_to_value(VerificationCriterion {
-            id: "echo-check".to_string(),
-            description: "Echo contains expected text".to_string(),
-            verifier: VerifierKind::CommandOutput {
-                cmd: "echo 'all tests passed'".to_string(),
-                contains: vec!["tests passed".to_string()],
-                not_contains: vec![],
-            },
-            required: true,
-            timeout_sec: 10,
-            global_only: false,
-        }));
+        manifest
+            .success_criteria
+            .push(criterion_to_value(VerificationCriterion {
+                id: "echo-check".to_string(),
+                description: "Echo contains expected text".to_string(),
+                verifier: VerifierKind::CommandOutput {
+                    cmd: "echo 'all tests passed'".to_string(),
+                    contains: vec!["tests passed".to_string()],
+                    not_contains: vec![],
+                },
+                required: true,
+                timeout_sec: 10,
+                global_only: false,
+            }));
 
         let verifier = SkillVerifier::new(dir.path().to_path_buf());
         let (passed, results) = verifier.verify(&manifest).await;
