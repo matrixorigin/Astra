@@ -1140,6 +1140,7 @@ pub(crate) mod tests {
                 },
             ),
             calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
+            ..crate::runtime_promotion_signals::RuntimePromotionSignals::default()
         }
     }
 
@@ -1154,6 +1155,7 @@ pub(crate) mod tests {
                 },
             ),
             calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
+            ..crate::runtime_promotion_signals::RuntimePromotionSignals::default()
         }
     }
 

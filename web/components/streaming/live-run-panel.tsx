@@ -106,6 +106,8 @@ function eventSummary(event: StreamEvent): string {
       return `Agent ${event.agent_id}: ${event.status}${event.tool_name ? ` [${event.tool_name}]` : ''}${event.description ? ` — ${event.description}` : ''}`;
     case 'agent_completed':
       return `Agent ${event.agent_id} ${event.status}${event.result_summary ? `: ${event.result_summary}` : ''}${event.error ? ` — ${event.error}` : ''}`;
+    default:
+      return event.type;
   }
 }
 

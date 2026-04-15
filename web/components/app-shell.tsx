@@ -5,6 +5,7 @@ import { UserBadge } from '@/components/auth/user-badge';
 const navigation = [
   { href: '/overview', label: 'Overview' },
   { href: '/agents', label: 'Agents' },
+  { href: '/edges', label: 'Edges' },
   { href: '/models', label: 'Models' },
   { href: '/sessions', label: 'Sessions' },
   { href: '/runs', label: 'Runs' },
