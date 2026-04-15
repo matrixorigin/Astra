@@ -85,7 +85,7 @@ use crate::{
         drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
         validated_json_events_from_sse_block,
     },
-    turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG,
+    turn::stall::cli_agentic_tool_round_budget_abort_msg,
     turn::stream_events::build_approval_required_event,
     turn::tool_call_shape::tool_call_name,
     turn::tool_schema_prune::prune_tool_schemas,
@@ -1682,8 +1682,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 if bridge_remaining_turns == 0 {
                     yield render_sse_map(&build_stream_error_event(
                         &format!(
-                            "{} ({} turns used)",
-                            CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, round_limit
+                            "{} ({} rounds used)",
+                            cli_agentic_tool_round_budget_abort_msg(),
+                            round_limit
                         ),
                         "TURN_BUDGET_EXHAUSTED",
                         false,

@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use astra_core::RuntimeLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -13,6 +14,14 @@ pub const SERVER_STALL_WINDOW: usize = 3;
 /// User-visible error prefix when the agentic loop exhausts the per-request remaining-turn budget.
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set MO_MAX_TURNS (interactive) or MO_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
+
+/// User-visible error when the legacy in-process bridge exhausts the tool-round budget.
+pub fn cli_agentic_tool_round_budget_abort_msg() -> String {
+    format!(
+        "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS=30 (current default: {}).",
+        RuntimeLimits::default().max_tool_rounds
+    )
+}
 
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.
@@ -691,6 +700,14 @@ mod tests {
             .iter()
             .map(|tools| tools.iter().map(|t| format!("{}:{{}}", t)).collect())
             .collect()
+    }
+
+    #[test]
+    fn tool_round_abort_message_points_to_tool_round_limit() {
+        assert_eq!(
+            cli_agentic_tool_round_budget_abort_msg(),
+            "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS=30 (current default: 15)."
+        );
     }
 
     // ── Stall detection ──

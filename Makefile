@@ -127,7 +127,7 @@ check-runtime:
 # Dependencies (MatrixOne + Memoria)
 # ============================================================================
 
-DEPS_COMPOSE := cd deployment/all-in-one && UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
+DEPS_COMPOSE := cd deployment/all-in-one && env UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
 
 .PHONY: dev-deps-up
 dev-deps-up:
