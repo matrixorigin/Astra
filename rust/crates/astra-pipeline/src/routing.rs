@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 // ─── Task Type ───────────────────────────────────────────────────────────────
 
 /// Enriched task classification — 8 types for precise routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum TaskType {
     /// Code editing, generation, or file manipulation.
     Code,
@@ -27,13 +27,8 @@ pub enum TaskType {
     /// Multiple task types combined (e.g., "show me PRs and fix the failing one").
     Compound,
     /// Cannot determine task type.
+    #[default]
     Unknown,
-}
-
-impl Default for TaskType {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 // ─── Domain Hint ─────────────────────────────────────────────────────────────
