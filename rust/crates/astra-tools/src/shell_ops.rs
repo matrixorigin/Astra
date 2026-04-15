@@ -342,6 +342,20 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         &request.ignore_rules,
         &gitignored_paths,
     );
+    if lines.is_empty() {
+        return if cancelled {
+            ToolResult::text("No matches found before grep was cancelled".into())
+        } else if timed_out {
+            ToolResult::text("No matches found before grep timed out".into())
+        } else if stderr.trim().is_empty() {
+            ToolResult::text("No matches found".into())
+        } else {
+            ToolResult::text(format!(
+                "No matches found (warnings: {})",
+                format_search_warning(stderr.trim())
+            ))
+        };
+    }
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
             return ToolResult::text(format!(
@@ -406,6 +420,12 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         result_text.push_str(
             "\n\n[grep results truncated to the tool output limit. Narrow 'path' or lower 'head_limit' for complete output.]",
         );
+    }
+    if !stderr.trim().is_empty() {
+        result_text.push_str(&format!(
+            "\n\n[grep completed with warnings: {}]",
+            format_search_warning(stderr.trim())
+        ));
     }
 
     if scope_context && output_mode == SearchOutputMode::Content {
@@ -508,8 +528,13 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
             ToolResult::text("No files found before glob was cancelled".into())
         } else if timed_out {
             ToolResult::text("No files found before glob timed out".into())
-        } else {
+        } else if stderr.trim().is_empty() {
             ToolResult::text("No files found".into())
+        } else {
+            ToolResult::text(format!(
+                "No files found (warnings: {})",
+                format_search_warning(stderr.trim())
+            ))
         };
     }
 
@@ -574,6 +599,12 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         result_text.push_str(
             "\n\n[glob results truncated to the tool output limit. Narrow 'path' or lower 'head_limit' for complete output.]",
         );
+    }
+    if !stderr.trim().is_empty() {
+        result_text.push_str(&format!(
+            "\n\n[glob completed with warnings: {}]",
+            format_search_warning(stderr.trim())
+        ));
     }
 
     ToolResult::text(result_text)
@@ -1677,6 +1708,16 @@ fn looks_like_rg_regex_error(stderr: &str) -> bool {
         || lower.contains("pcre2")
 }
 
+fn format_search_warning(stderr: &str) -> String {
+    let compact = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    truncate_output(compact, 500)
+}
+
 fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<usize>) {
     match (before, after) {
         (Some(b), Some(a)) if b == a && b > 0 => {
@@ -2090,6 +2131,27 @@ mod tests {
             .collect();
         assert_eq!(count_lines.len(), 1, "unexpected output: {}", result.output);
         assert!(!result.output.contains("c.txt:0"));
+    }
+
+    #[tokio::test]
+    async fn grep_count_mode_all_zeroes_returns_no_matches_message() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "output_mode": "count"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert_eq!(result.output, "No matches found");
     }
 
     #[tokio::test]
