@@ -46,9 +46,8 @@ pub(crate) struct CompactionReplayResult {
 /// The `retry_count` parameter enables tiered escalation:
 /// - retry 1: default pipeline (balanced thresholds)
 /// - retry 2+: aggressive pipeline (lower thresholds, fewer preserved turns)
-/// Convenience wrapper: run first-tier (default pipeline) compaction.
 ///
-/// Used in tests and as the backwards-compatible entry point.
+/// Test-only helper for first-tier (default pipeline) compaction.
 #[cfg(test)]
 pub(crate) fn try_compact_for_retry(
     messages: &mut Vec<Value>,
