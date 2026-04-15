@@ -396,7 +396,7 @@ fn rollback_file_tool_scope_hint(path: Option<&str>) -> String {
 }
 
 fn rollback_turn_tool_scope_hint() -> &'static str {
-    "use `rollback_turn_actions` with scope=`current_turn` to revert mixed file/database changes from the same turn"
+    "when available, use `rollback_turn_actions` with scope=`current_turn` to revert mixed file/database changes from the same turn"
 }
 
 fn restore_file_compensation_summary(path: Option<&str>, delete_if_created: bool) -> String {
@@ -460,23 +460,23 @@ fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
 }
 
 fn set_goal_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the previous_goal and goal-tracking snapshot; rerun `set_goal` with the `previous_goal` from the tool result only as the manual fallback"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the previous_goal and goal-tracking snapshot; rerun `set_goal` with the `previous_goal` from the tool result only as the manual fallback"
 }
 
 fn compress_context_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
 
 fn task_create_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-task snapshot; `task_stop` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-task snapshot; `task_stop` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
 }
 
 fn task_update_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-update task snapshot; otherwise use `task_get` plus the `previous_status` from the tool result and rerun `task_update` manually"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-update task snapshot; otherwise use `task_get` plus the `previous_status` from the tool result and rerun `task_update` manually"
 }
 
 fn task_stop_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task_update` with the `previous_status` from the tool result to reopen the task manually"
+    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task_update` with the `previous_status` from the tool result to reopen the task manually"
 }
 
 fn session_state_action_profile(

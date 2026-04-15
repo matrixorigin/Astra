@@ -98,6 +98,10 @@ impl DatabaseSnapshotRollbackJournal {
         plan
     }
 
+    fn checkpoint(&self) -> u64 {
+        self.next_sequence
+    }
+
     fn remove_snapshot(&mut self, snapshot_id: &str) -> bool {
         if let Some(index) = self
             .entries
@@ -827,6 +831,10 @@ fn mo_restore_snapshot_sql(name: &str, database: Option<&str>) -> String {
     )
 }
 
+fn mo_drop_snapshot_sql(name: &str) -> String {
+    format!("DROP SNAPSHOT IF EXISTS `{name}`")
+}
+
 fn mo_query_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> bool {
     match sql
         .split_whitespace()
@@ -1285,6 +1293,13 @@ impl ServerToolExecutor {
         }
     }
 
+    pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
+        match self.database_snapshot_journal.lock() {
+            Ok(journal) => journal.checkpoint(),
+            Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
     fn record_database_snapshot_rollback(
         &self,
         snapshot_id: impl Into<String>,
@@ -1361,12 +1376,20 @@ impl ServerToolExecutor {
         &self,
         entry: &DatabaseSnapshotRollbackEntry,
     ) -> Result<(), String> {
-        let output = mo_execute_sql(
+        let restore_output = mo_execute_sql(
             &mo_restore_snapshot_sql(&entry.snapshot_id, entry.database.as_deref()),
             None,
         );
-        if is_mo_error(&output) {
-            Err(output)
+        if is_mo_error(&restore_output) {
+            return Err(restore_output);
+        }
+
+        let drop_output = mo_execute_sql(&mo_drop_snapshot_sql(&entry.snapshot_id), None);
+        if is_mo_error(&drop_output) {
+            Err(format!(
+                "restored MatrixOne snapshot `{}` but failed to drop it afterwards.\n{}",
+                entry.snapshot_id, drop_output
+            ))
         } else {
             Ok(())
         }
@@ -3055,6 +3078,9 @@ case "$*" in
     printf 'Query OK, 1 row affected\n'
     ;;
   *"RESTORE ACCOUNT"*)
+    printf 'Query OK, 1 row affected\n'
+    ;;
+  *"DROP SNAPSHOT"*)
     printf 'Query OK, 1 row affected\n'
     ;;
   *"UPDATE metrics SET value = 1"*)

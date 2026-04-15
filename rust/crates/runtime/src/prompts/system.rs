@@ -198,6 +198,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     let has_git_revert = tool_names.contains(&"git_revert_commit");
     let has_git_worktree = tool_names.contains(&"git_worktree");
     let has_session_state_rollback = tool_names.contains(&"rollback_session_state");
+    let has_turn_rollback = tool_names.contains(&"rollback_turn_actions");
 
     let mut s = String::new();
 
@@ -306,17 +307,24 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
             );
         }
         if has_git_worktree {
-            s.push_str(
-                "             - Use **git_worktree** for isolated parallel branch work; clean worktrees created by `enter`/`add` can participate in `rollback_turn_actions`, but explicit `remove` or `exit_action=remove` is still the destructive manual boundary once that worktree has diverged.\n",
-            );
+            if has_turn_rollback {
+                s.push_str(
+                    "             - Use **git_worktree** for isolated parallel branch work; clean worktrees created by `enter`/`add` can participate in `rollback_turn_actions`, but explicit `remove` or `exit_action=remove` is still the destructive manual boundary once that worktree has diverged.\n",
+                );
+            }
         }
     }
     if has_session_state_rollback {
         s.push_str(
             "\n## Session-State Rollback\n\
              - Use **rollback_session_state** to restore bounded self-mod or task mutations from the current turn (or inspect recorded handles with `scope=list`).\n\
-             - `rollback_turn_actions` now also includes recorded session-state mutations alongside file/database/git rollback journals for mixed-turn recovery.\n",
+",
         );
+        if has_turn_rollback {
+            s.push_str(
+                "             - `rollback_turn_actions` now also includes recorded session-state mutations alongside file/database/git rollback journals for mixed-turn recovery.\n",
+            );
+        }
     }
     if has_memory {
         s.push_str(
@@ -1743,6 +1751,42 @@ mod tests {
         assert!(
             !p.contains("Git Workflow"),
             "should NOT include git mutations without commit tool"
+        );
+    }
+
+    #[test]
+    fn session_state_rollback_guidance_omits_turn_rollback_when_unavailable() {
+        let p = build_main_system_prompt(
+            &["rollback_session_state", "adjust_config"],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(
+            p.contains("Session-State Rollback"),
+            "should include session rollback section"
+        );
+        assert!(
+            !p.contains("rollback_turn_actions"),
+            "should not mention unavailable mixed-surface rollback tool"
+        );
+    }
+
+    #[test]
+    fn session_state_rollback_guidance_mentions_turn_rollback_when_available() {
+        let p = build_main_system_prompt(
+            &[
+                "rollback_session_state",
+                "rollback_turn_actions",
+                "adjust_config",
+            ],
+            "",
+            0.5,
+            Some("implementation"),
+        );
+        assert!(
+            p.contains("rollback_turn_actions"),
+            "should mention mixed-surface rollback when tool is available"
         );
     }
 
