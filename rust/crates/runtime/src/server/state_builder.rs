@@ -246,7 +246,8 @@ pub async fn build_server_state(
             run_encryptor.clone(),
             state.edge_callback_ledger.clone(),
         )
-        .with_pool(shared_pool.clone()),
+        .with_pool(shared_pool.clone())
+        .with_edge_connection_pool(state.edge_connection_pool.clone()),
     );
     let delegation_engine = Arc::new(
         crate::server::delegation_engine::DelegationEngine::with_executor(

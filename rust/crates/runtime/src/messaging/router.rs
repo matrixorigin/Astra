@@ -370,15 +370,24 @@ impl AgentMailboxRouter {
             .delegation_tracker
             .get_agent_id(&parent_run_id)
             .await
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                MailboxError::Transport(format!(
-                    "parent run_id '{}' has no agent_id in delegation tracker",
-                    parent_run_id
-                ))
-            })?;
+            .filter(|id| !id.is_empty());
 
-        Ok(AgentAddress::new(&parent_run_id, &agent_id))
+        match agent_id {
+            Some(id) => Ok(AgentAddress::new(&parent_run_id, &id)),
+            None => {
+                // Parent is the orchestrator/root run — not itself a sub-run,
+                // so it has no agent_id in the tracker. Use a synthetic address
+                // so progress messages can still be routed (best-effort).
+                tracing::debug!(
+                    target: "astra_runtime::messaging",
+                    parent_run_id = %parent_run_id,
+                    child_run_id = %child_run_id,
+                    "parent run_id not found in address registry or tracker; \
+                     using synthetic 'orchestrator' agent_id",
+                );
+                Ok(AgentAddress::new(&parent_run_id, "orchestrator"))
+            }
+        }
     }
 
     /// Resolve a Direct target that may have an empty run_id (from send_tool).
