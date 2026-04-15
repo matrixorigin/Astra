@@ -6,11 +6,13 @@ use super::agentic_loop_host::{
     finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::agentic_loop_lifecycle::TurnIterationPrep;
+use super::agentic_loop_lifecycle::interruption_state_summary;
 use super::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut,
     agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
+use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 pub(crate) struct TurnExecutionPhase {
     pub(crate) llm_wall_start: Instant,
@@ -111,6 +113,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                      Error: {}",
                     state.total_tool_calls, e,
                 );
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::RateLimited,
+                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Rate limit during streaming: {}", e)),
+                    ),
+                ));
                 observe_turn_end_without_tools(
                     state,
                     turn_index,
@@ -119,6 +129,55 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 finalize_and_render(host, state);
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
+
+            if is_rate_limit {
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::RateLimited,
+                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Rate limit during streaming: {}", e)),
+                    ),
+                ));
+            }
+
+            // ── Context-window overflow: compact and retry ────────────
+            let is_context_overflow = e
+                .contains(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX)
+                || crate::turn::llm_client::is_context_window_error(&lower);
+            if is_context_overflow
+                && state.consecutive_context_window_errors
+                    <= super::compaction_replay::MAX_COMPACT_RETRIES
+            {
+                if let Some(result) = super::compaction_replay::try_compact_for_retry(
+                    &mut state.messages,
+                    state.last_measured_prompt_tokens,
+                    state.max_turn_input_tokens,
+                ) {
+                    let summary = super::compaction_replay::compaction_summary(&result);
+                    if !prep.quiet {
+                        host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!("♻ Context overflow — {}; retrying turn…", summary),
+                        );
+                    }
+                    try_write_heavy_checkpoint(state);
+                    return Ok(TurnExecutionControl::ContinueLoop);
+                }
+            }
+            // If we reach here with a context overflow that couldn't be
+            // compacted (or retries exhausted), record a structured
+            // interruption so the session can resume from checkpoint.
+            if is_context_overflow {
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::ContextOverflow,
+                    ResumeAction::CompactAndRetry,
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Context overflow after compaction: {}", e)),
+                    ),
+                ));
             }
 
             finalize_turn_trace(state);
@@ -253,6 +312,17 @@ fn handle_token_budget<H: AgenticLoopHost>(
                 "⚠ Token budget exceeded — completing turn.".to_string(),
             );
         }
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::TokenBudgetExceeded,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(
+                state,
+                Some(format!(
+                    "Token budget: {}/{} tokens",
+                    measured, state.max_turn_input_tokens,
+                )),
+            ),
+        ));
         observe_turn_end_without_tools(
             state,
             turn_index,
@@ -322,6 +392,11 @@ fn record_tool_selection(
     turn_result: &HostTurnResult,
     turn_index: usize,
 ) {
+    // Feed confidence trend tracker with latest selector confidence.
+    if let Some(conf) = state.telemetry.first_selector_confidence {
+        state.confidence_trend.record(conf);
+    }
+
     if let Some(session) = &state.telemetry.observability_session {
         let selected_tools: Vec<String> = turn_result
             .edge_tool_round

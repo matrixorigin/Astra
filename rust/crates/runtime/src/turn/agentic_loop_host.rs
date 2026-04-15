@@ -680,6 +680,16 @@ pub struct AgenticLoopState {
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
     /// When present, tools that have no edge match are executed directly by the server.
     pub server_tool_executor: Option<Arc<crate::server::server_tool_executor::ServerToolExecutor>>,
+
+    // ── Interruption tracking ──
+    /// Structured interruption record populated by early-exit paths.
+    /// When set, the session journal and checkpoint include machine-readable
+    /// interruption context for structured resumption.
+    pub interruption: Option<super::interruption::InterruptionRecord>,
+
+    // ── Confidence tracking ──
+    /// Tracks selector confidence trends across turns to detect floor loops.
+    pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1111,6 +1121,8 @@ pub(crate) mod tests {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
+            interruption: None,
+            confidence_trend: Default::default(),
         }
     }
 

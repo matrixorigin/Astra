@@ -1744,6 +1744,31 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     n_changes,
                                 );
                             }
+                            session_journal::JournalEventType::InterruptionRecorded => {
+                                let kind = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("interruption"))
+                                    .and_then(|v| v.get("kind"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let resumable = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("interruption"))
+                                    .and_then(|v| v.get("resumable"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let icon = if resumable { "⏸" } else { "⛔" };
+                                eprintln!(
+                                    "  {} {} T{} interruption: {} (resumable={})",
+                                    ts_short.dim(),
+                                    icon.yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    kind,
+                                    resumable,
+                                );
+                            }
                         }
                     }
                     // Summary stats

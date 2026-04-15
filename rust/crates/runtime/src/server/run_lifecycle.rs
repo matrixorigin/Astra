@@ -885,6 +885,8 @@ impl AgenticRunLifecycleService {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
+            interruption: None,
+            confidence_trend: Default::default(),
         }
     }
 
@@ -1896,6 +1898,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
+            interruption: None,
+            confidence_trend: Default::default(),
         };
         let learning_stack = configure_runtime_controllers(
             &self.matrixone,
