@@ -3,12 +3,14 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
+mod activity;
 mod counter;
 mod implicit_feedback;
 mod result_quality;
 mod routing_metrics;
 mod tool_result_quality;
 
+pub use activity::{SessionActivityUpdatePlan, build_session_activity_update_plan};
 pub use counter::count_persisted_turn_events;
 pub use implicit_feedback::{
     ImplicitSignal, StructuredFeedback, detect_implicit_feedback_signal,

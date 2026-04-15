@@ -1,5 +1,8 @@
 pub mod action_compensation;
-pub mod activity;
+/// Re-exported from astra-turn-types
+pub mod activity {
+    pub use astra_turn_types::{SessionActivityUpdatePlan, build_session_activity_update_plan};
+}
 pub mod agent_progress_ui;
 pub mod agentic_adaptive_tuning;
 pub mod agentic_auto_reflection;
