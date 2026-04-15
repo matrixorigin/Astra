@@ -183,8 +183,8 @@ impl DefaultToolExecutor {
 
             // ── Shell operations ─────────────────────────────────────
             "bash" => crate::shell_ops::execute_bash(ws, args).await,
-            "grep" => crate::shell_ops::grep(ws, args),
-            "glob" => crate::shell_ops::glob(ws, args),
+            "grep" => crate::shell_ops::grep(ws, args).await,
+            "glob" => crate::shell_ops::glob(ws, args).await,
 
             // ── Git operations (gix-based) ───────────────────────────
             "git_status" => string_to_result(crate::git_gix::git_status(pr)),
