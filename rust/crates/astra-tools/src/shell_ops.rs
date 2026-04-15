@@ -343,18 +343,13 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         &gitignored_paths,
     );
     if lines.is_empty() {
-        return if cancelled {
-            ToolResult::text("No matches found before grep was cancelled".into())
-        } else if timed_out {
-            ToolResult::text("No matches found before grep timed out".into())
-        } else if stderr.trim().is_empty() {
-            ToolResult::text("No matches found".into())
-        } else {
-            ToolResult::text(format!(
-                "No matches found (warnings: {})",
-                format_search_warning(stderr.trim())
-            ))
-        };
+        return ToolResult::text(no_visible_results_message(
+            "matches",
+            timed_out,
+            cancelled,
+            stdout_capped,
+            stderr.trim(),
+        ));
     }
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
@@ -527,18 +522,13 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     sort_search_paths(&mut files, workspace_root, sort_mode);
 
     if files.is_empty() {
-        return if cancelled {
-            ToolResult::text("No files found before glob was cancelled".into())
-        } else if timed_out {
-            ToolResult::text("No files found before glob timed out".into())
-        } else if stderr.trim().is_empty() {
-            ToolResult::text("No files found".into())
-        } else {
-            ToolResult::text(format!(
-                "No files found (warnings: {})",
-                format_search_warning(stderr.trim())
-            ))
-        };
+        return ToolResult::text(no_visible_results_message(
+            "files",
+            timed_out,
+            cancelled,
+            stdout_capped,
+            stderr.trim(),
+        ));
     }
 
     let total_files = files.len();
@@ -1754,6 +1744,47 @@ fn no_more_results_message(
     }
 }
 
+fn no_visible_results_message(
+    subject: &str,
+    timed_out: bool,
+    cancelled: bool,
+    stdout_capped: bool,
+    stderr: &str,
+) -> String {
+    let mut caveats = Vec::new();
+    if cancelled {
+        caveats.push("search was cancelled before completion");
+    }
+    if timed_out {
+        caveats.push("search timed out before completion");
+    }
+    if stdout_capped {
+        caveats.push("backend output was capped before post-filtering");
+    }
+
+    if caveats.is_empty() {
+        if stderr.is_empty() {
+            format!("No {subject} found")
+        } else {
+            format!(
+                "No {subject} found (warnings: {})",
+                format_search_warning(stderr)
+            )
+        }
+    } else if stderr.is_empty() {
+        format!(
+            "No visible {subject} found in captured results. Note: {} so additional results may exist.",
+            caveats.join(", ")
+        )
+    } else {
+        format!(
+            "No visible {subject} found in captured results. Note: {} so additional results may exist. Warnings: {}",
+            caveats.join(", "),
+            format_search_warning(stderr)
+        )
+    }
+}
+
 fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<usize>) {
     match (before, after) {
         (Some(b), Some(a)) if b == a && b > 0 => {
@@ -2098,6 +2129,7 @@ fn glob_pattern_fragment(pattern: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use tempfile::tempdir;
 
     use super::*;
@@ -2220,6 +2252,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn ripgrep_probe_accepts_supported_backend() {
         let bin_dir = tempdir().unwrap();
         let fake_rg = write_fake_rg_script(
@@ -2243,6 +2276,7 @@ printf 'probe.txt:1:needle\n'
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn ripgrep_probe_rejects_broken_backend() {
         let bin_dir = tempdir().unwrap();
         let fake_rg = write_fake_rg_script(
@@ -2258,6 +2292,7 @@ printf 'probe.txt:1:needle\n'
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial]
     async fn grep_falls_back_when_rg_backend_errors() {
         let bin_dir = tempdir().unwrap();
         let fake_rg = write_fake_rg_script(
@@ -2305,6 +2340,7 @@ printf 'probe.txt:1:needle\n'
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial]
     async fn glob_falls_back_when_rg_backend_errors() {
         let bin_dir = tempdir().unwrap();
         let fake_rg = write_fake_rg_script(
@@ -3057,6 +3093,39 @@ printf 'probe.txt:1:needle\n'
         assert!(
             message.contains("additional results may exist"),
             "expected uncertainty note, got: {message}"
+        );
+    }
+
+    #[test]
+    fn no_visible_results_message_stays_simple_when_search_completed() {
+        assert_eq!(
+            no_visible_results_message("matches", false, false, false, ""),
+            "No matches found"
+        );
+        assert_eq!(
+            no_visible_results_message("files", false, false, false, "warn"),
+            "No files found (warnings: warn)"
+        );
+    }
+
+    #[test]
+    fn no_visible_results_message_mentions_incomplete_capture() {
+        let message = no_visible_results_message("matches", true, false, true, "disk warning");
+        assert!(
+            message.contains("No visible matches found in captured results"),
+            "expected visible-results wording, got: {message}"
+        );
+        assert!(
+            message.contains("search timed out before completion"),
+            "expected timeout caveat, got: {message}"
+        );
+        assert!(
+            message.contains("backend output was capped before post-filtering"),
+            "expected cap caveat, got: {message}"
+        );
+        assert!(
+            message.contains("Warnings: disk warning"),
+            "expected warnings, got: {message}"
         );
     }
 
