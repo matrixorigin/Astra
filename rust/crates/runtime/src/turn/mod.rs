@@ -99,7 +99,13 @@ pub mod result_quality {
 }
 pub mod retrieval;
 pub mod routing;
-pub mod routing_metrics;
+/// Re-exported from astra-turn-types
+pub mod routing_metrics {
+    pub use astra_turn_types::{
+        ConfidenceCalibrator, DisambiguationAction, IntentDisambiguation, RoutingMetricsPlan,
+        build_routing_metrics_plan, disambiguate_intents,
+    };
+}
 pub mod safety_middleware;
 pub(crate) mod services;
 pub mod session_cache;

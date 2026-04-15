@@ -397,6 +397,7 @@ dependencies = [
 name = "astra-turn-types"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "regex",
  "serde",
  "serde_json",
