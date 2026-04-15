@@ -60,15 +60,29 @@ struct ReadOnlyCommandOutput {
     cancelled: bool,
 }
 
+struct EnumeratedSearchFiles {
+    files: Vec<String>,
+    timed_out: bool,
+    cancelled: bool,
+}
+
+struct MultilineMatchBlock {
+    start_line: usize,
+    end_line: usize,
+    match_ranges: Vec<(usize, usize)>,
+}
+
 struct GrepRequest<'a> {
     workspace_root: &'a Path,
     target: &'a str,
     pattern: &'a str,
     include_globs: Vec<String>,
     case_sensitive: bool,
-    context_lines: Option<usize>,
+    before_context_lines: Option<usize>,
+    after_context_lines: Option<usize>,
     max_matches: Option<usize>,
     output_mode: SearchOutputMode,
+    multiline: bool,
 }
 
 /// Execute a bash command with timeout in a workspace directory.
@@ -168,6 +182,16 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .get("context_lines")
         .and_then(|v| v.as_u64())
         .map(|value| value.min(10) as usize);
+    let before_context_lines = args
+        .get("before_context_lines")
+        .and_then(|v| v.as_u64())
+        .map(|value| value.min(10) as usize)
+        .or(context_lines);
+    let after_context_lines = args
+        .get("after_context_lines")
+        .and_then(|v| v.as_u64())
+        .map(|value| value.min(10) as usize)
+        .or(context_lines);
     let max_matches = args
         .get("max_matches")
         .and_then(|v| v.as_u64())
@@ -185,6 +209,10 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .get("head_limit")
         .and_then(|v| v.as_u64())
         .map(|value| value as usize);
+    let multiline = args
+        .get("multiline")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let request = GrepRequest {
         workspace_root,
@@ -192,12 +220,16 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         pattern,
         include_globs,
         case_sensitive,
-        context_lines,
+        before_context_lines,
+        after_context_lines,
         max_matches,
         output_mode,
+        multiline,
     };
 
-    let command_output = if ripgrep_available() {
+    let command_output = if request.multiline {
+        run_grep_multiline_locally(&request, ctx.cancel_token.as_deref()).await
+    } else if ripgrep_available() {
         run_grep_with_rg(&request, ctx.cancel_token.as_deref()).await
     } else {
         run_grep_with_grep(&request, ctx.cancel_token.as_deref()).await
@@ -574,9 +606,11 @@ async fn run_grep_with_rg(
     if !request.case_sensitive {
         cmd.arg("-i");
     }
-    if let Some(context) = request.context_lines {
-        cmd.arg("-C").arg(context.to_string());
-    }
+    append_context_flags(
+        &mut cmd,
+        request.before_context_lines,
+        request.after_context_lines,
+    );
     if let Some(max) = request.max_matches {
         cmd.arg("-m").arg(max.to_string());
     }
@@ -615,9 +649,11 @@ async fn run_grep_with_grep(
     if !request.case_sensitive {
         cmd.arg("-i");
     }
-    if let Some(context) = request.context_lines {
-        cmd.arg(format!("-C{context}"));
-    }
+    append_context_flags(
+        &mut cmd,
+        request.before_context_lines,
+        request.after_context_lines,
+    );
     if let Some(max) = request.max_matches {
         cmd.arg(format!("-m{max}"));
     }
@@ -632,6 +668,245 @@ async fn run_grep_with_grep(
 
     run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT, cancel_token)
         .await
+}
+
+async fn run_grep_multiline_locally(
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<ReadOnlyCommandOutput, String> {
+    let regex = regex::RegexBuilder::new(request.pattern)
+        .case_insensitive(!request.case_sensitive)
+        .multi_line(true)
+        .dot_matches_new_line(true)
+        .build()
+        .map_err(|e| format!("Error: invalid regex: {e}"))?;
+
+    let deadline = tokio::time::Instant::now() + GREP_TIMEOUT;
+    let mut stdout = String::new();
+    let mut stdout_capped = false;
+
+    let enumerated = enumerate_search_files(request, cancel_token, deadline).await?;
+    let mut timed_out = enumerated.timed_out;
+    let mut cancelled = enumerated.cancelled;
+    for relative_path in enumerated.files {
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break;
+        }
+
+        let absolute_path = request.workspace_root.join(&relative_path);
+        let Ok(contents) = std::fs::read_to_string(&absolute_path) else {
+            continue;
+        };
+
+        match request.output_mode {
+            SearchOutputMode::FilesWithMatches => {
+                if regex.is_match(&contents) {
+                    append_output_line(
+                        &mut stdout,
+                        &relative_path,
+                        RAW_GREP_OUTPUT_LIMIT,
+                        &mut stdout_capped,
+                    );
+                }
+            }
+            SearchOutputMode::Count => {
+                let count = count_regex_matches(&regex, &contents, request.max_matches);
+                if count > 0 {
+                    append_output_line(
+                        &mut stdout,
+                        &format!("{relative_path}:{count}"),
+                        RAW_GREP_OUTPUT_LIMIT,
+                        &mut stdout_capped,
+                    );
+                }
+            }
+            SearchOutputMode::Content => {
+                for line in render_multiline_matches(&relative_path, &contents, &regex, request) {
+                    append_output_line(
+                        &mut stdout,
+                        &line,
+                        RAW_GREP_OUTPUT_LIMIT,
+                        &mut stdout_capped,
+                    );
+                    if stdout_capped {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if stdout_capped {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let exit_code = if stdout.trim().is_empty() {
+        if timed_out || cancelled { -1 } else { 1 }
+    } else {
+        0
+    };
+
+    Ok(ReadOnlyCommandOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code,
+        timed_out,
+        cancelled,
+    })
+}
+
+async fn enumerate_search_files(
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<EnumeratedSearchFiles, String> {
+    let target_path = request.workspace_root.join(request.target);
+    if target_path.is_file() {
+        let relative = relative_search_target(request.workspace_root, &target_path);
+        return Ok(EnumeratedSearchFiles {
+            files: if matches_search_file_filters(&relative, &request.include_globs) {
+                vec![relative]
+            } else {
+                Vec::new()
+            },
+            timed_out: false,
+            cancelled: false,
+        });
+    }
+
+    let listed = run_search_file_listing_with_find(
+        request.workspace_root,
+        request.target,
+        cancel_token,
+        GREP_TIMEOUT,
+    )
+    .await?;
+    let mut files = listed
+        .stdout
+        .lines()
+        .map(strip_current_dir_prefix)
+        .filter(|line| !line.is_empty())
+        .filter(|line| matches_search_file_filters(line, &request.include_globs))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+
+    Ok(EnumeratedSearchFiles {
+        files,
+        timed_out: tokio::time::Instant::now() >= deadline || listed.timed_out,
+        cancelled: cancel_token.is_some_and(CancellationToken::is_cancelled) || listed.cancelled,
+    })
+}
+
+fn matches_search_file_filters(path: &str, include_globs: &[String]) -> bool {
+    include_globs.is_empty()
+        || include_globs
+            .iter()
+            .any(|glob| glob_matches_path(glob, path))
+}
+
+fn count_regex_matches(regex: &regex::Regex, contents: &str, max_matches: Option<usize>) -> usize {
+    match max_matches {
+        Some(limit) => regex.find_iter(contents).take(limit).count(),
+        None => regex.find_iter(contents).count(),
+    }
+}
+
+fn render_multiline_matches(
+    relative_path: &str,
+    contents: &str,
+    regex: &regex::Regex,
+    request: &GrepRequest<'_>,
+) -> Vec<String> {
+    let lines: Vec<&str> = contents.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let line_starts = build_line_starts(contents);
+    let before = request.before_context_lines.unwrap_or(0);
+    let after = request.after_context_lines.unwrap_or(0);
+    let matches = match request.max_matches {
+        Some(limit) => regex.find_iter(contents).take(limit).collect::<Vec<_>>(),
+        None => regex.find_iter(contents).collect::<Vec<_>>(),
+    };
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    let mut blocks: Vec<MultilineMatchBlock> = Vec::new();
+    for matched in matches {
+        let match_start = line_number_for_offset(&line_starts, matched.start());
+        let match_end = line_number_for_offset(&line_starts, matched.end().saturating_sub(1));
+        let block_start = match_start.saturating_sub(before).max(1);
+        let block_end = (match_end + after).min(lines.len());
+
+        if let Some(block) = blocks.last_mut()
+            && block_start <= block.end_line + 1
+        {
+            block.start_line = block.start_line.min(block_start);
+            block.end_line = block.end_line.max(block_end);
+            block.match_ranges.push((match_start, match_end));
+            continue;
+        }
+        blocks.push(MultilineMatchBlock {
+            start_line: block_start,
+            end_line: block_end,
+            match_ranges: vec![(match_start, match_end)],
+        });
+    }
+
+    let mut rendered = Vec::new();
+    for (index, block) in blocks.into_iter().enumerate() {
+        if index > 0 {
+            rendered.push("--".into());
+        }
+        for line_number in block.start_line..=block.end_line {
+            let is_match = block
+                .match_ranges
+                .iter()
+                .any(|(start, end)| line_number >= *start && line_number <= *end);
+            let separator = if is_match { ':' } else { '-' };
+            let line_text = lines.get(line_number - 1).copied().unwrap_or("");
+            rendered.push(format!(
+                "{relative_path}{separator}{line_number}{separator}{line_text}"
+            ));
+        }
+    }
+    rendered
+}
+
+fn build_line_starts(contents: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in contents.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < contents.len() {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn line_number_for_offset(line_starts: &[usize], offset: usize) -> usize {
+    match line_starts.binary_search(&offset) {
+        Ok(index) => index + 1,
+        Err(index) => index,
+    }
+}
+
+fn append_output_line(output: &mut String, line: &str, max_bytes: usize, capped: &mut bool) {
+    if *capped {
+        return;
+    }
+    if !output.is_empty() {
+        append_capped(output, "\n", max_bytes, capped);
+    }
+    append_capped(output, line, max_bytes, capped);
 }
 
 async fn run_glob_with_rg(
@@ -657,6 +932,15 @@ async fn run_glob_with_find(
     target: &str,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    run_search_file_listing_with_find(workspace_root, target, cancel_token, GLOB_TIMEOUT).await
+}
+
+async fn run_search_file_listing_with_find(
+    workspace_root: &Path,
+    target: &str,
+    cancel_token: Option<&CancellationToken>,
+    timeout: Duration,
+) -> Result<ReadOnlyCommandOutput, String> {
     let mut cmd = Command::new("find");
     cmd.current_dir(workspace_root).kill_on_drop(true);
     cmd.arg(target).arg("(").arg("-type").arg("d").arg("(");
@@ -674,8 +958,7 @@ async fn run_glob_with_find(
         .arg("f")
         .arg("-print");
 
-    run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT, cancel_token)
-        .await
+    run_readonly_command_with_partial(&mut cmd, timeout, RAW_GLOB_OUTPUT_LIMIT, cancel_token).await
 }
 
 fn append_default_rg_excludes(cmd: &mut Command) {
@@ -689,6 +972,29 @@ fn append_default_grep_excludes(cmd: &mut Command) {
     cmd.arg("--devices=skip");
     for dir in DEFAULT_SEARCH_EXCLUDE_DIRS {
         cmd.arg("--exclude-dir").arg(dir);
+    }
+}
+
+fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<usize>) {
+    match (before, after) {
+        (Some(b), Some(a)) if b == a && b > 0 => {
+            cmd.arg("-C").arg(b.to_string());
+        }
+        (Some(b), Some(a)) => {
+            if b > 0 {
+                cmd.arg("-B").arg(b.to_string());
+            }
+            if a > 0 {
+                cmd.arg("-A").arg(a.to_string());
+            }
+        }
+        (Some(b), None) if b > 0 => {
+            cmd.arg("-B").arg(b.to_string());
+        }
+        (None, Some(a)) if a > 0 => {
+            cmd.arg("-A").arg(a.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -1169,6 +1475,93 @@ mod tests {
         assert!(
             result.output.contains("unsupported grep type"),
             "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_multiline_matches_across_lines() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(
+            dir.path().join("sample.txt"),
+            "alpha\nneedle\nbridge\nomega\n",
+        )
+        .unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle\\nbridge",
+                "path": ".",
+                "multiline": true
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(
+            result.output.contains("sample.txt:2:needle"),
+            "expected first multiline line, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("sample.txt:3:bridge"),
+            "expected second multiline line, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_before_and_after_context_lines_are_independent() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(
+            dir.path().join("sample.txt"),
+            "zero\none\nneedle\ntwo\nthree\nfour\n",
+        )
+        .unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "before_context_lines": 1,
+                "after_context_lines": 2
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert!(
+            result.output.contains("sample.txt-2-one"),
+            "expected one line of leading context, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("sample.txt:3:needle"),
+            "expected match line, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("sample.txt-4-two"),
+            "expected first trailing context line, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("sample.txt-5-three"),
+            "expected second trailing context line, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("sample.txt-1-zero"),
+            "should not include extra leading context: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("sample.txt-6-four"),
+            "should not include extra trailing context: {}",
             result.output
         );
     }
