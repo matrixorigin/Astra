@@ -6,7 +6,7 @@
 //!
 //! Rules are isolated per session_id — no cross-session leakage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use astra_turn_types::StructuredFeedback;
@@ -22,9 +22,13 @@ const MAX_SESSIONS: usize = 200;
 /// Thread-safe via internal `Mutex`. Designed to be shared as `Arc<FeedbackStore>`
 /// across the bridge singleton — rules are keyed by session_id.
 pub struct FeedbackStore {
-    sessions: Mutex<HashMap<String, SessionRules>>,
+    inner: Mutex<StoreInner>,
+}
+
+struct StoreInner {
+    sessions: HashMap<String, SessionRules>,
     /// Insertion-order tracking for LRU eviction of sessions.
-    order: Mutex<Vec<String>>,
+    order: VecDeque<String>,
 }
 
 struct SessionRules {
@@ -34,28 +38,29 @@ struct SessionRules {
 impl FeedbackStore {
     pub fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
-            order: Mutex::new(Vec::new()),
+            inner: Mutex::new(StoreInner {
+                sessions: HashMap::new(),
+                order: VecDeque::new(),
+            }),
         }
     }
 
     /// Store a feedback rule for a session. Deduplicates by rule text.
     pub fn add(&self, session_id: &str, feedback: StructuredFeedback) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // LRU eviction of oldest session if at capacity
-        if !sessions.contains_key(session_id) {
-            let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-            if order.len() >= MAX_SESSIONS {
-                if let Some(oldest) = order.first().cloned() {
-                    order.remove(0);
-                    sessions.remove(&oldest);
+        if !inner.sessions.contains_key(session_id) {
+            if inner.order.len() >= MAX_SESSIONS {
+                if let Some(oldest) = inner.order.pop_front() {
+                    inner.sessions.remove(&oldest);
                 }
             }
-            order.push(session_id.to_string());
+            inner.order.push_back(session_id.to_string());
         }
 
-        let entry = sessions
+        let entry = inner
+            .sessions
             .entry(session_id.to_string())
             .or_insert_with(|| SessionRules { rules: Vec::new() });
 
@@ -70,9 +75,10 @@ impl FeedbackStore {
 
     /// Number of stored rules for a session.
     pub fn len(&self, session_id: &str) -> usize {
-        self.sessions
+        self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .sessions
             .get(session_id)
             .map(|s| s.rules.len())
             .unwrap_or(0)
@@ -85,8 +91,8 @@ impl FeedbackStore {
 
     /// Build a context injection string for a specific session.
     pub fn build_injection(&self, session_id: &str) -> String {
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = sessions.get(session_id) else {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = inner.sessions.get(session_id) else {
             return String::new();
         };
         if entry.rules.is_empty() {
@@ -108,9 +114,10 @@ impl FeedbackStore {
 
     /// Get a snapshot of rules for a session.
     pub fn rules(&self, session_id: &str) -> Vec<StructuredFeedback> {
-        self.sessions
+        self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .sessions
             .get(session_id)
             .map(|s| s.rules.clone())
             .unwrap_or_default()
@@ -118,10 +125,18 @@ impl FeedbackStore {
 
     /// Number of tracked sessions.
     pub fn session_count(&self) -> usize {
-        self.sessions
+        self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .sessions
             .len()
+    }
+
+    /// Remove all rules for a session. Call on session close for explicit cleanup.
+    pub fn clear_session(&self, session_id: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.sessions.remove(session_id);
+        inner.order.retain(|s| s != session_id);
     }
 }
 
@@ -264,6 +279,27 @@ mod tests {
     }
 
     // ── Thread safety ──
+
+    #[test]
+    fn clear_session_removes_rules_and_order() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb("rule A"));
+        store.add("s2", make_fb("rule B"));
+        assert_eq!(store.session_count(), 2);
+
+        store.clear_session("s1");
+        assert!(store.is_empty("s1"));
+        assert_eq!(store.session_count(), 1);
+        assert!(!store.is_empty("s2"));
+    }
+
+    #[test]
+    fn clear_nonexistent_session_is_noop() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb("rule A"));
+        store.clear_session("nonexistent");
+        assert_eq!(store.session_count(), 1);
+    }
 
     #[test]
     fn concurrent_access() {

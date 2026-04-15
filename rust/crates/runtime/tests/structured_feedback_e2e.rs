@@ -1,15 +1,12 @@
 //! End-to-end tests for the structured feedback loop:
 //! detect → extract → store → inject.
 //!
-//! No LLM calls — uses heuristic extraction only.
-
-use std::sync::{Arc, Mutex};
+//! Tests the actual production path: bridge calls heuristic_extract directly,
+//! not through record_implicit_feedback. No LLM calls.
 
 use astra_runtime::pipeline::{
-    calibration::ProgressiveCalibrator,
+    feedback_extraction::heuristic_extract,
     feedback_store::FeedbackStore,
-    learning::PipelineLearningWriter,
-    routing::{DomainHint, TaskType},
 };
 use astra_runtime::turn::implicit_feedback::{
     detect_implicit_feedback_signal, implicit_feedback_context_injection,
@@ -19,12 +16,9 @@ use astra_runtime::turn::implicit_feedback::{
 
 #[test]
 fn full_cycle_correction_stored_and_injected() {
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal);
     let store = FeedbackStore::new();
     let sid = "session-1";
 
-    // Full user message — heuristic must extract directive after prefix
     let user_text = "wrong, don't use mocks in tests";
     let signal = detect_implicit_feedback_signal(user_text, Some("I'll mock the database"));
     assert_eq!(signal.signal_type, "correction");
@@ -32,12 +26,10 @@ fn full_cycle_correction_stored_and_injected() {
     let injection = implicit_feedback_context_injection(&signal);
     assert!(injection.is_some());
 
-    // record_implicit_feedback takes the directive portion for calibration
-    let feedback = writer.record_implicit_feedback(
-        &signal, "don't use mocks in tests", "code", Some(DomainHint::Code), TaskType::Code,
-    );
-    assert!(feedback.is_some());
-    store.add(sid, feedback.unwrap());
+    // Bridge path: heuristic_extract on the full user message
+    let fb = heuristic_extract(user_text, &signal.signal_type, signal.confidence);
+    assert!(fb.is_some());
+    store.add(sid, fb.unwrap());
 
     let next_turn_injection = store.build_injection(sid);
     assert!(next_turn_injection.contains("[Learned Feedback Rules]"));
@@ -46,66 +38,44 @@ fn full_cycle_correction_stored_and_injected() {
 
 #[test]
 fn full_cycle_chinese_correction() {
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal);
     let store = FeedbackStore::new();
 
     let user_text = "不对，不要用bash执行git命令";
     let signal = detect_implicit_feedback_signal(user_text, Some("我用bash执行git log"));
     assert_eq!(signal.signal_type, "correction");
 
-    let feedback = writer.record_implicit_feedback(
-        &signal, "不要用bash执行git命令", "code", Some(DomainHint::Code), TaskType::Code,
-    );
-    assert!(feedback.is_some());
-    store.add("s1", feedback.unwrap());
+    let fb = heuristic_extract(user_text, &signal.signal_type, signal.confidence);
+    assert!(fb.is_some());
+    store.add("s1", fb.unwrap());
     assert!(store.build_injection("s1").contains("不要用bash执行git命令"));
 }
 
 #[test]
 fn full_cycle_complex_correction_heuristic_returns_none() {
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
     let store = FeedbackStore::new();
 
     let user_text = "that's wrong, the approach doesn't work for this codebase";
     let signal = detect_implicit_feedback_signal(user_text, Some("I used method A"));
     assert_eq!(signal.signal_type, "correction");
 
-    let feedback = writer.record_implicit_feedback(
-        &signal, user_text, "code", Some(DomainHint::Code), TaskType::Code,
-    );
-    assert!(feedback.is_none());
+    let fb = heuristic_extract(user_text, &signal.signal_type, signal.confidence);
+    assert!(fb.is_none());
     assert!(store.is_empty("s1"));
-
-    let c = cal.lock().unwrap();
-    assert!(c.intent_stats("code").unwrap().correction_rate() > 0.0);
 }
 
 #[test]
-fn full_cycle_positive_signal_no_feedback() {
-    let store = FeedbackStore::new();
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal);
-
+fn full_cycle_positive_signal_no_extraction() {
     let signal = detect_implicit_feedback_signal("perfect, that's exactly right", None);
-    let feedback = writer.record_implicit_feedback(
-        &signal, "perfect", "code", Some(DomainHint::Code), TaskType::Code,
-    );
-    assert!(feedback.is_none());
-    assert!(store.is_empty("s1"));
+    // Positive signals don't trigger extraction in the bridge (guard: correction|frustration)
+    assert_ne!(signal.signal_type, "correction");
+    assert_ne!(signal.signal_type, "frustration");
 }
 
 #[test]
-fn full_cycle_neutral_signal_no_feedback() {
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal);
-
+fn full_cycle_neutral_signal_no_extraction() {
     let signal = detect_implicit_feedback_signal("tell me about Rust generics", None);
-    let feedback = writer.record_implicit_feedback(
-        &signal, "tell me about Rust generics", "code", None, TaskType::Code,
-    );
-    assert!(feedback.is_none());
+    assert_ne!(signal.signal_type, "correction");
+    assert_ne!(signal.signal_type, "frustration");
 }
 
 // ─── Session isolation ──────────────────────────────────────────────────────
@@ -141,38 +111,61 @@ fn sessions_are_isolated() {
 
 #[test]
 fn multi_turn_rules_accumulate() {
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal);
     let store = FeedbackStore::new();
     let sid = "s1";
 
-    let s1 = detect_implicit_feedback_signal("wrong, don't use mocks", Some("I'll mock"));
-    if let Some(fb) = writer.record_implicit_feedback(
-        &s1, "don't use mocks", "code", Some(DomainHint::Code), TaskType::Code,
-    ) { store.add(sid, fb); }
-
-    let s2 = detect_implicit_feedback_signal("incorrect, never force push", Some("I'll push"));
-    if let Some(fb) = writer.record_implicit_feedback(
-        &s2, "never force push on main", "git", Some(DomainHint::Git), TaskType::Code,
-    ) { store.add(sid, fb); }
+    let corrections = [
+        "wrong, don't use mocks",
+        "incorrect, never force push on main",
+    ];
+    for msg in &corrections {
+        let signal = detect_implicit_feedback_signal(msg, Some("prior"));
+        if let Some(fb) = heuristic_extract(msg, &signal.signal_type, signal.confidence) {
+            store.add(sid, fb);
+        }
+    }
 
     assert_eq!(store.len(sid), 2);
     let injection = store.build_injection(sid);
     assert!(injection.contains("don't use mocks"));
-    assert!(injection.contains("never force push"));
+    assert!(injection.contains("never force push on main"));
+}
+
+/// Simulates the bridge ordering: build_injection BEFORE store.add on each turn.
+/// Verifies that a rule stored on turn N is NOT in turn N's injection but IS in turn N+1's.
+#[test]
+fn injection_ordering_rule_not_injected_on_same_turn() {
+    let store = FeedbackStore::new();
+    let sid = "s1";
+
+    // Turn 1: user corrects — build injection first (empty), then store
+    let turn1_injection = store.build_injection(sid);
+    assert!(turn1_injection.is_empty(), "no rules yet on turn 1");
+    let fb1 = heuristic_extract("wrong, don't use mocks", "correction", 0.9).unwrap();
+    store.add(sid, fb1);
+
+    // Turn 2: user corrects again — build injection first (has turn 1's rule), then store
+    let turn2_injection = store.build_injection(sid);
+    assert!(turn2_injection.contains("don't use mocks"), "turn 1 rule visible on turn 2");
+    assert!(!turn2_injection.contains("never force push"), "turn 2 rule not yet stored");
+    let fb2 = heuristic_extract("no, never force push on main", "correction", 0.9).unwrap();
+    store.add(sid, fb2);
+
+    // Turn 3: no correction — both previous rules visible
+    let turn3_injection = store.build_injection(sid);
+    assert!(turn3_injection.contains("don't use mocks"));
+    assert!(turn3_injection.contains("never force push on main"));
 }
 
 #[test]
 fn duplicate_rules_deduplicated() {
-    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
-    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal);
     let store = FeedbackStore::new();
 
     for _ in 0..3 {
-        let s = detect_implicit_feedback_signal("wrong, don't use mocks", Some("mock"));
-        if let Some(fb) = writer.record_implicit_feedback(
-            &s, "don't use mocks", "code", Some(DomainHint::Code), TaskType::Code,
-        ) { store.add("s1", fb); }
+        let signal = detect_implicit_feedback_signal("wrong, don't use mocks", Some("mock"));
+        if let Some(fb) = heuristic_extract("wrong, don't use mocks", &signal.signal_type, signal.confidence) {
+            store.add("s1", fb);
+        }
     }
     assert_eq!(store.len("s1"), 1);
 }
@@ -256,9 +249,6 @@ fn bridge_feedback_store_is_shared_across_clones() {
 
 #[test]
 fn bridge_feedback_store_multi_turn_simulation() {
-    use astra_runtime::pipeline::feedback_extraction::heuristic_extract;
-    use astra_runtime::turn::implicit_feedback::detect_implicit_feedback_signal;
-
     let store = std::sync::Arc::new(FeedbackStore::new());
     let sid = "session-42";
 
@@ -281,7 +271,6 @@ fn bridge_feedback_store_multi_turn_simulation() {
     assert_eq!(store.len(sid), 3);
     let injection = store.build_injection(sid);
     assert!(injection.starts_with("[Learned Feedback Rules]"));
-    // Rules should be the directive portion, not the full message
     assert!(injection.contains("don't use mocks in tests"));
     assert!(injection.contains("never force push on main"));
     assert!(injection.contains("stop using SELECT *"));
@@ -295,12 +284,9 @@ fn bridge_feedback_store_multi_turn_simulation() {
 
 #[test]
 fn empty_session_id_does_not_store_feedback() {
-    // Mirrors the bridge guard: if session_id is empty, skip feedback
     let store = FeedbackStore::new();
     let empty_sid = "";
 
-    // Even if we add to empty session_id, it should work but the bridge
-    // guards against this. Verify the store itself handles it gracefully.
     store.add(empty_sid, astra_turn_types::StructuredFeedback {
         rule: "leaked rule".into(),
         reason: "Not stated".into(),
@@ -319,13 +305,12 @@ fn empty_session_id_does_not_store_feedback() {
 fn heuristic_extracts_directive_from_full_correction_message() {
     // This is the exact code path the bridge uses — full user message
     // passed to heuristic_extract, not a pre-extracted directive
-    use astra_runtime::pipeline::feedback_extraction::heuristic_extract;
 
     // "wrong, don't use mocks" → should extract "don't use mocks"
     let fb = heuristic_extract("wrong, don't use mocks", "correction", 0.9).unwrap();
     assert_eq!(fb.rule, "don't use mocks");
 
-    // "不对，不要用bash" → should extract "不要用bash"
+    // "不对，不要用bash" → should extract "不要用bash执行git命令"
     let fb = heuristic_extract("不对，不要用bash执行git命令", "correction", 0.8).unwrap();
     assert_eq!(fb.rule, "不要用bash执行git命令");
 

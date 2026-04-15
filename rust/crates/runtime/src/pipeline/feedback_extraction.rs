@@ -10,6 +10,8 @@
 use astra_turn_types::StructuredFeedback;
 
 /// System prompt for the feedback extraction sub-task.
+// TODO: wire into bridge for complex corrections that heuristic_extract cannot handle
+#[allow(dead_code)]
 pub const FEEDBACK_EXTRACTION_SYSTEM: &str = "\
 You are a feedback extraction agent. Given a user correction and the prior assistant response, \
 extract a structured feedback rule. Respond with ONLY a JSON object, no other text.
@@ -29,6 +31,8 @@ Guidelines:
 - Keep each field under 200 characters";
 
 /// Build the user message for feedback extraction.
+// TODO: wire into bridge for complex corrections that heuristic_extract cannot handle
+#[allow(dead_code)]
 pub fn build_extraction_message(correction_text: &str, prior_assistant_text: &str) -> String {
     let prior = if prior_assistant_text.is_empty() {
         "(no prior response)".to_string()
@@ -121,6 +125,13 @@ pub fn heuristic_extract(
 ///
 /// Checks the start of the text first, then scans after punctuation
 /// boundaries (", ", ". ", "，", "。") to handle "wrong, don't use X".
+///
+/// INVARIANT: byte offsets from `lower` are used to slice `text`. This is
+/// correct only when `to_lowercase()` preserves byte lengths for all
+/// characters in `DIRECTIVE_PREFIXES` and the separators. All current
+/// entries (ASCII + CJK) satisfy this. If adding prefixes with
+/// non-byte-stable lowercase mappings (e.g. German ß, Turkish İ),
+/// switch to char-based indexing.
 fn extract_directive(text: &str) -> Option<(String, usize)> {
     let lower = text.to_lowercase();
 

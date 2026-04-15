@@ -1827,6 +1827,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // When user expresses dissatisfaction (correction, frustration, rephrasing),
             // inject a directive so the model adjusts its approach immediately.
             let feedback_store = feedback_store_capture.clone();
+
+            // ── Learned feedback rules: inject accumulated correction rules ──
+            // Build injection BEFORE storing the new rule so the current turn's
+            // correction isn't redundantly injected (it's already in implicit_feedback_hint).
+            let feedback_rules_hint = {
+                if session_id.is_empty() {
+                    String::new()
+                } else {
+                    let injection = feedback_store.build_injection(&session_id);
+                    if injection.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\n{injection}")
+                    }
+                }
+            };
+
             let implicit_feedback_hint = {
                 let signal = crate::turn::implicit_feedback::detect_implicit_feedback_signal(
                     user_content_for_signal,
@@ -1848,20 +1865,6 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
                     .map(|s| format!("\n\n{s}"))
                     .unwrap_or_default()
-            };
-
-            // ── Learned feedback rules: inject accumulated correction rules ──
-            let feedback_rules_hint = {
-                if session_id.is_empty() {
-                    String::new()
-                } else {
-                    let injection = feedback_store.build_injection(&session_id);
-                    if injection.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\n{injection}")
-                    }
-                }
             };
 
             // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules)
@@ -3502,6 +3505,76 @@ mod tests {
         assert!(
             dyn_content.as_str().unwrap().contains("cwd: /test"),
             "dynamic message should contain profile"
+        );
+    }
+
+    #[test]
+    fn build_system_message_feedback_rules_in_dynamic_no_cache_control() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+
+        // Simulate dynamic_desc with accumulated feedback rules
+        let dynamic_with_rules = "cwd: /test\n\n[Learned Feedback Rules]\n- Rule: don't use mocks | Why: prod divergence | When: integration tests\n- Rule: never force push on main";
+
+        let (msg, _, _) = build_system_message(
+            &["bash", "read_file"],
+            dynamic_with_rules,
+            0.8,
+            Some("implementation"),
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
+
+        let blocks = msg["content"].as_array().expect("should be array");
+
+        // Last block should contain the feedback rules but have NO cache_control
+        let last = blocks.last().unwrap();
+        let text = last["text"].as_str().unwrap();
+        assert!(text.contains("[Learned Feedback Rules]"), "dynamic block should contain rules");
+        assert!(text.contains("don't use mocks"), "dynamic block should contain rule text");
+        assert!(
+            last.get("cache_control").is_none() || last["cache_control"].is_null(),
+            "dynamic block with feedback rules must NOT have cache_control"
+        );
+
+        // Stable blocks with cache_control should NOT contain feedback rules
+        for block in blocks.iter().filter(|b| b.get("cache_control").is_some() && !b["cache_control"].is_null()) {
+            let block_text = block["text"].as_str().unwrap_or("");
+            assert!(
+                !block_text.contains("[Learned Feedback Rules]"),
+                "cached block must not contain feedback rules"
+            );
+        }
+    }
+
+    #[test]
+    fn build_system_message_openai_feedback_rules_in_dynamic_message() {
+        // For OpenAI: feedback rules should be in the second (dynamic) system message,
+        // not in the first (stable/cacheable) message
+        let dynamic_with_rules = "cwd: /test\n\n[Learned Feedback Rules]\n- Rule: use moerr";
+
+        let (primary, dynamic, _) = build_system_message(
+            &["bash"],
+            dynamic_with_rules,
+            0.8,
+            None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+
+        // Primary (stable) must NOT contain feedback rules
+        let primary_text = primary["content"].as_str().unwrap();
+        assert!(
+            !primary_text.contains("[Learned Feedback Rules]"),
+            "stable prefix must not contain feedback rules"
+        );
+
+        // Dynamic message must contain them
+        let dyn_msg = dynamic.expect("should have dynamic message");
+        let dyn_text = dyn_msg["content"].as_str().unwrap();
+        assert!(
+            dyn_text.contains("[Learned Feedback Rules]"),
+            "dynamic message should contain feedback rules"
         );
     }
 

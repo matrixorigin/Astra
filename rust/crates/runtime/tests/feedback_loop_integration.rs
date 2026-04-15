@@ -161,7 +161,7 @@ fn end_to_end_correction_updates_calibrator() {
     assert_eq!(signal.signal_type, "correction");
 
     // Bridge to learning pipeline
-    writer.record_implicit_feedback(&signal, "不对，这个答案有问题", "code", Some(DomainHint::Code), TaskType::Code);
+    writer.record_implicit_feedback(&signal, "code", Some(DomainHint::Code), TaskType::Code);
 
     // Verify calibrator recorded the correction
     let c = cal.lock().unwrap();
@@ -178,7 +178,7 @@ fn end_to_end_positive_records_success() {
     let signal = detect_implicit_feedback_signal("perfect, thank you!", None);
     assert_eq!(signal.signal_type, "positive");
 
-    writer.record_implicit_feedback(&signal, "perfect, thank you!", "fetch", Some(DomainHint::GitHub), TaskType::Fetch);
+    writer.record_implicit_feedback(&signal, "fetch", Some(DomainHint::GitHub), TaskType::Fetch);
 
     let c = cal.lock().unwrap();
     let stats = c.intent_stats("fetch");
@@ -221,7 +221,7 @@ fn full_feedback_cycle_correction_to_learning() {
     assert!(injection.is_some(), "correction should generate injection");
 
     // Step 3: Update learning pipeline
-    writer.record_implicit_feedback(&signal, "wrong, should be the other way", "reasoning", None, TaskType::Reasoning);
+    writer.record_implicit_feedback(&signal, "reasoning", None, TaskType::Reasoning);
 
     // Verify the full cycle worked
     let c = cal.lock().unwrap();
@@ -375,7 +375,7 @@ fn edge_case_calibrator_with_empty_intent() {
     let signal = detect_implicit_feedback_signal("wrong", None);
 
     // Empty intent string should not crash
-    writer.record_implicit_feedback(&signal, "wrong", "", None, TaskType::Unknown);
+    writer.record_implicit_feedback(&signal, "", None, TaskType::Unknown);
 
     let c = cal.lock().unwrap();
     // Should still record (with empty string as key)
@@ -449,7 +449,7 @@ fn concurrent_calibrator_writes() {
                     evidence: format!("thread {}", i),
                 };
                 let intent = format!("intent_{}", i % 3);
-                writer_clone.record_implicit_feedback(&signal, "correction text", &intent, None, TaskType::Code);
+                writer_clone.record_implicit_feedback(&signal, &intent, None, TaskType::Code);
             })
         })
         .collect();
