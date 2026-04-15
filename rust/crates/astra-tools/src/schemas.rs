@@ -371,13 +371,15 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a glob pattern. Respects .gitignore/.astraignore when present.",
+                "description": "Find files matching a glob pattern. Respects .gitignore/.astraignore when present and supports pagination via offset/head_limit.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Glob pattern e.g. '**/*.rs'"},
                         "path": {"type": "string", "description": "Root directory (default: project root)"},
-                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."}
+                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Skip first N matching files (for pagination)"},
+                        "head_limit": {"type": "integer", "minimum": 0, "description": "Max matching files to return after offset. Defaults to 100; set 0 for unlimited."}
                     },
                     "required": ["pattern"]
                 }

@@ -18,6 +18,7 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
+const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
 const RAW_GLOB_OUTPUT_LIMIT: usize = 120_000;
 
@@ -66,6 +67,7 @@ struct ReadOnlyCommandOutput {
     exit_code: i32,
     timed_out: bool,
     cancelled: bool,
+    stdout_capped: bool,
 }
 
 struct EnumeratedSearchFiles {
@@ -278,6 +280,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         exit_code,
         timed_out,
         cancelled,
+        stdout_capped,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -367,8 +370,9 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         (paged_lines, false)
     };
 
-    let mut result_text = visible_lines.join("\n");
-    result_text = truncate_output(result_text, per_tool_output_limit("grep"));
+    let pre_truncate_text = visible_lines.join("\n");
+    let was_truncated_by_output_limit = pre_truncate_text.len() > per_tool_output_limit("grep");
+    let mut result_text = truncate_output(pre_truncate_text, per_tool_output_limit("grep"));
 
     if cancelled {
         if !result_text.is_empty() {
@@ -392,6 +396,16 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         result_text.push_str(&format!(
             "\n\n[Results limited to {limit} lines. Use 'offset' to paginate or 'head_limit: 0' for unlimited.]"
         ));
+    }
+    if stdout_capped {
+        result_text.push_str(
+            "\n\n[grep backend output capped before pagination. Narrow 'path', 'include'/'glob', 'type', or 'head_limit' for complete results.]",
+        );
+    }
+    if was_truncated_by_output_limit {
+        result_text.push_str(
+            "\n\n[grep results truncated to the tool output limit. Narrow 'path' or lower 'head_limit' for complete output.]",
+        );
     }
 
     if scope_context && output_mode == SearchOutputMode::Content {
@@ -425,6 +439,11 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         Ok(mode) => mode,
         Err(e) => return ToolResult::error(e),
     };
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let head_limit = args
+        .get("head_limit")
+        .and_then(|v| v.as_u64())
+        .map(|value| value as usize);
     let ignore_rules = match load_search_ignore_rules(workspace_root) {
         Ok(rules) => rules,
         Err(e) => return ToolResult::error(e),
@@ -455,6 +474,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         exit_code,
         timed_out,
         cancelled,
+        stdout_capped,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -494,8 +514,36 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     }
 
     let total_files = files.len();
-    let mut result_text = files.join("\n");
-    result_text = truncate_output(result_text, per_tool_output_limit("glob"));
+    let paged_files = if offset > 0 {
+        if offset >= files.len() {
+            return ToolResult::text(format!(
+                "No more results (offset {} >= {} files)",
+                offset,
+                files.len()
+            ));
+        }
+        &files[offset..]
+    } else {
+        files.as_slice()
+    };
+    let effective_limit = match head_limit {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(GLOB_DEFAULT_HEAD_LIMIT),
+    };
+    let (visible_files, was_truncated_by_limit) = if let Some(limit) = effective_limit {
+        if paged_files.len() > limit {
+            (&paged_files[..limit], true)
+        } else {
+            (paged_files, false)
+        }
+    } else {
+        (paged_files, false)
+    };
+
+    let pre_truncate_text = visible_files.join("\n");
+    let was_truncated_by_output_limit = pre_truncate_text.len() > per_tool_output_limit("glob");
+    let mut result_text = truncate_output(pre_truncate_text, per_tool_output_limit("glob"));
 
     if cancelled {
         result_text.push_str(
@@ -506,7 +554,26 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
             "\n\n[glob timed out after 15s — showing partial results. Narrow the search with 'path' or a more specific pattern.]",
         );
     } else {
-        result_text.push_str(&format!("\n({total_files} files)"));
+        result_text.push_str(&format!(
+            "\n(showing {} of {} files)",
+            visible_files.len(),
+            total_files
+        ));
+    }
+    if was_truncated_by_limit && let Some(limit) = effective_limit {
+        result_text.push_str(&format!(
+            "\n\n[Results limited to {limit} files. Use 'offset' to paginate or 'head_limit: 0' for unlimited.]"
+        ));
+    }
+    if stdout_capped {
+        result_text.push_str(
+            "\n\n[glob backend output capped before pagination. Narrow 'path' or use a more specific pattern for complete results.]",
+        );
+    }
+    if was_truncated_by_output_limit {
+        result_text.push_str(
+            "\n\n[glob results truncated to the tool output limit. Narrow 'path' or lower 'head_limit' for complete output.]",
+        );
     }
 
     ToolResult::text(result_text)
@@ -1227,6 +1294,7 @@ async fn run_grep_with_grep(
         exit_code,
         timed_out,
         cancelled,
+        stdout_capped,
     })
 }
 
@@ -1313,6 +1381,7 @@ async fn run_grep_multiline_locally(
         exit_code,
         timed_out,
         cancelled,
+        stdout_capped,
     })
 }
 
@@ -1724,6 +1793,7 @@ async fn run_readonly_command_with_partial(
         exit_code: exit_code.unwrap_or(-1),
         timed_out,
         cancelled,
+        stdout_capped,
     })
 }
 
@@ -2639,6 +2709,65 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn glob_supports_offset_and_head_limit_pagination() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.txt",
+                "path": ".",
+                "sort_by": "path",
+                "offset": 1,
+                "head_limit": 1
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "glob should succeed: {}", result.output);
+        let lines: Vec<&str> = result
+            .output
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('(') && !line.starts_with('['))
+            .collect();
+        assert_eq!(lines, vec!["b.txt"], "got: {}", result.output);
+        assert!(
+            result.output.contains("(showing 1 of 3 files)"),
+            "expected pagination summary, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Results limited to 1 files"),
+            "expected pagination limit note, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_offset_beyond_end_reports_no_more_results() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.txt",
+                "path": ".",
+                "offset": 5
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "glob should succeed: {}", result.output);
+        assert_eq!(result.output, "No more results (offset 5 >= 1 files)");
+    }
+
+    #[tokio::test]
     async fn glob_path_starting_with_dash_is_listed_safely() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -2785,6 +2914,23 @@ printf 'probe.txt:1:needle\n'
             "expected partial stdout, got: {}",
             output.stdout
         );
+    }
+
+    #[tokio::test]
+    async fn readonly_command_marks_stdout_cap() {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg("for i in $(seq 1 256); do printf 'xxxxxxxx'; done");
+
+        let output = run_readonly_command_with_partial(&mut cmd, Duration::from_secs(5), 128, None)
+            .await
+            .expect("command should succeed");
+
+        assert_eq!(output.exit_code, 0, "stderr: {}", output.stderr);
+        assert!(output.stdout_capped, "expected stdout cap to be reported");
+        assert!(output.stdout.len() <= 128, "stdout should be capped");
+        assert!(!output.timed_out, "cap should not look like timeout");
+        assert!(!output.cancelled, "cap should not look like cancellation");
     }
 
     #[test]
