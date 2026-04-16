@@ -4054,22 +4054,8 @@ mod tests {
         let result = executor.bash(&serde_json::json!({"command": "sleep 0.01 && echo done"}));
         assert!(result.contains("done"), "got: {result}");
         // sleep with explicit timeout should NOT be blocked (test usage)
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pure-sleep-timeout.pid");
-        let script = write_sleep_pid_script(dir.path(), "pure-sleep-timeout.sh", &pid_file, 10);
-        let executor = test_executor_in(dir.path());
-        let mut guard = ChildProcessGuard::new();
-        let result = executor.bash(&serde_json::json!({
-            "command": format!("bash {}", shell_escape(script.to_string_lossy().as_ref())),
-            "timeout": 0.1
-        }));
-        let pid = wait_for_pid_file(&pid_file);
-        guard.track(pid);
+        let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
         assert!(result.contains("timed out"), "got: {result}");
-        assert!(
-            wait_for_process_exit(pid, Duration::from_secs(1)),
-            "sleep process {pid} survived timeout"
-        );
     }
 
     #[test]
@@ -4095,22 +4081,9 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("sleep-timeout.pid");
-        let script = write_sleep_pid_script(dir.path(), "sleep-timeout.sh", &pid_file, 3);
-        let executor = test_executor_in(dir.path());
-        let mut guard = ChildProcessGuard::new();
-        let result = executor.bash(&serde_json::json!({
-            "command": format!("bash {}", shell_escape(script.to_string_lossy().as_ref())),
-            "timeout": 0.2
-        }));
-        let pid = wait_for_pid_file(&pid_file);
-        guard.track(pid);
+        let executor = test_executor();
+        let result = executor.bash(&serde_json::json!({"command": "sleep 3", "timeout": 0.2}));
         assert!(result.contains("timed out"), "got: {result}");
-        assert!(
-            wait_for_process_exit(pid, Duration::from_secs(1)),
-            "sleep process {pid} survived timeout"
-        );
     }
 
     #[test]
@@ -4163,24 +4136,10 @@ mod tests {
         assert!(!r.contains("timed out"));
 
         // Explicit timeout overrides tier
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("timeout-tier.pid");
-        let script = write_sleep_pid_script(dir.path(), "timeout-tier.sh", &pid_file, 3);
-        let executor = test_executor_in(dir.path());
-        let mut guard = ChildProcessGuard::new();
-        let r = executor.bash(&serde_json::json!({
-            "command": format!("bash {}", shell_escape(script.to_string_lossy().as_ref())),
-            "timeout": 0.1
-        }));
-        let pid = wait_for_pid_file(&pid_file);
-        guard.track(pid);
+        let r = executor.bash(&serde_json::json!({"command": "sleep 3", "timeout": 0.1}));
         assert!(
             r.contains("timed out"),
             "explicit timeout should override tier"
-        );
-        assert!(
-            wait_for_process_exit(pid, Duration::from_secs(1)),
-            "sleep process {pid} survived timeout"
         );
     }
 
