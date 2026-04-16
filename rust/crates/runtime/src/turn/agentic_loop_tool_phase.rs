@@ -1294,6 +1294,7 @@ mod tests {
             output_bytes: None,
             args_preview: Some("{\"command\":\"echo hi\"}".into()),
             result_preview: result_preview.map(str::to_string),
+            file_path: None,
         }
     }
 
@@ -1348,6 +1349,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: None,
+            file_path: None,
         }
     }
 

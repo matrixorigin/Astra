@@ -587,7 +587,17 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
 
         // Adaptive microcompact: scale aggressiveness with context pressure.
-        let mc = super::microcompact::compact_tool_results_adaptive(&mut state.messages, pressure);
+        // Use state-aware variant when SessionFacts has active files (pin list).
+        let mc = if !state.session_facts.active_files.is_empty() {
+            super::microcompact::compact_tool_results_state_aware(
+                &mut state.messages,
+                pressure,
+                &state.session_facts,
+                5,
+            )
+        } else {
+            super::microcompact::compact_tool_results_adaptive(&mut state.messages, pressure)
+        };
         if mc.results_compacted > 0 && !quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Dim,

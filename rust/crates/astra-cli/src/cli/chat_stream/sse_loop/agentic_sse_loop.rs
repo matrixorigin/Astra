@@ -325,6 +325,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: result_preview.map(str::to_string),
+            file_path: None,
         }
     }
 

@@ -208,6 +208,12 @@ fn build_bridge_tool_call_records(
         let output_bytes = output
             .as_ref()
             .map(|output| output.len().min(u32::MAX as usize) as u32);
+        // Extract file_path from full arguments before truncation
+        let file_path = arguments.as_deref().and_then(|args_str| {
+            serde_json::from_str::<serde_json::Value>(args_str)
+                .ok()
+                .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
+        });
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -222,6 +228,7 @@ fn build_bridge_tool_call_records(
                 .as_deref()
                 .map(|arguments| preview_chars(arguments, 80)),
             result_preview: output.as_deref().map(|output| preview_chars(output, 500)),
+            file_path,
         });
     }
 
@@ -240,6 +247,7 @@ fn build_bridge_tool_call_records(
                 .as_deref()
                 .map(|arguments| preview_chars(arguments, 80)),
             result_preview: None,
+            file_path: None,
         });
     }
 
@@ -1425,6 +1433,9 @@ pub struct InProcessChatTurnBridge {
     pub feedback_store: Arc<crate::pipeline::feedback_store::FeedbackStore>,
     /// Cached Memoria client — created once, reused across turns.
     pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
+    /// Shared session facts for facts-first compaction. Updated by the agentic loop
+    /// at each turn end; read by the bridge during compaction.
+    pub session_facts: Arc<std::sync::Mutex<crate::turn::cloud::session_facts::SessionFacts>>,
 }
 
 impl InProcessChatTurnBridge {
@@ -1437,6 +1448,7 @@ impl InProcessChatTurnBridge {
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(crate::pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
+            session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -1556,6 +1568,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let client_cancel_capture = client_cancel.clone();
         let feedback_store_capture = self.feedback_store.clone();
         let memoria_client_owned = self.memoria_client.clone();
+        let session_facts_shared = self.session_facts.clone();
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
@@ -1878,7 +1891,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // messages to show current state + progress — zero network calls.
             let session_anchor = {
                 use crate::turn::cloud::session_memory_protocol::{
-                    extract_anchor, extract_message_text, build_l1_from_messages, SessionMemory,
+                    extract_anchor, extract_anchor_from_facts, extract_message_text,
+                    build_l1_from_messages, SessionMemory,
                 };
                 let first_user_text = messages
                     .iter()
@@ -1889,17 +1903,36 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 if first_user_text.is_empty() {
                     String::new()
                 } else {
-                    // After first turn, derive anchor from conversation state (no network)
-                    let turn_count = messages.iter()
-                        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-                        .count();
-                    let l1 = if turn_count > 0 {
-                        let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-                        SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
+                    // Prefer facts-based anchor (ground truth) when available
+                    let facts_opt = session_facts_shared.lock().ok();
+                    let has_facts = facts_opt.as_ref().map(|f| f.turn > 0).unwrap_or(false);
+
+                    let anchor = if has_facts {
+                        let facts = facts_opt.unwrap();
+                        // Try to get narrative for task spec (optional enrichment)
+                        let turn_count = messages.iter()
+                            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                            .count();
+                        let l1 = if turn_count > 0 {
+                            let l1_text = build_l1_from_messages(&messages, turn_count, 0);
+                            SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
+                        } else {
+                            None
+                        };
+                        extract_anchor_from_facts(&first_user_text, &facts, l1.as_ref())
                     } else {
-                        None
+                        // First turn or lock failed — use legacy anchor
+                        let turn_count = messages.iter()
+                            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                            .count();
+                        let l1 = if turn_count > 0 {
+                            let l1_text = build_l1_from_messages(&messages, turn_count, 0);
+                            SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
+                        } else {
+                            None
+                        };
+                        extract_anchor(&first_user_text, l1.as_ref())
                     };
-                    let anchor = extract_anchor(&first_user_text, l1.as_ref());
                     format!("\n\n{anchor}")
                 }
             };
@@ -1966,6 +1999,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     current_tokens: cache_est.total_tokens,
                     session_memory_file,
                     session_memory_combine,
+                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                 };
 
                 // Reuse shared Memoria client for compaction
@@ -2257,6 +2291,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 current_tokens: budget.effective_input_limit(), // assume we're at limit
                                 session_memory_file,
                                 session_memory_combine,
+                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
                             };
                             let compact_config = crate::prompts::CompactConfig::from_env();
                             let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(
@@ -3107,6 +3142,18 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // Writes L1 at turn end. Deletes previous L1 for this session first to
             // avoid accumulating stale working memories. Retries once on failure.
             if cloud_loop_turns > 1 || !all_round_tool_calls.is_empty() {
+                // Update shared SessionFacts from this turn's tool_call_records
+                // so the next turn's compaction/anchor has fresh ground truth.
+                if let Ok(mut facts) = session_facts_shared.lock() {
+                    let mut event = astra_services::session_journal::JournalEvent::base_public(
+                        astra_services::session_journal::JournalEventType::Turn, None,
+                    );
+                    event.turn = Some(cloud_loop_turns as u32);
+                    event.tokens_in = usage.get("prompt_tokens").and_then(Value::as_i64).map(|t| t as u64);
+                    event.tool_calls = Some(tool_call_records.clone());
+                    facts.update_from_journal_event(&event);
+                }
+
                 let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
                     &messages, cloud_loop_turns as usize,
                     usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0) as usize,
@@ -5534,6 +5581,7 @@ mod tests {
             session_memory_file: None,
             session_memory_combine:
                 crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5587,6 +5635,7 @@ mod tests {
             session_memory_file: None,
             session_memory_combine:
                 crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5627,6 +5676,7 @@ mod tests {
             session_memory_file: None,
             session_memory_combine:
                 crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let result = tokio::runtime::Runtime::new()

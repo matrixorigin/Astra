@@ -386,6 +386,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            session_facts: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,

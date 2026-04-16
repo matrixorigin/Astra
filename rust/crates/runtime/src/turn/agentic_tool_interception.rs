@@ -41,6 +41,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             output_bytes: Some(result.result.len() as u32),
             args_preview: Some(result.tool_call_id.clone()),
             result_preview: Some(result.result.chars().take(500).collect::<String>()),
+            file_path: None,
         });
     }
 

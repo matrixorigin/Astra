@@ -318,6 +318,7 @@ mod tests {
             output_bytes: Some(500),
             args_preview: None,
             result_preview: Some("ok".to_string()),
+            file_path: None,
         }
     }
 

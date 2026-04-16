@@ -484,6 +484,10 @@ pub struct ToolCallRecord {
     /// Preview of tool result (truncated to 500 chars) for cloud audit trail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
+    /// File path extracted from full tool arguments at execution time.
+    /// More reliable than parsing `args_preview` (which is truncated to ~80 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 impl ToolCallRecord {
@@ -3510,6 +3514,7 @@ mod tests {
             output_bytes: None,
             args_preview: Some("owner/repo".into()),
             result_preview: None,
+            file_path: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -3532,6 +3537,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: None,
+            file_path: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -3555,6 +3561,7 @@ mod tests {
                 "Skipped: the skill already completed this work. Do NOT call `read_file` again."
                     .into(),
             ),
+            file_path: None,
         };
         let deferred = ToolCallRecord {
             name: "bash".into(),
@@ -3568,6 +3575,7 @@ mod tests {
                 "Deferred: skill was invoked in this turn. Read the skill instructions above."
                     .into(),
             ),
+            file_path: None,
         };
         let dedup = ToolCallRecord {
             name: "skill".into(),
@@ -3581,6 +3589,7 @@ mod tests {
                 "Skill 'debug' was already loaded (turn 2). Follow those instructions directly."
                     .into(),
             ),
+            file_path: None,
         };
         let actual_failure = ToolCallRecord {
             name: "skill".into(),
@@ -3591,6 +3600,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: Some("Unknown skill 'debug'.".into()),
+            file_path: None,
         };
 
         assert!(skipped.is_synthetic_placeholder());
@@ -3627,6 +3637,7 @@ mod tests {
             output_bytes: None,
             args_preview: Some("owner/repo".into()),
             result_preview: None,
+            file_path: None,
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -3675,6 +3686,7 @@ mod tests {
                 output_bytes: None,
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -3695,6 +3707,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: None,
+            file_path: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -3712,6 +3725,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: None,
+            file_path: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
