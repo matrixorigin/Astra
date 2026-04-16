@@ -618,7 +618,7 @@ impl ToolExecutor {
         }
 
         // Dangerous file guard
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
+        let rel = self.project_relative_path(&path);
         let rel_str = rel.to_string_lossy();
         if let Some(warning) = is_dangerous_write_target(&rel_str) {
             return json!({
@@ -634,7 +634,7 @@ impl ToolExecutor {
             }
             // Require full read (not outline/partial) before overwriting
             if !self.was_fully_read(&path) {
-                let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
+                let rel = self.project_relative_path(&path);
                 return json!({
                     "success": false,
                     "error": format!(
@@ -674,7 +674,12 @@ impl ToolExecutor {
         // symlink swaps (TOCTOU) between the initial resolve_checked and now.
         if path.exists() {
             if let Ok(canonical) = path.canonicalize() {
-                if !canonical.starts_with(&self.project_root) {
+                let allowed = self
+                    .sandbox_policy
+                    .as_ref()
+                    .map(|policy| policy.is_path_allowed(&canonical))
+                    .unwrap_or_else(|| canonical.starts_with(&self.project_root));
+                if !allowed {
                     return json!({
                         "success": false,
                         "error": format!(
@@ -691,8 +696,9 @@ impl ToolExecutor {
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("write_file:{}", path.display());
+        let journal_path = Self::file_state_key(&path);
         if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before(&path, &journal_call_id, turn_idx);
+            journal.record_before(&journal_path, &journal_call_id, turn_idx);
         }
 
         match fs::write(&path, content) {
@@ -701,7 +707,7 @@ impl ToolExecutor {
                 self.record_write_with_content(&path, content);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, content.as_bytes());
+                    journal.record_after(&journal_path, &journal_call_id, content.as_bytes());
                 }
                 let old_slice = prior_for_diff.as_deref().unwrap_or("");
                 let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
@@ -750,7 +756,7 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         // Dangerous file guard
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
+        let rel = self.project_relative_path(&path);
         let rel_str = rel.to_string_lossy();
         if let Some(warning) = is_dangerous_write_target(&rel_str) {
             return format!(
@@ -813,15 +819,20 @@ impl ToolExecutor {
                 } else {
                     format!("str_replace_fuzzy:{}", path.display())
                 };
+                let journal_path = Self::file_state_key(&path);
                 if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_before_patch(&path, &journal_call_id, turn_idx);
+                    journal.record_before_patch(&journal_path, &journal_call_id, turn_idx);
                 }
                 match fs::write(&path, &new_content) {
                     Ok(_) => {
                         self.record_write_with_content(&path, &new_content);
                         // Journal: record after-state
                         if let Ok(mut journal) = self.file_journal.lock() {
-                            journal.record_after(&path, &journal_call_id, new_content.as_bytes());
+                            journal.record_after(
+                                &journal_path,
+                                &journal_call_id,
+                                new_content.as_bytes(),
+                            );
                         }
                         let format_result = auto_format_file(&path, &self.project_root);
                         if format_result.is_some() {
@@ -911,8 +922,9 @@ impl ToolExecutor {
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("str_replace:{}", path.display());
+        let journal_path = Self::file_state_key(&path);
         if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before_patch(&path, &journal_call_id, turn_idx);
+            journal.record_before_patch(&journal_path, &journal_call_id, turn_idx);
         }
 
         match fs::write(&path, &new_content) {
@@ -921,7 +933,7 @@ impl ToolExecutor {
                 self.record_write_with_content(&path, &new_content);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, new_content.as_bytes());
+                    journal.record_after(&journal_path, &journal_call_id, new_content.as_bytes());
                 }
 
                 // Auto-format if formatter is available
@@ -995,7 +1007,7 @@ impl ToolExecutor {
         };
 
         // Safety: refuse .git/ contents
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
+        let rel = self.project_relative_path(&path);
         let rel_str = rel.to_string_lossy();
         if rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") || rel_str == ".git" {
             return "Error: refusing to delete .git contents".to_string();
@@ -1022,12 +1034,16 @@ impl ToolExecutor {
         match fs::remove_file(&path) {
             Ok(_) => {
                 self.remove_file_state(&path);
+                let journal_path = Self::file_state_key(&path);
                 match self.file_journal.lock() {
-                    Ok(mut journal) => {
-                        journal.record_delete(&path, &journal_call_id, turn_idx, before_content)
-                    }
+                    Ok(mut journal) => journal.record_delete(
+                        &journal_path,
+                        &journal_call_id,
+                        turn_idx,
+                        before_content,
+                    ),
                     Err(poisoned) => poisoned.into_inner().record_delete(
-                        &path,
+                        &journal_path,
                         &journal_call_id,
                         turn_idx,
                         before_content,
@@ -1040,10 +1056,7 @@ impl ToolExecutor {
     }
 
     fn rollback_display_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.project_root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        self.project_relative_path(path).display().to_string()
     }
 
     fn parse_rollback_tool_output(tool_name: &str, output: String) -> Value {
@@ -1540,9 +1553,10 @@ impl ToolExecutor {
                     Ok(path) => path,
                     Err(error) => return error,
                 };
+                let journal_path = Self::file_state_key(&path);
                 let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => journal.undo_file(&path),
-                    Err(poisoned) => poisoned.into_inner().undo_file(&path),
+                    Ok(journal) => journal.undo_file(&journal_path),
+                    Err(poisoned) => poisoned.into_inner().undo_file(&journal_path),
                 };
                 match undo_result {
                     Ok(Some(edit_type)) => {
@@ -1735,8 +1749,9 @@ impl ToolExecutor {
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("batch_edit:{}", path.display());
+        let journal_path = Self::file_state_key(&path);
         if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before_patch(&path, &journal_call_id, turn_idx);
+            journal.record_before_patch(&journal_path, &journal_call_id, turn_idx);
         }
 
         // Apply
@@ -1745,7 +1760,7 @@ impl ToolExecutor {
                 self.record_write_with_content(&path, &working);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, working.as_bytes());
+                    journal.record_after(&journal_path, &journal_call_id, working.as_bytes());
                 }
                 let format_result = auto_format_file(&path, &self.project_root);
                 if format_result.is_some() {

@@ -1,6 +1,6 @@
 //! Sandbox policy configuration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Security enforcement level (ordered from least to most restrictive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -161,10 +161,12 @@ impl SandboxPolicy {
         if self.mode == SandboxMode::Permissive {
             return true;
         }
-        if path.starts_with(&self.project_root) {
+        if path_matches_allowed_prefix(path, &self.project_root) {
             return true;
         }
-        self.allowed_paths.iter().any(|ap| path.starts_with(ap))
+        self.allowed_paths
+            .iter()
+            .any(|ap| path_matches_allowed_prefix(path, ap))
     }
 
     /// Check if an environment variable should be passed to child process.
@@ -181,6 +183,19 @@ impl SandboxPolicy {
         // No explicit allowlist in Standard mode → allow all
         true
     }
+}
+
+fn path_matches_allowed_prefix(path: &Path, allowed_prefix: &Path) -> bool {
+    if path.starts_with(allowed_prefix) {
+        return true;
+    }
+
+    allowed_prefix
+        .canonicalize()
+        .ok()
+        .is_some_and(|canonical_prefix| {
+            canonical_prefix != allowed_prefix && path.starts_with(&canonical_prefix)
+        })
 }
 
 #[cfg(test)]

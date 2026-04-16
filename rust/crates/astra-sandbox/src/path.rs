@@ -286,6 +286,39 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validates_existing_path_when_project_root_is_symlink_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-root");
+        let aliased_root = dir.path().join("aliased-root");
+        std::fs::create_dir(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &aliased_root).unwrap();
+
+        let file = real_root.join("test.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let p = standard_policy(aliased_root.to_str().unwrap());
+        let result = validate_path(&p, "test.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), file.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validates_new_path_when_project_root_is_symlink_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-root");
+        let aliased_root = dir.path().join("aliased-root");
+        std::fs::create_dir(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &aliased_root).unwrap();
+
+        let p = standard_policy(aliased_root.to_str().unwrap());
+        let result = validate_path(&p, "newfile.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), aliased_root.join("newfile.txt"));
+    }
+
     #[test]
     fn blocks_symlink_escape() {
         let dir = tempfile::tempdir().unwrap();

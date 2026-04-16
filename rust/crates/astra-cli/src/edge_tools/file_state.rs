@@ -92,6 +92,34 @@ fn ranges_cover(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
 impl ToolExecutor {
     // ─── File state helpers ──────────────────────────────────────────────────
 
+    pub(super) fn file_state_key(path: &Path) -> PathBuf {
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(canonical_parent) = parent.canonicalize()
+        {
+            return canonical_parent.join(name);
+        }
+
+        path.to_path_buf()
+    }
+
+    pub(super) fn project_relative_path(&self, path: &Path) -> PathBuf {
+        if let Ok(rel) = path.strip_prefix(&self.project_root) {
+            return rel.to_path_buf();
+        }
+
+        if let Ok(canonical_root) = self.project_root.canonicalize()
+            && let Ok(rel) = path.strip_prefix(&canonical_root)
+        {
+            return rel.to_path_buf();
+        }
+
+        path.to_path_buf()
+    }
+
     /// Get the mtime of a file in milliseconds. Returns 0 on error.
     pub(super) fn file_mtime_ms(path: &Path) -> u128 {
         fs::metadata(path)
@@ -129,8 +157,9 @@ impl ToolExecutor {
     ) {
         let ts = Self::file_mtime_ms(path);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
+        let key = Self::file_state_key(path);
         if let Ok(mut state) = self.file_state.lock() {
-            let prev = state.get(path);
+            let prev = state.get(&key);
             let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
             // Carry forward read_ranges if mtime unchanged, else reset.
@@ -162,7 +191,7 @@ impl ToolExecutor {
                 prev_ranged
             };
             state.insert(
-                path.to_path_buf(),
+                key,
                 FileState {
                     timestamp_ms: ts,
                     from_read: true,
@@ -196,9 +225,10 @@ impl ToolExecutor {
         let cached_content = content
             .filter(|c| c.len() <= MAX_CACHED_FILE_BYTES)
             .map(String::from);
+        let key = Self::file_state_key(path);
         if let Ok(mut state) = self.file_state.lock() {
             state.insert(
-                path.to_path_buf(),
+                key,
                 FileState {
                     timestamp_ms: ts,
                     from_read: false,
@@ -235,17 +265,16 @@ impl ToolExecutor {
         if current_ts == 0 {
             return Ok(()); // file doesn't exist yet — ok for write_file
         }
-        let rel = path
-            .strip_prefix(&self.project_root)
-            .unwrap_or(path)
-            .to_string_lossy();
+        let rel = self.project_relative_path(path);
+        let rel_display = rel.display();
+        let key = Self::file_state_key(path);
         if let Ok(state) = self.file_state.lock() {
-            if let Some(fs) = state.get(path) {
+            if let Some(fs) = state.get(&key) {
                 if current_ts > fs.timestamp_ms {
                     return Err(format!(
                         "File has been modified since last read (by user or linter). \
                          Read it again before editing.\n\
-                         → Action required: call read_file(\"{rel}\") first, then retry."
+                         → Action required: call read_file(\"{rel_display}\") first, then retry."
                     ));
                 }
             } else {
@@ -253,7 +282,7 @@ impl ToolExecutor {
                 return Err(format!(
                     "File exists but has not been read yet. \
                      Read it first before writing/editing.\n\
-                     → Action required: call read_file(\"{rel}\") first, then retry."
+                     → Action required: call read_file(\"{rel_display}\") first, then retry."
                 ));
             }
         }
@@ -274,10 +303,11 @@ impl ToolExecutor {
 
     /// Check if a file was read as a full view (not partial/outline).
     pub(super) fn was_fully_read(&self, path: &Path) -> bool {
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
-            .and_then(|s| s.get(path).map(|fs| !fs.is_partial))
+            .and_then(|s| s.get(&key).map(|fs| !fs.is_partial))
             .unwrap_or(false)
     }
 
@@ -299,11 +329,12 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(path).and_then(|fs| {
+                s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
                         && fs.last_dedup_key == *requested)
@@ -324,11 +355,12 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(path)
+                s.get(&key)
                     .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
             })
             .unwrap_or(false)
@@ -346,11 +378,12 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(path).and_then(|fs| {
+                s.get(&key).and_then(|fs| {
                     (fs.from_read
                         && fs.timestamp_ms == current_ts
                         && ranges_cover(&fs.read_ranges, start, end))
@@ -362,19 +395,21 @@ impl ToolExecutor {
 
     /// How many times this file has been read in the current session.
     pub(super) fn file_read_count(&self, path: &Path) -> u32 {
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
-            .and_then(|s| s.get(path).map(|fs| fs.read_count))
+            .and_then(|s| s.get(&key).map(|fs| fs.read_count))
             .unwrap_or(0)
     }
 
     /// How many times this file has been read with different ranges.
     pub(super) fn file_ranged_read_count(&self, path: &Path) -> u32 {
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
-            .and_then(|s| s.get(path).map(|fs| fs.ranged_read_count))
+            .and_then(|s| s.get(&key).map(|fs| fs.ranged_read_count))
             .unwrap_or(0)
     }
 
@@ -386,11 +421,12 @@ impl ToolExecutor {
         if current_ts == 0 {
             return false;
         }
+        let key = Self::file_state_key(path);
         self.file_state
             .lock()
             .ok()
             .and_then(|s| {
-                s.get(path)
+                s.get(&key)
                     .map(|fs| fs.from_read && fs.is_partial && fs.timestamp_ms == current_ts)
             })
             .unwrap_or(false)
@@ -408,8 +444,9 @@ impl ToolExecutor {
         if current_ts == 0 {
             return None;
         }
+        let key = Self::file_state_key(path);
         self.file_state.lock().ok().and_then(|s| {
-            s.get(path).and_then(|fs| {
+            s.get(&key).and_then(|fs| {
                 if fs.timestamp_ms == current_ts {
                     fs.cached_content.clone()
                 } else {
@@ -429,8 +466,9 @@ impl ToolExecutor {
 
     /// Remove a single file from state tracking (call after delete).
     pub(super) fn remove_file_state(&self, path: &Path) {
+        let key = Self::file_state_key(path);
         if let Ok(mut state) = self.file_state.lock() {
-            state.remove(path);
+            state.remove(&key);
         }
     }
 
