@@ -37,6 +37,7 @@ astra-learning.workspace = true
 astra-messaging.workspace = true
 astra-text-utils.workspace = true
 astra-pipeline.workspace = true
+astra-plan.workspace = true
 astra-sandbox.workspace = true
 astra-skills.workspace = true
 astra-server-types.workspace = true

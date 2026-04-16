@@ -5,11 +5,16 @@
 //! - `DomainHint` — 7 domain categories
 //! - `ToolFilter` — tool selection strategy
 //! - `CalibrationAxis` — calibration targeting
-//!
-//! The full calibration implementation lives in `astra-runtime::pipeline::calibration`.
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod calibration;
+pub mod engine;
+pub mod entity;
+pub mod event;
+pub mod feedback_extraction;
+pub mod feedback_store;
 pub mod routing;
+pub mod state;
 
 pub use routing::{domain_hint_to_label, CalibrationAxis, DomainHint, TaskType, ToolFilter};

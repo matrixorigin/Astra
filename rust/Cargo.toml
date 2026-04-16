@@ -9,6 +9,7 @@ members = [
     "crates/astra-thin-client",
     "crates/astra-edge",
     "crates/astra-pipeline",
+    "crates/astra-plan",
     "crates/astra-turn-types",
     "crates/astra-skills",
     "crates/astra-sandbox",
@@ -32,6 +33,7 @@ astra-learning = { path = "crates/astra-learning" }
 astra-messaging = { path = "crates/astra-messaging" }
 astra-text-utils = { path = "crates/astra-text-utils" }
 astra-pipeline = { path = "crates/astra-pipeline" }
+astra-plan = { path = "crates/astra-plan" }
 astra-sandbox = { path = "crates/astra-sandbox" }
 astra-server-types = { path = "crates/astra-server-types" }
 astra-turn-core = { path = "crates/astra-turn-core" }

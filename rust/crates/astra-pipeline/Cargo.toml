@@ -9,6 +9,11 @@ license = "MIT"
 default = []
 
 [dependencies]
+astra-turn-types = { path = "../astra-turn-types" }
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
