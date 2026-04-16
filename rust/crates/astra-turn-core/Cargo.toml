@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 astra-core.workspace = true
+astra-pipeline.workspace = true
+astra-sandbox.workspace = true
+astra-text-utils.workspace = true
 chrono = { workspace = true }
 fastrand = "2"
 regex = { workspace = true }

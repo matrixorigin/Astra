@@ -478,6 +478,9 @@ name = "astra-turn-core"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-pipeline",
+ "astra-sandbox",
+ "astra-text-utils",
  "chrono",
  "fastrand",
  "regex",
