@@ -59,3 +59,24 @@ pub mod view;
 pub mod xml_tool_call_fallback;
 pub mod parallel_tool_exec;
 pub mod streaming_tool_exec;
+
+// Phase 15: turn leaf modules + cloud session modules
+pub mod action_compensation;
+pub mod chat_turn_sse_dispatch;
+pub mod cloud_approval_policy;
+pub mod cloud_attachments;
+pub mod cloud_cache_diagnostics;
+pub mod cloud_grouping;
+pub mod cloud_history;
+pub mod cloud_iteration;
+pub mod cloud_prefilter;
+pub mod cloud_session_facts;
+pub mod cloud_session_memory_extract;
+pub mod counter;
+pub mod goal_tracker;
+pub mod headless_tool_journal;
+pub mod persist;
+pub mod quality;
+pub mod routing_metrics;
+pub mod stream_events;
+pub mod tool_argument_hints;

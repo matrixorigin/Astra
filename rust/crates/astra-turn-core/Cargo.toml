@@ -7,7 +7,9 @@ edition.workspace = true
 astra-core.workspace = true
 astra-pipeline.workspace = true
 astra-sandbox.workspace = true
+astra-services.workspace = true
 astra-text-utils.workspace = true
+astra-thin-client.workspace = true
 chrono = { workspace = true }
 fastrand = "2"
 regex = { workspace = true }
