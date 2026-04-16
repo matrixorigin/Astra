@@ -1554,6 +1554,7 @@ impl PlanModeState {
             }
         })?;
 
+        #[allow(clippy::collapsible_if)]
         if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let (Some(checksum_str), Some(inner)) = (
                 wrapper.get("_checksum").and_then(|v| v.as_str()),

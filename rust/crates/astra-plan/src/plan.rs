@@ -26,10 +26,11 @@ use std::fmt;
 /// (`chat_plan_only`, `plan_mode`, `executing_plan`, `plan_execution_config`,
 /// `executing_plan_goal`, `current_plan_subtask_id`) with a single enum that
 /// makes invalid states unrepresentable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum PlanPhase {
     /// No active plan. The user is in normal chat mode.
+    #[default]
     Idle,
 
     /// Plan-only chat mode: tools are disabled, model produces plans as text.
@@ -64,11 +65,6 @@ pub enum PlanPhase {
     },
 }
 
-impl Default for PlanPhase {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 impl PlanPhase {
     /// Whether the phase is idle (no active plan work).
@@ -694,12 +690,10 @@ impl PlanCommand {
             "restart ",
             "redo ",
         ] {
-            if let Some(rest) = strip_prefix_ci_local(trimmed, prefix) {
-                if !rest.is_empty() {
-                    return Some(PlanCommand::Rewind {
-                        anchor: rest.to_string(),
-                    });
-                }
+            if let Some(rest) = strip_prefix_ci_local(trimmed, prefix).filter(|r| !r.is_empty()) {
+                return Some(PlanCommand::Rewind {
+                    anchor: rest.to_string(),
+                });
             }
         }
 
@@ -912,7 +906,7 @@ impl RetryPolicy {
 }
 
 /// Approval policy for tool execution during plan execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
     /// No approval required — auto-execute everything.
@@ -920,15 +914,10 @@ pub enum ApprovalPolicy {
     /// Approve each subtask before starting it.
     PerSubtask,
     /// Only approve destructive operations (file writes, shell commands).
+    #[default]
     Destructive,
     /// Approve every single tool call.
     All,
-}
-
-impl Default for ApprovalPolicy {
-    fn default() -> Self {
-        Self::Destructive
-    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

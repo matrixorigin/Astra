@@ -4,6 +4,9 @@
 //! infrastructure (AppState, database connections, Axum, etc.) and can be
 //! tested and compiled independently.
 
+// Allow pre-existing patterns from runtime extraction; fix incrementally.
+#![allow(clippy::collapsible_if, clippy::type_complexity, clippy::unnecessary_map_or)]
+
 pub mod agent_progress_ui;
 pub mod agentic_recursion_guard;
 pub mod agentic_verdict_audit;
