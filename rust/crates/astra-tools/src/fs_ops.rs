@@ -283,74 +283,220 @@ fn fallback_outline(content: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
-    let path_str = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return ToolResult::error("Error: Missing 'path' parameter".into()),
-    };
-    let content = match args.get("content").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return ToolResult::error("Error: Missing 'content' parameter".into()),
-    };
-    let path = match resolve_path(workspace_root, path_str) {
-        Ok(p) => p,
-        Err(e) => return ToolResult::error(e),
-    };
+#[derive(Debug)]
+pub struct PreparedWriteFile {
+    path: PathBuf,
+    path_str: String,
+    content: String,
+}
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return ToolResult::error(format!("Error: Cannot create directories: {e}"));
+impl PreparedWriteFile {
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    match std::fs::write(&path, content) {
-        Ok(()) => ToolResult::text(format!(
-            "Successfully wrote {} bytes to {}",
-            content.len(),
-            path_str
-        )),
-        Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+    pub fn content_bytes(&self) -> &[u8] {
+        self.content.as_bytes()
+    }
+
+    pub fn apply(&self) -> ToolResult {
+        if let Some(parent) = self.path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return ToolResult::error(format!("Error: Cannot create directories: {e}"));
+        }
+
+        match std::fs::write(&self.path, &self.content) {
+            Ok(()) => ToolResult::text(format!(
+                "Successfully wrote {} bytes to {}",
+                self.content.len(),
+                self.path_str
+            )),
+            Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+        }
     }
 }
 
-pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
+pub fn prepare_write_file(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedWriteFile, ToolResult> {
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return ToolResult::error("Error: Missing 'path' parameter".into()),
+        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
     };
-    let old_str = match args.get("old_str").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return ToolResult::error("Error: Missing 'old_str' parameter".into()),
-    };
-    let new_str = match args.get("new_str").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return ToolResult::error("Error: Missing 'new_str' parameter".into()),
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'content' parameter".into(),
+            ));
+        }
     };
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return Err(ToolResult::error(e)),
+    };
+
+    Ok(PreparedWriteFile {
+        path,
+        path_str: path_str.to_string(),
+        content: content.to_string(),
+    })
+}
+
+pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
+    match prepare_write_file(workspace_root, args) {
+        Ok(prepared) => prepared.apply(),
+        Err(error) => error,
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedStrReplace {
+    path: PathBuf,
+    path_str: String,
+    new_content: String,
+}
+
+impl PreparedStrReplace {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn new_content_bytes(&self) -> &[u8] {
+        self.new_content.as_bytes()
+    }
+
+    pub fn apply(&self) -> ToolResult {
+        match std::fs::write(&self.path, &self.new_content) {
+            Ok(()) => ToolResult::text(format!("Successfully replaced text in {}", self.path_str)),
+            Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+        }
+    }
+}
+
+pub fn prepare_str_replace(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedStrReplace, ToolResult> {
+    let path_str = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+    };
+    let old_str = match args.get("old_str").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'old_str' parameter".into(),
+            ));
+        }
+    };
+    let new_str = match args.get("new_str").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return Err(ToolResult::error(
+                "Error: Missing 'new_str' parameter".into(),
+            ));
+        }
+    };
+    let path = match resolve_path(workspace_root, path_str) {
+        Ok(p) => p,
+        Err(e) => return Err(ToolResult::error(e)),
     };
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+        Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
     };
 
     let count = content.matches(old_str).count();
     if count == 0 {
-        return ToolResult::error(format!("Error: old_str not found in {path_str}"));
+        return Err(ToolResult::error(format!(
+            "Error: old_str not found in {path_str}"
+        )));
     }
     if count > 1 {
-        return ToolResult::error(format!(
+        return Err(ToolResult::error(format!(
             "Error: old_str found {count} times in {path_str}. Make old_str more specific to match exactly once."
-        ));
+        )));
     }
 
-    let new_content = content.replacen(old_str, new_str, 1);
-    match std::fs::write(&path, &new_content) {
-        Ok(()) => ToolResult::text(format!("Successfully replaced text in {path_str}")),
-        Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+    Ok(PreparedStrReplace {
+        path,
+        path_str: path_str.to_string(),
+        new_content: content.replacen(old_str, new_str, 1),
+    })
+}
+
+pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
+    match prepare_str_replace(workspace_root, args) {
+        Ok(prepared) => prepared.apply(),
+        Err(error) => error,
     }
+}
+
+#[derive(Debug)]
+pub struct PreparedDeleteFile {
+    path: PathBuf,
+    path_str: String,
+    before_content: Vec<u8>,
+}
+
+impl PreparedDeleteFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn before_content(&self) -> &[u8] {
+        &self.before_content
+    }
+
+    pub fn apply(&self) -> ToolResult {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => ToolResult::text(format!("Successfully deleted {}", self.path_str)),
+            Err(e) => ToolResult::error(format!("Error: Cannot delete file: {e}")),
+        }
+    }
+
+    pub fn into_before_content(self) -> Vec<u8> {
+        self.before_content
+    }
+}
+
+pub fn prepare_delete_file(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedDeleteFile, ToolResult> {
+    let path_str = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+    };
+    let path = match resolve_path(workspace_root, path_str) {
+        Ok(p) => p,
+        Err(e) => return Err(ToolResult::error(e)),
+    };
+
+    if !path.exists() {
+        return Err(ToolResult::error(format!(
+            "Error: File not found: {path_str}"
+        )));
+    }
+
+    let before_content = match std::fs::read(&path) {
+        Ok(content) => content,
+        Err(e) => {
+            return Err(ToolResult::error(format!(
+                "Error: Cannot read file before delete: {e}"
+            )));
+        }
+    };
+
+    Ok(PreparedDeleteFile {
+        path,
+        path_str: path_str.to_string(),
+        before_content,
+    })
 }
 
 pub fn delete_file(workspace_root: &Path, args: &Value) -> ToolResult {

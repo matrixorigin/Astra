@@ -2589,164 +2589,75 @@ impl ServerToolExecutor {
     // ────────────────────────────────────────────────────────────────────────
 
     fn resolve_path(&self, relative: &str) -> Result<PathBuf, String> {
-        let path = if Path::new(relative).is_absolute() {
-            PathBuf::from(relative)
-        } else {
-            self.workspace_root.join(relative)
-        };
-
-        // Normalize the path manually to collapse ".." BEFORE the sandbox check.
-        // canonicalize() only works for existing paths; for non-existent targets
-        // the fallback was returning the raw path with ".." intact, which could
-        // pass the starts_with() prefix check yet resolve outside the sandbox
-        // when the OS normalizes it during actual I/O.
-        let normalized = path.components().fold(PathBuf::new(), |mut acc, c| {
-            match c {
-                std::path::Component::ParentDir => {
-                    acc.pop();
-                }
-                std::path::Component::CurDir => {} // skip "."
-                other => acc.push(other),
-            }
-            acc
-        });
-
-        // For existing paths, canonicalize to resolve symlinks as well.
-        let final_path = if normalized.exists() {
-            normalized
-                .canonicalize()
-                .map_err(|e| format!("Cannot resolve path: {e}"))?
-        } else {
-            normalized
-        };
-
-        if !final_path.starts_with(&self.workspace_root) {
-            return Err(format!(
-                "SANDBOX_DENIED: Path '{}' is outside workspace root '{}'",
-                relative,
-                self.workspace_root.display()
-            ));
-        }
-        Ok(final_path)
+        astra_tools::fs_ops::resolve_path(&self.workspace_root, relative)
     }
 
     fn server_write_file(&self, args: &Value) -> String {
-        let path_str = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'path' parameter".to_string(),
-        };
-        let content = match args.get("content").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => return "Error: Missing 'content' parameter".to_string(),
-        };
-        let path = match self.resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => return e,
+        let prepared = match astra_tools::fs_ops::prepare_write_file(&self.workspace_root, args) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.output,
         };
 
         // Record journal entry before writing
         if let Ok(mut journal) = self.file_journal.lock() {
             let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before(&path, "server-write", turn_idx);
+            journal.record_before(prepared.path(), "server-write", turn_idx);
         }
 
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return format!("Error: Cannot create directories: {e}");
-            }
+        let result = prepared.apply();
+        if !result.is_error
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
         }
-
-        match std::fs::write(&path, content) {
-            Ok(()) => {
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, "server-write", content.as_bytes());
-                }
-                format!("Successfully wrote {} bytes to {}", content.len(), path_str)
-            }
-            Err(e) => format!("Error: Cannot write file: {e}"),
-        }
+        result.output
     }
 
     fn server_str_replace(&self, args: &Value) -> String {
-        let path_str = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'path' parameter".to_string(),
+        let prepared = match astra_tools::fs_ops::prepare_str_replace(&self.workspace_root, args) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.output,
         };
-        let old_str = match args.get("old_str").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return "Error: Missing 'old_str' parameter".to_string(),
-        };
-        let new_str = match args.get("new_str").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return "Error: Missing 'new_str' parameter".to_string(),
-        };
-        let path = match self.resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => return format!("Error: Cannot read file: {e}"),
-        };
-
-        let count = content.matches(old_str).count();
-        if count == 0 {
-            return format!("Error: old_str not found in {path_str}");
-        }
-        if count > 1 {
-            return format!(
-                "Error: old_str found {count} times in {path_str}. Make old_str more specific to match exactly once."
-            );
-        }
 
         // Record journal entry
         if let Ok(mut journal) = self.file_journal.lock() {
             let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before_patch(&path, "server-str-replace", turn_idx);
+            journal.record_before_patch(prepared.path(), "server-str-replace", turn_idx);
         }
 
-        let new_content = content.replacen(old_str, new_str, 1);
-        match std::fs::write(&path, &new_content) {
-            Ok(()) => {
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, "server-str-replace", new_content.as_bytes());
-                }
-                format!("Successfully replaced text in {path_str}")
-            }
-            Err(e) => format!("Error: Cannot write file: {e}"),
+        let result = prepared.apply();
+        if !result.is_error
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            journal.record_after(
+                prepared.path(),
+                "server-str-replace",
+                prepared.new_content_bytes(),
+            );
         }
+        result.output
     }
 
     fn server_delete_file(&self, args: &Value) -> String {
-        let path_str = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'path' parameter".to_string(),
+        let prepared = match astra_tools::fs_ops::prepare_delete_file(&self.workspace_root, args) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.output,
         };
-        let path = match self.resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-
-        if !path.exists() {
-            return format!("Error: File not found: {path_str}");
-        }
-
-        let before_content = match std::fs::read(&path) {
-            Ok(content) => content,
-            Err(e) => return format!("Error: Cannot read file before delete: {e}"),
-        };
+        let path = prepared.path().to_path_buf();
         let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
 
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_delete(&path, "server-delete", turn_idx, before_content);
-                }
-                format!("Successfully deleted {path_str}")
-            }
-            Err(e) => format!("Error: Cannot delete file: {e}"),
+        let result = prepared.apply();
+        if !result.is_error
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            journal.record_delete(
+                &path,
+                "server-delete",
+                turn_idx,
+                prepared.into_before_content(),
+            );
         }
+        result.output
     }
 
     fn rollback_display_path(&self, path: &Path) -> String {
