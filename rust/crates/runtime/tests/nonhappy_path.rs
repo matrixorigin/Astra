@@ -276,6 +276,235 @@ mod turn_guard_integration {
     }
 }
 
+// ── Multi-file edit & continuation round regression tests ───────────────────
+//
+// These tests reproduce the exact scenarios from session c98e2e7e that exposed:
+// 1. pin_invoked_tool_schemas duplicating schemas when the same tool appears
+//    in multiple tool_results (→ LLM 400 "function name duplicated")
+// 2. TurnGuard reward-hacking false positive when the same tool is called
+//    with different arguments (legitimate multi-file edits)
+
+mod multi_file_edit_regression {
+    use astra_runtime::tool_registry::SelectionReport;
+    use astra_runtime::turn::tool_schema_prune::pin_invoked_tool_schemas;
+    use astra_runtime::turn::turn_guard::{TurnGuard, VerdictSeverity};
+    use serde_json::{Value, json};
+
+    fn tool_schema(name: &str) -> Value {
+        json!({"type": "function", "function": {"name": name, "description": "d", "parameters": {}}})
+    }
+
+    fn tool_call_fn(name: &str, args: &str) -> Value {
+        json!({"function": {"name": name, "arguments": args}})
+    }
+
+    /// Reproduces the exact scenario from session c98e2e7e turn 5:
+    /// - Skill activates review-changes, agent calls git_diff 12 times
+    /// - Continuation turn sends 12 tool_results for git_diff
+    /// - pin_invoked_tool_schemas must NOT duplicate the schema
+    ///
+    /// Before fix: 12 git_diff schemas → kimi-k2.5 returns 400
+    /// After fix: 1 git_diff schema
+    #[test]
+    fn continuation_turn_with_12_git_diff_results_no_duplicate_schemas() {
+        let all_schemas = vec![
+            tool_schema("bash"),
+            tool_schema("read_file"),
+            tool_schema("git_diff"),
+            tool_schema("git_status"),
+            tool_schema("skill"),
+        ];
+
+        // Initial selection: bash + read_file (git_diff NOT selected)
+        let mut selected = vec![tool_schema("bash"), tool_schema("read_file")];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into(), "read_file".into()],
+            selected_count: 2,
+            budget_used: 0,
+            budget_total: 1000,
+        };
+
+        // 12 tool_results for git_diff (different file paths, same tool)
+        let tool_results: Vec<Value> = [
+            "HEAD -- stall.rs",
+            "HEAD -- chain.rs",
+            "HEAD -- routing.rs",
+            "HEAD -- runtime_limits.rs",
+            "HEAD -- stream_render.rs",
+            "HEAD -- repl_runtime.rs",
+            "HEAD -- schemas.rs",
+            "HEAD -- lib.rs",
+            "HEAD -- nonhappy_path.rs",
+            "HEAD -- improvement_proofs.rs",
+            "HEAD",
+            "HEAD --stat",
+        ]
+        .iter()
+        .map(|_| json!({"name": "git_diff"}))
+        .collect();
+
+        let pinned =
+            pin_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
+
+        assert_eq!(pinned, 1, "git_diff should be pinned exactly once");
+        assert_eq!(selected.len(), 3, "bash + read_file + git_diff");
+
+        // Verify no duplicate function names in the final schema list
+        let names: Vec<&str> = selected
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        let unique: std::collections::HashSet<&&str> = names.iter().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "All schema names must be unique, got: {names:?}"
+        );
+    }
+
+    /// Reproduces the exact scenario from session c98e2e7e turn 3:
+    /// - Agent fixes 4 bugs across 4 files using str_replace
+    /// - Each str_replace has different path/old/new arguments
+    /// - TurnGuard must NOT flag this as reward hacking
+    ///
+    /// Before fix: quality=0.0, avoid_tools=[str_replace, grep, read_file, bash]
+    /// After fix: healthy verdict, no restrictions
+    #[test]
+    fn four_file_str_replace_not_flagged_as_reward_hacking() {
+        let mut guard = TurnGuard::new();
+
+        // Turn 1: read 4 files (exploration phase)
+        guard.record_tool_calls(&[
+            tool_call_fn(
+                "read_file",
+                r#"{"path":"stream_render.rs","start":3300,"end":3320}"#,
+            ),
+            tool_call_fn("read_file", r#"{"path":"stall.rs","start":820,"end":860}"#),
+            tool_call_fn(
+                "read_file",
+                r#"{"path":"nonhappy_path.rs","start":80,"end":90}"#,
+            ),
+            tool_call_fn(
+                "read_file",
+                r#"{"path":"runtime_limits.rs","start":1,"end":50}"#,
+            ),
+        ]);
+        guard.record_tool_result("read_file", r#"fn tool_done_inline..."#);
+        guard.record_tool_result("read_file", r#"CJK_DOMAIN_MAP..."#);
+        guard.record_tool_result("read_file", r#"const { assert!..."#);
+        guard.record_tool_result("read_file", r#"MAX_TOOL_ROUNDS..."#);
+        let v1 = guard.evaluate();
+        assert_eq!(v1.severity, VerdictSeverity::Healthy);
+
+        // Turn 2: fix all 4 files with str_replace (different args each time)
+        guard.record_tool_calls(&[
+            tool_call_fn("str_replace", r#"{"path":"stream_render.rs","old":"if self.md.is_none()","new":"// unconditional"}"#),
+            tool_call_fn("str_replace", r#"{"path":"stall.rs","old":"(\"修\",","new":"(\"修复\","}"#),
+            tool_call_fn("str_replace", r#"{"path":"nonhappy_path.rs","old":"<= 150","new":"<= 100"}"#),
+            tool_call_fn("str_replace", r#"{"path":"stream_render.rs","old":"s.lines_written = 3","new":"s.tool_done_inline(...)"}"#),
+        ]);
+        guard.record_tool_result("str_replace", "Replaced successfully");
+        guard.record_tool_result("str_replace", "Replaced successfully");
+        guard.record_tool_result("str_replace", "Replaced successfully");
+        guard.record_tool_result("str_replace", "Replaced successfully");
+
+        let v2 = guard.evaluate();
+
+        // The key assertion: multi-file edits must NOT trigger reward hacking
+        assert!(
+            !v2.injections.iter().any(|m| m.contains("Reward-hacking")),
+            "Multi-file str_replace with different args should not trigger reward-hacking guard.\n\
+             Injections: {:?}",
+            v2.injections
+        );
+        assert!(
+            !v2.avoid_tools.contains(&"str_replace".to_string()),
+            "str_replace should not be in avoid_tools for legitimate multi-file edits"
+        );
+    }
+
+    /// Full multi-turn session: review → edit → verify → no false positives.
+    /// Simulates the complete flow from session c98e2e7e across 4 turns.
+    #[test]
+    fn full_review_edit_verify_session_stays_healthy() {
+        let mut guard = TurnGuard::new();
+
+        // Turn 1: skill activation + git_diff (review phase)
+        guard.record_tool_calls(&[
+            tool_call_fn("skill", r#"{"name":"review-changes"}"#),
+            tool_call_fn("git_diff", r#"{"ref":"HEAD","stat":true}"#),
+        ]);
+        guard.record_tool_result("skill", "# Skill: review-changes\n...");
+        guard.record_tool_result(
+            "git_diff",
+            " stall.rs | 178 ++++\n stream_render.rs | 52 +-",
+        );
+        let v1 = guard.evaluate();
+        assert_eq!(v1.severity, VerdictSeverity::Healthy);
+
+        // Turn 2: read files for context (different files)
+        guard.record_tool_calls(&[
+            tool_call_fn("read_file", r#"{"path":"stall.rs","start":820,"end":860}"#),
+            tool_call_fn(
+                "read_file",
+                r#"{"path":"stream_render.rs","start":3300,"end":3320}"#,
+            ),
+            tool_call_fn(
+                "grep",
+                r#"{"pattern":"MAX_TOOL_ROUNDS","path":"runtime/src"}"#,
+            ),
+        ]);
+        guard.record_tool_result("read_file", "fn extract_cjk_keywords...");
+        guard.record_tool_result("read_file", "fn tool_done_inline...");
+        guard.record_tool_result("grep", "routing.rs:11: max_tool_rounds: u32");
+        let v2 = guard.evaluate();
+        assert_eq!(v2.severity, VerdictSeverity::Healthy);
+
+        // Turn 3: apply fixes across 4 files
+        guard.record_tool_calls(&[
+            tool_call_fn(
+                "str_replace",
+                r#"{"path":"stream_render.rs","old":"a","new":"b"}"#,
+            ),
+            tool_call_fn("str_replace", r#"{"path":"stall.rs","old":"c","new":"d"}"#),
+            tool_call_fn(
+                "str_replace",
+                r#"{"path":"nonhappy_path.rs","old":"e","new":"f"}"#,
+            ),
+            tool_call_fn(
+                "str_replace",
+                r#"{"path":"stream_render.rs","old":"g","new":"h"}"#,
+            ),
+        ]);
+        for _ in 0..4 {
+            guard.record_tool_result("str_replace", "Replaced successfully");
+        }
+        let v3 = guard.evaluate();
+        assert!(
+            !v3.injections.iter().any(|m| m.contains("Reward-hacking")),
+            "Turn 3 (multi-file edit) should not trigger reward-hacking"
+        );
+
+        // Turn 4: run tests to verify
+        guard.record_tool_calls(&[
+            tool_call_fn(
+                "bash",
+                r#"{"command":"cargo test --package astra-runtime"}"#,
+            ),
+            tool_call_fn("bash", r#"{"command":"cargo test --package astra-cli"}"#),
+        ]);
+        guard.record_tool_result("bash", "test result: ok. 5 passed");
+        guard.record_tool_result("bash", "test result: ok. 13 passed");
+        let v4 = guard.evaluate();
+        assert_eq!(v4.severity, VerdictSeverity::Healthy);
+        assert!(v4.avoid_tools.is_empty());
+    }
+}
+
 // ── Input Guard Integration ─────────────────────────────────────────────────
 
 mod input_guards {
