@@ -131,3 +131,6 @@ pub mod llm_request_dump;
 pub mod cloud_tool_delivery;
 pub mod decision_explainer;
 pub mod sse_stream_host;
+
+// Phase 21: retrieval
+pub mod retrieval;
