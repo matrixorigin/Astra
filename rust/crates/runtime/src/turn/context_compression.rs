@@ -604,9 +604,12 @@ impl CompressionLayer for TieredCompaction {
             }
         }
 
+        // Preserve the first user message (the original task/goal) from compaction.
+        let first_user_end = crate::turn::cloud::session_memory_protocol::first_user_end(messages, system_end);
+
         let keep_tail = self.keep_recent_turns * 2; // user+assistant pairs
         let tail_start = before_count.saturating_sub(keep_tail);
-        let removable_start = system_end;
+        let removable_start = first_user_end;
         let removable_end = tail_start;
 
         if removable_end <= removable_start {
@@ -724,9 +727,12 @@ impl CompressionLayer for ReactiveCompact {
             }
         }
 
+        // Preserve the first user message (the original task/goal) from compaction.
+        let first_user_end = crate::turn::cloud::session_memory_protocol::first_user_end(messages, system_end);
+
         let keep_tail = 4;
         let tail_start = messages.len().saturating_sub(keep_tail);
-        let removable_start = system_end;
+        let removable_start = first_user_end;
         let removable_end = tail_start;
 
         if removable_end <= removable_start {
@@ -897,9 +903,10 @@ mod tests {
 
         let result = layer.compress(&mut msgs, &b);
         assert!(result.messages_removed > 20);
-        // Should keep: system(1) + boundary(1) + last 4
-        assert_eq!(msgs.len(), 6);
-        assert!(msgs[1]["content"].as_str().unwrap().contains("EMERGENCY"));
+        // Should keep: system(1) + first_user(1) + boundary(1) + last 4
+        assert_eq!(msgs.len(), 7);
+        assert_eq!(msgs[1]["role"], "user"); // first user message preserved
+        assert!(msgs[2]["content"].as_str().unwrap().contains("EMERGENCY"));
     }
 
     #[test]
@@ -1006,5 +1013,53 @@ mod tests {
             out_aggressive.total_tokens_freed,
             out_default.total_tokens_freed,
         );
+    }
+
+    #[test]
+    fn tiered_compaction_preserves_first_user_message() {
+        let layer = TieredCompaction::new(2, 0.75);
+        let mut msgs = make_messages(20); // system + 20 user/assistant pairs
+        let original_first_user = msgs[1]["content"].as_str().unwrap().to_string();
+        let b = budget(80000, 70000);
+
+        layer.compress(&mut msgs, &b);
+
+        // First user message must survive
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"].as_str().unwrap(), original_first_user);
+    }
+
+    #[test]
+    fn reactive_compact_preserves_first_user_message() {
+        let layer = ReactiveCompact::new(0.95);
+        let mut msgs = make_messages(20);
+        let original_first_user = msgs[1]["content"].as_str().unwrap().to_string();
+        let b = budget(80000, 85000);
+
+        layer.compress(&mut msgs, &b);
+
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"].as_str().unwrap(), original_first_user);
+    }
+
+    #[test]
+    fn tiered_preserves_first_user_when_preceded_by_tool() {
+        let layer = TieredCompaction::new(2, 0.75);
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "tool", "content": "stale tool result", "tool_call_id": "x"}),
+            json!({"role": "user", "content": "THE REAL TASK"}),
+        ];
+        for i in 0..20 {
+            msgs.push(json!({"role": "assistant", "content": format!("a{i} {}", "x".repeat(200))}));
+            msgs.push(json!({"role": "user", "content": format!("q{i}")}));
+        }
+        let b = budget(80000, 70000);
+        layer.compress(&mut msgs, &b);
+
+        let has_task = msgs.iter().any(|m|
+            m.get("content").and_then(Value::as_str).map(|s| s.contains("THE REAL TASK")).unwrap_or(false)
+        );
+        assert!(has_task, "First user message must survive even when preceded by tool msg");
     }
 }

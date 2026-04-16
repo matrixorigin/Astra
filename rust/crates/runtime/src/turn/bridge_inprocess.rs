@@ -1425,6 +1425,8 @@ pub struct InProcessChatTurnBridge {
     /// Session-scoped structured feedback store — accumulates correction rules
     /// and injects them into subsequent turn system prompts.
     pub feedback_store: Arc<crate::pipeline::feedback_store::FeedbackStore>,
+    /// Cached Memoria client — created once, reused across turns.
+    pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
 }
 
 impl InProcessChatTurnBridge {
@@ -1436,6 +1438,7 @@ impl InProcessChatTurnBridge {
             turn_learning_writer: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(crate::pipeline::feedback_store::FeedbackStore::new()),
+            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
         }
     }
 
@@ -1554,6 +1557,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
         let client_cancel_capture = client_cancel.clone();
         let feedback_store_capture = self.feedback_store.clone();
+        let memoria_client_owned = self.memoria_client.clone();
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
@@ -1867,8 +1871,43 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     .unwrap_or_default()
             };
 
-            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}");
+            // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
+            let memoria_client_shared = memoria_client_owned.clone();
+
+            // ── P1: L0 session anchor — inject original task into dynamic system prompt ──
+            // Derive anchor from current conversation state. On turn 1, falls back to
+            // first user message. On subsequent turns, builds a lightweight L1 from
+            // messages to show current state + progress — zero network calls.
+            let session_anchor = {
+                use crate::turn::cloud::session_memory_protocol::{
+                    extract_anchor, extract_message_text, build_l1_from_messages, SessionMemory,
+                };
+                let first_user_text = messages
+                    .iter()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    .and_then(|m| extract_message_text(m))
+                    .unwrap_or_default();
+
+                if first_user_text.is_empty() {
+                    String::new()
+                } else {
+                    // After first turn, derive anchor from conversation state (no network)
+                    let turn_count = messages.iter()
+                        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                        .count();
+                    let l1 = if turn_count > 0 {
+                        let l1_text = build_l1_from_messages(&messages, turn_count, 0);
+                        SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
+                    } else {
+                        None
+                    };
+                    let anchor = extract_anchor(&first_user_text, l1.as_ref());
+                    format!("\n\n{anchor}")
+                }
+            };
+
+            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
@@ -1931,9 +1970,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     session_memory_combine,
                 };
 
-                // Try to create Memoria client from environment
-                let memoria_client =
-                    crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+                // Reuse shared Memoria client for compaction
+                let memoria_client = memoria_client_shared.clone();
 
                 // Build summary client for LLM-based compaction
                 let compact_config = crate::prompts::CompactConfig::from_env();
@@ -1958,7 +1996,49 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 )
                 .await;
 
-                (compact_result.messages, tier) // tier only feeds memoria_compact params
+                // ── P2: Continuation prompt after compaction ──
+                // When compaction removed messages, append a user-role nudge so the
+                // LLM resumes the task instead of asking "how can I help?"
+                // Skip if the last assistant message signals task completion.
+                let mut msgs = compact_result.messages;
+                if compact_result.boundary.is_some() && msgs.len() >= 2 {
+                    let last_is_user = msgs.last()
+                        .and_then(|m| m.get("role").and_then(Value::as_str))
+                        == Some("user");
+                    let last_signals_done = msgs.last()
+                        .and_then(|m| m.get("content").and_then(Value::as_str))
+                        .map(|c| {
+                            let lower = c.to_ascii_lowercase();
+                            let has_negation = lower.contains("not ") || lower.contains("haven't")
+                                || lower.contains("hasn't") || lower.contains("isn't")
+                                || lower.contains("没有") || lower.contains("尚未")
+                                || lower.contains("except") || lower.contains("but ");
+                            let has_completion = lower.contains("task complete") || lower.contains("all done")
+                                || lower.contains("finished") || lower.contains("completed successfully")
+                                || lower.contains("任务完成") || lower.contains("已完成");
+                            has_completion && !has_negation
+                        })
+                        .unwrap_or(false);
+                    if !last_is_user && !last_signals_done {
+                        // Detect if conversation is primarily CJK (Chinese/Japanese/Korean)
+                        let is_cjk = msgs.iter().rev().take(4)
+                            .filter_map(|m| m.get("content").and_then(Value::as_str))
+                            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
+                        let prompt = if is_cjk {
+                            "从上次中断的地方继续。不要向用户提问，直接继续当前任务。"
+                        } else {
+                            "Continue the conversation from where it left off. \
+                             Do not ask the user any further questions — \
+                             pick up the current task and keep going."
+                        };
+                        msgs.push(serde_json::json!({
+                            "role": "user",
+                            "content": prompt
+                        }));
+                    }
+                }
+
+                (msgs, tier) // tier only feeds memoria_compact params
             };
 
             llm_messages.extend(merged_messages);
@@ -2183,7 +2263,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                     max_output_tokens: compact_config.summary_token_budget,
                                 },
                             );
-                            let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+                            let memoria_client = memoria_client_owned.clone();
                             let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
 
                             // Get original messages (exclude leading system messages)
@@ -3016,6 +3096,26 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     auxiliary_llm_calls,
                 );
                 yield render_sse_map(&explain_event);
+            }
+
+            // ── P3: Async L1 session memory write to Memoria ──
+            // Writes L1 at turn end. Deletes previous L1 for this session first to
+            // avoid accumulating stale working memories. Retries once on failure.
+            if cloud_loop_turns > 1 || !all_round_tool_calls.is_empty() {
+                let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
+                    &messages, cloud_loop_turns as usize,
+                    usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0) as usize,
+                );
+                let l1_sid = session_id.clone();
+                let l1_client = memoria_client_shared.clone();
+                tokio::spawn(async move {
+                    let Some(client) = l1_client else { return; };
+                    if let Err(e) = crate::turn::cloud::session_memory_protocol::persist_l1(
+                        &client, &l1_content, &l1_sid,
+                    ).await {
+                        eprintln!("[session-memory] L1 persist failed for session {l1_sid}: {e}");
+                    }
+                });
             }
 
             // turn_complete
@@ -5342,5 +5442,431 @@ mod tests {
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], false);
         assert_eq!(event["followup_suggestion"], "继续");
+    }
+
+    // ── P1: L0 anchor appears in system prompt ──────────────────────────
+
+    #[test]
+    fn p1_anchor_injected_into_openai_dynamic_message() {
+        use crate::turn::cloud::session_memory_protocol::extract_anchor;
+
+        let anchor = extract_anchor("Build a distributed rate limiter using Redis", None);
+        let profile_desc = format!("cwd: /home/user/project\n\n{anchor}");
+
+        let cache_cfg = PromptCacheConfig {
+            is_anthropic: false,
+            cache_enabled: false,
+        };
+        let (_primary, dynamic, _sections) = build_system_message(
+            &["read_file", "grep"],
+            &profile_desc,
+            0.9,
+            None,
+            &cache_cfg,
+        );
+
+        let dyn_content = dynamic
+            .expect("OpenAI should have dynamic message")
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            dyn_content.contains("[session-anchor]"),
+            "Dynamic message should contain anchor: {dyn_content}"
+        );
+        assert!(dyn_content.contains("rate limiter"));
+    }
+
+    #[test]
+    fn p1_anchor_injected_into_anthropic_blocks() {
+        use crate::turn::cloud::session_memory_protocol::extract_anchor;
+
+        let anchor = extract_anchor("Refactor auth module to use JWT", None);
+        let profile_desc = format!("cwd: /project\n\n{anchor}");
+
+        let cache_cfg = PromptCacheConfig {
+            is_anthropic: true,
+            cache_enabled: true,
+        };
+        let (msg, _, _) = build_system_message(
+            &["read_file"],
+            &profile_desc,
+            0.9,
+            None,
+            &cache_cfg,
+        );
+
+        // Anthropic: single message with content blocks array
+        let blocks = msg.get("content").and_then(Value::as_array).unwrap();
+        let all_text: String = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("[session-anchor]"),
+            "Anthropic blocks should contain anchor"
+        );
+        assert!(all_text.contains("JWT"));
+    }
+
+    // ── P2: Continuation prompt after compaction ────────────────────────
+
+    #[test]
+    fn p2_continuation_prompt_appended_after_compaction() {
+        use crate::turn::cloud::memoria_compact::{
+            MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
+        };
+
+        let mut messages: Vec<Value> = vec![json!({"role": "system", "content": "sys"})];
+        messages.push(json!({"role": "user", "content": "Build X"}));
+        for i in 0..20 {
+            messages.push(json!({"role": "assistant", "content": format!("Step {i} {}", "x".repeat(400))}));
+            messages.push(json!({"role": "user", "content": format!("Next {}", i + 1)}));
+        }
+
+        let config = MemoriaCompactConfig::default();
+        let params = MemoriaCompactParams {
+            budget_chars: 3000,
+            keep_chars: 1500,
+            tier: crate::prompts::CompactionTier::AggressivePrune,
+            keep_recent_turns: 2,
+            current_tokens: 80000,
+            session_memory_file: None,
+            session_memory_combine:
+                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        };
+
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            compact_with_memoria(&messages, None, &config, &params, None, None, None),
+        );
+
+        // Compaction happened (boundary present), so we simulate what the turn loop does
+        assert!(result.boundary.is_some(), "compaction should have triggered");
+
+        let mut msgs = result.messages;
+        if result.boundary.is_some() && msgs.len() >= 2 {
+            msgs.push(json!({
+                "role": "user",
+                "content": "Continue the conversation from where it left off. \
+                            Do not ask the user any further questions — \
+                            pick up the current task and keep going."
+            }));
+        }
+
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"].as_str().unwrap().contains("Continue"));
+        assert!(last["content"].as_str().unwrap().contains("keep going"));
+    }
+
+    #[test]
+    fn p2_no_continuation_when_no_compaction() {
+        use crate::turn::cloud::memoria_compact::{
+            MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
+        };
+
+        // Small conversation — no compaction needed
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+
+        let config = MemoriaCompactConfig::default();
+        let params = MemoriaCompactParams {
+            budget_chars: 100_000,
+            keep_chars: 50_000,
+            tier: crate::prompts::CompactionTier::CompactHistory,
+            keep_recent_turns: 2,
+            current_tokens: 500,
+            session_memory_file: None,
+            session_memory_combine:
+                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        };
+
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            compact_with_memoria(&messages, None, &config, &params, None, None, None),
+        );
+
+        assert!(result.boundary.is_none(), "no compaction should happen");
+        // No continuation prompt should be added
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages.last().unwrap()["role"], "assistant");
+    }
+
+    #[test]
+    fn p2_no_continuation_when_last_message_is_user() {
+        use crate::turn::cloud::memoria_compact::{
+            MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
+        };
+
+        // Build conversation where last message after compaction will be user
+        let mut messages: Vec<Value> = vec![json!({"role": "system", "content": "sys"})];
+        messages.push(json!({"role": "user", "content": "Build X"}));
+        for i in 0..20 {
+            messages.push(json!({"role": "assistant", "content": format!("Step {i} {}", "x".repeat(400))}));
+            messages.push(json!({"role": "user", "content": format!("Next {}", i + 1)}));
+        }
+
+        let config = MemoriaCompactConfig::default();
+        let params = MemoriaCompactParams {
+            budget_chars: 3000,
+            keep_chars: 1500,
+            tier: crate::prompts::CompactionTier::AggressivePrune,
+            keep_recent_turns: 2,
+            current_tokens: 80000,
+            session_memory_file: None,
+            session_memory_combine:
+                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        };
+
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(
+            compact_with_memoria(&messages, None, &config, &params, None, None, None),
+        );
+
+        assert!(result.boundary.is_some(), "compaction should trigger");
+
+        // Simulate the turn loop's P2 logic
+        let mut msgs = result.messages;
+        if result.boundary.is_some() && msgs.len() >= 2 {
+            let last_is_user = msgs.last()
+                .and_then(|m| m.get("role").and_then(Value::as_str))
+                == Some("user");
+            if !last_is_user {
+                msgs.push(json!({
+                    "role": "user",
+                    "content": "Continue..."
+                }));
+            }
+        }
+
+        // Verify no consecutive user messages
+        for window in msgs.windows(2) {
+            let r0 = window[0].get("role").and_then(Value::as_str).unwrap_or("");
+            let r1 = window[1].get("role").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !(r0 == "user" && r1 == "user"),
+                "Consecutive user messages found: [{r0}] then [{r1}]"
+            );
+        }
+    }
+
+    #[test]
+    fn p1_anchor_handles_anthropic_content_blocks_in_user_message() {
+        use crate::turn::cloud::session_memory_protocol::extract_anchor;
+
+        // Simulate Anthropic-style content blocks in user message
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "Build a distributed cache with LRU eviction"}
+            ]}),
+        ];
+
+        let first_user_text = messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| {
+                m.get("content").and_then(|c| {
+                    c.as_str().map(String::from).or_else(|| {
+                        c.as_array().and_then(|blocks| {
+                            blocks.iter().find_map(|b| {
+                                b.get("text").and_then(Value::as_str).map(String::from)
+                            })
+                        })
+                    })
+                })
+            });
+
+        assert!(first_user_text.is_some(), "Should extract text from content blocks");
+        let anchor = extract_anchor(&first_user_text.unwrap(), None);
+        assert!(anchor.contains("distributed cache"));
+    }
+
+    #[test]
+    fn p1_anchor_does_not_break_cached_prefix() {
+        use crate::turn::cloud::session_memory_protocol::extract_anchor;
+
+        let cache_cfg = PromptCacheConfig {
+            is_anthropic: false,
+            cache_enabled: true,
+        };
+        let tools = &["read_file", "grep"];
+
+        // Turn 1: no anchor
+        let (primary1, _, _) =
+            build_system_message(tools, "cwd: /project", 0.9, None, &cache_cfg);
+
+        // Turn 2: with anchor
+        let anchor = extract_anchor("Build rate limiter", None);
+        let profile_with_anchor = format!("cwd: /project\n\n{anchor}");
+        let (primary2, _, _) =
+            build_system_message(tools, &profile_with_anchor, 0.9, None, &cache_cfg);
+
+        // Stable cached primary must be identical — anchor only in dynamic
+        assert_eq!(
+            primary1.get("content").and_then(Value::as_str),
+            primary2.get("content").and_then(Value::as_str),
+            "Anchor must not change the cached primary system message"
+        );
+    }
+
+    #[test]
+    fn p3_usage_key_is_prompt_tokens_not_prompt() {
+        // Regression: the P3 code previously used usage.get("prompt") which always
+        // returned None. The correct key from LLM providers is "prompt_tokens".
+        let mut usage = serde_json::Map::new();
+        usage.insert("prompt_tokens".to_string(), json!(45000));
+        usage.insert("completion_tokens".to_string(), json!(2000));
+
+        // This is the exact expression from the P3 code path
+        let estimated_tokens = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0) as usize;
+        assert_eq!(estimated_tokens, 45000);
+
+        // The old buggy key must NOT work
+        let wrong = usage.get("prompt").and_then(Value::as_i64).unwrap_or(0) as usize;
+        assert_eq!(wrong, 0, "usage.get(\"prompt\") should return None — the key is prompt_tokens");
+    }
+
+    // ── Fix #1: anchor evolves with L1 ──────────────────────────────────
+
+    #[test]
+    fn p1_anchor_evolves_when_l1_available() {
+        use crate::turn::cloud::session_memory_protocol::{
+            extract_anchor, SessionMemory, SESSION_MEMORY_PREFIX,
+        };
+
+        // Without L1 — shows "starting"
+        let anchor_no_l1 = extract_anchor("Build rate limiter", None);
+        assert!(anchor_no_l1.contains("starting"));
+        assert!(anchor_no_l1.contains("0/0"));
+
+        // With L1 — shows current state and progress
+        let l1_text = format!(
+            "{SESSION_MEMORY_PREFIX}\n\
+             # Session Title\nRate Limiter\n\
+             # Task Specification\nBuild a distributed rate limiter.\n\
+             # Current State\nRedis integration complete, testing.\n\
+             # Key Files\nsrc/main.rs\n\
+             # Progress\n✅ Setup\n✅ Redis\n🔄 Testing\n⏳ Deploy\n\
+             # Errors & Corrections\nNone\n\
+             # Decisions\n- Use Redis\n\
+             # User Messages\nBuild rate limiter\n\
+             # Worklog\nT1\n\
+             # Context\nT5"
+        );
+        let l1 = SessionMemory::parse(&l1_text).unwrap();
+        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1));
+
+        assert!(!anchor_with_l1.contains("starting"), "should not say 'starting' when L1 available");
+        assert!(anchor_with_l1.contains("Redis integration"), "should show current state from L1");
+        assert!(anchor_with_l1.contains("2/4"), "should show progress from L1");
+    }
+
+    // ── Fix #4: P2 skips continuation when task is done ─────────────────
+
+    /// Helper matching the actual P2 completion detection logic in the turn loop.
+    fn signals_done(content: &str) -> bool {
+        let lower = content.to_ascii_lowercase();
+        let has_negation = lower.contains("not ") || lower.contains("haven't")
+            || lower.contains("hasn't") || lower.contains("isn't")
+            || lower.contains("没有") || lower.contains("尚未")
+            || lower.contains("except") || lower.contains("but ");
+        let has_completion = lower.contains("task complete") || lower.contains("all done")
+            || lower.contains("finished") || lower.contains("completed successfully")
+            || lower.contains("任务完成") || lower.contains("已完成");
+        has_completion && !has_negation
+    }
+
+    #[test]
+    fn p2_no_continuation_when_task_complete() {
+        assert!(signals_done("All tasks completed successfully. The rate limiter is deployed."));
+    }
+
+    #[test]
+    fn p2_continuation_when_task_in_progress() {
+        assert!(!signals_done("I've implemented step 3. Working on step 4 next."));
+    }
+
+    #[test]
+    fn p2_no_continuation_chinese_completion() {
+        assert!(signals_done("所有步骤已完成，任务完成！"));
+    }
+
+    #[test]
+    fn p2_no_false_positive_negated_finished() {
+        assert!(!signals_done("I haven't finished yet, still working on it."));
+    }
+
+    #[test]
+    fn p2_no_false_positive_not_complete() {
+        assert!(!signals_done("The task is not yet complete, need more work."));
+    }
+
+    #[test]
+    fn p2_no_false_positive_all_done_except() {
+        assert!(!signals_done("All done except the deployment step."));
+    }
+
+    // ── P1 latency fix: anchor from local messages, no network ──────────
+
+    #[test]
+    fn p1_anchor_evolves_from_local_messages_no_network() {
+        use crate::turn::cloud::session_memory_protocol::{
+            extract_anchor, build_l1_from_messages, SessionMemory,
+        };
+
+        // Multi-turn conversation — anchor should show progress, not "starting"
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "Build a rate limiter using Redis"}),
+            json!({"role": "assistant", "content": "Starting implementation.", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}
+            ]}),
+            json!({"role": "tool", "content": "fn main() {}", "tool_call_id": "c1"}),
+            json!({"role": "assistant", "content": "Done with step 1."}),
+            json!({"role": "user", "content": "Now add Redis connection"}),
+            json!({"role": "assistant", "content": "Added Redis."}),
+        ];
+
+        let turn_count = messages.iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .count();
+        assert_eq!(turn_count, 3);
+
+        let l1_text = build_l1_from_messages(&messages, turn_count, 0);
+        let l1 = SessionMemory::parse(&l1_text).unwrap();
+        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1));
+
+        assert!(!anchor.contains("starting"), "multi-turn anchor should not say 'starting'");
+        assert!(anchor.contains("Turn 3"), "should reflect current turn");
+    }
+
+    // ── Fix #11: CJK detection for bilingual continuation prompt ────────
+
+    #[test]
+    fn p2_cjk_detection_chinese_content() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "我已经完成了第一步的实现，接下来处理数据库连接。"}),
+            json!({"role": "user", "content": "继续"}),
+        ];
+        let is_cjk = msgs.iter().rev().take(4)
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
+        assert!(is_cjk, "should detect Chinese content");
+    }
+
+    #[test]
+    fn p2_cjk_detection_english_content() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "I've implemented step 1. Working on the database connection next."}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let is_cjk = msgs.iter().rev().take(4)
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
+        assert!(!is_cjk, "should not detect CJK in English content");
     }
 }

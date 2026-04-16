@@ -249,6 +249,9 @@ pub trait MemoriaClient: Send + Sync {
 
     /// Purge working memories for a session.
     async fn purge_working(&self, session_id: &str) -> Result<u64, String>;
+
+    /// Delete a single memory by ID.
+    async fn delete(&self, memory_id: &str) -> Result<(), String>;
 }
 
 /// A memory record from Memoria.
@@ -266,6 +269,7 @@ pub struct MemoriaMemory {
 // ---------------------------------------------------------------------------
 
 /// HTTP-based Memoria client.
+#[derive(Clone)]
 pub struct HttpMemoriaClient {
     base_url: String,
     api_key: String,
@@ -336,6 +340,7 @@ impl MemoriaClient for HttpMemoriaClient {
         let memories = data
             .get("memories")
             .and_then(Value::as_array)
+            .or_else(|| data.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
@@ -389,6 +394,11 @@ impl MemoriaClient for HttpMemoriaClient {
             .ok_or_else(|| "Memoria store: no memory_id in response".to_string())
     }
 
+    /// Purge working memories for a session.
+    /// NOTE: Currently uses topic-based purge which does fulltext search on content.
+    /// This does NOT reliably match UUID-style session IDs (ngram tokenizer issue).
+    /// TODO: switch to session_id-based purge once Memoria supports it
+    ///       (https://github.com/matrixorigin/Memoria/issues/182)
     async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let body = json!({
@@ -418,6 +428,23 @@ impl MemoriaClient for HttpMemoriaClient {
             .get("deleted_count")
             .and_then(Value::as_u64)
             .unwrap_or(0))
+    }
+
+    async fn delete(&self, memory_id: &str) -> Result<(), String> {
+        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+        let encoded_id = utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string();
+        let url = format!("{}/v1/memories/{}", self.base_url.trim_end_matches('/'), encoded_id);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| format!("Memoria delete failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria delete HTTP {}", resp.status()));
+        }
+        Ok(())
     }
 }
 
@@ -790,6 +817,10 @@ pub async fn compact_with_memoria(
     };
 
     // Step 1: Retrieve session context from Memoria
+    // NOTE: session_id is currently only used for score boosting, not strict filtering.
+    // This means other sessions' memories can outrank the current session's L1.
+    // TODO: use filter_session=true once Memoria supports it
+    //       (https://github.com/matrixorigin/Memoria/issues/184)
     let query = memoria_compact_retrieve_query(messages);
     let memories = match client
         .retrieve(&query, Some(sid), config.max_memories)
@@ -1030,6 +1061,10 @@ mod tests {
 
         async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
             Ok(0)
+        }
+
+        async fn delete(&self, _memory_id: &str) -> Result<(), String> {
+            Ok(())
         }
     }
 

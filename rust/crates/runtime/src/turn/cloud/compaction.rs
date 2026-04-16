@@ -469,6 +469,11 @@ pub fn compact_tiered_with_result(
 
     // AggressivePrune: also drop old conversation turns
     if tier == CompactionTier::AggressivePrune {
+        // Find the first user message index (the original task — must be preserved)
+        let first_user_idx = compacted
+            .iter()
+            .position(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+
         // Count user/assistant message pairs (excluding system and tool messages)
         let conv_indices: Vec<usize> = compacted
             .iter()
@@ -484,6 +489,7 @@ pub fn compact_tiered_with_result(
             let drop_set: HashSet<usize> = conv_indices[..conv_indices.len() - keep_count]
                 .iter()
                 .copied()
+                .filter(|i| Some(*i) != first_user_idx) // never drop first user message
                 .collect();
             compacted = compacted
                 .into_iter()
@@ -671,11 +677,16 @@ mod tests {
             tool(&"x".repeat(100)),
         ];
         // keep_recent_turns=1 → keep last 2 conversation msgs (1 user + 1 assistant)
+        // + first user message is always preserved (P0 fix)
         let result = compact_tiered(&msgs, 10, 100, CompactionTier::AggressivePrune, 1);
-        // Should have: recent user, recent assistant, tool = 3 messages
-        assert_eq!(result.len(), 3, "should drop old turns, keep recent + tool");
+        // Should have: first user (preserved), recent user, recent assistant, tool = 4
+        assert_eq!(result.len(), 4, "should drop old turns, keep first user + recent + tool");
         assert_eq!(
             result[0].get("content").unwrap().as_str().unwrap(),
+            "old question 1"
+        );
+        assert_eq!(
+            result[1].get("content").unwrap().as_str().unwrap(),
             "recent question"
         );
     }
