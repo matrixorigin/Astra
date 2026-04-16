@@ -683,7 +683,10 @@ pub fn skill_tool_schema(
          Do NOT call any other tools in the same response as a skill invocation — the skill \
          must be loaded first so you can follow its instructions\n\
          - NEVER just mention a skill in your text response without actually calling this tool\n\
-         - If the user explicitly references a skill by name, invoke it\n\n\
+         - If the user explicitly references a skill by name, invoke it\n\
+         - If you see a `<skill-loaded name=\"...\"/>` tag in a tool result, the skill \
+         has already executed. Follow those instructions directly — do NOT call any \
+         other tools or re-invoke the skill\n\n\
          Available skills:\n{}{}",
         skill_entries.join("\n"),
         dynamic_note
@@ -775,7 +778,10 @@ pub fn skill_listing_system_message(
          Do NOT call any other tools in the same response as a skill invocation — \
          the skill must be loaded first so you can follow its instructions. \
          Do not attempt to manually replicate what a skill does — skills encode \
-         domain-specific workflows that outperform ad-hoc tool calls.\n\n{}{}",
+         domain-specific workflows that outperform ad-hoc tool calls.\n\n\
+         When you see a `<skill-loaded name=\"...\"/>` tag in a tool result, the skill \
+         has already executed and its instructions are in that result. Follow those \
+         instructions directly — do NOT invoke any other tools or call the skill again.\n\n{}{}",
         lines.join("\n"),
         discover_note
     );
@@ -832,7 +838,7 @@ pub async fn execute_skill_inline(
 ) -> String {
     let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
     let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
-    let (text, _activation, _verification) = execute_skill(
+    execute_skill(
         resolver,
         None,
         skill_name,
@@ -840,8 +846,8 @@ pub async fn execute_skill_inline(
         None,
         &SkillContext::default(),
     )
-    .await;
-    text
+    .await
+    .output
 }
 
 // ─── Skill execution ─────────────────────────────────────────────────────────
@@ -870,6 +876,20 @@ pub struct SkillActivation {
 pub struct SkillVerificationOutcome {
     pub all_required_passed: bool,
     pub summary: Option<astra_services::MutationVerifierSummary>,
+}
+
+/// Result of a single skill execution.
+///
+/// `success` is the authoritative signal: `true` means the skill loaded and
+/// ran to completion (even if its output contains warnings). `false` means the
+/// skill failed to load, was blocked, or hit a validation/composition error.
+/// Callers must not infer success from the `output` string content.
+#[derive(Clone, Debug)]
+pub struct SkillCallResult {
+    pub output: String,
+    pub success: bool,
+    pub activation: Option<SkillActivation>,
+    pub verification: Option<SkillVerificationOutcome>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1040,7 +1060,7 @@ pub async fn partition_and_execute_skills(
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
 
                 let start = std::time::Instant::now();
-                let (text, act, verification) = execute_skill(
+                let r = execute_skill(
                     resolver,
                     executor,
                     skill_name,
@@ -1051,34 +1071,58 @@ pub async fn partition_and_execute_skills(
                 .await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
+                let SkillCallResult {
+                    output: skill_output,
+                    success: skill_success,
+                    activation: skill_activation,
+                    verification: skill_verification,
+                } = r;
+
                 // Record outcome in quality tracker
                 if let Some(ref mut tracker) = quality_tracker {
-                    let success = verification
+                    let success = skill_verification
                         .as_ref()
                         .map(|outcome| outcome.all_required_passed)
-                        .unwrap_or_else(|| {
-                            // Heuristic fallback when no verification ran
-                            !(text.contains("blocked:")
-                                || text.contains("failed:")
-                                || text.starts_with("Unknown skill"))
-                        });
+                        .unwrap_or(skill_success);
                     tracker.record_outcome(&crate::skills::quality::SkillOutcome {
                         skill_name: skill_name.to_string(),
-                        tokens_used: (text.len() as u32) / 4, // rough estimate
+                        tokens_used: (skill_output.len() as u32) / 4, // rough estimate
                         duration_ms,
                         all_required_passed: success,
                         partial: false,
                     });
                 }
 
-                if let Some(a) = act {
+                if let Some(a) = skill_activation {
                     activation = Some(merge_activations(activation, a));
                 }
+                // Append a sentinel tag so the model knows the skill has fully
+                // executed. The system prompt instructs the model to follow the
+                // skill's instructions directly upon seeing this tag, without
+                // invoking any further tools.
+                // Gate on verification when present: a skill that ran but failed
+                // its required checks should not be treated as successfully loaded.
+                let effective_success = skill_verification
+                    .as_ref()
+                    .map(|v| v.all_required_passed)
+                    .unwrap_or(skill_success);
+                let result = if effective_success {
+                    // Escape XML attribute reserved characters in skill_name.
+                    let safe_name = skill_name
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&apos;");
+                    format!("{}\n\n<skill-loaded name=\"{}\"/>", skill_output, safe_name)
+                } else {
+                    skill_output
+                };
                 InterceptedToolResult {
                     tool_call_id: call_id,
                     tool_name,
-                    result: text,
-                    verification_summary: verification.and_then(|outcome| outcome.summary),
+                    result,
+                    verification_summary: skill_verification.and_then(|v| v.summary),
                 }
             }
             None => InterceptedToolResult {
@@ -1171,11 +1215,7 @@ async fn execute_pipeline(
     task_hint: &str,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
     skill_ctx: &SkillContext,
-) -> (
-    String,
-    Option<SkillActivation>,
-    Option<SkillVerificationOutcome>,
-) {
+) -> SkillCallResult {
     let total = steps.len();
     let mut results: Vec<(String, String, Option<bool>)> = Vec::new();
     let mut previous_output: Option<String> = None;
@@ -1209,7 +1249,7 @@ async fn execute_pipeline(
             None
         };
 
-        let (output, act, verification) = execute_skill(
+        let r = execute_skill(
             resolver,
             executor,
             &step.skill,
@@ -1218,25 +1258,28 @@ async fn execute_pipeline(
             skill_ctx,
         )
         .await;
-        let verified = verification
+        let SkillCallResult {
+            output: step_output,
+            success: step_success,
+            activation: step_activation,
+            verification: step_verification,
+        } = r;
+        let verified = step_verification
             .as_ref()
             .map(|outcome| outcome.all_required_passed);
 
-        // Determine step success: explicit verification > activation presence > assume pass
-        let step_passed = match verified {
-            Some(v) => v,
-            None => act.is_some(), // no activation = skill failed to load/resolve
-        };
+        // Determine step success: explicit verification > success flag
+        let step_passed = verified.unwrap_or(step_success);
         if !step_passed {
             all_passed = false;
         }
 
-        if let Some(a) = act {
+        if let Some(a) = step_activation {
             last_activation = Some(merge_activations(last_activation, a));
         }
 
-        previous_output = Some(output.clone());
-        results.push((label.to_string(), output, verified));
+        previous_output = Some(step_output.clone());
+        results.push((label.to_string(), step_output, verified));
 
         // Stop on failure for required steps
         if step.required && !step_passed {
@@ -1255,14 +1298,15 @@ async fn execute_pipeline(
                 };
                 summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
             }
-            return (
-                summary,
-                last_activation,
-                Some(SkillVerificationOutcome {
+            return SkillCallResult {
+                output: summary,
+                success: false,
+                activation: last_activation,
+                verification: Some(SkillVerificationOutcome {
                     all_required_passed: false,
                     summary: None,
                 }),
-            );
+            };
         }
     }
 
@@ -1280,14 +1324,15 @@ async fn execute_pipeline(
         summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
     }
 
-    (
-        summary,
-        last_activation,
-        Some(SkillVerificationOutcome {
+    SkillCallResult {
+        output: summary,
+        success: all_passed,
+        activation: last_activation,
+        verification: Some(SkillVerificationOutcome {
             all_required_passed: all_passed,
             summary: None,
         }),
-    )
+    }
 }
 
 fn remote_response_to_text(payload: &Value) -> String {
@@ -1526,27 +1571,26 @@ fn execute_skill<'a>(
     task_hint: &'a str,
     composition_ctx: Option<&'a crate::skills::composition::CompositionContext>,
     skill_ctx: &'a SkillContext,
-) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = (
-                    String,
-                    Option<SkillActivation>,
-                    Option<SkillVerificationOutcome>,
-                ),
-            > + Send
-            + 'a,
-    >,
-> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillCallResult> + Send + 'a>> {
     Box::pin(async move {
         if let Some(ctx) = composition_ctx {
             // Depth check
             if let Err(e) = ctx.check_depth() {
-                return (format!("Composition error: {e}"), None, None);
+                return SkillCallResult {
+                    output: format!("Composition error: {e}"),
+                    success: false,
+                    activation: None,
+                    verification: None,
+                };
             }
             // Timeout check
             if let Err(e) = ctx.check_timeout() {
-                return (format!("Composition error: {e}"), None, None);
+                return SkillCallResult {
+                    output: format!("Composition error: {e}"),
+                    success: false,
+                    activation: None,
+                    verification: None,
+                };
             }
         }
 
@@ -1561,15 +1605,16 @@ fn execute_skill<'a>(
                             .map(|c| c.composable)
                             .unwrap_or(false);
                         if !composable {
-                            return (
-                                format!(
+                            return SkillCallResult {
+                                output: format!(
                                     "Composition error: skill '{}' is not composable \
                                  (set composable: true in manifest)",
                                     skill_name,
                                 ),
-                                None,
-                                None,
-                            );
+                                success: false,
+                                activation: None,
+                                verification: None,
+                            };
                         }
                     }
                 }
@@ -1579,8 +1624,8 @@ fn execute_skill<'a>(
                     let args_value: Value = serde_json::json!({ "task": task_hint });
                     let errors = crate::skills::composition::validate_input(schema, &args_value);
                     if !errors.is_empty() {
-                        return (
-                            format!(
+                        return SkillCallResult {
+                            output: format!(
                                 "Input validation failed for skill '{}':\n{}",
                                 skill_name,
                                 errors
@@ -1589,9 +1634,10 @@ fn execute_skill<'a>(
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             ),
-                            None,
-                            None,
-                        );
+                            success: false,
+                            activation: None,
+                            verification: None,
+                        };
                     }
                 }
 
@@ -1638,14 +1684,15 @@ fn execute_skill<'a>(
 
                 // MCP sandbox: block inline shell commands from untrusted sources.
                 if is_mcp && crate::skills::has_inline_shell(&skill.instructions) {
-                    return (
-                        format!(
+                    return SkillCallResult {
+                        output: format!(
                             "Skill '{}' blocked: MCP skills cannot contain inline shell commands.",
                             skill_name,
                         ),
-                        None,
-                        None,
-                    );
+                        success: false,
+                        activation: None,
+                        verification: None,
+                    };
                 }
 
                 // Run pre-invocation hooks exactly once before any execution path.
@@ -1661,15 +1708,24 @@ fn execute_skill<'a>(
                                 remote_output.payload_json.as_ref(),
                             );
                             run_hooks(&skill.hooks.post_invoke, is_mcp);
-                            return (output, Some(build_activation(&skill)), verification);
+                            return SkillCallResult {
+                                output,
+                                success: verification
+                                    .as_ref()
+                                    .map(|v| v.all_required_passed)
+                                    .unwrap_or(true),
+                                activation: Some(build_activation(&skill)),
+                                verification,
+                            };
                         }
                         Err(err) => {
                             run_hooks(&skill.hooks.on_error, is_mcp);
-                            return (
-                                format!("Remote skill '{}' failed: {err}", skill_name),
-                                None,
-                                None,
-                            );
+                            return SkillCallResult {
+                                output: format!("Remote skill '{}' failed: {err}", skill_name),
+                                success: false,
+                                activation: None,
+                                verification: None,
+                            };
                         }
                     }
                 }
@@ -1769,7 +1825,15 @@ fn execute_skill<'a>(
                                     (result.output, None)
                                 };
 
-                                return (output, Some(build_activation(&skill)), verification);
+                                return SkillCallResult {
+                                    output,
+                                    success: verification
+                                        .as_ref()
+                                        .map(|v| v.all_required_passed)
+                                        .unwrap_or(true),
+                                    activation: Some(build_activation(&skill)),
+                                    verification,
+                                };
                             }
                             Err(e) => {
                                 eprintln!(
@@ -1817,13 +1881,19 @@ fn execute_skill<'a>(
                 // Run post-invocation hooks (skipped for MCP)
                 run_hooks(&skill.hooks.post_invoke, is_mcp);
 
-                (output, Some(build_activation(&skill)), None)
+                SkillCallResult {
+                    output,
+                    success: true,
+                    activation: Some(build_activation(&skill)),
+                    verification: None,
+                }
             }
-            Err(e) => (
-                format!("Failed to load skill '{}': {}", skill_name, e),
-                None,
-                None,
-            ),
+            Err(e) => SkillCallResult {
+                output: format!("Failed to load skill '{}': {}", skill_name, e),
+                success: false,
+                activation: None,
+                verification: None,
+            },
         }
     })
 }
@@ -2174,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_returns_instructions() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "code-review",
@@ -2183,10 +2253,13 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("# Skill: code-review"));
-        assert!(output.contains("Check for bugs, security issues, and style."));
+        assert!(r.output.contains("# Skill: code-review"));
+        assert!(
+            r.output
+                .contains("Check for bugs, security issues, and style.")
+        );
         // Activation always returned on success (even with no overrides)
-        let act = activation.unwrap();
+        let act = r.activation.unwrap();
         assert!(act.model_override.is_none());
         assert!(act.allowed_tools.is_empty());
     }
@@ -2194,7 +2267,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_includes_task_hint() {
         let resolver = stub_resolver();
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "code-review",
@@ -2203,13 +2276,13 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("**Task context:** Review auth module"));
+        assert!(r.output.contains("**Task context:** Review auth module"));
     }
 
     #[tokio::test]
     async fn execute_skill_unknown_name() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "nonexistent",
@@ -2218,8 +2291,8 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("Failed to load skill 'nonexistent'"));
-        assert!(activation.is_none());
+        assert!(r.output.contains("Failed to load skill 'nonexistent'"));
+        assert!(r.activation.is_none());
     }
 
     #[tokio::test]
@@ -2278,7 +2351,7 @@ mod tests {
         let resolver = RemoteResolver {
             url: format!("http://{addr}/remote-skill"),
         };
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "remote-e2e",
@@ -2287,8 +2360,8 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert_eq!(output, "remote handled: ping remote");
-        assert!(activation.is_some());
+        assert_eq!(r.output, "remote handled: ping remote");
+        assert!(r.activation.is_some());
 
         server.abort();
     }
@@ -2344,7 +2417,7 @@ mod tests {
         let resolver = RemoteResolver {
             url: format!("http://{addr}/remote-skill"),
         };
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "remote-redirect",
@@ -2353,8 +2426,12 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("HTTP 307"), "unexpected output: {output}");
-        assert!(activation.is_none());
+        assert!(
+            r.output.contains("HTTP 307"),
+            "unexpected output: {}",
+            r.output
+        );
+        assert!(r.activation.is_none());
 
         server.abort();
     }
@@ -2417,7 +2494,7 @@ mod tests {
         let resolver = RemoteResolver {
             url: format!("http://{addr}/remote-skill"),
         };
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "remote-large-body",
@@ -2427,10 +2504,12 @@ mod tests {
         )
         .await;
         assert!(
-            output.contains("response body too large") || output.contains("response body exceeds"),
-            "unexpected output: {output}"
+            r.output.contains("response body too large")
+                || r.output.contains("response body exceeds"),
+            "unexpected output: {}",
+            r.output
         );
-        assert!(activation.is_none());
+        assert!(r.activation.is_none());
 
         server.abort();
     }
@@ -2496,7 +2575,7 @@ mod tests {
         let resolver = RemoteResolverWithOutputSchema {
             url: format!("http://{addr}/remote-skill"),
         };
-        let (output, activation, verification) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "remote-schema-pass",
@@ -2505,9 +2584,11 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert_eq!(output, "remote schema pass: ping remote");
-        assert!(activation.is_some());
-        let verification = verification.expect("expected output-schema verification outcome");
+        assert_eq!(r.output, "remote schema pass: ping remote");
+        assert!(r.activation.is_some());
+        let verification = r
+            .verification
+            .expect("expected output-schema verification outcome");
         assert!(verification.all_required_passed);
 
         server.abort();
@@ -2573,7 +2654,7 @@ mod tests {
         let resolver = RemoteResolverWithOutputSchema {
             url: format!("http://{addr}/remote-skill"),
         };
-        let (output, activation, verification) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "remote-schema-fail",
@@ -2582,9 +2663,11 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("Output schema validation failed"));
-        assert!(activation.is_some());
-        let verification = verification.expect("expected output-schema verification outcome");
+        assert!(r.output.contains("Output schema validation failed"));
+        assert!(r.activation.is_some());
+        let verification = r
+            .verification
+            .expect("expected output-schema verification outcome");
         assert!(!verification.all_required_passed);
 
         server.abort();
@@ -2670,7 +2753,7 @@ mod tests {
         };
         let executor: Arc<dyn SkillExecutor> = Arc::new(StubExecutor);
 
-        let (output, activation, verification) = execute_skill(
+        let r = execute_skill(
             &resolver,
             Some(&executor),
             "fork-verify",
@@ -2680,9 +2763,9 @@ mod tests {
         )
         .await;
 
-        assert!(output.contains("Verification Results:"));
-        assert!(activation.is_some());
-        let verification = verification.expect("expected verification outcome");
+        assert!(r.output.contains("Verification Results:"));
+        assert!(r.activation.is_some());
+        let verification = r.verification.expect("expected verification outcome");
         assert!(verification.all_required_passed);
         let summary = verification.summary.expect("expected verifier summary");
         assert_eq!(summary.criteria_total, 1);
@@ -2769,14 +2852,16 @@ mod tests {
             session_id: Some("s-99".into()),
             ..Default::default()
         };
-        let (output, _, _) = execute_skill(&CtxResolver, None, "ctx-test", "", None, &ctx).await;
+        let r = execute_skill(&CtxResolver, None, "ctx-test", "", None, &ctx).await;
         assert!(
-            output.contains("/my/project"),
-            "Expected work_dir in output, got: {output}"
+            r.output.contains("/my/project"),
+            "Expected work_dir in output, got: {}",
+            r.output
         );
         assert!(
-            output.contains("s-99"),
-            "Expected session_id in output, got: {output}"
+            r.output.contains("s-99"),
+            "Expected session_id in output, got: {}",
+            r.output
         );
     }
 
@@ -3201,7 +3286,7 @@ mod tests {
             }
         }
 
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &ToolRestrictedResolver,
             None,
             "restricted",
@@ -3210,9 +3295,12 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("**Allowed tools for this skill:** bash, read_file"));
+        assert!(
+            r.output
+                .contains("**Allowed tools for this skill:** bash, read_file")
+        );
         // allowed_tools set → activation returned
-        let act = activation.unwrap();
+        let act = r.activation.unwrap();
         assert_eq!(act.allowed_tools, vec!["bash", "read_file"]);
         assert!(act.model_override.is_none());
     }
@@ -3249,7 +3337,7 @@ mod tests {
             }
         }
 
-        let (_, activation, _) = execute_skill(
+        let r = execute_skill(
             &ModelOverrideResolver,
             None,
             "fancy",
@@ -3258,7 +3346,7 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        let act = activation.unwrap();
+        let act = r.activation.unwrap();
         assert_eq!(act.model_override.as_deref(), Some("gpt-4o"));
         assert_eq!(act.allowed_tools, vec!["bash"]);
     }
@@ -3266,7 +3354,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_activation_always_returned_for_successful_resolve() {
         let resolver = stub_resolver();
-        let (_, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "code-review",
@@ -3276,7 +3364,7 @@ mod tests {
         )
         .await;
         // Activation is always returned on success so the loop can clear stale overrides
-        let act = activation.unwrap();
+        let act = r.activation.unwrap();
         assert!(act.model_override.is_none());
         assert!(act.allowed_tools.is_empty());
     }
@@ -3284,7 +3372,7 @@ mod tests {
     #[tokio::test]
     async fn execute_skill_failure_returns_none_activation() {
         let resolver = stub_resolver();
-        let (output, activation, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "nonexistent",
@@ -3293,11 +3381,220 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(output.contains("Failed to load skill"));
-        assert!(activation.is_none());
+        assert!(r.output.contains("Failed to load skill"));
+        assert!(r.activation.is_none());
     }
 
-    // ── build_activation tests ───────────────────────────────────────────
+    #[tokio::test]
+    async fn execute_skill_success_sets_success_true() {
+        let resolver = stub_resolver();
+        let r = execute_skill(
+            &resolver,
+            None,
+            "code-review",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(r.success);
+        assert!(r.activation.is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_skill_failure_sets_success_false() {
+        let resolver = stub_resolver();
+        let r = execute_skill(
+            &resolver,
+            None,
+            "nonexistent",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(!r.success);
+        assert!(r.activation.is_none());
+    }
+
+    #[tokio::test]
+    async fn partition_appends_sentinel_tag_on_success() {
+        let resolver = stub_resolver();
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": { "name": "skill", "arguments": "{\"skill_name\": \"code-review\"}" }
+        })];
+        let (results, _, _) = partition_and_execute_skills(
+            &tool_calls,
+            &resolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .result
+                .contains("<skill-loaded name=\"code-review\"/>"),
+            "Expected sentinel tag in result, got: {}",
+            results[0].result
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_no_sentinel_tag_on_failure() {
+        let resolver = stub_resolver();
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": { "name": "skill", "arguments": "{\"skill_name\": \"nonexistent\"}" }
+        })];
+        let (results, _, _) = partition_and_execute_skills(
+            &tool_calls,
+            &resolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].result.contains("<skill-loaded"),
+            "Sentinel tag must not appear on failure, got: {}",
+            results[0].result
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_sentinel_tag_escapes_xml_reserved_chars_in_skill_name() {
+        // Skill names with XML-reserved characters must be fully escaped.
+        struct QuoteResolver;
+        impl SkillResolver for QuoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Do things.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: vec![],
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+        // skill name contains all XML-reserved chars: & < > " '
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": { "name": "skill", "arguments": "{\"skill_name\": \"a&b<c>d\\\"e'f\"}" }
+        })];
+        let (results, _, _) = partition_and_execute_skills(
+            &tool_calls,
+            &QuoteResolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        let result = &results[0].result;
+        assert!(result.contains("&amp;"), "& must be escaped, got: {result}");
+        assert!(result.contains("&lt;"), "< must be escaped, got: {result}");
+        assert!(result.contains("&gt;"), "> must be escaped, got: {result}");
+        assert!(
+            result.contains("&quot;"),
+            "\" must be escaped, got: {result}"
+        );
+        assert!(
+            result.contains("&apos;"),
+            "' must be escaped, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_skill_mcp_blocked_sets_success_false() {
+        struct McpResolver;
+        impl SkillResolver for McpResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    // Inline shell command — blocked for MCP skills
+                    instructions: "Do things.\n\n! echo hello\n".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Mcp,
+                    success_criteria: vec![],
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+        let r = execute_skill(
+            &McpResolver,
+            None,
+            "mcp-skill",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(!r.success);
+        assert!(r.output.contains("blocked"));
+        assert!(r.activation.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_skill_composition_timeout_sets_success_false() {
+        use crate::skills::composition::CompositionContext;
+        let mut ctx = CompositionContext::root();
+        // Set timeout to 0 so it's already expired
+        ctx.timeout_secs = Some(0);
+        // Sleep briefly to ensure timeout has elapsed
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let resolver = stub_resolver();
+        let r = execute_skill(
+            &resolver,
+            None,
+            "code-review",
+            "",
+            Some(&ctx),
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(!r.success);
+        assert!(r.output.contains("Composition error"));
+        assert!(r.activation.is_none());
+    }
 
     #[test]
     fn build_activation_unrestricted_skill() {
@@ -3763,7 +4060,7 @@ mod tests {
         let parent_ctx = crate::skills::composition::CompositionContext::root();
         let child_ctx = parent_ctx.child("parent-skill", None);
 
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &NonComposableResolver,
             None,
             "child-skill",
@@ -3773,8 +4070,9 @@ mod tests {
         )
         .await;
         assert!(
-            output.contains("not composable"),
-            "Expected composability error, got: {output}"
+            r.output.contains("not composable"),
+            "Expected composability error, got: {}",
+            r.output
         );
     }
 
@@ -3820,7 +4118,7 @@ mod tests {
         let parent_ctx = crate::skills::composition::CompositionContext::root();
         let child_ctx = parent_ctx.child("parent-skill", None);
 
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &ComposableResolver,
             None,
             "child-skill",
@@ -3831,8 +4129,9 @@ mod tests {
         .await;
         // Should succeed (inline injection)
         assert!(
-            output.contains("Do composable things"),
-            "Expected skill output, got: {output}"
+            r.output.contains("Do composable things"),
+            "Expected skill output, got: {}",
+            r.output
         );
     }
 
@@ -3881,7 +4180,7 @@ mod tests {
             ctx = ctx.child(&format!("level-{i}"), None);
         }
 
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &AnyResolver,
             None,
             "too-deep",
@@ -3891,8 +4190,9 @@ mod tests {
         )
         .await;
         assert!(
-            output.contains("depth"),
-            "Expected depth error, got: {output}"
+            r.output.contains("depth"),
+            "Expected depth error, got: {}",
+            r.output
         );
     }
 
@@ -3931,7 +4231,7 @@ mod tests {
 
         // Root context (depth=0) — composability check should not apply
         let root_ctx = crate::skills::composition::CompositionContext::root();
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &NonComposableResolver,
             None,
             "my-skill",
@@ -3941,12 +4241,13 @@ mod tests {
         )
         .await;
         assert!(
-            !output.contains("not composable"),
+            !r.output.contains("not composable"),
             "Root call should not check composability"
         );
         assert!(
-            output.contains("Top level only"),
-            "Expected skill output, got: {output}"
+            r.output.contains("Top level only"),
+            "Expected skill output, got: {}",
+            r.output
         );
     }
 
@@ -3988,7 +4289,7 @@ mod tests {
         }
 
         // The execute_skill builds args as {"task": "..."}, which won't have "target_path"
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &SchemaResolver,
             None,
             "schema-skill",
@@ -3998,8 +4299,9 @@ mod tests {
         )
         .await;
         assert!(
-            output.contains("validation failed"),
-            "Expected validation error, got: {output}"
+            r.output.contains("validation failed"),
+            "Expected validation error, got: {}",
+            r.output
         );
     }
 
@@ -4138,7 +4440,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_executes_all_steps_sequentially() {
         let resolver = PipelineResolver;
-        let (output, activation, verified) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "pipeline-skill",
@@ -4148,28 +4450,31 @@ mod tests {
         )
         .await;
         assert!(
-            output.contains("all 2 steps completed"),
-            "Expected pipeline completion, got: {output}"
+            r.output.contains("all 2 steps completed"),
+            "Expected pipeline completion, got: {}",
+            r.output
         );
         assert!(
-            output.contains("Step: Analyze"),
+            r.output.contains("Step: Analyze"),
             "Should contain step-a label"
         );
         assert!(
-            output.contains("Step: Build"),
+            r.output.contains("Step: Build"),
             "Should contain step-b label"
         );
         assert!(
-            output.contains("Instructions for step-a"),
+            r.output.contains("Instructions for step-a"),
             "Should contain step-a output"
         );
         assert!(
-            output.contains("Instructions for step-b"),
+            r.output.contains("Instructions for step-b"),
             "Should contain step-b output"
         );
-        assert!(activation.is_some());
+        assert!(r.activation.is_some());
         assert_eq!(
-            verified.as_ref().map(|outcome| outcome.all_required_passed),
+            r.verification
+                .as_ref()
+                .map(|outcome| outcome.all_required_passed),
             Some(true)
         );
     }
@@ -4177,7 +4482,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_threads_output_between_steps() {
         let resolver = PipelineResolver;
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "pipeline-skill",
@@ -4188,7 +4493,7 @@ mod tests {
         .await;
         // Step B should receive step A's output threaded in
         assert!(
-            output.contains("Previous step output"),
+            r.output.contains("Previous step output"),
             "Expected output threading between steps"
         );
     }
@@ -4281,7 +4586,7 @@ mod tests {
         }
 
         let resolver = FailingPipelineResolver;
-        let (output, _, _) = execute_skill(
+        let r = execute_skill(
             &resolver,
             None,
             "fail-pipeline",
@@ -4292,12 +4597,188 @@ mod tests {
         .await;
         // The missing-step should fail resolution, and never-reached should not appear
         assert!(
-            !output.contains("never-reached"),
+            !r.output.contains("never-reached"),
             "Pipeline should stop before 3rd step"
         );
         assert!(
-            output.contains("Failed to load skill"),
+            r.output.contains("Failed to load skill"),
             "Should show load failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_failure_sets_success_false() {
+        // Run an actual pipeline skill with a required step that fails to resolve.
+        // execute_pipeline must return success=false and no sentinel tag.
+        struct FailPipelineResolver2;
+        impl SkillResolver for FailPipelineResolver2 {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                match name {
+                    "fail-pipeline2" => Ok(ResolvedSkill {
+                        name: name.into(),
+                        instructions: "Pipeline.".into(),
+                        model: None,
+                        max_tokens: None,
+                        allowed_tools: vec![],
+                        execution_context: ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: SkillSourceKind::Local,
+                        success_criteria: vec![],
+                        composition: Some(crate::skills::manifest::SkillComposition {
+                            composable: false,
+                            idempotent: false,
+                            side_effects: vec![],
+                            max_duration_sec: None,
+                            max_depth: None,
+                            steps: vec![crate::skills::manifest::PipelineStep {
+                                skill: "missing-step".into(),
+                                label: None,
+                                timeout_sec: None,
+                                required: true,
+                            }],
+                        }),
+                        input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
+                        aliases: vec![],
+                        effort: None,
+                        agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                    }),
+                    _ => Err(format!("Unknown skill: {name}")),
+                }
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+        let r = execute_skill(
+            &FailPipelineResolver2,
+            None,
+            "fail-pipeline2",
+            "test",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(
+            !r.success,
+            "Pipeline with required failing step must have success=false"
+        );
+        assert!(
+            !r.output.contains("<skill-loaded"),
+            "Sentinel tag must not appear for failed pipeline, got: {}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_success_sets_success_true_and_appends_sentinel() {
+        use crate::skills::manifest::{PipelineStep, SkillComposition};
+        struct TwoStepResolver;
+        impl SkillResolver for TwoStepResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                match name {
+                    "pipeline-two" => Ok(ResolvedSkill {
+                        name: name.into(),
+                        instructions: "Pipeline.".into(),
+                        model: None,
+                        max_tokens: None,
+                        allowed_tools: vec![],
+                        execution_context: ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: SkillSourceKind::Local,
+                        success_criteria: vec![],
+                        composition: Some(SkillComposition {
+                            composable: false,
+                            idempotent: false,
+                            side_effects: vec![],
+                            max_duration_sec: None,
+                            max_depth: None,
+                            steps: vec![
+                                PipelineStep {
+                                    skill: "step-a".into(),
+                                    label: Some("A".into()),
+                                    required: true,
+                                    timeout_sec: None,
+                                },
+                                PipelineStep {
+                                    skill: "step-b".into(),
+                                    label: Some("B".into()),
+                                    required: true,
+                                    timeout_sec: None,
+                                },
+                            ],
+                        }),
+                        input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
+                        aliases: vec![],
+                        effort: None,
+                        agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                    }),
+                    "step-a" | "step-b" => Ok(ResolvedSkill {
+                        name: name.into(),
+                        instructions: format!("Instructions for {name}."),
+                        model: None,
+                        max_tokens: None,
+                        allowed_tools: vec![],
+                        execution_context: ExecutionContext::Inline,
+                        hooks: crate::skills::hooks::SkillHooks::default(),
+                        skill_dir: None,
+                        source: SkillSourceKind::Local,
+                        success_criteria: vec![],
+                        composition: Some(SkillComposition {
+                            composable: true,
+                            idempotent: false,
+                            side_effects: vec![],
+                            max_duration_sec: None,
+                            max_depth: None,
+                            steps: vec![],
+                        }),
+                        input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
+                        aliases: vec![],
+                        effort: None,
+                        agent_type: None,
+                        trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                    }),
+                    _ => Err(format!("Unknown skill: {name}")),
+                }
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+        let tool_calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": { "name": "skill", "arguments": "{\"skill_name\": \"pipeline-two\"}" }
+        })];
+        let (results, _, _) = partition_and_execute_skills(
+            &tool_calls,
+            &TwoStepResolver,
+            None,
+            None,
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .result
+                .contains("<skill-loaded name=\"pipeline-two\"/>"),
+            "Successful pipeline must have sentinel tag, got: {}",
+            results[0].result
+        );
+        assert!(
+            results[0].result.contains("all 2 steps completed"),
+            "Expected completion message, got: {}",
+            results[0].result
         );
     }
 
