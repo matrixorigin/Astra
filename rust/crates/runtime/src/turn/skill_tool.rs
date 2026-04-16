@@ -1320,6 +1320,66 @@ fn remote_skill_http_client() -> &'static reqwest::Client {
     })
 }
 
+fn allow_private_remote_network() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    std::env::var("ASTRA_REMOTE_SKILL_ALLOW_PRIVATE_NET")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn remote_host_is_private_or_local(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if host.ends_with(".local") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
+                    || v6.is_multicast()
+                    || v6.is_unspecified()
+            }
+        };
+    }
+    false
+}
+
+fn validate_remote_skill_endpoint(remote_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(remote_url)
+        .map_err(|err| format!("invalid remote_url '{remote_url}': {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "unsupported remote_url scheme '{other}'; only http/https are allowed"
+            ));
+        }
+    }
+    if remote_host_is_private_or_local(&parsed) && !allow_private_remote_network() {
+        return Err(
+            "remote_url resolves to localhost/private network; set ASTRA_REMOTE_SKILL_ALLOW_PRIVATE_NET=1 to explicitly allow".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_skill_output_schema(
     skill: &ResolvedSkill,
     output_text: String,
@@ -1372,6 +1432,8 @@ async fn execute_remote_skill(
     task_hint: &str,
     skill_ctx: &SkillContext,
 ) -> Result<RemoteSkillExecutionResult, String> {
+    validate_remote_skill_endpoint(remote_url)?;
+
     // Forward a minimal context subset to reduce data-exfiltration surface for
     // user-registered remote endpoints.
     let payload = serde_json::json!({
@@ -2488,6 +2550,18 @@ mod tests {
     fn skill_context_default_produces_empty_vars() {
         let ctx = SkillContext::default();
         assert!(ctx.as_substitution_vars().is_empty());
+    }
+
+    #[test]
+    fn remote_host_classifier_detects_private_and_public_hosts() {
+        let localhost = reqwest::Url::parse("http://127.0.0.1:8080/execute").unwrap();
+        assert!(remote_host_is_private_or_local(&localhost));
+
+        let public_ip = reqwest::Url::parse("https://8.8.8.8/execute").unwrap();
+        assert!(!remote_host_is_private_or_local(&public_ip));
+
+        let public_dns = reqwest::Url::parse("https://example.com/execute").unwrap();
+        assert!(!remote_host_is_private_or_local(&public_dns));
     }
 
     #[tokio::test]
