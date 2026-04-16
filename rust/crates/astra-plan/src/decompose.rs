@@ -4496,7 +4496,27 @@ Done!"#;
             .and_then(|p| p.parent())
             .expect("should find repo root");
         let ctx = analyze_project(root);
-        assert!(ctx.git_branch.is_some(), "should detect git branch");
+
+        // analyze_project only populates git_branch when HEAD points to a named
+        // ref. CI PR checkouts (refs/pull/<N>/merge) and other detached-HEAD
+        // states are valid but leave git_branch = None. Assert the two must
+        // stay consistent rather than forcing branch detection.
+        let head = std::fs::read_to_string(root.join(".git/HEAD")).ok();
+        let head_is_ref = head
+            .as_deref()
+            .is_some_and(|h| h.trim_start().starts_with("ref: refs/heads/"));
+        if head_is_ref {
+            assert!(
+                ctx.git_branch.is_some(),
+                "HEAD points to a named ref but git_branch was not detected"
+            );
+        } else {
+            assert!(
+                ctx.git_branch.is_none(),
+                "HEAD is detached but git_branch = {:?}",
+                ctx.git_branch
+            );
+        }
     }
 
     #[test]
