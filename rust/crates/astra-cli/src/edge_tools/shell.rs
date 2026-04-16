@@ -2337,6 +2337,37 @@ fn destructive_powershell_warning(command: &str) -> Option<&'static str> {
 /// - The tokio runtime shuts down mid-execution
 ///
 /// Returns the Output on success, or an error message on failure/timeout.
+#[cfg(unix)]
+fn wait_for_process_group_exit(pgid: u32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let exists = Command::new("kill")
+            .args(["-0", &format!("-{pgid}")])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !exists || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .status();
+        let _ = child.kill();
+        wait_for_process_group_exit(pid, Duration::from_secs(1));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
 fn run_command_with_cleanup(
     cmd: &mut Command,
     timeout_secs: f64,
@@ -2359,20 +2390,7 @@ fn run_command_with_cleanup(
             Ok(Some(_)) => break,
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
-                    // Kill entire process group (command + all children)
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        // Negative PID = kill process group via /bin/kill
-                        let _ = Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .output();
-                        let _ = child.kill();
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
+                    terminate_child_process_tree(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -2529,18 +2547,7 @@ fn run_command_streaming(
                         });
                     } else {
                         // Hard kill.
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id();
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{pid}")])
-                                .output();
-                            let _ = child.kill();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                        }
+                        terminate_child_process_tree(&mut child);
                         let _ = child.wait();
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
@@ -2698,20 +2705,7 @@ fn run_readonly_command_with_partial(
             }
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        // Kill the entire process group (catches child processes).
-                        // Fall back to direct kill so child.wait() never blocks forever.
-                        let _ = Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .output();
-                        let _ = child.kill();
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
+                    terminate_child_process_tree(&mut child);
                     let _ = child.wait();
                     let _ = reader.join();
                     let _ = stderr_reader.join();
@@ -2897,20 +2891,7 @@ impl ToolExecutor {
                 }
                 Ok(None) => {
                     if std::time::Instant::now() > deadline {
-                        // Kill entire process group (bash + all children)
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id();
-                            // Negative PID = kill process group via /bin/kill
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{pid}")])
-                                .output();
-                            let _ = child.kill();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                        }
+                        terminate_child_process_tree(&mut child);
                         // Reap the zombie process to prevent resource leak
                         let _ = child.wait();
                         return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -3935,11 +3916,7 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
-    fn write_bash_test_script(
-        dir: &std::path::Path,
-        name: &str,
-        body: &str,
-    ) -> std::path::PathBuf {
+    fn write_bash_test_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let script = dir.join(name);
         std::fs::write(&script, body).unwrap();
         #[cfg(unix)]
@@ -3995,9 +3972,7 @@ mod tests {
 
     #[cfg(unix)]
     fn kill_pid(pid: u32) {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     }
 
     #[cfg(not(unix))]
