@@ -3935,6 +3935,99 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
+    fn write_bash_test_script(
+        dir: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let script = dir.join(name);
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "timed out waiting for pid file {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(not(unix))]
+    fn process_exists(_pid: u32) -> bool {
+        false
+    }
+
+    fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !process_exists(pid) {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn kill_pid(pid: u32) {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+
+    #[cfg(not(unix))]
+    fn kill_pid(_pid: u32) {}
+
+    struct ChildProcessGuard {
+        pid: Option<u32>,
+    }
+
+    impl ChildProcessGuard {
+        fn new() -> Self {
+            Self { pid: None }
+        }
+
+        fn track(&mut self, pid: u32) {
+            self.pid = Some(pid);
+        }
+    }
+
+    impl Drop for ChildProcessGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid.take()
+                && process_exists(pid)
+            {
+                kill_pid(pid);
+                let _ = wait_for_process_exit(pid, Duration::from_secs(1));
+            }
+        }
+    }
+
     #[test]
     fn shell_escape_simple() {
         assert_eq!(shell_escape("hello"), "'hello'");
@@ -3997,24 +4090,37 @@ mod tests {
     #[test]
     fn bash_timeout_kills_process() {
         let executor = test_executor();
-        let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.2}));
+        let result = executor.bash(&serde_json::json!({"command": "sleep 3", "timeout": 0.2}));
         assert!(result.contains("timed out"), "got: {result}");
     }
 
     #[test]
     fn bash_timeout_kills_child_process_tree() {
-        // Spawn a parent bash that starts a child sleep.
-        // After timeout, verify the child is also killed via process group.
-        let executor = test_executor();
-        // Use a unique marker file to detect if the child survived
-        let marker = format!("/tmp/mo_test_pgid_{}", std::process::id());
-        let cmd = format!("bash -c 'sleep 10 && touch {marker}' & wait");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-survived");
+        let pid_file = dir.path().join("child.pid");
+        let script = write_bash_test_script(
+            dir.path(),
+            "spawn-child.sh",
+            &format!(
+                "#!/usr/bin/env bash\nsleep 3 &\nchild=$!\necho \"$child\" > {}\nwait \"$child\"\ntouch {}\n",
+                shell_escape(pid_file.to_string_lossy().as_ref()),
+                shell_escape(marker.to_string_lossy().as_ref()),
+            ),
+        );
+        let executor = test_executor_in(dir.path());
+        let mut guard = ChildProcessGuard::new();
+        let cmd = format!("bash {}", shell_escape(script.to_string_lossy().as_ref()));
         let result = executor.bash(&serde_json::json!({"command": cmd, "timeout": 0.3}));
+        let pid = wait_for_pid_file(&pid_file);
+        guard.track(pid);
         assert!(result.contains("timed out"), "got: {result}");
-        // Give a moment for any surviving child to act
-        std::thread::sleep(Duration::from_millis(200));
         assert!(
-            !std::path::Path::new(&marker).exists(),
+            wait_for_process_exit(pid, Duration::from_secs(1)),
+            "child process {pid} survived timeout"
+        );
+        assert!(
+            !marker.exists(),
             "child process survived timeout — process group kill failed"
         );
     }
@@ -4038,7 +4144,7 @@ mod tests {
         assert!(!r.contains("timed out"));
 
         // Explicit timeout overrides tier
-        let r = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
+        let r = executor.bash(&serde_json::json!({"command": "sleep 3", "timeout": 0.1}));
         assert!(
             r.contains("timed out"),
             "explicit timeout should override tier"
@@ -4050,16 +4156,26 @@ mod tests {
     /// stdout/stderr pipes open. We must not wait for pipes to close.
     #[test]
     fn bash_background_command_does_not_block() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("background.pid");
+        let script = write_bash_test_script(
+            dir.path(),
+            "background-command.sh",
+            &format!(
+                "#!/usr/bin/env bash\nsleep 10 &\necho \"$!\" > {}\necho started\n",
+                shell_escape(pid_file.to_string_lossy().as_ref()),
+            ),
+        );
+        let executor = test_executor_in(dir.path());
+        let mut guard = ChildProcessGuard::new();
         let start = std::time::Instant::now();
-        // This command starts a long-running background process and exits immediately.
-        // Without the fix, wait_with_output() would block until sleep finishes (60s).
         let result = executor.bash(&serde_json::json!({
-            "command": "echo started && sleep 60 &",
+            "command": format!("bash {}", shell_escape(script.to_string_lossy().as_ref())),
             "timeout": 5.0
         }));
         let elapsed = start.elapsed();
-        // Should complete in ~1 second (500ms read timeout + overhead), not 60s
+        let pid = wait_for_pid_file(&pid_file);
+        guard.track(pid);
         assert!(
             elapsed.as_secs() < 3,
             "background command blocked for {elapsed:?}, should return quickly"
@@ -4071,6 +4187,10 @@ mod tests {
         assert!(
             !result.contains("timed out"),
             "should not timeout: {result}"
+        );
+        assert!(
+            process_exists(pid),
+            "background child {pid} should still be alive when bash returns"
         );
     }
 
@@ -5792,22 +5912,36 @@ mod tests {
 
     #[test]
     fn run_command_with_cleanup_timeout_kills_process_group() {
-        // Test that run_command_with_cleanup properly kills the entire process group
-        let marker = format!("/tmp/mo_test_cleanup_{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cleanup-marker");
+        let pid_file = dir.path().join("cleanup.pid");
+        let script = write_bash_test_script(
+            dir.path(),
+            "cleanup-timeout.sh",
+            &format!(
+                "#!/usr/bin/env bash\nsleep 3 &\nchild=$!\necho \"$child\" > {}\nwait \"$child\"\ntouch {}\n",
+                shell_escape(pid_file.to_string_lossy().as_ref()),
+                shell_escape(marker.to_string_lossy().as_ref()),
+            ),
+        );
+        let mut guard = ChildProcessGuard::new();
         let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(format!("sleep 10 && touch {marker}"));
+        cmd.arg(&script);
 
         let result = run_command_with_cleanup(&mut cmd, 0.2);
+        let pid = wait_for_pid_file(&pid_file);
+        guard.track(pid);
         assert!(result.is_err(), "should timeout");
         assert!(
             result.unwrap_err().contains("timed out"),
             "should indicate timeout"
         );
-
-        // Give a moment for any surviving child to act
-        std::thread::sleep(Duration::from_millis(200));
         assert!(
-            !std::path::Path::new(&marker).exists(),
+            wait_for_process_exit(pid, Duration::from_secs(1)),
+            "child process {pid} survived timeout"
+        );
+        assert!(
+            !marker.exists(),
             "child process survived timeout — process group kill failed"
         );
     }
@@ -5825,9 +5959,8 @@ mod tests {
 
     #[test]
     fn grep_uses_process_group_cleanup() {
-        // Verify grep doesn't leave zombie processes on timeout
-        // This is a regression test for the curl zombie leak issue.
-        // We can't easily force grep to timeout, but we can verify it completes normally.
+        // Smoke test: grep still works through the readonly wrapper that installs
+        // process-group cleanup. Timeout cleanup is covered by grep_timeout_* tests.
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         std::fs::write(dir.path().join("test.txt"), "findme\n").unwrap();
@@ -5842,7 +5975,8 @@ mod tests {
 
     #[test]
     fn glob_uses_process_group_cleanup() {
-        // Verify glob (which uses bash internally) properly cleans up
+        // Smoke test: glob still works through the wrapper that installs
+        // process-group cleanup. Timeout behavior is covered by direct helper tests.
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         std::fs::write(dir.path().join("test.txt"), "content\n").unwrap();
