@@ -3,8 +3,7 @@
 //! Instead of keying session overrides by bare tool name (`"bash" → allow`),
 //! this module produces content-aware fingerprints that distinguish between
 //! e.g. `bash("git status")` and `bash("rm -rf /")`. Denial tracking implements
-//! consecutive/total limits inspired by Claude Code's `denialTracking.ts`,
-//! preventing infinite approval loops from stalling sessions.
+//! consecutive/total limits prevent infinite approval loops from stalling sessions.
 //!
 //! Phase C enhancement: When 2+ denials share a similar pattern (same tool +
 //! command prefix, or same denial reason keyword), auto-generates session deny
@@ -211,7 +210,7 @@ fn path_pattern_matches(pattern: &str, candidate: &str) -> bool {
 
 // ─── Denial Tracking ─────────────────────────────────────────────────────────
 
-/// Limits for denial tracking (inspired by Claude Code's `denialTracking.ts`).
+/// Limits for denial tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenialLimits {
     /// Max consecutive denials for the same fingerprint before fallback.

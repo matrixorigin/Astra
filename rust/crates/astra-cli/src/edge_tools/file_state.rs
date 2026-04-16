@@ -1,7 +1,7 @@
 //! File state tracking for staleness detection and read deduplication.
 //!
 //! Tracks mtime after each read/write/edit to prevent overwriting user edits
-//! and skip re-reading unchanged files. Inspired by Claude Code's readFileState.
+//! and skip re-reading unchanged files.
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,8 +23,8 @@ const MAX_CACHED_FILE_BYTES: usize = 256 * 1024;
 /// keeping metadata intact for dedup/staleness tracking.
 const MAX_TOTAL_CACHED_BYTES: usize = 8 * 1024 * 1024;
 
-/// Shape of the last `read_file` call, for consecutive-request dedup (same idea as
-/// Claude Code `FileReadTool`: same offset+limit + unchanged mtime → stub before I/O).
+/// Shape of the last `read_file` call, for consecutive-request dedup (same
+/// offset+limit + unchanged mtime → stub before I/O).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReadDedupKey {
     Full,
@@ -37,7 +37,6 @@ pub(crate) enum ReadDedupKey {
 }
 
 /// Tracks the last-read state of a file for staleness detection and dedup.
-/// Inspired by Claude Code's readFileState mechanism.
 pub(super) struct FileState {
     /// mtime (milliseconds) at the time of last read/write.
     pub(super) timestamp_ms: u128,
@@ -56,8 +55,7 @@ pub(super) struct FileState {
     pub(super) last_dedup_key: ReadDedupKey,
     /// Cached full file content. Stored on reads/writes when the full content
     /// is available and fits within `MAX_CACHED_FILE_BYTES`. Serves subsequent
-    /// reads without disk I/O when mtime is unchanged. Inspired by Claude Code's
-    /// FileStateCache content caching.
+    /// reads without disk I/O when mtime is unchanged.
     pub(super) cached_content: Option<String>,
     /// Merged line ranges already read (sorted, non-overlapping).
     /// Used to detect when a new ranged read is fully covered by prior reads.
@@ -282,7 +280,7 @@ impl ToolExecutor {
     }
 
     /// Consecutive identical partial read (outline or same raw line range) with unchanged
-    /// mtime — stub **before** disk read, like Claude Code `tengu_file_read_dedup` for
+    /// mtime — stub **before** disk read for
     /// the same offset/limit as the immediately previous read.
     pub(super) fn can_dedup_identical_partial_read(
         &self,
@@ -314,8 +312,7 @@ impl ToolExecutor {
     }
 
     /// Check if we can dedup a read (previous op was a full read, unchanged mtime).
-    /// Respects `MO_DEDUP_DISABLED=1` env var killswitch (inspired by Claude Code's
-    /// `tengu_read_dedup_killswitch` feature flag).
+    /// Respects `MO_DEDUP_DISABLED=1` env var killswitch.
     pub(super) fn can_dedup_read(&self, path: &Path) -> bool {
         if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
             return false;

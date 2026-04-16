@@ -1,6 +1,6 @@
 # Shell & Permission Security Improvements
 
-Inspired by Claude Code's architecture, adapted to the existing Rust codebase.
+Layered security model adapted to the existing Rust codebase.
 
 ## Changes Summary
 
@@ -10,7 +10,7 @@ Inspired by Claude Code's architecture, adapted to the existing Rust codebase.
 
 - **Rule-based permissions**: Added `PermissionRule` with glob-style matching (`Bash(git commit:*)`)
 - **Settings persistence**: `PermissionSettings` loads/saves from `.kiro/permissions.json`
-- **Layered evaluation order** (matching Claude Code's architecture):
+- **Layered evaluation order**:
   1. Deny rules (bypass-immune — checked even with auto_approve)
   2. Session overrides
   3. Git safety checks (bypass-immune)
@@ -88,19 +88,15 @@ Validates git commands before execution:
 | Full runtime suite | 2312 tests | ✅ All pass |
 | Full CLI suite | 852 tests | ✅ All pass |
 
-## Architecture Alignment
+## Architecture
 
-The implementation follows Claude Code's layered security model while fitting into the existing Rust architecture:
+The implementation follows a layered security model:
 
 ```
-Claude Code (TypeScript)          →  astra-runtime (Rust)
+Module Mapping
 ─────────────────────────────────────────────────────────────
-permissions.ts (rule engine)      →  permission_manager.rs (PermissionRule + PermissionSettings)
-bashSecurity.ts (git validation)  →  git_safety.rs (validate_git_command)
-readOnlyValidation.ts (bare repo) →  git_safety.rs (is_bare_git_repo)
-bashProvider.ts (extglob/IFS)     →  shell_hardening.rs (build_hardened_command)
-subprocessEnv.ts (secret scrub)   →  shell_hardening.rs (scrub_secrets_from_env)
-ShellCommand.ts (streaming)       →  shell.rs (run_command_streaming)
-ShellCommand.ts (backgrounding)   →  shell.rs (size_watchdog)
-filesystem.ts (dangerous paths)   →  shell_hardening.rs (DANGEROUS_FILE_PATHS)
+permission_manager.rs   — PermissionRule + PermissionSettings
+git_safety.rs           — validate_git_command, is_bare_git_repo
+shell_hardening.rs      — build_hardened_command, scrub_secrets_from_env, DANGEROUS_FILE_PATHS
+shell.rs                — run_command_streaming, size_watchdog
 ```

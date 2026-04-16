@@ -192,7 +192,7 @@ pub trait SkillResolver: Send + Sync {
 
 pub const SKILL_TOOL_NAME: &str = "skill";
 
-/// Second-stage discovery tool (Claude Code skill-search parity).
+/// Second-stage discovery tool for skill search.
 pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
 
 /// Max skills returned from a single `discover_skills` call.
@@ -708,8 +708,7 @@ pub fn skill_tool_schema(
 /// Build a system-reminder message listing available skills.
 ///
 /// Injected into the conversation so the LLM is aware skills exist even
-/// before inspecting tool schemas (mirrors Claude Code's `skill_listing`
-/// attachment pattern). Uses the same budget as the tool schema.
+/// before inspecting tool schemas. Uses the same budget as the tool schema.
 pub fn skill_listing_system_message(
     skills: &[SkillToolInfo],
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,

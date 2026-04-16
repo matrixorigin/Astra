@@ -3,11 +3,9 @@
 //! Three hook systems coexist:
 //!
 //! 1. **Skill lifecycle hooks** (`SkillHooks`) — pre/post invocation of a skill itself.
-//! 2. **Tool event hooks** (`ToolEventHook`) — fire on any tool call matching a pattern,
-//!    inspired by Claude Code's PreToolUse / PostToolUse system.
+//! 2. **Tool event hooks** (`ToolEventHook`) — fire on any tool call matching a pattern.
 //! 3. **Session event hooks** (`SessionEventHook`) — fire on session lifecycle events
-//!    (SessionStart, SessionEnd, UserPromptSubmit, SubagentStart), compatible with
-//!    Claude Code's hook event model.
+//!    (SessionStart, SessionEnd, UserPromptSubmit, SubagentStart).
 
 use serde::{Deserialize, Serialize};
 
@@ -941,8 +939,6 @@ pub enum SkillLifecycleEvent {
 // ── Session event hooks (CC-compatible) ─────────────────────────────────
 
 /// Session lifecycle events that can trigger hooks.
-///
-/// Compatible with Claude Code's hook event model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEvent {

@@ -1,7 +1,7 @@
 //! Conditional skill activation — path-glob matching and trigger detection.
 //!
 //! Skills with `paths` frontmatter are only visible after the model touches
-//! matching files (inspired by Claude Code's conditional skills).
+//! matching files (conditional activation based on path globs).
 
 use super::manifest::SkillManifest;
 

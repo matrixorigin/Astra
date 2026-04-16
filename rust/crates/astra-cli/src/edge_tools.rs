@@ -147,8 +147,7 @@ fn tool_output_limit() -> usize {
 /// Glob results are filename-only, so 100KB is fine. Bash has its own
 /// streaming cap at 30KB. Everything else uses the global default.
 ///
-/// Inspired by Claude Code's per-tool `maxResultSizeChars` overrides
-/// (grep: 20K, glob: 100K, default: 50K).
+/// Per-tool output size overrides (grep: 10K, glob: 100K, default: 50K).
 pub(crate) fn per_tool_output_limit(tool_name: &str) -> usize {
     let base = tool_output_limit();
     match tool_name {
@@ -173,7 +172,7 @@ const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 /// this AND aggregate output is above the soft limit, the result is persisted
 /// to disk and replaced with a preview + file path. The model can use
 /// `read_file` with `start_line/end_line` to access specific parts.
-/// Inspired by Claude Code's `DEFAULT_MAX_RESULT_SIZE_CHARS` (50K).
+/// Global default for large-output persistence threshold (50K).
 const PERSIST_THRESHOLD: usize = 50_000;
 
 /// Preview size (bytes) included in the persisted-output reference message.
@@ -226,7 +225,7 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
 
 /// Normalize empty/whitespace-only tool output to a short marker.
 /// Prevents model confusion from truly empty tool results.
-/// Inspired by Claude Code's `isToolResultContentEmpty` guard.
+/// Prevents model confusion from truly empty tool results.
 fn normalize_empty_output(output: String, tool_name: &str) -> String {
     if output.trim().is_empty() {
         format!("({tool_name} completed with no output)")
@@ -348,8 +347,8 @@ pub struct ToolExecutor {
     file_state: std::sync::Mutex<HashMap<PathBuf, FileState>>,
     /// Per-turn aggregate tool output size (bytes). When this exceeds
     /// `AGGREGATE_OUTPUT_BUDGET`, subsequent tool outputs are truncated
-    /// more aggressively. Inspired by Claude Code's
-    /// `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200K).
+    /// more aggressively.
+    /// Per-turn aggregate budget is 200K.
     aggregate_output_bytes: std::sync::atomic::AtomicUsize,
     /// URL fetch cache: LRU-style cache mapping URL → (response, timestamp).
     /// Returns cached response for repeated fetches within TTL (15 minutes).
@@ -1131,8 +1130,8 @@ impl ToolExecutor {
     /// ~2KB preview + file path. The model can use `read_file` with
     /// `start_line/end_line` to access specific parts of the persisted file.
     ///
-    /// Inspired by Claude Code's `toolResultStorage.ts` which persists large
-    /// results to `~/.claude/projects/<hash>/<session>/tool-results/`.
+    /// Large results are persisted to a temp file and replaced with a
+    /// ~2KB preview + file path.
     fn maybe_persist_large_output(&self, output: String, _tool_name: &str) -> String {
         // Skip small outputs
         if output.len() < PERSIST_THRESHOLD {

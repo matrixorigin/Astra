@@ -349,7 +349,7 @@ fn prefetch_review_git_stat(project_root: &std::path::Path, target: ReviewGitTar
     }
     let mut s = trimmed.to_string();
     if s.len() > REVIEW_PREFETCH_MAX {
-        s.truncate(REVIEW_PREFETCH_MAX);
+        s.truncate(s.floor_char_boundary(REVIEW_PREFETCH_MAX));
         s.push_str("\n[truncated]");
     }
     s
@@ -419,7 +419,7 @@ fn format_review_search_result(files: &[String], raw: &str) -> String {
     }
 
     if out.len() > 20_000 {
-        out.truncate(20_000);
+        out.truncate(out.floor_char_boundary(20_000));
         out.push_str("\n[truncated]");
     }
     out

@@ -1929,7 +1929,6 @@ pub enum McpError {
 }
 
 /// Maximum length for tool descriptions sent to the model.
-/// Matches Claude Code's MAX_MCP_DESCRIPTION_LENGTH.
 pub const MAX_DESCRIPTION_LENGTH: usize = 2048;
 
 /// Maximum character length for tool call result content.

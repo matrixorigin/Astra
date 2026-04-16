@@ -26,7 +26,7 @@ pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::
 }
 
 /// Pull a few Memoria hits after compact so the shortened context keeps **session-relevant**
-/// recall (similar in spirit to Claude Code keeping session memory as an anchor).
+/// recall (keeps session-relevant context as an anchor after compaction).
 const COMPACT_ANCHOR_QUERY_MAX: usize = 220;
 const COMPACT_ANCHOR_TOP_K: u32 = 3;
 const COMPACT_ANCHOR_MAX_LINES: usize = 3;

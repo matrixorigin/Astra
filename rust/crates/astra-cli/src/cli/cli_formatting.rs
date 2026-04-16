@@ -302,9 +302,9 @@ fn find_comment_start(code: &str) -> Option<usize> {
     let mut in_string = false;
     let mut string_char = '\0';
     let mut escape_next = false;
-    let chars: Vec<char> = code.chars().collect();
 
-    for (i, &c) in chars.iter().enumerate() {
+    let mut chars = code.char_indices().peekable();
+    while let Some((byte_pos, c)) = chars.next() {
         if escape_next {
             escape_next = false;
             continue;
@@ -319,11 +319,11 @@ fn find_comment_start(code: &str) -> Option<usize> {
             if c == '"' || c == '\'' {
                 in_string = true;
                 string_char = c;
-            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
-                return Some(i);
+            } else if c == '/' && chars.peek().map(|&(_, nc)| nc) == Some('/') {
+                return Some(byte_pos);
             } else if c == '#' {
                 // Python/shell comment
-                return Some(i);
+                return Some(byte_pos);
             }
         } else if c == string_char {
             in_string = false;
@@ -452,6 +452,37 @@ mod tests {
         let output3 = highlight_code_line(input3);
         let stripped3 = strip_ansi(&output3);
         assert!(stripped3.starts_with("10000│"));
+    }
+
+    #[test]
+    fn test_find_comment_start_multibyte() {
+        // '#' after CJK chars — byte offset must be returned, not char index
+        let s = "| 错误学习 | # comment";
+        let pos = find_comment_start(s).unwrap();
+        assert_eq!(&s[pos..pos + 1], "#");
+    }
+
+    #[test]
+    fn test_highlight_code_line_multibyte() {
+        // Must not panic on CJK content with comment-like characters
+        let input = "| 错误学习 | 写入 `## Errors`（`[lesson]` 标签） |";
+        let _output = highlight_code_line(input);
+    }
+
+    #[test]
+    fn test_floor_char_boundary_truncation_safety() {
+        // Regression: raw truncate at byte offset inside multi-byte char panics.
+        // All truncation sites must use floor_char_boundary.
+        let s = "abc你好def".to_string(); // 你 = bytes 3..6, 好 = bytes 6..9
+        for n in 0..=s.len() {
+            let boundary = s.floor_char_boundary(n);
+            // Must not panic
+            let _ = &s[..boundary];
+        }
+        // Verify it rounds down correctly
+        assert_eq!(s.floor_char_boundary(4), 3); // inside '你', rounds to 3
+        assert_eq!(s.floor_char_boundary(5), 3);
+        assert_eq!(s.floor_char_boundary(6), 6); // exact boundary of '好'
     }
 
     /// Helper to strip ANSI escape codes for testing

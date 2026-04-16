@@ -8,7 +8,7 @@
 
 #![allow(deprecated)]
 //!
-//! Also supports SKILL.md files for detailed instructions (Claude Code style).
+//! Also supports SKILL.md files for detailed instructions.
 //!
 #![allow(dead_code)] // Module provides future extensibility APIs
 //! Example manifest with tools:

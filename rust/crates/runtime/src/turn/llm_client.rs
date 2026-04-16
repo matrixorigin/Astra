@@ -217,7 +217,7 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
     }
 }
 
-/// Per-chunk idle watchdog (Claude Code–style): no SSE JSON for this long → treat as stalled.
+/// Per-chunk idle watchdog: no SSE JSON for this long → treat as stalled.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     // Delegate to the canonical public function in sse_stream_host.
     crate::turn::sse_stream_host::stream_idle_timeout()

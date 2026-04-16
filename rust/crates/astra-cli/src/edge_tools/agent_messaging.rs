@@ -3,7 +3,7 @@
 //! Provides `send_message` tool for point-to-point and broadcast communication
 //! between agents during delegation or team collaboration.
 //!
-//! Features (vs Claude Code's file-based mailbox):
+//! Features:
 //! - Database-backed transport (optional) with ack/nack
 //! - Dead letter queue for failed deliveries
 //! - Structured message types with priorities

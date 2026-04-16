@@ -11,9 +11,8 @@ pub struct ImplicitSignal {
 
 /// Structured feedback extracted from a correction signal.
 ///
-/// Inspired by Claude Code's feedback memory format: captures *why* the user
-/// corrected and *when* the rule applies, so the system can judge edge cases
-/// rather than blindly following statistical patterns.
+/// Captures *why* the user corrected and *when* the rule applies, so the system
+/// can judge edge cases rather than blindly following statistical patterns.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StructuredFeedback {
     /// The rule itself — what the user wants changed.

@@ -2,8 +2,6 @@
 //!
 //! Tracks what causes prompt cache invalidation (system prompt changes,
 //! tool schema changes, model switches) and logs actionable diagnostics.
-//!
-//! Inspired by Claude Code's `promptCacheBreakDetection.ts`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

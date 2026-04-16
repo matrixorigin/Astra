@@ -1,8 +1,7 @@
 //! Terminal Progress Visualization for Sub-Agent Execution (D-11)
 //!
 //! Provides a structured progress display for multi-agent runs in CLI mode.
-//! Inspired by Claude Code's Tmux/iTerm2 split-pane visualization where
-//! each agent has a visible progress indicator.
+//! Each agent has a visible progress indicator.
 //!
 //! This module provides the data model and text-rendering layer. It does NOT
 //! depend on ratatui or ncurses — it uses simple ANSI escape sequences for

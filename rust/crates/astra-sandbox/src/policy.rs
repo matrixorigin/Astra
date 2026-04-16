@@ -16,7 +16,7 @@ pub enum SandboxMode {
 /// Configurable security policy for tool execution.
 ///
 /// Note: ulimit-based resource limits (max_processes, max_memory_bytes) were
-/// removed to match Claude Code's approach. Resource control now relies on:
+/// removed. Resource control now relies on:
 /// - Concurrent tool execution limit (MAX_CONCURRENT_READ_ONLY_TOOLS = 10)
 /// - Per-command timeouts (max_execution_secs)
 ///
