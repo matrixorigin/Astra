@@ -1,0 +1,11 @@
+[package]
+name = "astra-server-types"
+version.workspace = true
+edition.workspace = true
+description = "Server request and response types for astra runtime"
+
+[dependencies]
+astra-core.workspace = true
+astra-services.workspace = true
+serde.workspace = true
+serde_json.workspace = true
