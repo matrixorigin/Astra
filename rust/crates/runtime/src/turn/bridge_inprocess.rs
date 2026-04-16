@@ -2009,8 +2009,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .and_then(|m| m.get("content").and_then(Value::as_str))
                         .map(|c| {
                             let lower = c.to_ascii_lowercase();
-                            let has_negation = lower.contains("not ") || lower.contains("haven't")
-                                || lower.contains("hasn't") || lower.contains("isn't")
+                            let has_negation = lower.contains("not ") || lower.contains("n't")
                                 || lower.contains("没有") || lower.contains("尚未")
                                 || lower.contains("except") || lower.contains("but ");
                             let has_completion = lower.contains("task complete") || lower.contains("all done")
@@ -3113,7 +3112,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     if let Err(e) = crate::turn::cloud::session_memory_protocol::persist_l1(
                         &client, &l1_content, &l1_sid,
                     ).await {
-                        eprintln!("[session-memory] L1 persist failed for session {l1_sid}: {e}");
+                        tracing::warn!(session_id = %l1_sid, error = %e, "L1 session memory persist failed");
                     }
                 });
             }
@@ -5770,8 +5769,7 @@ mod tests {
     /// Helper matching the actual P2 completion detection logic in the turn loop.
     fn signals_done(content: &str) -> bool {
         let lower = content.to_ascii_lowercase();
-        let has_negation = lower.contains("not ") || lower.contains("haven't")
-            || lower.contains("hasn't") || lower.contains("isn't")
+        let has_negation = lower.contains("not ") || lower.contains("n't")
             || lower.contains("没有") || lower.contains("尚未")
             || lower.contains("except") || lower.contains("but ");
         let has_completion = lower.contains("task complete") || lower.contains("all done")
@@ -5808,6 +5806,21 @@ mod tests {
     #[test]
     fn p2_no_false_positive_all_done_except() {
         assert!(!signals_done("All done except the deployment step."));
+    }
+
+    #[test]
+    fn p2_no_false_positive_wont_be_finished() {
+        assert!(!signals_done("The task won't be finished until deployment is done."));
+    }
+
+    #[test]
+    fn p2_no_false_positive_cannot_be_completed() {
+        assert!(!signals_done("This cannot be completed today."));
+    }
+
+    #[test]
+    fn p2_no_false_positive_dont_think_finished() {
+        assert!(!signals_done("I don't think we're finished yet."));
     }
 
     // ── P1 latency fix: anchor from local messages, no network ──────────

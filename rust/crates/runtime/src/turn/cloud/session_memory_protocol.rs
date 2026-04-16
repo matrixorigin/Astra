@@ -166,9 +166,7 @@ impl SessionMemory {
         for &name in REQUIRED_SECTIONS {
             match self.section(name) {
                 None => errors.push(format!("missing section: {name}")),
-                Some(c) if c.trim().is_empty() => {
-                    errors.push(format!("empty section: {name}"))
-                }
+                Some(c) if c.trim().is_empty() => errors.push(format!("empty section: {name}")),
                 _ => {}
             }
         }
@@ -281,10 +279,7 @@ pub fn compress_to_injection(l1: &SessionMemory) -> String {
 
     // Decisions — last 2, truncated
     if let Some(c) = l1.section("Decisions") {
-        let entries: Vec<&str> = c
-            .lines()
-            .filter(|l| l.trim().starts_with("- "))
-            .collect();
+        let entries: Vec<&str> = c.lines().filter(|l| l.trim().starts_with("- ")).collect();
         let last_two: Vec<&str> = entries.iter().rev().take(2).rev().copied().collect();
         if !last_two.is_empty() {
             out.push_str("# Decisions\n");
@@ -299,10 +294,7 @@ pub fn compress_to_injection(l1: &SessionMemory) -> String {
 
     // User Messages — last 3
     if let Some(c) = l1.section("User Messages") {
-        let msgs: Vec<&str> = c
-            .split("\n\n")
-            .filter(|s| !s.trim().is_empty())
-            .collect();
+        let msgs: Vec<&str> = c.split("\n\n").filter(|s| !s.trim().is_empty()).collect();
         let last_three: Vec<&str> = msgs.iter().rev().take(3).rev().copied().collect();
         if !last_three.is_empty() {
             out.push_str("# User Messages\n");
@@ -326,7 +318,11 @@ pub fn extract_message_text(msg: &Value) -> Option<String> {
                     .iter()
                     .filter_map(|b| b.get("text").and_then(Value::as_str))
                     .collect();
-                if texts.is_empty() { None } else { Some(texts.join("\n")) }
+                if texts.is_empty() {
+                    None
+                } else {
+                    Some(texts.join("\n"))
+                }
             })
         })
     })
@@ -411,16 +407,19 @@ pub async fn persist_l1(
     let _ = client.purge_working(session_id).await;
 
     // Store with one retry
-    match client.store(l1_content, "working", Some(session_id), Some("T2")).await {
+    match client
+        .store(l1_content, "working", Some(session_id), Some("T2"))
+        .await
+    {
         Ok(id) => Ok(id),
         Err(e) => {
-            eprintln!("[session-memory] L1 store failed (attempt 1): {e}");
+            tracing::warn!(session_id = %session_id, attempt = 1, error = %e, "L1 store failed, retrying");
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             client
                 .store(l1_content, "working", Some(session_id), Some("T2"))
                 .await
                 .map_err(|e2| {
-                    eprintln!("[session-memory] L1 store failed (attempt 2, giving up): {e2}");
+                    tracing::warn!(session_id = %session_id, attempt = 2, error = %e2, "L1 store failed, giving up");
                     e2
                 })
         }
@@ -431,15 +430,21 @@ pub async fn persist_l1(
 
 /// Build an L1 session memory string from the current conversation messages.
 /// This is called at turn end to persist session state to Memoria.
-pub fn build_l1_from_messages(messages: &[Value], turn_number: usize, estimated_tokens: usize) -> String {
-    let first_user = messages.iter()
+pub fn build_l1_from_messages(
+    messages: &[Value],
+    turn_number: usize,
+    estimated_tokens: usize,
+) -> String {
+    let first_user = messages
+        .iter()
         .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
         .and_then(|m| extract_message_text(m))
         .unwrap_or_default();
 
     // Collect user messages (deduplicated, last N)
     let mut seen_user_msgs = std::collections::HashSet::new();
-    let user_msgs: Vec<String> = messages.iter()
+    let user_msgs: Vec<String> = messages
+        .iter()
         .filter_map(|m| {
             if m.get("role").and_then(Value::as_str) == Some("user") {
                 extract_message_text(m).filter(|t| seen_user_msgs.insert(t.clone()))
@@ -455,7 +460,11 @@ pub fn build_l1_from_messages(messages: &[Value], turn_number: usize, estimated_
     for m in messages {
         if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
             for tc in calls {
-                if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
+                if let Some(name) = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                {
                     if seen_tools.insert(name.to_string()) {
                         tool_names.push(name.to_string());
                     }
@@ -470,7 +479,11 @@ pub fn build_l1_from_messages(messages: &[Value], turn_number: usize, estimated_
     for m in messages {
         if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
             for tc in calls {
-                if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                {
                     if let Ok(parsed) = serde_json::from_str::<Value>(args) {
                         if let Some(path) = parsed.get("path").and_then(Value::as_str) {
                             if seen_files.insert(path.to_string()) {
@@ -485,11 +498,17 @@ pub fn build_l1_from_messages(messages: &[Value], turn_number: usize, estimated_
 
     // Build the L1 markdown
     let task = truncate_to_token_budget(&first_user, 200); // match STORED_SECTION_BUDGETS
-    let user_section: String = user_msgs.iter().rev().take(10).rev()
+    let user_section: String = user_msgs
+        .iter()
+        .rev()
+        .take(10)
+        .rev()
         .map(|s| truncate_words(s, 30))
         .collect::<Vec<_>>()
         .join("\n");
-    let files_section = files.iter().take(20)
+    let files_section = files
+        .iter()
+        .take(20)
         .map(|f| f.as_str())
         .collect::<Vec<_>>()
         .join("\n");
@@ -508,8 +527,16 @@ pub fn build_l1_from_messages(messages: &[Value], turn_number: usize, estimated_
          # Context\nTurn {turn_number}, ~{tokens}K tokens",
         title = truncate_words(&first_user, 10),
         task = task,
-        files = if files_section.is_empty() { "None".to_string() } else { files_section },
-        tools = if tool_names.is_empty() { "none".to_string() } else { tool_names.join(", ") },
+        files = if files_section.is_empty() {
+            "None".to_string()
+        } else {
+            files_section
+        },
+        tools = if tool_names.is_empty() {
+            "none".to_string()
+        } else {
+            tool_names.join(", ")
+        },
         users = user_section,
         tokens = estimated_tokens / 1000,
     )
@@ -607,7 +634,10 @@ mod tests {
 
     #[test]
     fn anchor_truncates_long_user_message() {
-        let long_msg = (0..50).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let long_msg = (0..50)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let anchor = extract_anchor(&long_msg, None);
         let words: Vec<&str> = anchor
             .strip_prefix("[session-anchor] ")
@@ -625,7 +655,10 @@ mod tests {
     #[test]
     fn parse_valid_l1() {
         let l1 = SessionMemory::parse(sample_l1()).unwrap();
-        assert_eq!(l1.section("Session Title"), Some("OAuth API Implementation"));
+        assert_eq!(
+            l1.section("Session Title"),
+            Some("OAuth API Implementation")
+        );
         assert!(l1.section("Task Specification").unwrap().contains("OAuth"));
         assert!(l1.section("Current State").unwrap().contains("refresh"));
         assert_eq!(l1.section_names().len(), 10);
@@ -666,7 +699,9 @@ mod tests {
     fn validate_empty_required_section() {
         let l1 = SessionMemory::parse(sample_l1_empty_required()).unwrap();
         let errors = l1.validate().unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("empty section: Task Specification")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("empty section: Task Specification")));
     }
 
     // ── L1 Size Governance Tests ────────────────────────────────────────
@@ -709,7 +744,10 @@ mod tests {
     fn normal_l1_within_budget() {
         let l1 = SessionMemory::parse(sample_l1()).unwrap();
         let over = l1.over_budget_sections();
-        assert!(over.is_empty(), "sample L1 should be within budget: {over:?}");
+        assert!(
+            over.is_empty(),
+            "sample L1 should be within budget: {over:?}"
+        );
     }
 
     // ── L1 Injection Compression Tests ──────────────────────────────────
@@ -840,8 +878,14 @@ mod tests {
 
     #[test]
     fn injection_level_medium_pressure() {
-        assert_eq!(injection_level_for_pressure(0.75), InjectionLevel::L1Minimal);
-        assert_eq!(injection_level_for_pressure(0.84), InjectionLevel::L1Minimal);
+        assert_eq!(
+            injection_level_for_pressure(0.75),
+            InjectionLevel::L1Minimal
+        );
+        assert_eq!(
+            injection_level_for_pressure(0.84),
+            InjectionLevel::L1Minimal
+        );
     }
 
     #[test]
@@ -919,11 +963,21 @@ mod tests {
         ];
         let l1_text = build_l1_from_messages(&messages, 2, 50000);
         let l1 = SessionMemory::parse(&l1_text).expect("should parse");
-        assert!(l1.validate().is_ok(), "should be valid: {:?}", l1.validate());
-        assert!(l1.section("Task Specification").unwrap().contains("rate limiter"));
+        assert!(
+            l1.validate().is_ok(),
+            "should be valid: {:?}",
+            l1.validate()
+        );
+        assert!(l1
+            .section("Task Specification")
+            .unwrap()
+            .contains("rate limiter"));
         assert!(l1.section("Key Files").unwrap().contains("src/main.rs"));
         assert!(l1.section("Decisions").unwrap().contains("read_file"));
-        assert!(l1.section("User Messages").unwrap().contains("Redis connection"));
+        assert!(l1
+            .section("User Messages")
+            .unwrap()
+            .contains("Redis connection"));
         assert!(l1.section("Context").unwrap().contains("50K"));
     }
 
@@ -936,11 +990,15 @@ mod tests {
         ];
         for i in 0..50 {
             messages.push(json!({"role": "assistant", "content": format!("Step {i} done")}));
-            messages.push(json!({"role": "user", "content": format!("Continue with step {}", i+1)}));
+            messages
+                .push(json!({"role": "user", "content": format!("Continue with step {}", i+1)}));
         }
         let l1_text = build_l1_from_messages(&messages, 50, 100000);
         let tokens = l1_text.len() / 4;
-        assert!(tokens <= STORED_TOTAL_BUDGET, "L1 should be ≤{STORED_TOTAL_BUDGET} tokens, got {tokens}");
+        assert!(
+            tokens <= STORED_TOTAL_BUDGET,
+            "L1 should be ≤{STORED_TOTAL_BUDGET} tokens, got {tokens}"
+        );
     }
 
     #[test]
@@ -1015,11 +1073,15 @@ mod tests {
         let l1_text = build_l1_from_messages(&messages, 1, 10000);
         let l1 = SessionMemory::parse(&l1_text).unwrap();
         assert!(
-            l1.section("Task Specification").unwrap().contains("distributed cache"),
+            l1.section("Task Specification")
+                .unwrap()
+                .contains("distributed cache"),
             "Should extract text from Anthropic content blocks"
         );
         assert!(
-            l1.section("User Messages").unwrap().contains("distributed cache"),
+            l1.section("User Messages")
+                .unwrap()
+                .contains("distributed cache"),
             "User messages should include Anthropic block content"
         );
     }
@@ -1041,7 +1103,10 @@ mod tests {
         let l1 = SessionMemory::parse(&l1_text).unwrap();
         let user_section = l1.section("User Messages").unwrap();
         let count = user_section.matches("continue").count();
-        assert_eq!(count, 1, "duplicate 'continue' should appear only once, got {count}");
+        assert_eq!(
+            count, 1,
+            "duplicate 'continue' should appear only once, got {count}"
+        );
     }
 
     // ── Fix #5: shared first_user_end helper ────────────────────────────
@@ -1112,7 +1177,11 @@ mod tests {
     fn truncate_to_token_budget_long_text() {
         let long = "word ".repeat(500); // ~500 words, ~125 tokens per 100 words
         let result = truncate_to_token_budget(&long, 50); // 50 tokens = ~200 chars
-        assert!(result.len() <= 200, "should be ≤200 chars, got {}", result.len());
+        assert!(
+            result.len() <= 200,
+            "should be ≤200 chars, got {}",
+            result.len()
+        );
         assert!(!result.ends_with(' '), "should break at word boundary");
     }
 
@@ -1128,7 +1197,8 @@ mod tests {
         let l1_text = build_l1_from_messages(&messages, 1, 10000);
         let l1 = SessionMemory::parse(&l1_text).unwrap();
         let task_tokens = l1.section_tokens("Task Specification");
-        let budget = STORED_SECTION_BUDGETS.iter()
+        let budget = STORED_SECTION_BUDGETS
+            .iter()
             .find(|(n, _)| *n == "Task Specification")
             .map(|(_, b)| *b)
             .unwrap();
@@ -1203,19 +1273,30 @@ mod tests {
 
         #[async_trait::async_trait]
         impl MemoriaClient for MockMemoria {
-            async fn retrieve(&self, _q: &str, _sid: Option<&str>, _k: usize) -> Result<Vec<MemoriaMemory>, String> {
+            async fn retrieve(
+                &self,
+                _q: &str,
+                _sid: Option<&str>,
+                _k: usize,
+            ) -> Result<Vec<MemoriaMemory>, String> {
                 Ok(vec![])
             }
-            async fn store(&self, content: &str, _mt: &str, sid: Option<&str>, _tt: Option<&str>) -> Result<String, String> {
+            async fn store(
+                &self,
+                content: &str,
+                _mt: &str,
+                sid: Option<&str>,
+                _tt: Option<&str>,
+            ) -> Result<String, String> {
                 let n = self.store_calls.fetch_add(1, Ordering::SeqCst);
                 let remaining = self.fail_store_times.load(Ordering::SeqCst);
                 if n < remaining {
                     return Err(format!("mock store failure #{}", n + 1));
                 }
-                self.stored.lock().await.push((
-                    content.to_string(),
-                    sid.unwrap_or("").to_string(),
-                ));
+                self.stored
+                    .lock()
+                    .await
+                    .push((content.to_string(), sid.unwrap_or("").to_string()));
                 Ok(format!("mem-{n}"))
             }
             async fn purge_working(&self, _sid: &str) -> Result<u64, String> {
@@ -1232,8 +1313,16 @@ mod tests {
             let mock = Arc::new(MockMemoria::new(0));
             let result = persist_l1(&*mock, "L1 content", "sess-1").await;
             assert!(result.is_ok());
-            assert_eq!(mock.purge_calls.load(Ordering::SeqCst), 1, "should purge once");
-            assert_eq!(mock.store_calls.load(Ordering::SeqCst), 1, "should store once on success");
+            assert_eq!(
+                mock.purge_calls.load(Ordering::SeqCst),
+                1,
+                "should purge once"
+            );
+            assert_eq!(
+                mock.store_calls.load(Ordering::SeqCst),
+                1,
+                "should store once on success"
+            );
             let stored = mock.stored.lock().await;
             assert_eq!(stored[0].0, "L1 content");
             assert_eq!(stored[0].1, "sess-1");
@@ -1244,8 +1333,16 @@ mod tests {
             let mock = Arc::new(MockMemoria::new(1)); // fail first store, succeed second
             let result = persist_l1(&*mock, "L1 retry", "sess-2").await;
             assert!(result.is_ok(), "should succeed on retry");
-            assert_eq!(mock.store_calls.load(Ordering::SeqCst), 2, "should call store twice");
-            assert_eq!(mock.purge_calls.load(Ordering::SeqCst), 1, "purge only once");
+            assert_eq!(
+                mock.store_calls.load(Ordering::SeqCst),
+                2,
+                "should call store twice"
+            );
+            assert_eq!(
+                mock.purge_calls.load(Ordering::SeqCst),
+                1,
+                "purge only once"
+            );
         }
 
         #[tokio::test]
@@ -1253,8 +1350,15 @@ mod tests {
             let mock = Arc::new(MockMemoria::new(2)); // fail both attempts
             let result = persist_l1(&*mock, "L1 fail", "sess-3").await;
             assert!(result.is_err(), "should fail after 2 attempts");
-            assert_eq!(mock.store_calls.load(Ordering::SeqCst), 2, "should attempt exactly twice");
-            assert!(mock.stored.lock().await.is_empty(), "nothing should be stored");
+            assert_eq!(
+                mock.store_calls.load(Ordering::SeqCst),
+                2,
+                "should attempt exactly twice"
+            );
+            assert!(
+                mock.stored.lock().await.is_empty(),
+                "nothing should be stored"
+            );
         }
 
         #[tokio::test]
@@ -1263,10 +1367,29 @@ mod tests {
             struct PurgeFailMock;
             #[async_trait::async_trait]
             impl MemoriaClient for PurgeFailMock {
-                async fn retrieve(&self, _: &str, _: Option<&str>, _: usize) -> Result<Vec<MemoriaMemory>, String> { Ok(vec![]) }
-                async fn store(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>) -> Result<String, String> { Ok("ok".into()) }
-                async fn purge_working(&self, _: &str) -> Result<u64, String> { Err("purge broken".into()) }
-                async fn delete(&self, _: &str) -> Result<(), String> { Ok(()) }
+                async fn retrieve(
+                    &self,
+                    _: &str,
+                    _: Option<&str>,
+                    _: usize,
+                ) -> Result<Vec<MemoriaMemory>, String> {
+                    Ok(vec![])
+                }
+                async fn store(
+                    &self,
+                    _: &str,
+                    _: &str,
+                    _: Option<&str>,
+                    _: Option<&str>,
+                ) -> Result<String, String> {
+                    Ok("ok".into())
+                }
+                async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                    Err("purge broken".into())
+                }
+                async fn delete(&self, _: &str) -> Result<(), String> {
+                    Ok(())
+                }
             }
             let result = persist_l1(&PurgeFailMock, "L1", "s").await;
             assert!(result.is_ok(), "purge failure should not prevent store");

@@ -4,11 +4,11 @@
 //! Run with: `cargo test -p astra-runtime -- session_memory_protocol_integration --ignored`
 
 use astra_runtime::turn::cloud::memoria_compact::{
-    HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-    MemoriaMemory, compact_with_memoria,
+    compact_with_memoria, HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig,
+    MemoriaCompactParams, MemoriaMemory,
 };
 use astra_runtime::turn::cloud::session_memory_protocol::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 fn memoria_client() -> Option<HttpMemoriaClient> {
@@ -55,10 +55,16 @@ struct TestMemories {
 
 impl TestMemories {
     fn new(client: HttpMemoriaClient, sid: String) -> Self {
-        Self { client, ids: std::sync::Mutex::new(Vec::new()), sid }
+        Self {
+            client,
+            ids: std::sync::Mutex::new(Vec::new()),
+            sid,
+        }
     }
 
-    fn session_id(&self) -> &str { &self.sid }
+    fn session_id(&self) -> &str {
+        &self.sid
+    }
 
     /// Track a memory_id for cleanup (when store is called via client directly).
     #[allow(dead_code)]
@@ -70,7 +76,7 @@ impl TestMemories {
         let ids = std::mem::take(&mut *self.ids.lock().unwrap());
         for id in &ids {
             if let Err(e) = self.client.delete(id).await {
-                eprintln!("[test cleanup] failed to delete memory {id}: {e}");
+                tracing::warn!("[test cleanup] failed to delete memory {id}: {e}");
             }
         }
     }
@@ -78,7 +84,9 @@ impl TestMemories {
 
 impl std::ops::Deref for TestMemories {
     type Target = HttpMemoriaClient;
-    fn deref(&self) -> &HttpMemoriaClient { &self.client }
+    fn deref(&self) -> &HttpMemoriaClient {
+        &self.client
+    }
 }
 
 macro_rules! require_memoria {
@@ -97,23 +105,17 @@ fn unique_session_id() -> String {
     format!("test-smp-{}", Uuid::new_v4().simple())
 }
 
-
 /// Retrieve L1 for a specific session by content marker.
 /// Memoria's retrieve uses session_id for boosting, not strict filtering,
 /// and MemoriaMemory doesn't expose session_id. So we filter by content.
-async fn retrieve_l1_with_marker(
-    client: &HttpMemoriaClient,
-    marker: &str,
-) -> Vec<MemoriaMemory> {
+async fn retrieve_l1_with_marker(client: &HttpMemoriaClient, marker: &str) -> Vec<MemoriaMemory> {
     let results = client
         .retrieve(&format!("[session-memory:v1] {marker}"), None, 20)
         .await
         .unwrap_or_default();
     results
         .into_iter()
-        .filter(|m| {
-            m.content.starts_with(SESSION_MEMORY_PREFIX) && m.content.contains(marker)
-        })
+        .filter(|m| m.content.starts_with(SESSION_MEMORY_PREFIX) && m.content.contains(marker))
         .collect()
 }
 
@@ -227,8 +229,7 @@ async fn compaction_uses_l1_when_available() {
 
     // Store L1 in Memoria
     let l1_content = sample_session_memory("Implement OAuth");
-    tm
-        .store(&l1_content, "working", Some(tm.session_id()), Some("T2"))
+    tm.store(&l1_content, "working", Some(tm.session_id()), Some("T2"))
         .await
         .expect("store L1 failed");
 
@@ -239,7 +240,10 @@ async fn compaction_uses_l1_when_available() {
     ];
     // Add enough messages to trigger compaction
     for i in 0..20 {
-        messages.push(assistant(&format!("Working on step {i}... {}", "x".repeat(200))));
+        messages.push(assistant(&format!(
+            "Working on step {i}... {}",
+            "x".repeat(200)
+        )));
         messages.push(user(&format!("Continue with step {}", i + 1)));
     }
 
@@ -296,10 +300,7 @@ async fn first_user_message_survives_compaction() {
     let tm = require_memoria!();
 
     let original_task = "UNIQUE_TASK_MARKER_12345: Build a distributed cache";
-    let mut messages: Vec<Value> = vec![
-        system("You are helpful."),
-        user(original_task),
-    ];
+    let mut messages: Vec<Value> = vec![system("You are helpful."), user(original_task)];
     for i in 0..20 {
         messages.push(assistant(&format!("Step {i} done. {}", "y".repeat(300))));
         messages.push(user(&format!("Next step {}", i + 1)));
@@ -329,24 +330,25 @@ async fn first_user_message_survives_compaction() {
     .await;
 
     // P0 fix: TieredCompaction now preserves the first user message.
-    let has_original = result
-        .messages
-        .iter()
-        .any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("UNIQUE_TASK_MARKER_12345"))
-                .unwrap_or(false)
-        });
+    let has_original = result.messages.iter().any(|m| {
+        m.get("content")
+            .and_then(Value::as_str)
+            .map(|s| s.contains("UNIQUE_TASK_MARKER_12345"))
+            .unwrap_or(false)
+    });
     assert!(
         has_original,
         "First user message must survive compaction. Got {} messages: {:?}",
         result.messages.len(),
-        result.messages.iter().map(|m| {
-            let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
-            let c = m.get("content").and_then(Value::as_str).unwrap_or("");
-            format!("{role}: {}...", &c[..c.len().min(60)])
-        }).collect::<Vec<_>>()
+        result
+            .messages
+            .iter()
+            .map(|m| {
+                let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+                let c = m.get("content").and_then(Value::as_str).unwrap_or("");
+                format!("{role}: {}...", &c[..c.len().min(60)])
+            })
+            .collect::<Vec<_>>()
     );
 }
 
@@ -362,8 +364,7 @@ async fn l1_round_trip_preserves_structure() {
     let l1_before = SessionMemory::parse(&original).expect("should parse");
     assert!(l1_before.validate().is_ok());
 
-    tm
-        .store(&original, "working", Some(tm.session_id()), Some("T2"))
+    tm.store(&original, "working", Some(tm.session_id()), Some("T2"))
         .await
         .expect("store failed");
 
@@ -399,8 +400,7 @@ async fn anchor_from_retrieved_l1() {
     let marker = format!("anchor-{}", &tm.session_id()[..12]);
 
     let content = sample_session_memory(&marker);
-    tm
-        .store(&content, "working", Some(tm.session_id()), Some("T2"))
+    tm.store(&content, "working", Some(tm.session_id()), Some("T2"))
         .await
         .expect("store failed");
 
@@ -429,29 +429,30 @@ async fn different_sessions_are_isolated() {
     let marker_a = format!("iso-A-{}", &sid_a[..12]);
     let marker_b = format!("iso-B-{}", &sid_b[..12]);
 
-    tm
-        .store(
-            &sample_session_memory(&marker_a),
-            "working",
-            Some(&sid_a),
-            Some("T2"),
-        )
-        .await
-        .expect("store A failed");
+    tm.store(
+        &sample_session_memory(&marker_a),
+        "working",
+        Some(&sid_a),
+        Some("T2"),
+    )
+    .await
+    .expect("store A failed");
 
-    tm
-        .store(
-            &sample_session_memory(&marker_b),
-            "working",
-            Some(&sid_b),
-            Some("T2"),
-        )
-        .await
-        .expect("store B failed");
+    tm.store(
+        &sample_session_memory(&marker_b),
+        "working",
+        Some(&sid_b),
+        Some("T2"),
+    )
+    .await
+    .expect("store B failed");
 
     // Retrieve for marker A — should find A, not B
     let results_a = retrieve_l1_with_marker(&tm, &marker_a).await;
-    assert!(!results_a.is_empty(), "session A memory should be retrievable");
+    assert!(
+        !results_a.is_empty(),
+        "session A memory should be retrievable"
+    );
     assert!(
         !results_a.iter().any(|m| m.content.contains(&marker_b)),
         "session A results should not contain B's marker"
@@ -495,12 +496,20 @@ async fn multi_compaction_preserves_goal_and_decisions() {
         // Assistant does tool calls, gets big results
         messages.push(assistant(&format!(
             "Step {i}: {}. Let me read the file...\n{}",
-            if i < 3 { decisions[i] } else { "Continuing implementation" },
+            if i < 3 {
+                decisions[i]
+            } else {
+                "Continuing implementation"
+            },
             "x".repeat(400) // simulate tool result bulk
         )));
         messages.push(user(&format!(
             "{}{}",
-            if i == 15 { "Also remember: CRITICAL_NOTE_42 — must handle clock skew. " } else { "" },
+            if i == 15 {
+                "Also remember: CRITICAL_NOTE_42 — must handle clock skew. "
+            } else {
+                ""
+            },
             format!("Continue with step {}", i + 1)
         )));
     }
@@ -574,8 +583,7 @@ async fn multi_compaction_preserves_goal_and_decisions() {
          Turn 30, ~80K tokens, first compaction done",
         decisions[0], decisions[1], decisions[2]
     );
-    tm
-        .store(&l1_content, "working", Some(tm.session_id()), Some("T2"))
+    tm.store(&l1_content, "working", Some(tm.session_id()), Some("T2"))
         .await
         .expect("L1 store failed");
 
@@ -619,15 +627,18 @@ async fn multi_compaction_preserves_goal_and_decisions() {
 
     // First user message specifically must be preserved by P0 fix
     // (may be at index 1 or 2 depending on whether Memoria context was injected)
-    let first_user_idx = result2.messages.iter().position(|m| {
-        m.get("role").and_then(Value::as_str) == Some("user")
-    });
+    let first_user_idx = result2
+        .messages
+        .iter()
+        .position(|m| m.get("role").and_then(Value::as_str) == Some("user"));
     assert!(
         first_user_idx.is_some(),
         "No user message found after second compaction"
     );
     let first_user_content = result2.messages[first_user_idx.unwrap()]
-        .get("content").and_then(Value::as_str).unwrap_or("");
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     assert!(
         first_user_content.contains(&format!("GOAL_{marker}")),
         "First user message should be the original task, got: {first_user_content}"
@@ -652,14 +663,10 @@ async fn tool_heavy_session_preserves_task() {
     let tm = require_memoria!();
     let marker = format!("tools-{}", &tm.session_id()[..12]);
 
-    let original_task = format!(
-        "TASK_{marker}: Refactor the authentication module to use JWT with refresh tokens"
-    );
+    let original_task =
+        format!("TASK_{marker}: Refactor the authentication module to use JWT with refresh tokens");
 
-    let mut messages: Vec<Value> = vec![
-        system("You are helpful."),
-        user(&original_task),
-    ];
+    let mut messages: Vec<Value> = vec![system("You are helpful."), user(&original_task)];
 
     // Simulate tool-heavy turns: assistant calls tools, gets huge results
     for i in 0..15 {
@@ -875,16 +882,23 @@ async fn measure_memoria_token_overhead() {
          # Worklog\nT1-T15\n\
          # Context\nTurn 15"
     );
-    tm.store(&l1, "working", Some(tm.session_id()), Some("T2")).await.unwrap();
+    tm.store(&l1, "working", Some(tm.session_id()), Some("T2"))
+        .await
+        .unwrap();
 
     // Messages where last user msg contains the marker for high retrieve score
     let mut messages: Vec<Value> = vec![
         system("You are helpful."),
-        user(&format!("{marker} Build a rate limiter with sliding window")),
+        user(&format!(
+            "{marker} Build a rate limiter with sliding window"
+        )),
     ];
     for i in 0..20 {
         messages.push(assistant(&format!("Step {i}. {}", "x".repeat(300))));
-        messages.push(user(&format!("{marker} Continue rate limiter step {}", i + 1)));
+        messages.push(user(&format!(
+            "{marker} Continue rate limiter step {}",
+            i + 1
+        )));
     }
 
     let config = MemoriaCompactConfig::default();
@@ -901,20 +915,36 @@ async fn measure_memoria_token_overhead() {
 
     // Without Memoria
     let without = compact_with_memoria(
-        &messages, Some(tm.session_id()), &config, &params,
-        None, None, None,
-    ).await;
+        &messages,
+        Some(tm.session_id()),
+        &config,
+        &params,
+        None,
+        None,
+        None,
+    )
+    .await;
 
     // With Memoria
     let with = compact_with_memoria(
-        &messages, Some(tm.session_id()), &config, &params,
-        Some(&*tm), None, None,
-    ).await;
+        &messages,
+        Some(tm.session_id()),
+        &config,
+        &params,
+        Some(&*tm),
+        None,
+        None,
+    )
+    .await;
 
-    let chars_without: usize = without.messages.iter()
+    let chars_without: usize = without
+        .messages
+        .iter()
         .map(|m| m.get("content").and_then(Value::as_str).unwrap_or("").len())
         .sum();
-    let chars_with: usize = with.messages.iter()
+    let chars_with: usize = with
+        .messages
+        .iter()
         .map(|m| m.get("content").and_then(Value::as_str).unwrap_or("").len())
         .sum();
 
@@ -923,14 +953,24 @@ async fn measure_memoria_token_overhead() {
     let overhead = tokens_with.saturating_sub(tokens_without);
 
     let has_memory_msg = with.messages.iter().any(|m| {
-        m.get("content").and_then(Value::as_str)
+        m.get("content")
+            .and_then(Value::as_str)
             .map(|s| s.contains("[Session Context"))
             .unwrap_or(false)
     });
 
     eprintln!("=== Memoria Token Overhead ===");
-    eprintln!("Without: {} msgs, ~{} tokens", without.messages.len(), tokens_without);
-    eprintln!("With:    {} msgs, ~{} tokens (injected={})", with.messages.len(), tokens_with, has_memory_msg);
+    eprintln!(
+        "Without: {} msgs, ~{} tokens",
+        without.messages.len(),
+        tokens_without
+    );
+    eprintln!(
+        "With:    {} msgs, ~{} tokens (injected={})",
+        with.messages.len(),
+        tokens_with,
+        has_memory_msg
+    );
     eprintln!("Overhead: ~{} tokens", overhead);
 
     // Budget compensation: memory injection tightens compaction budget,
@@ -938,7 +978,10 @@ async fn measure_memoria_token_overhead() {
     // NOTE: injection may not trigger if retrieve doesn't return session-relevant
     // memories — session_id is only boosting, not filtering.
     // TODO: re-measure after https://github.com/matrixorigin/Memoria/issues/184
-    assert!(overhead < 500, "Overhead should be <500 tokens, got {overhead}");
+    assert!(
+        overhead < 500,
+        "Overhead should be <500 tokens, got {overhead}"
+    );
 }
 
 // ── P3: Full Loop — L1 Write → Compaction Reads L1 → Goal Preserved ────────
@@ -957,7 +1000,9 @@ async fn full_loop_l1_write_then_compaction_reads() {
     // Phase 1: Simulate a conversation and build L1
     let phase1_messages: Vec<Value> = vec![
         system("You are helpful."),
-        user(&format!("{marker}: Build a distributed cache with LRU eviction")),
+        user(&format!(
+            "{marker}: Build a distributed cache with LRU eviction"
+        )),
         json!({"role": "assistant", "content": "I'll start.", "tool_calls": [
             {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/cache.rs\"}"}}
         ]}),
@@ -974,13 +1019,17 @@ async fn full_loop_l1_write_then_compaction_reads() {
     assert!(l1.section("Task Specification").unwrap().contains(&marker));
 
     // Store L1 to Memoria
-    tm.store(&l1_content, "working", Some(tm.session_id()), Some("T2")).await.expect("store failed");
+    tm.store(&l1_content, "working", Some(tm.session_id()), Some("T2"))
+        .await
+        .expect("store failed");
 
     // Phase 2: New conversation (after compaction dropped history)
     // Use the marker in user messages so retrieve query matches our L1
     let mut phase2_messages: Vec<Value> = vec![
         system("You are helpful."),
-        user(&format!("{marker}: Build a distributed cache with LRU eviction")),
+        user(&format!(
+            "{marker}: Build a distributed cache with LRU eviction"
+        )),
     ];
     for i in 0..20 {
         phase2_messages.push(assistant(&format!("Step {i}. {}", "z".repeat(300))));
@@ -1000,12 +1049,20 @@ async fn full_loop_l1_write_then_compaction_reads() {
     };
 
     let result = compact_with_memoria(
-        &phase2_messages, Some(tm.session_id()), &config, &params,
-        Some(&*tm), None, None,
-    ).await;
+        &phase2_messages,
+        Some(tm.session_id()),
+        &config,
+        &params,
+        Some(&*tm),
+        None,
+        None,
+    )
+    .await;
 
     // Verify: original task preserved (via first user message P0 fix)
-    let all_content: String = result.messages.iter()
+    let all_content: String = result
+        .messages
+        .iter()
         .filter_map(|m| m.get("content").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1020,7 +1077,8 @@ async fn full_loop_l1_write_then_compaction_reads() {
     let has_session_context = all_content.contains("[Session Context");
     eprintln!(
         "Full loop: {} msgs, L1 injected={}, task preserved=true",
-        result.messages.len(), has_session_context
+        result.messages.len(),
+        has_session_context
     );
 }
 
@@ -1030,10 +1088,7 @@ async fn full_loop_l1_write_then_compaction_reads() {
 #[ignore]
 async fn l2_fallback_when_memoria_unavailable() {
     // No require_memoria! — we intentionally pass None as client
-    let mut messages: Vec<Value> = vec![
-        system("You are helpful."),
-        user("Build a rate limiter"),
-    ];
+    let mut messages: Vec<Value> = vec![system("You are helpful."), user("Build a rate limiter")];
     for i in 0..20 {
         messages.push(assistant(&format!("Step {i}. {}", "x".repeat(300))));
         messages.push(user(&format!("Next {}", i + 1)));
@@ -1053,16 +1108,25 @@ async fn l2_fallback_when_memoria_unavailable() {
 
     // No Memoria client — should still compact without error
     let result = compact_with_memoria(
-        &messages, Some("no-memoria-session"), &config, &params,
+        &messages,
+        Some("no-memoria-session"),
+        &config,
+        &params,
         None, // no Memoria
-        None, None,
-    ).await;
+        None,
+        None,
+    )
+    .await;
 
     // Compaction should still work
-    assert!(result.messages.len() < messages.len(), "should have compacted");
+    assert!(
+        result.messages.len() < messages.len(),
+        "should have compacted"
+    );
     // First user message preserved
     let has_task = result.messages.iter().any(|m| {
-        m.get("content").and_then(Value::as_str)
+        m.get("content")
+            .and_then(Value::as_str)
             .map(|s| s.contains("rate limiter"))
             .unwrap_or(false)
     });
@@ -1079,15 +1143,14 @@ async fn cross_session_retrieves_other_sessions_memories() {
     // Session A stores a memory
     let sid_a = &*unique_session_id();
     let marker_a = format!("cross-{}", &sid_a[..12]);
-    tm
-        .store(
-            &format!("{SESSION_MEMORY_PREFIX}\n# Task Specification\n{marker_a}: old session work"),
-            "working",
-            Some(&sid_a),
-            Some("T2"),
-        )
-        .await
-        .expect("store failed");
+    tm.store(
+        &format!("{SESSION_MEMORY_PREFIX}\n# Task Specification\n{marker_a}: old session work"),
+        "working",
+        Some(&sid_a),
+        Some("T2"),
+    )
+    .await
+    .expect("store failed");
 
     // Session B retrieves — should find session A's memory (cross-session)
     let sid_b = unique_session_id();
@@ -1109,8 +1172,8 @@ async fn cross_session_retrieves_other_sessions_memories() {
 
 #[test]
 fn post_compact_boundary_carries_recent_files() {
-    use astra_runtime::turn::cloud::compaction::{CompactBoundary, CompactTrigger};
     use astra_runtime::prompts::CompactionTier;
+    use astra_runtime::turn::cloud::compaction::{CompactBoundary, CompactTrigger};
 
     let boundary = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::CompactHistory)
         .with_recent_files(vec!["src/main.rs".into(), "src/lib.rs".into()])
@@ -1122,8 +1185,8 @@ fn post_compact_boundary_carries_recent_files() {
 
 #[test]
 fn post_compact_boundary_serializes_files() {
-    use astra_runtime::turn::cloud::compaction::{CompactBoundary, CompactTrigger};
     use astra_runtime::prompts::CompactionTier;
+    use astra_runtime::turn::cloud::compaction::{CompactBoundary, CompactTrigger};
 
     let boundary = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::CompactHistory)
         .with_recent_files(vec!["src/cache.rs".into()]);
