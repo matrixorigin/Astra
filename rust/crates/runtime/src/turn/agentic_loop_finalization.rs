@@ -214,10 +214,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     let ckpt_num = state.step_recorder.summary().checkpoints;
 
     // Serialize the interruption record (if any) for checkpoint persistence.
-    let interruption_json = state
-        .interruption
-        .as_ref()
-        .and_then(|ir| serde_json::to_value(ir).ok());
+    let interruption_json = state.interruption.as_ref().map(|ir| ir.to_json());
 
     // Serialize approval overrides (if any) for session continuity.
     let approval_overrides_json = state
@@ -372,17 +369,15 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 
     // Emit structured interruption to journal if one was recorded.
     if let Some(ref interruption) = state.interruption {
-        if let Ok(json) = serde_json::to_value(interruption) {
-            if let Some(ref sid) = state.current_session_id {
-                let turn_num = (state.max_turns - state.remaining_turns) as u32;
-                let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
-                    Some(sid.as_str()),
-                    turn_num,
-                    json,
-                );
-                if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
-                    let _ = writer.append(&evt);
-                }
+        if let Some(ref sid) = state.current_session_id {
+            let turn_num = (state.max_turns - state.remaining_turns) as u32;
+            let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
+                Some(sid.as_str()),
+                turn_num,
+                interruption.to_json(),
+            );
+            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                let _ = writer.append(&evt);
             }
         }
     }

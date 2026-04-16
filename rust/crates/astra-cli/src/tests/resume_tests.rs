@@ -1,5 +1,47 @@
 use super::*;
 use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
+use axum::response::IntoResponse;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct EnvVarGuard {
+    _lock: MutexGuard<'static, ()>,
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+        let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            _lock: lock,
+            key,
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(ref previous) = self.previous {
+            unsafe {
+                std::env::set_var(self.key, previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
 
 // ── slash_task::find_task_by_query ────────────────────────────────────────────────────
 
@@ -164,10 +206,19 @@ total_tokens_out: 3
 }
 
 #[tokio::test]
-async fn resume_initialize_repl_state_restores_workspace_session_state() {
+async fn initialize_repl_state_marks_workspace_session_as_pending_recovery() {
     let _creds = isolate_credentials();
+    let temp = tempfile::tempdir().unwrap();
+    let _sessions = session_journal::JournalDirGuard::new(temp.path());
 
     let sid = format!("test-session-state-{}", uuid::Uuid::new_v4());
+    let current_cwd = std::env::current_dir().unwrap();
+    let current_git_root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
     let writer = session_journal::JournalWriter::new(&sid).unwrap();
     writer
@@ -189,14 +240,29 @@ async fn resume_initialize_repl_state_restores_workspace_session_state() {
             50,
         ))
         .unwrap();
+    writer
+        .append(&session_journal::JournalEvent::interruption_recorded(
+            Some(&sid),
+            1,
+            serde_json::json!({
+                "kind": "rate_limited",
+                "resumable": true,
+                "has_checkpoint": true,
+                "tool_calls_completed": 1,
+                "turns_completed": 1,
+                "remaining_turns": 4,
+            }),
+        ))
+        .unwrap();
     drop(writer);
 
     let mut ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
         &sid,
         "gpt-4o",
-        "/tmp",
+        &current_cwd.display().to_string(),
         Some("main"),
     );
+    ws.git_root = current_git_root;
     ws.turn_count = 1;
     ws.total_tokens_in = 5;
     ws.total_tokens_out = 3;
@@ -222,16 +288,250 @@ async fn resume_initialize_repl_state_restores_workspace_session_state() {
     save_credentials(&creds).unwrap();
 
     let state = repl_runtime::initialize_repl_state(None, None);
-    assert_eq!(state.session_id, Some(sid));
-    assert_eq!(state.session_goal.as_deref(), Some("ship session restore"));
-    assert!(state.pinned_skills.contains("session-lifecycle"));
-    assert!(state.pinned_skills.contains("goal-driven-evolution"));
-    assert!(state.discovered_skills.contains("episodic-memory"));
-    assert!(
-        state
-            .discovered_skills
-            .contains("knowledge-graph-reasoning")
+    assert_eq!(state.session_id, None);
+    assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+    assert!(state.history.is_empty());
+    assert_eq!(state.turn, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn crash_recovery_short_continue_restores_and_replays_context_online() {
+    let _creds = isolate_credentials();
+    let temp = tempfile::tempdir().unwrap();
+    let _sessions = session_journal::JournalDirGuard::new(temp.path());
+    let claude_dir = tempfile::tempdir().unwrap();
+    let _claude = EnvVarGuard::set_path("CLAUDE_CONFIG_DIR", claude_dir.path());
+
+    let sid = format!("test-crash-recovery-{}", uuid::Uuid::new_v4());
+    let current_cwd = std::env::current_dir().unwrap();
+    let current_cwd_str = current_cwd.display().to_string();
+    let current_git_root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let interruption = serde_json::json!({
+        "kind": "rate_limited",
+        "resumable": true,
+        "has_checkpoint": true,
+        "tool_calls_completed": 2,
+        "turns_completed": 1,
+        "remaining_turns": 3,
+        "user_message": ""
+    });
+
+    let writer = session_journal::JournalWriter::new(&sid).unwrap();
+    writer
+        .append(&session_journal::JournalEvent::session_start(
+            Some(&sid),
+            Some("gpt-4o"),
+        ))
+        .unwrap();
+    writer
+        .append(&session_journal::JournalEvent::turn(
+            Some(&sid),
+            1,
+            None,
+            "continue the parser refactor",
+            "I updated the lexer; next patch the parser.",
+            1,
+            40,
+            20,
+            75,
+        ))
+        .unwrap();
+    writer
+        .append(&session_journal::JournalEvent::interruption_recorded(
+            Some(&sid),
+            1,
+            interruption.clone(),
+        ))
+        .unwrap();
+    drop(writer);
+
+    let mut ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
+        &sid,
+        "gpt-4o",
+        &current_cwd_str,
+        Some("main"),
     );
+    ws.git_root = current_git_root;
+    ws.turn_count = 1;
+    ws.total_tokens_in = 40;
+    ws.total_tokens_out = 20;
+    astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+    let light = astra_runtime::pipeline::step_protocol::LightCheckpoint {
+        protocol_version: astra_runtime::pipeline::step_protocol::PROTOCOL_VERSION,
+        cursor: astra_runtime::pipeline::step_protocol::ExecutionCursor::default(),
+        step_id: "resume-step".to_string(),
+        task_id: "task-1".to_string(),
+        agent_id: sid.clone(),
+        progress: 1.0,
+        total_tokens: 60,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    };
+    let heavy = astra_runtime::pipeline::step_protocol::HeavyCheckpoint {
+        light,
+        messages: vec![
+            serde_json::json!({"role": "user", "content": "continue the parser refactor"}),
+            serde_json::json!({"role": "assistant", "content": "I updated the lexer; next patch the parser."}),
+        ],
+        budget_remaining_tokens: 10_000,
+        budget_remaining_rounds: 8,
+        blocked_tools: Vec::new(),
+        recent_tools: vec!["bash".to_string()],
+        learning_snapshot_id: None,
+        memory_context: None,
+        delegation_id: None,
+        delegation_pattern: None,
+        delegation_sub_run_summaries: Vec::new(),
+        interruption: Some(interruption),
+        approval_overrides: None,
+        consecutive_context_window_errors: 0,
+        compaction_state: None,
+    };
+    astra_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+        &sid,
+        1,
+        &astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
+    )
+    .unwrap();
+
+    let summary_path = astra_runtime::claude_code_session_memory_path(&current_cwd_str, &sid);
+    std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &summary_path,
+        "# Session Memory\n\n## Errors & Corrections\n- Use apply_patch instead of python file rewrites.\n\n## Learnings\n- Keep diffs minimal and project-scoped.\n",
+    )
+    .unwrap();
+
+    let mut creds = CredentialsFile::default();
+    creds.profiles.insert(
+        "default".to_string(),
+        Profile {
+            last_session_id: Some(sid.clone()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&creds).unwrap();
+
+    let mut state = repl_runtime::initialize_repl_state(None, Some("gpt-4o"));
+    assert_eq!(state.session_id, None);
+    assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+
+    #[derive(Clone)]
+    struct MockState {
+        requests: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    let mock_state = MockState {
+        requests: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let recovered_session_id = "fresh-resume-session".to_string();
+    let app =
+        Router::new()
+            .route(
+                "/sessions",
+                post({
+                    let recovered_session_id = recovered_session_id.clone();
+                    move || {
+                        let recovered_session_id = recovered_session_id.clone();
+                        async move {
+                            axum::Json(serde_json::json!({ "session_id": recovered_session_id }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/chat/turn",
+                post({
+                    let mock_state = mock_state.clone();
+                    let sid = sid.clone();
+                    let recovered_session_id = recovered_session_id.clone();
+                    move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let mock_state = mock_state.clone();
+                        let sid = sid.clone();
+                        let recovered_session_id = recovered_session_id.clone();
+                        async move {
+                            mock_state.requests.lock().await.push(body.clone());
+                            if body.get("session_id").and_then(serde_json::Value::as_str)
+                                == Some(sid.as_str())
+                            {
+                                (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({ "error": "session not found" })),
+                                )
+                                    .into_response()
+                            } else {
+                                (
+                                    [("content-type", "text/event-stream")],
+                                    sse_text_response("Recovered!", &recovered_session_id),
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }
+                }),
+            );
+
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+        edge_tools::all_tool_schemas(),
+    ));
+
+    handle_chat_input(
+        "继续".to_string(),
+        Some("fake-token"),
+        &mut state,
+        ReplTurnContext {
+            api: &api,
+            profile: None,
+            selector: &selector,
+        },
+    )
+    .await
+    .unwrap();
+
+    let requests = mock_state.requests.lock().await.clone();
+    assert!(
+        requests.len() >= 2,
+        "expected retry after stale session recovery, got {} requests",
+        requests.len()
+    );
+    let resumed = requests
+        .iter()
+        .find(|req| req.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str()))
+        .expect("expected first recovered request to target stale session id");
+    let resumed_text = resumed.to_string();
+    assert!(resumed_text.contains("rate_limited"));
+    assert!(resumed_text.contains("Keep diffs minimal and project-scoped."));
+    assert!(resumed_text.contains("Use apply_patch instead of python file rewrites."));
+    assert!(resumed_text.contains("继续"));
+
+    let retried = requests.last().unwrap();
+    assert_ne!(
+        retried
+            .get("session_id")
+            .and_then(serde_json::Value::as_str),
+        Some(sid.as_str())
+    );
+    let retried_text = retried.to_string();
+    assert!(retried_text.contains("rate_limited"));
+    assert!(retried_text.contains("Keep diffs minimal and project-scoped."));
+    assert_eq!(state.pending_recovery, None);
+    assert_eq!(
+        state.session_id.as_deref(),
+        Some(recovered_session_id.as_str())
+    );
+    assert_eq!(state.history.len(), 2);
+    assert_eq!(state.history.last().unwrap().0, "继续");
+    assert!(state.resume_guidance.is_none());
 }
 
 // ── Learning snapshot restoration ────────────────────────────────────────

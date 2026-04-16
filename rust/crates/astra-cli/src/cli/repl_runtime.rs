@@ -544,60 +544,8 @@ pub(crate) fn initialize_repl_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
 ) -> ReplState {
-    let mut state = ReplState {
-        session_id: resumable_last_session_id(profile),
-        ..Default::default()
-    };
-    // Restore session state from local journal only for resumable sessions.
-    if let Some(ref sid) = state.session_id {
-        let restored = restore_session_state_from_journal(sid);
-        state.history = restored.history;
-        state.turn = restored.turn;
-        state.recent_tools = restored.recent_tools;
-        state.total_prompt_tokens = restored.total_prompt_tokens;
-        state.total_completion_tokens = restored.total_completion_tokens;
-
-        // Enrich with step checkpoint data if available (blocked tools, progress)
-        if let Ok(Some(heavy)) =
-            astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(sid)
-        {
-            // Merge blocked tools from checkpoint (tools that were deprioritized)
-            if !heavy.blocked_tools.is_empty() && state.recent_tools.is_empty() {
-                // Only use checkpoint's recent_tools as fallback
-                state.recent_tools = heavy.recent_tools;
-            }
-        }
-
-        // Restore session-level state from workspace.yaml (goal, pinned/discovered skills)
-        match astra_services::session_workspace::read_workspace(sid) {
-            Ok(ws) => {
-                state.session_goal = ws.session_goal;
-                state.pending_goal_progress = ws.goal_progress;
-                state.pinned_skills = ws.pinned_skills.into_iter().collect();
-                state.discovered_skills = ws.discovered_skills.into_iter().collect();
-
-                // Stash adaptive engine state for application when ObservabilitySession is created
-                if ws.last_scenario_change_turn.is_some()
-                    || ws.last_token_budget_direction != 0
-                    || ws.active_experiment_id.is_some()
-                    || ws.tuned_config_json.is_some()
-                {
-                    state.pending_adaptive_state =
-                        Some(super::repl_state::PersistedAdaptiveState {
-                            last_scenario_change_turn: ws.last_scenario_change_turn,
-                            last_token_budget_direction: ws.last_token_budget_direction,
-                            last_token_budget_change_turn: ws.last_token_budget_change_turn,
-                            active_experiment_id: ws.active_experiment_id,
-                            active_variant: ws.active_variant,
-                            tuned_config_json: ws.tuned_config_json,
-                        });
-                }
-            }
-            Err(e) => {
-                eprintln!("  ⚠ Failed to restore workspace state for session {sid}: {e}");
-            }
-        }
-    }
+    let mut state = ReplState::default();
+    state.pending_recovery = detect_pending_recovery_session(profile);
     if let Some(m) = initial_model {
         state.model = Some(m.to_string());
     }
@@ -643,6 +591,56 @@ pub(crate) fn initialize_repl_state(
     }
 
     state
+}
+
+fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> {
+    let session_id = resumable_last_session_id(cli_profile)?;
+    let workspace = astra_services::session_workspace::read_workspace(&session_id).ok()?;
+    workspace_matches_current_project(&workspace).then_some(session_id)
+}
+
+fn workspace_matches_current_project(
+    workspace: &astra_services::session_workspace::WorkspaceMetadata,
+) -> bool {
+    let current_cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+
+    if let (Some(current_root), Some(workspace_root)) =
+        (current_git_root(), workspace.git_root.as_deref())
+    {
+        return same_path(&current_root, std::path::Path::new(workspace_root));
+    }
+
+    path_contains_or_matches(&current_cwd, std::path::Path::new(&workspace.cwd))
+}
+
+fn current_git_root() -> Option<std::path::PathBuf> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let root = String::from_utf8(output.stdout).ok()?;
+            let trimmed = root.trim();
+            (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+        })
+}
+
+fn canonical_or_original(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    canonical_or_original(left) == canonical_or_original(right)
+}
+
+fn path_contains_or_matches(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let left = canonical_or_original(left);
+    let right = canonical_or_original(right);
+    left == right || left.starts_with(&right) || right.starts_with(&left)
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -1286,6 +1284,131 @@ mod tests {
 
         let state = initialize_repl_state(None, Some("gpt-5"));
         assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery, None);
+        assert!(state.history.is_empty());
+        assert_eq!(state.turn, 0);
+    }
+
+    #[test]
+    fn initialize_repl_state_records_project_scoped_pending_recovery() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let creds_dir = tempdir().unwrap();
+        let _creds_guard = EnvVarGuard::set("ASTRA_CREDENTIALS_DIR", creds_dir.path());
+
+        let sid = format!("test-pending-recovery-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "continue the refactor",
+                "I updated the parser entry point.",
+                0,
+                20,
+                10,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(&sid),
+                1,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 1,
+                    "turns_completed": 1,
+                    "remaining_turns": 4,
+                }),
+            ))
+            .unwrap();
+
+        let current_cwd = std::env::current_dir().unwrap();
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            &sid,
+            "gpt-5",
+            &current_cwd.display().to_string(),
+            Some("main"),
+        );
+        ws.git_root = current_git_root().map(|path| path.display().to_string());
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let state = initialize_repl_state(None, Some("gpt-5"));
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+        assert!(state.history.is_empty());
+        assert_eq!(state.turn, 0);
+    }
+
+    #[test]
+    fn initialize_repl_state_ignores_pending_recovery_from_other_project() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let creds_dir = tempdir().unwrap();
+        let _creds_guard = EnvVarGuard::set("ASTRA_CREDENTIALS_DIR", creds_dir.path());
+
+        let sid = format!("test-other-project-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(&sid),
+                0,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 0,
+                    "turns_completed": 0,
+                    "remaining_turns": 5,
+                }),
+            ))
+            .unwrap();
+
+        let other_project = tempdir().unwrap();
+        let ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            &sid,
+            "gpt-5",
+            &other_project.path().display().to_string(),
+            None,
+        );
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                last_session_id: Some(sid),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let state = initialize_repl_state(None, Some("gpt-5"));
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
     }

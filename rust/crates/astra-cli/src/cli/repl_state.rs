@@ -58,6 +58,10 @@ pub(crate) struct PersistedAdaptiveState {
 #[allow(deprecated)]
 pub(crate) struct ReplState {
     pub session_id: Option<String>,
+    /// Project-scoped recoverable session detected at startup.
+    /// Becomes a true resume only after explicit user intent (`continue` / `resume` / `继续`)
+    /// or `/resume`.
+    pub pending_recovery: Option<String>,
     pub run_id: Option<String>,
     /// Display name for this session (set via --name flag).
     pub session_name: Option<String>,
@@ -302,6 +306,7 @@ impl Default for ReplState {
     fn default() -> Self {
         Self {
             session_id: None,
+            pending_recovery: None,
             run_id: None,
             session_name: None,
             model: None,

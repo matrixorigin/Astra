@@ -22,25 +22,17 @@ pub(crate) async fn complete_repl_startup(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     resume_session_id: Option<&str>,
-) -> ReplStartupArtifacts {
+) -> Result<ReplStartupArtifacts, String> {
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
     // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
     install_sigterm_handler();
     let shutdown_signal_rx = subscribe_shutdown_signal();
 
-    // Apply resume session if requested (-c or -r)
-    if let Some(sid) = resume_session_id {
-        state.session_id = Some(sid.to_string());
-        eprintln!(
-            "{}",
-            format!("  Resuming session {}", truncate_str(sid, 12)).cyan()
-        );
-    }
-
     // --session-id: override with explicit session UUID
     if let Ok(sid) = std::env::var("ASTRA_SESSION_ID") {
         state.session_id = Some(sid.clone());
+        state.pending_recovery = None;
         eprintln!(
             "{}",
             format!("  Using session {}", truncate_str(&sid, 12)).cyan()
@@ -269,8 +261,26 @@ pub(crate) async fn complete_repl_startup(
     }
     tracer.phase("model_check");
 
+    if state.session_id.is_none()
+        && let Some(sid) = resume_session_id
+    {
+        slash_session::restore_session_into_state(sid, profile, state).await?;
+    }
+
     print_repl_banner(profile, state);
     tracer.phase("banner");
+
+    if let Some(ref sid) = state.pending_recovery {
+        let short = truncate_str(sid, 12);
+        eprintln!(
+            "{}",
+            format!(
+                "  ↻ Recoverable session {short} detected for this project. Say continue / resume / 继续 to restore it, or use /resume {short}."
+            )
+            .cyan()
+        );
+        eprintln!();
+    }
 
     if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
         && !proxy.is_empty()
@@ -310,7 +320,7 @@ pub(crate) async fn complete_repl_startup(
     }
     tracer.phase("multi_agent_runtime");
 
-    ReplStartupArtifacts {
+    Ok(ReplStartupArtifacts {
         selector,
         pipeline_modules,
         profile_name_str,
@@ -318,5 +328,5 @@ pub(crate) async fn complete_repl_startup(
         skill_quality_path,
         pinned_skills_path,
         shutdown_signal_rx,
-    }
+    })
 }

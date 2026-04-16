@@ -92,22 +92,10 @@ pub(super) fn get_profile_and_token(
 }
 
 pub(super) fn session_is_resumable(session_id: &str) -> bool {
-    match session_journal::read_journal(session_id) {
-        Ok(events) if events.is_empty() => true,
-        Ok(events) => {
-            let last_start = events.iter().rposition(|event| {
-                event.event_type == session_journal::JournalEventType::SessionStart
-            });
-            let last_end = events.iter().rposition(|event| {
-                event.event_type == session_journal::JournalEventType::SessionEnd
-            });
-            match (last_start, last_end) {
-                (Some(start_idx), Some(end_idx)) => start_idx > end_idx,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => true,
-            }
-        }
+    match session_journal::classify_session_end_state(session_id) {
+        Ok(session_journal::SessionEndState::Completed) => false,
+        Ok(session_journal::SessionEndState::Interrupted { resumable, .. }) => resumable,
+        Ok(session_journal::SessionEndState::Zombie) => true,
         Err(_) => true,
     }
 }

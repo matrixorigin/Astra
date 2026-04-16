@@ -1026,6 +1026,193 @@ pub struct SessionPeek {
     pub created_at: Option<String>,
 }
 
+const RECOVERY_TAIL_LINE_LIMIT: usize = 32;
+const RECOVERY_TAIL_CHUNK_BYTES: usize = 4096;
+const RECOVERY_TAIL_MAX_BYTES: usize = 64 * 1024;
+
+/// Lightweight terminal state for crash-recovery decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEndState {
+    /// The last recoverability marker in the latest session segment was `session_end`.
+    Completed,
+    /// The session stopped with a structured interruption record.
+    Interrupted { kind: String, resumable: bool },
+    /// The session had activity after the latest `session_start` but never ended cleanly.
+    Zombie,
+}
+
+impl SessionEndState {
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::Zombie
+                | Self::Interrupted {
+                    resumable: true,
+                    ..
+                }
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalTailEntry {
+    #[serde(rename = "type")]
+    event_type: JournalEventType,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek};
+
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let mut pos = file.seek(std::io::SeekFrom::End(0))?;
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut bytes_read = 0usize;
+    let mut newline_count = 0usize;
+
+    while pos > 0 && newline_count <= max_lines && bytes_read < RECOVERY_TAIL_MAX_BYTES {
+        let read_len = usize::min(RECOVERY_TAIL_CHUNK_BYTES, pos as usize);
+        pos -= read_len as u64;
+        file.seek(std::io::SeekFrom::Start(pos))?;
+        let mut chunk = vec![0; read_len];
+        file.read_exact(&mut chunk)?;
+        newline_count += chunk.iter().filter(|&&b| b == b'\n').count();
+        bytes_read += read_len;
+        chunks.push(chunk);
+    }
+
+    chunks.reverse();
+    let mut bytes = Vec::with_capacity(bytes_read);
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<String> = text
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(max_lines)
+        .map(ToString::to_string)
+        .collect();
+    lines.reverse();
+    Ok(lines)
+}
+
+fn parse_journal_tail_entry(line: &str) -> Option<JournalTailEntry> {
+    serde_json::from_str::<JournalTailEntry>(line).ok()
+}
+
+fn interruption_kind(entry: &JournalTailEntry) -> String {
+    entry
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("interruption"))
+        .and_then(|value| value.get("kind"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn interruption_is_resumable(entry: &JournalTailEntry) -> bool {
+    let interruption = entry
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("interruption"));
+
+    if let Some(resumable) = interruption
+        .and_then(|value| value.get("resumable"))
+        .and_then(|value| value.as_bool())
+    {
+        return resumable;
+    }
+
+    match interruption.and_then(|value| value.get("resume_action")) {
+        Some(serde_json::Value::String(action)) => !matches!(
+            action.as_str(),
+            "start_new_session" | "requires_intervention"
+        ),
+        Some(serde_json::Value::Object(action)) => {
+            action.contains_key("continue_immediately")
+                || action.contains_key("wait_and_retry")
+                || action.contains_key("compact_and_retry")
+        }
+        _ => true,
+    }
+}
+
+fn is_recovery_activity_event(event_type: &JournalEventType) -> bool {
+    !matches!(
+        event_type,
+        JournalEventType::SessionStart
+            | JournalEventType::SessionEnd
+            | JournalEventType::ConfigChange
+            | JournalEventType::SyncMarker
+            | JournalEventType::ContextAssemblyRecorded
+            | JournalEventType::AdaptiveBaselinePromoted
+            | JournalEventType::AdaptiveScenarioApplied
+            | JournalEventType::AdaptivePerTurnApplied
+            | JournalEventType::AdaptiveExperimentEnrolled
+            | JournalEventType::AdaptiveTuningRuleTriggered
+            | JournalEventType::ConfidenceDiagnosisRecorded
+            | JournalEventType::CompactionRetry
+    )
+}
+
+/// Classify the latest session segment as completed, interrupted, or zombie.
+///
+/// Uses a bounded reverse tail read instead of loading the full JSONL file.
+pub fn classify_session_end_state(session_id: &str) -> std::io::Result<SessionEndState> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let path = journal_file_path(session_id);
+    if !path.exists() {
+        return Ok(SessionEndState::Completed);
+    }
+
+    let tail_lines = read_journal_tail_lines(&path, RECOVERY_TAIL_LINE_LIMIT)?;
+    let mut saw_activity_after_start = false;
+
+    for line in tail_lines.iter().rev() {
+        let Some(entry) = parse_journal_tail_entry(line) else {
+            continue;
+        };
+        match entry.event_type {
+            JournalEventType::SessionEnd => return Ok(SessionEndState::Completed),
+            JournalEventType::InterruptionRecorded => {
+                return Ok(SessionEndState::Interrupted {
+                    kind: interruption_kind(&entry),
+                    resumable: interruption_is_resumable(&entry),
+                });
+            }
+            JournalEventType::SessionStart => {
+                return Ok(if saw_activity_after_start {
+                    SessionEndState::Zombie
+                } else {
+                    SessionEndState::Completed
+                });
+            }
+            _ if is_recovery_activity_event(&entry.event_type) => {
+                saw_activity_after_start = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(if saw_activity_after_start {
+        SessionEndState::Zombie
+    } else {
+        SessionEndState::Completed
+    })
+}
+
 /// Fast JSON string field extraction without full parse.
 /// Looks for `"key":"value"` and returns the value (handles simple escapes).
 fn extract_json_str(line: &str, needle: &str) -> Option<String> {
@@ -4434,6 +4621,159 @@ mod tests {
     #[should_panic(expected = "unsafe session ID")]
     fn journal_file_path_panics_on_traversal() {
         let _ = journal_file_path("../../etc/passwd");
+    }
+
+    #[test]
+    fn classify_session_end_state_detects_completed_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-recovery-complete-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "fix auth flow",
+                "I checked the login path.",
+                0,
+                10,
+                5,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::session_end(Some(&sid), 1))
+            .unwrap();
+
+        assert_eq!(
+            classify_session_end_state(&sid).unwrap(),
+            SessionEndState::Completed
+        );
+    }
+
+    #[test]
+    fn classify_session_end_state_uses_resume_action_when_resumable_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-recovery-interrupt-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "continue the migration",
+                "I finished the schema diff.",
+                0,
+                10,
+                5,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(&sid),
+                1,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resume_action": {"wait_and_retry": {"delay_seconds": 30}},
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 2,
+                    "turns_completed": 1,
+                    "remaining_turns": 4,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            classify_session_end_state(&sid).unwrap(),
+            SessionEndState::Interrupted {
+                kind: "rate_limited".to_string(),
+                resumable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_session_end_state_marks_requires_intervention_as_non_resumable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-recovery-auth-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "fetch CI logs",
+                "Need valid credentials first.",
+                0,
+                10,
+                5,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::interruption_recorded(
+                Some(&sid),
+                1,
+                serde_json::json!({
+                    "kind": "auth_failure",
+                    "resume_action": {
+                        "requires_intervention": {
+                            "description": "refresh credentials"
+                        }
+                    },
+                    "has_checkpoint": true,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            classify_session_end_state(&sid).unwrap(),
+            SessionEndState::Interrupted {
+                kind: "auth_failure".to_string(),
+                resumable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_session_end_state_detects_zombie_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = format!("test-recovery-zombie-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("gpt-5")))
+            .unwrap();
+        writer
+            .append(&JournalEvent::plan_progress(
+                Some(&sid),
+                1,
+                "task-1",
+                "Implement restart flow",
+                "started",
+                33,
+                3,
+                1,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            classify_session_end_state(&sid).unwrap(),
+            SessionEndState::Zombie
+        );
     }
 
     // ── Session Lifecycle Maintenance Tests ──────────────────────────

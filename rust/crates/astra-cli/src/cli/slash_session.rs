@@ -2,6 +2,9 @@ use std::io::Write;
 
 use astra_core::{DriftCause, EvidenceType};
 use astra_runtime::turn::decision_explainer::{DriftDetector, FocusDriftAnalysis};
+use astra_services::session_restore::{
+    HybridRestoreService, RestoredSession, SessionRestoreService,
+};
 use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
 use chrono::{DateTime, Utc};
 
@@ -4279,16 +4282,481 @@ mod export_tests {
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
+fn resume_restore_service(state: &ReplState) -> HybridRestoreService {
+    match &state.matrix_runtime {
+        Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
+        None => HybridRestoreService::local_only(),
+    }
+}
+
+fn reset_state_for_session_restore(state: &mut ReplState) {
+    state.session_id = None;
+    state.pending_recovery = None;
+    state.run_id = None;
+    state.turn = 0;
+    state.last_response = None;
+    state.continuation_anchor = None;
+    state.session_goal = None;
+    state.pending_followup_suggestion = None;
+    state.history.clear();
+    state.total_prompt_tokens = 0;
+    state.total_completion_tokens = 0;
+    state.total_cache_read_tokens = 0;
+    state.total_cache_creation_tokens = 0;
+    state.learning_snapshot = None;
+    state.plan_mode = None;
+    state.executing_plan = None;
+    state.plan_execution_config = None;
+    state.executing_plan_goal = None;
+    state.plan_execution_rounds = 0;
+    state.current_plan_subtask_id = None;
+    state.last_turn_interrupted = false;
+    state.last_turn_event = None;
+    state.plan_execution_corrections.clear();
+    state.plan_resume_pending = false;
+    state.pending_approval = None;
+    state.plan_in_token_stream = false;
+    state.plan_md_renderer = None;
+    state.plan_thinking_pane = None;
+    state.durable_task_state = None;
+    state.last_delivery_report = None;
+    state.redo_stack.clear();
+    state.resume_guidance = None;
+    state.pending_goal_progress = None;
+    state.pending_adaptive_state = None;
+    state.pinned_skills.clear();
+    state.discovered_skills.clear();
+}
+
+fn apply_restored_workspace_state(state: &mut ReplState, session_id: &str) {
+    match session_workspace::read_workspace(session_id) {
+        Ok(ws) => {
+            state.session_goal = ws.session_goal.clone();
+            state.pending_goal_progress = ws.goal_progress.clone();
+            state.pinned_skills = ws.pinned_skills.into_iter().collect();
+            state.discovered_skills = ws.discovered_skills.into_iter().collect();
+
+            if ws.last_scenario_change_turn.is_some()
+                || ws.last_token_budget_direction != 0
+                || ws.active_experiment_id.is_some()
+                || ws.tuned_config_json.is_some()
+            {
+                state.pending_adaptive_state = Some(super::repl_state::PersistedAdaptiveState {
+                    last_scenario_change_turn: ws.last_scenario_change_turn,
+                    last_token_budget_direction: ws.last_token_budget_direction,
+                    last_token_budget_change_turn: ws.last_token_budget_change_turn,
+                    active_experiment_id: ws.active_experiment_id,
+                    active_variant: ws.active_variant,
+                    tuned_config_json: ws.tuned_config_json,
+                });
+            }
+        }
+        Err(e) => {
+            eprintln!("  ⚠ Failed to restore workspace state for session {session_id}: {e}");
+        }
+    }
+
+    if let Some(goal) = state.session_goal.clone() {
+        repl_turn::steer_observability_goal(state, &goal);
+    }
+    repl_turn::apply_pending_adaptive_state(state);
+    repl_turn::apply_pending_goal_progress_state(state);
+}
+
+fn build_session_memory_resume_guidance(session_id: &str) -> Option<String> {
+    let workspace = session_workspace::read_workspace(session_id).ok()?;
+    let path = astra_runtime::resolve_resume_session_memory_file(
+        session_id,
+        Some(workspace.cwd.as_str()),
+    )?;
+    let memory_md = astra_runtime::read_session_memory_file(&path)?;
+    let sections = astra_runtime::extract_learnings_for_backflow(&memory_md);
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut blocks = Vec::new();
+    for (kind, content) in sections {
+        let title = match kind.as_str() {
+            "learnings" => "Learnings",
+            "error-corrections" => "Errors & Corrections",
+            _ => continue,
+        };
+        blocks.push(format!("## {title}\n{content}"));
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "[Recovered session memory]\nUse the persisted notes below when continuing the interrupted work.\n\n{}",
+        blocks.join("\n\n")
+    ))
+}
+
+fn combine_resume_guidance(
+    step_guidance: Option<String>,
+    session_memory_guidance: Option<String>,
+) -> Option<String> {
+    match (step_guidance, session_memory_guidance) {
+        (Some(step), Some(memory)) => Some(format!("{step}\n\n{memory}")),
+        (Some(step), None) => Some(step),
+        (None, Some(memory)) => Some(memory),
+        (None, None) => None,
+    }
+}
+
+async fn apply_restored_session(
+    profile: Option<&str>,
+    state: &mut ReplState,
+    restored: RestoredSession,
+) -> Result<(), String> {
+    if !restored.restored_from_cloud && session_journal::read_journal(&restored.session_id).is_err()
+    {
+        return Err(format!(
+            "Session {} not found or not owned by user",
+            restored.session_id
+        ));
+    }
+
+    reset_state_for_session_restore(state);
+
+    state.session_id = Some(restored.session_id.clone());
+    state.turn = restored.turn_count;
+    state.total_prompt_tokens = restored.total_tokens_in;
+    state.total_completion_tokens = restored.total_tokens_out;
+    state.recent_tools = restored.recent_tools;
+
+    apply_restored_workspace_state(state, &restored.session_id);
+
+    if let Ok(Some(step_restored)) =
+        astra_runtime::pipeline::step_restore::restore_session(&restored.session_id)
+    {
+        let summary = astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
+        for tool in &step_restored.blocked_tools {
+            if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
+                state.tool_health_entries.push(
+                    astra_runtime::pipeline::persistence::ToolHealthEntry {
+                        name: tool.clone(),
+                        total_calls: 3,
+                        total_failures: 3,
+                        failure_rate: 1.0,
+                        last_updated_epoch: 0,
+                    },
+                );
+            }
+        }
+        if state.recent_tools.is_empty() {
+            state.recent_tools = step_restored.recent_tools;
+        }
+        let step_guidance = step_restored.interruption.as_ref().and_then(|irj| {
+            let compaction_ctx = step_restored.compaction_state.as_ref().map(|cs| {
+                astra_runtime::turn::interruption::CompactionResumeContext {
+                    compaction_attempts: cs
+                        .get("attempt_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    total_tokens_freed: cs
+                        .get("cumulative_tokens_freed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    last_was_insufficient: cs
+                        .get("last_was_insufficient")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                }
+            });
+            astra_runtime::turn::interruption::build_resume_guidance_with_context(
+                irj,
+                compaction_ctx.as_ref(),
+            )
+        });
+        state.resume_guidance = combine_resume_guidance(
+            step_guidance,
+            build_session_memory_resume_guidance(&restored.session_id),
+        );
+        if let Some(ref ao_json) = step_restored.approval_overrides {
+            state.perm_manager.merge_restored_overrides(ao_json);
+        }
+        eprintln!("  {} {}", "↻".cyan(), summary.dim());
+    } else if let Ok(Some(heavy)) =
+        astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
+    {
+        if state.recent_tools.is_empty() {
+            state.recent_tools = heavy.recent_tools;
+        }
+        state.resume_guidance = combine_resume_guidance(
+            None,
+            build_session_memory_resume_guidance(&restored.session_id),
+        );
+    } else if let Some(ref mc) = state.matrix_runtime {
+        let pool = mc.shared_pool().get();
+        match astra_services::session_restore::pull_step_checkpoint_from_cloud(
+            pool,
+            &restored.session_id,
+        )
+        .await
+        {
+            Ok(Some(state_json)) => {
+                match serde_json::from_str::<astra_runtime::pipeline::step_protocol::StepCheckpoint>(
+                    &state_json,
+                ) {
+                    Ok(astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) => {
+                        for tool in &heavy.blocked_tools {
+                            if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
+                                state.tool_health_entries.push(
+                                    astra_runtime::pipeline::persistence::ToolHealthEntry {
+                                        name: tool.clone(),
+                                        total_calls: 3,
+                                        total_failures: 3,
+                                        failure_rate: 1.0,
+                                        last_updated_epoch: 0,
+                                    },
+                                );
+                            }
+                        }
+                        if state.recent_tools.is_empty() {
+                            state.recent_tools = heavy.recent_tools;
+                        }
+                        if state.history.is_empty() && !heavy.messages.is_empty() {
+                            let mut pairs = Vec::new();
+                            let mut last_user = String::new();
+                            for msg in &heavy.messages {
+                                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                                let content =
+                                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                match role {
+                                    "user" => last_user = content.to_string(),
+                                    "assistant" if !last_user.is_empty() => {
+                                        pairs.push((last_user.clone(), content.to_string()));
+                                        last_user.clear();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !pairs.is_empty() {
+                                state.history = pairs;
+                            }
+                        }
+                        state.resume_guidance = combine_resume_guidance(
+                            None,
+                            build_session_memory_resume_guidance(&restored.session_id),
+                        );
+                        eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "  {} Cloud checkpoint corrupted, skipping",
+                            theme::icon_warn()
+                        );
+                        eprintln!("{}", format!("     ({e})").dim());
+                    }
+                }
+            }
+            Ok(None) => {
+                state.resume_guidance = combine_resume_guidance(
+                    None,
+                    build_session_memory_resume_guidance(&restored.session_id),
+                );
+            }
+            Err(e) => {
+                eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
+                eprintln!("{}", format!("     ({e})").dim());
+                state.resume_guidance = combine_resume_guidance(
+                    None,
+                    build_session_memory_resume_guidance(&restored.session_id),
+                );
+            }
+        }
+    } else {
+        state.resume_guidance = combine_resume_guidance(
+            None,
+            build_session_memory_resume_guidance(&restored.session_id),
+        );
+    }
+
+    if let Some(ref m) = restored.model {
+        state.model = Some(m.clone());
+        state.cached_pricing = slash_stats::fallback_pricing(m);
+        state.context_budget =
+            prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
+    }
+
+    if let Some(ref learning_json) = restored.learning_snapshot_json
+        && !learning_json.is_empty()
+    {
+        state.learning_snapshot = Some(learning_json.clone());
+    }
+
+    state.history = repl_runtime::restore_history_from_journal(&restored.session_id);
+
+    if let Ok(events) = session_journal::read_journal(&restored.session_id) {
+        state.last_turn_event = events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == session_journal::JournalEventType::Turn)
+            .cloned();
+    }
+
+    if let Some(ref json) = restored.executing_plan_json {
+        state.executing_plan = serde_json::from_str(json).ok();
+    }
+    if let Some(ref goal) = restored.plan_goal {
+        state.executing_plan_goal = Some(goal.clone());
+        repl_turn::steer_observability_goal(state, goal);
+    } else if let Some(goal) = state.session_goal.clone() {
+        repl_turn::steer_observability_goal(state, &goal);
+    }
+    if let Some(ref json) = restored.plan_config_json {
+        state.plan_execution_config = serde_json::from_str(json).ok();
+    }
+    state.plan_execution_rounds = restored.plan_execution_rounds;
+    state.plan_execution_corrections = restored.plan_corrections.clone();
+
+    if let Some(ref json) = restored.contract_json
+        && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
+    {
+        let work_dir = std::env::current_dir().unwrap_or_default();
+        let ingestion_sender = state
+            .matrix_runtime
+            .as_ref()
+            .and_then(|mc| mc.clone_ingestion_sender());
+        let cloud_judge = state
+            .matrix_runtime
+            .as_ref()
+            .and_then(|mc| mc.create_cloud_llm_judge())
+            .map(|j| std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>);
+        let learning = build_learning_bridge(state);
+
+        let lifecycle = if let Some(pool) = state
+            .matrix_runtime
+            .as_ref()
+            .map(|mc| mc.shared_pool().get().clone())
+        {
+            durable_bridge::create_cloud_lifecycle_full(
+                pool,
+                &work_dir,
+                ingestion_sender,
+                Some(&restored.session_id),
+                state.ingestion_user_id.as_deref(),
+                cloud_judge,
+                learning,
+                None,
+            )
+        } else {
+            let session_dir =
+                astra_services::session_workspace::workspace_dir_for(&restored.session_id);
+            durable_bridge::create_local_lifecycle_full(
+                &session_dir,
+                &work_dir,
+                ingestion_sender,
+                Some(&restored.session_id),
+                state.ingestion_user_id.as_deref(),
+                cloud_judge,
+                learning,
+                None,
+            )
+        };
+        state.durable_task_state = Some(durable_bridge::DurableTaskState {
+            contract,
+            lifecycle,
+            last_report: None,
+        });
+    }
+
+    repl_turn::initialize_journal_pub(state, &restored.session_id);
+    repl_turn::persist_last_session_id(profile, &restored.session_id);
+    if let Ok(mut ws) = astra_services::session_workspace::read_workspace(&restored.session_id) {
+        ws.turn_count = restored.turn_count;
+        ws.total_tokens_in = restored.total_tokens_in;
+        ws.total_tokens_out = restored.total_tokens_out;
+        ws.status = restored.last_status.clone();
+        if let Some(ref branch) = restored.git_branch {
+            ws.git_branch = Some(branch.clone());
+        }
+        if let Some(ref model) = restored.model {
+            ws.model = model.clone();
+        }
+        ws.executing_plan_json = restored.executing_plan_json.clone();
+        ws.plan_goal = restored.plan_goal.clone();
+        ws.plan_config_json = restored.plan_config_json.clone();
+        ws.plan_execution_rounds = restored.plan_execution_rounds;
+        ws.contract_json = restored.contract_json.clone();
+        ws.plan_corrections = restored.plan_corrections.clone();
+        ws.last_context_trace = restored.last_context_trace.clone();
+        if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
+            eprintln!("  ⚠ workspace write failed during resume: {e}");
+        }
+    }
+
+    let source = if restored.restored_from_cloud {
+        "cloud"
+    } else {
+        "local"
+    };
+    eprintln!(
+        "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
+        theme::icon_ok(),
+        restored.session_id[..8.min(restored.session_id.len())].cyan(),
+        source,
+        restored.turn_count,
+        restored.checkpoint_count,
+    );
+    if let Some(ref trace) = restored.last_context_trace {
+        let preview = trace.preview();
+        if !preview.is_empty() {
+            eprintln!("    {} {}", "Last trace:".dim(), preview.dim());
+        }
+    }
+
+    if let Some(ref plan) = state.executing_plan {
+        let done = plan.items_done();
+        let total = plan.subtasks.len();
+        let pct = plan.progress_pct();
+        eprintln!(
+            "  {} Paused plan restored: {}/{} subtasks done ({}%)",
+            "📋".cyan(),
+            done,
+            total,
+            pct,
+        );
+        if let Some(ref goal) = state.executing_plan_goal {
+            eprintln!("    {} {}", "Goal:".dim(), goal.as_str().dim());
+        }
+        eprintln!(
+            "    {}",
+            "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
+                .dim()
+        );
+    }
+
+    Ok(())
+}
+
+pub(super) async fn restore_session_into_state(
+    session_id: &str,
+    profile: Option<&str>,
+    state: &mut ReplState,
+) -> Result<(), String> {
+    let svc = resume_restore_service(state);
+    let restored = svc
+        .restore_session(session_id)
+        .await
+        .map_err(|e| format!("Resume failed: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "Session {session_id} has no resumable workspace/checkpoint state. Use /resume to inspect available sessions."
+            )
+        })?;
+    apply_restored_session(profile, state, restored).await
+}
+
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
 pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut ReplState) {
-    use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
-
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-    let svc = match &state.matrix_runtime {
-        Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
-        None => HybridRestoreService::local_only(),
-    };
+    let svc = resume_restore_service(state);
 
     // If no session_id given, list and let user pick
     let effective_arg;
@@ -4672,400 +5140,16 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
         }
     }
 
-    // Restore session
-    match svc.restore_session(&session_id).await {
-        Ok(Some(restored)) => {
-            // Issue 1: Verify session belongs to current user
-            // For cloud restore, the session should already have user_id check done in DB query
-            // For local restore, we verify the session exists in user's journal
-            if !restored.restored_from_cloud {
-                // Local restore: verify user owns this session by checking journal exists
-                if session_journal::read_journal(&session_id).is_err() {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "  {} Session {} not found or not owned by user",
-                            theme::icon_err(),
-                            arg
-                        )
-                        .red()
-                    );
-                    return;
-                }
-            }
-
-            // Apply restored state
-            state.session_id = Some(restored.session_id.clone());
-            state.turn = restored.turn_count;
-            state.total_prompt_tokens = restored.total_tokens_in;
-            state.total_completion_tokens = restored.total_tokens_out;
-            state.recent_tools = restored.recent_tools;
-
-            // Merge step checkpoint data when the on-disk checkpoint matches current protocol.
-            if let Ok(Some(step_restored)) =
-                astra_runtime::pipeline::step_restore::restore_session(&restored.session_id)
-            {
-                let summary =
-                    astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
-                // Merge blocked tools from checkpoint into health entries
-                for tool in &step_restored.blocked_tools {
-                    if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
-                        state.tool_health_entries.push(
-                            astra_runtime::pipeline::persistence::ToolHealthEntry {
-                                name: tool.clone(),
-                                total_calls: 3,
-                                total_failures: 3,
-                                failure_rate: 1.0,
-                                last_updated_epoch: 0, // synthetic — will be overridden by real data
-                            },
-                        );
-                    }
-                }
-                if state.recent_tools.is_empty() {
-                    state.recent_tools = step_restored.recent_tools;
-                }
-                // Inject resume guidance when restoring from an interrupted checkpoint.
-                if let Some(ref irj) = step_restored.interruption {
-                    // Build compaction context from persisted state for richer resume advice.
-                    let compaction_ctx = step_restored.compaction_state.as_ref().map(|cs| {
-                        astra_runtime::turn::interruption::CompactionResumeContext {
-                            compaction_attempts: cs
-                                .get("attempt_count")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                                as u32,
-                            total_tokens_freed: cs
-                                .get("cumulative_tokens_freed")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            last_was_insufficient: cs
-                                .get("last_was_insufficient")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false),
-                        }
-                    });
-                    if let Some(guidance) =
-                        astra_runtime::turn::interruption::build_resume_guidance_with_context(
-                            irj,
-                            compaction_ctx.as_ref(),
-                        )
-                    {
-                        state.resume_guidance = Some(guidance);
-                    }
-                }
-                // Restore approval overrides so previously-approved tools stay approved.
-                if let Some(ref ao_json) = step_restored.approval_overrides {
-                    state.perm_manager.merge_restored_overrides(ao_json);
-                }
-                eprintln!("  {} {}", "↻".cyan(), summary.dim());
-            } else if let Ok(Some(heavy)) =
-                astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(
-                    &restored.session_id,
-                )
-            {
-                // Fallback to raw local checkpoint if step_restore fails (e.g., version mismatch)
-                if state.recent_tools.is_empty() {
-                    state.recent_tools = heavy.recent_tools;
-                }
-            } else if let Some(ref mc) = state.matrix_runtime {
-                // Cloud fallback: pull heavy checkpoint from MatrixOne
-                // (different device, local files not available)
-                let pool = mc.shared_pool().get();
-                match astra_services::session_restore::pull_step_checkpoint_from_cloud(
-                    pool,
-                    &restored.session_id,
-                )
-                .await
-                {
-                    Ok(Some(state_json)) => {
-                        match serde_json::from_str::<
-                            astra_runtime::pipeline::step_protocol::StepCheckpoint,
-                        >(&state_json)
-                        {
-                            Ok(astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
-                                heavy,
-                            )) => {
-                                for tool in &heavy.blocked_tools {
-                                    if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
-                                        state.tool_health_entries.push(
-                                            astra_runtime::pipeline::persistence::ToolHealthEntry {
-                                                name: tool.clone(),
-                                                total_calls: 3,
-                                                total_failures: 3,
-                                                failure_rate: 1.0,
-                                                last_updated_epoch: 0,
-                                            },
-                                        );
-                                    }
-                                }
-                                if state.recent_tools.is_empty() {
-                                    state.recent_tools = heavy.recent_tools;
-                                }
-                                // Restore conversation history from cloud checkpoint
-                                if state.history.is_empty() && !heavy.messages.is_empty() {
-                                    // Extract user/assistant pairs from messages for history
-                                    let mut pairs = Vec::new();
-                                    let mut last_user = String::new();
-                                    for msg in &heavy.messages {
-                                        let role =
-                                            msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                                        let content = msg
-                                            .get("content")
-                                            .and_then(|c| c.as_str())
-                                            .unwrap_or("");
-                                        match role {
-                                            "user" => last_user = content.to_string(),
-                                            "assistant" if !last_user.is_empty() => {
-                                                pairs
-                                                    .push((last_user.clone(), content.to_string()));
-                                                last_user.clear();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    if !pairs.is_empty() {
-                                        state.history = pairs;
-                                    }
-                                }
-                                eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
-                            }
-                            Ok(_) => {} // Light checkpoint — less useful, skip
-                            Err(e) => {
-                                eprintln!(
-                                    "  {} Cloud checkpoint corrupted, skipping",
-                                    theme::icon_warn()
-                                );
-                                eprintln!("{}", format!("     ({e})").dim());
-                            }
-                        }
-                    }
-                    Ok(None) => {} // No cloud checkpoint available
-                    Err(e) => {
-                        eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
-                        eprintln!("{}", format!("     ({e})").dim());
-                    }
-                }
-            }
-
-            if let Some(ref m) = restored.model {
-                state.model = Some(m.clone());
-                state.cached_pricing = slash_stats::fallback_pricing(m);
-                // M3: Use RuntimeConfig-driven context budget on session restore
-                state.context_budget =
-                    prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
-            }
-
-            // Store learning snapshot for merge after handler returns
-            // (pipeline modules are only accessible in run_chat_repl)
-            if let Some(ref learning_json) = restored.learning_snapshot_json
-                && !learning_json.is_empty()
-            {
-                state.learning_snapshot = Some(learning_json.clone());
-            }
-
-            // Issue 3: Restore conversation history from local journal
-            // restore_history_from_journal already handles session segmentation (only reads after latest session_start)
-            state.history = repl_runtime::restore_history_from_journal(&session_id);
-
-            // Restore last turn event for /turn command
-            if let Ok(events) = session_journal::read_journal(&session_id) {
-                state.last_turn_event = events
-                    .iter()
-                    .rev()
-                    .find(|e| e.event_type == session_journal::JournalEventType::Turn)
-                    .cloned();
-            }
-
-            // Restore plan execution state from workspace snapshot
-            if let Some(ref json) = restored.executing_plan_json {
-                state.executing_plan = serde_json::from_str(json).ok();
-            }
-            if let Some(ref goal) = restored.plan_goal {
-                state.executing_plan_goal = Some(goal.clone());
-                repl_turn::steer_observability_goal(state, goal);
-            }
-            if let Some(ref json) = restored.plan_config_json {
-                state.plan_execution_config = serde_json::from_str(json).ok();
-            }
-            state.plan_execution_rounds = restored.plan_execution_rounds;
-
-            // Restore operator corrections stacked during plan pause
-            state.plan_execution_corrections = restored.plan_corrections.clone();
-
-            // Restore durable task contract if present
-            if let Some(ref json) = restored.contract_json
-                && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
-            {
-                let work_dir = std::env::current_dir().unwrap_or_default();
-                let ingestion_sender = state
-                    .matrix_runtime
-                    .as_ref()
-                    .and_then(|mc| mc.clone_ingestion_sender());
-                let cloud_judge = state
-                    .matrix_runtime
-                    .as_ref()
-                    .and_then(|mc| mc.create_cloud_llm_judge())
-                    .map(|j| {
-                        std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>
-                    });
-                let learning = build_learning_bridge(state);
-
-                let lifecycle = if let Some(pool) = state
-                    .matrix_runtime
-                    .as_ref()
-                    .map(|mc| mc.shared_pool().get().clone())
-                {
-                    durable_bridge::create_cloud_lifecycle_full(
-                        pool,
-                        &work_dir,
-                        ingestion_sender,
-                        Some(&session_id),
-                        state.ingestion_user_id.as_deref(),
-                        cloud_judge,
-                        learning,
-                        None, // no server proxy during session restore
-                    )
-                } else {
-                    let session_dir =
-                        astra_services::session_workspace::workspace_dir_for(&session_id);
-                    durable_bridge::create_local_lifecycle_full(
-                        &session_dir,
-                        &work_dir,
-                        ingestion_sender,
-                        Some(&session_id),
-                        state.ingestion_user_id.as_deref(),
-                        cloud_judge,
-                        learning,
-                        None, // no server proxy during session restore
-                    )
-                };
-                state.durable_task_state = Some(durable_bridge::DurableTaskState {
-                    contract,
-                    lifecycle,
-                    last_report: None,
-                });
-            }
-
-            // Re-initialize journal for the resumed session
-            repl_turn::initialize_journal_pub(state, &session_id);
-            repl_turn::persist_last_session_id(profile, &session_id);
-            if let Ok(mut ws) = astra_services::session_workspace::read_workspace(&session_id) {
-                ws.turn_count = restored.turn_count;
-                ws.total_tokens_in = restored.total_tokens_in;
-                ws.total_tokens_out = restored.total_tokens_out;
-                ws.status = restored.last_status.clone();
-                if let Some(ref branch) = restored.git_branch {
-                    ws.git_branch = Some(branch.clone());
-                }
-                if let Some(ref model) = restored.model {
-                    ws.model = model.clone();
-                }
-                ws.executing_plan_json = restored.executing_plan_json.clone();
-                ws.plan_goal = restored.plan_goal.clone();
-                ws.plan_config_json = restored.plan_config_json.clone();
-                ws.plan_execution_rounds = restored.plan_execution_rounds;
-                ws.contract_json = restored.contract_json.clone();
-                ws.plan_corrections = restored.plan_corrections.clone();
-                ws.last_context_trace = restored.last_context_trace.clone();
-                if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
-                    eprintln!("  ⚠ workspace write failed during resume: {e}");
-                }
-            }
-
-            let source = if restored.restored_from_cloud {
-                "cloud"
-            } else {
-                "local"
-            };
-            eprintln!(
-                "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
-                theme::icon_ok(),
-                &session_id[..8.min(session_id.len())].cyan(),
-                source,
-                restored.turn_count,
-                restored.checkpoint_count,
-            );
-            if let Some(ref trace) = restored.last_context_trace {
-                let preview = trace.preview();
-                if !preview.is_empty() {
-                    eprintln!("    {} {}", "Last trace:".dim(), preview.dim());
-                }
-            }
-
-            // Show paused plan banner
-            if let Some(ref plan) = state.executing_plan {
-                let done = plan.items_done();
-                let total = plan.subtasks.len();
-                let pct = plan.progress_pct();
-                eprintln!(
-                    "  {} Paused plan restored: {}/{} subtasks done ({}%)",
-                    "📋".cyan(),
-                    done,
-                    total,
-                    pct,
-                );
-                if let Some(ref goal) = state.executing_plan_goal {
-                    eprintln!("    {} {}", "Goal:".dim(), goal.as_str().dim());
-                }
-                eprintln!(
-                    "    {}",
-                    "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
-                        .dim()
-                );
-            }
-        }
-        Ok(None) => {
-            // Service didn't find workspace/cloud data, but journal may exist.
-            // Don't reuse the old session_id — server doesn't know it.
-            // Restore history as context for a new session.
-            match session_journal::read_journal(&session_id) {
-                Ok(events) if !events.is_empty() => {
-                    let turn_count = events
-                        .iter()
-                        .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
-                        .count() as u32;
-                    // Restore last turn event for /turn command
-                    state.last_turn_event = events
-                        .iter()
-                        .rev()
-                        .find(|e| e.event_type == session_journal::JournalEventType::Turn)
-                        .cloned();
-                    state.session_id = None; // new session on next message
-                    state.turn = turn_count;
-                    state.history = repl_runtime::restore_history_from_journal(&session_id);
-                    eprintln!(
-                        "  {} Restored {} turns from journal {}. Next message starts a new session.",
-                        theme::icon_ok(),
-                        turn_count,
-                        &session_id[..8.min(session_id.len())].cyan(),
-                    );
-                }
-                _ => {
-                    // Suggest similar session IDs/prefixes
-                    let recent = session_journal::list_sessions_by_time(10).unwrap_or_default();
-                    let suggestions = cli_output::suggest_sessions(arg, &recent);
-                    let refs: Vec<&str> = suggestions.iter().map(|s| s.as_str()).collect();
-                    cli_output::format_not_found_error(
-                        "Session",
-                        arg,
-                        &refs,
-                        Some("/resume to see available sessions"),
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            let hint = if e.to_string().contains("not found") {
-                "Use /resume to see available sessions."
-            } else {
-                "Check connection with /diagnostics, or try a different session."
-            };
-            eprintln!(
-                "  {} {}",
-                theme::icon_err(),
-                format!("Resume failed: {e}").red()
-            );
-            eprintln!("{}", format!("  {hint}").dim());
-        }
+    if let Err(e) = restore_session_into_state(&session_id, profile, state).await {
+        let hint = if e.to_string().contains("not found")
+            || e.to_string()
+                .contains("no resumable workspace/checkpoint state")
+        {
+            "Use /resume to see available sessions."
+        } else {
+            "Check connection with /diagnostics, or try a different session."
+        };
+        eprintln!("  {} {}", theme::icon_err(), e.red());
+        eprintln!("{}", format!("  {hint}").dim());
     }
 }

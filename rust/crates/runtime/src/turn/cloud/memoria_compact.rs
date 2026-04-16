@@ -191,6 +191,21 @@ pub fn read_session_memory_file(path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Resolve the on-disk session memory file for crash/session recovery.
+///
+/// Unlike [`resolve_session_memory_file_options`], this path selection is
+/// independent of `ASTRA_SESSION_MEMORY_COMBINE`: recovery should reuse an
+/// existing session-memory summary whenever it exists, even if normal compaction
+/// is not configured to merge it into prompts.
+pub fn resolve_resume_session_memory_file(session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ASTRA_SESSION_MEMORY_FILE") {
+        return Some(PathBuf::from(path));
+    }
+
+    let cwd = cwd.filter(|s| !s.is_empty())?;
+    Some(claude_code_session_memory_path(cwd, session_id))
+}
+
 /// Resolve on-disk session memory path and combine mode from env + optional workspace cwd.
 ///
 /// - `ASTRA_SESSION_MEMORY_FILE` → explicit file; if set, defaults combine mode to [`Merge`]
@@ -217,12 +232,8 @@ pub fn resolve_session_memory_file_options(
         return (None, SessionMemoryFileCombine::None);
     }
 
-    let Some(cwd) = cwd.filter(|s| !s.is_empty()) else {
-        return (None, env_combine);
-    };
-
     (
-        Some(claude_code_session_memory_path(cwd, session_id)),
+        resolve_resume_session_memory_file(session_id, cwd),
         env_combine,
     )
 }
@@ -1061,7 +1072,51 @@ pub fn compact_with_memoria_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_env_paths<R>(
+        changes: &[(&'static str, Option<&std::path::Path>)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let _lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let previous: Vec<_> = changes
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+
+        for (key, value) in changes {
+            if let Some(path) = value {
+                unsafe {
+                    std::env::set_var(key, path);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+
+        let result = f();
+
+        for (key, previous) in previous {
+            if let Some(previous) = previous {
+                unsafe {
+                    std::env::set_var(key, previous);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+
+        result
+    }
 
     struct MockMemoriaClient {
         memories: Mutex<Vec<MemoriaMemory>>,
@@ -1809,6 +1864,38 @@ mod tests {
             sanitize_path_for_claude_projects("/home/user/proj"),
             "-home-user-proj"
         );
+    }
+
+    #[test]
+    fn resolve_resume_session_memory_file_uses_claude_path_without_combine_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = with_env_paths(
+            &[
+                ("CLAUDE_CONFIG_DIR", Some(dir.path())),
+                ("ASTRA_SESSION_MEMORY_FILE", None),
+            ],
+            || resolve_resume_session_memory_file("sess-123", Some("/tmp/my project")).unwrap(),
+        );
+        assert_eq!(
+            path,
+            dir.path()
+                .join("projects")
+                .join(sanitize_path_for_claude_projects("/tmp/my project"))
+                .join("sess-123")
+                .join("session-memory")
+                .join("summary.md")
+        );
+    }
+
+    #[test]
+    fn resolve_resume_session_memory_file_prefers_explicit_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join("override-summary.md");
+        let path = with_env_paths(
+            &[("ASTRA_SESSION_MEMORY_FILE", Some(override_path.as_path()))],
+            || resolve_resume_session_memory_file("sess-override", Some("/tmp/ignored")).unwrap(),
+        );
+        assert_eq!(path, override_path);
     }
 
     #[tokio::test]

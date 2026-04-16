@@ -320,7 +320,7 @@ async fn run_chat_repl(
         skill_quality_path,
         pinned_skills_path,
         mut shutdown_signal_rx,
-    } = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id).await;
+    } = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id).await?;
 
     // Print startup trace summary if enabled
     tracer.finish();

@@ -269,6 +269,21 @@ pub(super) async fn handle_chat_input(
         }
     };
 
+    if state.session_id.is_none()
+        && let Some(session_id) = state.pending_recovery.clone()
+    {
+        if is_short_continuation_prompt(&line) {
+            if let Err(e) =
+                slash_session::restore_session_into_state(&session_id, ctx.profile, state).await
+            {
+                eprintln!("  {} {}", theme::icon_err(), e.red());
+                return Ok(());
+            }
+        } else {
+            state.pending_recovery = None;
+        }
+    }
+
     eprintln!();
 
     // Consume one-shot resume guidance before building the effective line.
