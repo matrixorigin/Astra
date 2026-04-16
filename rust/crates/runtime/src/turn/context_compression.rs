@@ -11,143 +11,13 @@
 //! 3. **TieredCompaction** — Delegate to the existing tier-based compactor.
 //! 4. **ReactiveCompact** — Emergency compression triggered by API 413 errors.
 
+pub use astra_turn_core::compression_types::{
+    CompressionLayer, CompressionResult, PipelineOutcome, TokenBudget,
+};
+
 use crate::runtime_config::CompressionConfig;
 use serde_json::Value;
 use std::time::{Duration, SystemTime};
-
-// ───────────────────────────── Public types ──────────────────────────────
-
-/// Token budget descriptor passed to the pipeline.
-#[derive(Debug, Clone)]
-pub struct TokenBudget {
-    /// Maximum prompt tokens for the current turn.
-    pub max_prompt_tokens: u64,
-    /// Last measured prompt tokens from the LLM response.
-    pub last_measured_tokens: u64,
-    /// Characters-per-token estimate (for cheap pre-checks).
-    pub chars_per_token: f64,
-}
-
-impl TokenBudget {
-    pub fn is_over_budget(&self) -> bool {
-        self.max_prompt_tokens > 0 && self.last_measured_tokens > self.max_prompt_tokens
-    }
-
-    /// Estimated excess tokens (0 if under budget).
-    pub fn excess_tokens(&self) -> u64 {
-        self.last_measured_tokens
-            .saturating_sub(self.max_prompt_tokens)
-    }
-
-    /// Rough pressure ratio (0.0 = no pressure, 1.0+ = over budget).
-    pub fn pressure(&self) -> f64 {
-        if self.max_prompt_tokens == 0 {
-            return 0.0;
-        }
-        self.last_measured_tokens as f64 / self.max_prompt_tokens as f64
-    }
-}
-
-/// Result of a single compression layer execution.
-#[derive(Debug, Clone)]
-pub struct CompressionResult {
-    /// How many messages were removed or replaced.
-    pub messages_removed: usize,
-    /// Estimated tokens freed (approximate).
-    pub estimated_tokens_freed: u64,
-    /// Human-readable description of what this layer did.
-    pub description: String,
-    /// Turn indices that were compressed/modified by this layer.
-    ///
-    /// Used for drift detection - if important context was in these turns,
-    /// that could explain focus drift.
-    pub affected_turns: Vec<u32>,
-}
-
-impl Default for CompressionResult {
-    fn default() -> Self {
-        Self {
-            messages_removed: 0,
-            estimated_tokens_freed: 0,
-            description: String::new(),
-            affected_turns: Vec::new(),
-        }
-    }
-}
-
-/// Outcome of running the full pipeline.
-#[derive(Debug, Clone)]
-pub struct PipelineOutcome {
-    /// Per-layer results in execution order.
-    pub layer_results: Vec<(String, CompressionResult)>,
-    /// Total estimated tokens freed across all layers.
-    pub total_tokens_freed: u64,
-    /// Whether we believe the budget is now satisfied.
-    pub budget_satisfied: bool,
-}
-
-impl PipelineOutcome {
-    /// Get all turn indices that were affected by compression.
-    ///
-    /// Useful for drift detection - these turns may have lost context.
-    pub fn all_affected_turns(&self) -> Vec<u32> {
-        let mut turns: Vec<u32> = self
-            .layer_results
-            .iter()
-            .flat_map(|(_, result)| result.affected_turns.iter().copied())
-            .collect();
-        turns.sort_unstable();
-        turns.dedup();
-        turns
-    }
-
-    /// Convert to telemetry trace format.
-    pub fn to_compression_trace(
-        &self,
-    ) -> Vec<(
-        String,
-        super::context_assembly_trace::CompressionMethod,
-        u32,
-    )> {
-        use super::context_assembly_trace::CompressionMethod;
-
-        self.layer_results
-            .iter()
-            .map(|(name, result)| {
-                let method = match name.as_str() {
-                    "ToolResultTruncation" => CompressionMethod::ToolResultTruncation,
-                    "DuplicateReadElimination" => CompressionMethod::DuplicateReadElimination,
-                    "TieredCompaction" => CompressionMethod::TieredCompaction,
-                    "ReactiveCompact" => CompressionMethod::ReactiveCompact,
-                    _ => CompressionMethod::TieredCompaction, // fallback
-                };
-                (name.clone(), method, result.estimated_tokens_freed as u32)
-            })
-            .collect()
-    }
-}
-
-// ───────────────────────────── Layer trait ────────────────────────────────
-
-/// A single compression layer.
-///
-/// Layers are ordered from cheapest/least-aggressive to most expensive/aggressive.
-/// The pipeline calls `should_trigger` first; if true, calls `compress`.
-pub trait CompressionLayer: Send + Sync {
-    /// Human-readable name for logging / audit.
-    fn name(&self) -> &str;
-
-    /// Quick estimate of how many tokens this layer *could* free,
-    /// without actually doing the work.
-    fn estimate_savings(&self, messages: &[Value], budget: &TokenBudget) -> u64;
-
-    /// Whether this layer should fire given current pressure.
-    fn should_trigger(&self, messages: &[Value], budget: &TokenBudget) -> bool;
-
-    /// Execute compression, mutating the message list in place.
-    /// Returns metadata about what was done.
-    fn compress(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> CompressionResult;
-}
 
 // ───────────────────────────── Pipeline ──────────────────────────────────
 
@@ -165,6 +35,48 @@ impl Default for CompressionPipeline {
 impl CompressionPipeline {
     pub fn new() -> Self {
         Self { layers: Vec::new() }
+    }
+
+    pub fn add_layer(&mut self, layer: Box<dyn CompressionLayer>) {
+        self.layers.push(layer);
+    }
+
+    /// Run all layers in order, stopping early if budget is satisfied.
+    pub fn run(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> PipelineOutcome {
+        let mut outcome = PipelineOutcome {
+            layer_results: Vec::new(),
+            total_tokens_freed: 0,
+            budget_satisfied: false,
+        };
+
+        for layer in &self.layers {
+            if !layer.should_trigger(messages, budget) {
+                continue;
+            }
+
+            let result = layer.compress(messages, budget);
+            outcome.total_tokens_freed += result.estimated_tokens_freed;
+            outcome
+                .layer_results
+                .push((layer.name().to_string(), result));
+
+            let effective_used = budget
+                .last_measured_tokens
+                .saturating_sub(outcome.total_tokens_freed);
+            if effective_used <= budget.max_prompt_tokens {
+                outcome.budget_satisfied = true;
+                break;
+            }
+        }
+
+        if !outcome.budget_satisfied {
+            let effective_used = budget
+                .last_measured_tokens
+                .saturating_sub(outcome.total_tokens_freed);
+            outcome.budget_satisfied = effective_used <= budget.max_prompt_tokens;
+        }
+
+        outcome
     }
 
     /// Build a pipeline with the default layer stack (hardcoded defaults).
@@ -249,10 +161,6 @@ impl CompressionPipeline {
         p.add_layer(Box::new(ReactiveCompact::new(0.95))); // fixed high threshold
 
         p
-    }
-
-    pub fn add_layer(&mut self, layer: Box<dyn CompressionLayer>) {
-        self.layers.push(layer);
     }
 
     /// Run the pipeline. Each layer fires only if `should_trigger` returns true.

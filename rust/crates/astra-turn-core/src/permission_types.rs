@@ -551,6 +551,44 @@ impl PermissionSyncContext {
     }
 }
 
+/// Result of a permission decision.
+#[derive(Clone, Debug)]
+pub enum PermissionDecision {
+    /// Approve the request, optionally with rules to propagate.
+    Approve { updates: Vec<PermissionUpdate> },
+    /// Deny the request with a reason.
+    Deny { reason: String },
+    /// Escalate to user interaction (only valid for non-background agents).
+    Escalate,
+}
+
+impl PermissionDecision {
+    /// Create an approval decision.
+    pub fn approve() -> Self {
+        Self::Approve {
+            updates: Vec::new(),
+        }
+    }
+
+    /// Create an approval decision with a persistent allow rule.
+    pub fn approve_with_rule(rule: PermissionRule) -> Self {
+        Self::Approve {
+            updates: vec![PermissionUpdate::allow(rule)],
+        }
+    }
+
+    /// Create a denial decision.
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::Deny {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Callback type for permission decision.
+pub type PermissionCallback =
+    Box<dyn Fn(&PermissionRequest, &PermissionSyncContext) -> PermissionDecision + Send + Sync>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

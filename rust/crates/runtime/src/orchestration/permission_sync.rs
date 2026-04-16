@@ -237,48 +237,6 @@ mod tests {
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Result of permission decision.
-#[derive(Clone, Debug)]
-pub enum PermissionDecision {
-    /// Approve the request, optionally with rules to propagate.
-    Approve { updates: Vec<PermissionUpdate> },
-    /// Deny the request with a reason.
-    Deny { reason: String },
-    /// Escalate to user interaction (only valid for non-background agents).
-    Escalate,
-}
-
-impl PermissionDecision {
-    /// Create an approval decision.
-    pub fn approve() -> Self {
-        Self::Approve {
-            updates: Vec::new(),
-        }
-    }
-
-    /// Create an approval decision with a persistent allow rule.
-    pub fn approve_with_rule(rule: PermissionRule) -> Self {
-        Self::Approve {
-            updates: vec![PermissionUpdate::allow(rule)],
-        }
-    }
-
-    /// Create a denial decision.
-    pub fn deny(reason: impl Into<String>) -> Self {
-        Self::Deny {
-            reason: reason.into(),
-        }
-    }
-}
-
-/// Callback type for permission decision.
-///
-/// The callback receives the request and sync context, and should return
-/// a decision. If the callback returns `Escalate`, the handler will
-/// attempt user interaction (if allowed by mode).
-pub type PermissionCallback =
-    Box<dyn Fn(&PermissionRequest, &PermissionSyncContext) -> PermissionDecision + Send + Sync>;
-
 /// Handler for incoming permission requests from child agents.
 ///
 /// The parent agent creates a handler and registers a callback to make

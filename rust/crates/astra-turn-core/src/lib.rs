@@ -23,6 +23,7 @@ pub mod chat_turn_explain_wire;
 pub mod chat_turn_heuristics;
 pub mod chat_turn_payload;
 pub mod compaction_types;
+pub mod compression_types;
 pub mod confidence_contract;
 pub mod context_assembly_trace;
 pub mod edge_executor_id;
