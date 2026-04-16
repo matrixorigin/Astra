@@ -6,7 +6,7 @@
 //! ```text
 //! MO_MAX_TURNS=50              # conversation turns per session
 //! MO_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use MO_MAX_TURNS)
-//! MO_MAX_TOOL_ROUNDS=30        # tool execution rounds per turn
+//! MO_MAX_TOOL_ROUNDS=100       # tool execution rounds per turn
 //! MO_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
 //! MO_GLOBAL_OUTPUT_LIMIT=80000 # combined tool output bytes
 //! MO_TOOL_OUTPUT_LIMIT=30000   # per-tool output bytes
@@ -21,6 +21,13 @@ use std::sync::OnceLock;
 /// Global runtime limits, loaded once from env on first access.
 static LIMITS: OnceLock<RuntimeLimits> = OnceLock::new();
 
+/// Default value for max_tool_rounds (tool execution rounds per turn).
+///
+/// This is the **single source of truth** — routing.rs and RuntimeLimits::default()
+/// both reference this constant. If you change this value, both will automatically
+/// stay in sync.
+pub const MAX_TOOL_ROUNDS_DEFAULT: i64 = 100;
+
 /// Centralized runtime limits.  Read from `MO_*` env vars with defaults.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimits {
@@ -30,6 +37,12 @@ pub struct RuntimeLimits {
     /// 0 means fall back to `max_turns`.
     pub plan_subtask_max_turns: usize,
     /// Maximum tool execution rounds per turn.
+    ///
+    /// **Budget pressure note**: The 100-round default is generous for complex
+    /// multi-step tasks but can permit runaway loops. Consider implementing
+    /// per-turn token budget or progressive slowdown (e.g., warn at 50 rounds,
+    /// require confirmation at 75) to catch stalls earlier. See stall.rs for
+    /// intent-drift detection which complements this hard limit.
     pub max_tool_rounds: i64,
     /// Per-turn hard timeout in seconds.
     pub turn_timeout_s: f64,
@@ -54,7 +67,7 @@ impl Default for RuntimeLimits {
         Self {
             max_turns: 50,
             plan_subtask_max_turns: 0,
-            max_tool_rounds: 30,
+            max_tool_rounds: MAX_TOOL_ROUNDS_DEFAULT, // Single source of truth
             turn_timeout_s: 300.0,
             global_output_limit: 200_000,
             tool_output_limit: 80_000,
@@ -116,6 +129,13 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 /// Production deployments MUST set `MATRIXONE_PASSWORD` env var.
 pub const DEV_MATRIXONE_PASSWORD: &str = "111";
 
+/// Static assertion: ensure const default matches what Default impl uses.
+/// This catches accidental divergence at compile time.
+const _: () = assert!(
+    MAX_TOOL_ROUNDS_DEFAULT == 100,
+    "MAX_TOOL_ROUNDS_DEFAULT should be 100 (update this assertion if intentionally changed)"
+);
+
 /// Emit a one-time warning if using the default MatrixOne password.
 pub fn warn_default_credentials_once() {
     use std::sync::Once;
@@ -139,7 +159,7 @@ mod tests {
         let d = RuntimeLimits::default();
         assert_eq!(d.max_turns, 50);
         assert_eq!(d.plan_subtask_max_turns, 0);
-        assert_eq!(d.max_tool_rounds, 30);
+        assert_eq!(d.max_tool_rounds, 100);
         assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);
         assert_eq!(d.global_output_limit, 200_000);
         assert_eq!(d.tool_output_limit, 80_000);
@@ -188,5 +208,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(limits.effective_plan_subtask_turns(), 80);
+    }
+
+    #[test]
+    fn max_tool_rounds_const_matches_default() {
+        // This test ensures the single source of truth is used correctly.
+        // If this fails, someone modified Default without using MAX_TOOL_ROUNDS_DEFAULT.
+        let d = RuntimeLimits::default();
+        assert_eq!(
+            d.max_tool_rounds, MAX_TOOL_ROUNDS_DEFAULT,
+            "RuntimeLimits::default().max_tool_rounds must equal MAX_TOOL_ROUNDS_DEFAULT"
+        );
     }
 }

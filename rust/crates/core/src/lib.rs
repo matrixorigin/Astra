@@ -17,7 +17,9 @@ pub mod runtime_limits;
 pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
-pub use runtime_limits::{DEV_MATRIXONE_PASSWORD, RuntimeLimits, warn_default_credentials_once};
+pub use runtime_limits::{
+    DEV_MATRIXONE_PASSWORD, MAX_TOOL_ROUNDS_DEFAULT, RuntimeLimits, warn_default_credentials_once,
+};
 pub use sqlx;
 
 /// Base directory name for per-agent git worktrees under `std::env::temp_dir()`.

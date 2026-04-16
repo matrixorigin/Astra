@@ -575,6 +575,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn server_fallback_surfaces_read_file_large_file_guard() {
+        let mut harness = PipelineHarness::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("large.txt"),
+            "0123456789abcdef\n".repeat(6_000),
+        )
+        .unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let mut pipeline = harness.pipeline_with_server_executor(2, Some(&server_exec));
+        let args = json!({"path": "large.txt"});
+        let permitted = PermittedExecution {
+            execution: HeadlessResolvedExecution {
+                id: "call-read-large".into(),
+                name: "read_file".into(),
+                args: args.clone(),
+                result_str: "Error: headless edge protocol: no matching edge result".into(),
+                tool_result_fields: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                early_exit_ms: 0,
+            },
+            idem_key: IdempotencyKey::semantic("read_file", &args),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(executed.is_err, "got: {}", executed.execution.result_str);
+        assert!(
+            executed.execution.result_str.contains("file is too large"),
+            "got: {}",
+            executed.execution.result_str
+        );
+        assert!(
+            executed.execution.result_str.contains("outline=true"),
+            "got: {}",
+            executed.execution.result_str
+        );
+    }
+
+    #[tokio::test]
+    async fn server_fallback_surfaces_bash_timeout_partial_output() {
+        let mut harness = PipelineHarness::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let mut pipeline = harness.pipeline_with_server_executor(4, Some(&server_exec));
+        let args = json!({
+            "command": "printf 'start\\n'; sleep 1; printf 'done\\n'",
+            "timeout": 0.2
+        });
+        let permitted = PermittedExecution {
+            execution: HeadlessResolvedExecution {
+                id: "call-bash-timeout".into(),
+                name: "bash".into(),
+                args: args.clone(),
+                result_str: "Error: headless edge protocol: no matching edge result".into(),
+                tool_result_fields: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                early_exit_ms: 0,
+            },
+            idem_key: IdempotencyKey::semantic("bash", &args),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(executed.is_err, "got: {}", executed.execution.result_str);
+        assert!(
+            executed.execution.result_str.contains("start"),
+            "got: {}",
+            executed.execution.result_str
+        );
+        assert!(
+            executed
+                .execution
+                .result_str
+                .contains("timed out after 0.2s"),
+            "got: {}",
+            executed.execution.result_str
+        );
+        assert!(
+            !executed.execution.result_str.contains("done"),
+            "got: {}",
+            executed.execution.result_str
+        );
+    }
+
     // ── Unknown tool health tracking tests ───────────────────────────
 
     /// Helper: push a server tool_call JSON for an unknown tool and run validate_slot.
