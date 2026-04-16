@@ -126,3 +126,8 @@ pub mod bridge_e2e_hooks;
 pub mod edge_ledger;
 pub mod history_apply;
 pub mod llm_request_dump;
+
+// Phase 20: decision explainer, cloud tool delivery, sse stream host
+pub mod cloud_tool_delivery;
+pub mod decision_explainer;
+pub mod sse_stream_host;
