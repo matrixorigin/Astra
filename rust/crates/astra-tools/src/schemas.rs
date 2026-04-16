@@ -1231,7 +1231,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "input": {"type": "object", "description": "Initial input variables accessible via $input.{key}"}
                     },
-                    "required": ["name", "steps"]
+                    "required": ["steps"]
                 }
             }
         }),

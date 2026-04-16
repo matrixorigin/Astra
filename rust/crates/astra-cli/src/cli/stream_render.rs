@@ -3222,6 +3222,11 @@ impl StreamRenderState {
                 out_lines = out_lines.saturating_add(extra_line.matches('\n').count() + 1);
             }
             self.stderr_lines = self.stderr_lines.saturating_add(out_lines);
+            // In md mode, tool-done lines go to stderr but still occupy terminal rows.
+            // Track them in `lines_written` so subsequent MoveUp-based clearing
+            // accounts for these rows instead of leaving residual text on screen.
+            self.lines_written = self.lines_written.saturating_add(out_lines);
+            self.col = 0;
             return;
         }
         self.stop_tool_stdout_anim();
@@ -3234,8 +3239,13 @@ impl StreamRenderState {
             if !extra_line.is_empty() {
                 let insert_pos = idx + 1;
                 if insert_pos <= g.lines.len() {
-                    g.lines.insert(insert_pos, extra_line);
+                    g.lines.insert(insert_pos, extra_line.clone());
                 }
+                // TerminalRegion may render extra_line in-place, but if the region
+                // overflows its allocated height the extra line spills to stdout.
+                // Track it defensively so MoveUp accounts for the potential new row.
+                let extra_rows = extra_line.matches('\n').count().saturating_add(1);
+                self.lines_written = self.lines_written.saturating_add(extra_rows);
             }
             let lines = g.lines.clone();
             g.region.update(lines);
@@ -3293,6 +3303,12 @@ impl StreamRenderState {
             out_lines = out_lines.saturating_add(extra_line.matches('\n').count() + 1);
         }
         self.stderr_lines = self.stderr_lines.saturating_add(out_lines);
+        // Tool-done lines occupy terminal rows even though they go to stderr.
+        // Track them in `lines_written` so that subsequent MoveUp-based clearing
+        // moves the cursor past these lines instead of leaving residual text.
+        // NOTE: This applies in both normal and md mode (matches tool_done behavior).
+        self.lines_written = self.lines_written.saturating_add(out_lines);
+        self.col = 0;
     }
 
     /// Format tool output for completion UI.
@@ -4160,6 +4176,46 @@ mod tests {
         s.track_output("Let me review the code\n"); // text_delta
         s.track_eprintln(); // ⚡ tool_request: bash
         assert_eq!(s.lines_written, 3);
+    }
+
+    // ── Regression: stderr tool-done lines must be tracked in lines_written ──
+    //
+    // When tool completion output (e.g. "✓ Git diff …") goes to stderr via
+    // `tool_done_inline`, those lines occupy terminal rows. If they are NOT
+    // tracked in `lines_written`, subsequent `MoveUp(lines_written)` will
+    // move the cursor too few rows, leaving residual text on screen — the
+    // "text leakage" bug.
+    //
+    // The fix: both `tool_done` (md-mode branch) and `tool_done_inline`
+    // now increment `lines_written` for stderr output lines.
+
+    #[test]
+    fn tool_done_inline_stderr_lines_counted_in_lines_written() {
+        let mut s = StreamRenderState::with_term_width(80, false, false);
+        s.track_output("Draft review text\n"); // 1 stdout line
+        assert_eq!(s.lines_written, 1);
+
+        // Call actual method: emits 1 stderr line (summary only, no error detail)
+        s.tool_done_inline("bash", &serde_json::json!({}), "success", 100, "done");
+        assert!(
+            s.lines_written >= 2,
+            "lines_written should account for stderr"
+        );
+        assert!(s.stderr_lines >= 1, "stderr_lines should be incremented");
+    }
+
+    #[test]
+    fn tool_done_md_mode_stderr_lines_counted_in_lines_written() {
+        let mut s = StreamRenderState::with_term_width(80, true, false); // md mode
+        s.track_output("Intermediate draft\n"); // 1 stdout line
+        assert_eq!(s.lines_written, 1);
+
+        // Call actual method in md mode
+        s.tool_done(0, "bash", &serde_json::json!({}), "success", 100, "done");
+        assert!(
+            s.lines_written >= 2,
+            "md mode should still track lines_written"
+        );
     }
 
     // ── Partial tag detection ────────────────────────────────────────
