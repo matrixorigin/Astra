@@ -69,7 +69,7 @@ pub(super) async fn handle_health_command(arg: &str, state: &ReplState) {
             );
             let all = tracker.all();
             let mut sorted: Vec<_> = all.iter().collect();
-            sorted.sort_by(|a, b| b.1.total_failures.cmp(&a.1.total_failures));
+            sorted.sort_by_key(|x| std::cmp::Reverse(x.1.total_failures));
             for (name, health) in &sorted {
                 let status_str = if health.deprioritized {
                     "⛔ deprioritized".red().to_string()

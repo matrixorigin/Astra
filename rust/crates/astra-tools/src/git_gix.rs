@@ -1854,7 +1854,7 @@ pub fn git_contributors(project_root: &Path, args: &Value) -> String {
     // Top contributors
     if !author_counts.is_empty() {
         let mut sorted: Vec<_> = author_counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top: Vec<String> = sorted
             .iter()
             .take(10)
@@ -1866,7 +1866,7 @@ pub fn git_contributors(project_root: &Path, args: &Value) -> String {
     // Hot files
     if !file_freq.is_empty() {
         let mut sorted: Vec<_> = file_freq.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_files: Vec<String> = sorted
             .iter()
             .take(10)

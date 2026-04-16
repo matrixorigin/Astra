@@ -865,7 +865,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_summary_disabled_no_summary_injected() {
-        use crate::turn::cloud::summary::tests::MockSummaryClient;
+        use crate::turn::cloud::summary::test_support::MockSummaryClient;
         let client = MockSummaryClient::success("should not appear");
         let msgs = vec![tool(&"a".repeat(5000)), tool(&"b".repeat(100))];
         let cfg = CompactConfig {
@@ -894,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_summary_enabled_injects_summary() {
-        use crate::turn::cloud::summary::tests::MockSummaryClient;
+        use crate::turn::cloud::summary::test_support::MockSummaryClient;
         let client = MockSummaryClient::success("## Task\nFix the bug");
         let msgs: Vec<Value> = (0..5)
             .flat_map(|i| {

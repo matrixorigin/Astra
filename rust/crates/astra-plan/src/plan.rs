@@ -65,7 +65,6 @@ pub enum PlanPhase {
     },
 }
 
-
 impl PlanPhase {
     /// Whether the phase is idle (no active plan work).
     pub fn is_idle(&self) -> bool {

@@ -412,11 +412,10 @@ mod tests {
 
     #[test]
     fn skips_persisted_to_disk_results() {
-        let persisted = format!(
-            "<persisted-output>\nTool `read_file` produced 50000 chars.\n\
+        let persisted = "<persisted-output>\nTool `read_file` produced 50000 chars.\n\
              File: /tmp/sessions/tool_results/c1.txt\n\
              Preview: first 500 chars...\n</persisted-output>"
-        );
+            .to_string();
         let mut messages = vec![
             assistant_with_tools(&[("c1", "read_file")]),
             tool_result("c1", &persisted),

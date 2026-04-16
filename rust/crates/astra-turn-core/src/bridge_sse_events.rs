@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
 use crate::complete::build_turn_complete_event;
-use crate::stream_events::build_edge_tool_call_event;
-use crate::stall::{detect_server_stall, detect_divergence, SERVER_STALL_WINDOW};
 use crate::execution_state::normalize_execution_state;
+use crate::stall::{SERVER_STALL_WINDOW, detect_divergence, detect_server_stall};
+use crate::stream_events::build_edge_tool_call_event;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Stream event protocol version encoding follows the step-protocol convention:
 /// `major * 1000 + minor`. Keep this independent from checkpoint protocol changes.
@@ -559,11 +559,7 @@ fn build_followup_suggestion(
     user_message: &str,
 ) -> Option<crate::followup_suggestion::FollowupSuggestion> {
     let assistant_turn = latest_assistant_turn(bridge_state)?;
-    crate::followup_suggestion::suggest_followup(
-        user_message,
-        &assistant_turn.0,
-        &assistant_turn.1,
-    )
+    crate::followup_suggestion::suggest_followup(user_message, &assistant_turn.0, &assistant_turn.1)
 }
 
 fn latest_assistant_turn(

@@ -392,10 +392,8 @@ pub(super) fn interactive_select(
                 | KeyEvent {
                     code: KeyCode::BackTab,
                     ..
-                } => {
-                    if !filtered.is_empty() && selected > 0 {
-                        selected -= 1;
-                    }
+                } if !filtered.is_empty() && selected > 0 => {
+                    selected -= 1;
                 }
                 KeyEvent {
                     code: KeyCode::Down,
@@ -403,10 +401,8 @@ pub(super) fn interactive_select(
                 }
                 | KeyEvent {
                     code: KeyCode::Tab, ..
-                } => {
-                    if !filtered.is_empty() && selected + 1 < filtered.len() {
-                        selected += 1;
-                    }
+                } if !filtered.is_empty() && selected + 1 < filtered.len() => {
+                    selected += 1;
                 }
                 KeyEvent {
                     code: KeyCode::Enter,

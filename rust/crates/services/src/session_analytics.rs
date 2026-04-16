@@ -45,11 +45,10 @@ pub fn compute_session_stats(session_id: &str, events: &[JournalEvent]) -> Sessi
 
     for event in events {
         match event.event_type {
-            JournalEventType::SessionStart => {
-                if stats.model.is_none() {
-                    stats.model = event.model.clone();
-                }
+            JournalEventType::SessionStart if stats.model.is_none() => {
+                stats.model = event.model.clone();
             }
+            JournalEventType::SessionStart => {}
             JournalEventType::Turn => {
                 stats.turn_count += 1;
                 stats.total_tokens_in += event.tokens_in.unwrap_or(0);
@@ -214,7 +213,7 @@ pub fn compute_tool_profiles(events: &[JournalEvent]) -> Vec<ToolProfile> {
         })
         .collect();
     // Sort by total time descending (heaviest tools first).
-    profiles.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
+    profiles.sort_by_key(|b| std::cmp::Reverse(b.total_ms));
     profiles
 }
 

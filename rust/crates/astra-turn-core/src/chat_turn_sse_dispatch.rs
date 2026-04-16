@@ -1154,8 +1154,11 @@ mod tests {
 
     #[test]
     fn text_done_only_fills_when_full_text_empty() {
-        let mut a = ChatTurnSseAccum::default();
-        a.full_text = "already set".to_string();
+        let a_default = ChatTurnSseAccum::default();
+        let mut a = ChatTurnSseAccum {
+            full_text: "already set".to_string(),
+            ..a_default
+        };
         dispatch_chat_turn_sse_event_block(
             &sse("text_done", ",\"full_text\":\"should not overwrite\""),
             &mut a,

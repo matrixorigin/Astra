@@ -774,7 +774,7 @@ impl UserStats {
             .iter()
             .map(|(k, v)| (k.as_str(), *v))
             .collect();
-        tools.sort_by(|a, b| b.1.cmp(&a.1));
+        tools.sort_by_key(|b| std::cmp::Reverse(b.1));
         tools.truncate(n);
         tools
     }
@@ -814,12 +814,11 @@ impl UserProfileStore {
         };
 
         // Load existing profiles
-        if path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(profiles) = serde_json::from_str::<HashMap<String, UserProfile>>(&data) {
-                    *store.profiles.write_or_recover() = profiles;
-                }
-            }
+        if path.exists()
+            && let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(profiles) = serde_json::from_str::<HashMap<String, UserProfile>>(&data)
+        {
+            *store.profiles.write_or_recover() = profiles;
         }
 
         store
@@ -884,12 +883,12 @@ impl UserProfileStore {
     /// Persist to storage if configured. Uses atomic write (temp + rename)
     /// to avoid data loss on crash.
     fn persist(&self) {
-        if let Some(ref path) = self.storage_path {
-            if let Some(parent) = path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("[user-profile] failed to create storage directory: {e}");
-                    return;
-                }
+        if let Some(ref path) = self.storage_path
+            && let Some(parent) = path.parent()
+        {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("[user-profile] failed to create storage directory: {e}");
+                return;
             }
             let profiles = self.profiles.read_or_recover();
             if let Ok(data) = serde_json::to_string_pretty(&*profiles) {
@@ -1060,9 +1059,11 @@ mod tests {
 
     #[test]
     fn test_preference_tool_check() {
-        let mut prefs = UserPreferences::default();
-        prefs.preferred_tools = vec!["view".to_string(), "grep".to_string()];
-        prefs.blocked_tools = vec!["bash".to_string()];
+        let prefs = UserPreferences {
+            preferred_tools: vec!["view".to_string(), "grep".to_string()],
+            blocked_tools: vec!["bash".to_string()],
+            ..UserPreferences::default()
+        };
 
         assert!(prefs.is_preferred_tool("view"));
         assert!(prefs.is_preferred_tool("grep"));
@@ -1166,9 +1167,11 @@ mod tests {
 
     #[test]
     fn test_language_style_instruction() {
-        let mut style = LanguageStyle::default();
-        style.language = "zh".to_string();
-        style.formality = Formality::Formal;
+        let style = LanguageStyle {
+            language: "zh".to_string(),
+            formality: Formality::Formal,
+            ..LanguageStyle::default()
+        };
 
         let instruction = style.prompt_instruction();
         assert!(instruction.contains("Chinese"));

@@ -298,10 +298,7 @@ pub(super) fn has_open_xml_tag(text: &str) -> bool {
         let close = format!("</{tag}>");
         // Walk all opens; if any isn't matched by a close, we have an open tag.
         let mut search_from = 0;
-        loop {
-            let Some(start) = text[search_from..].find(&open) else {
-                break;
-            };
+        while let Some(start) = text[search_from..].find(&open) {
             let abs = search_from + start;
             if text[abs..].find(&close).is_none() {
                 return true;

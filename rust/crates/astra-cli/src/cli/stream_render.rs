@@ -3701,10 +3701,8 @@ fn format_tool_error_summary(tool: &str, output: &str) -> String {
                 return "File already exists".to_string();
             }
         }
-        "grep" | "glob" => {
-            if output_trimmed.contains("No matches") || output_trimmed.is_empty() {
-                return "No matches found".to_string();
-            }
+        "grep" | "glob" if output_trimmed.contains("No matches") || output_trimmed.is_empty() => {
+            return "No matches found".to_string();
         }
         _ => {}
     }

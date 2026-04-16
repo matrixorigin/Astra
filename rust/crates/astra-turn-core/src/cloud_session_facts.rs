@@ -405,17 +405,22 @@ mod tests {
 
     #[test]
     fn to_injection_format() {
-        let mut facts = SessionFacts::default();
-        facts.turn = 5;
-        facts.estimated_tokens = 25000;
-        facts.active_files.push(FileEntry {
-            path: "src/main.rs".to_string(),
-            last_action: "write".to_string(),
+        let facts = SessionFacts {
             turn: 5,
-        });
-        facts.error_state.total_errors = 1;
-        facts.error_state.last_error = Some("compile error".to_string());
-        facts.blocked_tools = vec!["web_fetch".to_string()];
+            estimated_tokens: 25000,
+            active_files: vec![FileEntry {
+                path: "src/main.rs".to_string(),
+                last_action: "write".to_string(),
+                turn: 5,
+            }],
+            error_state: ErrorFact {
+                total_errors: 1,
+                last_error: Some("compile error".to_string()),
+                ..Default::default()
+            },
+            blocked_tools: vec!["web_fetch".to_string()],
+            ..Default::default()
+        };
 
         let injection = facts.to_injection();
         assert!(injection.contains("Turn 5, ~25K tokens"));

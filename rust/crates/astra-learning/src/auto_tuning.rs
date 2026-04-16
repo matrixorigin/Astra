@@ -769,12 +769,11 @@ impl AutoTuningEngine {
             }
 
             // Check cooldown
-            if let Some(last) = last_triggered.get(&rule.id) {
-                if let Ok(elapsed) = now.duration_since(*last) {
-                    if elapsed < rule.cooldown {
-                        continue;
-                    }
-                }
+            if let Some(last) = last_triggered.get(&rule.id)
+                && let Ok(elapsed) = now.duration_since(*last)
+                && elapsed < rule.cooldown
+            {
+                continue;
             }
 
             // Evaluate trigger
@@ -865,20 +864,18 @@ impl AutoTuningEngine {
                 continue;
             }
 
-            if let Some(rule) = rules.iter().find(|r| r.id == execution.rule_id) {
-                if let Some(ref condition) = rule.rollback_condition {
-                    if self.should_rollback(condition, execution, &aggregator) {
-                        // Restore previous value
-                        if let Some(ref prev) = execution.previous_value {
-                            if let EvolutionAction::AdjustConfig { ref path, .. }
-                            | EvolutionAction::SetConfig { ref path, .. } = execution.action
-                            {
-                                apply_config_value(config, path, prev);
-                                execution.rolled_back = true;
-                                rolled_back.push(execution.rule_id.clone());
-                            }
-                        }
-                    }
+            if let Some(rule) = rules.iter().find(|r| r.id == execution.rule_id)
+                && let Some(ref condition) = rule.rollback_condition
+                && self.should_rollback(condition, execution, &aggregator)
+            {
+                // Restore previous value
+                if let Some(ref prev) = execution.previous_value
+                    && let EvolutionAction::AdjustConfig { ref path, .. }
+                    | EvolutionAction::SetConfig { ref path, .. } = execution.action
+                {
+                    apply_config_value(config, path, prev);
+                    execution.rolled_back = true;
+                    rolled_back.push(execution.rule_id.clone());
                 }
             }
         }
@@ -1111,11 +1108,11 @@ impl AutoTuningEngine {
         let Some(path) = &self.storage_path else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                eprintln!("[auto-tuning] failed to create storage directory: {err}");
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("[auto-tuning] failed to create storage directory: {err}");
+            return;
         }
         let Ok(data) = self.save_aggregator() else {
             return;
@@ -1568,10 +1565,7 @@ impl DelegationOutcomeTracker {
             }
             let pattern = &key[prefix.len()..];
             let rate = stats.success_rate();
-            if best
-                .as_ref()
-                .map_or(true, |(_, best_rate)| rate > *best_rate)
-            {
+            if best.as_ref().is_none_or(|(_, best_rate)| rate > *best_rate) {
                 best = Some((pattern.to_string(), rate));
             }
         }
@@ -1583,11 +1577,11 @@ impl DelegationOutcomeTracker {
         let Some(path) = &self.storage_path else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                eprintln!("[delegation-outcomes] failed to create storage directory: {err}");
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("[delegation-outcomes] failed to create storage directory: {err}");
+            return;
         }
         let data = {
             let map = match self.data.read() {

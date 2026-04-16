@@ -576,7 +576,7 @@ impl PatternLibrary {
         }
 
         // Sort by staleness (oldest first) to prioritize rediscovery
-        exploration_candidates.sort_by(|a, b| a.last_used_at.cmp(&b.last_used_at));
+        exploration_candidates.sort_by_key(|a| a.last_used_at);
 
         // Replace last suggestion with exploration pick
         if suggestions.len() >= limit {
@@ -627,7 +627,7 @@ impl PatternLibrary {
             return suggestions;
         }
 
-        exploration_candidates.sort_by(|a, b| a.last_used_at.cmp(&b.last_used_at));
+        exploration_candidates.sort_by_key(|a| a.last_used_at);
 
         if suggestions.len() >= limit {
             suggestions.pop();

@@ -956,7 +956,7 @@ pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
         }
     }
     let mut items: Vec<_> = heap.into_iter().map(|Reverse(item)| item).collect();
-    items.sort_by(|a, b| b.0.cmp(&a.0)); // newest first by mtime
+    items.sort_by_key(|b| std::cmp::Reverse(b.0)); // newest first by mtime
     Ok(items.into_iter().map(|(_, sid)| sid).collect())
 }
 
@@ -1122,7 +1122,7 @@ pub fn list_sessions_with_meta(limit: usize) -> std::io::Result<Vec<SessionListM
 
     // Extract and sort by newest first
     let mut items: Vec<_> = heap.into_iter().map(|Reverse(item)| item).collect();
-    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     // Enrich with total size and turn count (done after limit for efficiency)
     let result: Vec<SessionListMeta> = items
@@ -1347,7 +1347,7 @@ pub fn find_archivable_sessions(exclude_id: Option<&str>) -> std::io::Result<Vec
             result.push((sid.to_string(), bytes));
         }
     }
-    result.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+    result.sort_by_key(|b| std::cmp::Reverse(b.1)); // largest first
     Ok(result)
 }
 

@@ -2953,7 +2953,7 @@ pub(crate) mod tests {
         // Simulate post-compaction re-injection
         let mut builder = AttachmentBuilder::new();
         let mut skills: Vec<_> = state.skills.invoked.values().collect();
-        skills.sort_by(|a, b| b.invoked_at_turn.cmp(&a.invoked_at_turn));
+        skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
         for skill in skills {
             builder.add_skill(&skill.name, &skill.content);
         }
@@ -6208,7 +6208,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             adapter.reset_turn();
         }
         if let Some(ref mut collector) = state.step_signal_collector {
-            let budget = state.max_turn_input_tokens as u64;
+            let budget = state.max_turn_input_tokens;
             collector.reset(budget);
         }
 

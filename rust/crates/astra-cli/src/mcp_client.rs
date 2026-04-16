@@ -577,6 +577,7 @@ async fn do_elicitation(
                         return Ok(CreateElicitationResult {
                             action: ElicitationAction::Cancel,
                             content: None,
+                            meta: Default::default(),
                         });
                     }
 
@@ -589,6 +590,7 @@ async fn do_elicitation(
                         return Ok(CreateElicitationResult {
                             action: ElicitationAction::Cancel,
                             content: None,
+                            meta: Default::default(),
                         });
                     }
                     if trimmed == "/decline" {
@@ -596,6 +598,7 @@ async fn do_elicitation(
                         return Ok(CreateElicitationResult {
                             action: ElicitationAction::Decline,
                             content: None,
+                            meta: Default::default(),
                         });
                     }
 
@@ -628,6 +631,7 @@ async fn do_elicitation(
                 Ok(CreateElicitationResult {
                     action: ElicitationAction::Accept,
                     content: Some(serde_json::Value::Object(data)),
+                    meta: Default::default(),
                 })
             })
             .await
@@ -662,6 +666,7 @@ async fn do_elicitation(
                     return Ok(CreateElicitationResult {
                         action: ElicitationAction::Cancel,
                         content: None,
+                        meta: Default::default(),
                     });
                 }
 
@@ -671,18 +676,21 @@ async fn do_elicitation(
                     Ok(CreateElicitationResult {
                         action: ElicitationAction::Cancel,
                         content: None,
+                        meta: Default::default(),
                     })
                 } else if trimmed == "/decline" {
                     eprintln!("  ╰─ Declined");
                     Ok(CreateElicitationResult {
                         action: ElicitationAction::Decline,
                         content: None,
+                        meta: Default::default(),
                     })
                 } else {
                     eprintln!("  ╰─ Accepted");
                     Ok(CreateElicitationResult {
                         action: ElicitationAction::Accept,
                         content: None,
+                        meta: Default::default(),
                     })
                 }
             })
@@ -3122,6 +3130,7 @@ mcp_servers:
 
         let accept = CreateElicitationResult {
             action: ElicitationAction::Accept,
+            meta: Default::default(),
             content: Some(serde_json::json!({"name": "test"})),
         };
         assert!(matches!(accept.action, ElicitationAction::Accept));
@@ -3130,12 +3139,14 @@ mcp_servers:
         let decline = CreateElicitationResult {
             action: ElicitationAction::Decline,
             content: None,
+            meta: Default::default(),
         };
         assert!(matches!(decline.action, ElicitationAction::Decline));
 
         let cancel = CreateElicitationResult {
             action: ElicitationAction::Cancel,
             content: None,
+            meta: Default::default(),
         };
         assert!(matches!(cancel.action, ElicitationAction::Cancel));
     }
@@ -3146,6 +3157,7 @@ mcp_servers:
 
         let result = CreateElicitationResult {
             action: ElicitationAction::Accept,
+            meta: Default::default(),
             content: Some(serde_json::json!({"age": 25, "name": "Alice"})),
         };
         let json = serde_json::to_string(&result).unwrap();

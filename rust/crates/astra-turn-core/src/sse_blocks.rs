@@ -18,10 +18,7 @@ fn next_event_boundary(s: &str) -> Option<(usize, usize)> {
 /// Leaves a trailing partial event in `buf` for the next chunk or final flush.
 pub fn drain_complete_sse_event_blocks(buf: &mut String) -> Vec<String> {
     let mut out = Vec::new();
-    loop {
-        let Some((end, sep_len)) = next_event_boundary(buf) else {
-            break;
-        };
+    while let Some((end, sep_len)) = next_event_boundary(buf) {
         let block = buf[..end].to_string();
         buf.drain(..end + sep_len);
         out.push(block);

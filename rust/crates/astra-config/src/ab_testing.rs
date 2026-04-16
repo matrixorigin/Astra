@@ -359,11 +359,12 @@ pub enum AggregationType {
 }
 
 /// Traffic allocation strategy.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum TrafficAllocation {
     /// Percentage-based (use variant traffic_percentage).
     Percentage,
     /// Hash-based (deterministic by user ID).
+    #[default]
     HashBased,
     /// Round-robin.
     RoundRobin,
@@ -371,16 +372,11 @@ pub enum TrafficAllocation {
     Manual,
 }
 
-impl Default for TrafficAllocation {
-    fn default() -> Self {
-        Self::HashBased
-    }
-}
-
 /// Experiment lifecycle status.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub enum ExperimentStatus {
     /// Experiment is defined but not started.
+    #[default]
     Draft,
     /// Experiment is actively running.
     Running,
@@ -390,12 +386,6 @@ pub enum ExperimentStatus {
     Completed,
     /// Experiment was cancelled.
     Cancelled,
-}
-
-impl Default for ExperimentStatus {
-    fn default() -> Self {
-        Self::Draft
-    }
 }
 
 // ─── Experiment Builder ──────────────────────────────────────────────────────
@@ -935,28 +925,28 @@ impl ExperimentAnalyzer {
         let control_id = experiment.control().map(|v| v.id.clone());
         let mut comparisons = Vec::new();
 
-        if let Some(ref control_id) = control_id {
-            if let Some(control_stats) = variant_stats.get(control_id) {
-                for variant in &experiment.variants {
-                    if variant.is_control {
-                        continue;
-                    }
-                    if let Some(treatment_stats) = variant_stats.get(&variant.id) {
-                        for metric in &experiment.metrics {
-                            if let (Some(control_metric), Some(treatment_metric)) = (
-                                control_stats.metric_stats.get(&metric.name),
-                                treatment_stats.metric_stats.get(&metric.name),
-                            ) {
-                                let comparison = Self::compare_metrics(
-                                    &variant.id,
-                                    control_id,
-                                    &metric.name,
-                                    control_metric,
-                                    treatment_metric,
-                                    metric.lower_is_better,
-                                );
-                                comparisons.push(comparison);
-                            }
+        if let Some(ref control_id) = control_id
+            && let Some(control_stats) = variant_stats.get(control_id)
+        {
+            for variant in &experiment.variants {
+                if variant.is_control {
+                    continue;
+                }
+                if let Some(treatment_stats) = variant_stats.get(&variant.id) {
+                    for metric in &experiment.metrics {
+                        if let (Some(control_metric), Some(treatment_metric)) = (
+                            control_stats.metric_stats.get(&metric.name),
+                            treatment_stats.metric_stats.get(&metric.name),
+                        ) {
+                            let comparison = Self::compare_metrics(
+                                &variant.id,
+                                control_id,
+                                &metric.name,
+                                control_metric,
+                                treatment_metric,
+                                metric.lower_is_better,
+                            );
+                            comparisons.push(comparison);
                         }
                     }
                 }
@@ -1157,10 +1147,10 @@ impl ExperimentAnalyzer {
             .map(|c| c.treatment_id.clone())
             .collect();
 
-        if improving_variants.len() == 1 {
-            if let Some(variant_id) = improving_variants.into_iter().next() {
-                return Recommendation::RolloutTreatment { variant_id };
-            }
+        if improving_variants.len() == 1
+            && let Some(variant_id) = improving_variants.into_iter().next()
+        {
+            return Recommendation::RolloutTreatment { variant_id };
         }
 
         Recommendation::NeedsManualReview

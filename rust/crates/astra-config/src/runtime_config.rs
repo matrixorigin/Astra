@@ -747,19 +747,19 @@ impl RuntimeConfig {
         // User-level config
         if let Some(home) = dirs::home_dir() {
             let user_config = home.join(".astra/config/runtime.toml");
-            if let Ok(content) = std::fs::read_to_string(&user_config) {
-                if let Ok(user) = toml::from_str::<RuntimeConfig>(&content) {
-                    config = config.merge(user);
-                }
+            if let Ok(content) = std::fs::read_to_string(&user_config)
+                && let Ok(user) = toml::from_str::<RuntimeConfig>(&content)
+            {
+                config = config.merge(user);
             }
         }
 
         // Project-level config
         let project_config = PathBuf::from(".astra/config/runtime.toml");
-        if let Ok(content) = std::fs::read_to_string(&project_config) {
-            if let Ok(project) = toml::from_str::<RuntimeConfig>(&content) {
-                config = config.merge(project);
-            }
+        if let Ok(content) = std::fs::read_to_string(&project_config)
+            && let Ok(project) = toml::from_str::<RuntimeConfig>(&content)
+        {
+            config = config.merge(project);
         }
 
         // Environment overrides
@@ -1164,25 +1164,25 @@ impl RuntimeConfig {
 
     /// Apply environment variable overrides.
     fn apply_env_overrides(&mut self) {
-        if let Ok(val) = std::env::var("MO_MAX_HISTORY_TOKENS") {
-            if let Ok(n) = val.parse() {
-                self.compression.max_history_tokens = n;
-            }
+        if let Ok(val) = std::env::var("MO_MAX_HISTORY_TOKENS")
+            && let Ok(n) = val.parse()
+        {
+            self.compression.max_history_tokens = n;
         }
-        if let Ok(val) = std::env::var("MO_COMPRESSION_THRESHOLD") {
-            if let Ok(n) = val.parse() {
-                self.compression.compression_threshold = n;
-            }
+        if let Ok(val) = std::env::var("MO_COMPRESSION_THRESHOLD")
+            && let Ok(n) = val.parse()
+        {
+            self.compression.compression_threshold = n;
         }
-        if let Ok(val) = std::env::var("MO_RETRIEVAL_TOP_K") {
-            if let Ok(n) = val.parse() {
-                self.memory.retrieval_top_k = n;
-            }
+        if let Ok(val) = std::env::var("MO_RETRIEVAL_TOP_K")
+            && let Ok(n) = val.parse()
+        {
+            self.memory.retrieval_top_k = n;
         }
-        if let Ok(val) = std::env::var("MO_MAX_TURN_INPUT_TOKENS") {
-            if let Ok(n) = val.parse() {
-                self.token_budget.max_turn_input_tokens = n;
-            }
+        if let Ok(val) = std::env::var("MO_MAX_TURN_INPUT_TOKENS")
+            && let Ok(n) = val.parse()
+        {
+            self.token_budget.max_turn_input_tokens = n;
         }
         if let Ok(val) = std::env::var("MO_CAPTURE_TRACES") {
             self.telemetry.capture_context_traces = val == "1" || val.to_lowercase() == "true";

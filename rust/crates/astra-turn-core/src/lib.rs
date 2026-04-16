@@ -5,7 +5,11 @@
 //! tested and compiled independently.
 
 // Allow pre-existing patterns from runtime extraction; fix incrementally.
-#![allow(clippy::collapsible_if, clippy::type_complexity, clippy::unnecessary_map_or)]
+#![allow(
+    clippy::collapsible_if,
+    clippy::type_complexity,
+    clippy::unnecessary_map_or
+)]
 
 pub mod agent_progress_ui;
 pub mod agentic_recursion_guard;
@@ -34,6 +38,7 @@ pub mod hook_plans;
 pub mod interruption;
 pub mod microcompact;
 pub mod observer;
+pub mod parallel_tool_exec;
 pub mod persist_inputs;
 pub mod prepare_turn_explain_text;
 pub mod refresh;
@@ -46,6 +51,7 @@ pub mod sse_blocks;
 pub mod sse_edge_stderr_lines;
 pub mod state;
 pub mod stop_hooks;
+pub mod streaming_tool_exec;
 pub mod tail_persist;
 pub mod task;
 pub mod tool_args_repair;
@@ -57,8 +63,6 @@ pub mod tool_selection;
 pub mod unconsumed;
 pub mod view;
 pub mod xml_tool_call_fallback;
-pub mod parallel_tool_exec;
-pub mod streaming_tool_exec;
 
 // Phase 15: turn leaf modules + cloud session modules
 pub mod action_compensation;
@@ -102,3 +106,12 @@ pub mod edge_prompt_context;
 pub mod hydrate_reflect;
 pub mod stall;
 pub mod tool_registry_state;
+
+// Phase 17: telemetry, replay, edge profile
+pub mod activity;
+pub mod agentic_turn_telemetry;
+pub mod chat_turn_edge_profile;
+pub mod cloud_compact_prompt;
+pub mod cloud_summary;
+pub mod session_replay_harness;
+pub mod sse_data_lines;

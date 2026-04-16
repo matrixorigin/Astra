@@ -479,7 +479,7 @@ impl StepRecorder {
                 (name.clone(), avg)
             })
             .collect();
-        slowest_tools.sort_by(|a, b| b.1.cmp(&a.1));
+        slowest_tools.sort_by_key(|b| std::cmp::Reverse(b.1));
         slowest_tools.truncate(5);
 
         RecorderSummary {

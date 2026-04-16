@@ -378,7 +378,7 @@ pub(super) async fn handle_skill_command(
                     if score > 0 { Some((m, score)) } else { None }
                 })
                 .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|x| std::cmp::Reverse(x.1));
 
             eprintln!(
                 "\n  {} '{}' {}",
@@ -2167,7 +2167,7 @@ async fn create_skill_from_session(arg: &str, state: &mut super::ReplState) -> R
 
     // Sort by frequency, take top tools
     let mut tool_ranked: Vec<_> = tool_freq.into_iter().collect();
-    tool_ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    tool_ranked.sort_by_key(|x| std::cmp::Reverse(x.1));
     let top_tools: Vec<String> = tool_ranked.iter().take(10).map(|t| t.0.clone()).collect();
 
     // 2. Collect user intents (first line of each user input)
@@ -2370,7 +2370,7 @@ pub(crate) fn derive_triggers(name: &str, intents: &[String]) -> Vec<String> {
 
     // Take top 3 frequent words as triggers
     let mut ranked: Vec<_> = word_freq.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|x| std::cmp::Reverse(x.1));
     for (word, _) in ranked.iter().take(3) {
         if !triggers.contains(word) {
             triggers.push(word.clone());

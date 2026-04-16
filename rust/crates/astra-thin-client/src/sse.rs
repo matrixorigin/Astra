@@ -40,10 +40,7 @@ impl SseParser {
 
     fn drain_complete_events(&mut self) -> Result<Vec<StreamEvent>, ThinClientError> {
         let mut out = Vec::new();
-        loop {
-            let Some(sep) = find_event_separator(&self.buf) else {
-                break;
-            };
+        while let Some(sep) = find_event_separator(&self.buf) {
             let (event_bytes, rest_start) = sep;
             let block = &self.buf[..event_bytes];
             let text = std::str::from_utf8(block)

@@ -71,7 +71,7 @@ impl LatencyTracker {
             sum_us,
             min_us: if count > 0 { min_us } else { 0 },
             max_us,
-            avg_us: if count > 0 { sum_us / count } else { 0 },
+            avg_us: sum_us.checked_div(count).unwrap_or(0),
         }
     }
 
