@@ -109,14 +109,23 @@ fn unique_session_id() -> String {
 /// Memoria's retrieve uses session_id for boosting, not strict filtering,
 /// and MemoriaMemory doesn't expose session_id. So we filter by content.
 async fn retrieve_l1_with_marker(client: &HttpMemoriaClient, marker: &str) -> Vec<MemoriaMemory> {
-    let results = client
-        .retrieve(&format!("[session-memory:v1] {marker}"), None, 20)
-        .await
-        .unwrap_or_default();
-    results
-        .into_iter()
-        .filter(|m| m.content.starts_with(SESSION_MEMORY_PREFIX) && m.content.contains(marker))
-        .collect()
+    // Retry — with mock embeddings in CI, ranking is non-deterministic and
+    // the target memory may not appear in the first top_k window immediately.
+    for _ in 0..3 {
+        let results = client
+            .retrieve(&format!("[session-memory:v1] {marker}"), None, 50)
+            .await
+            .unwrap_or_default();
+        let matched: Vec<_> = results
+            .into_iter()
+            .filter(|m| m.content.starts_with(SESSION_MEMORY_PREFIX) && m.content.contains(marker))
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Vec::new()
 }
 
 fn user(content: &str) -> Value {

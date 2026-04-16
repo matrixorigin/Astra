@@ -35,6 +35,7 @@ astra-core.workspace = true
 astra-pipeline.workspace = true
 astra-sandbox.workspace = true
 astra-skills.workspace = true
+astra-server-types.workspace = true
 astra-turn-types.workspace = true
 astra-services.workspace = true
 astra-tools.workspace = true
