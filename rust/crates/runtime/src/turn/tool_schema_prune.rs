@@ -171,7 +171,7 @@ pub fn pin_invoked_tool_schemas(
     tool_results: &[Value],
     all_schemas: &[Value],
 ) -> u32 {
-    let selected_names: HashSet<String> = selected
+    let mut selected_names: HashSet<String> = selected
         .iter()
         .filter_map(|s| schema_tool_name(s).map(String::from))
         .collect();
@@ -184,6 +184,7 @@ pub fn pin_invoked_tool_schemas(
                 .iter()
                 .find(|s| schema_tool_name(s) == Some(name))
         {
+            selected_names.insert(name.to_string());
             selected.push(schema.clone());
             report.tools_selected.push(name.to_string());
             report.selected_count += 1;
@@ -426,5 +427,40 @@ mod tests {
 
         assert_eq!(pinned, 0);
         assert_eq!(selected.len(), 1);
+    }
+
+    /// Regression: when the same tool appears in multiple tool_results (e.g.
+    /// git_diff called 12 times), pin_invoked_tool_schemas must add the schema
+    /// only once. Previously, `selected_names` was a snapshot that was never
+    /// updated, causing N duplicate schemas → LLM 400 "function name duplicated".
+    #[test]
+    fn pin_deduplicates_same_tool_in_multiple_results() {
+        let all = vec![
+            make_tool_schema("bash", "run", false),
+            make_tool_schema("git_diff", "diff", false),
+        ];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        // 12 tool results for the same tool (different args, but same name)
+        let results: Vec<Value> = (0..12).map(|_| json!({"name": "git_diff"})).collect();
+
+        let pinned = pin_invoked_tool_schemas(&mut selected, &mut report, &results, &all);
+
+        assert_eq!(pinned, 1, "should pin git_diff exactly once");
+        assert_eq!(selected.len(), 2, "bash + git_diff");
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|n| *n == "git_diff")
+                .count(),
+            1,
+            "git_diff should appear once in report"
+        );
     }
 }
