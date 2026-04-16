@@ -132,6 +132,23 @@ impl RegisteredSkillType {
     }
 }
 
+fn validate_remote_url(raw_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|err| format!("invalid remote_url '{raw_url}': {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "remote_url must use http:// or https:// (found '{other}')"
+            ));
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err("remote_url must include a valid host".to_string());
+    }
+    Ok(())
+}
+
 /// `list_skills` row projection — excludes `skill_definition` (large JSON); use `get_skill` for body.
 const SKILL_REGISTRY_LIST_SELECT: &str = "\
     skill_id, skill_name, version, description, \
@@ -270,12 +287,8 @@ impl SkillService for DatabaseSkillService {
                         "remote skills must not provide skill_code",
                     ));
                 }
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "remote_url must start with http:// or https://",
-                    ));
-                }
+                validate_remote_url(url)
+                    .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg))?;
             }
         }
 
@@ -623,12 +636,8 @@ impl SkillService for DatabaseSkillService {
                         "remote skills require remote_url",
                     ));
                 };
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "remote_url must start with http:// or https://",
-                    ));
-                }
+                validate_remote_url(url)
+                    .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg))?;
             }
         }
 
@@ -659,10 +668,11 @@ impl SkillService for DatabaseSkillService {
             .map(|d| serde_json::to_string(d).unwrap_or_else(|_| "[]".into()));
         let mut manifest_map = match request.manifest.clone() {
             Some(serde_json::Value::Object(map)) => map,
-            Some(value) => {
-                let mut map = serde_json::Map::new();
-                map.insert("metadata".to_string(), value);
-                map
+            Some(_) => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "manifest must be a JSON object",
+                ));
             }
             None => serde_json::Map::new(),
         };
@@ -996,6 +1006,19 @@ mod tests {
             Some(RegisteredSkillType::Remote)
         );
         assert!(RegisteredSkillType::parse("invalid").is_none());
+    }
+
+    #[test]
+    fn validate_remote_url_accepts_http_https_with_host() {
+        assert!(validate_remote_url("https://example.com/skills/run").is_ok());
+        assert!(validate_remote_url("http://127.0.0.1:8080/execute").is_ok());
+    }
+
+    #[test]
+    fn validate_remote_url_rejects_invalid_or_unsupported_urls() {
+        assert!(validate_remote_url("http://").is_err());
+        assert!(validate_remote_url("https://").is_err());
+        assert!(validate_remote_url("ftp://example.com/execute").is_err());
     }
 
     #[test]
