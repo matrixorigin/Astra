@@ -19,37 +19,10 @@ use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::semantic_dedup::SemanticDedup;
 
-/// Terminal styling for one stderr line (host maps to crossterm etc.).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeadlessStderrStyle {
-    Dim,
-    Red,
-    Green,
-    Yellow,
-    /// File / `diff --git` headers (terminal preview).
-    CyanBold,
-    Magenta,
-    /// Unified diff `+` line (not `+++`).
-    DiffAdd,
-    /// Unified diff `-` line (not `---`).
-    DiffRemove,
-    /// Unified diff context (` `) and `\ No newline…` meta lines.
-    DiffContext,
-    /// Read file body / neutral code line.
-    Normal,
-}
-
-/// Host sink for headless tool round stderr (noop when CLI passes [`NoopHeadlessTerminal`]).
-pub trait HeadlessRoundTerminal: Send {
-    fn emit_line(&mut self, style: HeadlessStderrStyle, line: String);
-}
-
-/// No-op implementation (e.g. `--quiet`).
-pub struct NoopHeadlessTerminal;
-
-impl HeadlessRoundTerminal for NoopHeadlessTerminal {
-    fn emit_line(&mut self, _: HeadlessStderrStyle, _: String) {}
-}
+// Re-export headless types from turn-core (canonical definitions live there).
+pub use astra_turn_core::headless_types::{
+    HeadlessRoundTerminal, HeadlessStderrStyle, NoopHeadlessTerminal,
+};
 
 pub(crate) type PermissionSyncHandle = std::sync::Arc<
     tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>,

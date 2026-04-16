@@ -1,8 +1,12 @@
 //! Shared interaction-mode types extracted from `agentic_loop_host`.
+//!
+//! These live in turn-core so that modules like `chat_turn_heuristics` and
+//! `stop_hooks_yaml` can reference them without depending on the full runtime.
 
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Canonical name of the ask-user tool.
 pub const ASK_USER_TOOL_NAME: &str = "ask_user";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +109,7 @@ impl TurnInteractionPolicy {
     }
 }
 
+/// Returns the set of tool names that should be restricted for the given interaction mode.
 #[must_use]
 pub fn interaction_scoped_tool_restrictions(mode: TurnInteractionMode) -> HashSet<String> {
     if mode.allows_ask_user() {
@@ -114,6 +119,7 @@ pub fn interaction_scoped_tool_restrictions(mode: TurnInteractionMode) -> HashSe
     }
 }
 
+/// Whether a tool invocation counts as factual evidence (all tools except ask_user).
 #[must_use]
 pub fn tool_counts_as_factual_evidence(tool_name: &str) -> bool {
     tool_name != ASK_USER_TOOL_NAME

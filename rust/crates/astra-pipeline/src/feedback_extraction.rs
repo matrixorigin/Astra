@@ -370,12 +370,14 @@ mod tests {
 
     #[test]
     fn heuristic_complex_returns_none() {
-        assert!(heuristic_extract(
-            "the approach you took doesn't work well for this codebase",
-            "correction",
-            0.7,
-        )
-        .is_none());
+        assert!(
+            heuristic_extract(
+                "the approach you took doesn't work well for this codebase",
+                "correction",
+                0.7,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -390,12 +392,14 @@ mod tests {
 
     #[test]
     fn heuristic_instead_mid_sentence_not_matched() {
-        assert!(heuristic_extract(
-            "I want to understand the code instead of just running it",
-            "correction",
-            0.7,
-        )
-        .is_none());
+        assert!(
+            heuristic_extract(
+                "I want to understand the code instead of just running it",
+                "correction",
+                0.7,
+            )
+            .is_none()
+        );
     }
 
     #[test]

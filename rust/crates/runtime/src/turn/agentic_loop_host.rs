@@ -62,12 +62,12 @@ use crate::pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::semantic_dedup::SemanticDedup;
 use crate::tool_registry::SelectionReport;
-use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::sse_stream_host::EdgeToolExecResult;
 use crate::turn::turn_guard::TurnGuard;
+use astra_turn_core::headless_types::HeadlessStderrStyle;
 use tokio_util::sync::CancellationToken;
 
 // ─── Host turn result ────────────────────────────────────────────────────────
