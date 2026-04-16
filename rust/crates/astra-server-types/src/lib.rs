@@ -397,6 +397,165 @@ pub struct AdminUserRoleResponse {
 }
 
 #[doc(hidden)]
+pub fn default_ws_max_candidates() -> u32 {
+    25
+}
+
+/// Messages sent from browser client to server.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum WsClientMessage {
+    /// Authenticate with a Bearer token (must be first message).
+    #[serde(rename = "auth")]
+    Auth { token: String },
+
+    /// Send a chat message to the agent.
+    #[serde(rename = "message")]
+    ChatMessage {
+        content: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        skill_search: Option<astra_core::SkillSearchSettings>,
+        #[serde(default)]
+        context: Option<serde_json::Map<String, serde_json::Value>>,
+        #[serde(default = "default_ws_max_candidates")]
+        max_candidates: u32,
+        #[serde(default)]
+        explain: bool,
+        #[serde(default)]
+        plan_subtask_id: Option<String>,
+        #[serde(default)]
+        is_plan_subtask: Option<bool>,
+    },
+
+    /// Cancel an active run.
+    #[serde(rename = "cancel_run")]
+    CancelRun { run_id: String },
+
+    /// Pause an active run.
+    #[serde(rename = "pause_run")]
+    PauseRun { run_id: String },
+
+    /// Resume a paused run.
+    #[serde(rename = "resume_run")]
+    ResumeRun { run_id: String },
+
+    /// Respond to a tool approval request.
+    #[serde(rename = "tool_approval")]
+    ToolApproval {
+        request_id: String,
+        approved: bool,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+
+    /// Client heartbeat.
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+/// Messages sent from server to browser client.
+#[derive(Serialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum WsServerMessage {
+    /// Authentication succeeded.
+    #[serde(rename = "auth_ok")]
+    AuthOk { user_id: String, username: String },
+
+    /// Authentication failed.
+    #[serde(rename = "auth_error")]
+    AuthError { message: String },
+
+    /// Session/run identifiers for the active websocket chat stream.
+    #[serde(rename = "session_info")]
+    SessionInfo {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+
+    /// Agentic run started — client should track this run_id.
+    #[serde(rename = "run_started")]
+    RunStarted {
+        run_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        explain: Option<serde_json::Value>,
+    },
+
+    /// Agentic run finished (completed or failed).
+    #[serde(rename = "run_finished")]
+    RunFinished {
+        run_id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Run was cancelled by client request.
+    #[serde(rename = "run_cancelled")]
+    RunCancelled { run_id: String },
+
+    /// Run was paused.
+    #[serde(rename = "run_paused")]
+    RunPaused { run_id: String },
+
+    /// Run was resumed.
+    #[serde(rename = "run_resumed")]
+    RunResumed { run_id: String },
+
+    /// Tool requires user approval before execution.
+    #[serde(rename = "tool_approval_request")]
+    ToolApprovalRequest {
+        request_id: String,
+        tool: String,
+        args: serde_json::Value,
+    },
+
+    /// Tool execution started on server.
+    #[serde(rename = "tool_execution_started")]
+    ToolExecutionStarted { call_id: String, tool: String },
+
+    /// Incremental output from a running tool.
+    #[serde(rename = "tool_output_delta")]
+    ToolOutputDelta { call_id: String, content: String },
+
+    /// Tool execution completed on server.
+    #[serde(rename = "tool_execution_completed")]
+    ToolExecutionCompleted { call_id: String, success: bool },
+
+    /// Error during processing.
+    #[serde(rename = "error")]
+    Error {
+        message: String,
+        code: String,
+        retryable: bool,
+    },
+
+    /// Server heartbeat response.
+    #[serde(rename = "pong")]
+    Pong,
+
+    /// Connection is being closed.
+    #[serde(rename = "closing")]
+    Closing { reason: String },
+}
+
+/// Query params for WebSocket upgrade — allows token in URL for browser compat.
+#[derive(Deserialize, Default)]
+pub struct WsUpgradeQuery {
+    /// Optional Bearer token (alternative to sending auth message).
+    pub token: Option<String>,
+    /// Optional session ID to request on the first chat turn.
+    pub session_id: Option<String>,
+}
+
+#[doc(hidden)]
 pub fn merge_plan_subtask_context(
     mut context: Option<serde_json::Map<String, serde_json::Value>>,
     plan_subtask_id: Option<String>,
