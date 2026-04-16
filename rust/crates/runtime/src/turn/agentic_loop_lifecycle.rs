@@ -14,6 +14,7 @@ use super::interruption::{
     InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
 };
 use super::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
+use crate::orchestration::permission_sync::PermissionResponseMessaging;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TurnIterationPrep {
