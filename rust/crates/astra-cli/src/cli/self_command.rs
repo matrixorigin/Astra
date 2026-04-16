@@ -2428,6 +2428,7 @@ mod tests {
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 }]),
                 budget_used: Some(7000),
                 budget_pressure: Some(0.7),
@@ -2579,6 +2580,7 @@ mod tests {
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -2589,6 +2591,7 @@ mod tests {
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 },
             ]);
             if !bash_ok {
@@ -2726,6 +2729,7 @@ mod tests {
                         output_bytes: None,
                         args_preview: None,
                         result_preview: None,
+                        file_path: None,
                     },
                     ToolCallRecord {
                         name: "rg".to_string(),
@@ -2736,6 +2740,7 @@ mod tests {
                         output_bytes: None,
                         args_preview: None,
                         result_preview: None,
+                        file_path: None,
                     },
                 ]),
                 budget_used: Some(9100),
@@ -3012,6 +3017,7 @@ mod tests {
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 }]),
                 budget_used: Some(9100),
                 budget_pressure: Some(0.91),

@@ -108,24 +108,34 @@ fn unique_session_id() -> String {
 /// Retrieve L1 for a specific session by content marker.
 /// Memoria's retrieve uses session_id for boosting, not strict filtering,
 /// and MemoriaMemory doesn't expose session_id. So we filter by content.
-async fn retrieve_l1_with_marker(client: &HttpMemoriaClient, marker: &str) -> Vec<MemoriaMemory> {
-    // Retry — with mock embeddings in CI, ranking is non-deterministic and
-    // the target memory may not appear in the first top_k window immediately.
+async fn retrieve_l1_with_marker(
+    client: &HttpMemoriaClient,
+    marker: &str,
+    session_id: &str,
+) -> Vec<MemoriaMemory> {
+    // Retry briefly: MatrixOne snapshot isolation may delay visibility of just-committed rows.
+    // Note: session_id + filter_session=true ensures strict session scoping
+    // (Memoria #185). The content marker filter below is a secondary safeguard.
     for _ in 0..3 {
         let results = client
-            .retrieve(&format!("[session-memory:v1] {marker}"), None, 50)
+            .retrieve_ext(
+                &format!("[session-memory:v1] {marker}"),
+                Some(session_id),
+                20,
+                true,
+            )
             .await
             .unwrap_or_default();
-        let matched: Vec<_> = results
+        let filtered: Vec<_> = results
             .into_iter()
             .filter(|m| m.content.starts_with(SESSION_MEMORY_PREFIX) && m.content.contains(marker))
             .collect();
-        if !matched.is_empty() {
-            return matched;
+        if !filtered.is_empty() {
+            return filtered;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    Vec::new()
+    vec![]
 }
 
 fn user(content: &str) -> Value {
@@ -183,7 +193,7 @@ async fn l1_store_and_retrieve_via_memoria() {
     assert!(!memory_id.is_empty());
 
     // Retrieve by content marker
-    let found = retrieve_l1_with_marker(&tm, &marker).await;
+    let found = retrieve_l1_with_marker(&tm, &marker, tm.session_id()).await;
     assert!(!found.is_empty(), "L1 not found after store+wait");
 
     // Cleanup
@@ -212,7 +222,7 @@ async fn l1_correct_updates_in_place() {
         .await
         .expect("store v2 failed");
 
-    let found = retrieve_l1_with_marker(&tm, &marker_v2).await;
+    let found = retrieve_l1_with_marker(&tm, &marker_v2, tm.session_id()).await;
     assert!(!found.is_empty(), "v2 not found after update");
 
     let _ = tm.purge_working(tm.session_id()).await;
@@ -271,6 +281,7 @@ async fn compaction_uses_l1_when_available() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     let result = compact_with_memoria(
@@ -325,6 +336,7 @@ async fn first_user_message_survives_compaction() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     let result = compact_with_memoria(
@@ -377,7 +389,7 @@ async fn l1_round_trip_preserves_structure() {
         .await
         .expect("store failed");
 
-    let results = retrieve_l1_with_marker(&tm, &marker).await;
+    let results = retrieve_l1_with_marker(&tm, &marker, tm.session_id()).await;
     let retrieved = results.first().expect("L1 not found in results");
 
     let l1_after = SessionMemory::parse(&retrieved.content).expect("retrieved L1 should parse");
@@ -413,7 +425,7 @@ async fn anchor_from_retrieved_l1() {
         .await
         .expect("store failed");
 
-    let results = retrieve_l1_with_marker(&tm, &marker).await;
+    let results = retrieve_l1_with_marker(&tm, &marker, tm.session_id()).await;
     let retrieved = results.first().expect("L1 not found");
 
     let l1 = SessionMemory::parse(&retrieved.content).expect("should parse");
@@ -456,8 +468,8 @@ async fn different_sessions_are_isolated() {
     .await
     .expect("store B failed");
 
-    // Retrieve for marker A — should find A, not B
-    let results_a = retrieve_l1_with_marker(&tm, &marker_a).await;
+    // Retrieve for marker A — should find A, not B.
+    let results_a = retrieve_l1_with_marker(&tm, &marker_a, sid_a).await;
     assert!(
         !results_a.is_empty(),
         "session A memory should be retrievable"
@@ -531,6 +543,7 @@ async fn multi_compaction_preserves_goal_and_decisions() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     let result1 = compact_with_memoria(
@@ -714,6 +727,7 @@ async fn tool_heavy_session_preserves_task() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     let result = compact_with_memoria(
@@ -917,6 +931,7 @@ async fn measure_memoria_token_overhead() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     // Without Memoria
@@ -1052,6 +1067,7 @@ async fn full_loop_l1_write_then_compaction_reads() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     let result = compact_with_memoria(
@@ -1110,6 +1126,7 @@ async fn l2_fallback_when_memoria_unavailable() {
         session_memory_file: None,
         session_memory_combine:
             astra_runtime::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
+        session_facts: None,
     };
 
     // No Memoria client — should still compact without error

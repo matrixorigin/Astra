@@ -5,7 +5,6 @@ edition = "2024"
 description = "Core turn types for astra runtime"
 
 [dependencies]
-astra-core = { path = "../core" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

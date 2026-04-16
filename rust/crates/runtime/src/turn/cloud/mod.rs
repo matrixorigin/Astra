@@ -8,6 +8,8 @@ pub mod history;
 pub mod iteration;
 pub mod memoria_compact;
 pub mod prefilter;
+pub mod session_end_governance;
+pub mod session_facts;
 pub mod session_memory_extract;
 pub mod session_memory_protocol;
 pub mod summary;

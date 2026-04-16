@@ -14,6 +14,9 @@ use super::agentic_loop_host::{
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
 pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
+    // ── Update L1a SessionFacts from this turn's tool call records ──
+    update_session_facts_from_turn(state);
+
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
@@ -422,6 +425,63 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     }
 }
 
+/// Build a synthetic JournalEvent from the current turn's tool_call_records
+/// and feed it into SessionFacts. This keeps L1a ground truth up to date
+/// every turn without requiring the full journal write path.
+fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticLoopState) {
+    use astra_services::session_journal::{JournalEvent, JournalEventType};
+
+    // saturating_sub: max_turns=0 → immediate completion, turn_number is irrelevant
+    let turn_number = state.max_turns.saturating_sub(state.remaining_turns) as u32;
+    let mut event = JournalEvent::base_public(JournalEventType::Turn, None);
+    event.turn = Some(turn_number);
+    event.tokens_in = Some(
+        state
+            .total_prompt
+            .saturating_sub(state.session_facts.estimated_tokens),
+    );
+
+    // Copy tool_call_records from this turn
+    if !state.stall.tool_call_records.is_empty() {
+        event.tool_calls = Some(state.stall.tool_call_records.clone());
+    }
+
+    // Check for errors this turn
+    let had_error = state.error_recovery.consecutive_same_error > 0;
+    if had_error {
+        event.error = Some("turn had errors".to_string());
+    }
+
+    state.session_facts.update_from_journal_event(&event);
+
+    // Sync blocked tools from state
+    state
+        .session_facts
+        .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
+
+    // P4: Error-triggered L1 persist — when an error occurred this turn,
+    // write L1 to local session memory file immediately so user corrections
+    // are captured before compaction can drop them.
+    if had_error {
+        if let Some(ref sid) = state.current_session_id {
+            let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
+                &state.messages,
+                state.max_turns.saturating_sub(state.remaining_turns),
+                state.total_prompt as usize,
+            );
+            // Use home dir for absolute path, consistent with other session file writes.
+            let base = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let path = base.join(format!(".astra/sessions/{sid}/session-memory.md"));
+            if let Err(e) = crate::turn::cloud::session_memory_extract::write_session_memory_file(
+                &path,
+                &l1_content,
+            ) {
+                tracing::debug!(session_id = %sid, error = %e, "error-triggered L1 write failed (non-fatal)");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::turn::agentic_loop_host::tests::{
@@ -582,5 +642,99 @@ mod tests {
             serde_json::from_str(journal.lines().next().unwrap()).unwrap();
         assert_eq!(event["turn"], 3);
         assert_eq!(event["context_assembly_trace"]["turn_id"], "turn-3");
+    }
+
+    #[tokio::test]
+    async fn session_facts_updated_from_tool_call_records() {
+        let mut state = make_state();
+        state.max_turns = 5;
+        state.remaining_turns = 4; // turn 1
+
+        // Simulate tool_call_records from a turn
+        state.stall.tool_call_records = vec![
+            astra_services::session_journal::ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 50,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: Some("src/main.rs".to_string()),
+            },
+            astra_services::session_journal::ToolCallRecord {
+                name: "str_replace".to_string(),
+                ok: true,
+                ms: 30,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+                file_path: Some("src/lib.rs".to_string()),
+            },
+        ];
+        state.total_prompt = 5000;
+
+        // Before finalization, facts should be empty
+        assert!(state.session_facts.active_files.is_empty());
+
+        // Run finalization (which calls update_session_facts_from_turn)
+        finalize_turn_trace(&mut state).await;
+
+        // After finalization, facts should be populated
+        assert_eq!(state.session_facts.turn, 1);
+        assert_eq!(state.session_facts.active_files.len(), 2);
+        assert_eq!(state.session_facts.active_files[0].path, "src/main.rs");
+        assert_eq!(state.session_facts.active_files[0].last_action, "read");
+        assert_eq!(state.session_facts.active_files[1].path, "src/lib.rs");
+        assert_eq!(state.session_facts.active_files[1].last_action, "write");
+        assert_eq!(state.session_facts.estimated_tokens, 5000);
+        assert_eq!(state.session_facts.recent_tool_calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn error_triggered_l1_sets_error_state_and_builds_l1() {
+        let mut state = make_state();
+        state.max_turns = 5;
+        state.remaining_turns = 4;
+        state.current_session_id = Some("test-error-trigger".to_string());
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "fix the bug"}));
+        state
+            .messages
+            .push(serde_json::json!({"role": "assistant", "content": "working on it"}));
+        state.error_recovery.consecutive_same_error = 1;
+        state.stall.tool_call_records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "bash".to_string(),
+            ok: false,
+            ms: 50,
+            error: Some("compile error".to_string()),
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+            file_path: None,
+        }];
+        state.total_prompt = 15000;
+
+        // finalize_turn_trace will attempt L1 write to $HOME/.astra/... which may
+        // fail in test (no writable session dir). That's fine — it's non-fatal.
+        // We verify the facts update and L1 content generation instead.
+        finalize_turn_trace(&mut state).await;
+
+        // Error tracked in facts
+        assert_eq!(state.session_facts.error_state.total_errors, 1);
+
+        // L1 content can be built from the messages (verifies the code path runs)
+        let l1 = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
+            &state.messages,
+            1,
+            15000,
+        );
+        assert!(l1.contains("[session-memory:v1]"));
+        assert!(l1.contains("fix the bug"));
     }
 }

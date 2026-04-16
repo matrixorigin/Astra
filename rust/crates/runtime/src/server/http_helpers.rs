@@ -29,18 +29,25 @@ pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    sse_json_response(vec![astra_server_types::build_sse_error_event_payload(
-        status.as_u16(),
-        message,
-    )])
+    sse_json_response(vec![serde_json::json!({
+        "type": "error",
+        "message": message.into(),
+        "code": status_to_sse_error_code(status),
+        "retryable": status_to_sse_retryable(status),
+    })])
 }
 
 pub(super) fn status_to_sse_error_code(status: StatusCode) -> &'static str {
-    astra_server_types::sse_error_code_for_status(status.as_u16())
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "AUTH_ERROR",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::UNPROCESSABLE_ENTITY => "VALIDATION_ERROR",
+        _ => "INTERNAL_ERROR",
+    }
 }
 
 pub(super) fn status_to_sse_retryable(status: StatusCode) -> bool {
-    astra_server_types::sse_retryable_for_status(status.as_u16())
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
 }
 
 #[cfg(test)]
