@@ -436,7 +436,11 @@ impl MemoriaClient for HttpMemoriaClient {
     async fn delete(&self, memory_id: &str) -> Result<(), String> {
         use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
         let encoded_id = utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string();
-        let url = format!("{}/v1/memories/{}", self.base_url.trim_end_matches('/'), encoded_id);
+        let url = format!(
+            "{}/v1/memories/{}",
+            self.base_url.trim_end_matches('/'),
+            encoded_id
+        );
         let resp = self
             .http
             .delete(&url)

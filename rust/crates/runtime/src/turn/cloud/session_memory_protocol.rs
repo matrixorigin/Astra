@@ -514,13 +514,18 @@ pub fn build_l1_from_messages(
         .join("\n");
 
     // Derive current state from last assistant message
-    let current_state = messages
+    let last_action = messages
         .iter()
         .rev()
         .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
         .and_then(|m| extract_message_text(m))
-        .map(|t| truncate_words(&t, 20))
-        .unwrap_or_else(|| format!("Turn {turn_number}, active"));
+        .map(|t| truncate_words(&t, 15))
+        .unwrap_or_default();
+    let current_state = if last_action.is_empty() {
+        format!("Turn {turn_number}, active")
+    } else {
+        format!("Turn {turn_number}, active. {last_action}")
+    };
 
     // Derive progress from tool call count
     let tool_call_count: usize = messages
@@ -720,9 +725,11 @@ mod tests {
     fn validate_empty_required_section() {
         let l1 = SessionMemory::parse(sample_l1_empty_required()).unwrap();
         let errors = l1.validate().unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.contains("empty section: Task Specification")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("empty section: Task Specification"))
+        );
     }
 
     // ── L1 Size Governance Tests ────────────────────────────────────────
@@ -989,16 +996,18 @@ mod tests {
             "should be valid: {:?}",
             l1.validate()
         );
-        assert!(l1
-            .section("Task Specification")
-            .unwrap()
-            .contains("rate limiter"));
+        assert!(
+            l1.section("Task Specification")
+                .unwrap()
+                .contains("rate limiter")
+        );
         assert!(l1.section("Key Files").unwrap().contains("src/main.rs"));
         assert!(l1.section("Decisions").unwrap().contains("read_file"));
-        assert!(l1
-            .section("User Messages")
-            .unwrap()
-            .contains("Redis connection"));
+        assert!(
+            l1.section("User Messages")
+                .unwrap()
+                .contains("Redis connection")
+        );
         assert!(l1.section("Context").unwrap().contains("50K"));
     }
 
@@ -1270,8 +1279,8 @@ mod tests {
     mod persist_l1_tests {
         use super::*;
         use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Mock that tracks calls and can fail N times before succeeding.
         struct MockMemoria {

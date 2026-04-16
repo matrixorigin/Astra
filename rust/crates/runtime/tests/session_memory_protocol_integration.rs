@@ -4,11 +4,11 @@
 //! Run with: `cargo test -p astra-runtime -- session_memory_protocol_integration --ignored`
 
 use astra_runtime::turn::cloud::memoria_compact::{
-    compact_with_memoria, HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig,
-    MemoriaCompactParams, MemoriaMemory,
+    HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory,
+    compact_with_memoria,
 };
 use astra_runtime::turn::cloud::session_memory_protocol::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn memoria_client() -> Option<HttpMemoriaClient> {
@@ -432,7 +432,7 @@ async fn different_sessions_are_isolated() {
     tm.store(
         &sample_session_memory(&marker_a),
         "working",
-        Some(&sid_a),
+        Some(sid_a),
         Some("T2"),
     )
     .await
@@ -458,7 +458,7 @@ async fn different_sessions_are_isolated() {
         "session A results should not contain B's marker"
     );
 
-    let _ = tm.purge_working(&sid_a).await;
+    let _ = tm.purge_working(sid_a).await;
     let _ = tm.purge_working(&sid_b).await;
     tm.cleanup().await;
 }
@@ -492,26 +492,23 @@ async fn multi_compaction_preserves_goal_and_decisions() {
         "DECISION_B: Shard by tenant_id hash to 16 Redis nodes",
         "DECISION_C: Fallback to local token bucket when Redis is unreachable",
     ];
-    for i in 0..30 {
+    for (i, decision) in decisions.iter().enumerate().take(30) {
         // Assistant does tool calls, gets big results
         messages.push(assistant(&format!(
             "Step {i}: {}. Let me read the file...\n{}",
             if i < 3 {
-                decisions[i]
+                decision
             } else {
                 "Continuing implementation"
             },
             "x".repeat(400) // simulate tool result bulk
         )));
-        messages.push(user(&format!(
-            "{}{}",
-            if i == 15 {
-                "Also remember: CRITICAL_NOTE_42 — must handle clock skew. "
-            } else {
-                ""
-            },
-            format!("Continue with step {}", i + 1)
-        )));
+        let prefix = if i == 15 {
+            "Also remember: CRITICAL_NOTE_42 — must handle clock skew. "
+        } else {
+            ""
+        };
+        messages.push(user(&format!("{prefix}Continue with step {}", i + 1)));
     }
 
     // ── First compaction ────────────────────────────────────────────────
@@ -1146,7 +1143,7 @@ async fn cross_session_retrieves_other_sessions_memories() {
     tm.store(
         &format!("{SESSION_MEMORY_PREFIX}\n# Task Specification\n{marker_a}: old session work"),
         "working",
-        Some(&sid_a),
+        Some(sid_a),
         Some("T2"),
     )
     .await

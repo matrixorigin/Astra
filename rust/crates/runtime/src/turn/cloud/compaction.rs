@@ -680,7 +680,11 @@ mod tests {
         // + first user message is always preserved (P0 fix)
         let result = compact_tiered(&msgs, 10, 100, CompactionTier::AggressivePrune, 1);
         // Should have: first user (preserved), recent user, recent assistant, tool = 4
-        assert_eq!(result.len(), 4, "should drop old turns, keep first user + recent + tool");
+        assert_eq!(
+            result.len(),
+            4,
+            "should drop old turns, keep first user + recent + tool"
+        );
         assert_eq!(
             result[0].get("content").unwrap().as_str().unwrap(),
             "old question 1"

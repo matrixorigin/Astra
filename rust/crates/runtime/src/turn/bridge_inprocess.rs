@@ -5465,13 +5465,8 @@ mod tests {
             is_anthropic: false,
             cache_enabled: false,
         };
-        let (_primary, dynamic, _sections) = build_system_message(
-            &["read_file", "grep"],
-            &profile_desc,
-            0.9,
-            None,
-            &cache_cfg,
-        );
+        let (_primary, dynamic, _sections) =
+            build_system_message(&["read_file", "grep"], &profile_desc, 0.9, None, &cache_cfg);
 
         let dyn_content = dynamic
             .expect("OpenAI should have dynamic message")
@@ -5497,13 +5492,8 @@ mod tests {
             is_anthropic: true,
             cache_enabled: true,
         };
-        let (msg, _, _) = build_system_message(
-            &["read_file"],
-            &profile_desc,
-            0.9,
-            None,
-            &cache_cfg,
-        );
+        let (msg, _, _) =
+            build_system_message(&["read_file"], &profile_desc, 0.9, None, &cache_cfg);
 
         // Anthropic: single message with content blocks array
         let blocks = msg.get("content").and_then(Value::as_array).unwrap();
@@ -5530,7 +5520,9 @@ mod tests {
         let mut messages: Vec<Value> = vec![json!({"role": "system", "content": "sys"})];
         messages.push(json!({"role": "user", "content": "Build X"}));
         for i in 0..20 {
-            messages.push(json!({"role": "assistant", "content": format!("Step {i} {}", "x".repeat(400))}));
+            messages.push(
+                json!({"role": "assistant", "content": format!("Step {i} {}", "x".repeat(400))}),
+            );
             messages.push(json!({"role": "user", "content": format!("Next {}", i + 1)}));
         }
 
@@ -5546,12 +5538,17 @@ mod tests {
                 crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         };
 
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(
-            compact_with_memoria(&messages, None, &config, &params, None, None, None),
-        );
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(compact_with_memoria(
+                &messages, None, &config, &params, None, None, None,
+            ));
 
         // Compaction happened (boundary present), so we simulate what the turn loop does
-        assert!(result.boundary.is_some(), "compaction should have triggered");
+        assert!(
+            result.boundary.is_some(),
+            "compaction should have triggered"
+        );
 
         let mut msgs = result.messages;
         if result.boundary.is_some() && msgs.len() >= 2 {
@@ -5594,9 +5591,11 @@ mod tests {
                 crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         };
 
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(
-            compact_with_memoria(&messages, None, &config, &params, None, None, None),
-        );
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(compact_with_memoria(
+                &messages, None, &config, &params, None, None, None,
+            ));
 
         assert!(result.boundary.is_none(), "no compaction should happen");
         // No continuation prompt should be added
@@ -5614,7 +5613,9 @@ mod tests {
         let mut messages: Vec<Value> = vec![json!({"role": "system", "content": "sys"})];
         messages.push(json!({"role": "user", "content": "Build X"}));
         for i in 0..20 {
-            messages.push(json!({"role": "assistant", "content": format!("Step {i} {}", "x".repeat(400))}));
+            messages.push(
+                json!({"role": "assistant", "content": format!("Step {i} {}", "x".repeat(400))}),
+            );
             messages.push(json!({"role": "user", "content": format!("Next {}", i + 1)}));
         }
 
@@ -5630,16 +5631,19 @@ mod tests {
                 crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
         };
 
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(
-            compact_with_memoria(&messages, None, &config, &params, None, None, None),
-        );
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(compact_with_memoria(
+                &messages, None, &config, &params, None, None, None,
+            ));
 
         assert!(result.boundary.is_some(), "compaction should trigger");
 
         // Simulate the turn loop's P2 logic
         let mut msgs = result.messages;
         if result.boundary.is_some() && msgs.len() >= 2 {
-            let last_is_user = msgs.last()
+            let last_is_user = msgs
+                .last()
                 .and_then(|m| m.get("role").and_then(Value::as_str))
                 == Some("user");
             if !last_is_user {
@@ -5688,7 +5692,10 @@ mod tests {
                 })
             });
 
-        assert!(first_user_text.is_some(), "Should extract text from content blocks");
+        assert!(
+            first_user_text.is_some(),
+            "Should extract text from content blocks"
+        );
         let anchor = extract_anchor(&first_user_text.unwrap(), None);
         assert!(anchor.contains("distributed cache"));
     }
@@ -5704,8 +5711,7 @@ mod tests {
         let tools = &["read_file", "grep"];
 
         // Turn 1: no anchor
-        let (primary1, _, _) =
-            build_system_message(tools, "cwd: /project", 0.9, None, &cache_cfg);
+        let (primary1, _, _) = build_system_message(tools, "cwd: /project", 0.9, None, &cache_cfg);
 
         // Turn 2: with anchor
         let anchor = extract_anchor("Build rate limiter", None);
@@ -5730,12 +5736,18 @@ mod tests {
         usage.insert("completion_tokens".to_string(), json!(2000));
 
         // This is the exact expression from the P3 code path
-        let estimated_tokens = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0) as usize;
+        let estimated_tokens = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as usize;
         assert_eq!(estimated_tokens, 45000);
 
         // The old buggy key must NOT work
         let wrong = usage.get("prompt").and_then(Value::as_i64).unwrap_or(0) as usize;
-        assert_eq!(wrong, 0, "usage.get(\"prompt\") should return None — the key is prompt_tokens");
+        assert_eq!(
+            wrong, 0,
+            "usage.get(\"prompt\") should return None — the key is prompt_tokens"
+        );
     }
 
     // ── Fix #1: anchor evolves with L1 ──────────────────────────────────
@@ -5743,7 +5755,7 @@ mod tests {
     #[test]
     fn p1_anchor_evolves_when_l1_available() {
         use crate::turn::cloud::session_memory_protocol::{
-            extract_anchor, SessionMemory, SESSION_MEMORY_PREFIX,
+            SESSION_MEMORY_PREFIX, SessionMemory, extract_anchor,
         };
 
         // Without L1 — shows "starting"
@@ -5768,38 +5780,66 @@ mod tests {
         let l1 = SessionMemory::parse(&l1_text).unwrap();
         let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1));
 
-        assert!(!anchor_with_l1.contains("starting"), "should not say 'starting' when L1 available");
-        assert!(anchor_with_l1.contains("Redis integration"), "should show current state from L1");
-        assert!(anchor_with_l1.contains("2/4"), "should show progress from L1");
+        assert!(
+            !anchor_with_l1.contains("starting"),
+            "should not say 'starting' when L1 available"
+        );
+        assert!(
+            anchor_with_l1.contains("Redis integration"),
+            "should show current state from L1"
+        );
+        assert!(
+            anchor_with_l1.contains("2/4"),
+            "should show progress from L1"
+        );
     }
 
     // ── Fix #4: P2 skips continuation when task is done ─────────────────
 
     /// Helper matching the actual P2 completion detection logic in the turn loop.
     fn signals_done(content: &str) -> bool {
-        let tail = if content.len() > 200 { &content[content.floor_char_boundary(content.len() - 200)..] } else { content };
+        let tail = if content.len() > 200 {
+            &content[content.floor_char_boundary(content.len() - 200)..]
+        } else {
+            content
+        };
         let lower = tail.to_ascii_lowercase();
-        let has_completion = lower.contains("task complete") || lower.contains("all done")
-            || lower.contains("finished") || lower.contains("completed successfully")
-            || lower.contains("任务完成") || lower.contains("已完成");
-        if !has_completion { return false; }
-        let has_negation = lower.contains("not yet") || lower.contains("not complete")
-            || lower.contains("not finished") || lower.contains("haven't finished")
-            || lower.contains("hasn't finished") || lower.contains("won't be finished")
-            || lower.contains("don't think") || lower.contains("not sure")
-            || lower.contains("没有完成") || lower.contains("尚未完成")
-            || lower.contains("except") || lower.contains("but ");
+        let has_completion = lower.contains("task complete")
+            || lower.contains("all done")
+            || lower.contains("finished")
+            || lower.contains("completed successfully")
+            || lower.contains("任务完成")
+            || lower.contains("已完成");
+        if !has_completion {
+            return false;
+        }
+        let has_negation = lower.contains("not yet")
+            || lower.contains("not complete")
+            || lower.contains("not finished")
+            || lower.contains("haven't finished")
+            || lower.contains("hasn't finished")
+            || lower.contains("won't be finished")
+            || lower.contains("don't think")
+            || lower.contains("not sure")
+            || lower.contains("没有完成")
+            || lower.contains("尚未完成")
+            || lower.contains("except")
+            || lower.contains("but ");
         has_completion && !has_negation
     }
 
     #[test]
     fn p2_no_continuation_when_task_complete() {
-        assert!(signals_done("All tasks completed successfully. The rate limiter is deployed."));
+        assert!(signals_done(
+            "All tasks completed successfully. The rate limiter is deployed."
+        ));
     }
 
     #[test]
     fn p2_continuation_when_task_in_progress() {
-        assert!(!signals_done("I've implemented step 3. Working on step 4 next."));
+        assert!(!signals_done(
+            "I've implemented step 3. Working on step 4 next."
+        ));
     }
 
     #[test]
@@ -5809,12 +5849,16 @@ mod tests {
 
     #[test]
     fn p2_no_false_positive_negated_finished() {
-        assert!(!signals_done("I haven't finished yet, still working on it."));
+        assert!(!signals_done(
+            "I haven't finished yet, still working on it."
+        ));
     }
 
     #[test]
     fn p2_no_false_positive_not_complete() {
-        assert!(!signals_done("The task is not yet complete, need more work."));
+        assert!(!signals_done(
+            "The task is not yet complete, need more work."
+        ));
     }
 
     #[test]
@@ -5824,7 +5868,9 @@ mod tests {
 
     #[test]
     fn p2_no_false_positive_wont_be_finished() {
-        assert!(!signals_done("The task won't be finished until deployment is done."));
+        assert!(!signals_done(
+            "The task won't be finished until deployment is done."
+        ));
     }
 
     #[test]
@@ -5848,7 +5894,7 @@ mod tests {
     #[test]
     fn p1_anchor_evolves_from_local_messages_no_network() {
         use crate::turn::cloud::session_memory_protocol::{
-            extract_anchor, build_l1_from_messages, SessionMemory,
+            SessionMemory, build_l1_from_messages, extract_anchor,
         };
 
         // Multi-turn conversation — anchor should show progress, not "starting"
@@ -5864,7 +5910,8 @@ mod tests {
             json!({"role": "assistant", "content": "Added Redis."}),
         ];
 
-        let turn_count = messages.iter()
+        let turn_count = messages
+            .iter()
             .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
             .count();
         assert_eq!(turn_count, 3);
@@ -5873,7 +5920,10 @@ mod tests {
         let l1 = SessionMemory::parse(&l1_text).unwrap();
         let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1));
 
-        assert!(!anchor.contains("starting"), "multi-turn anchor should not say 'starting'");
+        assert!(
+            !anchor.contains("starting"),
+            "multi-turn anchor should not say 'starting'"
+        );
         assert!(anchor.contains("Turn 3"), "should reflect current turn");
     }
 
@@ -5885,9 +5935,18 @@ mod tests {
             json!({"role": "assistant", "content": "我已经完成了第一步的实现，接下来处理数据库连接。"}),
             json!({"role": "user", "content": "继续"}),
         ];
-        let is_cjk = msgs.iter().rev().take(4)
+        let is_cjk = msgs
+            .iter()
+            .rev()
+            .take(4)
             .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
+            .any(|c| {
+                c.chars()
+                    .take(200)
+                    .filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch))
+                    .count()
+                    > 10
+            });
         assert!(is_cjk, "should detect Chinese content");
     }
 
@@ -5897,9 +5956,18 @@ mod tests {
             json!({"role": "assistant", "content": "I've implemented step 1. Working on the database connection next."}),
             json!({"role": "user", "content": "continue"}),
         ];
-        let is_cjk = msgs.iter().rev().take(4)
+        let is_cjk = msgs
+            .iter()
+            .rev()
+            .take(4)
             .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
+            .any(|c| {
+                c.chars()
+                    .take(200)
+                    .filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch))
+                    .count()
+                    > 10
+            });
         assert!(!is_cjk, "should not detect CJK in English content");
     }
 }

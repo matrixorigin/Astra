@@ -6,7 +6,7 @@
 //! ```text
 //! MO_MAX_TURNS=50              # conversation turns per session
 //! MO_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use MO_MAX_TURNS)
-//! MO_MAX_TOOL_ROUNDS=15        # tool execution rounds per turn
+//! MO_MAX_TOOL_ROUNDS=30        # tool execution rounds per turn
 //! MO_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
 //! MO_GLOBAL_OUTPUT_LIMIT=80000 # combined tool output bytes
 //! MO_TOOL_OUTPUT_LIMIT=30000   # per-tool output bytes
@@ -54,7 +54,7 @@ impl Default for RuntimeLimits {
         Self {
             max_turns: 50,
             plan_subtask_max_turns: 0,
-            max_tool_rounds: 15,
+            max_tool_rounds: 30,
             turn_timeout_s: 300.0,
             global_output_limit: 200_000,
             tool_output_limit: 80_000,
@@ -139,7 +139,7 @@ mod tests {
         let d = RuntimeLimits::default();
         assert_eq!(d.max_turns, 50);
         assert_eq!(d.plan_subtask_max_turns, 0);
-        assert_eq!(d.max_tool_rounds, 15);
+        assert_eq!(d.max_tool_rounds, 30);
         assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);
         assert_eq!(d.global_output_limit, 200_000);
         assert_eq!(d.tool_output_limit, 80_000);

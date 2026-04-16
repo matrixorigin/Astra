@@ -605,7 +605,8 @@ impl CompressionLayer for TieredCompaction {
         }
 
         // Preserve the first user message (the original task/goal) from compaction.
-        let first_user_end = crate::turn::cloud::session_memory_protocol::first_user_end(messages, system_end);
+        let first_user_end =
+            crate::turn::cloud::session_memory_protocol::first_user_end(messages, system_end);
 
         let keep_tail = self.keep_recent_turns * 2; // user+assistant pairs
         let tail_start = before_count.saturating_sub(keep_tail);
@@ -728,7 +729,8 @@ impl CompressionLayer for ReactiveCompact {
         }
 
         // Preserve the first user message (the original task/goal) from compaction.
-        let first_user_end = crate::turn::cloud::session_memory_protocol::first_user_end(messages, system_end);
+        let first_user_end =
+            crate::turn::cloud::session_memory_protocol::first_user_end(messages, system_end);
 
         let keep_tail = 4;
         let tail_start = messages.len().saturating_sub(keep_tail);
@@ -1057,9 +1059,15 @@ mod tests {
         let b = budget(80000, 70000);
         layer.compress(&mut msgs, &b);
 
-        let has_task = msgs.iter().any(|m|
-            m.get("content").and_then(Value::as_str).map(|s| s.contains("THE REAL TASK")).unwrap_or(false)
+        let has_task = msgs.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.contains("THE REAL TASK"))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_task,
+            "First user message must survive even when preceded by tool msg"
         );
-        assert!(has_task, "First user message must survive even when preceded by tool msg");
     }
 }
