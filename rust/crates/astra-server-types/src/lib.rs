@@ -637,6 +637,28 @@ pub fn default_signal_types() -> Vec<String> {
     vec!["wrong_skill".to_string()]
 }
 
+pub fn sse_error_code_for_status(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "AUTH_ERROR",
+        404 => "NOT_FOUND",
+        422 => "VALIDATION_ERROR",
+        _ => "INTERNAL_ERROR",
+    }
+}
+
+pub fn sse_retryable_for_status(status: u16) -> bool {
+    status >= 500 || status == 429
+}
+
+pub fn build_sse_error_event_payload(status: u16, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "message": message.into(),
+        "code": sse_error_code_for_status(status),
+        "retryable": sse_retryable_for_status(status),
+    })
+}
+
 impl From<AdminTokenRecord> for AdminTokenResponse {
     fn from(value: AdminTokenRecord) -> Self {
         Self {
@@ -841,5 +863,27 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         context,
         max_candidates: request.max_candidates,
         explain: request.explain,
+    }
+}
+
+#[cfg(test)]
+mod sse_error_payload_tests {
+    use super::*;
+
+    #[test]
+    fn sse_error_code_maps_common_statuses() {
+        assert_eq!(sse_error_code_for_status(401), "AUTH_ERROR");
+        assert_eq!(sse_error_code_for_status(404), "NOT_FOUND");
+        assert_eq!(sse_error_code_for_status(422), "VALIDATION_ERROR");
+        assert_eq!(sse_error_code_for_status(418), "INTERNAL_ERROR");
+    }
+
+    #[test]
+    fn sse_error_event_payload_includes_code_and_retryable() {
+        let payload = build_sse_error_event_payload(503, "upstream unavailable");
+        assert_eq!(payload["type"], "error");
+        assert_eq!(payload["code"], "INTERNAL_ERROR");
+        assert_eq!(payload["retryable"], true);
+        assert_eq!(payload["message"], "upstream unavailable");
     }
 }
