@@ -13,6 +13,7 @@ members = [
     "crates/astra-skills",
     "crates/astra-sandbox",
     "crates/astra-server-types",
+    "crates/astra-turn-core",
 ]
 resolver = "2"
 
@@ -25,6 +26,7 @@ astra-core = { path = "crates/core" }
 astra-pipeline = { path = "crates/astra-pipeline" }
 astra-sandbox = { path = "crates/astra-sandbox" }
 astra-server-types = { path = "crates/astra-server-types" }
+astra-turn-core = { path = "crates/astra-turn-core" }
 astra-turn-types = { path = "crates/astra-turn-types" }
 astra-skills = { path = "crates/astra-skills" }
 astra-tools = { path = "crates/astra-tools" }
