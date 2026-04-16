@@ -149,6 +149,12 @@ fn validate_remote_url(raw_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn strip_reserved_skill_definition_keys(map: &mut serde_json::Map<String, serde_json::Value>) {
+    // `skill_type` / `remote_url` are controlled by dedicated API fields.
+    map.remove("skill_type");
+    map.remove("remote_url");
+}
+
 /// `list_skills` row projection — excludes `skill_definition` (large JSON); use `get_skill` for body.
 const SKILL_REGISTRY_LIST_SELECT: &str = "\
     skill_id, skill_name, version, description, \
@@ -311,7 +317,10 @@ impl SkillService for DatabaseSkillService {
         }
 
         let mut skill_definition = match request.metadata.clone() {
-            Some(serde_json::Value::Object(map)) => map,
+            Some(serde_json::Value::Object(mut map)) => {
+                strip_reserved_skill_definition_keys(&mut map);
+                map
+            }
             Some(value) => {
                 let mut map = serde_json::Map::new();
                 map.insert("metadata".to_string(), value);
@@ -667,7 +676,10 @@ impl SkillService for DatabaseSkillService {
             .as_ref()
             .map(|d| serde_json::to_string(d).unwrap_or_else(|_| "[]".into()));
         let mut manifest_map = match request.manifest.clone() {
-            Some(serde_json::Value::Object(map)) => map,
+            Some(serde_json::Value::Object(mut map)) => {
+                strip_reserved_skill_definition_keys(&mut map);
+                map
+            }
             Some(_) => {
                 return Err(error_response(
                     StatusCode::BAD_REQUEST,
@@ -1019,6 +1031,29 @@ mod tests {
         assert!(validate_remote_url("http://").is_err());
         assert!(validate_remote_url("https://").is_err());
         assert!(validate_remote_url("ftp://example.com/execute").is_err());
+    }
+
+    #[test]
+    fn strip_reserved_skill_definition_keys_removes_remote_url_and_skill_type() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "remote_url".to_string(),
+            serde_json::Value::String("https://evil.example/exec".to_string()),
+        );
+        map.insert(
+            "skill_type".to_string(),
+            serde_json::Value::String("remote".to_string()),
+        );
+        map.insert("display_name".to_string(), serde_json::json!("safe"));
+
+        strip_reserved_skill_definition_keys(&mut map);
+
+        assert!(!map.contains_key("remote_url"));
+        assert!(!map.contains_key("skill_type"));
+        assert_eq!(
+            map.get("display_name"),
+            Some(&serde_json::Value::String("safe".to_string()))
+        );
     }
 
     #[test]
