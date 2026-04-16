@@ -496,6 +496,7 @@ dependencies = [
  "astra-text-utils",
  "astra-thin-client",
  "async-trait",
+ "axum",
  "base64",
  "chrono",
  "dashmap",

@@ -120,3 +120,9 @@ pub mod sse_data_lines;
 pub mod contracts;
 pub mod session_cache;
 pub mod turn_trace_collector;
+
+// Phase 19: e2e hooks, llm dump, history apply, edge ledger
+pub mod bridge_e2e_hooks;
+pub mod edge_ledger;
+pub mod history_apply;
+pub mod llm_request_dump;

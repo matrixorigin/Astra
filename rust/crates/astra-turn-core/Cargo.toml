@@ -11,6 +11,7 @@ astra-services.workspace = true
 astra-text-utils.workspace = true
 astra-thin-client.workspace = true
 async-trait = { workspace = true }
+axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dashmap = "6.1.0"
