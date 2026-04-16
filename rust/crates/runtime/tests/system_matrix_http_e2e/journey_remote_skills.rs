@@ -101,10 +101,8 @@ pub async fn run_remote_skill_registration_user_system_integration() {
         StatusCode::CREATED,
         "register remote skill: {reg_j}"
     );
-    assert_eq!(
-        reg_j["skill_id"].as_str(),
-        Some(format!("{skill_name}@{skill_version}").as_str())
-    );
+    let expected_skill_id = format!("{skill_name}@{skill_version}");
+    assert_eq!(reg_j["skill_id"].as_str(), Some(expected_skill_id.as_str()));
     assert_eq!(reg_j["skill_name"].as_str(), Some(skill_name.as_str()));
     assert_eq!(reg_j["version"].as_str(), Some(skill_version));
     assert_eq!(reg_j["metadata"]["skill_type"].as_str(), Some("remote"));

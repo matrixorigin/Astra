@@ -30,7 +30,7 @@
 //! still resolved and executed **inline** so composition can proceed.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use astra_core::SkillSearchSettings;
 use serde_json::Value;
@@ -1311,6 +1311,15 @@ struct RemoteSkillExecutionResult {
     payload_json: Option<Value>,
 }
 
+fn remote_skill_http_client() -> &'static reqwest::Client {
+    static REMOTE_SKILL_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+    REMOTE_SKILL_HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 fn validate_skill_output_schema(
     skill: &ResolvedSkill,
     output_text: String,
@@ -1363,11 +1372,8 @@ async fn execute_remote_skill(
     task_hint: &str,
     skill_ctx: &SkillContext,
 ) -> Result<RemoteSkillExecutionResult, String> {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|err| format!("failed to initialize HTTP client: {err}"))?;
-
+    // Forward a minimal context subset to reduce data-exfiltration surface for
+    // user-registered remote endpoints.
     let payload = serde_json::json!({
         "skill_name": skill.name,
         "task": task_hint,
@@ -1376,15 +1382,12 @@ async fn execute_remote_skill(
         },
         "context": {
             "session_id": skill_ctx.session_id,
-            "session_dir": skill_ctx.session_dir,
-            "work_dir": skill_ctx.work_dir,
-            "available_tools": skill_ctx.available_tools,
             "recursion_depth": skill_ctx.recursion_depth,
-            "extra": skill_ctx.extra,
         }
     });
-    let response = http
+    let response = remote_skill_http_client()
         .post(remote_url)
+        .timeout(std::time::Duration::from_secs(30))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&payload)
         .send()

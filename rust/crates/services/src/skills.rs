@@ -264,6 +264,12 @@ impl SkillService for DatabaseSkillService {
                         "remote skills require remote_url",
                     ));
                 };
+                if !request.skill_code.trim().is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "remote skills must not provide skill_code",
+                    ));
+                }
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return Err(error_response(
                         StatusCode::BAD_REQUEST,
@@ -666,6 +672,19 @@ impl SkillService for DatabaseSkillService {
         );
         if let Some(url) = remote_url.clone() {
             manifest_map.insert("remote_url".to_string(), serde_json::Value::String(url));
+        }
+        if !request.category.trim().is_empty() {
+            manifest_map.insert(
+                "category".to_string(),
+                serde_json::Value::String(request.category.clone()),
+            );
+        }
+        manifest_map.insert("priority".to_string(), serde_json::json!(request.priority));
+        if let Some(triggers) = request.triggers.clone() {
+            manifest_map.insert("triggers".to_string(), serde_json::json!(triggers));
+        }
+        if let Some(dependencies) = request.dependencies.clone() {
+            manifest_map.insert("dependencies".to_string(), serde_json::json!(dependencies));
         }
         let skill_definition_json =
             serde_json::to_string(&serde_json::Value::Object(manifest_map.clone()))

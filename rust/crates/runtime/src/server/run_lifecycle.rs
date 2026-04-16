@@ -59,45 +59,53 @@ const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
+type ServerSkillResolverBundle = (
+    Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+);
+
 /// Build skill registry + resolver for server-side agentic loops.
 ///
 /// Returns `(registry_for_activation, resolver)` using runtime providers
 /// (Local + Bundled + optional Database provider).
 fn build_server_skill_resolver(
     skill_service: Option<Arc<dyn SkillService>>,
-) -> (
-    Option<Arc<crate::skills::UnifiedSkillRegistry>>,
-    Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
-) {
+    cache: &std::sync::OnceLock<ServerSkillResolverBundle>,
+) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let mut registry = crate::skills::UnifiedSkillRegistry::new();
-    registry.add_provider(Box::new(crate::skills::LocalSkillProvider::standard()));
-    registry.add_provider(Box::new(
-        crate::skills::BundledSkillProvider::with_defaults(),
-    ));
-    if let Some(service) = skill_service {
-        registry.add_provider(Box::new(crate::skills::DatabaseSkillProvider::new(service)));
-    }
-    let registry = Arc::new(registry);
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let r = Arc::clone(&registry);
-        let _ = std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
-    }
-    if registry.is_empty() {
-        return (None, None);
-    }
-    let inner = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
-        &registry,
-    )));
-    let adapter = crate::skills::registry::LegacySkillResolverAdapter::new(inner);
-    let skills = adapter.available_skills();
-    let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty() {
-        None
-    } else {
-        Some(Arc::new(adapter))
-    };
-    (Some(registry), resolver)
+    let bundle = cache.get_or_init(|| {
+        let mut registry = crate::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(crate::skills::LocalSkillProvider::standard()));
+        registry.add_provider(Box::new(
+            crate::skills::BundledSkillProvider::with_defaults(),
+        ));
+        if let Some(service) = skill_service {
+            registry.add_provider(Box::new(crate::skills::DatabaseSkillProvider::new(service)));
+        }
+        let registry = Arc::new(registry);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let r = Arc::clone(&registry);
+            let _ =
+                std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
+        }
+        if registry.is_empty() {
+            return (None, None);
+        }
+        let inner = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
+            &registry,
+        )));
+        let adapter = crate::skills::registry::LegacySkillResolverAdapter::new(inner);
+        let skills = adapter.available_skills();
+        let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty()
+        {
+            None
+        } else {
+            Some(Arc::new(adapter))
+        };
+        (Some(registry), resolver)
+    });
+    bundle.clone()
 }
 
 /// Build a server-side skill executor that supports both Inline and Fork
@@ -532,6 +540,8 @@ pub struct AgenticRunLifecycleService {
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
     /// Optional database skill provider for runtime skill resolution.
     skill_service: Option<Arc<dyn SkillService>>,
+    /// Lazily initialized server skill registry + resolver bundle.
+    server_skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
@@ -557,6 +567,7 @@ impl AgenticRunLifecycleService {
             resource_governor: None,
             edge_connection_pool: None,
             skill_service: None,
+            server_skill_resolver_cache: std::sync::OnceLock::new(),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
         }
@@ -598,6 +609,7 @@ impl AgenticRunLifecycleService {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        self.server_skill_resolver_cache = std::sync::OnceLock::new();
         self
     }
 
@@ -810,8 +822,10 @@ impl AgenticRunLifecycleService {
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
-        let (skill_registry, skill_resolver) =
-            build_server_skill_resolver(self.skill_service.clone());
+        let (skill_registry, skill_resolver) = build_server_skill_resolver(
+            self.skill_service.clone(),
+            &self.server_skill_resolver_cache,
+        );
         use crate::turn::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -1775,6 +1789,7 @@ pub struct ServerSubRunExecutor {
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
     skill_service: Option<Arc<dyn SkillService>>,
+    skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
 }
 
 impl ServerSubRunExecutor {
@@ -1790,6 +1805,7 @@ impl ServerSubRunExecutor {
             edge_callback_ledger,
             edge_connection_pool: None,
             skill_service: None,
+            skill_resolver_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1808,6 +1824,7 @@ impl ServerSubRunExecutor {
 
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
+        self.skill_resolver_cache = std::sync::OnceLock::new();
         self
     }
 }
@@ -1915,7 +1932,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .unwrap_or_default();
 
         let (skill_registry, skill_resolver) =
-            build_server_skill_resolver(self.skill_service.clone());
+            build_server_skill_resolver(self.skill_service.clone(), &self.skill_resolver_cache);
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
