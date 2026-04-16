@@ -495,6 +495,7 @@ dependencies = [
  "astra-services",
  "astra-text-utils",
  "astra-thin-client",
+ "base64",
  "chrono",
  "dashmap",
  "dirs 6.0.0",

@@ -92,3 +92,13 @@ pub mod orchestration_spawn_tool;
 pub mod orchestration_team_config;
 pub mod stream_events;
 pub mod tool_argument_hints;
+
+// Phase 16: bridge, edge, stall
+pub mod bridge_circuit_breaker;
+pub mod bridge_rate_limit_cooldown;
+pub mod bridge_sse_events;
+pub mod complete;
+pub mod edge_prompt_context;
+pub mod hydrate_reflect;
+pub mod stall;
+pub mod tool_registry_state;
