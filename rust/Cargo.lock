@@ -283,6 +283,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-prompts"
+version = "0.1.0"
+dependencies = [
+ "astra-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "astra-runtime"
 version = "0.1.0"
 dependencies = [
@@ -292,6 +303,7 @@ dependencies = [
  "astra-messaging",
  "astra-pipeline",
  "astra-plan",
+ "astra-prompts",
  "astra-sandbox",
  "astra-server-types",
  "astra-services",
@@ -484,10 +496,13 @@ dependencies = [
  "astra-text-utils",
  "astra-thin-client",
  "chrono",
+ "dashmap",
+ "dirs 6.0.0",
  "fastrand",
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "uuid",

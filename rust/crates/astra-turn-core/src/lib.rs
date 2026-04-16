@@ -78,5 +78,17 @@ pub mod headless_tool_journal;
 pub mod persist;
 pub mod quality;
 pub mod routing_metrics;
+pub mod tool_registry_chain;
+pub mod tool_registry_meta;
+pub mod tool_registry_report;
+
+// Orchestration + liquid modules
+pub mod liquid_step_signals;
+pub mod liquid_tactical;
+pub mod orchestration_builtin_agents;
+pub mod orchestration_context_cache;
+pub mod orchestration_progress;
+pub mod orchestration_spawn_tool;
+pub mod orchestration_team_config;
 pub mod stream_events;
 pub mod tool_argument_hints;

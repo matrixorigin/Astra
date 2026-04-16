@@ -172,6 +172,7 @@ jobs:
           -p astra-messaging -p astra-text-utils
           -p astra-config -p astra-learning
           -p astra-plan
+          -p astra-prompts
           --no-fail-fast
 
   # ── Online: needs MatrixOne + Memoria ─────────────────────────────────
