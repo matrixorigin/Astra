@@ -321,7 +321,7 @@ pub fn restore_recent_files(recent_reads: &[(String, u32)], cwd: Option<&str>) -
 
     // Sort by turn number descending (most recent first), take top N.
     let mut candidates: Vec<(&str, u32)> = by_path.into_iter().collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
     candidates.truncate(MAX_FILES_TO_RESTORE);
 
     let mut builder = AttachmentBuilder::new();

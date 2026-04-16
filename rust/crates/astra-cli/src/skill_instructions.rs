@@ -922,7 +922,7 @@ pub fn detect_triggers_in_message(registry: &SkillRegistry, message: &str) -> Ve
     }
 
     // Sort by trigger length (longer = more specific) descending
-    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.sort_by_key(|b| std::cmp::Reverse(b.1));
     matches.into_iter().map(|(name, _)| name).collect()
 }
 

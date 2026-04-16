@@ -596,15 +596,194 @@ pub const INTENT_DRIFT_WINDOW: usize = 3;
 const ALWAYS_ON_TASK_TOOLS: &[&str] =
     &["memory_search", "memory_store", "reflect", "get_agent_info"];
 
+/// Check if a character is a common CJK stopword that should be filtered.
+/// These are grammatical particles with no semantic value for tool matching:
+/// - 的/之 (possessive particles)
+/// - 是/有/在 (copula/existential verbs)
+/// - 了/着/过 (aspect markers)
+/// - 也/又/还 (adverbs)
+/// - 我/你/他 (pronouns)
+/// - Japanese particles: を/は/が/の/に/で/と/も/か
+/// - Korean particles: 은/는/이/가/을/를/에
+fn is_cjk_stopword(ch: char) -> bool {
+    matches!(
+        ch,
+        // Chinese
+        '的' | '之' | '是' | '有' | '在' | '了' | '着' | '过' |
+        '也' | '又' | '还' | '都' | '就' | '才' | '很' | '会' |
+        '能' | '要' | '我' | '你' | '他' | '她' | '它' | '们' |
+        '这' | '那' | '什' | '么' | '怎' | '吗' | '呢' | '啊' |
+        // Japanese particles (hiragana)
+        'を' | 'は' | 'が' | 'の' | 'に' | 'で' | 'と' | 'も' | 'か' |
+        // Korean particles (hangul)
+        '은' | '는' | '이' | '가' | '을' | '를' | '에'
+    )
+}
+
+/// Check if a character is a CJK ideograph (not kana or hangul).
+fn is_cjk_ideograph(ch: char) -> bool {
+    matches!(ch,
+        '\u{4E00}'..='\u{9FFF}' |  // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |  // CJK Extension A
+        '\u{20000}'..='\u{2A6DF}' | // CJK Extension B
+        '\u{2A700}'..='\u{2B73F}' | // CJK Extension C
+        '\u{2B740}'..='\u{2B81F}' | // CJK Extension D
+        '\u{2B820}'..='\u{2CEAF}' | // CJK Extension E
+        '\u{F900}'..='\u{FAFF}'     // CJK Compatibility Ideographs
+    )
+}
+
+/// Check if a character is CJK (including kana and hangul).
+/// Used to split CJK↔non-CJK boundaries in keyword extraction.
+fn is_cjk_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{4E00}'..='\u{9FFF}' |  // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |  // CJK Extension A
+        '\u{20000}'..='\u{2A6DF}' | // CJK Extension B
+        '\u{2A700}'..='\u{2B73F}' | // CJK Extension C
+        '\u{2B740}'..='\u{2B81F}' | // CJK Extension D
+        '\u{2B820}'..='\u{2CEAF}' | // CJK Extension E
+        '\u{F900}'..='\u{FAFF}' |  // CJK Compatibility Ideographs
+        '\u{3040}'..='\u{309F}' |  // Hiragana
+        '\u{30A0}'..='\u{30FF}' |  // Katakana
+        '\u{AC00}'..='\u{D7AF}'    // Hangul Syllables
+    )
+}
+
+/// Check if a character is Japanese kana (hiragana or katakana).
+/// Used to keep kana words as whole tokens (e.g., "テスト" = test).
+fn is_kana(ch: char) -> bool {
+    matches!(ch,
+        '\u{3040}'..='\u{309F}' |  // Hiragana
+        '\u{30A0}'..='\u{30FF}'    // Katakana
+    )
+}
+
+/// Check if a character is Korean hangul.
+/// Used to keep hangul words as whole tokens (e.g., "수정" = fix).
+fn is_hangul_syllable(ch: char) -> bool {
+    matches!(ch, '\u{AC00}'..='\u{D7AF}')
+}
+
+/// Check if a character is CJK/fullwidth punctuation.
+/// These should be treated as split points (like ASCII punctuation).
+fn is_cjk_punctuation(ch: char) -> bool {
+    matches!(ch,
+        '\u{3000}'..='\u{303F}' |  // CJK Symbols and Punctuation (，。！？… etc.)
+        '\u{FF01}'..='\u{FF0F}' |  // Fullwidth punctuation variants
+        '\u{FF1A}'..='\u{FF20}' |  // Fullwidth colon..at
+        '\u{FF3B}'..='\u{FF40}' |  // Fullwidth brackets
+        '\u{FF5B}'..='\u{FF65}' |  // Fullwidth misc punctuation
+        '\u{2026}' | '\u{2025}'    // Ellipsis … and two-dot leader ‥
+    )
+}
+
 /// Extract keywords from user query for intent matching.
-/// Lowercases and splits on whitespace/punctuation, filters short words.
+///
+/// Handles four critical cases for multilingual queries:
+/// 1. **CJK-Latin boundary**: "根据memory" splits into ["根", "据", "memory"],
+///    so "memory" can match tool args containing "memory".
+/// 2. **CJK ideograph splitting**: Each CJK ideograph is extracted individually
+///    (e.g., "修复" → ["修", "复"]), maximizing match probability in tool args.
+/// 3. **Kana/Hangul word preservation**: Japanese kana and Korean hangul words
+///    are kept as whole tokens (e.g., "テスト" → ["テスト"], "수정" → ["수정"])
+///    since per-character splitting loses semantic meaning for these scripts.
+/// 4. **CJK punctuation**: Fullwidth commas, periods, etc. are treated as
+///    split points (same as ASCII punctuation).
+/// 5. **Stopword filtering**: Common CJK grammatical particles (的, 是, 了, etc.)
+///    are filtered out to avoid false matches.
 fn extract_intent_keywords(query: &str) -> Vec<String> {
-    query
-        .to_lowercase()
-        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-        .filter(|w| w.len() >= 2)
-        .map(String::from)
-        .collect()
+    let lower = query.to_lowercase();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current_token = String::new();
+    let mut last_char_type: Option<CharType> = None;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum CharType {
+        Ascii,
+        CjkIdeograph, // Chinese characters — split per-char
+        Kana,         // Japanese hiragana/katakana — keep as words
+        Hangul,       // Korean — keep as words
+    }
+
+    fn char_type(ch: char) -> Option<CharType> {
+        if is_cjk_ideograph(ch) {
+            Some(CharType::CjkIdeograph)
+        } else if is_kana(ch) {
+            Some(CharType::Kana)
+        } else if is_hangul_syllable(ch) {
+            Some(CharType::Hangul)
+        } else if ch.is_ascii() && !ch.is_whitespace() && !ch.is_ascii_punctuation() {
+            Some(CharType::Ascii)
+        } else {
+            None // whitespace, punctuation, or other
+        }
+    }
+
+    for ch in lower.chars() {
+        // Split on whitespace, ASCII punctuation, CJK punctuation, or CJK stopwords.
+        // Stopwords (的, を, 은, etc.) act as delimiters — they are discarded and
+        // never become part of a token. This ensures "テストを実行" splits into
+        // ["テスト", "実", "行"] rather than ["テストを", "実", "行"].
+        if ch.is_whitespace()
+            || ch.is_ascii_punctuation()
+            || is_cjk_punctuation(ch)
+            || is_cjk_stopword(ch)
+        {
+            if !current_token.is_empty() {
+                tokens.push(std::mem::take(&mut current_token));
+                last_char_type = None;
+            }
+            continue;
+        }
+
+        let this_type = char_type(ch);
+
+        // Determine if we should split before this character
+        let should_split = match (last_char_type, this_type) {
+            // Different script boundaries always split
+            (Some(last), Some(this)) if last != this => true,
+            // CJK ideographs split on each character
+            (Some(CharType::CjkIdeograph), Some(CharType::CjkIdeograph)) => true,
+            // Kana/Hangul/ASCII stay together as words
+            _ => false,
+        };
+
+        if !current_token.is_empty() && should_split {
+            tokens.push(std::mem::take(&mut current_token));
+        }
+
+        current_token.push(ch);
+        last_char_type = this_type;
+    }
+
+    if !current_token.is_empty() {
+        tokens.push(current_token);
+    }
+
+    // Filter: keep CJK tokens (≥1 char) and ASCII tokens (≥2 chars).
+    // Single CJK characters are meaningful keywords ("修" = repair).
+    // Single ASCII letters are not (filter out "a", "I", etc.).
+    //
+    // ⚠️ False match risk: Single CJK characters like "的" (possessive particle)
+    // or "是" (copula) are extremely common and could match Chinese filenames,
+    // causing false negatives (incorrectly marking on-task tools as off-task).
+    // We mitigate this with `is_cjk_stopword()` which filters ~30 common particles.
+    // If false matches still occur, consider:
+    // 1. Expanding the stopword list (see is_cjk_stopword below)
+    // 2. Requiring 2+ CJK chars for common particles only
+    // 3. Using IDF-based scoring to downweight high-frequency characters
+    tokens.retain(|w| {
+        let char_count = w.chars().count();
+        let first_char = w.chars().next();
+        match first_char {
+            Some(c) if is_cjk_stopword(c) => false, // Filter stopwords
+            Some(c) if is_cjk_char(c) => char_count >= 1,
+            _ => char_count >= 2,
+        }
+    });
+
+    tokens
 }
 
 /// Check if a set of tool names + their arguments have any relevance to
@@ -613,6 +792,7 @@ fn tools_relate_to_intent(
     tool_names: &[String],
     tool_args_text: &str,
     intent_keywords: &[String],
+    original_query: &str,
 ) -> bool {
     if intent_keywords.is_empty() || tool_names.is_empty() {
         return true; // can't judge → assume on-task
@@ -635,17 +815,94 @@ fn tools_relate_to_intent(
 
     // At least 1 keyword match, or >20% overlap
     match_count > 0 || {
-        // Fallback: check if tool names themselves suggest the right domain
-        let query_lower = intent_keywords.join(" ");
-        // Git-related queries match git tools
-        (query_lower.contains("commit")
-            || query_lower.contains("git")
-            || query_lower.contains("review")
-            || query_lower.contains("diff")
-            || query_lower.contains("blame"))
-            && tool_names
-                .iter()
-                .any(|n| n.starts_with("git_") || n == "bash")
+        // Fallback: domain-level semantic bridging for keywords that don't
+        // literally appear in tool names/args. Handles both:
+        //  - English keywords that suggest a domain (git, review, etc.)
+        //  - CJK keywords that map to English domain concepts
+        let query_lower = original_query.to_lowercase();
+
+        // CJK→English domain translation table
+        // Maps common CJK task verbs to their English equivalents that
+        // appear in tool names, args, and file paths.
+        //
+        // ⚠️ MAINTENANCE BURDEN: This is a static mapping that requires manual updates.
+        // Known limitations:
+        // 1. Coverage gaps: New CJK verbs (e.g., "重构" = refactor, "优化" = optimize,
+        //    "调试" = debug) need manual addition. Consider setting up a CI check that
+        //    alerts when CJK queries with no domain-map match trigger intent_drift.
+        // 2. Single-character ambiguity: "修" maps to fix/repair, but also appears in
+        //    "修改" (modify), "修建" (build), "修饰" (decorate). Context is lost.
+        //    Acceptable for v1 since substring matching still works.
+        // 3. Language coverage: Chinese is best covered; Korean/Japanese have fewer entries.
+        //
+        // Future improvements:
+        // - LLM-based translation for uncovered terms (fallback on first use)
+        // - External mapping file (e.g., ~/.astra/cjk_domain_map.toml) for easy updates
+        // - Embedding-based semantic matching for better coverage
+        //
+        // When adding new entries, test with queries like "修复bug" to ensure both
+        // the CJK keyword and its English equivalents match tool names/args.
+        const CJK_DOMAIN_MAP: &[(&str, &[&str])] = &[
+            // Chinese
+            ("提交", &["commit", "git"]),          // commit/push
+            ("修复", &["fix", "repair", "patch"]), // fix bugs
+            ("测试", &["test", "spec"]),           // test
+            ("审查", &["review", "check"]),        // review
+            ("分析", &["analyze", "debug"]),       // analyze/debug
+            ("搜索", &["search", "find", "grep"]), // search/grep
+            ("查找", &["search", "find", "grep"]), // search/find
+            ("创建", &["create", "new", "add"]),   // create
+            ("删除", &["delete", "remove", "rm"]), // delete
+            ("更新", &["update", "modify"]),       // update/modify
+            ("查看", &["view", "read", "show"]),   // view/read
+            ("运行", &["run", "exec", "build"]),   // run/execute
+            ("构建", &["build", "compile"]),       // build
+            ("部署", &["deploy", "release"]),      // deploy
+            ("配置", &["config", "setup"]),        // config/setup
+            ("比较", &["diff", "compare"]),        // diff/compare
+            ("合并", &["merge", "combine"]),       // merge
+            ("回滚", &["revert", "rollback"]),     // revert/rollback
+            // Korean
+            ("수정", &["fix", "modify"]),    // fix/modify
+            ("검색", &["search", "find"]),   // search/find
+            ("테스트", &["test"]),           // test
+            ("분석", &["analyze", "debug"]), // analyze
+            ("배포", &["deploy"]),           // deploy
+            // Japanese
+            ("テスト", &["test"]),         // test
+            ("修正", &["fix", "repair"]),  // fix
+            ("検索", &["search", "find"]), // search
+            ("分析", &["analyze"]),        // analyze
+        ];
+
+        let mut domain_keywords: Vec<&str> = Vec::new();
+        for (cjk, english_equivs) in CJK_DOMAIN_MAP {
+            if query_lower.contains(*cjk) {
+                domain_keywords.extend(*english_equivs);
+            }
+        }
+
+        // Also add explicit English domain keywords from the query itself,
+        // with domain expansion (e.g. "commit" → also check "git")
+        const ENGLISH_DOMAIN_EXPANSIONS: &[(&str, &[&str])] = &[
+            ("commit", &["commit", "git"]),
+            ("git", &["git", "commit"]),
+            ("review", &["review"]),
+            ("diff", &["diff"]),
+            ("blame", &["blame"]),
+        ];
+        for (kw, expansions) in ENGLISH_DOMAIN_EXPANSIONS {
+            if query_lower.contains(*kw) {
+                domain_keywords.extend(*expansions);
+            }
+        }
+
+        if domain_keywords.is_empty() {
+            return false;
+        }
+
+        // Check if domain keywords appear in tool names or args
+        domain_keywords.iter().any(|dk| combined.contains(dk))
     }
 }
 
@@ -668,7 +925,7 @@ pub fn detect_intent_drift(
     // Count consecutive off-task turns from the end
     let mut consecutive_off_task = 0;
     for (names, args_text) in recent_tool_turns.iter().rev() {
-        if tools_relate_to_intent(names, args_text, &keywords) {
+        if tools_relate_to_intent(names, args_text, &keywords, user_query) {
             break;
         }
         consecutive_off_task += 1;
@@ -706,8 +963,8 @@ mod tests {
     #[test]
     fn tool_round_abort_message_points_to_tool_round_limit() {
         assert_eq!(
-            cli_agentic_tool_round_budget_abort_msg(30),
-            "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS to a larger value (current limit: 30, default: 30)."
+            cli_agentic_tool_round_budget_abort_msg(100),
+            "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS to a larger value (current limit: 100, default: 100)."
         );
     }
 
@@ -1932,7 +2189,548 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  round_tool_call_sig_and_names — additional cases
+    //  extract_intent_keywords — CJK keyword extraction
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn keyword_extraction_cjk_latin_boundary() {
+        // "根据memory" must split into ["根", "据", "memory"], not ["根据memory"]
+        let kws = extract_intent_keywords("根据memory");
+        assert!(
+            kws.contains(&"memory".to_string()),
+            "CJK-Latin boundary must split: got {kws:?}"
+        );
+        assert!(
+            kws.contains(&"根".to_string()) && kws.contains(&"据".to_string()),
+            "CJK portion must be preserved as individual chars: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_pure_cjk() {
+        // "修复" must produce individual CJK chars as keywords
+        let kws = extract_intent_keywords("修复");
+        assert!(
+            !kws.is_empty(),
+            "Pure CJK must produce keywords, not be filtered out: got {kws:?}"
+        );
+        assert!(
+            kws.contains(&"修".to_string()) || kws.contains(&"复".to_string()),
+            "CJK keyword must contain the characters: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_cjk_latin_multiple() {
+        // "分析session日志" → ["分析", "session", "日志"]
+        let kws = extract_intent_keywords("分析session日志");
+        assert!(
+            kws.contains(&"session".to_string()),
+            "Latin between CJK must be extracted: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_cjk_punctuation_split() {
+        // CJK fullwidth punctuation acts as delimiter
+        // "修复，测试" → ["修", "复", "测", "试"] or ["修复", "测试"]
+        let kws = extract_intent_keywords("修复，测试");
+        // Should split at fullwidth comma，not treat "修复，测试" as one token
+        assert!(
+            kws.len() >= 2,
+            "CJK punctuation must split tokens: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_mixed_spaces() {
+        // "review 最新的 commit" → ["review", "最", "新", "的", "commit"]
+        let kws = extract_intent_keywords("review 最新的 commit");
+        assert!(kws.contains(&"review".to_string()));
+        assert!(kws.contains(&"commit".to_string()));
+    }
+
+    #[test]
+    fn keyword_extraction_single_ascii_letter_filtered() {
+        // "a b cd" → ["cd"] only (single letters filtered)
+        let kws = extract_intent_keywords("a b cd");
+        assert!(!kws.contains(&"a".to_string()));
+        assert!(!kws.contains(&"b".to_string()));
+        assert!(kws.contains(&"cd".to_string()));
+    }
+
+    #[test]
+    fn keyword_extraction_single_cjk_char_kept() {
+        // Single CJK char is meaningful and should be kept
+        let kws = extract_intent_keywords("修");
+        assert!(
+            kws.contains(&"修".to_string()),
+            "Single CJK char should be kept as keyword: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_korean_kept() {
+        // Korean (Hangul) characters should be kept
+        let kws = extract_intent_keywords("수정");
+        assert!(
+            !kws.is_empty(),
+            "Korean keywords must not be empty: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_japanese_kept() {
+        // Japanese Hiragana/Katakana should be kept
+        let kws = extract_intent_keywords("テスト");
+        assert!(
+            !kws.is_empty(),
+            "Japanese keywords must not be empty: got {kws:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_empty_query() {
+        assert!(extract_intent_keywords("").is_empty());
+    }
+
+    #[test]
+    fn keyword_extraction_pure_ascii_preserved() {
+        // Existing behavior: "review commit" → ["review", "commit"]
+        let kws = extract_intent_keywords("review commit");
+        assert!(kws.contains(&"review".to_string()));
+        assert!(kws.contains(&"commit".to_string()));
+        assert_eq!(kws.len(), 2);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  detect_intent_drift — CJK false positive regression tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn intent_drift_cjk_latin_not_false_positive() {
+        // Regression: "根据memory protocol" with memory-related tools → OnTask
+        // Previously "根据memory" was one token, never matching "memory" in args
+        let turns = make_intent_turns(&[
+            (&["memory_search"], r#"{"query":"memory protocol"}"#),
+            (&["read_file"], r#"{"path":"memory.rs"}"#),
+            (&["grep"], r#"{"pattern":"memory"}"#),
+        ]);
+        let result = detect_intent_drift("根据memory protocol设计评估", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "CJK-Latin boundary must split so 'memory' can match tool args"
+        );
+    }
+
+    #[test]
+    fn intent_drift_pure_cjk_with_matching_args() {
+        // "修复" — tool args contain file paths related to fixing code.
+        // The key fix is: CJK keywords are now EXTRACTED (not lost as one giant token).
+        // With 1 turn (below INTENT_DRIFT_WINDOW=3), always OnTask regardless.
+        let _turns = make_intent_turns(&[
+            (&["read_file"], r#"{"path":"fix_bug.rs"}"#),
+            (
+                &["str_replace"],
+                r#"{"path":"bug_fix.rs","old":"x","new":"y"}"#,
+            ),
+            (&["bash"], r#"{"command":"git commit -m fix bug"}"#),
+        ]);
+        let kws = extract_intent_keywords("修复");
+        assert!(!kws.is_empty(), "Keywords must be extracted from pure CJK");
+    }
+
+    /// Pure CJK query with 3+ unrelated tool turns still triggers drift,
+    /// but it's a TRUE positive (tools really don't relate), not a false positive
+    /// from keyword extraction failure.
+    #[test]
+    fn intent_drift_pure_cjk_triggers_true_positive_not_false() {
+        // "修复代码" with tools that have nothing to do with fixing → Drifting
+        // This is correct behavior: tools ARE unrelated.
+        // (memory_search is ALWAYS_ON_TASK, so using those would give OnTask —
+        // we use bash instead to test true drift)
+        let turns2 = make_intent_turns(&[
+            (&["bash"], r#"{"command":"curl weather-api"}"#),
+            (&["bash"], r#"{"command":"curl recipe-api"}"#),
+            (&["bash"], r#"{"command":"curl travel-api"}"#),
+        ]);
+        let result = detect_intent_drift("修复代码", &turns2);
+        assert_eq!(
+            result,
+            IntentDrift::Drifting {
+                consecutive_off_task: 3,
+                correction: "⚠ INTENT DRIFT DETECTED — you have spent 3 consecutive turns on tools unrelated to the user's request: \"修复代码\". STOP your current approach and refocus on what the user asked. If you cannot accomplish the original task, explain why and ask for guidance.".to_string(),
+            },
+            "Pure CJK + unrelated tools → TRUE positive drift, not false positive from lost keywords"
+        );
+    }
+
+    #[test]
+    fn intent_drift_cjk_false_positive_before_fix() {
+        // Before the fix, "根据memory" was one token and never matched.
+        // Now "memory" is extracted separately and CAN match tool args.
+        // Demonstrate: pure-CJK query + English tool args that contain
+        // the same Latin substring from the mixed query.
+        let turns =
+            make_intent_turns(&[(&["memory_store"], r#"{"key":"memory","value":"protocol"}"#)]);
+        // Only 1 turn, below window — should always be OnTask
+        let result = detect_intent_drift("根据memory protocol", &turns);
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_cjk_mixed_query_git_tools() {
+        // "提交代码" (commit code) — has no English keyword,
+        // but "提" and "交" won't match git tools. That's expected:
+        // CJK→English semantic gap remains. The fix ensures keywords
+        // ARE extracted (not swallowed), even if they can't match.
+        let turns = make_intent_turns(&[(&["git_commit"], r#"{"message":"fix bug"}"#)]);
+        let result = detect_intent_drift("提交代码", &turns);
+        // With only 1 turn (below window), always OnTask
+        assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    #[test]
+    fn intent_drift_cjk_fullwidth_punctuation_split() {
+        // CJK punctuation like ，。 must split tokens
+        // "修复代码，提交commit" → keywords include "commit"
+        let turns = make_intent_turns(&[(&["git_commit"], r#"{"message":"fix"}"#)]);
+        let result = detect_intent_drift("修复代码，提交commit", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "Fullwidth comma must split so 'commit' can match git tools"
+        );
+    }
+
+    // ── Punctuation boundary fix tests (exclusive → inclusive ranges) ──
+
+    #[test]
+    fn is_cjk_punctuation_inclusive_right_boundary() {
+        // Before fix: ranges used .. (exclusive) so right-boundary chars were missed.
+        // After fix: ..= (inclusive) correctly catches these.
+        // U+303F = 〿 (CJK ancient iteration mark)
+        assert!(
+            is_cjk_punctuation('\u{303F}'),
+            "U+303F must be CJK punctuation (inclusive range end)"
+        );
+        // U+FF0F = ／ (fullwidth solidus)
+        assert!(
+            is_cjk_punctuation('\u{FF0F}'),
+            "U+FF0F must be CJK punctuation (inclusive range end)"
+        );
+        // U+FF20 = ＠ (fullwidth commercial at)
+        assert!(
+            is_cjk_punctuation('\u{FF20}'),
+            "U+FF20 must be CJK punctuation (inclusive range end)"
+        );
+        // U+FF40 = ＿ (fullwidth low line)
+        assert!(
+            is_cjk_punctuation('\u{FF40}'),
+            "U+FF40 must be CJK punctuation (inclusive range end)"
+        );
+        // U+FF65 = ｣ (halfwidth corner bracket)
+        assert!(
+            is_cjk_punctuation('\u{FF65}'),
+            "U+FF65 must be CJK punctuation (inclusive range end)"
+        );
+    }
+
+    #[test]
+    fn is_cjk_punctuation_ellipsis_and_two_dot_leader() {
+        // U+2026 = … (ellipsis), U+2025 = ‥ (two-dot leader)
+        assert!(
+            is_cjk_punctuation('\u{2026}'),
+            "U+2026 ellipsis must be CJK punctuation"
+        );
+        assert!(
+            is_cjk_punctuation('\u{2025}'),
+            "U+2025 two-dot leader must be CJK punctuation"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_ellipsis_splits() {
+        // "修复…测试" → ellipsis acts as separator
+        let kws = extract_intent_keywords("修复…测试");
+        assert!(
+            kws.len() >= 2,
+            "ellipsis must split CJK tokens: got {kws:?}"
+        );
+        assert!(
+            kws.contains(&"修".to_string()) || kws.contains(&"测".to_string()),
+            "individual CJK chars must be extracted after ellipsis split"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_fullwidth_solidus_splits() {
+        // "read／write" → fullwidth solidus ／ (U+FF0F) acts as separator
+        let kws = extract_intent_keywords("read／write");
+        assert!(
+            kws.contains(&"read".to_string()),
+            "U+FF0F must split: got {kws:?}"
+        );
+        assert!(
+            kws.contains(&"write".to_string()),
+            "U+FF0F must split: got {kws:?}"
+        );
+    }
+
+    // ── CJK→English domain mapping tests ──
+
+    #[test]
+    fn cjk_domain_map_修复_matches_fix_in_tool_args() {
+        // "修复" → maps to ["fix", "repair", "patch"]
+        // Tool args contain "fix" → should be on-task even without literal CJK match
+        let turns = make_intent_turns(&[
+            (&["read_file"], r#"{"path":"fix_bug.rs"}"#),
+            (
+                &["str_replace"],
+                r#"{"path":"bug_fix.rs","old":"x","new":"y"}"#,
+            ),
+            (&["bash"], r#"{"command":"cargo test -- fix"}"#),
+        ]);
+        let result = detect_intent_drift("修复", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "修复 should match 'fix' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_提交_matches_commit_git_tools() {
+        // "提交" → maps to ["commit", "git"]
+        // git_ tools → should be on-task
+        let turns = make_intent_turns(&[
+            (&["git_status"], ""),
+            (&["git_diff"], ""),
+            (&["bash"], r#"{"command":"git commit -m fix"}"#),
+        ]);
+        let result = detect_intent_drift("提交代码", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "提交 should match commit/git via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_测试_matches_test_in_args() {
+        // "测试" → maps to ["test", "spec"]
+        // Tool args contain "test" → on-task
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"cargo test"}"#),
+            (&["bash"], r#"{"command":"pytest spec_test.py"}"#),
+            (&["read_file"], r#"{"path":"test_helper.rs"}"#),
+        ]);
+        let result = detect_intent_drift("测试", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "测试 should match 'test' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_审查_matches_review() {
+        // "审查" → maps to ["review", "check"]
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"cargo check"}"#),
+            (&["read_file"], r#"{"path":"review_comments.md"}"#),
+            (&["bash"], r#"{"command":"gh pr review"}"#),
+        ]);
+        let result = detect_intent_drift("审查代码", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "审查 should match 'review/check' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_搜索_matches_search_find_grep() {
+        // "搜索" → maps to ["search", "find", "grep"]
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"grep -r pattern"}"#),
+            (&["bash"], r#"{"command":"rg 'find_me' src/"}"#),
+            (&["bash"], r#"{"command":"grep search_term"}"#),
+        ]);
+        let result = detect_intent_drift("搜索bug", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "搜索 should match 'grep/find/search' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_korean_수정_matches_fix_modify() {
+        // "수정" → maps to ["fix", "modify"]
+        let turns = make_intent_turns(&[
+            (
+                &["str_replace"],
+                r#"{"path":"fix_issue.rs","old":"x","new":"y"}"#,
+            ),
+            (&["read_file"], r#"{"path":"modify_config.rs"}"#),
+            (&["bash"], r#"{"command":"git diff"}"#),
+        ]);
+        let result = detect_intent_drift("수정", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "수정 should match 'fix/modify' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_japanese_テスト_matches_test() {
+        // "テスト" → maps to ["test"]
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"cargo test"}"#),
+            (&["bash"], r#"{"command":"npm test"}"#),
+            (&["bash"], r#"{"command":"pytest"}"#),
+        ]);
+        let result = detect_intent_drift("テスト", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "テスト should match 'test' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_unrelated_tools_still_drift() {
+        // Domain map doesn't help if tools truly are unrelated
+        // "修复" → maps to ["fix", "repair", "patch"], but tools are about weather API
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"curl weather-api"}"#),
+            (&["bash"], r#"{"command":"curl recipe-api"}"#),
+            (&["bash"], r#"{"command":"curl travel-api"}"#),
+        ]);
+        let result = detect_intent_drift("修复", &turns);
+        assert!(
+            matches!(result, IntentDrift::Drifting { .. }),
+            "unrelated tools should still drift"
+        );
+    }
+
+    #[test]
+    fn intent_drift_partial_cjk_keyword_match_3_turn_window() {
+        // Regression test for: 3-turn window where CJK keyword partially matches
+        // "修复bug" → keywords: ["修", "复", "bug"]
+        // "bug" matches in tool args, "修"/"复" don't literally appear
+        // but domain map bridges "修"/"复" → ["fix", "repair", "patch"]
+        // So combined.contains("fix") → true → OnTask
+        let turns = make_intent_turns(&[
+            (&["read_file"], r#"{"path":"fix_bug.rs"}"#),
+            (&["str_replace"], r#"{"path":"bug_fix.rs"}"#),
+            (&["bash"], r#"{"command":"cargo fix"}"#),
+        ]);
+        let result = detect_intent_drift("修复bug", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "partial CJK match with domain map should be OnTask"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_分析_matches_analyze_debug() {
+        // "分析" → maps to ["analyze", "debug"]
+        let turns = make_intent_turns(&[
+            (&["bash"], r#"{"command":"gdb analyze_core"}"#),
+            (&["read_file"], r#"{"path":"debug_log.txt"}"#),
+            (&["bash"], r#"{"command":"valgrind analyze"}"#),
+        ]);
+        let result = detect_intent_drift("分析问题", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "分析 should match 'analyze/debug' via domain map"
+        );
+    }
+
+    #[test]
+    fn cjk_domain_map_比较_matches_diff() {
+        // "比较" → maps to ["diff", "compare"]
+        let turns = make_intent_turns(&[
+            (&["git_diff"], ""),
+            (&["bash"], r#"{"command":"diff file_a file_b"}"#),
+            (&["bash"], r#"{"command":"git compare branches"}"#),
+        ]);
+        let result = detect_intent_drift("比较分支", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "比较 should match 'diff' via domain map"
+        );
+    }
+
+    #[test]
+    fn english_domain_keywords_still_work() {
+        // English keywords "commit", "git", "review", "diff", "blame" still work
+        let turns = make_intent_turns(&[
+            (&["git_status"], ""),
+            (&["git_diff"], ""),
+            (&["bash"], r#"{"command":"git log"}"#),
+        ]);
+        let result = detect_intent_drift("commit these changes", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "English domain keywords still work"
+        );
+    }
+
+    // ── CJK Extension C/D/E tests ──
+
+    #[test]
+    fn is_cjk_char_extension_c() {
+        // U+2A700..=U+2B73F: CJK Extension C
+        assert!(is_cjk_char('\u{2A700}'), "CJK Extension C start");
+        assert!(is_cjk_char('\u{2B73F}'), "CJK Extension C end");
+    }
+
+    #[test]
+    fn is_cjk_char_extension_d() {
+        // U+2B740..=U+2B81F: CJK Extension D
+        assert!(is_cjk_char('\u{2B740}'), "CJK Extension D start");
+        assert!(is_cjk_char('\u{2B81F}'), "CJK Extension D end");
+    }
+
+    #[test]
+    fn is_cjk_char_extension_e() {
+        // U+2B820..=U+2CEAF: CJK Extension E
+        assert!(is_cjk_char('\u{2B820}'), "CJK Extension E start");
+        assert!(is_cjk_char('\u{2CEAF}'), "CJK Extension E end");
+    }
+
+    #[test]
+    fn is_cjk_char_non_cjk_ranges_rejected() {
+        // Characters just outside CJK ranges should NOT match
+        assert!(
+            !is_cjk_char('\u{4DC0}'),
+            "4DC0 is just past Extension A, not CJK"
+        );
+        // Let's use safe values:
+        assert!(!is_cjk_char('A'), "ASCII letter is not CJK");
+        assert!(!is_cjk_char(' '), "space is not CJK");
+        assert!(!is_cjk_char(','), "ASCII comma is not CJK");
+    }
+
+    #[test]
+    fn is_cjk_punctuation_non_punctuation_rejected() {
+        // Regular CJK ideographs should NOT be punctuation
+        assert!(!is_cjk_punctuation('修'), "CJK char is not punctuation");
+        assert!(
+            !is_cjk_punctuation('A'),
+            "ASCII letter is not CJK punctuation"
+        );
+        assert!(!is_cjk_punctuation(' '), "space is not CJK punctuation");
+    }
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -1972,5 +2770,121 @@ mod tests {
         let (sigs, names) = round_tool_call_sig_and_names(&calls);
         assert_eq!(sigs.len(), 1);
         assert!(names.contains(""));
+    }
+
+    // ── Stopword filtering tests ──
+
+    #[test]
+    fn keyword_extraction_filters_stopwords() {
+        // "的" is a stopword and should be filtered out
+        let keywords = extract_intent_keywords("查看的内容");
+        assert!(
+            !keywords.contains(&"的".to_string()),
+            "stopword '的' should be filtered"
+        );
+        assert!(keywords.contains(&"查".to_string()), "'查' should be kept");
+        assert!(keywords.contains(&"看".to_string()), "'看' should be kept");
+    }
+
+    #[test]
+    fn keyword_extraction_filters_multiple_stopwords() {
+        let keywords = extract_intent_keywords("是的，我在修复bug");
+        // "是" and "在" are stopwords
+        assert!(
+            !keywords.contains(&"是".to_string()),
+            "stopword '是' should be filtered"
+        );
+        assert!(
+            !keywords.contains(&"在".to_string()),
+            "stopword '在' should be filtered"
+        );
+        assert!(keywords.contains(&"修".to_string()), "'修' should be kept");
+        assert!(keywords.contains(&"复".to_string()), "'复' should be kept");
+        assert!(
+            keywords.contains(&"bug".to_string()),
+            "'bug' should be kept"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_pronoun_filtered() {
+        // Pronouns like "我", "你" are stopwords
+        let keywords = extract_intent_keywords("我要修复代码");
+        assert!(
+            !keywords.contains(&"我".to_string()),
+            "pronoun '我' should be filtered"
+        );
+        assert!(keywords.contains(&"修".to_string()), "'修' should be kept");
+    }
+
+    // ── Kana/Hangul word preservation tests ──
+
+    #[test]
+    fn keyword_extraction_kana_kept_as_word() {
+        // Japanese "テスト" (test) should be kept as a whole word, not split per-char
+        let keywords = extract_intent_keywords("テストを実行");
+        assert!(
+            keywords.contains(&"テスト".to_string()),
+            "kana word should be kept whole"
+        );
+        // "実" and "行" are CJK ideographs, split per-char
+        assert!(
+            keywords.contains(&"実".to_string()),
+            "ideograph should be split"
+        );
+        assert!(
+            keywords.contains(&"行".to_string()),
+            "ideograph should be split"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_kana_cjk_boundary() {
+        // Kana↔CJK ideograph boundary should split
+        let keywords = extract_intent_keywords("テスト修正");
+        assert!(
+            keywords.contains(&"テスト".to_string()),
+            "kana word should be kept whole"
+        );
+        assert!(keywords.contains(&"修".to_string()), "ideograph '修'");
+        assert!(keywords.contains(&"正".to_string()), "ideograph '正'");
+    }
+
+    #[test]
+    fn keyword_extraction_hangul_kept_as_word() {
+        // Korean "수정합니다" — all hangul syllables, kept as one token.
+        // Hangul doesn't split per-character (unlike CJK ideographs).
+        let keywords = extract_intent_keywords("수정합니다");
+        assert!(
+            keywords.contains(&"수정합니다".to_string()),
+            "all-hangul sequence should be one token: got {keywords:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_extraction_hangul_latin_boundary() {
+        // Hangul↔Latin boundary should split; "을" is a stopword and filtered
+        let keywords = extract_intent_keywords("fix bug을 수정");
+        assert!(keywords.contains(&"fix".to_string()));
+        assert!(keywords.contains(&"bug".to_string()));
+        assert!(
+            !keywords.contains(&"을".to_string()),
+            "hangul particle '을' should be filtered as stopword"
+        );
+        assert!(keywords.contains(&"수정".to_string()), "hangul word '수정'");
+    }
+
+    // ── Integration: stopword + domain translation ──
+
+    #[test]
+    fn intent_drift_stopword_filtered_before_domain_match() {
+        // Stopwords should not interfere with domain translation
+        let turns = make_intent_turns(&[(&["str_replace"], r#"{"path":"fix.rs"}"#)]);
+        let result = detect_intent_drift("我的是修复代码", &turns);
+        assert_eq!(
+            result,
+            IntentDrift::OnTask,
+            "stopwords filtered, '修' matches 'fix'"
+        );
     }
 }

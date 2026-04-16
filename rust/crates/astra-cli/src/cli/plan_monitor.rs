@@ -62,11 +62,7 @@ pub(crate) fn format_plan_progress(
     } else {
         0
     };
-    let filled = if total > 0 {
-        (done * bar_width) / total
-    } else {
-        0
-    };
+    let filled = (done * bar_width).checked_div(total).unwrap_or(0);
     let empty = bar_width - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty),);
 
@@ -295,11 +291,7 @@ fn display_plan_updates_live(
                 eta,
             } => {
                 if state.plan_run_task_id.is_some() {
-                    let pct = if total > 0 {
-                        (done * 100 / total) as u32
-                    } else {
-                        0
-                    };
+                    let pct = (done * 100).checked_div(total).unwrap_or(0) as u32;
                     state.plan_run_task_last_progress = Some((pct, done as u32, total as u32));
                 }
                 if let Some(PlanSpinner::Activity(spinner)) = plan_spinner.as_ref() {

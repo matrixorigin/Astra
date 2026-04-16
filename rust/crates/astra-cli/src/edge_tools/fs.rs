@@ -1905,7 +1905,7 @@ impl ToolExecutor {
         }
 
         // Sort by score descending and take top 3
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
         candidates
             .into_iter()
             .take(3)

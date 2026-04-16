@@ -128,11 +128,9 @@ impl ToolExecutor {
                                             input.push(c);
                                             eprint!("{}", c);
                                         }
-                                        KeyCode::Char(c) => {
-                                            if input.len() < MAX_INPUT_LEN {
-                                                input.push(c);
-                                                eprint!("{}", c);
-                                            }
+                                        KeyCode::Char(c) if input.len() < MAX_INPUT_LEN => {
+                                            input.push(c);
+                                            eprint!("{}", c);
                                         }
                                         KeyCode::Backspace if !input.is_empty() => {
                                             input.pop();

@@ -72,7 +72,7 @@ pub fn plan_cloud_skill_candidates(
         candidates.push((schema.clone(), score));
     }
 
-    candidates.sort_by(|left, right| right.1.cmp(&left.1));
+    candidates.sort_by_key(|right| std::cmp::Reverse(right.1));
     CloudSkillCandidatePlan {
         selected_schemas: candidates
             .into_iter()

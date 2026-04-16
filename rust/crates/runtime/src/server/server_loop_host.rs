@@ -572,7 +572,7 @@ impl ServerAgenticLoopHost {
         if !state.skills.invoked.is_empty() {
             let mut builder = crate::turn::cloud::attachments::AttachmentBuilder::new();
             let mut skills: Vec<_> = state.skills.invoked.values().collect();
-            skills.sort_by(|a, b| b.invoked_at_turn.cmp(&a.invoked_at_turn));
+            skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
             for skill in skills {
                 builder.add_skill(&skill.name, &skill.content);
             }

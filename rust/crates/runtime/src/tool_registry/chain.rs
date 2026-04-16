@@ -39,11 +39,24 @@ pub struct ChainStep {
 /// A named sequence of tool calls with data flow between them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolChain {
+    /// Chain name (auto-generated if omitted: "chain_{step_count}")
+    #[serde(default = "default_chain_name")]
     pub name: String,
+    /// Chain description (auto-generated if omitted)
+    #[serde(default = "default_chain_description")]
     pub description: String,
     #[serde(default)]
     pub rollback_on_failure: bool,
+    #[serde(default)]
     pub steps: Vec<ChainStep>,
+}
+
+fn default_chain_name() -> String {
+    String::new() // Empty signals resolve_name() should auto-generate
+}
+
+fn default_chain_description() -> String {
+    String::new() // Empty signals resolve_description() should auto-generate
 }
 
 impl ToolChain {
@@ -53,6 +66,45 @@ impl ToolChain {
             description: description.into(),
             rollback_on_failure: false,
             steps: Vec::new(),
+        }
+    }
+
+    /// Resolve the chain name, auto-generating from steps if not provided.
+    ///
+    /// Generation rules:
+    /// - Empty chain → "empty_chain"
+    /// - Single step → "single_{tool_name}"
+    /// - Multiple steps → "chain_{first}_to_{last}"
+    pub fn resolve_name(&self) -> String {
+        if !self.name.is_empty() {
+            return self.name.clone();
+        }
+        let tools: Vec<_> = self.steps.iter().map(|s| s.tool.as_str()).collect();
+        match tools.as_slice() {
+            [] => "empty_chain".into(),
+            [single] => format!("single_{}", single),
+            [first, .., last] => format!("chain_{}_to_{}", first, last),
+        }
+    }
+
+    /// Resolve the chain description, auto-generating from steps if not provided.
+    ///
+    /// Generation rules:
+    /// - Empty chain → "Empty tool chain"
+    /// - Single step → "Execute {tool_name}"
+    /// - Multiple steps → "Chain: {tool1} → {tool2} → ... → {toolN}"
+    pub fn resolve_description(&self) -> String {
+        if !self.description.is_empty() {
+            return self.description.clone();
+        }
+        let tools: Vec<_> = self.steps.iter().map(|s| s.tool.as_str()).collect();
+        match tools.as_slice() {
+            [] => "Empty tool chain".into(),
+            [single] => format!("Execute {}", single),
+            multiple => {
+                let chain_str = multiple.join(" → ");
+                format!("Chain: {}", chain_str)
+            }
         }
     }
 
@@ -398,6 +450,106 @@ mod tests {
         assert_eq!(deserialized.name, "roundtrip");
         assert_eq!(deserialized.steps.len(), 2);
         assert_eq!(deserialized.steps[1].output_key.as_deref(), Some("files"));
+    }
+
+    #[test]
+    fn chain_deserialize_without_name_field() {
+        // LLM may omit "name" — must not fail with "missing field `name`"
+        let json = json!({
+            "description": "Find and read a file",
+            "steps": [
+                {"tool": "glob", "args": {"pattern": "**/*.rs"}},
+                {"tool": "read_file", "args": {"path": "$prev"}}
+            ]
+        });
+        let chain: ToolChain = serde_json::from_value(json).unwrap();
+        // name field is empty → resolve_name() generates semantic name
+        assert_eq!(chain.resolve_name(), "chain_glob_to_read_file");
+        assert_eq!(chain.description, "Find and read a file");
+        assert_eq!(chain.steps.len(), 2);
+    }
+
+    #[test]
+    fn chain_deserialize_minimal_steps_only() {
+        // LLM may send just steps — name and description should auto-generate
+        let json = json!({
+            "steps": [
+                {"tool": "bash", "args": {"command": "ls"}}
+            ]
+        });
+        let chain: ToolChain = serde_json::from_value(json).unwrap();
+        assert_eq!(chain.resolve_name(), "single_bash");
+        assert_eq!(chain.resolve_description(), "Execute bash");
+        assert_eq!(chain.steps.len(), 1);
+    }
+
+    // ── resolve_name/description tests ──
+
+    #[test]
+    fn resolve_name_empty_chain() {
+        let chain = ToolChain::new("", "");
+        assert_eq!(chain.resolve_name(), "empty_chain");
+    }
+
+    #[test]
+    fn resolve_name_single_step() {
+        let chain = ToolChain::new("", "").step("grep", json!({}));
+        assert_eq!(chain.resolve_name(), "single_grep");
+    }
+
+    #[test]
+    fn resolve_name_two_steps() {
+        let chain = ToolChain::new("", "")
+            .step("glob", json!({}))
+            .step("read_file", json!({}));
+        assert_eq!(chain.resolve_name(), "chain_glob_to_read_file");
+    }
+
+    #[test]
+    fn resolve_name_three_steps() {
+        let chain = ToolChain::new("", "")
+            .step("glob", json!({}))
+            .step("grep", json!({}))
+            .step("str_replace", json!({}));
+        assert_eq!(chain.resolve_name(), "chain_glob_to_str_replace");
+    }
+
+    #[test]
+    fn resolve_name_provided_unchanged() {
+        let chain = ToolChain::new("fix_bug", "Fix the bug")
+            .step("read_file", json!({}))
+            .step("str_replace", json!({}));
+        assert_eq!(chain.resolve_name(), "fix_bug");
+    }
+
+    #[test]
+    fn resolve_description_empty_chain() {
+        let chain = ToolChain::new("", "");
+        assert_eq!(chain.resolve_description(), "Empty tool chain");
+    }
+
+    #[test]
+    fn resolve_description_single_step() {
+        let chain = ToolChain::new("", "").step("read_file", json!({}));
+        assert_eq!(chain.resolve_description(), "Execute read_file");
+    }
+
+    #[test]
+    fn resolve_description_multiple_steps() {
+        let chain = ToolChain::new("", "")
+            .step("glob", json!({}))
+            .step("read_file", json!({}))
+            .step("str_replace", json!({}));
+        assert_eq!(
+            chain.resolve_description(),
+            "Chain: glob → read_file → str_replace"
+        );
+    }
+
+    #[test]
+    fn resolve_description_provided_unchanged() {
+        let chain = ToolChain::new("test", "My custom description").step("bash", json!({}));
+        assert_eq!(chain.resolve_description(), "My custom description");
     }
 
     // ── Predefined chain patterns ──

@@ -774,7 +774,7 @@ impl UserStats {
             .iter()
             .map(|(k, v)| (k.as_str(), *v))
             .collect();
-        tools.sort_by(|a, b| b.1.cmp(&a.1));
+        tools.sort_by_key(|b| std::cmp::Reverse(b.1));
         tools.truncate(n);
         tools
     }

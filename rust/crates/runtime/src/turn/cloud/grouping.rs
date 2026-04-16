@@ -60,10 +60,8 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
 
         match role {
-            "system" => {
-                if current_round.is_none() {
-                    system_messages.push(msg.clone());
-                }
+            "system" if current_round.is_none() => {
+                system_messages.push(msg.clone());
                 // system messages mid-conversation are treated as user-side injections
             }
             "user" => {

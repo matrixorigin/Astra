@@ -446,7 +446,10 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
     let name = profile_name(profile, &creds);
     if let Some(p) = creds.profiles.get_mut(&name) {
         p.access_token = None;
-        p.refresh_token = None;
+        // Keep refresh_token for next login attempt - it may still be valid
+        // even if this refresh attempt failed (e.g., due to temporary network issues).
+        // If refresh_token is truly expired, the next refresh will also fail and
+        // user will be prompted to re-login then.
     }
     let _ = save_credentials(&creds);
 }

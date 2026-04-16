@@ -657,13 +657,10 @@ pub fn plan_run_finish_from_delivery_report(
         .iter()
         .filter(|s| s.criteria_passed == s.criteria_total)
         .count() as u32;
-    let progress_pct = if items_total > 0 {
-        items_done.saturating_mul(100) / items_total
-    } else if fully_delivered {
-        100
-    } else {
-        0
-    };
+    let progress_pct = items_done
+        .saturating_mul(100)
+        .checked_div(items_total)
+        .unwrap_or(if fully_delivered { 100 } else { 0 });
 
     let outcome = if fully_delivered {
         TaskOutcome::Success

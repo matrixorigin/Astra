@@ -438,7 +438,7 @@ impl ToolExecutor {
     pub fn recently_read_files(&self, max: usize) -> Vec<PathBuf> {
         if let Ok(state) = self.file_state.lock() {
             let mut entries: Vec<_> = state.iter().filter(|(_, fs)| fs.from_read).collect();
-            entries.sort_by(|a, b| b.1.timestamp_ms.cmp(&a.1.timestamp_ms));
+            entries.sort_by_key(|b| std::cmp::Reverse(b.1.timestamp_ms));
             entries
                 .into_iter()
                 .take(max)

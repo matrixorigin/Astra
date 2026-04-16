@@ -1144,10 +1144,8 @@ fn merge_activations(prev: Option<SkillActivation>, new: SkillActivation) -> Ski
     // Sandbox: stricter policy wins (higher SandboxMode ordinal = more restrictive).
     match (&merged.sandbox_policy, &new.sandbox_policy) {
         (None, p @ Some(_)) => merged.sandbox_policy = p.clone(),
-        (Some(prev_p), Some(new_p)) => {
-            if new_p.mode > prev_p.mode {
-                merged.sandbox_policy = Some(new_p.clone());
-            }
+        (Some(prev_p), Some(new_p)) if new_p.mode > prev_p.mode => {
+            merged.sandbox_policy = Some(new_p.clone());
         }
         _ => {} // prev has policy, new doesn't → keep prev; both None → nothing.
     }

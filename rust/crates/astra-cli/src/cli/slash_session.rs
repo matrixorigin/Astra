@@ -3634,7 +3634,7 @@ fn handle_session_analyze(arg: &str, state: &ReplState) {
         );
 
         let mut sorted_tools: Vec<_> = tool_stats.iter().collect();
-        sorted_tools.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        sorted_tools.sort_by_key(|b| std::cmp::Reverse(b.1.0));
 
         for (name, (total, fails, total_ms, total_bytes)) in &sorted_tools {
             let avg_ms = if *total > 0 {
@@ -4336,7 +4336,7 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
         }
         // Remaining cloud-only sessions at the front (they're newer if not local)
         let mut cloud_only: Vec<_> = merged.into_values().collect();
-        cloud_only.sort_by(|a, b| b.turn_count.cmp(&a.turn_count));
+        cloud_only.sort_by_key(|b| std::cmp::Reverse(b.turn_count));
         result.splice(0..0, cloud_only);
 
         // Filter out empty sessions (0 turns = nothing to resume)

@@ -183,7 +183,7 @@ pub fn analyze_project(root: &Path) -> ProjectContext {
     // Collect key modules: largest source files (by line count), top 15
     let mut source_files: Vec<(String, usize)> = Vec::new();
     collect_source_files(root, root, 0, 4, &mut source_files);
-    source_files.sort_by(|a, b| b.1.cmp(&a.1));
+    source_files.sort_by_key(|b| std::cmp::Reverse(b.1));
     source_files.truncate(15);
     ctx.key_modules = source_files;
 
@@ -1605,7 +1605,7 @@ impl PlanModeState {
                 if plans_dir.exists() {
                     let mut candidates: Vec<_> = Self::list_saved_plans().into_iter().collect();
                     if !candidates.is_empty() {
-                        candidates.sort_by(|a, b| b.progress_pct.cmp(&a.progress_pct));
+                        candidates.sort_by_key(|b| std::cmp::Reverse(b.progress_pct));
                         let best = &candidates[0];
                         if let Ok(state) = Self::load_from_plans_dir(&best.name) {
                             eprintln!("  ⚠ Recovered plan '{}' from plans directory", best.goal);

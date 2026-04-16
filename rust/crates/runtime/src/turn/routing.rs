@@ -1,14 +1,14 @@
 use serde_json::{Map, Value, json};
 
 /// Maximum tool execution rounds per turn. Reads from `MO_MAX_TOOL_ROUNDS` env
-/// var at process start, defaulting to 15.
+/// var at process start, defaulting to astra_core::MAX_TOOL_ROUNDS_DEFAULT.
 pub fn max_tool_rounds() -> i64 {
     astra_core::RuntimeLimits::global().max_tool_rounds
 }
 
 /// Compile-time constant for tests that need `const` assertions.
-/// Runtime value from `max_tool_rounds()` may differ if env var is set.
-pub const MAX_TOOL_ROUNDS: i64 = 15;
+/// Re-exported from astra_core for convenience — single source of truth.
+pub use astra_core::MAX_TOOL_ROUNDS_DEFAULT as MAX_TOOL_ROUNDS;
 
 pub fn detect_correction(query: &str) -> bool {
     let pattern = regex::Regex::new(
@@ -265,5 +265,32 @@ mod tests {
             .and_then(Value::as_array)
             .unwrap();
         assert!(skipped.is_empty());
+    }
+
+    // ── MAX_TOOL_ROUNDS sync ──
+
+    #[test]
+    fn max_tool_rounds_const_matches_runtime_default() {
+        // This test verifies the single source of truth pattern:
+        // routing::MAX_TOOL_ROUNDS is a re-export of astra_core::MAX_TOOL_ROUNDS_DEFAULT,
+        // which is also used by RuntimeLimits::default().max_tool_rounds.
+        // If this fails, someone changed one without the other.
+        assert_eq!(
+            MAX_TOOL_ROUNDS,
+            astra_core::RuntimeLimits::default().max_tool_rounds,
+            "MAX_TOOL_ROUNDS must equal RuntimeLimits::default().max_tool_rounds"
+        );
+    }
+
+    #[test]
+    fn max_tool_rounds_runtime_value_matches_const() {
+        // The runtime function max_tool_rounds() reads from RuntimeLimits::global(),
+        // which uses MAX_TOOL_ROUNDS_DEFAULT as its default. They should match
+        // (unless overridden by env var, which we don't set in tests).
+        assert_eq!(
+            max_tool_rounds(),
+            MAX_TOOL_ROUNDS,
+            "max_tool_rounds() should return MAX_TOOL_ROUNDS when env var not set"
+        );
     }
 }
