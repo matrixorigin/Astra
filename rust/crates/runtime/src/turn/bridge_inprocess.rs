@@ -2008,13 +2008,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     let last_signals_done = msgs.last()
                         .and_then(|m| m.get("content").and_then(Value::as_str))
                         .map(|c| {
-                            let lower = c.to_ascii_lowercase();
-                            let has_negation = lower.contains("not ") || lower.contains("n't")
-                                || lower.contains("没有") || lower.contains("尚未")
-                                || lower.contains("except") || lower.contains("but ");
+                            // Check only the last ~200 chars (the conclusion) to avoid
+                            // false positives from negations in earlier context.
+                            let tail = if c.len() > 200 { &c[c.floor_char_boundary(c.len() - 200)..] } else { c };
+                            let lower = tail.to_ascii_lowercase();
                             let has_completion = lower.contains("task complete") || lower.contains("all done")
                                 || lower.contains("finished") || lower.contains("completed successfully")
                                 || lower.contains("任务完成") || lower.contains("已完成");
+                            if !has_completion { return false; }
+                            // Only check negation near the completion phrase (same tail)
+                            let has_negation = lower.contains("not yet") || lower.contains("not complete")
+                                || lower.contains("not finished") || lower.contains("haven't finished")
+                                || lower.contains("hasn't finished") || lower.contains("won't be finished")
+                                || lower.contains("don't think") || lower.contains("not sure")
+                                || lower.contains("没有完成") || lower.contains("尚未完成")
+                                || lower.contains("except") || lower.contains("but ");
                             has_completion && !has_negation
                         })
                         .unwrap_or(false);
@@ -3109,10 +3117,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let l1_client = memoria_client_shared.clone();
                 tokio::spawn(async move {
                     let Some(client) = l1_client else { return; };
-                    if let Err(e) = crate::turn::cloud::session_memory_protocol::persist_l1(
+                    match crate::turn::cloud::session_memory_protocol::persist_l1(
                         &client, &l1_content, &l1_sid,
                     ).await {
-                        tracing::warn!(session_id = %l1_sid, error = %e, "L1 session memory persist failed");
+                        Ok(id) => tracing::debug!(session_id = %l1_sid, memory_id = %id, "L1 session memory persisted"),
+                        Err(e) => tracing::warn!(session_id = %l1_sid, error = %e, "L1 session memory persist failed"),
                     }
                 });
             }
@@ -5768,13 +5777,18 @@ mod tests {
 
     /// Helper matching the actual P2 completion detection logic in the turn loop.
     fn signals_done(content: &str) -> bool {
-        let lower = content.to_ascii_lowercase();
-        let has_negation = lower.contains("not ") || lower.contains("n't")
-            || lower.contains("没有") || lower.contains("尚未")
-            || lower.contains("except") || lower.contains("but ");
+        let tail = if content.len() > 200 { &content[content.floor_char_boundary(content.len() - 200)..] } else { content };
+        let lower = tail.to_ascii_lowercase();
         let has_completion = lower.contains("task complete") || lower.contains("all done")
             || lower.contains("finished") || lower.contains("completed successfully")
             || lower.contains("任务完成") || lower.contains("已完成");
+        if !has_completion { return false; }
+        let has_negation = lower.contains("not yet") || lower.contains("not complete")
+            || lower.contains("not finished") || lower.contains("haven't finished")
+            || lower.contains("hasn't finished") || lower.contains("won't be finished")
+            || lower.contains("don't think") || lower.contains("not sure")
+            || lower.contains("没有完成") || lower.contains("尚未完成")
+            || lower.contains("except") || lower.contains("but ");
         has_completion && !has_negation
     }
 
@@ -5821,6 +5835,12 @@ mod tests {
     #[test]
     fn p2_no_false_positive_dont_think_finished() {
         assert!(!signals_done("I don't think we're finished yet."));
+    }
+
+    #[test]
+    fn p2_true_positive_cant_believe_completed() {
+        // "can't" in a non-negating context should NOT suppress completion detection
+        assert!(signals_done("I can't believe we completed successfully!"));
     }
 
     // ── P1 latency fix: anchor from local messages, no network ──────────

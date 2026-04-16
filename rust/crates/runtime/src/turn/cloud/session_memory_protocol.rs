@@ -447,7 +447,7 @@ pub fn build_l1_from_messages(
         .iter()
         .filter_map(|m| {
             if m.get("role").and_then(Value::as_str) == Some("user") {
-                extract_message_text(m).filter(|t| seen_user_msgs.insert(t.clone()))
+                extract_message_text(m).filter(|t| seen_user_msgs.insert(t.to_lowercase()))
             } else {
                 None
             }
@@ -513,13 +513,34 @@ pub fn build_l1_from_messages(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Derive current state from last assistant message
+    let current_state = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|m| extract_message_text(m))
+        .map(|t| truncate_words(&t, 20))
+        .unwrap_or_else(|| format!("Turn {turn_number}, active"));
+
+    // Derive progress from tool call count
+    let tool_call_count: usize = messages
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+        .map(|a| a.len())
+        .sum();
+    let progress = if tool_call_count == 0 {
+        "🔄 In progress".to_string()
+    } else {
+        format!("✅ {tool_call_count} tool calls completed\n🔄 Turn {turn_number} in progress")
+    };
+
     format!(
         "{SESSION_MEMORY_PREFIX}\n\
          # Session Title\n{title}\n\
          # Task Specification\n{task}\n\
-         # Current State\nTurn {turn_number}, active\n\
+         # Current State\n{current_state}\n\
          # Key Files\n{files}\n\
-         # Progress\n🔄 In progress\n\
+         # Progress\n{progress}\n\
          # Errors & Corrections\nNone\n\
          # Decisions\nTools used: {tools}\n\
          # User Messages\n{users}\n\

@@ -251,7 +251,10 @@ pub trait MemoriaClient: Send + Sync {
     async fn purge_working(&self, session_id: &str) -> Result<u64, String>;
 
     /// Delete a single memory by ID.
-    async fn delete(&self, memory_id: &str) -> Result<(), String>;
+    /// Default: no-op. Override for clients that support deletion.
+    async fn delete(&self, _memory_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A memory record from Memoria.
