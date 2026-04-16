@@ -46,20 +46,20 @@ Two problems:
          └──────────────────────┘
 ```
 
-Key change from v1: L1 is split into **L1a (system facts, ground truth)** and **L1b (LLM narrative, supplement)**. L1a is always available (updated every turn, zero LLM). L1b is periodic and optional. Compaction no longer needs to wait for L1b — L1a alone is sufficient for zero-LLM compaction.
+Key change from v1: L1 is split into **L1a (system facts, ground truth)** and **L1b (LLM narrative, supplement)**. L1a is always available (updated every turn, zero LLM). L1b is periodic and optional. Compaction no longer needs to wait for L1b — L1a alone is sufficient for zero-LLM compaction. See Appendix A for v1 architecture.
 
 ### 2.2 Design Principles
 
 | Principle | Practice | Implementation |
 |-----------|----------|----------------|
-| Facts over narrative | System-tracked state takes priority over LLM summaries | L1a (facts) injected before L1b (narrative); cross-validation warnings |
-| Anti-drift | User messages preserved + user corrections never deleted | L1b "User Messages" sliding window + "User Corrections" section |
+| Facts over narrative | System-tracked state takes priority over LLM summaries | L1a facts injected before L1b narrative; contradicted narrative sections skipped (not just warned) |
+| Anti-drift | User messages preserved + user corrections never deleted | L1b "User Corrections" section + first user message pin |
 | Cache-aware | Never inject into stable prefix | Memory in CacheScope::None; injection after cache breakpoint |
 | Layered compaction | Microcompact → session facts → narrative → LLM summary | L0 MC → L1a facts → L1b narrative → L2 LLM summary |
-| Size governance | Per-section budgets, total injection ≤700t | L1a ~150t + L1b ~500t; v1 was 2000t |
+| Size governance | Per-section budgets, total injection ≤700t | L1a ~150t + L1b ~500t |
 | Zero-LLM compaction | Session facts always available, no waiting | L1a replaces L2 at compaction; L1b enriches if available |
 | LLM does LLM things | Don't ask LLM to track files/errors/progress | L1b only: task spec, decisions, corrections, learnings |
-| Post-compact restoration | Re-inject top 5 files, plans, skills, tool schemas | Same, with file dedup against preserved messages |
+| Post-compact restoration | Re-inject top 5 files, plans, skills, tool schemas | File dedup against preserved messages |
 
 ## 3. L0: Anchor + Microcompact
 
@@ -78,29 +78,21 @@ A compact task summary embedded in the system prompt's dynamic section (`CacheSc
 [session-anchor] Goal: Fix auth module login bug. State: write src/auth.rs (t7). Avoid: rm, git push --force.
 ```
 
-**Generation** (zero LLM):
+**Generation** (from SessionFacts, zero LLM):
+
 ```rust
 fn extract_anchor(first_user_msg: &str, facts: &SessionFacts, narrative: Option<&SessionMemory>) -> String {
-    // Task: from narrative if available (LLM good at summarizing), fallback to first user msg
     let task = narrative
         .and_then(|n| n.section("Task Specification"))
         .map(|s| first_sentence(s))
         .unwrap_or_else(|| truncate_words(first_user_msg, 20));
-
-    // State: from system facts (ground truth, not LLM narrative)
     let state = if let Some(plan) = &facts.plan_state {
-        format!("{}/{} subtasks, current: {}",
-            plan.completed, plan.total,
+        format!("{}/{} subtasks, current: {}", plan.completed, plan.total,
             plan.current_subtask.as_deref().unwrap_or("unknown"))
     } else if let Some(f) = facts.active_files.last() {
         format!("{} {} (t{})", f.last_action, f.path, f.turn)
-    } else {
-        "starting".to_string()
-    };
-
+    } else { "starting".to_string() };
     let mut anchor = format!("[session-anchor] Goal: {task}. State: {state}.");
-
-    // Constraints: from system facts
     if let Some(err) = &facts.error_state.last_error {
         anchor.push_str(&format!(" Last error: {}.", truncate_words(err, 10)));
     }
@@ -110,6 +102,8 @@ fn extract_anchor(first_user_msg: &str, facts: &SessionFacts, narrative: Option<
     anchor
 }
 ```
+
+> **Migration**: v1 anchor derives from L1 narrative sections (`Current State`, `Progress`). This version derives from `SessionFacts` — always available, ground truth.
 
 **Lifecycle**:
 - **Created**: Turn 1, from first user message + empty facts
@@ -142,70 +136,55 @@ Clears old tool result content for compactable tools, with pressure-adaptive ret
 
 **Duplicate read elimination**: When the same file path appears in multiple `read_file` results, only the most recent is kept. Earlier reads are replaced with `"[Earlier read of {path} — see later read for current content]"`.
 
+**State-aware compaction** (uses `SessionFacts.active_files` as pin list):
+
+```
+For each tool_result in compactable messages:
+  file = extract_file_path(tool_result)
+  if file ∈ active_files (last 5 turns) → PIN: never compact, keep full content
+  if file ∈ active_files (older turns)  → keep metadata only (path + size), compact content
+  if file ∉ active_files                → aggressive drop (replace with placeholder)
+```
+
+This shifts compaction from pure token-counting to **semantic-aware GC**: files the agent is actively working on are preserved regardless of token pressure, while irrelevant file reads are dropped first. The pin list is free — it comes from L1a facts which are updated every turn at zero cost.
+
 **Cache impact**: Microcompact modifies message content in the volatile region (after the cache breakpoint). It does NOT affect the cached prefix. After microcompact, the cache breakpoint is re-placed on the last message.
 
-## 4. L1: Session State (Hybrid)
+## 4. L1: Session State
 
-L1 is split into two sub-layers: **L1a (system facts)** and **L1b (LLM narrative)**.
+L1 is split into **L1a (system facts, ground truth)** and **L1b (LLM narrative, supplement)**. L1a is always available; L1b enriches when available but is never blocking.
 
-### 4.0 L1a: Session Facts (Ground Truth)
+> **Current state**: v1 uses a monolithic 10-section L1 generated by `build_l1_from_messages()`. See Appendix A for v1 details and known limitations.
+
+### 4.1 L1a: Session Facts (Ground Truth)
 
 System-tracked state, updated every turn from journal events and tool call records. Zero LLM cost. Always available.
 
 ```rust
 /// Ground truth session state. Never hallucinated.
 pub struct SessionFacts {
-    /// Files touched (from tool_call records: read_file, write_file, str_replace)
     pub active_files: Vec<FileEntry>,       // path + last_action + turn, last 20
-    /// Last N tool calls with outcomes (from JournalEvent.tool_calls)
     pub recent_tool_calls: Vec<ToolFact>,   // name + ok/fail + turn, last 10
-    /// Plan progress (from RestoredSession.executing_plan_json / PlanProgress events)
     pub plan_state: Option<PlanFact>,       // goal + completed/total + current_subtask
-    /// Blocked/unhealthy tools (from checkpoint.blocked_tools)
     pub blocked_tools: Vec<String>,
-    /// Error state (from TurnError journal events)
     pub error_state: ErrorFact,             // count + last_error_msg + turn
-    /// Session metadata
     pub turn: u32,
     pub estimated_tokens: u64,
 }
 ```
 
-**Update mechanism**: At each turn end, after `JournalEvent` is written:
-```rust
-impl SessionFacts {
-    /// Incremental update from a single turn's journal event.
-    pub fn update_from_turn(&mut self, event: &JournalEvent) {
-        self.turn = event.turn.unwrap_or(self.turn);
-        if let Some(tokens) = event.tokens_in {
-            self.estimated_tokens += tokens;
-        }
-        // Extract file paths from tool_call records
-        for tc in event.tool_calls.iter().flatten() {
-            if let Some(path) = extract_file_path_from_tool_call(tc) {
-                self.upsert_file(path, action_for_tool(&tc.tool_name), self.turn);
-            }
-        }
-        // Track tool outcomes
-        for tc in event.tool_calls.iter().flatten() {
-            if !tc.is_synthetic_placeholder() {
-                self.recent_tool_calls.push(ToolFact {
-                    name: tc.tool_name.clone(), ok: tc.ok, turn: self.turn,
-                });
-                if self.recent_tool_calls.len() > 10 {
-                    self.recent_tool_calls.remove(0);
-                }
-            }
-        }
-        // Track errors
-        if event.event_type == JournalEventType::TurnError {
-            self.error_state.total_errors += 1;
-            self.error_state.last_error = event.error_message.clone();
-            self.error_state.last_error_turn = Some(self.turn);
-        }
-    }
-}
-```
+**Data sources**:
+
+| Field | Source | How |
+|-------|--------|-----|
+| `active_files` | `ToolCallRecord` at tool execution time | Tool executor extracts `path` from full arguments *before* truncation to `args_preview`. Stored as `ToolCallRecord.file_path: Option<String>` (new field, ~30 bytes). NOT parsed from `args_preview` (which is truncated to 80 chars and unreliable for `str_replace` where path may be buried). |
+| `recent_tool_calls` | `JournalEvent.tool_calls` | Direct: `name`, `ok` fields already exist |
+| `plan_state` | `HeavyCheckpoint` (not journal) | `checkpoint.executing_plan_json` contains the full plan with step statuses. Parsed at session resume and updated when plan steps complete. Journal only has `plan_subtask_id` (not enough). |
+| `blocked_tools` | `HeavyCheckpoint.blocked_tools` | Direct field access |
+| `error_state` | `JournalEvent` where `error.is_some()` | Incremental: count errors, keep last error message |
+| `turn` / `estimated_tokens` | `JournalEvent.turn` / `tokens_in` | Direct field access |
+
+**⚠️ Implementation note**: `ToolCallRecord` currently has `args_preview: Option<String>` (truncated ~80 chars) but no `file_path` field. P1 must add `file_path: Option<String>` to `ToolCallRecord`, populated by the tool executor from the full arguments before truncation. This is a ~5-line change in the tool execution path.
 
 **Injection format** (~150 tokens):
 ```
@@ -215,16 +194,15 @@ Plan: Implement OAuth (3/5 subtasks), current: token refresh
 Active files:
   write src/auth/refresh.rs (t11)
   read src/auth/mod.rs (t10)
-  write src/routes/oauth.rs (t8)
 Errors: 2 total, last: sqlx migration column exists (t9)
 Blocked tools: web_fetch
 ```
 
 **Cost**: ~150 tokens, updated every turn, zero LLM.
 
-### 4.1 L1b: Session Narrative (LLM-Generated)
+### 4.2 L1b: Session Narrative (LLM-Generated)
 
-LLM-generated structured notes. Only covers what LLM is good at: task understanding, decisions, user corrections, learnings. Does NOT duplicate system-tracked state.
+Only covers what LLM is good at: task understanding, decisions, user corrections, learnings. Does NOT duplicate system-tracked state.
 
 **Template (6 sections, stored ≤2000t)**:
 
@@ -263,6 +241,23 @@ LLM-generated structured notes. Only covers what LLM is good at: task understand
 | User Messages | 800 | Last 5 verbatim; older → 1-line summary; drop oldest summaries first |
 | **Total** | **≤2000** | Half of v1's 4000t budget |
 
+**User Messages sliding window detail**: The "older → 1-line summary" is done by the LLM during extraction. The extraction prompt receives `recent_messages` (truncated to ~3000t). If more than 5 new user messages arrived since last extraction, the LLM sees all of them in the input and decides which 5 are "last 5" (verbatim) vs older (summarized). If the input window misses some messages (>3000t of messages since last extraction), those messages are lost — this is acceptable because extraction triggers every ~5K tokens, so the 3000t input window covers the gap with margin. For sessions with very long user messages, the extraction trigger threshold should be lowered.
+
+**v1 vs v2.1 section comparison**:
+
+| Section | v1 | v2.1 | Rationale |
+|---------|----|------|-----------|
+| Session Title | ✅ | ✅ | Same |
+| Task Specification | ✅ | ✅ | Same |
+| Current State | ✅ (LLM-derived) | ❌ → L1a | Replaced by system facts |
+| Key Files | ✅ (from tool args) | ❌ → L1a | Replaced by SessionFacts.active_files |
+| Progress | ✅ (emoji count) | ❌ → L1a | Replaced by SessionFacts.plan_state |
+| Errors & Corrections | ✅ (mixed) | ❌ → L1a + User Corrections | Errors → L1a; Corrections → dedicated section |
+| Decisions | ✅ | ✅ | Same |
+| User Messages | ✅ | ✅ | Same |
+| Worklog | ✅ | ❌ | Redundant with journal |
+| Context | ✅ | ❌ | Redundant with anchor |
+
 **Injection version** (≤500t, rule-compressed, zero LLM):
 
 | Section | Injection Rule |
@@ -272,9 +267,15 @@ LLM-generated structured notes. Only covers what LLM is good at: task understand
 | Learnings | Last 3 entries |
 | Decisions | Last 2 entries, ≤15 words each |
 | User Messages | Last 3 verbatim only |
-| Session Title, Worklog | Omitted |
+| Session Title | Omitted |
 
-### 4.2 Combined Injection: Facts-First Assembly
+**⚠️ Migration note**: v1 `compress_to_injection` still uses all 10 sections. The injection budget reduction (2000t → 500t) requires the L1a/L1b split first.
+
+### 4.4 Combined Injection: Facts-First Assembly
+
+Assembles L1a facts + L1b narrative with cross-validation.
+
+> **Migration**: v1 `compress_to_injection()` compresses the 10-section L1 by filtering sections. This is replaced by `build_injection()` after P1–P4.
 
 ```rust
 pub fn build_injection(facts: &SessionFacts, narrative: Option<&SessionMemory>) -> String {
@@ -312,23 +313,50 @@ pub fn build_injection(facts: &SessionFacts, narrative: Option<&SessionMemory>) 
         }
     }
 
-    // ── Layer 3: Cross-validation ──
+    // ── Layer 3: Cross-validation (detect AND act) ──
+    // When facts contradict narrative, don't just warn — downgrade the contradicted section.
+    // Rationale: a warning string may be ignored by the model. Omitting the bad section is reliable.
+    let mut stale_sections: Vec<&str> = Vec::new();
+
+    if facts.error_state.total_errors > 0 && facts.error_state.last_error.is_some() {
+        let narrative_implies_done = facts.plan_state.as_ref()
+            .map(|p| p.completed == p.total && p.total > 0)
+            .unwrap_or(false);
+        if narrative_implies_done {
+            // Plan says done but errors exist → don't trust narrative's Task Spec
+            // (it may have been updated to say "completed")
+            stale_sections.push("Task Specification");
+            out.push_str("⚠️ Plan complete but unresolved errors — narrative Task section omitted, using facts only\n");
+        }
+    }
     if let Some(n) = narrative {
-        if let Some(task) = n.section("Task Specification") {
-            if (task.contains("completed") || task.contains("done"))
-                && facts.error_state.total_errors > 0
-                && facts.error_state.last_error.is_some()
-            {
-                out.push_str("⚠️ Narrative says completed but system has unresolved errors\n");
+        if let Some(corrections) = n.section("User Corrections") {
+            if corrections.trim().is_empty() && facts.error_state.total_errors >= 3 {
+                // Many errors but no corrections recorded → mark for priority re-extraction
+                stale_sections.push("User Corrections");
+                out.push_str("⚠️ 3+ errors but no corrections recorded — triggering re-extraction\n");
             }
         }
     }
+
+    // Stale sections are skipped in the narrative injection above (Layer 2 checks stale_sections).
+    // Also mark them for priority update on next L1b extraction cycle.
 
     out
 }
 ```
 
-### 4.3 Update Trigger
+**Cross-validation actions** (not just warnings):
+
+| Contradiction | Detection | Action |
+|--------------|-----------|--------|
+| Plan complete + unresolved errors | `plan.completed == plan.total && error_state.total_errors > 0` | **Skip** narrative Task Specification from injection; facts alone provide state |
+| Many errors + no corrections | `error_state.total_errors >= 3 && corrections.is_empty()` | **Trigger** immediate L1b re-extraction to capture missed corrections |
+| Narrative file list ≠ facts file list | Future: diff `active_files` vs narrative Key Files | N/A (Key Files removed from L1b, so this contradiction is eliminated by design) |
+
+The key insight: **omitting a contradicted section is more reliable than warning the model**, because the model may ignore warnings but cannot hallucinate from data that isn't there.
+
+### 4.5 Update Trigger
 
 L1a (facts): **Every turn**, zero cost.
 
@@ -343,16 +371,20 @@ Subsequent updates require BOTH:
 
 OR: Token growth ≥ 5,000 AND last assistant turn has no tool calls (natural break)
 
-NEW — Error trigger:
+Error trigger:
   - TurnError occurred this turn AND context tokens ≥ 10,000
   (captures user corrections immediately, before compaction can drop them)
 ```
 
-### 4.4 Update Mechanism (L1b only)
+> **Migration**: v1 only has the dual-threshold. Error-triggered extraction is added in P3.
+
+### 4.6 Update Mechanism (L1b Only)
 
 Uses a **cheap text model**. Async fire-and-forget — main turn does NOT block.
 
-**Update prompt** (revised — LLM only updates what LLM is good at):
+> **Migration**: v1 uses `build_l1_from_messages()` (synchronous, scans conversation, no LLM call). The LLM-based extraction module exists in `session_memory_extract.rs` but is not yet wired to the runtime loop.
+
+**Update prompt** (LLM only updates what LLM is good at):
 
 ```
 You are updating session notes based on new conversation messages.
@@ -375,11 +407,11 @@ New messages since last update (turn {from_turn} to {to_turn}):
 Output the complete updated notes in [session-memory:v1] format.
 ```
 
-### 4.5 Format Validation
+### 4.7 Format Validation
 
 Same as v1: must start with `[session-memory:v1]`, must contain `# Task Specification` with non-empty content. After 2 consecutive validation failures, L1b updates are paused — L1a (facts) alone is sufficient.
 
-### 4.6 Pressure-Adaptive Injection
+### 4.8 Pressure-Adaptive Injection
 
 | Context Pressure | What's Injected | Token Cost |
 |-----------------|-----------------|------------|
@@ -388,9 +420,9 @@ Same as v1: must start with `[session-memory:v1]`, must contain `# Task Specific
 | ≥ 85% | L0 anchor only | ~60 |
 | Post-compaction | L1a facts + L1b narrative + continuation prompt | ~850 |
 
-v1 injected 2000t at < 75% pressure. This design injects ~650t. **Saves ~1350t/turn.**
+v1 injects up to 2000t at < 75%. This design injects ~650t. **Saves ~1350t/turn.**
 
-### 4.7 Memoria Storage Protocol
+### 4.9 Memoria Storage Protocol
 
 ```
 Store/Update L1:
@@ -624,7 +656,7 @@ When running alongside Claude Code:
 - astra-engine also maintains its own L1 in Memoria
 - Both sources are combined for maximum context preservation
 
-## 9. Compaction Flow (Revised)
+## 9. Compaction Flow
 
 ```
 Compaction triggered (pressure ≥ 75%):
@@ -662,7 +694,7 @@ Compaction triggered (pressure ≥ 75%):
     - Reset microcompact state
 ```
 
-Key improvement over v1: **No 15-second wait for L1b extraction.** L1a (facts) is always available, so compaction is always instant and zero-LLM. L1b enriches if available but is never blocking.
+> **Migration from v1**: v1 compaction retrieves L1 narrative from Memoria and waits up to 15s if extraction is in-flight. This design eliminates the wait — L1a facts are always available locally.
 
 ### 9.1 Multi-Compaction Handling
 
@@ -672,22 +704,39 @@ A long session may compact multiple times. Key invariants:
 
 2. **L1 is always the latest version** — it's updated incrementally, so the second compaction's L1 already incorporates everything from the first compaction's preserved context. No summary-of-summary problem.
 
-3. **First user message is always preserved** — even across multiple compactions, the original task message is pinned. It may appear immediately after the latest summary message.
+3. **First user message is always preserved** — even across multiple compactions, the original task message is pinned. It may appear immediately after the latest summary message. ✅ Implemented in `session_memory_protocol.rs`.
 
 4. **Compaction archives accumulate in L3** — each compaction stores a semantic memory with `[compaction:{sid}]` tag. These form a chain of historical snapshots, retrievable for debugging but never re-injected.
 
+**⚠️ v1 limitation**: Without L1a (facts), the second compaction depends on the L1 narrative generated from the first compaction's preserved messages. Any hallucination in the L1 narrative propagates. v2.1 eliminates this by making L1a (facts) the authoritative source.
+
 ## 10. Implementation Plan
+
+> v1 current state is documented in Appendix A.
 
 | Phase | Scope | Key Changes | Files |
 |-------|-------|-------------|-------|
-| **P0** | Goal preservation | TieredCompaction/ReactiveCompact preserve first user message; continuation prompt after compaction | `context_compression.rs`, `memoria_compact.rs` |
-| **P1** | L1a Session Facts | `SessionFacts` struct; update from journal events every turn; `to_injection()` serialization | New: `session_facts.rs` in runtime |
-| **P2** | L0 anchor from facts | `extract_anchor()` uses `SessionFacts` for State/Constraints instead of LLM narrative | `session_memory_protocol.rs` |
+| **P1** | L1a Session Facts | `SessionFacts` struct; `ToolCallRecord.file_path` field; update from journal events every turn; `to_injection()` | New: `session_facts.rs`; Modified: tool execution path for `file_path` |
+| **P2** | L0 anchor from facts | `extract_anchor()` uses `SessionFacts` for State/Constraints instead of L1 narrative | `session_memory_protocol.rs` |
 | **P3** | L1b narrative slimdown | Template from 10→6 sections; extraction prompt only updates LLM-appropriate sections; error-triggered extraction | `session_memory_extract.rs`, `session_memory_protocol.rs` |
 | **P4** | Facts-first injection | `build_injection()` assembles L1a + L1b with cross-validation; pressure-adaptive levels | `session_memory_protocol.rs` |
-| **P5** | Facts-first compaction | Compaction uses L1a (always available) as base; L1b enriches; remove 15s wait | `memoria_compact.rs` |
+| **P5** | Facts-first compaction | Compaction uses L1a (always available) as base; L1b enriches; remove blocking wait | `memoria_compact.rs` |
 | **P6** | Microcompact improvements | Adaptive retention by pressure; duplicate read elimination; `SessionFacts.active_files` as pin list | `microcompact.rs` |
 | **P7** | L3 governance | Session end: knowledge backflow from L1b Learnings + User Corrections; working memory purge | `agentic_loop_lifecycle.rs` |
+
+### Known Gaps
+
+| Gap | Severity | Notes |
+|-----|----------|-------|
+| No `SessionFacts` struct | High | Cornerstone of the design — blocks P1–P5 |
+| No `ToolCallRecord.file_path` field | High | P1 prerequisite — `args_preview` is unreliable for file path extraction |
+| `plan_state` requires checkpoint access | Medium | Journal only has `plan_subtask_id`; full plan is in `HeavyCheckpoint.executing_plan_json` |
+| Error-triggered extraction not wired | Medium | User corrections between extraction cycles may be lost |
+| Cross-validation not implemented | Medium | No warning when narrative contradicts system facts |
+| L1b extraction via LLM not wired to runtime | Medium | `session_memory_extract.rs` has `build_extraction_prompt()` but it's not called from the agentic loop |
+| Post-compact restoration not implemented | Low | File re-injection, plan restoration, skill re-announcement |
+| `truncate_to_token_budget` not CJK-aware | Medium | Needs `floor_char_boundary` guard |
+| Memoria fallback for L1 persistence | Medium | `persist_l1` gives up after 2 failures with no local file fallback |
 
 ## 11. Metrics & Observability
 
@@ -699,20 +748,70 @@ A long session may compact multiple times. Key invariants:
 | `session_narrative.update_latency_ms` | Cheap model API call | Monitor extraction cost |
 | `session_memory.injection_tokens` | Token count of L1a+L1b injection | Track token overhead (target: ≤700t) |
 | `session_memory.cross_validation_warnings` | `build_injection()` | Track facts/narrative inconsistencies |
-| `compaction.summary_source` | `l1a_facts` / `l1a_facts_plus_narrative` / `l2_llm_summary` | Track zero-LLM compaction rate |
+| `compaction.summary_source` | `l1a_facts` / `l1a_plus_narrative` / `l2_llm_summary` | Track zero-LLM compaction rate |
 | `compaction.goal_preserved` | Boolean: first user message + L0 anchor present post-compact | Verify goal preservation |
 | `cache.hit_rate` | Existing cache diagnostics | Verify injection doesn't degrade cache |
+| `session_memory.learnings_backflow_count` | `extract_learnings_for_backflow()` | Track knowledge persistence |
 
 ## 12. Risks & Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Cheap model produces low-quality L1b narrative | Incorrect task spec or decisions | Format validation (4.5); 2 consecutive failures → pause L1b; L1a facts alone is sufficient |
+| Cheap model produces low-quality L1b narrative | Incorrect task spec or decisions | Format validation (4.7); 2 consecutive failures → pause L1b; L1a facts alone is sufficient |
 | L1b update latency blocks main turn | User-visible delay | Async fire-and-forget; result available next turn; compaction does NOT wait (uses L1a facts) |
 | Memoria unavailable during compaction | No L1b narrative | L1a facts always available locally; L2 only needed if journal also corrupted |
 | L1a facts miss some state | Incomplete file/tool tracking | Facts are best-effort; narrative supplements; cross-validation catches inconsistencies |
-| L1b narrative contradicts L1a facts | Confusing injection | Cross-validation warning in `build_injection()`: "⚠️ Narrative says X but system shows Y" |
+| L1b narrative contradicts L1a facts | Confusing injection | Cross-validation **skips** contradicted narrative sections + triggers re-extraction; model cannot hallucinate from omitted data |
 | Per-section budgets too restrictive | Important info truncated | Stored version has 2000t total (generous for 6 sections); injection separately compressed |
-| User corrections lost before extraction | Correction dropped by compaction | Error-triggered extraction (4.3): TurnError → immediate L1b update captures correction |
+| User corrections lost before extraction | Correction dropped by compaction | Error-triggered extraction (4.5): TurnError → immediate L1b update captures correction |
 | Multiple compactions nest summaries | Summary-of-summary degradation | L1a facts are always fresh (not derived from previous summary); old boundaries identified by compact_metadata |
 | Session resume without cached facts | Cannot restore L1a | `SessionFacts::from_journal_and_checkpoint()` rebuilds from persisted journal + checkpoint |
+| `ToolCallRecord.args_preview` truncates file path | `active_files` misses files from `str_replace` calls | New `file_path` field on `ToolCallRecord`, populated at execution time from full args (P1 prerequisite) |
+| `build_l1_from_messages` scans ALL messages | O(n) per turn for long sessions | Replaced by incremental `SessionFacts.update_from_turn()` (O(1) per turn) |
+| `truncate_to_token_budget` not CJK-aware | May truncate mid-character for Chinese | Needs `floor_char_boundary` guard (same pattern as UTF-8 bugfix in cli_formatting.rs) |
+
+
+## Appendix A: v1 Current Implementation
+
+The current L1 is a monolithic `SessionMemory` struct with 10 sections, all populated by `build_l1_from_messages()` in `session_memory_protocol.rs`.
+
+```rust
+pub const SESSION_MEMORY_PREFIX: &str = "[session-memory:v1]";
+
+const REQUIRED_SECTIONS: &[&str] = &["Task Specification", "Current State", "User Messages"];
+
+const SECTION_NAMES: &[&str] = &[
+    "Session Title", "Task Specification", "Current State", "Key Files",
+    "Progress", "Errors & Corrections", "Decisions", "User Messages",
+    "Worklog", "Context",
+];
+```
+
+**Budget**: Stored 4000t, injection 2000t via `compress_to_injection()`.
+
+**Generation**: `build_l1_from_messages()` scans all conversation messages to extract task (first user msg), files (tool call `path` args), tools (`tool_calls[].function.name`), current state (last assistant msg, 15 words), progress (tool call count), user messages (deduped, last 10).
+
+**Known limitations**:
+1. `Current State`, `Progress`, `Key Files` are LLM-derivative, not system facts
+2. No dedicated "User Corrections" section — corrections buried in "Errors & Corrections"
+3. No cross-validation between facts and narrative
+4. No error-triggered extraction — only dual-threshold (token growth + tool calls)
+5. `count_progress_markers` uses emoji counting (✅/🔄/⏳), not real plan steps
+6. `truncate_to_token_budget` not CJK-aware (unlike `truncate_words`)
+
+**Implemented components** (line references to `session_memory_protocol.rs`):
+
+| Component | Lines |
+|-----------|-------|
+| L0 Anchor (from L1) | 13–23 |
+| L1 Parse/Validate | 148–238 |
+| `build_l1_from_messages` | 470–606 |
+| `compress_to_injection` | 241–347 |
+| 10-section template + budgets | 112–145 |
+| First user message pin | 381–388 |
+| Compaction boundary detection | 391–393 |
+| Pressure-adaptive injection levels | 397–432 |
+| L1 persist to Memoria | 438–464 |
+| CJK-aware `truncate_words` | 36–67 |
+| Anthropic content block support | 350–366 |
+| User message deduplication | 482–491 |

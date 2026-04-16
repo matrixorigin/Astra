@@ -1337,6 +1337,7 @@ mod tests {
                 output_bytes: Some(5),
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -1347,6 +1348,7 @@ mod tests {
                 output_bytes: Some(20),
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -1357,6 +1359,7 @@ mod tests {
                 output_bytes: Some(0),
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             },
         ];
 

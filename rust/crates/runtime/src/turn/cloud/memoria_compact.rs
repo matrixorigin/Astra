@@ -102,6 +102,10 @@ pub struct MemoriaCompactParams {
     pub session_memory_file: Option<PathBuf>,
     /// How to combine that file with Memoria retrieval.
     pub session_memory_combine: SessionMemoryFileCombine,
+    /// Optional session facts for facts-first compaction (L1a ground truth).
+    /// When present, `build_facts_first_injection()` is used as the primary
+    /// memory context, with Memoria narrative as supplement.
+    pub session_facts: Option<super::session_facts::SessionFacts>,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,12 +234,23 @@ pub fn resolve_session_memory_file_options(
 /// Trait for Memoria HTTP operations (allows mocking in tests).
 #[async_trait::async_trait]
 pub trait MemoriaClient: Send + Sync {
-    /// Retrieve memories for a query.
+    /// Retrieve memories (cross-session). Delegates to [`retrieve_ext`] with `filter_session=false`.
     async fn retrieve(
         &self,
         query: &str,
         session_id: Option<&str>,
         top_k: usize,
+    ) -> Result<Vec<MemoriaMemory>, String> {
+        self.retrieve_ext(query, session_id, top_k, false).await
+    }
+
+    /// Retrieve with explicit filter_session control.
+    async fn retrieve_ext(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filter_session: bool,
     ) -> Result<Vec<MemoriaMemory>, String>;
 
     /// Store a memory with optional trust tier for confidence decay.
@@ -304,11 +319,12 @@ impl HttpMemoriaClient {
 
 #[async_trait::async_trait]
 impl MemoriaClient for HttpMemoriaClient {
-    async fn retrieve(
+    async fn retrieve_ext(
         &self,
         query: &str,
         session_id: Option<&str>,
         top_k: usize,
+        filter_session: bool,
     ) -> Result<Vec<MemoriaMemory>, String> {
         let url = format!(
             "{}/v1/memories/retrieve",
@@ -320,6 +336,9 @@ impl MemoriaClient for HttpMemoriaClient {
         });
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
+            if filter_session {
+                body["filter_session"] = json!(true);
+            }
         }
 
         let resp = self
@@ -823,14 +842,10 @@ pub async fn compact_with_memoria(
         );
     };
 
-    // Step 1: Retrieve session context from Memoria
-    // NOTE: session_id is currently only used for score boosting, not strict filtering.
-    // This means other sessions' memories can outrank the current session's L1.
-    // TODO: use filter_session=true once Memoria supports it
-    //       (https://github.com/matrixorigin/Memoria/issues/184)
+    // Step 1: Retrieve session context from Memoria (strict session scope).
     let query = memoria_compact_retrieve_query(messages);
     let memories = match client
-        .retrieve(&query, Some(sid), config.max_memories)
+        .retrieve_ext(&query, Some(sid), config.max_memories, true)
         .await
     {
         Ok(m) => m,
@@ -858,13 +873,34 @@ pub async fn compact_with_memoria(
         config.max_memory_tokens,
     );
 
-    // Step 2: Build context summary (token cap unified with summary reservation)
-    let memory_context = build_session_context_with_optional_file(
-        &memories,
-        file_text.as_deref(),
-        params.session_memory_combine,
-        memory_max_tokens,
-    );
+    // Step 2: Build context summary
+    // Facts-first path: when SessionFacts available, use ground truth + narrative
+    // instead of raw Memoria memories. Zero LLM, always available.
+    let memory_context = if let Some(facts) = &params.session_facts {
+        // Try to find L1 narrative from Memoria memories (prefix match)
+        let narrative = memories
+            .iter()
+            .find(|m| {
+                m.content
+                    .starts_with(super::session_memory_protocol::SESSION_MEMORY_PREFIX)
+            })
+            .and_then(|m| super::session_memory_protocol::SessionMemory::parse(&m.content));
+        let injection =
+            super::session_memory_protocol::build_facts_first_injection(facts, narrative.as_ref());
+        eprintln!(
+            "[compact] Facts-first injection ({} chars, narrative={})",
+            injection.len(),
+            narrative.is_some(),
+        );
+        injection
+    } else {
+        build_session_context_with_optional_file(
+            &memories,
+            file_text.as_deref(),
+            params.session_memory_combine,
+            memory_max_tokens,
+        )
+    };
     let has_memory_context = !memory_context.is_empty();
     let memory_chars = memory_context.chars().count();
 
@@ -1043,11 +1079,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MemoriaClient for MockMemoriaClient {
-        async fn retrieve(
+        async fn retrieve_ext(
             &self,
             _query: &str,
             _session_id: Option<&str>,
             _top_k: usize,
+            _filter_session: bool,
         ) -> Result<Vec<MemoriaMemory>, String> {
             Ok(self.memories.lock().unwrap().clone())
         }
@@ -1240,6 +1277,7 @@ mod tests {
             current_tokens: 1000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
         let result = compact_with_memoria(
             &msgs,
@@ -1271,6 +1309,7 @@ mod tests {
             current_tokens: 1000, // Below threshold
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let result = compact_with_memoria(
@@ -1315,6 +1354,7 @@ mod tests {
             current_tokens: 6000, // Above threshold
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let result = compact_with_memoria(
@@ -1351,6 +1391,154 @@ mod tests {
         assert_eq!(stored[0].1, "working");
     }
 
+    #[tokio::test]
+    async fn compact_facts_first_uses_session_facts() {
+        use super::super::session_facts::{ErrorFact, FileEntry, SessionFacts};
+        let msgs = vec![
+            user("implement OAuth"),
+            assistant("I'll help with OAuth"),
+            user("use JWT"),
+            assistant("Switching to JWT"),
+        ];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        // Memoria returns an L1 narrative
+        let l1_content = format!(
+            "{}\n# Session Title\nOAuth impl\n# Task Specification\nImplement OAuth with JWT\n# User Messages\nuse JWT",
+            super::super::session_memory_protocol::SESSION_MEMORY_PREFIX
+        );
+        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: l1_content,
+            memory_type: "working".to_string(),
+            retrieval_score: Some(0.9),
+        }]);
+        let mut facts = SessionFacts::default();
+        facts.turn = 4;
+        facts.estimated_tokens = 20000;
+        facts.active_files.push(FileEntry {
+            path: "src/auth.rs".to_string(),
+            last_action: "write".to_string(),
+            turn: 3,
+        });
+        facts.error_state = ErrorFact {
+            total_errors: 1,
+            last_error: Some("compile error".to_string()),
+            last_error_turn: Some(3),
+        };
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::CompactHistory,
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+            session_memory_file: None,
+            session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: Some(facts),
+        };
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
+
+        // Should have injected facts-first context
+        let ctx = result
+            .messages
+            .iter()
+            .find(|m| {
+                m.get("role").and_then(Value::as_str) == Some("system")
+                    && m.get("content")
+                        .and_then(Value::as_str)
+                        .map(|c| c.contains("# System State"))
+                        .unwrap_or(false)
+            })
+            .expect("Should have facts-first injection");
+        let content = ctx.get("content").unwrap().as_str().unwrap();
+        // Facts present
+        assert!(content.contains("Turn 4"), "should have turn from facts");
+        assert!(
+            content.contains("src/auth.rs"),
+            "should have active file from facts"
+        );
+        assert!(
+            content.contains("compile error"),
+            "should have error from facts"
+        );
+        // Narrative present (from Memoria L1)
+        assert!(
+            content.contains("# Task"),
+            "should have task from narrative"
+        );
+        assert!(
+            content.contains("OAuth"),
+            "should have OAuth from narrative"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_facts_first_works_without_narrative() {
+        use super::super::session_facts::{FileEntry, SessionFacts};
+        let msgs = vec![user("hello"), assistant("hi")];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false,
+            ..Default::default()
+        };
+        // Memoria returns nothing (no narrative available)
+        let mock = MockMemoriaClient::new(vec![]);
+        let mut facts = SessionFacts::default();
+        facts.turn = 2;
+        facts.estimated_tokens = 10000;
+        facts.active_files.push(FileEntry {
+            path: "main.rs".to_string(),
+            last_action: "read".to_string(),
+            turn: 1,
+        });
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::CompactHistory,
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+            session_memory_file: None,
+            session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: Some(facts),
+        };
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
+
+        // Should still inject facts (no narrative, but facts alone is sufficient)
+        let has_facts = result.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|c| c.contains("# System State") && c.contains("main.rs"))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_facts,
+            "facts-only injection should work without narrative"
+        );
+    }
+
     #[test]
     fn sync_wrapper_falls_back() {
         let msgs = vec![user("hello"), assistant("hi")];
@@ -1363,6 +1551,7 @@ mod tests {
             current_tokens: 1000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
         let result = compact_with_memoria_sync(&msgs, Some("sess1"), &config, &params);
         assert_eq!(result.messages.len(), 2);
@@ -1431,6 +1620,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let compact_config = CompactConfig {
@@ -1487,6 +1677,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let compact_config = CompactConfig {
@@ -1534,6 +1725,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let compact_config = CompactConfig {
@@ -1581,6 +1773,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
 
         let compact_config = CompactConfig {
@@ -1638,6 +1831,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: Some(f),
             session_memory_combine: SessionMemoryFileCombine::Fallback,
+            session_facts: None,
         };
         let r = compact_with_memoria(
             &msgs,
@@ -1678,6 +1872,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: Some(f),
             session_memory_combine: SessionMemoryFileCombine::Fallback,
+            session_facts: None,
         };
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
@@ -1723,6 +1918,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: Some(f),
             session_memory_combine: SessionMemoryFileCombine::Merge,
+            session_facts: None,
         };
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
@@ -2179,6 +2375,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
         let compact_config = CompactConfig {
             enable_summary: true,
@@ -2249,6 +2446,7 @@ mod tests {
             current_tokens: 6000,
             session_memory_file: None,
             session_memory_combine: SessionMemoryFileCombine::None,
+            session_facts: None,
         };
         let compact_config = CompactConfig {
             enable_summary: true,

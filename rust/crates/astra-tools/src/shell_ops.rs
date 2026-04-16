@@ -21,6 +21,7 @@ const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
 const RAW_GLOB_OUTPUT_LIMIT: usize = 120_000;
+const RAW_STDERR_OUTPUT_LIMIT: usize = 16_000;
 
 const DEFAULT_SEARCH_EXCLUDE_DIRS: &[&str] = &[
     ".git",
@@ -68,6 +69,7 @@ struct ReadOnlyCommandOutput {
     timed_out: bool,
     cancelled: bool,
     stdout_capped: bool,
+    stderr_capped: bool,
 }
 
 struct EnumeratedSearchFiles {
@@ -109,8 +111,9 @@ struct GrepRequest<'a> {
     multiline: bool,
 }
 
-/// Execute a bash command with timeout in a workspace directory.
-pub async fn execute_bash(workspace_root: &Path, args: &Value) -> ToolResult {
+/// Execute a bash command with bounded partial-output capture.
+pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+    let workspace_root = ctx.workspace_root.as_path();
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return ToolResult::error("Error: Missing 'command' parameter".into()),
@@ -119,49 +122,100 @@ pub async fn execute_bash(workspace_root: &Path, args: &Value) -> ToolResult {
         .get("timeout")
         .and_then(|v| v.as_f64())
         .unwrap_or(30.0)
-        .min(120.0);
+        .clamp(0.1, 120.0);
 
     let timeout = Duration::from_secs_f64(timeout_secs);
-    let output = tokio::time::timeout(timeout, async {
-        tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(workspace_root)
-            .kill_on_drop(true)
-            .output()
-            .await
-    })
-    .await;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(workspace_root)
+        .kill_on_drop(true);
 
-    match output {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut result = String::new();
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str("stderr:\n");
-                result.push_str(&stderr);
-            }
-            if !out.status.success() {
-                result.push_str(&format!(
-                    "\n(exit code: {})",
-                    out.status.code().unwrap_or(-1)
-                ));
-            }
-            if result.is_empty() {
-                ToolResult::text("(command completed with no output)".into())
-            } else {
-                ToolResult::text(result)
-            }
+    let output_limit = per_tool_output_limit("bash");
+    let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
+    let raw_stderr_limit = output_limit.clamp(8_192, 32_768);
+    let output = match run_readonly_command_with_partial(
+        &mut cmd,
+        timeout,
+        raw_stdout_limit,
+        raw_stderr_limit,
+        ctx.cancel_token.as_deref(),
+        "bash command",
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => return ToolResult::error(e),
+    };
+
+    let mut result = String::new();
+    if !output.stdout.is_empty() {
+        result.push_str(&output.stdout);
+    }
+    if !output.stderr.is_empty() {
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
         }
-        Ok(Err(e)) => ToolResult::error(format!("Error: Failed to execute command: {e}")),
-        Err(_) => ToolResult::error(format!("Error: Command timed out after {timeout_secs}s")),
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("stderr:\n");
+        result.push_str(&output.stderr);
+    }
+
+    let mut cap_notes = Vec::new();
+    if output.stdout_capped {
+        cap_notes.push("stdout capped");
+    }
+    if output.stderr_capped {
+        cap_notes.push("stderr capped");
+    }
+    if !cap_notes.is_empty() {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(&format!(
+            "[bash output capped before completion: {}]",
+            cap_notes.join(", ")
+        ));
+    }
+
+    if output.exit_code != 0 && !output.timed_out && !output.cancelled {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(&format!("[exit code: {}]", output.exit_code));
+    }
+
+    if output.timed_out {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+            result.push_str(&format!(
+                "[bash timed out after {timeout_secs}s — showing partial output]"
+            ));
+        } else {
+            result = format!("Error: bash timed out after {timeout_secs}s with no captured output");
+        }
+        return ToolResult::error(truncate_output(result, output_limit));
+    }
+
+    if output.cancelled {
+        if !result.is_empty() {
+            result.push_str("\n\n[bash cancelled — showing partial output]");
+        } else {
+            result = "Error: bash cancelled before any output was captured".into();
+        }
+        return ToolResult::error(truncate_output(result, output_limit));
+    }
+
+    if output.exit_code != 0 {
+        return ToolResult::error(truncate_output(result, output_limit));
+    }
+
+    if result.is_empty() {
+        ToolResult::text("(command completed with no output)".into())
+    } else {
+        ToolResult::text(truncate_output(result, output_limit))
     }
 }
 
@@ -281,6 +335,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         timed_out,
         cancelled,
         stdout_capped,
+        stderr_capped: _stderr_capped,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -493,6 +548,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         timed_out,
         cancelled,
         stdout_capped,
+        stderr_capped: _stderr_capped,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -1172,8 +1228,15 @@ async fn run_grep_with_rg_program(
         .arg("--")
         .arg(request.target);
 
-    run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT, cancel_token)
-        .await
+    run_readonly_command_with_partial(
+        &mut cmd,
+        GREP_TIMEOUT,
+        RAW_GREP_OUTPUT_LIMIT,
+        RAW_STDERR_OUTPUT_LIMIT,
+        cancel_token,
+        "search command",
+    )
+    .await
 }
 
 async fn run_grep_with_preferred_backend(
@@ -1284,7 +1347,9 @@ async fn run_grep_with_grep(
             &mut cmd,
             remaining,
             RAW_GREP_OUTPUT_LIMIT,
+            RAW_STDERR_OUTPUT_LIMIT,
             cancel_token,
+            "search command",
         )
         .await?;
 
@@ -1323,6 +1388,7 @@ async fn run_grep_with_grep(
         timed_out,
         cancelled,
         stdout_capped,
+        stderr_capped: false,
     })
 }
 
@@ -1410,6 +1476,7 @@ async fn run_grep_multiline_locally(
         timed_out,
         cancelled,
         stdout_capped,
+        stderr_capped: false,
     })
 }
 
@@ -1595,8 +1662,15 @@ async fn run_glob_with_rg_program(
     append_default_rg_excludes(&mut cmd);
     cmd.arg("-g").arg(pattern).arg(shell_target);
 
-    run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT, cancel_token)
-        .await
+    run_readonly_command_with_partial(
+        &mut cmd,
+        GLOB_TIMEOUT,
+        RAW_GLOB_OUTPUT_LIMIT,
+        RAW_STDERR_OUTPUT_LIMIT,
+        cancel_token,
+        "search command",
+    )
+    .await
 }
 
 async fn run_glob_with_preferred_backend(
@@ -1674,7 +1748,15 @@ async fn run_search_file_listing_with_find(
         .arg("f")
         .arg("-print");
 
-    run_readonly_command_with_partial(&mut cmd, timeout, RAW_GLOB_OUTPUT_LIMIT, cancel_token).await
+    run_readonly_command_with_partial(
+        &mut cmd,
+        timeout,
+        RAW_GLOB_OUTPUT_LIMIT,
+        RAW_STDERR_OUTPUT_LIMIT,
+        cancel_token,
+        "search command",
+    )
+    .await
 }
 
 fn append_default_rg_excludes(cmd: &mut Command) {
@@ -1812,21 +1894,23 @@ async fn run_readonly_command_with_partial(
     cmd: &mut Command,
     timeout: Duration,
     max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
     cancel_token: Option<&CancellationToken>,
+    command_kind: &str,
 ) -> Result<ReadOnlyCommandOutput, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Error: failed to start search command: {e}"))?;
+        .map_err(|e| format!("Error: failed to start {command_kind}: {e}"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "Error: failed to capture stdout".to_string())?;
+        .ok_or_else(|| format!("Error: failed to capture {command_kind} stdout"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "Error: failed to capture stderr".to_string())?;
+        .ok_or_else(|| format!("Error: failed to capture {command_kind} stderr"))?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(StreamKind, String)>();
     let stdout_task = tokio::spawn(read_stream(stdout, StreamKind::Stdout, tx.clone()));
@@ -1836,17 +1920,20 @@ async fn run_readonly_command_with_partial(
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
     let mut stdout_capped = false;
+    let mut stderr_capped = false;
     let mut exit_code = None;
     let mut timed_out = false;
     let mut cancelled = false;
 
     loop {
-        drain_search_chunks(
+        drain_command_chunks(
             &mut rx,
             &mut stdout_text,
             &mut stderr_text,
             max_stdout_bytes,
             &mut stdout_capped,
+            max_stderr_bytes,
+            &mut stderr_capped,
         );
 
         match child.try_wait() {
@@ -1875,24 +1962,25 @@ async fn run_readonly_command_with_partial(
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
-            Err(e) => return Err(format!("Error: search command failed: {e}")),
+            Err(e) => return Err(format!("Error: {command_kind} failed: {e}")),
         }
     }
 
     let _ = stdout_task.await;
     let _ = stderr_task.await;
-    drain_search_chunks(
+    drain_command_chunks(
         &mut rx,
         &mut stdout_text,
         &mut stderr_text,
         max_stdout_bytes,
         &mut stdout_capped,
+        max_stderr_bytes,
+        &mut stderr_capped,
     );
 
-    if (timed_out || cancelled)
-        && let Some(last_newline) = stdout_text.rfind('\n')
-    {
-        stdout_text.truncate(last_newline);
+    if timed_out || cancelled {
+        truncate_partial_line(&mut stdout_text);
+        truncate_partial_line(&mut stderr_text);
     }
 
     Ok(ReadOnlyCommandOutput {
@@ -1902,6 +1990,7 @@ async fn run_readonly_command_with_partial(
         timed_out,
         cancelled,
         stdout_capped,
+        stderr_capped,
     })
 }
 
@@ -1925,20 +2014,32 @@ async fn read_stream<R>(
     }
 }
 
-fn drain_search_chunks(
+fn drain_command_chunks(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<(StreamKind, String)>,
     stdout_text: &mut String,
     stderr_text: &mut String,
     max_stdout_bytes: usize,
     stdout_capped: &mut bool,
+    max_stderr_bytes: usize,
+    stderr_capped: &mut bool,
 ) {
     while let Ok((kind, chunk)) = rx.try_recv() {
         match kind {
             StreamKind::Stdout => {
                 append_capped(stdout_text, &chunk, max_stdout_bytes, stdout_capped)
             }
-            StreamKind::Stderr => stderr_text.push_str(&chunk),
+            StreamKind::Stderr => {
+                append_capped(stderr_text, &chunk, max_stderr_bytes, stderr_capped)
+            }
         }
+    }
+}
+
+fn truncate_partial_line(output: &mut String) {
+    if let Some(last_newline) = output.rfind('\n') {
+        output.truncate(last_newline);
+    } else if !output.is_empty() {
+        output.clear();
     }
 }
 
@@ -2135,6 +2236,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     #[cfg(unix)]
     fn write_fake_rg_script(dir: &Path, body: &str) -> PathBuf {
@@ -3020,6 +3122,86 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_non_zero_exit_is_reported_as_error() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "echo nope >&2; exit 7"
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "non-zero bash should be error");
+        assert!(
+            result.output.contains("stderr:\nnope"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("[exit code: 7]"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_keeps_partial_output() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "echo start; sleep 1; echo done",
+                "timeout": 0.2
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "timed out bash should be error");
+        assert!(result.output.contains("start"), "got: {}", result.output);
+        assert!(
+            result.output.contains("timed out after 0.2s"),
+            "got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("done"), "got: {}", result.output);
+    }
+
+    #[tokio::test]
+    async fn bash_cancellation_keeps_partial_output() {
+        let dir = tempdir().unwrap();
+        let token = Arc::new(CancellationToken::new());
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            trigger.cancel();
+        });
+
+        let mut ctx = crate::ToolContext::test(dir.path());
+        ctx.cancel_token = Some(token);
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "for i in $(seq 1 5); do echo line_$i; sleep 0.1; done; sleep 5"
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "cancelled bash should be error");
+        assert!(result.output.contains("line_1"), "got: {}", result.output);
+        assert!(
+            result.output.contains("bash cancelled"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn readonly_command_cancels_and_keeps_partial_output() {
         let token = CancellationToken::new();
         let trigger = token.clone();
@@ -3036,7 +3218,9 @@ printf 'probe.txt:1:needle\n'
             &mut cmd,
             Duration::from_secs(10),
             RAW_GREP_OUTPUT_LIMIT,
+            RAW_STDERR_OUTPUT_LIMIT,
             Some(&token),
+            "test command",
         )
         .await
         .expect("command should return partial output on cancellation");
@@ -3056,9 +3240,16 @@ printf 'probe.txt:1:needle\n'
         cmd.arg("-c")
             .arg("for i in $(seq 1 256); do printf 'xxxxxxxx'; done");
 
-        let output = run_readonly_command_with_partial(&mut cmd, Duration::from_secs(5), 128, None)
-            .await
-            .expect("command should succeed");
+        let output = run_readonly_command_with_partial(
+            &mut cmd,
+            Duration::from_secs(5),
+            128,
+            64,
+            None,
+            "test command",
+        )
+        .await
+        .expect("command should succeed");
 
         assert_eq!(output.exit_code, 0, "stderr: {}", output.stderr);
         assert!(output.stdout_capped, "expected stdout cap to be reported");

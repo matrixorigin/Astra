@@ -5,9 +5,20 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use serde_json::Value;
 
-use crate::ToolResult;
+use crate::code_intel;
+use crate::{ToolResult, per_tool_output_limit, truncate_output};
+
+const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
+const IMAGE_READ_SIZE_LIMIT: u64 = 1_500_000;
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+const BINARY_EXTS: &[&str] = &[
+    "svg", "pdf", "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib", "o",
+    "a", "lib", "wasm", "class", "pyc", "pyo", "mp3", "mp4", "avi", "mov", "wav", "flac", "ogg",
+    "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb", "ico",
+];
 
 /// Resolve a relative path against workspace_root with normalization.
 ///
@@ -57,11 +68,6 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::error(e),
     };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
-    };
-
     let start_line = args
         .get("start_line")
         .and_then(|v| v.as_u64())
@@ -70,10 +76,108 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         .get("end_line")
         .and_then(|v| v.as_u64())
         .map(|l| l as usize);
+    let outline = args
+        .get("outline")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_range = start_line.is_some() || end_line.is_some();
+
+    let metadata = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+    };
+    if metadata.is_dir() {
+        return ToolResult::error(format!(
+            "Error: '{}' is a directory. Use list_dir instead.",
+            path_str
+        ));
+    }
+    if !metadata.is_file() {
+        return ToolResult::error(format!(
+            "Error: refusing to read special file '{}'. Use bash with an appropriate tool instead.",
+            path_str
+        ));
+    }
+
+    if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+        if IMAGE_EXTS.contains(&ext_lower.as_str()) {
+            if metadata.len() > IMAGE_READ_SIZE_LIMIT {
+                return ToolResult::error(format!(
+                    "Error: image too large ({} bytes). Use bash to resize first.",
+                    metadata.len()
+                ));
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => return ToolResult::error(format!("Error reading image: {e}")),
+            };
+            let mime = match ext_lower.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "bmp" => "image/bmp",
+                "webp" => "image/webp",
+                _ => "application/octet-stream",
+            };
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            return ToolResult::text(format!("data:{mime};base64,{encoded}"));
+        }
+
+        if BINARY_EXTS.contains(&ext_lower.as_str()) {
+            return ToolResult::error(format!(
+                "Error: refusing to read binary file (.{ext}). Use bash with appropriate tools (e.g. file, xxd, strings) for binary analysis."
+            ));
+        }
+    }
+
+    if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
+        let rough_lines = (metadata.len() as usize / 40).max(1);
+        return ToolResult::error(format!(
+            "Error: file is too large ({} bytes, ~{} lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only.",
+            metadata.len(),
+            rough_lines
+        ));
+    }
+
+    let content = match read_to_string_lossy(&path) {
+        Ok(content) => content,
+        Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+    };
+    let total_lines = content.lines().count();
+
+    if outline {
+        let rendered = render_outline(&path, &content, total_lines);
+        return ToolResult::text(rendered);
+    }
+
+    if !has_range {
+        let numbered = add_line_numbers(&content, 1);
+        let limit = per_tool_output_limit("read_file");
+        if numbered.len() > limit {
+            let mut truncated = truncate_output(numbered, limit);
+            truncated.push_str(&format!(
+                "\n[file has {total_lines} lines — use start_line/end_line or outline=true]"
+            ));
+            return ToolResult::text(truncated);
+        }
+        return ToolResult::text(numbered);
+    }
 
     let lines: Vec<&str> = content.lines().collect();
-    let start = start_line.unwrap_or(1).saturating_sub(1);
-    let end = end_line.unwrap_or(lines.len()).min(lines.len());
+    if lines.is_empty() {
+        return ToolResult::text("(empty file)".into());
+    }
+
+    let start_line = start_line.unwrap_or(1);
+    let end_line = end_line.unwrap_or(lines.len());
+    let (start_line, end_line) = if start_line > end_line {
+        (end_line, start_line)
+    } else {
+        (start_line, end_line)
+    };
+    let start = start_line.saturating_sub(1).min(lines.len());
+    let end = end_line.min(lines.len());
 
     if start >= lines.len() {
         return ToolResult::error(format!(
@@ -82,12 +186,101 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
             lines.len()
         ));
     }
+    if start >= end {
+        return ToolResult::text(format!(
+            "(empty range: start_line {} >= end_line {} or file has only {} lines)",
+            start + 1,
+            end,
+            lines.len()
+        ));
+    }
 
-    let mut result = String::new();
-    for (i, line) in lines[start..end].iter().enumerate() {
-        result.push_str(&format!("{}\t{}\n", start + i + 1, line));
+    let slice = lines[start..end].join("\n");
+    let mut result = truncate_output(
+        add_line_numbers(&slice, start + 1),
+        per_tool_output_limit("read_file"),
+    );
+    if end < lines.len() {
+        result.push_str(&format!(
+            "\n[showing lines {}-{} of {}]",
+            start + 1,
+            end,
+            lines.len()
+        ));
     }
     ToolResult::text(result)
+}
+
+fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(content),
+        Err(error) => Ok(String::from_utf8_lossy(&error.into_bytes()).into_owned()),
+    }
+}
+
+fn add_line_numbers(content: &str, start_line: usize) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let max_num = start_line + lines.len().saturating_sub(1);
+    let width = max_num.to_string().len().max(1);
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| format!("{:width$}\t{}", start_line + idx, line, width = width))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_outline(path: &Path, content: &str, total_lines: usize) -> String {
+    if let Some(lang) = code_intel::detect_language(path) {
+        let outline = code_intel::generate_outline(content, lang);
+        if !outline.is_empty() {
+            let symbol_count = outline.lines().count();
+            return format!("# Outline ({total_lines} lines, {symbol_count} symbols)\n{outline}");
+        }
+    }
+
+    let fallback = fallback_outline(content);
+    if fallback.is_empty() {
+        format!("(no definitions found in {total_lines}-line file)")
+    } else {
+        format!(
+            "# Outline ({total_lines} lines total, {} definitions)\n{}",
+            fallback.len(),
+            fallback
+                .into_iter()
+                .map(|(line_no, sig)| format!("L{line_no}: {sig}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
+fn fallback_outline(content: &str) -> Vec<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let trimmed = line.trim_start();
+            let looks_like_definition = trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("struct ")
+                || trimmed.starts_with("pub struct ")
+                || trimmed.starts_with("trait ")
+                || trimmed.starts_with("pub trait ")
+                || trimmed.starts_with("enum ")
+                || trimmed.starts_with("pub enum ")
+                || trimmed.starts_with("interface ")
+                || trimmed.starts_with("type ")
+                || trimmed.starts_with("func ");
+            looks_like_definition.then(|| (idx + 1, trimmed.to_string()))
+        })
+        .collect()
 }
 
 pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
@@ -305,6 +498,101 @@ mod tests {
         assert!(result.output.contains("2\tb"));
         assert!(result.output.contains("3\tc"));
         assert!(!result.output.contains("1\ta"));
+    }
+
+    #[test]
+    fn read_file_outline_returns_signatures() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub struct User;\n\npub fn parse() {}\nfn helper() {}\n",
+        )
+        .unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "lib.rs", "outline": true}),
+        );
+
+        assert!(!result.is_error);
+        assert!(
+            result.output.contains("# Outline"),
+            "got: {}",
+            result.output
+        );
+        assert!(result.output.contains("parse"), "got: {}", result.output);
+        assert!(result.output.contains("User"), "got: {}", result.output);
+    }
+
+    #[test]
+    fn read_file_rejects_large_full_reads() {
+        let tmp = TempDir::new().unwrap();
+        let large = "abcdefghij".repeat(9_000);
+        std::fs::write(tmp.path().join("big.txt"), large).unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "big.txt"}));
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("file is too large"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("outline=true"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn read_file_rejects_binary_extensions() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("data.db"), b"\0\0\0sqlite").unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "data.db"}));
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("binary file"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn read_file_returns_image_data_uri() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("tiny.png"),
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'],
+        )
+        .unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "tiny.png"}));
+
+        assert!(!result.is_error);
+        assert!(
+            result.output.starts_with("data:image/png;base64,"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn read_file_swaps_reversed_ranges() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "test.txt", "start_line": 4, "end_line": 2}),
+        );
+
+        assert!(!result.is_error);
+        assert!(result.output.contains("2\tb"), "got: {}", result.output);
+        assert!(result.output.contains("3\tc"), "got: {}", result.output);
+        assert!(result.output.contains("4\td"), "got: {}", result.output);
     }
 
     #[test]

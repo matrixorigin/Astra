@@ -90,7 +90,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks, run_chain, or explicit rollback-on-failure batch transactions, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks, run_chain, or explicit rollback-on-failure batch transactions, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout. On timeout or cancellation, returns any partial captured output plus a boundary note. Non-zero exits are returned as tool errors with stderr and exit code.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -120,7 +120,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. Large files (over ~80KB) will return an error when read without a range — use start_line/end_line or outline=true. For files over 500 lines, prefer targeted reads. Set outline=true to get only function/class/struct/trait signatures (saves tokens). If you previously read part of a file and request another range, the tool may auto-expand to return the full file to avoid fragmented reads. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
+                "description": "Read file contents with optional line range. Output includes line numbers (tab-separated). IMPORTANT: If you are NOT certain the file exists, use list_dir or glob FIRST to verify the path — do NOT guess paths. Large files (over ~80KB) will return an error when read without a range — use start_line/end_line or outline=true. For files over 500 lines, prefer targeted reads. Set outline=true to get only function/class/struct/trait signatures (saves tokens). Common image types return a data URI; known binary formats are refused and should be inspected via bash instead. When using str_replace, provide old_str WITHOUT line numbers — only the actual file content.",
                 "parameters": {
                     "type": "object",
                     "properties": {

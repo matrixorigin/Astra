@@ -1,8 +1,5 @@
 pub mod action_compensation;
-/// Re-exported from astra-turn-types
-pub mod activity {
-    pub use astra_turn_types::{SessionActivityUpdatePlan, build_session_activity_update_plan};
-}
+pub mod activity;
 pub mod agent_progress_ui;
 pub mod agentic_adaptive_tuning;
 pub mod agentic_auto_reflection;
@@ -49,10 +46,7 @@ pub mod confidence_contract;
 pub mod context_assembly_trace;
 pub mod context_compression;
 pub mod contracts;
-/// Re-exported from astra-turn-types
-pub mod counter {
-    pub use astra_turn_types::count_persisted_turn_events;
-}
+pub mod counter;
 pub mod decision_explainer;
 pub mod delegation_tree;
 pub mod edge_executor_id;
@@ -96,10 +90,7 @@ pub mod persist;
 pub mod persist_inputs;
 pub mod prepare_turn_explain_text;
 pub mod progress_display;
-/// Re-exported from astra-turn-types
-pub mod quality {
-    pub use astra_turn_types::build_tool_result_quality_event_payload;
-}
+pub mod quality;
 pub mod refresh;
 pub mod response_guard;
 /// Re-exported from astra-turn-types
@@ -108,13 +99,7 @@ pub mod result_quality {
 }
 pub mod retrieval;
 pub mod routing;
-/// Re-exported from astra-turn-types
-pub mod routing_metrics {
-    pub use astra_turn_types::{
-        ConfidenceCalibrator, DisambiguationAction, IntentDisambiguation, RoutingMetricsPlan,
-        build_routing_metrics_plan, disambiguate_intents,
-    };
-}
+pub mod routing_metrics;
 pub mod safety_middleware;
 pub(crate) mod services;
 pub mod session_cache;

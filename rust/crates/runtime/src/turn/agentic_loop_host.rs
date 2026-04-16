@@ -713,6 +713,11 @@ pub struct AgenticLoopState {
     /// interruption context for structured resumption.
     pub interruption: Option<super::interruption::InterruptionRecord>,
 
+    // ── Session Facts (L1a ground truth) ──
+    /// System-tracked session state updated every turn from tool call records.
+    /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
+    pub session_facts: crate::turn::cloud::session_facts::SessionFacts,
+
     // ── Approval checkpoint persistence ──
     /// Approval overrides synchronized from CLI's PermissionManager before each turn.
     /// Written to HeavyCheckpoint so approval decisions survive session restarts.
@@ -1156,6 +1161,7 @@ pub(crate) mod tests {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            session_facts: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -3993,6 +3999,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             output_bytes: None,
             args_preview: None,
             result_preview: result_preview.map(str::to_string),
+            file_path: None,
         }
     }
 
@@ -5830,6 +5837,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: None,
                 args_preview: Some("npm test".into()),
                 result_preview: None,
+                file_path: None,
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -5840,6 +5848,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: None,
                 args_preview: Some("npm test".into()),
                 result_preview: None,
+                file_path: None,
             },
         ];
 
@@ -5981,6 +5990,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: Some(200),
                 args_preview: Some("ls -la".into()),
                 result_preview: Some("error".into()),
+                file_path: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -5991,6 +6001,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: Some(200),
                 args_preview: Some("cat foo".into()),
                 result_preview: Some("not found".into()),
+                file_path: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6001,6 +6012,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: Some(200),
                 args_preview: Some("rm bar".into()),
                 result_preview: Some("permission denied".into()),
+                file_path: None,
             },
         ];
 
@@ -6558,6 +6570,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -6568,6 +6581,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 },
             ]);
             if !bash_ok {
@@ -6622,6 +6636,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 }]),
                 budget_used: None,
                 budget_pressure: None,
@@ -6707,6 +6722,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: Some(0),
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6717,6 +6733,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: Some(20),
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -6727,6 +6744,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 output_bytes: Some(50),
                 args_preview: None,
                 result_preview: None,
+                file_path: None,
             },
         ];
         state.recent_tactical_actions = vec![

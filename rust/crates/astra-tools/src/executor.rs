@@ -193,7 +193,7 @@ impl DefaultToolExecutor {
             "multi_edit" => crate::fs_ops::multi_edit(ws, args),
 
             // ── Shell operations ─────────────────────────────────────
-            "bash" => crate::shell_ops::execute_bash(ws, args).await,
+            "bash" => crate::shell_ops::execute_bash(&self.ctx, args).await,
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
@@ -473,6 +473,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_read_file_outline() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub struct User;\n\npub fn parse() {}\nfn helper() {}\n",
+        )
+        .unwrap();
+        let result = exec
+            .execute(
+                "read_file",
+                &serde_json::json!({"path": "lib.rs", "outline": true}),
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(result.output.contains("# Outline"));
+        assert!(result.output.contains("parse"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_read_file_large_file_returns_error() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("big.txt"), "abcdefghij".repeat(9_000)).unwrap();
+        let result = exec
+            .execute("read_file", &serde_json::json!({"path": "big.txt"}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("file is too large"));
+        assert!(result.output.contains("outline=true"));
+    }
+
+    #[tokio::test]
     async fn dispatch_write_file() {
         let (tmp, exec) = test_executor();
         let result = exec
@@ -512,6 +543,47 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(result.output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_non_zero_is_error() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "echo nope >&2; exit 7"}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("stderr:\nnope"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("[exit code: 7]"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_timeout_keeps_partial_output() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "echo start; sleep 1; echo done", "timeout": 0.2}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("start"), "got: {}", result.output);
+        assert!(
+            result.output.contains("timed out after 0.2s"),
+            "got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("done"), "got: {}", result.output);
     }
 
     #[tokio::test]

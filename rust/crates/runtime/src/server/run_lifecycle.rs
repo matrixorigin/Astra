@@ -955,6 +955,7 @@ impl AgenticRunLifecycleService {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            session_facts: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -1300,6 +1301,52 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 loop_state.current_session_id.as_deref().unwrap_or(""),
             )
             .await;
+
+            // Session-end governance: extract learnings, store to Memoria, purge working memory.
+            if let Some(ref memoria_client) =
+                crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
+            {
+                use crate::turn::cloud::memoria_compact::MemoriaClient as _;
+                let sid = loop_state.current_session_id.as_deref().unwrap_or("");
+                if !sid.is_empty() {
+                    // Try to retrieve L1 narrative from Memoria for knowledge extraction
+                    let narrative = memoria_client
+                        .retrieve_ext(
+                            &format!("{} session state", crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX),
+                            Some(sid), 3, true,
+                        )
+                        .await
+                        .ok()
+                        .and_then(|mems| {
+                            mems.into_iter()
+                                .find(|m| m.content.starts_with(crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX))
+                        })
+                        .and_then(|m| crate::turn::cloud::session_memory_protocol::SessionMemory::parse(&m.content));
+                    match crate::turn::cloud::session_end_governance::run_session_end_governance(
+                        &loop_state.session_facts,
+                        narrative.as_ref(),
+                        sid,
+                        memoria_client,
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            if report.learnings_stored > 0 {
+                                tracing::info!(
+                                    session_id = %sid,
+                                    learnings = report.learnings_stored,
+                                    purged = report.working_purged,
+                                    "session-end governance complete"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(session_id = %sid, error = %e, "session-end governance failed")
+                        }
+                    }
+                }
+            }
+
             persist_runtime_promotion_events(
                 &bg_matrixone,
                 bg_shared_pool.as_ref(),
@@ -2022,6 +2069,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            session_facts: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -2381,6 +2429,7 @@ mod tests {
             output_bytes: Some(180),
             args_preview: None,
             result_preview: Some("clean".into()),
+            file_path: None,
         });
 
         let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);

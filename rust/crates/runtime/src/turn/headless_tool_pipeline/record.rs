@@ -114,6 +114,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             .map(|s| s.len() as u32)
             .unwrap_or(0);
         let args_preview = make_args_preview(&execution.name, &execution.args);
+        let file_path = execution
+            .args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         self.ctx
             .tool_call_records
             .push(journal_record_executed_tool_call(
@@ -123,6 +128,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 args_size,
                 execution.result_str.as_str(),
                 args_preview,
+                file_path,
             ));
         self.ctx.step_recorder.complete_tool_with_result(
             &execution.name,

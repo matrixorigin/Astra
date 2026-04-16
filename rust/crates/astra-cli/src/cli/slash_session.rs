@@ -4105,6 +4105,7 @@ mod export_tests {
             output_bytes: None,
             args_preview: Some("pattern in src/".into()),
             result_preview: None,
+            file_path: None,
         }];
         let block = format_tool_calls_md(&calls);
         assert!(block.contains("<details>"));

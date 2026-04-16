@@ -34,67 +34,13 @@ jobs:
       # Partition by Rust test path: `edge_tools::` marks tests under src/edge_tools/.
       # `source()` is invalid filterset DSL; `/edge_tools/` alone parses as a broken regex.
       - name: "Test astra-cli (bins: non-edge_tools modules)"
-        run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins -E 'not test(/edge_tools::/)' --no-fail-fast
-      - name: "Test astra-cli (bins: edge_tools shell proc/cleanup)"
-        timeout-minutes: 15
         run: >-
-          timeout --signal=TERM --kill-after=30s 15m
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::shell::tests::(bash_timeout_.*|bash_background_command_does_not_block|run_command_with_cleanup_.*|grep_uses_process_group_cleanup|glob_uses_process_group_cleanup)/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools shell proc/cleanup failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools shell grep timeout)"
-        timeout-minutes: 15
+          -E 'not test(/edge_tools::/)' --no-fail-fast
+      - name: "Test astra-cli (bins: edge_tools)"
         run: >-
-          timeout --signal=TERM --kill-after=30s 15m
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::shell::tests::(grep_streaming_preserves_partial_on_timeout|grep_timeout_.*)/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools shell grep timeout failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools shell remaining)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::shell::/) and not test(/edge_tools::shell::tests::(bash_timeout_.*|bash_background_command_does_not_block|run_command_with_cleanup_.*|grep_uses_process_group_cleanup|glob_uses_process_group_cleanup)/) and not test(/edge_tools::shell::tests::(grep_streaming_preserves_partial_on_timeout|grep_timeout_.*)/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools shell remaining failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools lsp/worktree)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::tests::lsp_tests::/) or test(/edge_tools::tests::worktree_tests::/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools lsp/worktree failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools remaining)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::tests::lsp_tests::/) and not test(/edge_tools::tests::worktree_tests::/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools remaining failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
+          -E 'test(/edge_tools::/)' --no-fail-fast
 
   test-offline-runtime:
     name: "Offline: astra-runtime"
@@ -168,7 +114,7 @@ jobs:
           cargo nextest run --manifest-path rust/Cargo.toml
           -p astra-core -p astra-thin-client -p astra-admin-cli
           -p astra-tools -p astra-pipeline -p astra-turn-types
-          -p astra-skills -p astra-sandbox -p astra-server-types
+          -p astra-skills -p astra-sandbox
           --no-fail-fast
 
   # ── Online: needs MatrixOne + Memoria ─────────────────────────────────

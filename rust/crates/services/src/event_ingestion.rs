@@ -1075,6 +1075,7 @@ mod tests {
                 output_bytes: None,
                 args_preview: Some("HEAD~10".into()),
                 result_preview: None,
+                file_path: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "read_file".into(),
@@ -1085,6 +1086,7 @@ mod tests {
                 output_bytes: None,
                 args_preview: Some("missing.txt".into()),
                 result_preview: None,
+                file_path: None,
             },
         ]);
 
@@ -1139,6 +1141,7 @@ mod tests {
             output_bytes: None,
             args_preview: Some("npm test".into()),
             result_preview: None,
+            file_path: None,
         }]);
 
         let events = IngestionEvent::expand_journal_event(&journal, "u1");
@@ -1162,6 +1165,7 @@ mod tests {
             output_bytes: None,
             args_preview: None,
             result_preview: None,
+            file_path: None,
         }]);
 
         let a = IngestionEvent::expand_journal_event(&journal, "u1");
