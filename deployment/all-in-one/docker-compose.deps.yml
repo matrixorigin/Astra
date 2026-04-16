@@ -69,6 +69,8 @@ services:
       - EMBEDDING_BASE_URL=${MEMORIA_EMBEDDING_BASE_URL:-}
       - EMBEDDING_ENDPOINTS=${MEMORIA_EMBEDDING_ENDPOINTS:-}
       - RUST_LOG=${RUST_LOG:-info}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       matrixone:
         condition: service_healthy

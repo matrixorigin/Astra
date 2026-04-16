@@ -125,12 +125,9 @@ fn persist_to_disk_triggers_when_aggregate_high_and_output_large() {
     );
 
     // Verify file was actually written
-    let path_start = result.find("tool-results/").unwrap();
-    let path_line = result[path_start - 20..].lines().next().unwrap();
-    let file_path = path_line
-        .split_whitespace()
-        .find(|s| s.contains("tool-results/"))
-        .unwrap();
+    let marker = "Full output saved to: ";
+    let path_start = result.find(marker).unwrap() + marker.len();
+    let file_path = result[path_start..].lines().next().unwrap().trim();
     assert!(
         std::path::Path::new(file_path).exists(),
         "persisted file should exist: {file_path}"
