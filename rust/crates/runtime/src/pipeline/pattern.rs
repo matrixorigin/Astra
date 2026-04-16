@@ -1109,6 +1109,14 @@ pub struct LearningSummary {
     pub exploration_opportunities: usize,
 }
 
+// ─── DriftSource bridge ─────────────────────────────────────────────────────
+
+impl astra_learning::DriftSource for PatternLibrary {
+    fn max_drift_score(&self) -> f64 {
+        self.max_drift_score()
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ members = [
     "crates/astra-turn-core",
     "crates/astra-messaging",
     "crates/astra-text-utils",
+    "crates/astra-config",
+    "crates/astra-learning",
 ]
 resolver = "2"
 
@@ -25,6 +27,8 @@ edition = "2024"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-config = { path = "crates/astra-config" }
+astra-learning = { path = "crates/astra-learning" }
 astra-messaging = { path = "crates/astra-messaging" }
 astra-text-utils = { path = "crates/astra-text-utils" }
 astra-pipeline = { path = "crates/astra-pipeline" }

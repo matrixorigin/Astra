@@ -802,7 +802,10 @@ impl ObservabilityHub {
         // Get pattern library reference for drift detection
         let pattern_lib_guard = self.pattern_library();
         let pattern_lib_lock = pattern_lib_guard.as_ref().map(|arc| arc.lock().ok());
-        let pattern_lib_ref = pattern_lib_lock.as_ref().and_then(|opt| opt.as_deref());
+        let pattern_lib_ref = pattern_lib_lock
+            .as_ref()
+            .and_then(|opt| opt.as_deref())
+            .map(|pl| pl as &dyn astra_learning::DriftSource);
 
         let executions = self
             .tuning_engine

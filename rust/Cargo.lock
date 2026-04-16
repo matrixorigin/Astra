@@ -192,6 +192,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-config"
+version = "0.1.0"
+dependencies = [
+ "astra-core",
+ "dirs 6.0.0",
+ "serde",
+ "serde_json",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "astra-core"
 version = "0.1.0"
 dependencies = [
@@ -223,6 +234,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-learning"
+version = "0.1.0"
+dependencies = [
+ "astra-config",
+ "astra-core",
+ "dirs 6.0.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "astra-messaging"
 version = "0.1.0"
 dependencies = [
@@ -247,7 +270,9 @@ dependencies = [
 name = "astra-runtime"
 version = "0.1.0"
 dependencies = [
+ "astra-config",
  "astra-core",
+ "astra-learning",
  "astra-messaging",
  "astra-pipeline",
  "astra-sandbox",
