@@ -1,12 +1,11 @@
 //! Dynamic agent spawner — runtime agent creation and lifecycle management.
 
+use crate::messaging::SubRunInfo;
 use crate::messaging::router::AgentMailboxRouter;
 use crate::messaging::types::AgentAddress;
 use crate::orchestration::context_cache::SharedContextCache;
 use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
-use crate::server::delegation_engine::SubRunRecord;
-use astra_core::SubRunState;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -417,14 +416,12 @@ impl DynamicAgentSpawner {
                 .unwrap_or(0)
                 + 1;
             self.mailbox_router
-                .record_sub_run(SubRunRecord {
+                .record_sub_run(SubRunInfo {
                     run_id: run_id.clone(),
                     parent_run_id: context.parent_run_id.clone(),
                     delegation_id: context.parent_run_id.clone(),
                     agent_id: agent_id.clone(),
                     depth,
-                    state: SubRunState::Created,
-                    retry_of: None,
                 })
                 .await;
         }

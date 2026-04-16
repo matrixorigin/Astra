@@ -114,9 +114,12 @@ async fn e2e_child_requests_permission_parent_approves() {
     let child_result = child_handle.await.unwrap();
     assert!(child_result.is_ok());
     let resp = child_result.unwrap();
-    assert!(resp.approved);
-    assert_eq!(resp.updates.len(), 1);
-    assert_eq!(resp.updates[0].rule.tool, "bash");
+    assert!(resp.accepted);
+    // Deserialize the response data to verify updates
+    let perm_resp: astra_runtime::orchestration::PermissionResponse =
+        serde_json::from_value(resp.data.unwrap()).unwrap();
+    assert_eq!(perm_resp.updates.len(), 1);
+    assert_eq!(perm_resp.updates[0].rule.tool, "bash");
 }
 
 /// Test: parent denies based on inherited deny rules
@@ -183,7 +186,7 @@ async fn e2e_parent_denies_based_on_rules() {
     let child_result = child_handle.await.unwrap();
     assert!(child_result.is_ok());
     let resp = child_result.unwrap();
-    assert!(!resp.approved);
+    assert!(!resp.accepted);
 }
 
 /// Test: permission callback controls decisions
@@ -249,7 +252,7 @@ async fn e2e_callback_controls_permission() {
     router.send(response_msg).await.unwrap();
 
     let result = child_handle.await.unwrap().unwrap();
-    assert!(result.approved);
+    assert!(result.accepted);
 }
 
 /// Test: inherited permissions propagate to child context

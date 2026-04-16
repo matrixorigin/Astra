@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::messaging::router::AgentMailbox;
 use crate::orchestration::permission_sync::{
-    PermissionMode, PermissionRequest, PermissionSyncContext, PermissionUpdate,
+    PermissionMode, PermissionRequest, PermissionResponse, PermissionSyncContext, PermissionUpdate,
 };
 use crate::turn::action_compensation::explicit_approval_reason;
 use crate::turn::tool_argument_hints::{
@@ -142,7 +142,19 @@ pub async fn check_tool_permission(
     // Send request and wait for response
     ctx.write().await.record_permission_request();
     match mailbox.request_permission(request, timeout).await {
-        Ok(response) => {
+        Ok(outcome) => {
+            // Deserialize generic PermissionOutcome into PermissionResponse
+            let response: PermissionResponse = outcome
+                .data
+                .as_ref()
+                .and_then(|d| serde_json::from_value(d.clone()).ok())
+                .unwrap_or_else(|| {
+                    if outcome.accepted {
+                        PermissionResponse::approve()
+                    } else {
+                        PermissionResponse::deny("Permission denied by parent")
+                    }
+                });
             if response.approved {
                 // Apply any new rules to our context
                 let new_rules = response.updates.clone();

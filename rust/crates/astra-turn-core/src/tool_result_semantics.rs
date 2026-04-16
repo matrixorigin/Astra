@@ -1,0 +1,412 @@
+//! Shared interpretation of edge tool outputs and stable tool-call keys (§5.5 dedup).
+//!
+//! Used by CLI `chat_stream` / `stream_render` and available for `bridge_inprocess` or server paths.
+
+use serde_json::Value;
+
+/// Determine whether a tool result string indicates an error.
+///
+/// For structured JSON results (our tools), checks `"ok": false` or a non-null
+/// `"error"` field. For plain-text results, falls back to `starts_with("error")`.
+pub fn is_tool_error(result_str: &str) -> bool {
+    if let Ok(v) = serde_json::from_str::<Value>(result_str) {
+        if let Some(ok_val) = v.get("ok").and_then(|o| o.as_bool()) {
+            return !ok_val;
+        }
+        if let Some(err) = v.get("error") {
+            return !err.is_null() && err.as_str() != Some("");
+        }
+        if v.get("error_code").is_some() {
+            return true;
+        }
+        if v.get("status").and_then(|s| s.as_str()) == Some("error") {
+            return true;
+        }
+    }
+    result_str.to_lowercase().starts_with("error")
+}
+
+/// `status` string for cloud `POST /tools/result` from edge executor output prefixes.
+///
+/// Matches the CLI convention: `Error:`, `Unknown tool:`, and `Sandbox:` imply `"error"`;
+/// everything else is reported as `"success"` (the body may still describe failure in JSON).
+#[must_use]
+pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
+    if output.starts_with("Error:")
+        || output.starts_with("Unknown tool:")
+        || output.starts_with("Sandbox:")
+    {
+        "error"
+    } else {
+        "success"
+    }
+}
+
+/// Detect OS-level resource exhaustion in tool output that wasn't flagged by [`is_tool_error`].
+///
+/// Scans **per-line** to avoid false positives in source or large file contents.
+pub fn is_resource_limit_output(output: &str) -> bool {
+    if output.len() > 8192 {
+        return false;
+    }
+    for line in output.lines() {
+        let l = line.trim().to_lowercase();
+        if l.is_empty() {
+            continue;
+        }
+        if l.starts_with("//")
+            || l.starts_with('#')
+            || l.starts_with("/*")
+            || l.starts_with('*')
+            || l.contains("||")
+            || l.contains("fn ")
+            || l.contains("let ")
+            || l.contains("if ")
+            || l.contains("match ")
+            || l.contains("def ")
+            || l.contains("import ")
+        {
+            continue;
+        }
+        if l.contains("resource temporarily unavailable")
+            || l.contains("cannot allocate memory")
+            || l.contains("cannot fork")
+            || l.contains("no space left on device")
+            || l.contains("too many open files")
+            || l.contains("device or resource busy")
+        {
+            return true;
+        }
+        if l.starts_with("bash: fork:") || l.starts_with("sh: fork:") {
+            return true;
+        }
+        if l.len() < 120
+            && (l.contains("enomem") || l.contains("enospc") || l.contains("ebusy"))
+            && (l.starts_with("error") || l.starts_with("fatal") || l.starts_with("failed"))
+        {
+            return true;
+        }
+        if l == "killed" || l.starts_with("killed:") {
+            return true;
+        }
+        if l.len() < 200
+            && (l.contains("资源暂时不足") || l.contains("内存不足") || l.contains("系统资源"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalize tool arguments for deterministic comparison (paths, key order, nested objects).
+pub fn normalize_tool_arguments(val: &Value) -> Value {
+    match val {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            let normalized = trimmed.trim_end_matches('/');
+            Value::String(normalized.to_string())
+        }
+        Value::Object(map) => {
+            let mut sorted: serde_json::Map<String, Value> = serde_json::Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                sorted.insert(k.clone(), normalize_tool_arguments(&map[k]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_tool_arguments).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Stable key for deduplicating `tool_request` (SSE) vs `tool_call` (same turn).
+pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
+    let normalized = normalize_tool_arguments(args);
+    format!(
+        "{}:{}",
+        name,
+        serde_json::to_string(&normalized).unwrap_or_default()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_error_success_with_null_error_is_not_error() {
+        let result = r#"{"ok":true,"tool":"github_list_prs","error":null,"count":6}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_ok_false_is_error() {
+        let result = r#"{"ok":false,"tool":"github_ci_status","error":"missing repo"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_non_null_error_field_is_error() {
+        let result = r#"{"error":"connection refused"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_plain_text_error() {
+        assert!(is_tool_error("Error: command not found"));
+        assert!(is_tool_error("error reading file"));
+    }
+
+    #[test]
+    fn tool_error_plain_text_success() {
+        assert!(!is_tool_error("file contents here"));
+        assert!(!is_tool_error("{}"));
+        assert!(!is_tool_error("[]"));
+    }
+
+    #[test]
+    fn cloud_tool_result_status_prefixes() {
+        assert_eq!(cloud_tool_result_status_label("ok"), "success");
+        assert_eq!(cloud_tool_result_status_label("Error: x"), "error");
+        assert_eq!(cloud_tool_result_status_label("Unknown tool: y"), "error");
+        assert_eq!(cloud_tool_result_status_label("Sandbox: z"), "error");
+    }
+
+    #[test]
+    fn tool_error_empty_error_string_is_not_error() {
+        let result = r#"{"error":""}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_ok_true_with_error_string_trusts_ok_field() {
+        let result = r#"{"ok":true,"error":"leftover field"}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_nested_error_key_is_not_error() {
+        let result = r#"{"ok":true,"data":{"error":"some inner issue"}}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_array_response_is_not_error() {
+        let result = r#"[{"name":"pr1"},{"name":"pr2"}]"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_error_count_field_is_not_error() {
+        let result = r#"{"error_count":0,"status":"ok"}"#;
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_html_error_page() {
+        let result = "<html><body>error 502 Bad Gateway</body></html>";
+        assert!(!is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_unicode_error_message() {
+        let result = r#"{"ok":false,"error":"连接被拒绝"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_ok_as_string_not_boolean() {
+        let result = r#"{"ok":"false","error":"something"}"#;
+        assert!(is_tool_error(result));
+    }
+
+    #[test]
+    fn tool_error_empty_string_is_not_error() {
+        assert!(!is_tool_error(""));
+    }
+
+    #[test]
+    fn tool_error_whitespace_is_not_error() {
+        assert!(!is_tool_error("   \n\t  "));
+    }
+
+    #[test]
+    fn tool_error_bash_fork_resource_limit_is_not_detected_by_is_tool_error() {
+        let fork_err = "bash: fork: retry: Resource temporarily unavailable\nbash: fork: Resource temporarily unavailable";
+        assert!(!is_tool_error(fork_err));
+        assert!(is_resource_limit_output(fork_err));
+    }
+
+    #[test]
+    fn resource_limit_detects_oom_and_disk_full() {
+        assert!(is_resource_limit_output("Cannot allocate memory"));
+        assert!(is_resource_limit_output("No space left on device"));
+        assert!(is_resource_limit_output("Too many open files"));
+        assert!(is_resource_limit_output(
+            "sh: fork: retry: Resource temporarily unavailable"
+        ));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_git_fork() {
+        assert!(!is_resource_limit_output(
+            "Forked from user/repo\nfork: created successfully"
+        ));
+        assert!(!is_resource_limit_output(
+            "commit abc123\nAuthor: user\n\n  fork: implement new feature"
+        ));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_docs() {
+        assert!(!is_resource_limit_output(
+            "This function allocates memory for the buffer.\nSee out of memory handling docs."
+        ));
+        assert!(!is_resource_limit_output(
+            "The fork() system call creates a new process."
+        ));
+    }
+
+    #[test]
+    fn is_tool_error_json_error_code() {
+        assert!(is_tool_error(
+            r#"{"error_code": 42, "message": "bad request"}"#
+        ));
+    }
+
+    #[test]
+    fn is_tool_error_json_status_error() {
+        assert!(is_tool_error(r#"{"status": "error", "detail": "oops"}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_status_ok_not_error() {
+        assert!(!is_tool_error(r#"{"status": "ok", "data": []}"#));
+    }
+
+    #[test]
+    fn is_tool_error_json_error_code_absent_not_error() {
+        assert!(!is_tool_error(r#"{"result": "success"}"#));
+    }
+
+    #[test]
+    fn resource_limit_enospc_in_error_context() {
+        assert!(is_resource_limit_output("Error: ENOSPC"));
+        assert!(is_resource_limit_output("error writing file: enospc"));
+        assert!(is_resource_limit_output(
+            "failed to write: ENOSPC (disk full)"
+        ));
+    }
+
+    #[test]
+    fn resource_limit_oom_killed() {
+        assert!(is_resource_limit_output(
+            "Killed: process ran out of memory"
+        ));
+        assert!(is_resource_limit_output("Killed"));
+    }
+
+    #[test]
+    fn resource_limit_device_busy() {
+        assert!(is_resource_limit_output("Error: Device or resource busy"));
+    }
+
+    #[test]
+    fn resource_limit_chinese_oom() {
+        assert!(is_resource_limit_output("错误：内存不足"));
+    }
+
+    #[test]
+    fn resource_limit_chinese_system_resource() {
+        assert!(is_resource_limit_output("错误：系统资源不足"));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_source_code_enospc() {
+        let source_code = r#"
+if let Err(e) = writeln!(file, "{line}") {
+    if e.kind() == std::io::ErrorKind::Other
+        || e.raw_os_error() == Some(28) // ENOSPC
+        || e.to_string().contains("No space")
+    {
+        eprintln!("disk full");
+    }
+}
+"#;
+        assert!(!is_resource_limit_output(source_code));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_large_file() {
+        let large = "x".repeat(9000);
+        assert!(!is_resource_limit_output(&large));
+        let mut large_with_pattern = "x".repeat(8200);
+        large_with_pattern.push_str("\nbash: fork: Resource temporarily unavailable");
+        assert!(!is_resource_limit_output(&large_with_pattern));
+    }
+
+    #[test]
+    fn resource_limit_no_false_positive_on_comment_lines() {
+        assert!(!is_resource_limit_output("// handle ENOMEM gracefully"));
+        assert!(!is_resource_limit_output("# ENOSPC handling logic"));
+        assert!(!is_resource_limit_output("/* EBUSY retry loop */"));
+        assert!(!is_resource_limit_output("* Returns ENOMEM on failure"));
+    }
+
+    #[test]
+    fn tool_dedup_signature_strips_trailing_slash() {
+        let args = json!({"path": "src/", "pattern": "*.rs"});
+        let sig1 = tool_dedup_signature("glob", &args);
+        let args2 = json!({"path": "src", "pattern": "*.rs"});
+        let sig2 = tool_dedup_signature("glob", &args2);
+        assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn tool_dedup_signature_sorts_keys() {
+        let args1 = json!({"b": "2", "a": "1"});
+        let args2 = json!({"a": "1", "b": "2"});
+        assert_eq!(
+            tool_dedup_signature("test", &args1),
+            tool_dedup_signature("test", &args2)
+        );
+    }
+
+    #[test]
+    fn tool_dedup_signature_preserves_distinct_args() {
+        let args1 = json!({"file": "a.rs"});
+        let args2 = json!({"file": "b.rs"});
+        assert_ne!(
+            tool_dedup_signature("read_file", &args1),
+            tool_dedup_signature("read_file", &args2)
+        );
+    }
+
+    #[test]
+    fn tool_dedup_signature_trims_whitespace() {
+        let args1 = json!({"query": " hello world "});
+        let args2 = json!({"query": "hello world"});
+        assert_eq!(
+            tool_dedup_signature("search", &args1),
+            tool_dedup_signature("search", &args2)
+        );
+    }
+
+    #[test]
+    fn normalize_tool_arguments_handles_nested_objects() {
+        let args = json!({"outer": {"z": 1, "a": 2}});
+        let norm = normalize_tool_arguments(&args);
+        let keys: Vec<&String> = norm["outer"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["a", "z"]);
+    }
+
+    #[test]
+    fn normalize_tool_arguments_preserves_numbers_and_bools() {
+        let args = json!({"count": 5, "verbose": true});
+        let norm = normalize_tool_arguments(&args);
+        assert_eq!(norm["count"], 5);
+        assert_eq!(norm["verbose"], true);
+    }
+}

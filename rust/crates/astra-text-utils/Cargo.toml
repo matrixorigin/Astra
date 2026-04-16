@@ -1,0 +1,9 @@
+[package]
+name = "astra-text-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dirs = "6.0.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

@@ -1023,6 +1023,31 @@ impl DelegationTracker {
     }
 }
 
+#[async_trait]
+impl astra_messaging::DelegationLookup for DelegationTracker {
+    async fn get_parent(&self, run_id: &str) -> Option<String> {
+        self.get_parent(run_id).await
+    }
+    async fn get_agent_id(&self, run_id: &str) -> Option<String> {
+        self.get_agent_id(run_id).await
+    }
+    async fn get_depth(&self, run_id: &str) -> Option<u32> {
+        self.get_depth(run_id).await
+    }
+    async fn record_sub_run(&self, info: astra_messaging::SubRunInfo) {
+        self.record_sub_run(SubRunRecord {
+            run_id: info.run_id,
+            parent_run_id: info.parent_run_id,
+            delegation_id: info.delegation_id,
+            agent_id: info.agent_id,
+            depth: info.depth,
+            state: SubRunState::Created,
+            retry_of: None,
+        })
+        .await;
+    }
+}
+
 impl Default for DelegationTracker {
     fn default() -> Self {
         Self::new()

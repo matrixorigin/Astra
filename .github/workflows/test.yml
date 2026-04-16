@@ -169,6 +169,7 @@ jobs:
           -p astra-core -p astra-thin-client -p astra-admin-cli
           -p astra-tools -p astra-pipeline -p astra-turn-types
           -p astra-skills -p astra-sandbox -p astra-server-types -p astra-turn-core
+          -p astra-messaging -p astra-text-utils
           --no-fail-fast
 
   # ── Online: needs MatrixOne + Memoria ─────────────────────────────────
