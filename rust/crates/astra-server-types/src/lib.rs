@@ -1,3 +1,4 @@
+mod chat_route;
 mod edge_ws_protocol;
 
 use astra_services::auth::SessionActivityRecord;
@@ -13,6 +14,7 @@ pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,
     EdgeClientMessage, EdgeServerMessage,
 };
+pub use chat_route::{ChatRouteResponse, classify_chat_route};
 
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RootResponse {

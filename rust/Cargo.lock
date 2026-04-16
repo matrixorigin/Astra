@@ -301,6 +301,7 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-services",
+ "regex",
  "serde",
  "serde_json",
 ]

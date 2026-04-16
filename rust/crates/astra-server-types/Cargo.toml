@@ -7,5 +7,6 @@ description = "Server request and response types for astra runtime"
 [dependencies]
 astra-core.workspace = true
 astra-services.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
