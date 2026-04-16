@@ -148,6 +148,154 @@ pub fn compact_tool_results_adaptive(messages: &mut [Value], pressure: f64) -> C
     compact_tool_results_with_config(messages, &config)
 }
 
+/// State-aware variant: uses `SessionFacts.active_files` as a pin list.
+/// Files actively being worked on (last `pin_turns` turns) are never compacted,
+/// regardless of count/token pressure. Other files follow normal compaction rules.
+pub fn compact_tool_results_state_aware(
+    messages: &mut [Value],
+    pressure: f64,
+    facts: &crate::cloud_session_facts::SessionFacts,
+    pin_turns: u32,
+) -> CompactStats {
+    let config = AdaptiveCompactConfig::from_pressure(pressure);
+    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns)
+}
+
+fn compact_tool_results_with_pin_list(
+    messages: &mut [Value],
+    config: &AdaptiveCompactConfig,
+    facts: &crate::cloud_session_facts::SessionFacts,
+    pin_turns: u32,
+) -> CompactStats {
+    let keep = config.keep_recent;
+
+    // Build tool_call_id → tool_name mapping
+    let mut id_to_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for msg in messages.iter() {
+        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                for tc in calls {
+                    if let (Some(id), Some(name)) = (
+                        tc.get("id").and_then(Value::as_str),
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str),
+                    ) {
+                        id_to_name.insert(id, name);
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect compactable results, split into pinned vs unpinned
+    let mut unpinned: Vec<(usize, usize)> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if !is_compactable_tool_result(msg, &id_to_name) {
+            continue;
+        }
+        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+        if content.len() < MIN_COMPACT_SIZE || content == CLEARED_PLACEHOLDER {
+            continue;
+        }
+        // Check if this result's file is in the active pin list
+        let file_path = extract_file_path_from_tool_result(msg, &id_to_name);
+        let is_pinned = file_path
+            .as_deref()
+            .map(|p| facts.is_active_file(p, pin_turns))
+            .unwrap_or(false);
+        if !is_pinned {
+            unpinned.push((i, estimate_tokens(content)));
+        }
+        // Pinned files are never compacted
+    }
+
+    if unpinned.is_empty() {
+        return CompactStats::default();
+    }
+
+    // Apply normal compaction rules only to unpinned results
+    let count_based = unpinned.len().saturating_sub(keep);
+    let total_tokens: usize = unpinned.iter().map(|(_, t)| t).sum();
+    let budget = config.token_budget;
+    let token_based = if total_tokens > budget {
+        let mut cumulative = 0usize;
+        let mut n = 0usize;
+        for &(_, tokens) in &unpinned {
+            if total_tokens - cumulative <= budget {
+                break;
+            }
+            cumulative += tokens;
+            n += 1;
+        }
+        n.min(unpinned.len() - 1)
+    } else {
+        0
+    };
+
+    let to_compact = count_based.max(token_based);
+    let mut stats = CompactStats::default();
+
+    for &(idx, tokens) in unpinned.iter().take(to_compact) {
+        stats.tokens_saved += tokens;
+        stats.results_compacted += 1;
+        messages[idx]["content"] = Value::String(CLEARED_PLACEHOLDER.to_string());
+    }
+
+    stats
+}
+
+/// Extract file path from a tool result message (for pin list matching).
+fn extract_file_path_from_tool_result(
+    msg: &Value,
+    id_to_name: &std::collections::HashMap<&str, &str>,
+) -> Option<String> {
+    // For read_file results, the content often starts with the file path
+    let tool_name = msg.get("name").and_then(Value::as_str).or_else(|| {
+        msg.get("tool_call_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id_to_name.get(id).copied())
+    })?;
+    if !matches!(
+        tool_name,
+        "read_file" | "grep" | "glob" | "git_show" | "git_diff"
+    ) {
+        return None;
+    }
+    // Try to extract path from content (read_file results typically start with path)
+    let content = msg.get("content").and_then(Value::as_str)?;
+    // Pattern 1: read_file output with tab-separated format "1\t/path/to/file"
+    let first_line = content.lines().next().unwrap_or("");
+    // Try to find a path-like segment (contains /, no spaces, reasonable length)
+    for segment in first_line.split(|c: char| c.is_whitespace() || c == '\t') {
+        // Skip line numbers (pure digits)
+        if segment.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // Valid path: contains /, no spaces (already split), reasonable length
+        if segment.contains('/') && segment.len() < 200 && segment.len() > 1 {
+            // Skip if it looks like a content fragment (starts with non-path chars)
+            if segment.starts_with('/') || segment.starts_with("./") || segment.starts_with("../") {
+                return Some(segment.to_string());
+            }
+            // Also accept relative paths (e.g. "src/main.rs") — must have a file extension
+            // to avoid false positives like "v1.2/feature" or prose fragments.
+            if segment
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_alphanumeric())
+                && segment
+                    .rsplit('/')
+                    .next()
+                    .map_or(false, |f| f.contains('.'))
+            {
+                return Some(segment.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn compact_tool_results_with_config(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
@@ -1304,6 +1452,132 @@ mod tests {
             "high pressure ({}) should compact more than low ({})",
             stats_high.results_compacted,
             stats_low.results_compacted
+        );
+    }
+
+    // ── State-Aware Compaction Tests ─────────────────────────────────
+
+    #[test]
+    fn state_aware_pins_active_files() {
+        use crate::cloud_session_facts::{FileEntry, SessionFacts};
+        let mut facts = SessionFacts {
+            turn: 10,
+            ..Default::default()
+        };
+        facts.active_files.push(FileEntry {
+            path: "src/important.rs".to_string(),
+            last_action: "write".to_string(),
+            turn: 9, // recent
+        });
+        facts.active_files.push(FileEntry {
+            path: "src/old.rs".to_string(),
+            last_action: "read".to_string(),
+            turn: 1, // old
+        });
+
+        // Build messages: 8 read_file results, some for pinned files
+        let mut msgs: Vec<Value> = Vec::new();
+        let files = [
+            "src/important.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/d.rs",
+            "src/e.rs",
+            "src/f.rs",
+            "src/old.rs",
+        ];
+        for (i, file) in files.iter().enumerate() {
+            let call_id = format!("call_{i}");
+            msgs.push(json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": call_id,
+                    "function": { "name": "read_file" }
+                }]
+            }));
+            // Content starts with file path (common pattern)
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": "read_file",
+                "content": format!("{}\n{}", file, "x".repeat(2000))
+            }));
+        }
+
+        let mut msgs_normal = msgs.clone();
+        let stats_normal = compact_tool_results_adaptive(&mut msgs_normal, 0.80);
+
+        let mut msgs_aware = msgs;
+        let stats_aware = compact_tool_results_state_aware(&mut msgs_aware, 0.80, &facts, 5);
+
+        // State-aware should compact fewer (pinned file preserved)
+        // The important.rs file (turn 9, within 5-turn window) should be pinned
+        let important_idx = msgs_aware.iter().position(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .map(|c| c.starts_with("src/important.rs"))
+                .unwrap_or(false)
+        });
+        assert!(
+            important_idx.is_some(),
+            "pinned file should still have content"
+        );
+        let content = msgs_aware[important_idx.unwrap()]
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_ne!(
+            content, CLEARED_PLACEHOLDER,
+            "pinned file should NOT be cleared"
+        );
+
+        // old.rs (turn 1, outside 5-turn window) should NOT be pinned
+        // It may or may not be compacted depending on count, but it's eligible
+        assert!(
+            stats_aware.results_compacted > 0,
+            "should compact some results"
+        );
+        // Normal compaction doesn't know about pins, so it may compact more
+        assert!(
+            stats_normal.results_compacted >= stats_aware.results_compacted,
+            "state-aware ({}) should compact ≤ normal ({})",
+            stats_aware.results_compacted,
+            stats_normal.results_compacted
+        );
+    }
+
+    #[test]
+    fn state_aware_with_empty_facts_behaves_like_normal() {
+        use crate::cloud_session_facts::SessionFacts;
+        let facts = SessionFacts::default(); // no active files
+
+        let mut msgs: Vec<Value> = Vec::new();
+        for i in 0..8 {
+            let call_id = format!("call_{i}");
+            msgs.push(json!({
+                "role": "assistant",
+                "tool_calls": [{"id": call_id, "function": {"name": "read_file"}}]
+            }));
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": "read_file",
+                "content": format!("file_{i}.rs\n{}", "x".repeat(2000))
+            }));
+        }
+
+        let mut msgs_normal = msgs.clone();
+        let stats_normal = compact_tool_results_adaptive(&mut msgs_normal, 0.80);
+
+        let mut msgs_aware = msgs;
+        let stats_aware = compact_tool_results_state_aware(&mut msgs_aware, 0.80, &facts, 5);
+
+        // With no active files, nothing is pinned — should compact same amount
+        assert_eq!(
+            stats_normal.results_compacted,
+            stats_aware.results_compacted
         );
     }
 }
