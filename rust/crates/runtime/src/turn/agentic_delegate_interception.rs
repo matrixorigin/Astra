@@ -159,6 +159,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 output_bytes: Some(result.summary.len() as u32),
                 args_preview: Some(result.call_id.clone()),
                 result_preview: Some(result.summary.chars().take(500).collect::<String>()),
+                file_path: None,
             });
         }
         if !quiet {

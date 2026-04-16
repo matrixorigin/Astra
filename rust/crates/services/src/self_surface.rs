@@ -2322,6 +2322,7 @@ mod tests {
                     output_bytes: None,
                     args_preview: None,
                     result_preview: None,
+                    file_path: None,
                 }]),
                 budget_used: Some(8300),
                 budget_pressure: Some(0.83),

@@ -33,6 +33,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use futures_util::StreamExt;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{mysql::MySqlPoolOptions, query};
@@ -205,7 +206,7 @@ pub use astra_services::{
     },
 };
 
-pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;
+pub(crate) use astra_services::runs::{RunMutationRecord, UnconfiguredRunLifecycleService};
 
 // ── Re-exports: runtime app state ────────────────────────────────────────────
 
@@ -299,12 +300,13 @@ pub use turn::{
             sanitize_path_for_claude_projects,
         },
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
+        session_facts::{ErrorFact, FileEntry, PlanFact, SessionFacts, ToolFact},
         session_memory_extract::{
             SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
             build_extraction_prompt, build_learnings_extraction_prompt,
             extract_learnings_for_backflow, extract_section, parse_learnings_response,
-            should_extract as should_extract_session_memory, truncate_for_prompt,
-            write_session_memory_file,
+            should_extract as should_extract_session_memory, should_extract_with_error_trigger,
+            truncate_for_prompt, write_session_memory_file,
         },
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     },

@@ -4,12 +4,52 @@
 
 use serde_json::Value;
 
+use super::session_facts::SessionFacts;
+
 // ── L0: Session Anchor ──────────────────────────────────────────────────────
 
 const ANCHOR_PREFIX: &str = "[session-anchor] ";
 const MAX_TASK_WORDS: usize = 20;
 
+/// Build an L0 anchor from SessionFacts (ground truth) + optional narrative.
+/// Preferred over `extract_anchor` when facts are available.
+pub fn extract_anchor_from_facts(
+    first_user_msg: &str,
+    facts: &SessionFacts,
+    narrative: Option<&SessionMemory>,
+) -> String {
+    // Task: from narrative if available (LLM good at summarizing), fallback to first user msg
+    let task = narrative
+        .and_then(|n| n.section("Task Specification"))
+        .map(|s| first_sentence(s).to_string())
+        .unwrap_or_else(|| truncate_words(first_user_msg, MAX_TASK_WORDS));
+
+    // State: from system facts (ground truth)
+    let state = if let Some(plan) = &facts.plan_state {
+        let sub = plan.current_subtask.as_deref().unwrap_or("unknown");
+        format!("{}/{} subtasks, current: {sub}", plan.completed, plan.total)
+    } else if let Some(f) = facts.active_files.last() {
+        format!("{} {} (t{})", f.last_action, f.path, f.turn)
+    } else {
+        "starting".to_string()
+    };
+
+    let mut anchor = format!("{ANCHOR_PREFIX}Goal: {task}. State: {state}.");
+
+    // Constraints from system facts
+    if let Some(err) = &facts.error_state.last_error {
+        let short = truncate_words(err, 10);
+        anchor.push_str(&format!(" Last error: {short}."));
+    }
+    if !facts.blocked_tools.is_empty() {
+        anchor.push_str(&format!(" Avoid: {}.", facts.blocked_tools.join(", ")));
+    }
+
+    anchor
+}
+
 /// Build an L0 anchor line from the first user message or from a parsed L1.
+/// Legacy path — used when SessionFacts is not available.
 pub fn extract_anchor(first_user_msg: &str, l1: Option<&SessionMemory>) -> String {
     if let Some(l1) = l1 {
         let task = first_sentence(l1.section("Task Specification").unwrap_or(""));
@@ -34,10 +74,54 @@ fn first_sentence(text: &str) -> &str {
 }
 
 fn truncate_words(text: &str, max_words: usize) -> String {
-    text.split_whitespace()
-        .take(max_words)
-        .collect::<Vec<_>>()
-        .join(" ")
+    // CJK-aware: count CJK characters as individual "words" since they
+    // lack whitespace boundaries. Mixed text uses a blended count.
+    let mut result = String::new();
+    let mut count = 0;
+    let mut in_word = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if in_word {
+                // End of an ASCII word - count it
+                count += 1;
+                result.push(' ');
+                in_word = false;
+            }
+            continue;
+        }
+        if count >= max_words {
+            break;
+        }
+        // CJK characters each count as one "word" unit
+        if is_cjk_char(ch) {
+            if in_word {
+                // End of an ASCII word before CJK - count it
+                count += 1;
+                in_word = false;
+            }
+            if !result.is_empty() && !result.ends_with(' ') {
+                result.push(' ');
+            }
+            result.push(ch);
+            count += 1;
+        } else {
+            // Accumulate ASCII/Latin into word groups
+            result.push(ch);
+            in_word = true;
+        }
+    }
+    result
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{4E00}'..='\u{9FFF}' |   // CJK Unified Ideographs
+        '\u{3400}'..='\u{4DBF}' |   // CJK Extension A
+        '\u{3000}'..='\u{303F}' |   // CJK Symbols and Punctuation
+        '\u{FF00}'..='\u{FFEF}' |   // Halfwidth and Fullwidth Forms
+        '\u{2E80}'..='\u{2EFF}' |   // CJK Radicals Supplement
+        '\u{AC00}'..='\u{D7AF}'     // Hangul Syllables
+    )
 }
 
 /// Truncate text to fit within a token budget (~4 chars/token).
@@ -305,6 +389,79 @@ pub fn compress_to_injection(l1: &SessionMemory) -> String {
 
     // Worklog — omitted
     // Context — omitted
+
+    out
+}
+
+/// Build facts-first injection: L1a (system facts) + L1b (narrative) with cross-validation.
+/// Returns ~650 tokens at normal pressure. See design doc Section 4.4.
+pub fn build_facts_first_injection(
+    facts: &SessionFacts,
+    narrative: Option<&SessionMemory>,
+) -> String {
+    let mut out = String::from("[session-memory]\n");
+
+    // ── Layer 1: System Facts (ground truth, ~150t) ──
+    out.push_str(&facts.to_injection());
+
+    // Track which narrative sections to skip due to cross-validation
+    let mut skip_task = false;
+
+    // ── Layer 2: Cross-validation (detect contradictions BEFORE injecting narrative) ──
+    if facts.error_state.total_errors > 0 && facts.error_state.last_error.is_some() {
+        if let Some(plan) = &facts.plan_state {
+            if plan.completed == plan.total && plan.total > 0 {
+                skip_task = true;
+                out.push_str(
+                    "⚠️ Plan complete but unresolved errors — narrative Task section omitted\n",
+                );
+            }
+        }
+    }
+
+    // ── Layer 3: LLM Narrative (supplement, ≤500t) ──
+    if let Some(n) = narrative {
+        if !skip_task {
+            if let Some(task) = n.section("Task Specification") {
+                out.push_str("# Task\n");
+                out.push_str(&truncate_to_token_budget(task.trim(), 200));
+                out.push('\n');
+            }
+        }
+        if let Some(corrections) = n.section("User Corrections") {
+            let trimmed = corrections.trim();
+            if !trimmed.is_empty() {
+                out.push_str("# User Corrections\n");
+                out.push_str(&truncate_to_token_budget(trimmed, 150));
+                out.push('\n');
+            }
+        }
+        if let Some(learnings) = n.section("Learnings") {
+            let entries: Vec<&str> = learnings
+                .lines()
+                .filter(|l| l.trim().starts_with("- "))
+                .collect();
+            let last_three: Vec<&str> = entries.iter().rev().take(3).rev().copied().collect();
+            if !last_three.is_empty() {
+                out.push_str("# Learnings\n");
+                for line in &last_three {
+                    out.push_str(line.trim());
+                    out.push('\n');
+                }
+            }
+        }
+        if let Some(decisions) = n.section("Decisions") {
+            let entries: Vec<&str> = decisions
+                .lines()
+                .filter(|l| l.trim().starts_with("- "))
+                .collect();
+            if let Some(recent) = entries.last() {
+                out.push_str("# Last Decision\n");
+                out.push_str(recent.trim());
+                out.push('\n');
+            }
+        }
+    }
 
     out
 }
@@ -674,6 +831,220 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(words.len() <= MAX_TASK_WORDS);
+    }
+
+    // ── L0 Anchor from Facts Tests ──────────────────────────────────────
+
+    #[test]
+    fn facts_anchor_with_plan_state() {
+        use super::super::session_facts::{PlanFact, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.plan_state = Some(PlanFact {
+            goal: "Implement OAuth".to_string(),
+            completed: 3,
+            total: 5,
+            current_subtask: Some("token refresh".to_string()),
+        });
+        let anchor = extract_anchor_from_facts("Add OAuth support", &facts, None);
+        assert!(
+            anchor.starts_with("[session-anchor] Goal:"),
+            "anchor: {anchor}"
+        );
+        assert!(anchor.contains("OAuth"), "anchor: {anchor}");
+        assert!(anchor.contains("3/5 subtasks"), "anchor: {anchor}");
+        assert!(
+            anchor.contains("current: token refresh"),
+            "anchor: {anchor}"
+        );
+    }
+
+    #[test]
+    fn facts_anchor_with_active_file_no_plan() {
+        use super::super::session_facts::{FileEntry, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.active_files.push(FileEntry {
+            path: "src/auth.rs".to_string(),
+            last_action: "write".to_string(),
+            turn: 7,
+        });
+        let anchor = extract_anchor_from_facts("Fix auth bug", &facts, None);
+        assert!(anchor.contains("State: write src/auth.rs (t7)"));
+    }
+
+    #[test]
+    fn facts_anchor_empty_facts_shows_starting() {
+        use super::super::session_facts::SessionFacts;
+        let facts = SessionFacts::default();
+        let anchor = extract_anchor_from_facts("Build something", &facts, None);
+        assert!(anchor.contains("State: starting"));
+    }
+
+    #[test]
+    fn facts_anchor_includes_last_error() {
+        use super::super::session_facts::{ErrorFact, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.error_state = ErrorFact {
+            total_errors: 2,
+            last_error: Some("sqlx migration column exists".to_string()),
+            last_error_turn: Some(5),
+        };
+        let anchor = extract_anchor_from_facts("Fix DB", &facts, None);
+        assert!(anchor.contains("Last error:"), "anchor: {anchor}");
+        assert!(anchor.contains("sqlx"), "anchor: {anchor}");
+    }
+
+    #[test]
+    fn facts_anchor_includes_blocked_tools() {
+        use super::super::session_facts::SessionFacts;
+        let mut facts = SessionFacts::default();
+        facts.blocked_tools = vec!["web_fetch".to_string(), "rm".to_string()];
+        let anchor = extract_anchor_from_facts("Do stuff", &facts, None);
+        assert!(anchor.contains("Avoid: web_fetch, rm"));
+    }
+
+    #[test]
+    fn facts_anchor_prefers_narrative_task_spec() {
+        use super::super::session_facts::SessionFacts;
+        let facts = SessionFacts::default();
+        let l1 = SessionMemory::parse(sample_l1()).unwrap();
+        let anchor = extract_anchor_from_facts("raw user msg ignored", &facts, Some(&l1));
+        // Should use Task Specification from narrative, not the raw user msg
+        assert!(anchor.contains("OAuth"));
+        assert!(!anchor.contains("raw user msg"));
+    }
+
+    // ── Facts-First Injection Tests ────────────────────────────────────
+
+    fn narrative_with_sections(sections: &[(&str, &str)]) -> SessionMemory {
+        let mut text = String::from("[session-memory:v1]\n");
+        for (name, content) in sections {
+            text.push_str(&format!("# {name}\n{content}\n"));
+        }
+        SessionMemory::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn injection_facts_before_narrative() {
+        use super::super::session_facts::{FileEntry, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.turn = 5;
+        facts.estimated_tokens = 20000;
+        facts.active_files.push(FileEntry {
+            path: "src/main.rs".to_string(),
+            last_action: "write".to_string(),
+            turn: 5,
+        });
+        let narrative = narrative_with_sections(&[
+            ("Task Specification", "Build a web server"),
+            ("Decisions", "- Use axum framework"),
+        ]);
+        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        // System State must come before Task
+        let facts_pos = injection.find("# System State").unwrap();
+        let task_pos = injection.find("# Task").unwrap();
+        assert!(facts_pos < task_pos, "facts must come before narrative");
+    }
+
+    #[test]
+    fn injection_includes_narrative_sections() {
+        use super::super::session_facts::SessionFacts;
+        let facts = SessionFacts::default();
+        let narrative = narrative_with_sections(&[
+            ("Task Specification", "Implement OAuth"),
+            ("User Corrections", "Use RS256 not HS256"),
+            (
+                "Learnings",
+                "- CJK needs special handling\n- Use char_indices",
+            ),
+            ("Decisions", "- Use axum\n- Use sqlx"),
+        ]);
+        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        assert!(injection.contains("# Task\nImplement OAuth"));
+        assert!(injection.contains("# User Corrections\nUse RS256 not HS256"));
+        assert!(injection.contains("# Learnings"));
+        assert!(injection.contains("# Last Decision"));
+        assert!(injection.contains("Use sqlx")); // last decision
+    }
+
+    #[test]
+    fn injection_without_narrative() {
+        use super::super::session_facts::{FileEntry, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.turn = 3;
+        facts.estimated_tokens = 10000;
+        facts.active_files.push(FileEntry {
+            path: "a.rs".to_string(),
+            last_action: "read".to_string(),
+            turn: 3,
+        });
+        let injection = build_facts_first_injection(&facts, None);
+        assert!(injection.contains("# System State"));
+        assert!(injection.contains("Turn 3"));
+        assert!(!injection.contains("# Task")); // no narrative
+    }
+
+    #[test]
+    fn injection_cross_validation_skips_task_on_contradiction() {
+        use super::super::session_facts::{ErrorFact, PlanFact, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.plan_state = Some(PlanFact {
+            goal: "Build API".to_string(),
+            completed: 3,
+            total: 3, // all done
+            current_subtask: None,
+        });
+        facts.error_state = ErrorFact {
+            total_errors: 1,
+            last_error: Some("test failure".to_string()),
+            last_error_turn: Some(5),
+        };
+        let narrative = narrative_with_sections(&[
+            ("Task Specification", "Build API — completed successfully"),
+            ("User Corrections", "Use RS256"),
+        ]);
+        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        // Task should be SKIPPED due to contradiction
+        assert!(
+            !injection.contains("# Task"),
+            "contradicted Task should be skipped"
+        );
+        assert!(injection.contains("⚠️"), "should have warning");
+        // But User Corrections should still be present
+        assert!(injection.contains("# User Corrections"));
+        assert!(injection.contains("RS256"));
+    }
+
+    #[test]
+    fn injection_no_cross_validation_when_no_errors() {
+        use super::super::session_facts::{PlanFact, SessionFacts};
+        let mut facts = SessionFacts::default();
+        facts.plan_state = Some(PlanFact {
+            goal: "Build API".to_string(),
+            completed: 3,
+            total: 3,
+            current_subtask: None,
+        });
+        // No errors — no contradiction
+        let narrative = narrative_with_sections(&[("Task Specification", "Build API")]);
+        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        assert!(injection.contains("# Task\nBuild API")); // Task NOT skipped
+        assert!(!injection.contains("⚠️"));
+    }
+
+    #[test]
+    fn injection_learnings_last_three_only() {
+        use super::super::session_facts::SessionFacts;
+        let facts = SessionFacts::default();
+        let narrative = narrative_with_sections(&[(
+            "Learnings",
+            "- first\n- second\n- third\n- fourth\n- fifth",
+        )]);
+        let injection = build_facts_first_injection(&facts, Some(&narrative));
+        assert!(!injection.contains("- first"));
+        assert!(!injection.contains("- second"));
+        assert!(injection.contains("- third"));
+        assert!(injection.contains("- fourth"));
+        assert!(injection.contains("- fifth"));
     }
 
     // ── L1 Parsing Tests ────────────────────────────────────────────────
@@ -1303,11 +1674,12 @@ mod tests {
 
         #[async_trait::async_trait]
         impl MemoriaClient for MockMemoria {
-            async fn retrieve(
+            async fn retrieve_ext(
                 &self,
                 _q: &str,
                 _sid: Option<&str>,
                 _k: usize,
+                _filter: bool,
             ) -> Result<Vec<MemoriaMemory>, String> {
                 Ok(vec![])
             }
@@ -1397,11 +1769,12 @@ mod tests {
             struct PurgeFailMock;
             #[async_trait::async_trait]
             impl MemoriaClient for PurgeFailMock {
-                async fn retrieve(
+                async fn retrieve_ext(
                     &self,
                     _: &str,
                     _: Option<&str>,
                     _: usize,
+                    _: bool,
                 ) -> Result<Vec<MemoriaMemory>, String> {
                     Ok(vec![])
                 }

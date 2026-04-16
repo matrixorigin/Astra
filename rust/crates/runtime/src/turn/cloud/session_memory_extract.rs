@@ -74,6 +74,25 @@ pub fn should_extract(
         && tool_growth >= config.min_tool_calls_between_updates
 }
 
+/// Check whether extraction should run, with error-triggered override.
+/// When `had_error_this_turn` is true and the session is past the init gate,
+/// extraction triggers immediately to capture user corrections before compaction.
+pub fn should_extract_with_error_trigger(
+    state: &SessionMemoryState,
+    current_tokens: usize,
+    current_tool_calls: usize,
+    config: &SessionMemoryExtractConfig,
+    had_error_this_turn: bool,
+) -> bool {
+    let normal = should_extract(state, current_tokens, current_tool_calls, config);
+    if normal {
+        return true;
+    }
+    // Error trigger: if an error occurred and we're past the init gate,
+    // extract immediately to capture user corrections.
+    had_error_this_turn && current_tokens >= config.min_tokens_to_init
+}
+
 // ---------------------------------------------------------------------------
 // Template
 // ---------------------------------------------------------------------------
@@ -358,6 +377,69 @@ mod tests {
         let config = SessionMemoryExtractConfig::default();
         // Token growth OK (2K) but below 5K threshold
         assert!(!should_extract(&state, 12_000, 6, &config));
+    }
+
+    // ── Error-Triggered Extraction Tests ─────────────────────────────
+
+    #[test]
+    fn error_trigger_fires_when_past_init_gate() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 10_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let config = SessionMemoryExtractConfig::default();
+        // Normal threshold NOT met (insufficient growth)
+        assert!(!should_extract(&state, 12_000, 6, &config));
+        // But error trigger fires
+        assert!(should_extract_with_error_trigger(
+            &state, 12_000, 6, &config, true
+        ));
+    }
+
+    #[test]
+    fn error_trigger_does_not_fire_below_init_gate() {
+        let state = SessionMemoryState::default();
+        let config = SessionMemoryExtractConfig::default();
+        // Below init gate (5K < 10K)
+        assert!(!should_extract_with_error_trigger(
+            &state, 5_000, 0, &config, true
+        ));
+    }
+
+    #[test]
+    fn error_trigger_does_not_fire_without_error() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 10_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let config = SessionMemoryExtractConfig::default();
+        // No error, insufficient growth
+        assert!(!should_extract_with_error_trigger(
+            &state, 12_000, 6, &config, false
+        ));
+    }
+
+    #[test]
+    fn error_trigger_redundant_when_normal_threshold_met() {
+        let state = SessionMemoryState {
+            initialized: true,
+            tokens_at_last_extraction: 10_000,
+            tool_calls_at_last_extraction: 5,
+            last_extraction_time: None,
+        };
+        let config = SessionMemoryExtractConfig::default();
+        // Normal threshold met
+        assert!(should_extract_with_error_trigger(
+            &state, 16_000, 9, &config, false
+        ));
+        // Also met with error (redundant but should still return true)
+        assert!(should_extract_with_error_trigger(
+            &state, 16_000, 9, &config, true
+        ));
     }
 
     #[test]
