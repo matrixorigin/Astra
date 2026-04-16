@@ -21,6 +21,7 @@ pub mod chat_history_openai;
 pub mod chat_turn_api_error;
 pub mod chat_turn_explain_wire;
 pub mod chat_turn_heuristics;
+pub mod chat_turn_payload;
 pub mod compaction_types;
 pub mod confidence_contract;
 pub mod context_assembly_trace;
