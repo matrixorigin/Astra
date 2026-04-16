@@ -4206,7 +4206,7 @@ mod tests {
 
     #[test]
     fn tool_done_md_mode_stderr_lines_counted_in_lines_written() {
-        let mut s = StreamRenderState::with_term_width(80, false, true); // md mode
+        let mut s = StreamRenderState::with_term_width(80, true, false); // md mode
         s.track_output("Intermediate draft\n"); // 1 stdout line
         assert_eq!(s.lines_written, 1);
 
