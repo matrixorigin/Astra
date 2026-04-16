@@ -707,7 +707,7 @@ mod tests {
     fn tool_round_abort_message_points_to_tool_round_limit() {
         assert_eq!(
             cli_agentic_tool_round_budget_abort_msg(30),
-            "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS to a larger value (current limit: 30, default: 30)."
+            "Tool-round budget exhausted. To increase, set MO_MAX_TOOL_ROUNDS to a larger value (current limit: 30, default: 100)."
         );
     }
 
