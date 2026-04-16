@@ -102,7 +102,6 @@ fn last_pipeline_command(command: &str) -> &str {
 
 // ---------------------------------------------------------------------------
 // Destructive command detection — warn before dangerous operations.
-// Inspired by Claude Code's destructiveCommandWarning.ts.
 // ---------------------------------------------------------------------------
 
 /// Check if a bash command references file paths outside the sandbox boundary.
@@ -2388,10 +2387,10 @@ fn run_command_with_cleanup(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming output support — inspired by Claude Code's ShellCommand.ts
+// Streaming output support
 // ---------------------------------------------------------------------------
 
-/// Maximum output size before truncation (30K chars, matching Claude Code's default).
+/// Maximum output size before truncation (30K chars).
 const MAX_OUTPUT_CHARS: usize = 30_000;
 
 /// Size watchdog poll interval for backgrounded tasks.
@@ -2399,7 +2398,6 @@ const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Execute a command with streaming output and optional auto-backgrounding on timeout.
 ///
-/// Inspired by Claude Code's `ShellCommandImpl`:
 /// - Streams stdout/stderr incrementally via `on_output` callback
 /// - On timeout: backgrounds the process instead of killing it (if `allow_background` is true)
 /// - Watchdog kills backgrounded processes after 30 minutes
@@ -2577,7 +2575,6 @@ enum OutputChunk {
 
 /// Time-limit watchdog for backgrounded processes.
 /// Kills the process after 30 minutes to prevent indefinite resource consumption.
-/// Inspired by Claude Code's background task management.
 fn size_watchdog(
     mut child: std::process::Child,
     stdout_thread: std::thread::JoinHandle<()>,
@@ -2724,7 +2721,7 @@ fn run_readonly_command_with_partial(
                             output.push_str(&chunk);
                         }
                     }
-                    // Drop the last line — it may be incomplete (like Claude Code)
+                    // Drop the last line — it may be incomplete
                     if let Some(last_nl) = output.rfind('\n') {
                         output.truncate(last_nl);
                     }
@@ -3681,7 +3678,7 @@ impl ToolExecutor {
                 }
 
                 if result.len() > max_bytes {
-                    result.truncate(max_bytes);
+                    result.truncate(result.floor_char_boundary(max_bytes));
                     result.push_str("\n[truncated]");
                 }
 
@@ -6708,5 +6705,16 @@ mod tests {
             result.contains("⚠️"),
             "command containing destructive pattern should have warning: {result}"
         );
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        // Regression: raw truncate at byte offset inside multi-byte char panics.
+        let mut s = "café ☕ 你好世界".to_string();
+        let limit = 10; // lands inside '☕' (bytes 6..9)
+        let boundary = s.floor_char_boundary(limit);
+        s.truncate(boundary);
+        s.push_str("\n[truncated]");
+        assert!(s.starts_with("café "));
     }
 }

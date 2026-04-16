@@ -11,11 +11,11 @@
 //! 4. Optionally store new working memory with updated context
 //! ```
 //!
-//! ## On-disk session memory (Claude Code–compatible)
+//! ## On-disk session memory
 //!
 //! When `ASTRA_SESSION_MEMORY_COMBINE` is set, the compactor can read
 //! `CLAUDE_CONFIG_DIR/projects/<sanitized-cwd>/<session_id>/session-memory/summary.md`
-//! (same layout as Claude Code) or a path from `ASTRA_SESSION_MEMORY_FILE`.
+//! or a path from `ASTRA_SESSION_MEMORY_FILE`.
 //! - `fallback`: use the file only if Memoria returns no memories.
 //! - `merge` / `true` / `1` / `both`: keep Memoria hits and add a capped file excerpt.
 
@@ -59,7 +59,7 @@ impl Default for MemoriaCompactConfig {
     }
 }
 
-/// How to mix Claude Code–style on-disk `summary.md` with Memoria HTTP retrieval.
+/// How to mix on-disk `summary.md` with Memoria HTTP retrieval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SessionMemoryFileCombine {
     /// Ignore on-disk session memory for compaction injection.
@@ -98,14 +98,14 @@ pub struct MemoriaCompactParams {
     pub keep_recent_turns: usize,
     /// Current token count before compaction.
     pub current_tokens: usize,
-    /// Optional path to on-disk session memory (e.g. Claude Code `session-memory/summary.md`).
+    /// Optional path to on-disk session memory.
     pub session_memory_file: Option<PathBuf>,
     /// How to combine that file with Memoria retrieval.
     pub session_memory_combine: SessionMemoryFileCombine,
 }
 
 // ---------------------------------------------------------------------------
-// Claude Code–compatible session memory paths
+// Compatible session memory paths
 // ---------------------------------------------------------------------------
 
 const CLAUDE_PROJECTS_SANITIZE_MAX_CHARS: usize = 200;
@@ -138,7 +138,7 @@ fn abs_hash_to_string_36(h: i32) -> String {
 }
 
 /// Sanitize a working-directory path for use under `CLAUDE_CONFIG_DIR/projects/`,
-/// matching Claude Code’s `sanitizePath` (alphanumeric → keep, else `-`, length cap + djb2).
+/// (alphanumeric → keep, else `-`, length cap + djb2).
 pub fn sanitize_path_for_claude_projects(name: &str) -> String {
     let sanitized: String = name
         .chars()

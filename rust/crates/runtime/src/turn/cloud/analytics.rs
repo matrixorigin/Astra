@@ -290,8 +290,7 @@ fn find_last_assistant_timestamp(messages: &[Value]) -> Option<u64> {
 }
 
 /// Tool names whose results are eligible for microcompaction clearing.
-/// Mirrors Claude Code's compactable tools list — only tools producing
-/// large, reproducible output that the LLM can re-run if needed.
+/// Only tools producing large, reproducible output that the LLM can re-run if needed.
 fn is_clearable_tool(name: &str) -> bool {
     let n = name.to_lowercase();
     // File read operations

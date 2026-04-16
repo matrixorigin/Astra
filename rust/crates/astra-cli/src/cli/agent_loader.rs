@@ -1,6 +1,6 @@
 //! Load custom agent profiles from Markdown files with YAML frontmatter.
 //!
-//! Inspired by Claude Code's `.claude/agents/*.md` pattern, this module
+//! This module
 //! scans well-known directories for agent definition files and builds
 //! [`AgentProfile`] structs that the delegation engine can use.
 //!

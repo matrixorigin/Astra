@@ -1,6 +1,5 @@
 //! Git safety validation for shell commands.
 //!
-//! Inspired by Claude Code's `bashSecurity.ts`, `readOnlyValidation.ts`, and `gitSafety.ts`.
 //! Provides defense-in-depth checks that run *before* a git command is executed.
 
 use std::path::Path;

@@ -1,7 +1,7 @@
 //! Learning Quality Gate — filters out low-value or derivable signals before
 //! they enter the learning pipeline.
 //!
-//! Inspired by Claude Code's "what not to save" rules: code patterns,
+//! Filters out low-value or derivable signals: code patterns,
 //! architecture, git history, and file structure are derivable from the
 //! codebase and should not pollute the learning system.
 

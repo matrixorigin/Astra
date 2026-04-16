@@ -5,8 +5,6 @@
 //! and the in-memory content is replaced with a compact preview + file
 //! reference.  This prevents oversized tool outputs from bloating the LLM
 //! context window while still preserving the full output for later retrieval.
-//!
-//! Inspired by Claude Code's `toolResultStorage.ts`.
 
 use std::path::{Path, PathBuf};
 

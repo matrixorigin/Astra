@@ -1,6 +1,6 @@
 //! SKILL.md parser: parse skill instruction files with YAML frontmatter + Markdown body.
 //!
-//! This module implements Claude Code-style skill instructions, allowing skills to include
+//! This module parses skill instruction files, allowing skills to include
 //! detailed, step-by-step guidance that gets injected into the agent's context when the
 //! skill is invoked.
 //!
@@ -33,7 +33,7 @@
 //! # Discovery Paths
 //!
 //! Skills are discovered from (highest priority first):
-//! 1. `{cwd}/.astra/skills/` — project-level (Claude Code–style `.claude/skills`)
+//! 1. `{cwd}/.astra/skills/` — project-level
 //! 2. `{cwd}/skills/` — project-level (explicit)
 //! 3. `~/.astra/skills/` — user-level global skills
 //!
@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 
 /// Standard skill directory search order (high → low priority):
 ///
-/// 1. `{cwd}/.astra/skills/`  — project-level (Claude Code–style .claude/skills)
+/// 1. `{cwd}/.astra/skills/`  — project-level
 /// 2. `{cwd}/skills/`         — project-level (legacy / explicit)
 /// 3. `~/.astra/skills/`      — user-level global skills
 pub fn skill_search_paths() -> Vec<PathBuf> {
@@ -93,7 +93,7 @@ pub struct SkillInstruction {
     #[serde(default)]
     pub allowed_tools: Vec<String>,
 
-    // ── Claude Code–aligned extended fields ──
+    // ── Extended fields ──
     /// When this skill should be activated (natural-language hint for the model).
     /// Analogous to CC's `whenToUse` frontmatter field.
     #[serde(default)]

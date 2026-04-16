@@ -62,7 +62,7 @@ impl ToolExecutor {
             }
             // Truncate if too long
             if response.len() > MAX_INPUT_LEN {
-                response.truncate(MAX_INPUT_LEN);
+                response.truncate(response.floor_char_boundary(MAX_INPUT_LEN));
             }
             let response = response.trim();
             let answer = if response.is_empty() {
@@ -190,7 +190,7 @@ impl ToolExecutor {
                     return "Error: failed to read user input".to_string();
                 }
                 if response.len() > MAX_INPUT_LEN {
-                    response.truncate(MAX_INPUT_LEN);
+                    response.truncate(response.floor_char_boundary(MAX_INPUT_LEN));
                 }
                 let trimmed = response.trim();
                 if trimmed.is_empty() {

@@ -1,8 +1,7 @@
 //! File edit journal — tracks file mutations for undo support.
 //!
-//! Inspired by Claude Code's built-in file history system, this module records
-//! the before-state of every file write so that changes can be reverted at the
-//! file level or turn level.
+//! Records the before-state of every file write so that changes can be reverted
+//! at the file level or turn level.
 //!
 //! # Usage
 //!

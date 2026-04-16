@@ -63,8 +63,8 @@ pub fn sandbox_command(
 /// Applies shell hardening (extglob disable, IFS reset, stdin redirect)
 /// for Standard+ modes.
 ///
-/// Note: ulimit-based resource limits were removed to match Claude Code's
-/// approach (relies on timeouts and concurrent tool limits instead).
+/// Note: ulimit-based resource limits were removed (relies on timeouts
+/// and concurrent tool limits instead).
 /// ulimit -u is UID-wide and caused false-positive fork failures.
 pub fn wrap_command_with_limits(policy: &SandboxPolicy, user_command: &str) -> String {
     if policy.mode == SandboxMode::Permissive {
@@ -316,7 +316,7 @@ mod tests {
     fn standard_applies_shell_hardening() {
         let p = SandboxPolicy::for_project("/tmp");
         let wrapped = wrap_command_with_limits(&p, "echo hello");
-        // No ulimit restrictions (removed to match Claude Code approach)
+        // No ulimit restrictions (removed for reliability)
         assert!(
             !wrapped.contains("ulimit"),
             "should NOT contain ulimit (removed)"

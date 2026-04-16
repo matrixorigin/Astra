@@ -1471,7 +1471,7 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
         return false;
     }
 
-    // Minimal allowlist, modeled after Claude Code's "read-only command subsets" idea.
+    // Minimal allowlist of read-only commands.
     // Kept deliberately small to avoid silently allowing write-capable commands.
     let prefixes = [
         "git status",

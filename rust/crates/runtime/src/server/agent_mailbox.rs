@@ -1,7 +1,6 @@
 //! Bidirectional Agent Communication (D-8)
 //!
-//! An in-memory mailbox system for agent-to-agent messaging, inspired by
-//! Claude Code's SendMessageTool + file-system mailbox architecture.
+//! An in-memory mailbox system for agent-to-agent messaging.
 //!
 //! Key features:
 //! - Unicast (agent-to-agent) and broadcast messaging

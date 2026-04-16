@@ -11,7 +11,6 @@ const SHELL_EXECUTION_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"]
 /// Zsh-specific dangerous commands that can bypass security checks.
 /// These commands allow arbitrary file I/O, network access, or code execution
 /// without going through standard binaries that we can validate.
-/// Ref: Claude Code `bashSecurity.ts` ZSH_DANGEROUS_COMMANDS
 const ZSH_DANGEROUS_COMMANDS: &[&str] = &[
     // zmodload is the gateway to many dangerous module-based attacks
     "zmodload", // emulate with -c flag is an eval-equivalent

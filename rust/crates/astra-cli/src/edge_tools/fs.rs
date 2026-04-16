@@ -247,7 +247,7 @@ impl ToolExecutor {
             }
         }
 
-        // Raw range keys (match Claude Code offset/limit identity for consecutive dedup).
+        // Raw range keys for consecutive dedup.
         let start_raw = args.get("start_line").and_then(Value::as_u64);
         let end_raw = args.get("end_line").and_then(Value::as_u64);
         let has_range = start_raw.is_some() || end_raw.is_some();
@@ -266,8 +266,7 @@ impl ToolExecutor {
             ReadDedupKey::Full
         };
 
-        // Consecutive identical outline/range request + unchanged file → stub before I/O
-        // (Claude Code FileReadTool dedup for the same offset/limit as last read).
+        // Consecutive identical outline/range request + unchanged file → stub before I/O.
         if self.can_dedup_identical_partial_read(&path, &dedup_key) {
             return format!(
                 "[Same read_file request as immediately before — file unchanged. \
@@ -293,7 +292,6 @@ impl ToolExecutor {
 
         // Pre-read size gate: check file size before reading.
         // Large files without a line range should use outline or start_line/end_line.
-        // Inspired by Claude Code's maxSizeBytes (256KB) pre-read check.
         if !has_range
             && !has_outline
             && let Ok(meta) = fs::metadata(&path)
@@ -314,8 +312,7 @@ impl ToolExecutor {
         // Aggregate output gate: when cumulative tool output this turn is
         // already high and a full-file read would be too large, auto-downgrade
         // to outline mode instead of blocking. Ranged reads are always allowed
-        // (they're already targeted). Inspired by Claude Code's approach of
-        // never blocking tool calls but degrading gracefully.
+        // (they're already targeted). Degrades gracefully instead of blocking.
         if !has_range && !has_outline {
             let agg = self
                 .aggregate_output_bytes
@@ -521,8 +518,7 @@ impl ToolExecutor {
         self.record_read_cached(&path, is_ranged, record_key, content.clone());
 
         // Escalating warning when the same file is read too many times.
-        // Inspired by Claude Code's dedup stub behavior: train the model
-        // to stop re-reading by making the cost of repetition visible.
+        // Trains the model to stop re-reading by making the cost of repetition visible.
         let read_count = self.file_read_count(&path);
         let ranged_count = self.file_ranged_read_count(&path);
         let read_warning = if read_count >= 4 {
@@ -3472,7 +3468,7 @@ type Handler interface {
         );
     }
 
-    // ── Claude Code–style consecutive identical partial read dedup ───────────
+    // ── Consecutive identical partial read dedup ───────────
 
     #[test]
     fn read_file_consecutive_identical_range_dedups() {

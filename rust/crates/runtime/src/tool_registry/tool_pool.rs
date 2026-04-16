@@ -1,7 +1,6 @@
 //! ToolPool: two-phase tool selection for large dynamic tool sets.
 //!
-//! This module is the runtime-native analogue of Claude Code's ToolSearch:
-//! instead of relying on `tool_reference` blocks, we keep a large searchable
+//! Instead of relying on `tool_reference` blocks, we keep a large searchable
 //! metadata index and only materialize full tool schemas for the small set of
 //! selected tools.
 
@@ -108,8 +107,6 @@ impl Default for ToolSearchConfig {
 }
 
 /// Persisted tool-search state across turns/compaction boundaries.
-///
-/// This is the runtime-native equivalent of Claude Code's "discovered tools set".
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSearchState {
     /// Tools that have been materialized/selected previously in this conversation.

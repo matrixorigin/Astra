@@ -154,7 +154,6 @@ pub struct CompactBoundary {
     pub recent_files: Vec<String>,
     /// Discovered tools carried across compaction/replay boundaries.
     ///
-    /// This is the runtime-native equivalent of Claude Code's discovered-tool set.
     /// These names can be used by the tool selection layer to re-materialize
     /// schemas even if the current tool index no longer lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -416,7 +415,6 @@ pub fn compact_tiered_with_result(
         }
         // For CompactHistory+, replace large non-error tool results with a
         // compact preview stub — the file can be re-read if needed.
-        // Inspired by Claude Code's microcompact pattern.
         let line_count = content.lines().count();
         if matches!(
             tier,

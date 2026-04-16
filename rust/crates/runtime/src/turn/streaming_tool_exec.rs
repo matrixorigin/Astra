@@ -1,6 +1,6 @@
 //! Streaming / Speculative Tool Execution (D-9)
 //!
-//! Inspired by Claude Code's `StreamingToolExecutor`, this module allows
+//! This module allows
 //! read-only tools to begin executing **while the LLM response is still
 //! streaming**. When the SSE stream emits a complete `tool_use` block for
 //! a tool classified as read-only (see `parallel_tool_exec::is_read_only_tool`),

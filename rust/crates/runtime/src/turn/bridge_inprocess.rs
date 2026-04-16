@@ -1,14 +1,14 @@
 /// In-process ChatTurnBridge — calls LLM directly without an external bridge service.
 ///
-/// # Claude Code–style behaviors mapped onto this stack
+/// # Key behaviors
 ///
-/// | Claude Code (desktop) | Here |
+/// | Behavior | Implementation |
 /// |------------------------|------|
 /// | Long-lived stream “stall” / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (90s default, `MO_STREAM_IDLE_TIMEOUT_MS`) |
 /// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm_client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm_client::wait_until_cancelled_or_pending) in the bridge stream |
-/// | Tool permission queue + single resolve | CLI: `astra-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. Claude’s `PermissionContext` “resolve once” matches ledger single-shot semantics |
+/// | Tool permission queue + single resolve | CLI: `astra-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. "resolve once" matches ledger single-shot semantics |
 ///
 /// # Legacy Status
 ///
@@ -54,7 +54,6 @@ use futures_util::{StreamExt, stream};
 
 /// Maximum number of read-only tools to execute concurrently.
 /// Prevents resource exhaustion from parallel tool execution.
-/// Matches Claude Code's default `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`.
 const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 10;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
@@ -697,7 +696,6 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
 
 // ── Cache Configuration (session-latched) ────────────────────────────────────
 // Latched at session start to prevent mid-session flips from busting the cache.
-// Claude Code calls these "session-stable latches."
 
 /// Prompt cache configuration, latched once per session.
 ///
@@ -932,8 +930,8 @@ pub(crate) fn build_system_message(
 /// - Tools: 1 breakpoint (last tool only)
 /// - Messages: 1 breakpoint (last message)
 ///
-/// This matches Claude Code's strategy of prioritizing message history caching
-/// for multi-turn conversations while still caching the stable tool prefix.
+/// Prioritizes message history caching for multi-turn conversations
+/// while still caching the stable tool prefix.
 pub(crate) fn annotate_tool_schemas_for_caching(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,
@@ -987,7 +985,7 @@ fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
 /// Emits: text_delta, reasoning_delta, reasoning_done, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
 ///
-/// **Stream resilience (Claude Code–style, same as [`super::llm_client::call_llm_and_collect`])**:
+/// **Stream resilience (same as [`super::llm_client::call_llm_and_collect`])**:
 /// per-chunk idle watchdog on parsed SSE; if the provider stops sending, partial state is
 /// discarded and a **single non-stream** `/chat/completions` request attempts recovery.
 ///

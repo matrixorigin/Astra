@@ -1,6 +1,6 @@
 //! Context Compression Pipeline (D-4)
 //!
-//! Layered, progressive compression inspired by Claude Code's 5-layer approach.
+//! Layered, progressive compression pipeline.
 //! Each layer estimates savings, decides whether to trigger, and compresses
 //! the conversation state. The pipeline runs layers in order, stopping as soon
 //! as the token budget is satisfied.
@@ -291,8 +291,8 @@ impl CompressionPipeline {
 
 /// Clears or shortens tool-result content bodies older than `age_threshold`.
 ///
-/// Inspired by Claude Code's time-based microcompact: tool results older than
-/// 60 minutes get their content cleared (keeping the role/tool_use_id structure).
+/// Tool results older than the threshold get their content cleared
+/// (keeping the role/tool_use_id structure).
 pub struct ToolResultTruncation {
     /// Results older than this are eligible for truncation.
     age_threshold: Duration,

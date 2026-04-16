@@ -4,8 +4,7 @@
 //! the KV cache prefix is broken. Classifies breaks by cause and logs
 //! diagnostics with token impact estimates.
 //!
-//! Inspired by Claude Code's `promptCacheBreakDetection.ts`, but with
-//! auto-remediation suggestions and richer classification.
+//! diagnostics with token impact estimates and auto-remediation suggestions.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

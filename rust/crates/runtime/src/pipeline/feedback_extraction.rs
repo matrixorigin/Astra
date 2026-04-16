@@ -5,7 +5,7 @@
 //! the rule, the reason (why), and when it applies.
 //!
 //! This bridges the gap between Astra's regex-based signal detection and
-//! Claude Code's LLM-driven semantic understanding of user corrections.
+//! LLM-driven semantic understanding of user corrections.
 
 use astra_turn_types::StructuredFeedback;
 

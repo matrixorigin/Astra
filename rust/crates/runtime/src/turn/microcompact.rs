@@ -1,7 +1,6 @@
 //! Microcompact: clear old tool result content before each LLM call.
 //!
-//! Inspired by Claude Code's microcompact strategy. Tool results (file reads,
-//! grep output, git diffs) dominate history token cost. Once the LLM has acted
+//! Tool results (file reads, grep output, git diffs) dominate history token cost. Once the LLM has acted
 //! on a tool result, the full content is rarely needed again. This module
 //! replaces old tool result content with a short placeholder, keeping only the
 //! most recent N results intact.

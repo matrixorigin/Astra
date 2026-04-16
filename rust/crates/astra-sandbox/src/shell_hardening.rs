@@ -1,6 +1,5 @@
 //! Shell security hardening for command execution.
 //!
-//! Inspired by Claude Code's `bashProvider.ts`, `subprocessEnv.ts`, and `shellQuote.ts`.
 //! Provides:
 //! - Extglob/extended-glob disabling (prevents malicious filename expansion after validation)
 //! - IFS reset (prevents word-splitting attacks)
@@ -37,11 +36,9 @@ pub const DANGEROUS_FILE_PATHS: &[&str] = &[
 ];
 
 /// Environment variables that contain secrets and must be scrubbed from subprocesses.
-/// Inspired by Claude Code's `subprocessEnv.ts` scrub list.
 pub const SENSITIVE_ENV_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",

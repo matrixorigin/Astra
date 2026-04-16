@@ -1,7 +1,7 @@
 //! Parallel Tool Execution (D-1)
 //!
 //! Classifies tool calls as read-only (safe for parallel execution) vs mutating
-//! (must run sequentially), inspired by Claude Code's `StreamingToolExecutor`.
+//! (must run sequentially).
 //!
 //! Read-only tools can be dispatched concurrently via `tokio::JoinSet` with
 //! a semaphore limiting concurrency. Mutating tools run one at a time after
