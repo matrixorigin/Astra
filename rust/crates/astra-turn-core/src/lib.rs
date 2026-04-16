@@ -115,3 +115,8 @@ pub mod cloud_compact_prompt;
 pub mod cloud_summary;
 pub mod session_replay_harness;
 pub mod sse_data_lines;
+
+// Phase 18: contracts, session cache, trace collector
+pub mod contracts;
+pub mod session_cache;
+pub mod turn_trace_collector;
