@@ -19,6 +19,8 @@ pub struct SkillRegisterRequestData {
     pub skill_name: String,
     pub skill_version: String,
     pub skill_code: String,
+    pub skill_type: String,
+    pub remote_url: Option<String>,
     pub description: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -31,6 +33,8 @@ pub struct SkillPublishRequestData {
     pub triggers: Option<Vec<String>>,
     pub dependencies: Option<Vec<String>>,
     pub manifest: Option<serde_json::Value>,
+    pub skill_type: String,
+    pub remote_url: Option<String>,
     pub category: String,
     pub priority: i32,
     // Phase 3: publisher + trust fields
@@ -102,6 +106,54 @@ pub struct SkillStatusRecord {
 }
 
 const MAX_SKILL_STATUS_PER_GROUP: u32 = 100;
+const SKILL_TYPE_LOCAL: &str = "local";
+const SKILL_TYPE_REMOTE: &str = "remote";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegisteredSkillType {
+    Local,
+    Remote,
+}
+
+impl RegisteredSkillType {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | SKILL_TYPE_LOCAL => Some(Self::Local),
+            SKILL_TYPE_REMOTE => Some(Self::Remote),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => SKILL_TYPE_LOCAL,
+            Self::Remote => SKILL_TYPE_REMOTE,
+        }
+    }
+}
+
+fn validate_remote_url(raw_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|err| format!("invalid remote_url '{raw_url}': {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "remote_url must use http:// or https:// (found '{other}')"
+            ));
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err("remote_url must include a valid host".to_string());
+    }
+    Ok(())
+}
+
+fn strip_reserved_skill_definition_keys(map: &mut serde_json::Map<String, serde_json::Value>) {
+    // `skill_type` / `remote_url` are controlled by dedicated API fields.
+    map.remove("skill_type");
+    map.remove("remote_url");
+}
 
 /// `list_skills` row projection — excludes `skill_definition` (large JSON); use `get_skill` for body.
 const SKILL_REGISTRY_LIST_SELECT: &str = "\
@@ -198,6 +250,54 @@ impl SkillService for DatabaseSkillService {
     ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
+        let skill_type = RegisteredSkillType::parse(&request.skill_type).ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid skill_type '{}'; expected '{}' or '{}'",
+                    request.skill_type, SKILL_TYPE_LOCAL, SKILL_TYPE_REMOTE
+                ),
+            )
+        })?;
+        let remote_url = request
+            .remote_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
+        match skill_type {
+            RegisteredSkillType::Local => {
+                if request.skill_code.trim().is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "local skills require non-empty skill_code",
+                    ));
+                }
+                if remote_url.is_some() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "local skills must not provide remote_url",
+                    ));
+                }
+            }
+            RegisteredSkillType::Remote => {
+                let Some(url) = remote_url.as_deref() else {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "remote skills require remote_url",
+                    ));
+                };
+                if !request.skill_code.trim().is_empty() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "remote skills must not provide skill_code",
+                    ));
+                }
+                validate_remote_url(url)
+                    .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg))?;
+            }
+        }
+
         let skill_id = if request.skill_id.is_empty() {
             format!("{}@{}", request.skill_name, request.skill_version)
         } else {
@@ -216,10 +316,34 @@ impl SkillService for DatabaseSkillService {
             ));
         }
 
-        let metadata_json = request
-            .metadata
-            .as_ref()
-            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".into()));
+        let mut skill_definition = match request.metadata.clone() {
+            Some(serde_json::Value::Object(mut map)) => {
+                strip_reserved_skill_definition_keys(&mut map);
+                map
+            }
+            Some(value) => {
+                let mut map = serde_json::Map::new();
+                map.insert("metadata".to_string(), value);
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        skill_definition.insert(
+            "skill_type".to_string(),
+            serde_json::Value::String(skill_type.as_str().to_string()),
+        );
+        if !request.skill_code.trim().is_empty() {
+            skill_definition.insert(
+                "instructions".to_string(),
+                serde_json::Value::String(request.skill_code.clone()),
+            );
+        }
+        if let Some(url) = remote_url.clone() {
+            skill_definition.insert("remote_url".to_string(), serde_json::Value::String(url));
+        }
+        let definition_value = serde_json::Value::Object(skill_definition);
+        let definition_json =
+            serde_json::to_string(&definition_value).unwrap_or_else(|_| "{}".to_string());
         let code_hash = format!("{:x}", sha2::Sha256::digest(request.skill_code.as_bytes()));
 
         query(
@@ -232,7 +356,7 @@ impl SkillService for DatabaseSkillService {
         .bind(&request.skill_name)
         .bind(&request.skill_version)
         .bind(&request.description)
-        .bind(&metadata_json)
+        .bind(&definition_json)
         .bind(&code_hash)
         .bind(&user_id)
         .execute(&pool)
@@ -244,7 +368,7 @@ impl SkillService for DatabaseSkillService {
             skill_name: request.skill_name,
             version: request.skill_version,
             description: request.description,
-            metadata: request.metadata,
+            metadata: Some(definition_value),
             created_at: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()),
         })
     }
@@ -490,6 +614,42 @@ impl SkillService for DatabaseSkillService {
     ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
+        let skill_type = RegisteredSkillType::parse(&request.skill_type).ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid skill_type '{}'; expected '{}' or '{}'",
+                    request.skill_type, SKILL_TYPE_LOCAL, SKILL_TYPE_REMOTE
+                ),
+            )
+        })?;
+        let remote_url = request
+            .remote_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
+        match skill_type {
+            RegisteredSkillType::Local => {
+                if remote_url.is_some() {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "local skills must not provide remote_url",
+                    ));
+                }
+            }
+            RegisteredSkillType::Remote => {
+                let Some(url) = remote_url.as_deref() else {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "remote skills require remote_url",
+                    ));
+                };
+                validate_remote_url(url)
+                    .map_err(|msg| error_response(StatusCode::BAD_REQUEST, msg))?;
+            }
+        }
+
         let existing =
             query("SELECT skill_id FROM skills_registry WHERE skill_name = ? AND source != 'user'")
                 .bind(&request.name)
@@ -515,22 +675,57 @@ impl SkillService for DatabaseSkillService {
             .dependencies
             .as_ref()
             .map(|d| serde_json::to_string(d).unwrap_or_else(|_| "[]".into()));
-        let manifest_json = request
-            .manifest
-            .as_ref()
-            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "{}".into()));
+        let mut manifest_map = match request.manifest.clone() {
+            Some(serde_json::Value::Object(mut map)) => {
+                strip_reserved_skill_definition_keys(&mut map);
+                map
+            }
+            Some(_) => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "manifest must be a JSON object",
+                ));
+            }
+            None => serde_json::Map::new(),
+        };
+        manifest_map.insert(
+            "skill_type".to_string(),
+            serde_json::Value::String(skill_type.as_str().to_string()),
+        );
+        if let Some(url) = remote_url.clone() {
+            manifest_map.insert("remote_url".to_string(), serde_json::Value::String(url));
+        }
+        if !request.category.trim().is_empty() {
+            manifest_map.insert(
+                "category".to_string(),
+                serde_json::Value::String(request.category.clone()),
+            );
+        }
+        manifest_map.insert("priority".to_string(), serde_json::json!(request.priority));
+        if let Some(triggers) = request.triggers.clone() {
+            manifest_map.insert("triggers".to_string(), serde_json::json!(triggers));
+        }
+        if let Some(dependencies) = request.dependencies.clone() {
+            manifest_map.insert("dependencies".to_string(), serde_json::json!(dependencies));
+        }
+        let skill_definition_json =
+            serde_json::to_string(&serde_json::Value::Object(manifest_map.clone()))
+                .unwrap_or_else(|_| "{}".into());
+        let manifest_json = serde_json::to_string(&serde_json::Value::Object(manifest_map))
+            .unwrap_or_else(|_| "{}".into());
 
         let insert_result = query(
             "INSERT INTO skills_registry \
-             (skill_id, skill_name, version, description, triggers, dependencies, manifest, \
+             (skill_id, skill_name, version, description, skill_definition, triggers, dependencies, manifest, \
                category, priority, is_active, status, source, is_public, created_by, \
                publisher_id, trust_tier, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', 'user', 1, ?, ?, ?, NOW(), NOW())",
         )
         .bind(&skill_id)
         .bind(&request.name)
         .bind(&request.version)
         .bind(&request.description)
+        .bind(&skill_definition_json)
         .bind(&triggers_json)
         .bind(&deps_json)
         .bind(&manifest_json)
@@ -669,12 +864,22 @@ impl SkillService for UnconfiguredSkillService {
 
 #[derive(Deserialize)]
 pub struct RegisterSkillRequest {
+    #[serde(default)]
     pub skill_id: String,
     pub skill_name: String,
     pub skill_version: String,
+    #[serde(default)]
     pub skill_code: String,
+    #[serde(default = "default_skill_type")]
+    pub skill_type: String,
+    #[serde(default)]
+    pub remote_url: Option<String>,
     pub description: Option<String>,
     pub metadata: Option<serde_json::Value>,
+}
+
+fn default_skill_type() -> String {
+    SKILL_TYPE_LOCAL.to_string()
 }
 
 #[derive(Deserialize)]
@@ -685,6 +890,10 @@ pub struct PublishSkillRequest {
     pub triggers: Option<Vec<String>>,
     pub dependencies: Option<Vec<String>>,
     pub manifest: Option<serde_json::Value>,
+    #[serde(default = "default_skill_type")]
+    pub skill_type: String,
+    #[serde(default)]
+    pub remote_url: Option<String>,
     #[serde(default = "default_category")]
     pub category: String,
     #[serde(default = "default_priority")]
@@ -745,8 +954,106 @@ mod tests {
         let req: PublishSkillRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.category, "user");
         assert_eq!(req.priority, 5);
+        assert_eq!(req.skill_type, "local");
+        assert!(req.remote_url.is_none());
         assert!(req.triggers.is_none());
         assert!(req.manifest.is_none());
+    }
+
+    #[test]
+    fn publish_request_remote_mode_fields() {
+        let json = r#"{
+            "name":"remote-test",
+            "version":"1.0",
+            "description":"desc",
+            "skill_type":"remote",
+            "remote_url":"https://example.com/skills/run"
+        }"#;
+        let req: PublishSkillRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.skill_type, "remote");
+        assert_eq!(
+            req.remote_url.as_deref(),
+            Some("https://example.com/skills/run")
+        );
+    }
+
+    #[test]
+    fn register_request_defaults_local_mode() {
+        let json = r#"{"skill_name":"s","skill_version":"1.0.0"}"#;
+        let req: RegisterSkillRequest = serde_json::from_str(json).unwrap();
+        assert!(req.skill_id.is_empty());
+        assert!(req.skill_code.is_empty());
+        assert_eq!(req.skill_type, "local");
+        assert!(req.remote_url.is_none());
+    }
+
+    #[test]
+    fn register_request_remote_mode_fields() {
+        let json = r#"{
+            "skill_name":"s",
+            "skill_version":"1.0.0",
+            "skill_type":"remote",
+            "remote_url":"http://127.0.0.1:8080/skills/run"
+        }"#;
+        let req: RegisterSkillRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.skill_type, "remote");
+        assert_eq!(
+            req.remote_url.as_deref(),
+            Some("http://127.0.0.1:8080/skills/run")
+        );
+    }
+
+    #[test]
+    fn registered_skill_type_parse() {
+        assert_eq!(
+            RegisteredSkillType::parse("local"),
+            Some(RegisteredSkillType::Local)
+        );
+        assert_eq!(
+            RegisteredSkillType::parse(""),
+            Some(RegisteredSkillType::Local)
+        );
+        assert_eq!(
+            RegisteredSkillType::parse("remote"),
+            Some(RegisteredSkillType::Remote)
+        );
+        assert!(RegisteredSkillType::parse("invalid").is_none());
+    }
+
+    #[test]
+    fn validate_remote_url_accepts_http_https_with_host() {
+        assert!(validate_remote_url("https://example.com/skills/run").is_ok());
+        assert!(validate_remote_url("http://127.0.0.1:8080/execute").is_ok());
+    }
+
+    #[test]
+    fn validate_remote_url_rejects_invalid_or_unsupported_urls() {
+        assert!(validate_remote_url("http://").is_err());
+        assert!(validate_remote_url("https://").is_err());
+        assert!(validate_remote_url("ftp://example.com/execute").is_err());
+    }
+
+    #[test]
+    fn strip_reserved_skill_definition_keys_removes_remote_url_and_skill_type() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "remote_url".to_string(),
+            serde_json::Value::String("https://evil.example/exec".to_string()),
+        );
+        map.insert(
+            "skill_type".to_string(),
+            serde_json::Value::String("remote".to_string()),
+        );
+        map.insert("display_name".to_string(), serde_json::json!("safe"));
+
+        strip_reserved_skill_definition_keys(&mut map);
+
+        assert!(!map.contains_key("remote_url"));
+        assert!(!map.contains_key("skill_type"));
+        assert_eq!(
+            map.get("display_name"),
+            Some(&serde_json::Value::String("safe".to_string()))
+        );
     }
 
     #[test]

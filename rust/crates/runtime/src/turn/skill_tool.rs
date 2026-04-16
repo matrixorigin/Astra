@@ -30,7 +30,7 @@
 //! still resolved and executed **inline** so composition can proceed.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use astra_core::SkillSearchSettings;
 use serde_json::Value;
@@ -166,6 +166,10 @@ pub struct ResolvedSkill {
     pub composition: Option<crate::skills::manifest::SkillComposition>,
     /// Input schema for argument validation (JSON Schema subset).
     pub input_schema: Option<Value>,
+    /// Output schema for execution-result validation (JSON Schema subset).
+    pub output_schema: Option<Value>,
+    /// Remote execution endpoint. When set, runtime dispatches over HTTP.
+    pub remote_url: Option<String>,
     /// Alternative names for this skill.
     pub aliases: Vec<String>,
     /// Effort level hint for reasoning depth.
@@ -1288,6 +1292,229 @@ async fn execute_pipeline(
     )
 }
 
+fn remote_response_to_text(payload: &Value) -> String {
+    for key in ["result", "output", "content", "message"] {
+        if let Some(value) = payload.get(key) {
+            if let Some(text) = value.as_str() {
+                return text.to_string();
+            }
+            if !value.is_null() {
+                return value.to_string();
+            }
+        }
+    }
+    payload.to_string()
+}
+
+struct RemoteSkillExecutionResult {
+    text: String,
+    payload_json: Option<Value>,
+}
+
+const REMOTE_SKILL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+fn remote_skill_http_client() -> &'static reqwest::Client {
+    static REMOTE_SKILL_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+    REMOTE_SKILL_HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn allow_private_remote_network() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    std::env::var("ASTRA_REMOTE_SKILL_ALLOW_PRIVATE_NET")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn remote_host_is_private_or_local(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if host.ends_with(".local") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
+                    || v6.is_multicast()
+                    || v6.is_unspecified()
+            }
+        };
+    }
+    false
+}
+
+fn validate_remote_skill_endpoint(remote_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(remote_url)
+        .map_err(|err| format!("invalid remote_url '{remote_url}': {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "unsupported remote_url scheme '{other}'; only http/https are allowed"
+            ));
+        }
+    }
+    if remote_host_is_private_or_local(&parsed) && !allow_private_remote_network() {
+        return Err(
+            "remote_url resolves to localhost/private network; set ASTRA_REMOTE_SKILL_ALLOW_PRIVATE_NET=1 to explicitly allow".to_string(),
+        );
+    }
+    Ok(())
+}
+
+async fn read_remote_skill_body_limited(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes as u64 {
+            return Err(format!(
+                "response body too large: {content_length} bytes (max {max_bytes})"
+            ));
+        }
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut collected = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("failed to read response body: {err}"))?;
+        let remaining = max_bytes.saturating_sub(collected.len());
+        if chunk.len() > remaining {
+            return Err(format!("response body exceeds max {max_bytes} bytes"));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected)
+}
+
+fn validate_skill_output_schema(
+    skill: &ResolvedSkill,
+    output_text: String,
+    output_payload_json: Option<&Value>,
+) -> (String, Option<SkillVerificationOutcome>) {
+    let Some(schema) = skill.output_schema.as_ref() else {
+        return (output_text, None);
+    };
+    let validation_errors = if let Some(payload_json) = output_payload_json {
+        crate::skills::composition::validate_input(schema, payload_json)
+    } else {
+        crate::skills::composition::validate_output(schema, &output_text)
+    };
+    if validation_errors.is_empty() {
+        return (
+            output_text,
+            Some(SkillVerificationOutcome {
+                all_required_passed: true,
+                summary: None,
+            }),
+        );
+    }
+
+    let mut warning = String::new();
+    if !output_text.trim().is_empty() {
+        warning.push_str(&output_text);
+        warning.push_str("\n\n");
+    }
+    warning.push_str(&format!(
+        "⚠️ Output schema validation failed for skill '{}':\n{}",
+        skill.name,
+        validation_errors
+            .iter()
+            .map(|err| format!("- {err}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    (
+        warning,
+        Some(SkillVerificationOutcome {
+            all_required_passed: false,
+            summary: None,
+        }),
+    )
+}
+
+async fn execute_remote_skill(
+    remote_url: &str,
+    skill: &ResolvedSkill,
+    task_hint: &str,
+    skill_ctx: &SkillContext,
+) -> Result<RemoteSkillExecutionResult, String> {
+    validate_remote_skill_endpoint(remote_url)?;
+
+    // Forward a minimal context subset to reduce data-exfiltration surface for
+    // user-registered remote endpoints.
+    let payload = serde_json::json!({
+        "skill_name": skill.name,
+        "task": task_hint,
+        "arguments": {
+            "task": task_hint,
+        },
+        "context": {
+            "session_id": skill_ctx.session_id,
+            "recursion_depth": skill_ctx.recursion_depth,
+        }
+    });
+    let response = remote_skill_http_client()
+        .post(remote_url)
+        .timeout(std::time::Duration::from_secs(30))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err}"))?;
+    let status = response.status();
+    let body = read_remote_skill_body_limited(response, REMOTE_SKILL_MAX_RESPONSE_BYTES).await?;
+
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&body).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            format!("HTTP {}: {detail}", status.as_u16())
+        });
+    }
+
+    if body.is_empty() {
+        return Ok(RemoteSkillExecutionResult {
+            text: String::new(),
+            payload_json: None,
+        });
+    }
+    if let Ok(json) = serde_json::from_slice::<Value>(&body) {
+        return Ok(RemoteSkillExecutionResult {
+            text: remote_response_to_text(&json),
+            payload_json: Some(json),
+        });
+    }
+    Ok(RemoteSkillExecutionResult {
+        text: String::from_utf8_lossy(&body).to_string(),
+        payload_json: None,
+    })
+}
+
 /// Execute a single skill call and return the output text + activation metadata.
 ///
 /// When the skill has `execution_context: Fork` and an executor is available,
@@ -1425,6 +1652,29 @@ fn execute_skill<'a>(
 
                 // Run pre-invocation hooks exactly once before any execution path.
                 run_hooks(&skill.hooks.pre_invoke, is_mcp);
+
+                // Remote execution: dispatch to external endpoint.
+                if let Some(remote_url) = skill.remote_url.as_deref() {
+                    match execute_remote_skill(remote_url, &skill, task_hint, skill_ctx).await {
+                        Ok(remote_output) => {
+                            let (output, verification) = validate_skill_output_schema(
+                                &skill,
+                                remote_output.text,
+                                remote_output.payload_json.as_ref(),
+                            );
+                            run_hooks(&skill.hooks.post_invoke, is_mcp);
+                            return (output, Some(build_activation(&skill)), verification);
+                        }
+                        Err(err) => {
+                            run_hooks(&skill.hooks.on_error, is_mcp);
+                            return (
+                                format!("Remote skill '{}' failed: {err}", skill_name),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                }
 
                 // Fork execution: delegate to the executor for isolated sub-agent run
                 if skill.execution_context == ExecutionContext::Fork {
@@ -1673,6 +1923,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -1973,6 +2225,374 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_skill_remote_dispatches_http_endpoint() {
+        use axum::{Json, Router, routing::post};
+
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|Json(body): Json<Value>| async move {
+                let task = body.get("task").and_then(Value::as_str).unwrap_or("");
+                Json(serde_json::json!({
+                    "result": format!("remote handled: {task}")
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolver {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "remote-e2e",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(output, "remote handled: ping remote");
+        assert!(activation.is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_does_not_follow_redirects() {
+        use axum::{Router, response::Redirect, routing::post};
+
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|| async move { Redirect::temporary("/should-not-follow") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolver {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "remote-redirect",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(output.contains("HTTP 307"), "unexpected output: {output}");
+        assert!(activation.is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_rejects_oversized_response_body() {
+        use axum::{Router, routing::post};
+
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let oversized = "x".repeat(REMOTE_SKILL_MAX_RESPONSE_BYTES + 1);
+        let app = Router::new().route(
+            "/remote-skill",
+            post({
+                let oversized = oversized.clone();
+                move || {
+                    let oversized = oversized.clone();
+                    async move { oversized }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolver {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "remote-large-body",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(
+            output.contains("response body too large") || output.contains("response body exceeds"),
+            "unexpected output: {output}"
+        );
+        assert!(activation.is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_output_schema_is_verified() {
+        use axum::{Json, Router, routing::post};
+
+        struct RemoteResolverWithOutputSchema {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolverWithOutputSchema {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "result": { "type": "string" }
+                        },
+                        "required": ["result"]
+                    })),
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|Json(body): Json<Value>| async move {
+                let task = body.get("task").and_then(Value::as_str).unwrap_or("");
+                Json(serde_json::json!({
+                    "result": format!("remote schema pass: {task}")
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolverWithOutputSchema {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, verification) = execute_skill(
+            &resolver,
+            None,
+            "remote-schema-pass",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(output, "remote schema pass: ping remote");
+        assert!(activation.is_some());
+        let verification = verification.expect("expected output-schema verification outcome");
+        assert!(verification.all_required_passed);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_output_schema_failure_marks_verification() {
+        use axum::{Json, Router, routing::post};
+
+        struct RemoteResolverWithOutputSchema {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolverWithOutputSchema {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "result": { "type": "string" }
+                        },
+                        "required": ["result"]
+                    })),
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|Json(_body): Json<Value>| async move {
+                Json(serde_json::json!({
+                    "status": "ok"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolverWithOutputSchema {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, verification) = execute_skill(
+            &resolver,
+            None,
+            "remote-schema-fail",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(output.contains("Output schema validation failed"));
+        assert!(activation.is_some());
+        let verification = verification.expect("expected output-schema verification outcome");
+        assert!(!verification.all_required_passed);
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn execute_skill_fork_returns_verification_summary() {
         use async_trait::async_trait;
 
@@ -2004,6 +2624,8 @@ mod tests {
                     }],
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2099,6 +2721,18 @@ mod tests {
         assert!(ctx.as_substitution_vars().is_empty());
     }
 
+    #[test]
+    fn remote_host_classifier_detects_private_and_public_hosts() {
+        let localhost = reqwest::Url::parse("http://127.0.0.1:8080/execute").unwrap();
+        assert!(remote_host_is_private_or_local(&localhost));
+
+        let public_ip = reqwest::Url::parse("https://8.8.8.8/execute").unwrap();
+        assert!(!remote_host_is_private_or_local(&public_ip));
+
+        let public_dns = reqwest::Url::parse("https://example.com/execute").unwrap();
+        assert!(!remote_host_is_private_or_local(&public_dns));
+    }
+
     #[tokio::test]
     async fn execute_skill_expands_context_vars() {
         // Build a resolver that includes ${CTX_WORK_DIR} in instructions
@@ -2119,6 +2753,8 @@ mod tests {
                     success_criteria: vec![],
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2553,6 +3189,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -2599,6 +3237,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -2676,6 +3316,8 @@ mod tests {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            output_schema: None,
+            remote_url: None,
             aliases: Vec::new(),
 
             effort: None,
@@ -2702,6 +3344,8 @@ mod tests {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            output_schema: None,
+            remote_url: None,
             aliases: Vec::new(),
 
             effort: None,
@@ -2869,6 +3513,8 @@ mod tests {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            output_schema: None,
+            remote_url: None,
             aliases: Vec::new(),
 
             effort: Some(EffortLevel::High),
@@ -2924,6 +3570,8 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
@@ -2943,6 +3591,8 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
@@ -3028,6 +3678,8 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
@@ -3095,6 +3747,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None, // not composable
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3151,6 +3805,8 @@ mod tests {
                         steps: vec![],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3207,6 +3863,8 @@ mod tests {
                         steps: vec![],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3259,6 +3917,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3315,6 +3975,8 @@ mod tests {
                         },
                         "required": ["target_path"]
                     })),
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3433,6 +4095,8 @@ mod tests {
                         ],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -3458,6 +4122,8 @@ mod tests {
                         steps: vec![],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -3574,6 +4240,8 @@ mod tests {
                             ],
                         }),
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
@@ -3599,6 +4267,8 @@ mod tests {
                             steps: vec![],
                         }),
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,

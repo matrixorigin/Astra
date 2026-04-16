@@ -27,6 +27,9 @@
 //! - **`e2e_matrix_trusted_moi_user_system_integration`** — run server in `trusted_moi` mode,
 //!   authenticate via external JWT claims, verify local auth endpoints are disabled, and assert
 //!   session/memory ownership maps to upstream user id.
+//! - **`e2e_matrix_remote_skill_registration_user_system_integration`** — register remote skill via
+//!   `/skills` with mode-aware bootstrap (`local_jwt` or `trusted_moi`), verify validation behavior,
+//!   list/get/version discoverability, and `skills_registry.created_by` ownership mapping.
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -53,6 +56,7 @@ mod harness;
 mod journey_audit_cross_session;
 mod journey_extended;
 mod journey_full;
+mod journey_remote_skills;
 mod journey_tasks_runs;
 mod journey_trusted_moi;
 
@@ -134,4 +138,11 @@ async fn e2e_matrix_audit_cross_session_analytics_http() {
 async fn e2e_matrix_trusted_moi_user_system_integration() {
     require_system_e2e_env();
     journey_trusted_moi::run_trusted_moi_user_system_integration().await;
+}
+
+#[tokio::test]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_remote_skill_registration_user_system_integration() {
+    require_system_e2e_env();
+    journey_remote_skills::run_remote_skill_registration_user_system_integration().await;
 }

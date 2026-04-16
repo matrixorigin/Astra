@@ -120,6 +120,9 @@ pub struct SkillManifest {
     /// JSON Schema for structured skill output. Enables post-execution parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// Remote execution endpoint. When set, runtime dispatches skill calls over HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
     /// Machine-executable success criteria as raw JSON.
     /// The actual verification types are defined in astra_services.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -363,6 +366,7 @@ impl Default for SkillManifest {
             metadata: HashMap::new(),
             input_schema: None,
             output_schema: None,
+            remote_url: None,
             success_criteria: Vec::new(),
             required_capabilities: Vec::new(),
             composition: None,

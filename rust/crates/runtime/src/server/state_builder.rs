@@ -265,7 +265,8 @@ pub async fn build_server_state(
             state.edge_callback_ledger.clone(),
         )
         .with_pool(shared_pool.clone())
-        .with_edge_connection_pool(state.edge_connection_pool.clone()),
+        .with_edge_connection_pool(state.edge_connection_pool.clone())
+        .with_skill_service(state.skill_service.clone()),
     );
     let delegation_engine = Arc::new(
         crate::server::delegation_engine::DelegationEngine::with_executor(
@@ -295,7 +296,8 @@ pub async fn build_server_state(
     .with_run_engine(run_engine)
     .with_delegation_engine(Arc::clone(&delegation_engine))
     .with_edge_connection_pool(state.edge_connection_pool.clone())
-    .with_resource_governor(resource_governor.clone());
+    .with_resource_governor(resource_governor.clone())
+    .with_skill_service(state.skill_service.clone());
 
     // Wire team persistence store backed by MatrixOne.
     let team_store =
