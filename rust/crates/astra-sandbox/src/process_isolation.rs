@@ -12,7 +12,15 @@
 //! - Caller passes `IsolationConfig::disabled()`.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+const MAX_CAPTURED_STDOUT_BYTES: usize = 64 * 1024;
+const MAX_CAPTURED_STDERR_BYTES: usize = 32 * 1024;
+const READ_CHUNK_SIZE: usize = 8 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Per-invocation isolation configuration.
 #[derive(Debug, Clone)]
@@ -81,6 +89,8 @@ pub struct IsolatedOutput {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    pub stdout_capped: bool,
+    pub stderr_capped: bool,
     /// Whether namespace isolation was actually applied (false = fallback).
     pub namespace_active: bool,
     /// Whether cgroup limits were actually applied.
@@ -105,11 +115,35 @@ impl IsolatedOutput {
         {
             out.push_str(&format!("\n(exit code: {code})"));
         }
+        if self.stdout_capped || self.stderr_capped {
+            let mut capped_streams = Vec::new();
+            if self.stdout_capped {
+                capped_streams.push("stdout");
+            }
+            if self.stderr_capped {
+                capped_streams.push("stderr");
+            }
+            out.push_str(&format!(
+                "\n(output capped: {} limit reached)",
+                capped_streams.join(", ")
+            ));
+        }
         if self.timed_out {
             out.push_str("\n(timed out)");
         }
         out
     }
+}
+
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+struct StreamChunk {
+    stream: StreamKind,
+    bytes: Vec<u8>,
 }
 
 /// Check if `unshare` with user namespace mapping actually works.
@@ -120,7 +154,14 @@ fn unshare_available() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::process::Command::new("unshare")
-            .args(["--map-root-user", "--", "true"])
+            .args([
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--kill-child",
+                "--",
+                "true",
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -183,6 +224,85 @@ fn cleanup_cgroup(cg_path: &Path) {
     let _ = std::fs::remove_dir(cg_path);
 }
 
+fn append_capped(buffer: &mut Vec<u8>, chunk: &[u8], max_bytes: usize, capped: &mut bool) {
+    if buffer.len() >= max_bytes {
+        *capped = true;
+        return;
+    }
+
+    let remaining = max_bytes - buffer.len();
+    if chunk.len() <= remaining {
+        buffer.extend_from_slice(chunk);
+    } else {
+        buffer.extend_from_slice(&chunk[..remaining]);
+        *capped = true;
+    }
+}
+
+fn drain_stream_chunks(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    stdout_capped: &mut bool,
+    stderr_capped: &mut bool,
+) {
+    while let Ok(chunk) = rx.try_recv() {
+        match chunk.stream {
+            StreamKind::Stdout => append_capped(
+                stdout,
+                &chunk.bytes,
+                MAX_CAPTURED_STDOUT_BYTES,
+                stdout_capped,
+            ),
+            StreamKind::Stderr => append_capped(
+                stderr,
+                &chunk.bytes,
+                MAX_CAPTURED_STDERR_BYTES,
+                stderr_capped,
+            ),
+        }
+    }
+}
+
+fn trim_incomplete_trailing_line(output: &mut String) {
+    if output.is_empty() || output.ends_with('\n') || output.ends_with('\r') {
+        return;
+    }
+
+    if let Some(last_break) = output.rfind('\n').or_else(|| output.rfind('\r')) {
+        output.truncate(last_break + 1);
+    } else {
+        output.clear();
+    }
+}
+
+async fn pump_stream<R>(
+    mut reader: R,
+    stream: StreamKind,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; READ_CHUNK_SIZE];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                if tx
+                    .send(StreamChunk {
+                        stream,
+                        bytes: buffer[..read].to_vec(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Execute a command with Linux process isolation.
 ///
 /// # Fallback behavior
@@ -204,6 +324,7 @@ pub async fn execute_isolated(
         if config.pid_namespace {
             unshare_flags.push("--pid");
             unshare_flags.push("--fork");
+            unshare_flags.push("--kill-child");
         }
         if config.mount_namespace {
             unshare_flags.push("--mount");
@@ -236,6 +357,9 @@ pub async fn execute_isolated(
 
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args).current_dir(&config.working_dir).env_clear();
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     // Apply filtered environment.
     for (k, v) in env {
@@ -256,39 +380,162 @@ pub async fn execute_isolated(
         }
     }
 
-    // ── Execute with timeout ─────────────────────────────────────────
-    let result = tokio::time::timeout(config.timeout, cmd.output()).await;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(ref cg) = cg_path {
+                cleanup_cgroup(cg);
+            }
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: format!("Failed to execute: {e}"),
+                exit_code: None,
+                timed_out: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: false,
+                cgroup_active: false,
+            };
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if let Some(ref cg) = cg_path {
+                cleanup_cgroup(cg);
+            }
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: "Failed to capture stdout pipe".to_string(),
+                exit_code: None,
+                timed_out: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: ns_available,
+                cgroup_active: cg_path.is_some(),
+            };
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if let Some(ref cg) = cg_path {
+                cleanup_cgroup(cg);
+            }
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: "Failed to capture stderr pipe".to_string(),
+                exit_code: None,
+                timed_out: false,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: ns_available,
+                cgroup_active: cg_path.is_some(),
+            };
+        }
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let stdout_task = tokio::spawn(pump_stream(stdout, StreamKind::Stdout, tx.clone()));
+    let stderr_task = tokio::spawn(pump_stream(stderr, StreamKind::Stderr, tx));
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_capped = false;
+    let mut stderr_capped = false;
+    let mut exit_code = None;
+    let mut timed_out = false;
+    let deadline = tokio::time::Instant::now() + config.timeout;
+
+    loop {
+        drain_stream_chunks(
+            &mut rx,
+            &mut stdout_bytes,
+            &mut stderr_bytes,
+            &mut stdout_capped,
+            &mut stderr_capped,
+        );
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code();
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                if let Some(ref cg) = cg_path {
+                    cleanup_cgroup(cg);
+                }
+                return IsolatedOutput {
+                    stdout: String::new(),
+                    stderr: format!("Failed to execute: {e}"),
+                    exit_code: None,
+                    timed_out: false,
+                    stdout_capped: false,
+                    stderr_capped: false,
+                    namespace_active: ns_available,
+                    cgroup_active: cg_path.is_some(),
+                };
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            timed_out = true;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            break;
+        }
+
+        tokio::time::sleep(std::cmp::min(
+            PROCESS_POLL_INTERVAL,
+            deadline.saturating_duration_since(now),
+        ))
+        .await;
+    }
+
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    drain_stream_chunks(
+        &mut rx,
+        &mut stdout_bytes,
+        &mut stderr_bytes,
+        &mut stdout_capped,
+        &mut stderr_capped,
+    );
 
     // ── Cleanup cgroup ───────────────────────────────────────────────
     if let Some(ref cg) = cg_path {
         cleanup_cgroup(cg);
     }
 
-    match result {
-        Ok(Ok(output)) => IsolatedOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code(),
-            timed_out: false,
-            namespace_active: ns_available,
-            cgroup_active: cg_path.is_some(),
-        },
-        Ok(Err(e)) => IsolatedOutput {
-            stdout: String::new(),
-            stderr: format!("Failed to execute: {e}"),
-            exit_code: None,
-            timed_out: false,
-            namespace_active: false,
-            cgroup_active: false,
-        },
-        Err(_) => IsolatedOutput {
-            stdout: String::new(),
-            stderr: format!("Command timed out after {}s", config.timeout.as_secs()),
-            exit_code: None,
-            timed_out: true,
-            namespace_active: ns_available,
-            cgroup_active: cg_path.is_some(),
-        },
+    let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+    if timed_out || stdout_capped {
+        trim_incomplete_trailing_line(&mut stdout);
+    }
+    if timed_out || stderr_capped {
+        trim_incomplete_trailing_line(&mut stderr);
+    }
+
+    IsolatedOutput {
+        stdout,
+        stderr,
+        exit_code: if timed_out { None } else { exit_code },
+        timed_out,
+        stdout_capped,
+        stderr_capped,
+        namespace_active: ns_available,
+        cgroup_active: cg_path.is_some(),
     }
 }
 
@@ -322,6 +569,8 @@ mod tests {
             stderr: "warn".to_string(),
             exit_code: Some(1),
             timed_out: false,
+            stdout_capped: false,
+            stderr_capped: false,
             namespace_active: false,
             cgroup_active: false,
         };
@@ -338,6 +587,8 @@ mod tests {
             stderr: String::new(),
             exit_code: None,
             timed_out: true,
+            stdout_capped: false,
+            stderr_capped: false,
             namespace_active: true,
             cgroup_active: false,
         };
@@ -360,8 +611,10 @@ mod tests {
         config.timeout = Duration::from_millis(100);
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let out = execute_isolated("sleep 10", &env, &config).await;
+        let out = execute_isolated("echo start; sleep 10; echo done", &env, &config).await;
         assert!(out.timed_out);
+        assert!(out.stdout.contains("start"));
+        assert!(!out.stdout.contains("done"));
     }
 
     #[tokio::test]

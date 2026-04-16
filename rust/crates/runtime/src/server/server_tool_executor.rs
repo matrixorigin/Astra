@@ -27,8 +27,8 @@ use astra_tools::{ToolContext, ToolExecutor};
 use async_trait::async_trait;
 
 use crate::tool_sandbox::{
-    IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier, execute_isolated,
-    filter_environment,
+    IsolatedOutput, IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier,
+    execute_isolated, filter_environment,
 };
 use crate::turn::file_edit_journal::{EditType, FileEditJournal};
 
@@ -2942,56 +2942,96 @@ impl ServerToolExecutor {
                 config.net_namespace = !self.sandbox_policy.network_allowed;
                 let env = filter_environment(&self.sandbox_policy);
                 let out = execute_isolated(command, &env, &config).await;
-                out.combined_output()
+                format_server_bash_output(out, timeout_secs)
             }
             ToolTier::Sandboxed => {
                 let mut config = IsolationConfig::sandboxed(self.workspace_root.clone());
                 config.timeout = Duration::from_secs_f64(timeout_secs);
                 let env = filter_environment(&self.sandbox_policy);
                 let out = execute_isolated(command, &env, &config).await;
-                out.combined_output()
+                format_server_bash_output(out, timeout_secs)
             }
             ToolTier::InProcess => {
-                // Permissive mode — direct execution (backward compat).
-                let timeout = Duration::from_secs_f64(timeout_secs);
-                let output = tokio::time::timeout(timeout, async {
-                    tokio::process::Command::new("bash")
-                        .arg("-c")
-                        .arg(command)
-                        .current_dir(&self.workspace_root)
-                        .output()
-                        .await
-                })
-                .await;
-                match output {
-                    Ok(Ok(out)) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        let mut result = String::new();
-                        if !stdout.is_empty() {
-                            result.push_str(&stdout);
-                        }
-                        if !stderr.is_empty() {
-                            if !result.is_empty() {
-                                result.push('\n');
-                            }
-                            result.push_str("stderr:\n");
-                            result.push_str(&stderr);
-                        }
-                        if !out.status.success() {
-                            result.push_str(&format!(
-                                "\n(exit code: {})",
-                                out.status.code().unwrap_or(-1)
-                            ));
-                        }
-                        result
-                    }
-                    Ok(Err(e)) => format!("Error: Failed to execute command: {e}"),
-                    Err(_) => format!("Error: Command timed out after {timeout_secs}s"),
+                let result = self.default_executor.execute("bash", args).await;
+                if result.is_error && !result.output.starts_with("Error:") {
+                    format!("Error: {}", result.output)
+                } else {
+                    result.output
                 }
             }
         }
     }
+}
+
+fn format_server_bash_output(output: IsolatedOutput, timeout_secs: f64) -> String {
+    let mut body = String::new();
+    if !output.stdout.is_empty() {
+        body.push_str(&output.stdout);
+    }
+    if !output.stderr.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("stderr:\n");
+        body.push_str(&output.stderr);
+    }
+    if let Some(code) = output.exit_code {
+        if code != 0 {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&format!("(exit code: {code})"));
+        }
+    }
+    if output.stdout_capped || output.stderr_capped {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "[output capped: {} limit reached]",
+            capped_streams_label(output.stdout_capped, output.stderr_capped)
+        ));
+    }
+
+    if output.timed_out {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "[bash timed out after {}; partial output shown]",
+            format_timeout_seconds(timeout_secs)
+        ));
+        return format!("Error: {body}");
+    }
+
+    if output.exit_code.is_some_and(|code| code != 0) {
+        return format!("Error: {body}");
+    }
+    if output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty() {
+        return format!("Error: {body}");
+    }
+
+    body
+}
+
+fn capped_streams_label(stdout_capped: bool, stderr_capped: bool) -> &'static str {
+    match (stdout_capped, stderr_capped) {
+        (true, true) => "stdout, stderr",
+        (true, false) => "stdout",
+        (false, true) => "stderr",
+        (false, false) => "output",
+    }
+}
+
+fn format_timeout_seconds(timeout_secs: f64) -> String {
+    let mut text = format!("{timeout_secs:.3}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    format!("{text}s")
 }
 
 /// Generate a short UUID-like identifier for call tracking.
@@ -3275,6 +3315,30 @@ esac
     }
 
     #[tokio::test]
+    async fn read_file_outline_returns_outline() {
+        let (exec, dir) = test_executor();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub struct User;\n\npub fn parse() {}\nfn helper() {}\n",
+        )
+        .unwrap();
+        let result = exec
+            .execute("read_file", &json!({"path": "lib.rs", "outline": true}))
+            .await;
+        assert!(result.contains("# Outline"), "got: {result}");
+        assert!(result.contains("parse"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn read_file_large_full_read_requires_range_or_outline() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("big.txt"), "abcdefghij".repeat(9_000)).unwrap();
+        let result = exec.execute("read_file", &json!({"path": "big.txt"})).await;
+        assert!(result.contains("file is too large"), "got: {result}");
+        assert!(result.contains("outline=true"), "got: {result}");
+    }
+
+    #[tokio::test]
     async fn read_file_missing_file_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec
@@ -3532,8 +3596,22 @@ esac
     #[tokio::test]
     async fn bash_nonzero_exit_includes_exit_code() {
         let (exec, _dir) = test_executor();
-        let result = exec.execute("bash", &json!({"command": "exit 42"})).await;
+        let result = exec
+            .execute("bash", &json!({"command": "echo nope >&2; exit 42"}))
+            .await;
         assert!(result.contains("exit code: 42"));
+        assert!(result.contains("stderr:"));
+        assert!(result.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_sets_error_metadata() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("bash", &json!({"command": "echo nope >&2; exit 42"}))
+            .await;
+        assert!(result.is_error, "got: {}", result.output);
+        assert!(result.output.contains("exit code: 42"));
     }
 
     #[tokio::test]
@@ -3554,6 +3632,34 @@ esac
             .server_bash(&json!({"command": "cat marker.txt"}))
             .await;
         assert_eq!(result.trim(), "found");
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_returns_partial_output() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute(
+                "bash",
+                &json!({"command": "echo start; sleep 1; echo done", "timeout": 0.2}),
+            )
+            .await;
+        assert!(result.contains("start"), "got: {result}");
+        assert!(result.contains("timed out after 0.2s"), "got: {result}");
+        assert!(!result.contains("done"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_sets_error_metadata() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "bash",
+                &json!({"command": "echo start; sleep 1; echo done", "timeout": 0.2}),
+            )
+            .await;
+        assert!(result.is_error, "got: {}", result.output);
+        assert!(result.output.contains("start"), "got: {}", result.output);
+        assert!(result.output.contains("timed out after 0.2s"));
     }
 
     // ── Grep ───────────────────────────────────────────────────────────
