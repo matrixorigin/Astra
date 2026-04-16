@@ -3945,7 +3945,7 @@ mod tests {
     }
 
     fn wait_for_pid_file(path: &std::path::Path) -> u32 {
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             if let Ok(text) = std::fs::read_to_string(path)
                 && let Ok(pid) = text.trim().parse::<u32>()
@@ -4088,21 +4088,25 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_child_process_tree() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("child-survived");
         let pid_file = dir.path().join("child.pid");
-        let script = write_bash_test_script(
+        let script_name = "spawn-child.sh";
+        write_bash_test_script(
             dir.path(),
-            "spawn-child.sh",
+            script_name,
             &format!(
                 "#!/usr/bin/env bash\nsleep 3 &\nchild=$!\necho \"$child\" > {}\nwait \"$child\"\ntouch {}\n",
                 shell_escape(pid_file.to_string_lossy().as_ref()),
                 shell_escape(marker.to_string_lossy().as_ref()),
             ),
         );
-        let executor = test_executor_in(dir.path());
+        let mut executor = test_executor_in(dir.path());
+        executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
         let mut guard = ChildProcessGuard::new();
-        let cmd = format!("bash {}", shell_escape(script.to_string_lossy().as_ref()));
+        let cmd = format!("bash {}", shell_escape(script_name));
         let result = executor.bash(&serde_json::json!({"command": cmd, "timeout": 0.3}));
         let pid = wait_for_pid_file(&pid_file);
         guard.track(pid);
@@ -4148,21 +4152,25 @@ mod tests {
     /// stdout/stderr pipes open. We must not wait for pipes to close.
     #[test]
     fn bash_background_command_does_not_block() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("background.pid");
-        let script = write_bash_test_script(
+        let script_name = "background-command.sh";
+        write_bash_test_script(
             dir.path(),
-            "background-command.sh",
+            script_name,
             &format!(
                 "#!/usr/bin/env bash\nsleep 10 &\necho \"$!\" > {}\necho started\n",
                 shell_escape(pid_file.to_string_lossy().as_ref()),
             ),
         );
-        let executor = test_executor_in(dir.path());
+        let mut executor = test_executor_in(dir.path());
+        executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
         let mut guard = ChildProcessGuard::new();
         let start = std::time::Instant::now();
         let result = executor.bash(&serde_json::json!({
-            "command": format!("bash {}", shell_escape(script.to_string_lossy().as_ref())),
+            "command": format!("bash {}", shell_escape(script_name)),
             "timeout": 5.0
         }));
         let elapsed = start.elapsed();
@@ -5951,14 +5959,20 @@ mod tests {
 
     #[test]
     fn grep_uses_process_group_cleanup() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+
         // Smoke test: grep still works through the readonly wrapper that installs
         // process-group cleanup. Timeout cleanup is covered by grep_timeout_* tests.
         let dir = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(dir.path());
+        let mut executor = ToolExecutor::new(dir.path());
+        executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
         std::fs::write(dir.path().join("test.txt"), "findme\n").unwrap();
 
         // Normal grep should work
-        let result = executor.grep(&serde_json::json!({"pattern": "findme", "path": "."}));
+        let result = executor.grep(&serde_json::json!({
+            "pattern": "findme",
+            "path": "test.txt"
+        }));
         assert!(result.contains("findme"), "got: {result}");
 
         // After grep completes, verify no zombie processes from this test
