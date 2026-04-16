@@ -103,22 +103,27 @@ pub(crate) fn cached_system_prompt(
     )
 }
 
-/// Classify an LLM error message into a category for SSE error events.
-pub(crate) fn classify_llm_error(msg: &str) -> &'static str {
+/// Classify an LLM error message into an [`ErrorKind`].
+///
+/// Used only for legacy callers that still have string errors. New code should
+/// construct [`ClassifiedError`] at the source.
+pub(crate) fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     let lower = msg.to_lowercase();
     if is_context_window_error(&lower) {
-        "context_window"
+        astra_core::ErrorKind::ContextWindow
     } else if lower.contains("rate") || lower.contains("429") {
-        "rate_limit"
+        astra_core::ErrorKind::RateLimit
     } else if lower.contains("timeout") || lower.contains("timed out") {
-        "timeout"
+        astra_core::ErrorKind::StreamIdle
     } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
     {
-        "transport"
+        astra_core::ErrorKind::StreamTransport
     } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("api key") {
-        "permission"
+        astra_core::ErrorKind::Auth
+    } else if lower.contains("cancelled") || lower.contains("canceled") {
+        astra_core::ErrorKind::Cancelled
     } else {
-        "internal"
+        astra_core::ErrorKind::Unknown
     }
 }
 
@@ -132,9 +137,6 @@ pub(crate) fn is_context_window_error(lower: &str) -> bool {
         || lower.contains("context window")
         || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
 }
-
-/// Prefix for context-window errors that callers can detect.
-pub(crate) const CONTEXT_WINDOW_ERROR_PREFIX: &str = "[CONTEXT_WINDOW] ";
 
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
@@ -209,10 +211,13 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
 pub(crate) async fn sleep_ms_or_llm_cancel(
     delay_ms: u64,
     cancel: LlmCancel<'_>,
-) -> Result<(), String> {
+) -> Result<(), astra_core::ClassifiedError> {
     tokio::select! {
         biased;
-        _ = wait_llm_cancel(cancel) => Err("LLM call cancelled".to_string()),
+        _ = wait_llm_cancel(cancel) => Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Cancelled,
+            "LLM call cancelled",
+        )),
         _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => Ok(()),
     }
 }
@@ -272,7 +277,7 @@ pub(crate) async fn call_llm_and_collect(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     cancel: LlmCancel<'_>,
-) -> Result<LlmCallResult, String> {
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
 
@@ -303,22 +308,32 @@ pub(crate) async fn call_llm_and_collect(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let mut last_err = String::new();
+    let mut last_kind = astra_core::ErrorKind::Unknown;
     for attempt in 0..=LLM_MAX_RETRIES {
         if cancel.is_triggered() {
-            return Err("LLM call cancelled".to_string());
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "LLM call cancelled",
+            ));
         }
         // Total budget guard: abort if we've already spent too long across retries.
         if started.elapsed() > total_budget {
-            return Err(format!(
-                "LLM total budget exhausted ({:.0}s): {last_err}",
-                total_budget.as_secs_f64()
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::BudgetExhausted,
+                format!(
+                    "LLM total budget exhausted ({:.0}s): {last_err}",
+                    total_budget.as_secs_f64()
+                ),
             ));
         }
         if attempt > 0 {
             let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
             tokio::select! {
                 biased;
-                _ = wait_llm_cancel(cancel) => return Err("LLM call cancelled".to_string()),
+                _ = wait_llm_cancel(cancel) => return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "LLM call cancelled",
+                )),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
             }
         }
@@ -336,6 +351,7 @@ pub(crate) async fn call_llm_and_collect(
             Ok(r) => r,
             Err(e) => {
                 last_err = format!("LLM request failed: {e}");
+                last_kind = astra_core::ErrorKind::Network;
                 continue;
             }
         };
@@ -348,22 +364,32 @@ pub(crate) async fn call_llm_and_collect(
             match collect_llm_stream(byte_stream, model_name, started, cancel).await {
                 Ok(result) => return Ok(result),
                 Err(StreamCollectError::Cancelled) => {
-                    return Err("LLM call cancelled".to_string());
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Cancelled,
+                        "LLM call cancelled",
+                    ));
                 }
                 Err(StreamCollectError::Transport(e)) => {
                     last_err = format!("LLM stream transport error: {e}");
+                    last_kind = astra_core::ErrorKind::StreamTransport;
                     continue;
                 }
                 Err(StreamCollectError::IdleTimeout { elapsed_ms }) => {
                     if cancel.is_triggered() {
-                        return Err("LLM call cancelled".to_string());
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "LLM call cancelled",
+                        ));
                     }
                     // Check total budget before attempting fallback.
                     let elapsed = started.elapsed();
                     if elapsed > total_budget {
-                        return Err(format!(
-                            "LLM total budget exhausted ({:.0}s) after stream idle timeout",
-                            total_budget.as_secs_f64()
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::BudgetExhausted,
+                            format!(
+                                "LLM total budget exhausted ({:.0}s) after stream idle timeout",
+                                total_budget.as_secs_f64()
+                            ),
                         ));
                     }
                     // Abort streaming and fall back to non-stream request (single response).
@@ -404,6 +430,7 @@ pub(crate) async fn call_llm_and_collect(
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
+            last_kind = astra_core::ErrorKind::RateLimit;
             let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
             astra_core::agent_warn!(
                 "llm",
@@ -418,6 +445,7 @@ pub(crate) async fn call_llm_and_collect(
         }
 
         if is_overload_status(status) {
+            last_kind = astra_core::ErrorKind::ServerError;
             let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
             astra_core::agent_warn!(
                 "llm",
@@ -433,19 +461,41 @@ pub(crate) async fn call_llm_and_collect(
 
         // Other 5xx errors are retryable
         if status >= 500 {
+            last_kind = astra_core::ErrorKind::ServerError;
             continue;
         }
 
-        // Context-window errors get a special prefix so callers can
-        // detect them and trigger auto-compaction + retry.
+        // Context-window errors — classified at source, no string prefix needed.
         if status == 400 && is_context_window_error(&text.to_lowercase()) {
-            return Err(format!("{CONTEXT_WINDOW_ERROR_PREFIX}{last_err}"));
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContextWindow,
+                last_err,
+            ));
         }
 
-        return Err(last_err);
+        // Auth errors
+        if status == 401 || status == 403 {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Auth,
+                last_err,
+            ));
+        }
+
+        // Other 400 errors
+        if status == 400 {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                last_err,
+            ));
+        }
+
+        return Err(astra_core::ClassifiedError::new(last_kind, last_err));
     }
 
-    Err(format!("{last_err} (after {} retries)", LLM_MAX_RETRIES))
+    Err(astra_core::ClassifiedError::new(
+        last_kind,
+        format!("{last_err} (after {} retries)", LLM_MAX_RETRIES),
+    ))
 }
 
 /// Maximum accumulated response size (text + reasoning + args) before aborting stream (16 MB).
@@ -696,7 +746,7 @@ pub(crate) async fn call_llm_nonstream_fallback(
     provider: &str,
     max_output_tokens: Option<usize>,
     timeout: std::time::Duration,
-) -> Result<LlmCallResult, String> {
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let started = Instant::now();
     let mut body = json!({
         "model": model_name,
@@ -727,17 +777,38 @@ pub(crate) async fn call_llm_nonstream_fallback(
 
     // Apply per-request timeout (overrides the client-level default).
     let resp = req.timeout(timeout).json(&body).send().await.map_err(|e| {
-        format!(
-            "LLM fallback request failed (timeout {}s): {e}",
-            timeout.as_secs()
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Network,
+            format!(
+                "LLM fallback request failed (timeout {}s): {e}",
+                timeout.as_secs()
+            ),
         )
     })?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("LLM fallback error {status}: {text}"));
+        let kind = if status == 401 || status == 403 {
+            astra_core::ErrorKind::Auth
+        } else if is_rate_limit_status(status) {
+            astra_core::ErrorKind::RateLimit
+        } else if status >= 500 {
+            astra_core::ErrorKind::ServerError
+        } else if status == 400 && is_context_window_error(&text.to_lowercase()) {
+            astra_core::ErrorKind::ContextWindow
+        } else if status == 400 {
+            astra_core::ErrorKind::InvalidRequest
+        } else {
+            astra_core::ErrorKind::Unknown
+        };
+        return Err(astra_core::ClassifiedError::new(
+            kind,
+            format!("LLM fallback error {status}: {text}"),
+        ));
     }
-    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let v: Value = resp.json().await.map_err(|e| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, e.to_string())
+    })?;
     Ok(parse_nonstream_response(&v, model_name, started))
 }
 
@@ -881,7 +952,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         token.cancel();
         let r = h.await.expect("join");
-        assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+        assert_eq!(
+            r.expect_err("cancelled").kind,
+            astra_core::ErrorKind::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -895,7 +969,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         flag_signal.store(true, Ordering::SeqCst);
         let r = h.await.expect("join");
-        assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+        assert_eq!(
+            r.expect_err("cancelled").kind,
+            astra_core::ErrorKind::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -914,7 +991,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         token.cancel();
         let r = h.await.expect("join");
-        assert_eq!(r.expect_err("cancelled"), "LLM call cancelled");
+        assert_eq!(
+            r.expect_err("cancelled").kind,
+            astra_core::ErrorKind::Cancelled
+        );
         assert!(!flag_for_join.load(Ordering::SeqCst));
     }
 
@@ -1015,26 +1095,68 @@ mod tests {
         assert!(result.is_err(), "should timeout: {result:?}");
         let err = result.unwrap_err();
         assert!(
-            err.contains("timeout") || err.contains("Timeout"),
+            err.message.contains("timeout") || err.message.contains("Timeout"),
             "error should mention timeout: {err}"
         );
     }
 
     #[test]
     fn classify_llm_error_categories() {
-        assert_eq!(classify_llm_error("rate limit exceeded"), "rate_limit");
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_llm_error("rate limit exceeded"),
+            ErrorKind::RateLimit
+        );
         assert_eq!(
             classify_llm_error("error 429: too many requests"),
-            "rate_limit"
+            ErrorKind::RateLimit
         );
-        assert_eq!(classify_llm_error("request timed out"), "timeout");
-        assert_eq!(classify_llm_error("connection refused"), "transport");
-        assert_eq!(classify_llm_error("401 unauthorized"), "permission");
-        assert_eq!(classify_llm_error("something went wrong"), "internal");
+        assert_eq!(
+            classify_llm_error("request timed out"),
+            ErrorKind::StreamIdle
+        );
+        assert_eq!(
+            classify_llm_error("connection refused"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(classify_llm_error("401 unauthorized"), ErrorKind::Auth);
+        assert_eq!(
+            classify_llm_error("something went wrong"),
+            ErrorKind::Unknown
+        );
         assert_eq!(
             classify_llm_error("LLM stream transport error: connection reset"),
-            "transport"
+            ErrorKind::StreamTransport
         );
+        assert_eq!(
+            classify_llm_error("LLM call cancelled"),
+            ErrorKind::Cancelled
+        );
+    }
+
+    #[test]
+    fn is_context_window_error_detects_all_patterns() {
+        // These are the actual API response patterns from various providers
+        assert!(is_context_window_error("context_length_exceeded"));
+        assert!(is_context_window_error("maximum context length is 128000"));
+        assert!(is_context_window_error("prompt is too long"));
+        assert!(is_context_window_error("too many tokens in the input"));
+        assert!(is_context_window_error("input is too long for this model"));
+        assert!(is_context_window_error("context window exceeded"));
+        assert!(is_context_window_error("max_tokens limit exceeded"));
+        // Negative cases
+        assert!(!is_context_window_error("rate limit exceeded"));
+        assert!(!is_context_window_error("internal server error"));
+        assert!(!is_context_window_error(""));
+    }
+
+    #[test]
+    fn context_window_error_detected_in_llm_error_format() {
+        // Verify that is_context_window_error works on the format produced by
+        // call_llm_stream: "LLM error 400: {api_response_body}"
+        let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
+        let err = format!("LLM error 400: {api_body}");
+        assert!(is_context_window_error(&err.to_lowercase()));
     }
 
     #[test]
@@ -1501,7 +1623,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         token.cancel();
         let err = handle.await.expect("join").expect_err("cancelled");
-        assert_eq!(err, "LLM call cancelled");
+        assert_eq!(err.kind, astra_core::ErrorKind::Cancelled);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -1590,7 +1712,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         token.cancel();
         let err = handle.await.expect("join").expect_err("cancelled");
-        assert_eq!(err, "LLM call cancelled");
+        assert_eq!(err.kind, astra_core::ErrorKind::Cancelled);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -1724,6 +1846,72 @@ mod tests {
             .expect("collect");
         assert_eq!(res.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(res.tool_calls.len(), 1);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    /// Mock server that returns 400 with context_length_exceeded.
+    async fn mock_400_context_window() -> Response {
+        let body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 200000 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        Response::builder()
+            .status(400)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_returns_context_window_error_kind() {
+        reset_rate_limit_cooldown_for_tests();
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let app = Router::new().route("/chat/completions", post(mock_400_context_window));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("should fail with context window");
+        assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
+        assert!(err.message.contains("context_length_exceeded"));
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    /// Mock server that returns 401 Unauthorized.
+    async fn mock_401() -> Response {
+        Response::builder()
+            .status(401)
+            .body(Body::from("Unauthorized"))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_returns_auth_error_kind() {
+        reset_rate_limit_cooldown_for_tests();
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let app = Router::new().route("/chat/completions", post(mock_401));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("should fail with auth");
+        assert_eq!(err.kind, astra_core::ErrorKind::Auth);
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 }

@@ -1,7 +1,7 @@
 //! Error classification, retry policy, and alternative tool suggestion.
 //!
 //! Provides a systematic approach to non-happy-path handling:
-//! 1. **Error classification** — categorize tool errors into actionable types
+//! 1. **Error classification** — delegates to [`astra_core::classify_tool_output`]
 //! 2. **Retry policy** — transient errors get automatic retry with backoff
 //! 3. **Alternative suggestion** — when a tool fails, suggest domain alternatives
 //! 4. **Progressive escalation** — each stall nudge gets stronger consequences
@@ -10,165 +10,14 @@ use std::collections::HashMap;
 
 // ── Error Classification ─────────────────────────────────────────────────────
 
-/// Categorized error type — determines retry and escalation strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCategory {
-    /// Network timeout, rate limit, temporary service unavailability.
-    /// These should be retried with backoff.
-    Transient,
-    /// Auth failure, permission denied. Don't retry — suggest auth fix.
-    Auth,
-    /// Resource not found (file, repo, branch). Don't retry — suggest correction.
-    NotFound,
-    /// Invalid arguments (bad JSON, missing required param). Don't retry.
-    InvalidArgs,
-    /// Tool explicitly says it's not available or unsupported.
-    Unavailable,
-    /// System resource exhaustion (fork limit, OOM, disk full).
-    /// Don't retry — block the tool immediately.
-    ResourceLimit,
-    /// Local command timed out (e.g. grep on a large repo). Don't retry —
-    /// the search scope is too broad. Suggest narrowing path/pattern.
-    CommandTimeout,
-    /// Unknown error type — treat as permanent.
-    Unknown,
-}
+/// Backward-compatible alias — all new code should use [`astra_core::ErrorKind`] directly.
+pub type ErrorCategory = astra_core::ErrorKind;
 
-/// True when the error comes from the Edge workspace guard: existing paths must be
-/// read (fully, when required) before overwrite / patch. Keep in sync with
-/// `astra` `ToolExecutor` / `check_staleness` / `was_fully_read` messages.
-fn is_workspace_read_before_write_error(lower: &str) -> bool {
-    lower.contains("not been read yet")
-        || lower.contains("read it first before")
-        || lower.contains("only partially read")
-        || (lower.contains("partially read") && lower.contains("write"))
-        || lower.contains("modified since last read")
-        || lower.contains("read it again before")
-        || lower.contains("read the full file before overwriting")
-}
-
-/// Classify a tool error string into an actionable category.
-pub fn classify_error(error_str: &str) -> ErrorCategory {
-    let lower = error_str.to_lowercase();
-
-    // Resource limit: fork exhaustion, OOM, disk full — never retry
-    if lower.contains("resource temporarily unavailable")
-        || lower.contains("cannot allocate memory")
-        || lower.contains("out of memory")
-        || lower.contains("no space left on device")
-        || lower.contains("too many open files")
-        || lower.contains("fork:")
-        || lower.contains("enomem")
-        || lower.contains("enospc")
-        || lower.contains("ebusy")
-        || lower.contains("device or resource busy")
-        || lower.contains("资源暂时不足")
-        || lower.contains("系统资源")
-        || lower.contains("内存不足")
-    {
-        return ErrorCategory::ResourceLimit;
-    }
-
-    // Edge workspace policy: must read on-disk file (fully when overwriting)
-    // before write/patch. Check BEFORE Transient because the actionable error
-    // messages contain "retry" which would otherwise match the Transient rule.
-    if is_workspace_read_before_write_error(&lower) {
-        return ErrorCategory::InvalidArgs;
-    }
-
-    // Local command timeout: grep/bash timed out because scope was too broad.
-    // Check BEFORE Transient because "timed out" would match the Transient rule,
-    // but command timeouts need different guidance (narrow scope, not retry).
-    if lower.contains("command timed out")
-        || lower.contains("grep timed out")
-        || (lower.contains("timed out after") && !lower.contains("connection"))
-    {
-        return ErrorCategory::CommandTimeout;
-    }
-
-    // Transient: network, timeout, rate limit, server errors
-    if lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("rate limit")
-        || lower.contains("429")
-        || lower.contains("500")
-        || lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("504")
-        || lower.contains("internal server error")
-        || lower.contains("service unavailable")
-        || lower.contains("bad gateway")
-        || lower.contains("gateway timeout")
-        || lower.contains("connection refused")
-        || lower.contains("connection reset")
-        || lower.contains("network")
-        || lower.contains("temporary")
-        || lower.contains("retry")
-        || lower.contains("econnrefused")
-        || lower.contains("econnreset")
-        || lower.contains("etimeout")
-    {
-        return ErrorCategory::Transient;
-    }
-
-    // Auth: permission, unauthorized, forbidden
-    if lower.contains("unauthorized")
-        || lower.contains("401")
-        || lower.contains("403")
-        || lower.contains("forbidden")
-        || lower.contains("permission denied")
-        || lower.contains("access denied")
-        || lower.contains("authentication")
-        || lower.contains("auth failed")
-        || lower.contains("token expired")
-        || lower.contains("invalid token")
-        || lower.contains("could not validate")
-        || lower.contains("credentials")
-        || lower.contains("eacces")
-        || lower.contains("eperm")
-        || lower.contains("operation not permitted")
-    {
-        return ErrorCategory::Auth;
-    }
-
-    // Unavailable: not installed, not configured (check BEFORE NotFound
-    // because "command not found" would otherwise match "not found")
-    if lower.contains("not installed")
-        || lower.contains("not configured")
-        || lower.contains("unavailable")
-        || lower.contains("not supported")
-        || lower.contains("command not found")
-    {
-        return ErrorCategory::Unavailable;
-    }
-
-    // Not found: 404, no such file, repo not found
-    if lower.contains("not found")
-        || lower.contains("404")
-        || lower.contains("no such file")
-        || lower.contains("does not exist")
-        || lower.contains("couldn't find")
-        || lower.contains("unknown tool")
-        || lower.contains("is a directory")
-        || lower.contains("eisdir")
-    {
-        return ErrorCategory::NotFound;
-    }
-
-    // Invalid args: parse error, missing field, type mismatch
-    if lower.contains("invalid")
-        || lower.contains("file is too large")
-        || lower.contains("parse error")
-        || lower.contains("missing")
-        || lower.contains("expected")
-        || lower.contains("required field")
-        || lower.contains("type mismatch")
-        || lower.contains("malformed")
-    {
-        return ErrorCategory::InvalidArgs;
-    }
-
-    ErrorCategory::Unknown
+/// Classify a tool error string into an actionable [`ErrorKind`].
+///
+/// Delegates to the canonical classifier in `astra_core`.
+pub fn classify_error(error_str: &str) -> astra_core::ErrorKind {
+    astra_core::classify_tool_output(error_str)
 }
 
 // ── Retry Policy ─────────────────────────────────────────────────────────────
@@ -210,27 +59,23 @@ pub fn should_retry_with_hint(
     if attempt >= max_tool_retries() {
         return None;
     }
-    match category {
-        ErrorCategory::Transient => {
-            let base = retry_base_ms();
-            // Random jitter: [0, base/2)
-            let jitter = if base > 1 {
-                fastrand::u64(0..base / 2)
-            } else {
-                0
-            };
-            if let Some(hint) = retry_after_hint_ms {
-                // Honour server hint, clamped to [base, MAX_RETRY_AFTER_MS]
-                let clamped = hint.clamp(base, MAX_RETRY_AFTER_MS);
-                Some(clamped + jitter)
-            } else {
-                // Exponential backoff + random jitter
-                let backoff = base.saturating_mul(1 << attempt.min(10));
-                Some(backoff + jitter)
-            }
-        }
-        // All other categories: don't retry
-        _ => None,
+    if !category.is_retryable() {
+        // ToolTimeout (formerly CommandTimeout) is not retryable at the tool level
+        // — the scope needs to be narrowed, not retried.
+        return None;
+    }
+    let base = retry_base_ms();
+    let jitter = if base > 1 {
+        fastrand::u64(0..base / 2)
+    } else {
+        0
+    };
+    if let Some(hint) = retry_after_hint_ms {
+        let clamped = hint.clamp(base, MAX_RETRY_AFTER_MS);
+        Some(clamped + jitter)
+    } else {
+        let backoff = base.saturating_mul(1 << attempt.min(10));
+        Some(backoff + jitter)
     }
 }
 
@@ -304,7 +149,11 @@ pub fn build_recovery_message(
     let error_lower = error_str.to_lowercase();
 
     let mut msg = match category {
-        ErrorCategory::Transient => format!(
+        ErrorCategory::Network
+        | ErrorCategory::RateLimit
+        | ErrorCategory::ServerError
+        | ErrorCategory::StreamIdle
+        | ErrorCategory::StreamTransport => format!(
             "⚠ {} failed with a transient error (network/timeout). \
              The system retried automatically but it still failed.",
             tool_name
@@ -314,17 +163,17 @@ pub fn build_recovery_message(
              Do NOT retry — check credentials or use a different approach.",
             tool_name
         ),
-        ErrorCategory::NotFound => format!(
+        ErrorCategory::ToolNotFound => format!(
             "⚠ {} failed: resource not found. \
              Verify the path/name is correct before retrying.",
             tool_name
         ),
-        ErrorCategory::InvalidArgs => format!(
+        ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest => format!(
             "⚠ {} failed: invalid arguments. \
              Check the tool's expected parameters and fix the call.",
             tool_name
         ),
-        ErrorCategory::Unavailable => format!(
+        ErrorCategory::ToolUnavailable => format!(
             "⚠ {} is not available in this environment. \
              Do NOT retry — use an alternative tool.",
             tool_name
@@ -335,7 +184,7 @@ pub fn build_recovery_message(
              Do NOT retry — reduce system load or try a different approach.",
             tool_name
         ),
-        ErrorCategory::CommandTimeout => format!(
+        ErrorCategory::ToolTimeout => format!(
             "⚠ {} timed out — the search scope is too broad. \
              Do NOT retry with the same arguments. Instead: \
              (1) search a specific subdirectory with 'path', \
@@ -343,7 +192,7 @@ pub fn build_recovery_message(
              (3) use a more specific pattern.",
             tool_name
         ),
-        ErrorCategory::Unknown => {
+        _ => {
             astra_core::agent_debug!(
                 "error_recovery",
                 "unclassified_error tool={} error={}",
@@ -358,12 +207,12 @@ pub fn build_recovery_message(
         }
     };
 
-    if category == ErrorCategory::InvalidArgs
+    if category == ErrorCategory::ToolInvalidArgs
         && matches!(
             tool_name,
             "write_file" | "str_replace" | "multi_edit" | "apply_patch"
         )
-        && is_workspace_read_before_write_error(&error_lower)
+        && astra_core::error_kind::is_workspace_read_before_write(&error_lower)
     {
         // The check_staleness error already contains the actionable "→ Action required"
         // line with the concrete file path. Avoid duplicating the guidance — just add
@@ -502,12 +351,7 @@ impl SessionErrorSummary {
     }
 }
 
-// Allow ErrorCategory to be used as HashMap key
-impl std::hash::Hash for ErrorCategory {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        core::mem::discriminant(self).hash(state);
-    }
-}
+// `ErrorCategory` is now a type alias for `ErrorKind` which already derives `Hash`.
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -521,20 +365,20 @@ mod tests {
     fn classify_timeout() {
         assert_eq!(
             classify_error("connection timed out after 30s"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
-        assert_eq!(classify_error("ETIMEOUT"), ErrorCategory::Transient);
+        assert_eq!(classify_error("ETIMEOUT"), ErrorCategory::Network);
     }
 
     #[test]
     fn classify_rate_limit() {
         assert_eq!(
             classify_error("rate limit exceeded (429)"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
         assert_eq!(
             classify_error("HTTP 503 Service Unavailable"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
     }
 
@@ -570,14 +414,14 @@ mod tests {
 
     #[test]
     fn classify_not_found() {
-        assert_eq!(classify_error("404 Not Found"), ErrorCategory::NotFound);
+        assert_eq!(classify_error("404 Not Found"), ErrorCategory::ToolNotFound);
         assert_eq!(
             classify_error("No such file or directory"),
-            ErrorCategory::NotFound
+            ErrorCategory::ToolNotFound
         );
         assert_eq!(
             classify_error("Repository does not exist"),
-            ErrorCategory::NotFound
+            ErrorCategory::ToolNotFound
         );
     }
 
@@ -587,19 +431,19 @@ mod tests {
             classify_error(
                 "File exists but has not been read yet. Read it first before writing/editing."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
         assert_eq!(
             classify_error(
                 "File was only partially read (outline or line range). Read the full file before overwriting."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
         assert_eq!(
             classify_error(
                 "File has been modified since last read (by user or linter). Read it again before editing."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
     }
 
@@ -613,7 +457,7 @@ mod tests {
                 "File exists but has not been read yet. Read it first before writing/editing.\n\
                  → Action required: call read_file(\"src/main.rs\") first, then retry."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
         assert_eq!(
             classify_error(
@@ -621,7 +465,7 @@ mod tests {
                  Read it again before editing.\n\
                  → Action required: call read_file(\"config.toml\") first, then retry."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
         assert_eq!(
             classify_error(
@@ -629,7 +473,7 @@ mod tests {
                  (by user or linter). Read it again before editing.\n\
                  → Action required: call read_file(\"src/lib.rs\") first, then retry."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
     }
 
@@ -637,17 +481,17 @@ mod tests {
     fn classify_invalid_args() {
         assert_eq!(
             classify_error("invalid JSON in arguments"),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
         assert_eq!(
             classify_error("missing required field 'path'"),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
         assert_eq!(
             classify_error(
                 "Error: file is too large (97716 bytes, ~2442 lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only."
             ),
-            ErrorCategory::InvalidArgs
+            ErrorCategory::ToolInvalidArgs
         );
     }
 
@@ -655,11 +499,11 @@ mod tests {
     fn classify_unavailable() {
         assert_eq!(
             classify_error("mysql: command not found"),
-            ErrorCategory::Unavailable
+            ErrorCategory::ToolUnavailable
         );
         assert_eq!(
             classify_error("Tool not configured for this environment"),
-            ErrorCategory::Unavailable
+            ErrorCategory::ToolUnavailable
         );
     }
 
@@ -675,22 +519,22 @@ mod tests {
     fn classify_http_500_as_transient() {
         assert_eq!(
             classify_error("HTTP 500 Internal Server Error"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
         assert_eq!(
             classify_error("internal server error"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
     }
 
     #[test]
     fn classify_http_status_aliases_as_transient() {
-        assert_eq!(classify_error("502 Bad Gateway"), ErrorCategory::Transient);
+        assert_eq!(classify_error("502 Bad Gateway"), ErrorCategory::Network);
         assert_eq!(
             classify_error("service unavailable"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
-        assert_eq!(classify_error("gateway timeout"), ErrorCategory::Transient);
+        assert_eq!(classify_error("gateway timeout"), ErrorCategory::Network);
     }
 
     // ── Retry policy ──
@@ -698,20 +542,20 @@ mod tests {
     #[test]
     fn retry_transient_first_attempt() {
         // base=500, attempt=0: backoff=500, jitter ∈ [0, 250) → [500, 750)
-        let d = should_retry(ErrorCategory::Transient, 0).unwrap();
+        let d = should_retry(ErrorCategory::Network, 0).unwrap();
         assert!((500..750).contains(&d), "attempt 0 delay={d}");
     }
 
     #[test]
     fn retry_transient_second_attempt() {
         // base=500, attempt=1: backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
-        let d = should_retry(ErrorCategory::Transient, 1).unwrap();
+        let d = should_retry(ErrorCategory::Network, 1).unwrap();
         assert!((1000..1250).contains(&d), "attempt 1 delay={d}");
     }
 
     #[test]
     fn retry_transient_exhausted() {
-        assert_eq!(should_retry(ErrorCategory::Transient, 2), None);
+        assert_eq!(should_retry(ErrorCategory::Network, 2), None);
     }
 
     #[test]
@@ -721,12 +565,12 @@ mod tests {
 
     #[test]
     fn no_retry_not_found() {
-        assert_eq!(should_retry(ErrorCategory::NotFound, 0), None);
+        assert_eq!(should_retry(ErrorCategory::ToolNotFound, 0), None);
     }
 
     #[test]
     fn no_retry_invalid_args() {
-        assert_eq!(should_retry(ErrorCategory::InvalidArgs, 0), None);
+        assert_eq!(should_retry(ErrorCategory::ToolInvalidArgs, 0), None);
     }
 
     // ── Alternative suggestions ──
@@ -769,7 +613,7 @@ mod tests {
 
     #[test]
     fn recovery_message_includes_alternatives() {
-        let msg = build_recovery_message("git_log", "timeout", ErrorCategory::Transient, &[]);
+        let msg = build_recovery_message("git_log", "timeout", ErrorCategory::Network, &[]);
         assert!(msg.contains("git_diff"));
         assert!(msg.contains("Alternatives"));
     }
@@ -778,7 +622,7 @@ mod tests {
     fn recovery_message_write_file_read_guard_is_actionable() {
         let err = "File exists but has not been read yet. Read it first before writing/editing.";
         let cat = classify_error(err);
-        assert_eq!(cat, ErrorCategory::InvalidArgs);
+        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
         let msg = build_recovery_message("write_file", err, cat, &[]);
         assert!(msg.contains("read_file"));
         assert!(msg.contains("workspace safety"));
@@ -793,8 +637,12 @@ mod tests {
 
     #[test]
     fn recovery_message_unavailable() {
-        let msg =
-            build_recovery_message("mo_query", "not installed", ErrorCategory::Unavailable, &[]);
+        let msg = build_recovery_message(
+            "mo_query",
+            "not installed",
+            ErrorCategory::ToolUnavailable,
+            &[],
+        );
         assert!(msg.contains("not available"));
         assert!(msg.contains("alternative"));
     }
@@ -915,11 +763,11 @@ mod tests {
     #[test]
     fn error_summary_tracks_categories() {
         let mut summary = SessionErrorSummary::new();
-        summary.record_error(ErrorCategory::Transient);
-        summary.record_error(ErrorCategory::Transient);
+        summary.record_error(ErrorCategory::Network);
+        summary.record_error(ErrorCategory::Network);
         summary.record_error(ErrorCategory::Auth);
         assert_eq!(summary.total_errors, 3);
-        assert_eq!(summary.errors_by_category[&ErrorCategory::Transient], 2);
+        assert_eq!(summary.errors_by_category[&ErrorCategory::Network], 2);
         assert_eq!(summary.errors_by_category[&ErrorCategory::Auth], 1);
     }
 
@@ -986,7 +834,7 @@ mod tests {
         // even though it contains "unavailable" (which Unavailable would match)
         let cat = classify_error("fork: Resource temporarily unavailable");
         assert_eq!(cat, ErrorCategory::ResourceLimit);
-        assert_ne!(cat, ErrorCategory::Transient);
+        assert_ne!(cat, ErrorCategory::Network);
     }
 
     // ── CommandTimeout classification ──
@@ -995,7 +843,7 @@ mod tests {
     fn classify_command_timeout_grep() {
         assert_eq!(
             classify_error("Error: grep timed out after 30s with no results"),
-            ErrorCategory::CommandTimeout
+            ErrorCategory::ToolTimeout
         );
     }
 
@@ -1003,7 +851,7 @@ mod tests {
     fn classify_command_timeout_generic() {
         assert_eq!(
             classify_error("Error: command timed out after 30s"),
-            ErrorCategory::CommandTimeout
+            ErrorCategory::ToolTimeout
         );
     }
 
@@ -1012,13 +860,13 @@ mod tests {
         // "connection timed out" should still be Transient, not CommandTimeout
         assert_eq!(
             classify_error("connection timed out after 30s"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
     }
 
     #[test]
     fn no_retry_command_timeout() {
-        assert_eq!(should_retry(ErrorCategory::CommandTimeout, 0), None);
+        assert_eq!(should_retry(ErrorCategory::ToolTimeout, 0), None);
     }
 
     #[test]
@@ -1026,7 +874,7 @@ mod tests {
         let msg = build_recovery_message(
             "grep",
             "Error: grep timed out after 30s",
-            ErrorCategory::CommandTimeout,
+            ErrorCategory::ToolTimeout,
             &[],
         );
         assert!(msg.contains("timed out"), "got: {msg}");
@@ -1110,7 +958,7 @@ mod tests {
     fn classify_eisdir_as_not_found() {
         assert_eq!(
             classify_error("Error: EISDIR: illegal operation on a directory"),
-            ErrorCategory::NotFound
+            ErrorCategory::ToolNotFound
         );
     }
 
@@ -1118,7 +966,7 @@ mod tests {
     fn classify_is_a_directory_as_not_found() {
         assert_eq!(
             classify_error("Error: Is a directory"),
-            ErrorCategory::NotFound
+            ErrorCategory::ToolNotFound
         );
     }
 
@@ -1126,7 +974,7 @@ mod tests {
 
     #[test]
     fn retry_with_hint_honours_server_delay() {
-        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(5000)).unwrap();
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(5000)).unwrap();
         // hint=5000ms, clamped to [500, 30000], plus jitter [0, 250)
         assert!((5000..5250).contains(&delay), "delay={delay}");
     }
@@ -1134,27 +982,27 @@ mod tests {
     #[test]
     fn retry_with_hint_clamps_low_to_base() {
         // Server says 50ms but base is 500ms → clamped up to 500
-        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(50)).unwrap();
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(50)).unwrap();
         assert!((500..750).contains(&delay), "delay={delay}");
     }
 
     #[test]
     fn retry_with_hint_clamps_high_to_max() {
         // Server says 60s but max is 30s → clamped down to 30000
-        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(60_000)).unwrap();
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, Some(60_000)).unwrap();
         assert!((30_000..30_250).contains(&delay), "delay={delay}");
     }
 
     #[test]
     fn retry_with_hint_none_uses_exponential() {
-        let delay = should_retry_with_hint(ErrorCategory::Transient, 0, None).unwrap();
+        let delay = should_retry_with_hint(ErrorCategory::Network, 0, None).unwrap();
         // Same as should_retry: base=500 + jitter [0, 250) → [500, 750)
         assert!((500..750).contains(&delay), "delay={delay}");
     }
 
     #[test]
     fn retry_with_hint_respects_max_attempts() {
-        assert!(should_retry_with_hint(ErrorCategory::Transient, 2, Some(1000)).is_none());
+        assert!(should_retry_with_hint(ErrorCategory::Network, 2, Some(1000)).is_none());
     }
 
     #[test]
@@ -1167,7 +1015,7 @@ mod tests {
     fn retry_jitter_is_non_deterministic() {
         // Run 20 retries — if jitter is truly random, we should see at least 2 distinct values
         let delays: Vec<u64> = (0..20)
-            .map(|_| should_retry(ErrorCategory::Transient, 0).unwrap())
+            .map(|_| should_retry(ErrorCategory::Network, 0).unwrap())
             .collect();
         let unique: std::collections::HashSet<u64> = delays.iter().copied().collect();
         assert!(

@@ -330,12 +330,54 @@ pub struct CompactionResumeContext {
     pub last_was_insufficient: bool,
 }
 
+/// Map an [`ErrorKind`] to an [`InterruptionKind`] and [`ResumeAction`].
+///
+/// This is the structured replacement for [`classify_error`]. When the caller
+/// already has a [`ClassifiedError`], use this instead of re-parsing the string.
+#[must_use]
+pub fn interruption_from_error_kind(
+    kind: astra_core::ErrorKind,
+) -> Option<(InterruptionKind, ResumeAction)> {
+    use astra_core::ErrorKind;
+    match kind {
+        ErrorKind::Auth => Some((
+            InterruptionKind::AuthFailure,
+            ResumeAction::RequiresIntervention {
+                description: "API key or credentials are invalid — please refresh.".into(),
+            },
+        )),
+        ErrorKind::RateLimit => Some((
+            InterruptionKind::RateLimited,
+            ResumeAction::WaitAndRetry { delay_seconds: 30 },
+        )),
+        ErrorKind::ContextWindow => Some((
+            InterruptionKind::ContextOverflow,
+            ResumeAction::CompactAndRetry,
+        )),
+        ErrorKind::ServerError => Some((
+            InterruptionKind::ServerOverload,
+            ResumeAction::WaitAndRetry { delay_seconds: 60 },
+        )),
+        ErrorKind::BudgetExhausted => Some((
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+        )),
+        ErrorKind::Cancelled => Some((
+            InterruptionKind::UserCancelled,
+            ResumeAction::ContinueImmediately,
+        )),
+        _ => None,
+    }
+}
+
 /// Classify a streaming/API error string into an [`InterruptionKind`] and
 /// [`ResumeAction`], if the error matches a known pattern.
 ///
 /// Used as a catch-all at the end of the fatal-error path so that *every*
 /// early exit produces a structured interruption record rather than a bare
 /// string error.
+///
+/// Prefer [`interruption_from_error_kind`] when a [`ClassifiedError`] is available.
 #[must_use]
 pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
     let lower = error.to_lowercase();
@@ -771,5 +813,78 @@ mod tests {
         let with = build_resume_guidance_with_context(&irj, None).unwrap();
         let without = build_resume_guidance(&irj).unwrap();
         assert_eq!(with, without);
+    }
+
+    // ── interruption_from_error_kind tests ──
+
+    #[test]
+    fn error_kind_auth_maps_to_auth_failure() {
+        let (kind, action) = interruption_from_error_kind(astra_core::ErrorKind::Auth).unwrap();
+        assert_eq!(kind, InterruptionKind::AuthFailure);
+        assert!(matches!(action, ResumeAction::RequiresIntervention { .. }));
+    }
+
+    #[test]
+    fn error_kind_rate_limit_maps_to_rate_limited() {
+        let (kind, action) =
+            interruption_from_error_kind(astra_core::ErrorKind::RateLimit).unwrap();
+        assert_eq!(kind, InterruptionKind::RateLimited);
+        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+    }
+
+    #[test]
+    fn error_kind_context_window_maps_to_context_overflow() {
+        let (kind, action) =
+            interruption_from_error_kind(astra_core::ErrorKind::ContextWindow).unwrap();
+        assert_eq!(kind, InterruptionKind::ContextOverflow);
+        assert!(matches!(action, ResumeAction::CompactAndRetry));
+    }
+
+    #[test]
+    fn error_kind_server_error_maps_to_server_overload() {
+        let (kind, action) =
+            interruption_from_error_kind(astra_core::ErrorKind::ServerError).unwrap();
+        assert_eq!(kind, InterruptionKind::ServerOverload);
+        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+    }
+
+    #[test]
+    fn error_kind_budget_exhausted_maps_to_budget_exhausted() {
+        let (kind, _) =
+            interruption_from_error_kind(astra_core::ErrorKind::BudgetExhausted).unwrap();
+        assert_eq!(kind, InterruptionKind::BudgetExhausted);
+    }
+
+    #[test]
+    fn error_kind_cancelled_maps_to_user_cancelled() {
+        let (kind, _) = interruption_from_error_kind(astra_core::ErrorKind::Cancelled).unwrap();
+        assert_eq!(kind, InterruptionKind::UserCancelled);
+    }
+
+    #[test]
+    fn error_kind_unknown_returns_none() {
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::Unknown).is_none());
+    }
+
+    #[test]
+    fn error_kind_tool_errors_return_none() {
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolNotFound).is_none());
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolTimeout).is_none());
+    }
+
+    #[test]
+    fn error_kind_stream_errors_return_none() {
+        // Stream errors are retryable at the LLM layer, not session interruptions
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::StreamIdle).is_none());
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::StreamTransport).is_none());
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::Network).is_none());
+    }
+
+    #[test]
+    fn error_kind_non_retryable_non_interruption() {
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::InvalidRequest).is_none());
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolInvalidArgs).is_none());
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::ResourceLimit).is_none());
+        assert!(interruption_from_error_kind(astra_core::ErrorKind::ToolRoundsExhausted).is_none());
     }
 }

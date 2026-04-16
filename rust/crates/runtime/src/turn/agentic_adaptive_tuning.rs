@@ -778,7 +778,7 @@ fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
 /// Called once after the loop finishes (or errors) to feed the auto-tuning engine.
 pub(crate) fn record_loop_completion_feedback(
     state: &mut AgenticLoopState,
-    result: &Result<AgenticLoopOutcome, String>,
+    result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
 ) {
     use crate::auto_tuning::{FeedbackSignal, SignalType};
 
@@ -832,7 +832,7 @@ pub(crate) fn record_loop_completion_feedback(
         Err(reason) => {
             hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskFailure {
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                 })
                 .with_turn(&turn_id),
             ));

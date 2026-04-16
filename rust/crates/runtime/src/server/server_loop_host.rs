@@ -34,8 +34,7 @@ use crate::turn::bridge_inprocess::{
 };
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
-    LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, classify_llm_error,
-    sleep_ms_or_llm_cancel,
+    LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, sleep_ms_or_llm_cancel,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
 use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
@@ -651,7 +650,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
-    ) -> Result<HostTurnResult, String> {
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
@@ -678,7 +677,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     m.provider,
                     m.fallback_model,
                 ),
-                Err(e) => return Err(format!("Model resolution failed: {e}")),
+                Err(e) => {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Unknown,
+                        format!("Model resolution failed: {e}"),
+                    ));
+                }
             };
         let has_fallback = fallback_model_name.is_some();
 
@@ -738,10 +742,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 reason,
                 reset_in_ms,
             } => {
-                return Err(format!(
-                    "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
-                    reason.as_str(),
-                    reset_in_ms / 1000
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::RateLimit,
+                    format!(
+                        "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
+                        reason.as_str(),
+                        reset_in_ms / 1000
+                    ),
                 ));
             }
         }
@@ -827,11 +834,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 has_fallback,
                 llm_cancel,
             )
-            .await
-            .map_err(|e| {
-                let kind = classify_llm_error(&e);
-                format!("[{kind}] {e}")
-            })?;
+            .await;
+
+            // Context-window errors flow through the accum so the agentic loop's
+            // Fatal handler can trigger auto-compaction + retry.
+            let r = match r {
+                Ok(r) => r,
+                Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
+                    let accum = ChatTurnSseAccum {
+                        error_message: Some(e.message.clone()),
+                        ..Default::default()
+                    };
+                    let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
+                    return Ok(HostTurnResult {
+                        accum,
+                        ttft_ms,
+                        edge_tool_round: Vec::new(),
+                        error_kind: Some(astra_core::ErrorKind::ContextWindow),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
 
             if r.finish_reason.as_deref() == Some("length")
                 && effective_max_output < max_output_tokens * 4
@@ -875,6 +898,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             accum,
             ttft_ms,
             edge_tool_round: Vec::new(),
+            error_kind: None,
         })
     }
 
@@ -886,7 +910,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
         request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, String> {
+    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
         let effective_model_override = state
             .skills
             .model_override
@@ -909,7 +933,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     m.provider,
                     m.fallback_model,
                 ),
-                Err(e) => return Err(format!("Model resolution failed: {e}")),
+                Err(e) => return Err(format!("Model resolution failed: {e}").into()),
             };
         let has_fallback = fallback_model_name.is_some();
 
@@ -938,10 +962,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 reason,
                 reset_in_ms,
             } => {
-                return Err(format!(
-                    "Rate limit cooldown active ({}). Resets in {}s.",
-                    reason.as_str(),
-                    reset_in_ms / 1000
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::RateLimit,
+                    format!(
+                        "Rate limit cooldown active ({}). Resets in {}s.",
+                        reason.as_str(),
+                        reset_in_ms / 1000
+                    ),
                 ));
             }
         }
@@ -961,15 +988,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             has_fallback,
             llm_cancel_for_state(state),
         )
-        .await
-        .map_err(|e| {
-            let kind = classify_llm_error(&e);
-            format!("[{kind}] {e}")
-        })?;
+        .await?;
         let accum = Self::result_to_accum(&result);
 
         if accum.has_tool_calls {
-            return Err("auto-reflection unexpectedly returned tool calls".to_string());
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "auto-reflection unexpectedly returned tool calls",
+            ));
         }
 
         Ok(Some(HostReflectionResult {
@@ -1484,6 +1510,7 @@ mod tests {
                     },
                     ttft_ms: Some(50),
                     edge_tool_round: Vec::new(),
+                    error_kind: None,
                 }],
                 valid_tools: HashSet::new(),
                 emitted: Vec::new(),
@@ -1506,6 +1533,7 @@ mod tests {
                     },
                     ttft_ms: Some(30),
                     edge_tool_round: tools,
+                    error_kind: None,
                 }],
                 valid_tools: HashSet::from(["bash".to_string(), "read_file".to_string()]),
                 emitted: Vec::new(),
@@ -1518,9 +1546,12 @@ mod tests {
         async fn execute_turn(
             &mut self,
             _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, String> {
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turns.is_empty() {
-                return Err("no more turns".to_string());
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "no more turns",
+                ));
             }
             Ok(self.turns.remove(0))
         }
@@ -1747,6 +1778,7 @@ mod tests {
                     },
                     ttft_ms: Some(10),
                     edge_tool_round: Vec::new(),
+                    error_kind: None,
                 },
                 HostTurnResult {
                     accum: ChatTurnSseAccum {
@@ -1758,6 +1790,7 @@ mod tests {
                     },
                     ttft_ms: Some(10),
                     edge_tool_round: Vec::new(),
+                    error_kind: None,
                 },
             ],
             valid_tools: HashSet::new(),

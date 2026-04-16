@@ -8,11 +8,10 @@ use super::agentic_loop_host::{
 use super::agentic_loop_lifecycle::TurnIterationPrep;
 use super::agentic_loop_lifecycle::interruption_state_summary;
 use super::agentic_turn_ingest::{
-    AgenticIngestIterationControl, AgenticTurnIngestMut,
-    agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
-    map_ingest_outcome_to_iteration_control,
+    AgenticIngestIterationControl, AgenticTurnIngestMut, agentic_turn_stream_snapshot_with_kind,
+    ingest_agentic_turn_stream, map_ingest_outcome_to_iteration_control,
 };
-use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction, classify_error};
+use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 pub(crate) struct TurnExecutionPhase {
     pub(crate) llm_wall_start: Instant,
@@ -30,7 +29,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
     turn_index: usize,
     prep: TurnIterationPrep,
-) -> Result<TurnExecutionControl, String> {
+) -> Result<TurnExecutionControl, astra_core::ClassifiedError> {
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
@@ -45,7 +44,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         );
     }
 
-    let snap = agentic_turn_stream_snapshot_from_sse_accum(&turn_result.accum, turn_result.ttft_ms);
+    let snap = agentic_turn_stream_snapshot_with_kind(
+        &turn_result.accum,
+        turn_result.ttft_ms,
+        turn_result.error_kind,
+    );
     update_turn_trace_collector(state, &turn_result);
 
     let edge_len = turn_result.edge_tool_round.len();
@@ -79,21 +82,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         },
     )) {
         AgenticIngestIterationControl::Fatal(e) => {
-            let lower = e.to_lowercase();
-            let is_rate_limit = lower.contains("rate")
-                || lower.contains("429")
-                || lower.contains("too many requests")
-                || lower.contains("tpm")
-                || lower.contains("rpm");
+            use astra_core::ErrorKind;
+
+            let is_rate_limit = matches!(e.kind, ErrorKind::RateLimit);
 
             if is_rate_limit {
-                let is_overload =
-                    lower.contains("529") || lower.contains("503") || lower.contains("overload");
-                if is_overload {
-                    state.rate_limit_cooldown.record_529(None, false);
-                } else {
-                    state.rate_limit_cooldown.record_429(None, false);
-                }
+                state.rate_limit_cooldown.record_429(None, false);
+            }
+            if matches!(e.kind, ErrorKind::ServerError) {
+                state.rate_limit_cooldown.record_529(None, false);
             }
 
             if is_rate_limit && state.total_tool_calls > 0 {
@@ -111,14 +108,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                      All completed tool results are preserved above. \
                      You can continue from where I left off in the next message.]\n\n\
                      Error: {}",
-                    state.total_tool_calls, e,
+                    state.total_tool_calls, e.message,
                 );
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::RateLimited,
                     ResumeAction::WaitAndRetry { delay_seconds: 30 },
                     interruption_state_summary(
                         state,
-                        Some(format!("Rate limit during streaming: {}", e)),
+                        Some(format!("Rate limit during streaming: {}", e.message)),
                     ),
                 ));
                 observe_turn_end_without_tools(
@@ -137,15 +134,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     ResumeAction::WaitAndRetry { delay_seconds: 30 },
                     interruption_state_summary(
                         state,
-                        Some(format!("Rate limit during streaming: {}", e)),
+                        Some(format!("Rate limit during streaming: {}", e.message)),
                     ),
                 ));
             }
 
             // ── Context-window overflow: compact and retry ────────────
-            let is_context_overflow = e
-                .contains(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX)
-                || crate::turn::llm_client::is_context_window_error(&lower);
+            let is_context_overflow = e.kind == ErrorKind::ContextWindow;
             if is_context_overflow {
                 // If a prior compaction ran but we still got a 413, mark it insufficient.
                 if state.compaction_effectiveness.last_tokens_freed > 0
@@ -219,21 +214,22 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     ResumeAction::CompactAndRetry,
                     interruption_state_summary(
                         state,
-                        Some(format!("Context overflow after compaction: {}", e)),
+                        Some(format!("Context overflow after compaction: {}", e.message)),
                     ),
                 ));
             }
 
-            // Catch-all: classify any remaining unstructured error into a
-            // structured InterruptionRecord so the checkpoint always carries
-            // resume guidance. Existing specific records (rate limit, context
-            // overflow) take priority — only fill when still empty.
+            // Catch-all: map ErrorKind to InterruptionRecord so the checkpoint
+            // always carries resume guidance. Existing specific records (rate
+            // limit, context overflow) take priority — only fill when still empty.
             if state.interruption.is_none() {
-                if let Some((kind, action)) = classify_error(&e) {
+                if let Some((kind, action)) =
+                    super::interruption::interruption_from_error_kind(e.kind)
+                {
                     state.interruption = Some(InterruptionRecord::new(
                         kind,
                         action,
-                        interruption_state_summary(state, Some(e.clone())),
+                        interruption_state_summary(state, Some(e.message.clone())),
                     ));
                 }
             }

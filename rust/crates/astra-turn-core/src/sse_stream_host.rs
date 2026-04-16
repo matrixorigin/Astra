@@ -162,13 +162,9 @@ pub struct SseConsumeResult {
 }
 
 /// Why SSE consumption aborted unexpectedly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SseAbortReason {
-    IdleTimeout,
-    TransportError,
-    /// User-initiated cancellation via [`CancellationToken`].
-    Cancelled,
-}
+///
+/// Uses [`astra_core::ErrorKind`] directly — no separate enum needed.
+pub type SseAbortReason = astra_core::ErrorKind;
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
 
@@ -316,7 +312,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     tokio::select! {
                         biased;
                         _ = token.cancelled() => {
-                            abort = Some(SseAbortReason::Cancelled);
+                            abort = Some(astra_core::ErrorKind::Cancelled);
                             break 'wait None;
                         }
                         next = tokio::time::timeout(wait, chunks.next()) => next,
@@ -340,13 +336,13 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         let chunk = match chunk_result {
             Some(v) => v,
             None => {
-                abort = Some(SseAbortReason::IdleTimeout);
+                abort = Some(astra_core::ErrorKind::StreamIdle);
                 break;
             }
         };
         let Some(chunk) = chunk else { break };
         let Ok(bytes) = chunk else {
-            abort = Some(SseAbortReason::TransportError);
+            abort = Some(astra_core::ErrorKind::StreamTransport);
             break;
         };
         for event_str in framer.push_lossy_bytes(&bytes) {
@@ -379,17 +375,17 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     // Tombstone on abort (timeout or cancellation).
     if matches!(
         abort,
-        Some(SseAbortReason::IdleTimeout) | Some(SseAbortReason::Cancelled)
+        Some(astra_core::ErrorKind::StreamIdle) | Some(astra_core::ErrorKind::Cancelled)
     ) {
         accum.full_text.clear();
         accum.reasoning_content.clear();
         accum.tool_calls.clear();
         pending.clear();
         let msg = match abort {
-            Some(SseAbortReason::IdleTimeout) => {
+            Some(astra_core::ErrorKind::StreamIdle) => {
                 format!("Error: stream idle timeout after {}ms", idle.as_millis())
             }
-            Some(SseAbortReason::Cancelled) => "Cancelled by user".to_string(),
+            Some(astra_core::ErrorKind::Cancelled) => "Cancelled by user".to_string(),
             _ => "Unknown abort".to_string(),
         };
         accum.error_message = Some(msg);
@@ -1015,7 +1011,7 @@ mod tests {
         let (result, abort) =
             consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_millis(5)).await;
 
-        assert_eq!(abort, Some(SseAbortReason::IdleTimeout));
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamIdle));
         assert!(host.stream_completed);
         assert!(result.accum.full_text.is_empty());
         assert!(result.accum.reasoning_content.is_empty());
@@ -1055,7 +1051,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(abort, Some(SseAbortReason::Cancelled));
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
         assert!(host.stream_completed);
         assert!(result.accum.full_text.is_empty());
         assert!(result.accum.reasoning_content.is_empty());
@@ -1088,7 +1084,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(abort, Some(SseAbortReason::TransportError));
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
         // Unlike idle timeout, transport error does NOT tombstone — partial
         // state is preserved so the caller can decide what to do.
         // (The consumer breaks out of the loop immediately.)
@@ -1471,7 +1467,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(abort, Some(SseAbortReason::IdleTimeout));
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamIdle));
         assert!(
             result.accum.full_text.is_empty(),
             "text should be tombstoned"

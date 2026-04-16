@@ -138,7 +138,7 @@ impl AgenticLoopHost for SubRunHost {
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
-    ) -> Result<HostTurnResult, String> {
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         self.executor
             .set_send_message_context(state.messaging.mailbox.as_ref().map(|mailbox| {
                 crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
@@ -215,7 +215,18 @@ impl AgenticLoopHost for SubRunHost {
             }
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
-            return Err(format!("Sub-run API error {status}: {body}"));
+            return Err(astra_core::ClassifiedError::new(
+                if status.as_u16() == 401 || status.as_u16() == 403 {
+                    astra_core::ErrorKind::Auth
+                } else if status.as_u16() == 429 {
+                    astra_core::ErrorKind::RateLimit
+                } else if status.is_server_error() {
+                    astra_core::ErrorKind::ServerError
+                } else {
+                    astra_core::ErrorKind::Unknown
+                },
+                format!("Sub-run API error {status}: {body}"),
+            ));
         }
 
         let edge_ctx = EdgeSseContext {
@@ -254,6 +265,7 @@ impl AgenticLoopHost for SubRunHost {
             accum: turn.core,
             ttft_ms: turn.ttft_ms,
             edge_tool_round: turn.edge_tool_round,
+            error_kind: None,
         })
     }
 
@@ -562,7 +574,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
-            let failure_output = persist_failed_subrun(&mut state, &err);
+            let err_str = err.to_string();
+            let failure_output = persist_failed_subrun(&mut state, &err_str);
             return Err(failure_output);
         }
 

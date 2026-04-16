@@ -431,11 +431,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 })
             }
             Err(e) => {
-                // Emit failed event for unexpected errors
+                let msg = e.to_string();
                 if let Some(ref emitter) = progress_emitter {
-                    emitter.failed(&e);
+                    emitter.failed(&msg);
                 }
-                Err(e)
+                Err(msg)
             }
         }
     }

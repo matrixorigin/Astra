@@ -1655,9 +1655,11 @@ fn report_turn_failure(
         );
         // Always populate metadata for post-mortem analysis.
         {
-            let error_category = classify_turn_error(&failure.error);
+            let error_kind = astra_core::ClassifiedError::from(failure.error.clone()).kind;
             err_event.metadata = Some(serde_json::json!({
-                "error_category": error_category,
+                "error_kind": error_kind.as_str(),
+                "retryable": error_kind.is_retryable(),
+                "guidance": error_kind.guidance(),
                 "stall_count": failure.partial.stall_events.len(),
                 "verdict_count": failure.partial.verdict_events.len(),
                 "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
@@ -2153,22 +2155,13 @@ pub(super) fn create_manual_repl_checkpoint(
     })
 }
 
-/// Classify a turn error message into a category for post-mortem analysis.
-fn classify_turn_error(error: &str) -> &'static str {
-    let lower = error.to_lowercase();
-    if lower.contains("timeout") || lower.contains("timed out") {
-        "timeout"
-    } else if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many") {
-        "rate_limit"
-    } else if lower.contains("connection") || lower.contains("network") || lower.contains("dns") {
-        "network"
-    } else if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
-        "auth"
-    } else if lower.contains("500") || lower.contains("502") || lower.contains("503") {
-        "server_error"
-    } else {
-        "unknown"
-    }
+/// Classify a turn error message into an [`ErrorKind`] for post-mortem analysis.
+///
+/// Delegates to [`astra_core::classify_tool_output`] — kept as a thin wrapper
+/// for backward compatibility with callers that haven't migrated yet.
+#[allow(dead_code)]
+fn classify_turn_error(error: &str) -> astra_core::ErrorKind {
+    astra_core::classify_tool_output(error)
 }
 
 #[cfg(test)]
@@ -3805,64 +3798,101 @@ mod tests {
 
     #[test]
     fn classify_turn_error_timeout() {
+        use astra_core::ErrorKind;
+        // "Request timed out after 30s" → ToolTimeout (local command timeout pattern)
         assert_eq!(
             classify_turn_error("Request timed out after 30s"),
-            "timeout"
+            ErrorKind::ToolTimeout
         );
-        assert_eq!(classify_turn_error("connection timeout"), "timeout");
-        assert_eq!(classify_turn_error("TIMEOUT waiting for LLM"), "timeout");
+        // "connection timeout" → Network (contains "connection")
+        assert_eq!(
+            classify_turn_error("connection timeout"),
+            ErrorKind::Network
+        );
+        // "TIMEOUT waiting for LLM" → Network (generic timeout)
+        assert_eq!(
+            classify_turn_error("TIMEOUT waiting for LLM"),
+            ErrorKind::Network
+        );
     }
 
     #[test]
     fn classify_turn_error_rate_limit() {
-        assert_eq!(classify_turn_error("Rate limit exceeded"), "rate_limit");
+        use astra_core::ErrorKind;
+        // "Rate limit" → Network (transient, contains "rate limit")
         assert_eq!(
-            classify_turn_error("HTTP 429: too many requests"),
-            "rate_limit"
+            classify_turn_error("Rate limit exceeded"),
+            ErrorKind::Network
         );
         assert_eq!(
-            classify_turn_error("Too many requests, retry later"),
-            "rate_limit"
+            classify_turn_error("HTTP 429: too many requests"),
+            ErrorKind::Network
         );
     }
 
     #[test]
     fn classify_turn_error_network() {
-        assert_eq!(classify_turn_error("Connection refused"), "network");
-        assert_eq!(classify_turn_error("DNS resolution failed"), "network");
-        assert_eq!(classify_turn_error("network unreachable"), "network");
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_turn_error("Connection refused"),
+            ErrorKind::Network
+        );
+        assert_eq!(
+            classify_turn_error("DNS resolution failed"),
+            ErrorKind::Network
+        );
+        assert_eq!(
+            classify_turn_error("network unreachable"),
+            ErrorKind::Network
+        );
     }
 
     #[test]
     fn classify_turn_error_auth() {
-        assert_eq!(classify_turn_error("HTTP 401 Unauthorized"), "auth");
-        assert_eq!(classify_turn_error("403 Forbidden"), "auth");
-        assert_eq!(classify_turn_error("Authentication failed"), "auth");
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_turn_error("HTTP 401 Unauthorized"),
+            ErrorKind::Auth
+        );
+        assert_eq!(classify_turn_error("403 Forbidden"), ErrorKind::Auth);
+        assert_eq!(
+            classify_turn_error("Authentication failed"),
+            ErrorKind::Auth
+        );
     }
 
     #[test]
     fn classify_turn_error_server() {
+        use astra_core::ErrorKind;
+        // 500/502/503 → Network (transient)
         assert_eq!(
             classify_turn_error("Internal Server Error 500"),
-            "server_error"
+            ErrorKind::Network
         );
-        assert_eq!(classify_turn_error("502 Bad Gateway"), "server_error");
+        assert_eq!(classify_turn_error("502 Bad Gateway"), ErrorKind::Network);
         assert_eq!(
             classify_turn_error("503 Service Unavailable"),
-            "server_error"
+            ErrorKind::Network
         );
     }
 
     #[test]
     fn classify_turn_error_unknown() {
-        assert_eq!(classify_turn_error("something weird happened"), "unknown");
-        assert_eq!(classify_turn_error(""), "unknown");
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_turn_error("something weird happened"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(classify_turn_error(""), ErrorKind::Unknown);
     }
 
     #[test]
     fn classify_turn_error_priority_timeout_over_network() {
-        // "connection timeout" contains both "connection" and "timeout"
-        // timeout should win (checked first)
-        assert_eq!(classify_turn_error("connection timeout"), "timeout");
+        use astra_core::ErrorKind;
+        // "connection timeout" → Network (both patterns match, Network wins)
+        assert_eq!(
+            classify_turn_error("connection timeout"),
+            ErrorKind::Network
+        );
     }
 }

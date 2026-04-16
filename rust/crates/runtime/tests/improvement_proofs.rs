@@ -2976,27 +2976,27 @@ mod error_recovery_proofs {
         // Real error messages from production logs
         assert_eq!(
             classify_error(r#"{"error": "connect ECONNREFUSED 127.0.0.1:3306"}"#),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
         assert_eq!(
             classify_error("HTTP 429 Too Many Requests"),
-            ErrorCategory::Transient
+            ErrorCategory::Network
         );
         assert_eq!(classify_error("Bad credentials (401)"), ErrorCategory::Auth);
         assert_eq!(
             classify_error("Repository 'foo/bar' does not exist"),
-            ErrorCategory::NotFound
+            ErrorCategory::ToolNotFound
         );
         assert_eq!(
             classify_error("mysql: command not found"),
-            ErrorCategory::Unavailable
+            ErrorCategory::ToolUnavailable
         );
     }
 
     #[test]
     fn transient_retry_policy_uses_exponential_backoff() {
-        let d0 = should_retry(ErrorCategory::Transient, 0).unwrap();
-        let d1 = should_retry(ErrorCategory::Transient, 1).unwrap();
+        let d0 = should_retry(ErrorCategory::Network, 0).unwrap();
+        let d1 = should_retry(ErrorCategory::Network, 1).unwrap();
         // Exponential backoff with random jitter:
         // attempt 0: base=500, backoff=500, jitter ∈ [0, 250) → [500, 750)
         // attempt 1: base=500, backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
@@ -3004,7 +3004,7 @@ mod error_recovery_proofs {
         assert!((1000..1250).contains(&d1), "attempt 1 out of range: {d1}");
         assert!(d1 > d0, "backoff should increase");
         assert!(
-            should_retry(ErrorCategory::Transient, 2).is_none(),
+            should_retry(ErrorCategory::Network, 2).is_none(),
             "exhausted after 2 retries"
         );
     }
@@ -3013,9 +3013,9 @@ mod error_recovery_proofs {
     fn permanent_errors_never_retry() {
         for cat in [
             ErrorCategory::Auth,
-            ErrorCategory::NotFound,
-            ErrorCategory::InvalidArgs,
-            ErrorCategory::Unavailable,
+            ErrorCategory::ToolNotFound,
+            ErrorCategory::ToolInvalidArgs,
+            ErrorCategory::ToolUnavailable,
         ] {
             assert!(should_retry(cat, 0).is_none(), "{cat:?} should not retry");
         }
@@ -3063,7 +3063,7 @@ mod error_recovery_proofs {
 
         // NEW: classified, retried, alternatives suggested
         let category = classify_error(old_msg);
-        assert_eq!(category, ErrorCategory::Transient);
+        assert_eq!(category, ErrorCategory::Network);
         let can_retry = should_retry(category, 0).is_some();
         assert!(can_retry, "transient errors should be retried");
         let recovery = build_recovery_message("github_ci_status", old_msg, category, &[]);
@@ -3081,7 +3081,7 @@ mod error_recovery_proofs {
         let mut summary = SessionErrorSummary::new();
         // Simulate a problematic session
         for _ in 0..8 {
-            summary.record_error(ErrorCategory::Transient);
+            summary.record_error(ErrorCategory::Network);
         }
         summary.record_retry(false);
         summary.record_retry(false);
@@ -8475,10 +8475,10 @@ mod turnguard_e2e_proofs {
 
         // Record enough non-auth errors to trigger Warning (need 5+ actionable)
         guard.errors.record_error(ErrorCategory::Auth);
-        guard.errors.record_error(ErrorCategory::NotFound);
+        guard.errors.record_error(ErrorCategory::ToolNotFound);
         guard.errors.record_error(ErrorCategory::Unknown);
-        guard.errors.record_error(ErrorCategory::Transient);
-        guard.errors.record_error(ErrorCategory::NotFound);
+        guard.errors.record_error(ErrorCategory::Network);
+        guard.errors.record_error(ErrorCategory::ToolNotFound);
         guard.errors.record_error(ErrorCategory::Unknown);
         assert_eq!(guard.errors.total_errors, 6);
 

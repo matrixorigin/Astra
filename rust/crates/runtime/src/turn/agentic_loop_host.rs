@@ -80,6 +80,11 @@ pub struct HostTurnResult {
     pub ttft_ms: Option<u64>,
     /// Ordered edge tool executions from this turn.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
+    /// Structured error kind when the turn failed at the LLM layer.
+    /// Set by hosts that have a [`ClassifiedError`] (e.g. `ServerAgenticLoopHost`).
+    /// When present, `agentic_turn_ingest` uses this instead of re-classifying
+    /// `accum.error_message` from string content.
+    pub error_kind: Option<astra_core::ErrorKind>,
 }
 
 pub use astra_turn_core::interaction_types::{
@@ -136,7 +141,7 @@ pub trait AgenticLoopHost: Send {
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
-    ) -> Result<HostTurnResult, String>;
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError>;
 
     /// Whether the host can execute a hidden reflection-only LLM subcall.
     fn supports_auto_reflection(&self) -> bool {
@@ -150,7 +155,7 @@ pub trait AgenticLoopHost: Send {
         &mut self,
         _state: &mut AgenticLoopState,
         _request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, String> {
+    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
         Ok(None)
     }
 
@@ -692,7 +697,7 @@ pub(crate) use super::agentic_loop_tool_phase::{TurnToolPhaseControl, execute_to
 pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-) -> Result<AgenticLoopOutcome, String> {
+) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     run_loop_preamble(host, state).await;
 
     for turn_index in 0..state.max_turns {
@@ -816,9 +821,12 @@ pub(crate) mod tests {
         async fn execute_turn(
             &mut self,
             _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, String> {
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turn_results.is_empty() {
-                return Err("no more turns".to_string());
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "no more turns",
+                ));
             }
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
@@ -833,10 +841,10 @@ pub(crate) mod tests {
             &mut self,
             _state: &mut AgenticLoopState,
             request: HostReflectionRequest<'_>,
-        ) -> Result<Option<HostReflectionResult>, String> {
+        ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
             self.last_reflection_prompt = Some(request.user_prompt.to_string());
             if let Some(error) = self.reflection_error.take() {
-                return Err(error);
+                return Err(error.into());
             }
             let Some(text) = self.reflection_text.take() else {
                 return Ok(None);
@@ -898,6 +906,7 @@ pub(crate) mod tests {
             },
             ttft_ms: ttft,
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -917,6 +926,7 @@ pub(crate) mod tests {
             },
             ttft_ms: ttft,
             edge_tool_round: tools,
+            error_kind: None,
         }
     }
 
@@ -938,6 +948,7 @@ pub(crate) mod tests {
             },
             ttft_ms: ttft,
             edge_tool_round: edge_tools,
+            error_kind: None,
         }
     }
 
@@ -1169,9 +1180,12 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_err());
         let err = outcome.unwrap_err();
-        assert!(err.contains("budget"), "should mention budget: {err}");
         assert!(
-            err.contains("budget: 25"),
+            err.message.contains("budget"),
+            "should mention budget: {err}"
+        );
+        assert!(
+            err.message.contains("budget: 25"),
             "should show max_turns as budget: {err}"
         );
     }
@@ -1198,7 +1212,10 @@ pub(crate) mod tests {
         let mut state = make_state();
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_err());
-        assert_eq!(outcome.unwrap_err(), "no more turns");
+        assert!(
+            outcome.unwrap_err().message.contains("no more turns"),
+            "error should mention 'no more turns'"
+        );
     }
 
     #[tokio::test]
@@ -1348,12 +1365,13 @@ pub(crate) mod tests {
             },
             ttft_ms: None,
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }]);
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_err());
-        assert!(outcome.unwrap_err().contains("rate limit"));
+        assert!(outcome.unwrap_err().message.contains("rate limit"));
     }
 
     // ── State accumulation tests ────────────────────────────────────────────
@@ -1410,6 +1428,7 @@ pub(crate) mod tests {
             },
             ttft_ms: None,
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }]);
         let mut state = make_state();
 
@@ -1748,6 +1767,7 @@ pub(crate) mod tests {
             },
             ttft_ms: Some(30),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -2211,6 +2231,7 @@ pub(crate) mod tests {
             },
             ttft_ms: Some(30),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -2895,6 +2916,7 @@ pub(crate) mod tests {
             },
             ttft_ms: Some(30),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -3124,6 +3146,7 @@ pub(crate) mod tests {
                 },
                 ttft_ms: Some(30),
                 edge_tool_round: Vec::new(),
+                error_kind: None,
             },
             text_result("Done.", 80, 30, None),
         ];
@@ -3242,6 +3265,7 @@ pub(crate) mod tests {
                 },
                 ttft_ms: Some(30),
                 edge_tool_round: Vec::new(),
+                error_kind: None,
             },
             text_result("Done.", 80, 30, None),
         ];
@@ -3367,6 +3391,7 @@ pub(crate) mod tests {
             },
             ttft_ms: None,
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -3525,7 +3550,7 @@ pub(crate) mod tests {
         assert!(outcome.is_err(), "should reject with error: {outcome:?}");
         let err = outcome.unwrap_err();
         assert!(
-            err.contains("Rate limit cooldown active"),
+            err.message.contains("Rate limit cooldown active"),
             "error should mention cooldown: {err}"
         );
     }
@@ -3933,10 +3958,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
 
         // Record failures to bring success rate below threshold.
-        let fail_result: Result<AgenticLoopOutcome, String> =
+        let fail_result: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
             Ok(AgenticLoopOutcome::Error("test error".into()));
         record_loop_completion_feedback(&mut state, &fail_result);
-        let fail_result2: Result<AgenticLoopOutcome, String> =
+        let fail_result2: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
             Ok(AgenticLoopOutcome::Error("test error 2".into()));
         record_loop_completion_feedback(&mut state, &fail_result2);
 
@@ -3962,7 +3987,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
 
-        let result: Result<AgenticLoopOutcome, String> = Err("something broke".into());
+        let result: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
+            Err("something broke".to_string().into());
         record_loop_completion_feedback(&mut state, &result);
 
         // TaskFailure lowers success rate. With 0 successes and 1 failure, rate = 0.0.
@@ -4985,7 +5011,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         query: &str,
         tools: &[&str],
         tokens_used: u64,
-        outcome: &Result<AgenticLoopOutcome, String>,
+        outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     ) {
         // Advance turn
         {
@@ -5028,8 +5054,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
         state.max_turn_input_tokens = 100_000;
 
-        let success: Result<AgenticLoopOutcome, String> = Ok(AgenticLoopOutcome::Completed);
-        let failure: Result<AgenticLoopOutcome, String> =
+        let success: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
+            Ok(AgenticLoopOutcome::Completed);
+        let failure: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
             Ok(AgenticLoopOutcome::Error("test error".into()));
 
         // Turns 1-10: Debugging scenario, moderate token usage, mostly successful
@@ -5316,7 +5343,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
         state.max_turn_input_tokens = 100_000;
 
-        let success: Result<AgenticLoopOutcome, String> = Ok(AgenticLoopOutcome::Completed);
+        let success: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
+            Ok(AgenticLoopOutcome::Completed);
 
         for turn in 1..=50u32 {
             // Add some corrections every 10 turns
@@ -5585,8 +5613,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.max_turn_input_tokens = 100_000;
 
         // --- Phase 1: Generate mixed signals over 10 turns ---
-        let success: Result<AgenticLoopOutcome, String> = Ok(AgenticLoopOutcome::Completed);
-        let failure: Result<AgenticLoopOutcome, String> =
+        let success: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
+            Ok(AgenticLoopOutcome::Completed);
+        let failure: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
             Ok(AgenticLoopOutcome::Error("test error".into()));
 
         for i in 0..10 {
@@ -6342,7 +6371,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(
             host.emitted_lines
                 .iter()
-                .any(|line| line.contains("skipped: network unavailable"))
+                .any(|line| line.contains("skipped:") && line.contains("network unavailable"))
         );
     }
 
@@ -6795,6 +6824,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             },
             ttft_ms: Some(30),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 

@@ -364,7 +364,7 @@ pub(crate) async fn build_full_composite_snapshot(
 pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-) -> Result<AgenticLoopOutcome, String> {
+) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     let result = run_agentic_loop_impl(host, state).await;
 
     // Emit structured interruption to journal if one was recorded.

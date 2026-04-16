@@ -1056,7 +1056,9 @@ async fn call_llm_stream(
     for attempt in 0..=LLM_MAX_RETRIES {
         if attempt > 0 {
             let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
-            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
+            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -1374,7 +1376,9 @@ async fn call_llm_stream(
 
             // If cooldown says to wait, honor it
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel)).await?;
+                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             continue; // Retryable
         }
@@ -1390,7 +1394,9 @@ async fn call_llm_stream(
 
             // If cooldown says to wait, honor it
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel)).await?;
+                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             continue; // Retryable
         }
@@ -1400,16 +1406,9 @@ async fn call_llm_stream(
             continue;
         }
 
-        // 4xx (except 429) is not retryable — fail immediately
-        // Context-window errors get a special prefix so callers can detect and
-        // trigger auto-compaction + retry.
-        if status == 400 && crate::turn::llm_client::is_context_window_error(&text.to_lowercase()) {
-            return Err(format!(
-                "{}{}",
-                crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX,
-                last_err
-            ));
-        }
+        // 4xx (except 429) is not retryable — fail immediately.
+        // Context-window errors are detected by content at the call site
+        // (bridge_inprocess line ~2271), not here.
         return Err(last_err);
     }
 
@@ -2268,7 +2267,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     .await
                     {
                         Ok(s) => s,
-                        Err(e) if e.starts_with(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX) => {
+                        Err(e) if crate::turn::llm_client::is_context_window_error(&e.to_lowercase()) => {
                             // Context-window error: force aggressive compaction and retry once
                             bridge_ptl_streak = bridge_ptl_streak.saturating_add(1);
                             astra_core::agent_warn!(
@@ -2371,7 +2370,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                     dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
                                     yield render_sse_map(&build_stream_error_event(
                                         &format!("Context window exceeded even after aggressive compaction: {e2}"),
-                                        kind,
+                                        kind.as_str(),
                                         false, // not retryable
                                     ));
                                     return;
@@ -2390,7 +2389,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 eprintln!("[llm_error_dump] {path}");
                             }
                             dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
-                            yield render_sse_map(&build_stream_error_event(&e, kind, kind != "internal"));
+                            yield render_sse_map(&build_stream_error_event(&e, kind.as_str(), kind.is_retryable()));
                             return;
                         }
                     };
@@ -3194,20 +3193,9 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn classify_llm_error(msg: &str) -> &'static str {
-    let lower = msg.to_lowercase();
-    if lower.contains("rate") || lower.contains("429") {
-        "rate_limit"
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        "timeout"
-    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
-    {
-        "transport"
-    } else if lower.contains("401") || lower.contains("unauthorized") || lower.contains("api key") {
-        "permission"
-    } else {
-        "internal"
-    }
+fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
+    // Delegate to the canonical classifier in llm_client.
+    crate::turn::llm_client::classify_llm_error(msg)
 }
 
 /// Result of a memory prefetch operation.
@@ -4973,45 +4961,72 @@ mod tests {
 
     #[test]
     fn classify_llm_error_rate_limit_variants() {
-        assert_eq!(classify_llm_error("rate limit exceeded"), "rate_limit");
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_llm_error("rate limit exceeded"),
+            ErrorKind::RateLimit
+        );
         assert_eq!(
             classify_llm_error("HTTP 429 Too Many Requests"),
-            "rate_limit"
+            ErrorKind::RateLimit
         );
-        assert_eq!(classify_llm_error("Rate limiting active"), "rate_limit");
+        assert_eq!(
+            classify_llm_error("Rate limiting active"),
+            ErrorKind::RateLimit
+        );
     }
 
     #[test]
     fn classify_llm_error_timeout_variants() {
-        assert_eq!(classify_llm_error("request timeout"), "timeout");
-        assert_eq!(classify_llm_error("connection timed out"), "timeout");
+        use astra_core::ErrorKind;
+        assert_eq!(classify_llm_error("request timeout"), ErrorKind::StreamIdle);
+        assert_eq!(
+            classify_llm_error("connection timed out"),
+            ErrorKind::StreamIdle
+        );
     }
 
     #[test]
     fn classify_llm_error_transport_variants() {
-        assert_eq!(classify_llm_error("connection refused"), "transport");
-        assert_eq!(classify_llm_error("transport error"), "transport");
-        assert_eq!(classify_llm_error("network unreachable"), "transport");
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_llm_error("connection refused"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(
+            classify_llm_error("transport error"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(
+            classify_llm_error("network unreachable"),
+            ErrorKind::StreamTransport
+        );
     }
 
     #[test]
     fn classify_llm_error_permission_variants() {
-        assert_eq!(classify_llm_error("HTTP 401"), "permission");
-        assert_eq!(classify_llm_error("unauthorized access"), "permission");
-        assert_eq!(classify_llm_error("invalid api key"), "permission");
+        use astra_core::ErrorKind;
+        assert_eq!(classify_llm_error("HTTP 401"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("unauthorized access"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("invalid api key"), ErrorKind::Auth);
     }
 
     #[test]
-    fn classify_llm_error_unknown_defaults_to_internal() {
-        assert_eq!(classify_llm_error("something went wrong"), "internal");
-        assert_eq!(classify_llm_error(""), "internal");
+    fn classify_llm_error_unknown_defaults_to_unknown() {
+        use astra_core::ErrorKind;
+        assert_eq!(
+            classify_llm_error("something went wrong"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(classify_llm_error(""), ErrorKind::Unknown);
     }
 
     #[test]
     fn classify_llm_error_case_insensitive() {
-        assert_eq!(classify_llm_error("RATE LIMIT"), "rate_limit");
-        assert_eq!(classify_llm_error("Timeout"), "timeout");
-        assert_eq!(classify_llm_error("UNAUTHORIZED"), "permission");
+        use astra_core::ErrorKind;
+        assert_eq!(classify_llm_error("RATE LIMIT"), ErrorKind::RateLimit);
+        assert_eq!(classify_llm_error("Timeout"), ErrorKind::StreamIdle);
+        assert_eq!(classify_llm_error("UNAUTHORIZED"), ErrorKind::Auth);
     }
 
     #[test]

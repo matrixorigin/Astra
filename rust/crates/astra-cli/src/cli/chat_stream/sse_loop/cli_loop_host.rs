@@ -114,7 +114,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
-    ) -> Result<HostTurnResult, String> {
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let assembly_start = Instant::now();
 
         // Create a fresh trace collector for each turn (so /context breakdown reflects
@@ -263,6 +263,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             accum: turn_result.core,
             ttft_ms: turn_result.ttft_ms,
             edge_tool_round: turn_result.edge_tool_round,
+            error_kind: None,
         })
     }
 
@@ -274,7 +275,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         &mut self,
         state: &mut AgenticLoopState,
         request: HostReflectionRequest<'_>,
-    ) -> Result<Option<HostReflectionResult>, String> {
+    ) -> Result<Option<HostReflectionResult>, astra_core::ClassifiedError> {
         let effective_model = state.skills.model_override.as_deref().or(self.model);
         let reflection_messages = vec![
             json!({"role": "system", "content": request.system_prompt}),
@@ -307,7 +308,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
-            return Err(format!("auto-reflection API error {status}: {body}"));
+            return Err(format!("auto-reflection API error {status}: {body}").into());
         }
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
@@ -338,7 +339,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         .await;
 
         if turn.core.has_tool_calls {
-            return Err("auto-reflection unexpectedly returned tool calls".to_string());
+            return Err("auto-reflection unexpectedly returned tool calls"
+                .to_string()
+                .into());
         }
 
         Ok(Some(HostReflectionResult {

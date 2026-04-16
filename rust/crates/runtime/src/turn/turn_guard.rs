@@ -207,7 +207,7 @@ impl TurnGuard {
                 let category = error_recovery::classify_error(result_str);
                 match category {
                     // Permanent failures: deprioritize immediately, no retry
-                    error_recovery::ErrorCategory::Unavailable
+                    error_recovery::ErrorCategory::ToolUnavailable
                     | error_recovery::ErrorCategory::ResourceLimit => {
                         self.health.record_resource_limit_failure(tool_name);
                     }
@@ -228,7 +228,7 @@ impl TurnGuard {
     pub fn record_tool_timeout(&mut self, tool_name: &str) {
         self.health.record_timeout(tool_name);
         self.errors
-            .record_error(error_recovery::ErrorCategory::Transient);
+            .record_error(error_recovery::ErrorCategory::Network);
     }
 
     /// Record an idempotency cache hit (tool skipped, result served from cache).
@@ -246,7 +246,7 @@ impl TurnGuard {
         }
         if !aborted_tools.is_empty() {
             self.errors
-                .record_error(error_recovery::ErrorCategory::Transient);
+                .record_error(error_recovery::ErrorCategory::Network);
         }
     }
 
@@ -761,13 +761,13 @@ mod tests {
         guard.nudge_count = 5;
         guard
             .errors
-            .record_error(error_recovery::ErrorCategory::Transient);
+            .record_error(error_recovery::ErrorCategory::Network);
         guard
             .errors
-            .record_error(error_recovery::ErrorCategory::Transient);
+            .record_error(error_recovery::ErrorCategory::Network);
         guard
             .errors
-            .record_error(error_recovery::ErrorCategory::Transient);
+            .record_error(error_recovery::ErrorCategory::Network);
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
@@ -1073,7 +1073,7 @@ mod tests {
         for i in 0..10 {
             guard
                 .errors
-                .record_error(super::error_recovery::ErrorCategory::NotFound);
+                .record_error(super::error_recovery::ErrorCategory::ToolNotFound);
             guard.record_tool_result(&format!("tool_{}", i), "Error: not found");
         }
         // Feed tool_sigs via record_tool_calls with JSON tool_call format

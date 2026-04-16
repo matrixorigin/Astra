@@ -168,7 +168,8 @@ impl LoopDispatcher {
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
                 DispatchOutcome::Waiting(WaitReason::ExternalEvent { event_type: reason })
             }
-            Ok(AgenticLoopOutcome::Error(e)) | Err(e) => DispatchOutcome::Error(e),
+            Ok(AgenticLoopOutcome::Error(e)) => DispatchOutcome::Error(e),
+            Err(e) => DispatchOutcome::Error(e.to_string()),
         }
     }
 }
@@ -230,6 +231,7 @@ mod tests {
                     },
                     ttft_ms: Some(42),
                     edge_tool_round: vec![],
+                    error_kind: None,
                 }],
                 valid_tools: HashSet::new(),
             }
@@ -241,9 +243,12 @@ mod tests {
         async fn execute_turn(
             &mut self,
             _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, String> {
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turns.is_empty() {
-                return Err("no more turns".to_string());
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "no more turns",
+                ));
             }
             Ok(self.turns.remove(0))
         }

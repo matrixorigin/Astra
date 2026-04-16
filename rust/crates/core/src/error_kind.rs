@@ -1,0 +1,859 @@
+//! Unified error classification for the astra-engine runtime.
+//!
+//! Every error in the system is classified exactly once at its source into an
+//! [`ErrorKind`]. No downstream code re-parses error strings — it pattern-matches
+//! on the kind instead.
+//!
+//! The only exception is [`classify_tool_output`]: external tools (bash, MCP)
+//! return unstructured strings, so one fallback classifier remains.
+
+use serde::{Deserialize, Serialize};
+
+/// Unified error classification.
+///
+/// Covers LLM provider errors, streaming failures, budget/limit exhaustion,
+/// network issues, tool errors, and client-side cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    // ── LLM provider ─────────────────────────────────
+    /// 429, TPM/RPM exceeded.
+    RateLimit,
+    /// 5xx from provider.
+    ServerError,
+    /// 401/403, bad API key or expired token.
+    Auth,
+    /// Prompt too long for the model's context window.
+    ContextWindow,
+    /// 400 other (duplicate function name, bad schema, malformed request).
+    InvalidRequest,
+
+    // ── Streaming ────────────────────────────────────
+    /// No SSE chunk received within the idle timeout.
+    StreamIdle,
+    /// Connection reset, TLS failure, or other transport error mid-stream.
+    StreamTransport,
+
+    // ── Budget / limits ──────────────────────────────
+    /// Total LLM time budget for the turn/session exhausted.
+    BudgetExhausted,
+    /// Maximum tool rounds per turn exceeded.
+    ToolRoundsExhausted,
+
+    // ── Network ──────────────────────────────────────
+    /// DNS failure, connection refused, host unreachable.
+    Network,
+
+    // ── Tool errors ──────────────────────────────────
+    /// Tool or resource not found (unknown tool, file 404).
+    ToolNotFound,
+    /// Bad arguments, parse error, type mismatch, workspace read-before-write.
+    ToolInvalidArgs,
+    /// Local command timed out (grep on huge repo, long-running bash).
+    ToolTimeout,
+    /// Tool not installed, not configured, or explicitly unavailable.
+    ToolUnavailable,
+    /// OOM, disk full, fork exhaustion, too many open files.
+    ResourceLimit,
+
+    // ── Client-side ──────────────────────────────────
+    /// User Ctrl-C, cancel token, or API cancellation.
+    Cancelled,
+
+    // ── Catch-all ────────────────────────────────────
+    /// Unrecognized error.
+    Unknown,
+}
+
+impl ErrorKind {
+    /// Stable string tag for journal/serialization.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::ServerError => "server_error",
+            Self::Auth => "auth",
+            Self::ContextWindow => "context_window",
+            Self::InvalidRequest => "invalid_request",
+            Self::StreamIdle => "stream_idle",
+            Self::StreamTransport => "stream_transport",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ToolRoundsExhausted => "tool_rounds_exhausted",
+            Self::Network => "network",
+            Self::ToolNotFound => "tool_not_found",
+            Self::ToolInvalidArgs => "tool_invalid_args",
+            Self::ToolTimeout => "tool_timeout",
+            Self::ToolUnavailable => "tool_unavailable",
+            Self::ResourceLimit => "resource_limit",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the error is worth retrying automatically.
+    #[must_use]
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimit
+                | Self::ServerError
+                | Self::StreamIdle
+                | Self::StreamTransport
+                | Self::Network
+        )
+    }
+
+    /// Suggested delay in milliseconds before retry attempt `attempt` (0-based).
+    /// Returns `None` for non-retryable errors.
+    #[must_use]
+    pub fn retry_delay_ms(self, attempt: usize) -> Option<u64> {
+        if !self.is_retryable() {
+            return None;
+        }
+        let base = match self {
+            Self::RateLimit => 5_000,
+            Self::ServerError => 2_000,
+            Self::StreamIdle => 0,
+            Self::StreamTransport => 1_000,
+            Self::Network => 3_000,
+            _ => return None,
+        };
+        Some(base * (1u64 << attempt.min(3)))
+    }
+
+    /// Actionable guidance for humans and LLMs.
+    ///
+    /// This is the single source of truth for "what happened and what to do next".
+    /// Tool-specific guidance (alternatives, scope narrowing) is layered on top
+    /// by the caller.
+    #[must_use]
+    pub fn guidance(self) -> &'static str {
+        match self {
+            Self::RateLimit => {
+                "Rate limit hit. The system will retry automatically. \
+                 Reduce parallel tool calls if this persists."
+            }
+            Self::ServerError => {
+                "LLM provider returned a server error (5xx). \
+                 Retrying automatically with backoff."
+            }
+            Self::Auth => {
+                "Authentication failed (401/403). \
+                 Do NOT retry — credentials need to be refreshed."
+            }
+            Self::ContextWindow => {
+                "Prompt exceeds the model's context window. \
+                 Reduce input size: drop older messages, summarize, or use a model with a larger context."
+            }
+            Self::InvalidRequest => {
+                "The request was rejected by the LLM provider (400). \
+                 This may indicate a bug in request assembly. Do NOT retry with the same parameters."
+            }
+            Self::StreamIdle => {
+                "Model stopped sending tokens mid-stream (idle timeout). \
+                 Retrying the same request. If this recurs, try a different model or reduce input size."
+            }
+            Self::StreamTransport => {
+                "Connection to the LLM provider was lost mid-stream. \
+                 Retrying automatically."
+            }
+            Self::BudgetExhausted => {
+                "Turn/session time budget exhausted. \
+                 Wrap up with what you have or ask the user to extend the budget."
+            }
+            Self::ToolRoundsExhausted => {
+                "Maximum tool rounds reached for this turn. \
+                 Provide your best answer with the information gathered so far."
+            }
+            Self::Network => {
+                "Network error (DNS, connection refused, unreachable). \
+                 Retrying with backoff. Check network connectivity if this persists."
+            }
+            Self::ToolNotFound => {
+                "Tool or resource not found. \
+                 Verify the name/path is correct before retrying."
+            }
+            Self::ToolInvalidArgs => {
+                "Invalid arguments for the tool. \
+                 Check the tool's expected parameters and fix the call."
+            }
+            Self::ToolTimeout => {
+                "Tool command timed out — the scope is too broad. \
+                 Do NOT retry with the same arguments. Narrow the search: \
+                 use a specific subdirectory, file filter, or more specific pattern."
+            }
+            Self::ToolUnavailable => {
+                "Tool is not available in this environment. \
+                 Do NOT retry — use an alternative tool."
+            }
+            Self::ResourceLimit => {
+                "System resource limit reached (memory/disk/processes). \
+                 This tool is BLOCKED for the rest of this session. \
+                 Reduce system load or try a different approach."
+            }
+            Self::Cancelled => "Operation was cancelled by the user.",
+            Self::Unknown => "An unexpected error occurred. Check the error output and adjust.",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ErrorKind {
+    /// Parse from the stable string tag produced by [`as_str`].
+    #[must_use]
+    pub fn parse_tag(s: &str) -> Option<Self> {
+        match s {
+            "rate_limit" => Some(Self::RateLimit),
+            "server_error" => Some(Self::ServerError),
+            "auth" => Some(Self::Auth),
+            "context_window" => Some(Self::ContextWindow),
+            "invalid_request" => Some(Self::InvalidRequest),
+            "stream_idle" => Some(Self::StreamIdle),
+            "stream_transport" => Some(Self::StreamTransport),
+            "budget_exhausted" => Some(Self::BudgetExhausted),
+            "tool_rounds_exhausted" => Some(Self::ToolRoundsExhausted),
+            "network" => Some(Self::Network),
+            "tool_not_found" => Some(Self::ToolNotFound),
+            "tool_invalid_args" => Some(Self::ToolInvalidArgs),
+            "tool_timeout" => Some(Self::ToolTimeout),
+            "tool_unavailable" => Some(Self::ToolUnavailable),
+            "resource_limit" => Some(Self::ResourceLimit),
+            "cancelled" => Some(Self::Cancelled),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+// ── ClassifiedError ──────────────────────────────────────────────────────────
+
+/// An error with its classification attached at the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifiedError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl ClassifiedError {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Structured feedback suitable for appending to conversation history.
+    /// Combines the error message with actionable guidance.
+    #[must_use]
+    pub fn llm_feedback(&self) -> String {
+        format!(
+            "[{}] {}\n→ {}",
+            self.kind.as_str(),
+            self.message,
+            self.kind.guidance()
+        )
+    }
+}
+
+impl std::fmt::Display for ClassifiedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.kind.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedError {}
+
+impl From<String> for ClassifiedError {
+    fn from(s: String) -> Self {
+        // Try to recover ErrorKind from the [kind] prefix produced by Display.
+        if let Some(rest) = s.strip_prefix('[')
+            && let Some(bracket_end) = rest.find(']')
+        {
+            let tag = &rest[..bracket_end];
+            if let Some(kind) = ErrorKind::parse_tag(tag) {
+                let message = rest[bracket_end + 1..].trim_start().to_string();
+                return Self { kind, message };
+            }
+        }
+        let kind = crate::classify_tool_output(&s);
+        Self { kind, message: s }
+    }
+}
+
+// ── Tool output fallback classifier ──────────────────────────────────────────
+
+/// The ONLY string-matching classifier in the codebase.
+///
+/// Used exclusively for external tool output (bash, MCP tools) where we don't
+/// control the error format. All other errors are constructed with the correct
+/// [`ErrorKind`] at their source.
+#[must_use]
+pub fn classify_tool_output(error_str: &str) -> ErrorKind {
+    let lower = error_str.to_lowercase();
+
+    // Resource limit — never retry, block the tool
+    if lower.contains("resource temporarily unavailable")
+        || lower.contains("cannot allocate memory")
+        || lower.contains("out of memory")
+        || lower.contains("no space left on device")
+        || lower.contains("too many open files")
+        || lower.contains("fork:")
+        || lower.contains("enomem")
+        || lower.contains("enospc")
+        || lower.contains("ebusy")
+        || lower.contains("emfile")
+        || lower.contains("device or resource busy")
+        || lower.contains("oom")
+        || lower.contains("资源暂时不足")
+        || lower.contains("系统资源")
+        || lower.contains("内存不足")
+    {
+        return ErrorKind::ResourceLimit;
+    }
+
+    // Workspace read-before-write — classify as invalid args
+    if is_workspace_read_before_write(&lower) {
+        return ErrorKind::ToolInvalidArgs;
+    }
+
+    // Local command timeout — different from network timeout
+    if lower.contains("command timed out")
+        || lower.contains("grep timed out")
+        || lower.contains("deadline exceeded")
+        || (lower.contains("timed out after") && !lower.contains("connection"))
+    {
+        return ErrorKind::ToolTimeout;
+    }
+
+    // Transient: network, timeout, rate limit, server errors
+    if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("500")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("internal server error")
+        || lower.contains("service unavailable")
+        || lower.contains("bad gateway")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection closed")
+        || lower.contains("econnreset")
+        || lower.contains("econnrefused")
+        || lower.contains("etimedout")
+        || lower.contains("epipe")
+        || lower.contains("broken pipe")
+        || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("error sending request")
+        || lower.contains("deadline exceeded")
+    {
+        return ErrorKind::Network;
+    }
+
+    // Auth
+    if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("authentication")
+        || lower.contains("auth failed")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        || lower.contains("credentials")
+        || lower.contains("could not validate")
+        || lower.contains("eacces")
+        || lower.contains("eperm")
+        || lower.contains("operation not permitted")
+    {
+        return ErrorKind::Auth;
+    }
+
+    // Unavailable — check BEFORE "not found" because "command not found" should
+    // be ToolUnavailable, not ToolNotFound.
+    if lower.contains("not installed")
+        || lower.contains("not available")
+        || lower.contains("not configured")
+        || lower.contains("command not found")
+        || lower.contains("no such command")
+        || lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("not implemented")
+        || lower.contains("unavailable")
+    {
+        return ErrorKind::ToolUnavailable;
+    }
+
+    // Invalid args — check BEFORE "not found" because "old_str not found" is
+    // a tool misuse, not a missing file.
+    if lower.contains("invalid argument")
+        || lower.contains("invalid parameter")
+        || lower.contains("missing required")
+        || lower.contains("missing '")
+        || lower.contains("parse error")
+        || lower.contains("syntax error")
+        || lower.contains("unexpected token")
+        || lower.contains("type mismatch")
+        || lower.contains("invalid json")
+        || lower.contains("malformed")
+        || lower.contains("file is too large")
+        || lower.contains("old_str not found")
+        || lower.contains("sandbox")
+    {
+        return ErrorKind::ToolInvalidArgs;
+    }
+
+    // Not found
+    if lower.contains("not found")
+        || lower.contains("no such file")
+        || lower.contains("does not exist")
+        || lower.contains("enoent")
+        || lower.contains("404")
+        || lower.contains("couldn't find")
+        || lower.contains("unknown tool")
+        || lower.contains("is a directory")
+        || lower.contains("eisdir")
+    {
+        return ErrorKind::ToolNotFound;
+    }
+
+    ErrorKind::Unknown
+}
+
+/// True when the error comes from the Edge workspace guard: existing paths must
+/// be read before overwrite/patch.
+pub fn is_workspace_read_before_write(lower: &str) -> bool {
+    lower.contains("not been read yet")
+        || lower.contains("read it first before")
+        || lower.contains("only partially read")
+        || (lower.contains("partially read") && lower.contains("write"))
+        || lower.contains("modified since last read")
+        || lower.contains("read it again before")
+        || lower.contains("read the full file before overwriting")
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ErrorKind basics ──
+
+    #[test]
+    fn as_str_roundtrip() {
+        // Verify serde roundtrip for all variants
+        for kind in [
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::InvalidRequest,
+            ErrorKind::StreamIdle,
+            ErrorKind::StreamTransport,
+            ErrorKind::BudgetExhausted,
+            ErrorKind::ToolRoundsExhausted,
+            ErrorKind::Network,
+            ErrorKind::ToolNotFound,
+            ErrorKind::ToolInvalidArgs,
+            ErrorKind::ToolTimeout,
+            ErrorKind::ToolUnavailable,
+            ErrorKind::ResourceLimit,
+            ErrorKind::Cancelled,
+            ErrorKind::Unknown,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: ErrorKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back, "roundtrip failed for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn retryable_variants() {
+        assert!(ErrorKind::RateLimit.is_retryable());
+        assert!(ErrorKind::ServerError.is_retryable());
+        assert!(ErrorKind::StreamIdle.is_retryable());
+        assert!(ErrorKind::StreamTransport.is_retryable());
+        assert!(ErrorKind::Network.is_retryable());
+
+        assert!(!ErrorKind::Auth.is_retryable());
+        assert!(!ErrorKind::ContextWindow.is_retryable());
+        assert!(!ErrorKind::Cancelled.is_retryable());
+        assert!(!ErrorKind::ResourceLimit.is_retryable());
+        assert!(!ErrorKind::ToolTimeout.is_retryable());
+    }
+
+    #[test]
+    fn retry_delay_exponential() {
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(0), Some(5_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(1), Some(10_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(2), Some(20_000));
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(3), Some(40_000));
+        // Capped at attempt 3
+        assert_eq!(ErrorKind::RateLimit.retry_delay_ms(10), Some(40_000));
+
+        assert_eq!(ErrorKind::StreamIdle.retry_delay_ms(0), Some(0));
+        assert_eq!(ErrorKind::Auth.retry_delay_ms(0), None);
+    }
+
+    #[test]
+    fn guidance_non_empty() {
+        // ALL 17 variants must have non-empty guidance
+        let all = [
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::InvalidRequest,
+            ErrorKind::StreamIdle,
+            ErrorKind::StreamTransport,
+            ErrorKind::BudgetExhausted,
+            ErrorKind::ToolRoundsExhausted,
+            ErrorKind::Network,
+            ErrorKind::ToolNotFound,
+            ErrorKind::ToolInvalidArgs,
+            ErrorKind::ToolTimeout,
+            ErrorKind::ToolUnavailable,
+            ErrorKind::ResourceLimit,
+            ErrorKind::Cancelled,
+            ErrorKind::Unknown,
+        ];
+        for kind in all {
+            assert!(!kind.guidance().is_empty(), "empty guidance for {kind:?}");
+            assert!(!kind.as_str().is_empty(), "empty as_str for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        for kind in [ErrorKind::RateLimit, ErrorKind::Auth, ErrorKind::Unknown] {
+            assert_eq!(format!("{kind}"), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn retry_delay_all_retryable_variants() {
+        // Every retryable variant must return Some for attempt 0
+        for kind in [
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::StreamIdle,
+            ErrorKind::StreamTransport,
+            ErrorKind::Network,
+        ] {
+            assert!(
+                kind.retry_delay_ms(0).is_some(),
+                "retryable {kind:?} should have delay"
+            );
+        }
+        // Every non-retryable variant must return None
+        for kind in [
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::InvalidRequest,
+            ErrorKind::BudgetExhausted,
+            ErrorKind::ToolRoundsExhausted,
+            ErrorKind::ToolNotFound,
+            ErrorKind::ToolInvalidArgs,
+            ErrorKind::ToolTimeout,
+            ErrorKind::ToolUnavailable,
+            ErrorKind::ResourceLimit,
+            ErrorKind::Cancelled,
+            ErrorKind::Unknown,
+        ] {
+            assert_eq!(
+                kind.retry_delay_ms(0),
+                None,
+                "non-retryable {kind:?} should have no delay"
+            );
+        }
+    }
+
+    // ── ClassifiedError ──
+
+    #[test]
+    fn llm_feedback_format() {
+        let err = ClassifiedError::new(ErrorKind::StreamIdle, "no chunk in 90000ms");
+        let fb = err.llm_feedback();
+        assert!(fb.starts_with("[stream_idle]"));
+        assert!(fb.contains("no chunk in 90000ms"));
+        assert!(fb.contains("→"));
+    }
+
+    #[test]
+    fn display_format() {
+        let err = ClassifiedError::new(ErrorKind::Auth, "401 Unauthorized");
+        assert_eq!(err.to_string(), "[auth] 401 Unauthorized");
+    }
+
+    #[test]
+    fn from_string_recovers_kind_from_prefix() {
+        let original = ClassifiedError::new(ErrorKind::RateLimit, "429 too many requests");
+        let roundtrip = ClassifiedError::from(original.to_string());
+        assert_eq!(roundtrip.kind, ErrorKind::RateLimit);
+        assert_eq!(roundtrip.message, "429 too many requests");
+    }
+
+    #[test]
+    fn from_string_recovers_all_kinds() {
+        for kind in [
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::InvalidRequest,
+            ErrorKind::StreamIdle,
+            ErrorKind::BudgetExhausted,
+            ErrorKind::Cancelled,
+        ] {
+            let original = ClassifiedError::new(kind, "test");
+            let roundtrip = ClassifiedError::from(original.to_string());
+            assert_eq!(roundtrip.kind, kind, "round-trip failed for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn from_string_without_prefix_falls_back_to_classify() {
+        let err = ClassifiedError::from("connection refused".to_string());
+        assert_eq!(err.kind, ErrorKind::Network);
+        assert_eq!(err.message, "connection refused");
+    }
+
+    #[test]
+    fn error_kind_from_str_roundtrip() {
+        for kind in [
+            ErrorKind::RateLimit,
+            ErrorKind::ServerError,
+            ErrorKind::Auth,
+            ErrorKind::ContextWindow,
+            ErrorKind::Unknown,
+        ] {
+            assert_eq!(ErrorKind::parse_tag(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ErrorKind::parse_tag("nonexistent"), None);
+    }
+
+    // ── classify_tool_output ──
+
+    #[test]
+    fn classify_resource_limit() {
+        assert_eq!(
+            classify_tool_output("fork: Resource temporarily unavailable"),
+            ErrorKind::ResourceLimit
+        );
+        assert_eq!(
+            classify_tool_output("Cannot allocate memory"),
+            ErrorKind::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_command_timeout() {
+        assert_eq!(
+            classify_tool_output("command timed out after 30s"),
+            ErrorKind::ToolTimeout
+        );
+        assert_eq!(
+            classify_tool_output("grep timed out"),
+            ErrorKind::ToolTimeout
+        );
+    }
+
+    #[test]
+    fn classify_network_transient() {
+        assert_eq!(
+            classify_tool_output("connection timed out after 30s"),
+            ErrorKind::Network
+        );
+        assert_eq!(classify_tool_output("ETIMEDOUT"), ErrorKind::Network);
+        assert_eq!(
+            classify_tool_output("HTTP 503 Service Unavailable"),
+            ErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn classify_auth() {
+        assert_eq!(classify_tool_output("401 Unauthorized"), ErrorKind::Auth);
+        assert_eq!(
+            classify_tool_output("Permission denied: insufficient scope"),
+            ErrorKind::Auth
+        );
+    }
+
+    #[test]
+    fn classify_not_found() {
+        assert_eq!(
+            classify_tool_output("No such file or directory"),
+            ErrorKind::ToolNotFound
+        );
+        assert_eq!(
+            classify_tool_output("ENOENT: file does not exist"),
+            ErrorKind::ToolNotFound
+        );
+    }
+
+    #[test]
+    fn classify_invalid_args() {
+        assert_eq!(
+            classify_tool_output("invalid argument: expected integer"),
+            ErrorKind::ToolInvalidArgs
+        );
+    }
+
+    #[test]
+    fn classify_unavailable() {
+        assert_eq!(
+            classify_tool_output("command not found: rg"),
+            ErrorKind::ToolUnavailable
+        );
+    }
+
+    #[test]
+    fn classify_workspace_read_before_write() {
+        assert_eq!(
+            classify_tool_output("File has not been read yet — read it first before editing"),
+            ErrorKind::ToolInvalidArgs
+        );
+        assert_eq!(
+            classify_tool_output(
+                "File was only partially read; read the full file before overwriting"
+            ),
+            ErrorKind::ToolInvalidArgs
+        );
+    }
+
+    #[test]
+    fn classify_unknown_fallback() {
+        assert_eq!(
+            classify_tool_output("something completely unexpected happened"),
+            ErrorKind::Unknown
+        );
+    }
+
+    // ── Unhappy path / edge cases ──
+
+    #[test]
+    fn classify_empty_string() {
+        assert_eq!(classify_tool_output(""), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn classify_whitespace_only() {
+        assert_eq!(classify_tool_output("   \n\t  "), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn classify_very_long_input() {
+        let long = "x".repeat(100_000);
+        assert_eq!(classify_tool_output(&long), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn classify_chinese_resource_limit() {
+        assert_eq!(
+            classify_tool_output("系统资源不足，无法完成操作"),
+            ErrorKind::ResourceLimit
+        );
+        assert_eq!(classify_tool_output("内存不足"), ErrorKind::ResourceLimit);
+    }
+
+    #[test]
+    fn classify_priority_command_not_found_over_not_found() {
+        // "command not found" should be ToolUnavailable, not ToolNotFound
+        assert_eq!(
+            classify_tool_output("bash: rg: command not found"),
+            ErrorKind::ToolUnavailable
+        );
+    }
+
+    #[test]
+    fn classify_priority_command_timeout_over_network_timeout() {
+        // "command timed out after 30s" should be ToolTimeout, not Network
+        assert_eq!(
+            classify_tool_output("command timed out after 30s"),
+            ErrorKind::ToolTimeout
+        );
+        // But "connection timed out" should be Network
+        assert_eq!(
+            classify_tool_output("connection timed out after 30s"),
+            ErrorKind::Network
+        );
+    }
+
+    #[test]
+    fn classify_priority_workspace_guard_over_network() {
+        // Workspace guard errors contain "retry" which could match Network
+        assert_eq!(
+            classify_tool_output("File has not been read yet — read it first before editing"),
+            ErrorKind::ToolInvalidArgs
+        );
+    }
+
+    #[test]
+    fn classify_priority_resource_limit_first() {
+        // Resource limit should win over everything
+        assert_eq!(
+            classify_tool_output("fork: Resource temporarily unavailable (connection timeout)"),
+            ErrorKind::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn classify_is_a_directory() {
+        assert_eq!(
+            classify_tool_output("Is a directory"),
+            ErrorKind::ToolNotFound
+        );
+        assert_eq!(
+            classify_tool_output("EISDIR: illegal operation on a directory"),
+            ErrorKind::ToolNotFound
+        );
+    }
+
+    #[test]
+    fn classify_file_too_large() {
+        assert_eq!(
+            classify_tool_output("Error: file is too large (97716 bytes)"),
+            ErrorKind::ToolInvalidArgs
+        );
+    }
+
+    #[test]
+    fn classify_eacces_eperm() {
+        assert_eq!(
+            classify_tool_output("EACCES: permission denied"),
+            ErrorKind::Auth
+        );
+        assert_eq!(
+            classify_tool_output("EPERM: operation not permitted"),
+            ErrorKind::Auth
+        );
+    }
+
+    // ── ClassifiedError unhappy paths ──
+
+    #[test]
+    fn classified_error_is_std_error() {
+        let err = ClassifiedError::new(ErrorKind::Auth, "bad key");
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn classified_error_empty_message() {
+        let err = ClassifiedError::new(ErrorKind::Unknown, "");
+        assert_eq!(err.to_string(), "[unknown] ");
+        let fb = err.llm_feedback();
+        assert!(fb.contains("[unknown]"));
+        assert!(fb.contains("→"));
+    }
+}

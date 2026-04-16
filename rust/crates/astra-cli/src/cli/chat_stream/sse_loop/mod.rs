@@ -602,7 +602,7 @@ pub(crate) async fn stream_chat_sse(
             &state.stall.tool_call_records,
         );
         return Err(crate::TurnFailure {
-            error: e,
+            error: e.to_string(),
             partial: crate::PartialTurnData {
                 tool_call_records: std::mem::take(&mut state.stall.tool_call_records),
                 tools_used,

@@ -630,7 +630,7 @@ mod error_recovery_integration {
         // Simulate: tool fails → classify → suggest alternatives → escalate
         let error = "HTTP 503 Service Unavailable";
         let category = classify_error(error);
-        assert_eq!(category, ErrorCategory::Transient);
+        assert_eq!(category, ErrorCategory::Network);
 
         // Should retry
         let delay = should_retry(category, 0);
@@ -652,7 +652,7 @@ mod error_recovery_integration {
         let cat = classify_error("bash: mysql: command not found");
         assert_eq!(
             cat,
-            ErrorCategory::Unavailable,
+            ErrorCategory::ToolUnavailable,
             "command not found should be Unavailable, not NotFound"
         );
     }
@@ -660,9 +660,9 @@ mod error_recovery_integration {
     #[test]
     fn error_summary_accumulates_correctly() {
         let mut summary = SessionErrorSummary::new();
-        summary.record_error(ErrorCategory::Transient);
+        summary.record_error(ErrorCategory::Network);
         summary.record_error(ErrorCategory::Auth);
-        summary.record_error(ErrorCategory::Transient);
+        summary.record_error(ErrorCategory::Network);
         summary.record_retry(true);
         summary.record_retry(false);
 

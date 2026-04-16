@@ -69,9 +69,12 @@ mod tests {
         async fn execute_turn(
             &mut self,
             _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, String> {
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turn_results.is_empty() {
-                return Err("no more turns".to_string());
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "no more turns",
+                ));
             }
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
@@ -116,6 +119,7 @@ mod tests {
             },
             ttft_ms: Some(10),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -131,6 +135,7 @@ mod tests {
             },
             ttft_ms: Some(10),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         }
     }
 
@@ -450,6 +455,7 @@ mod tests {
                 },
                 ttft_ms: Some(10),
                 edge_tool_round: edge_tools,
+                error_kind: None,
             },
             text_result("Done."),
         ])
@@ -515,6 +521,7 @@ mod tests {
                 },
                 ttft_ms: Some(10),
                 edge_tool_round: edge_tools,
+                error_kind: None,
             },
             text_result("Read the file."),
         ])

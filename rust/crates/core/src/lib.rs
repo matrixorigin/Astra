@@ -12,11 +12,13 @@ pub mod composite_snapshot;
 pub mod confidence;
 pub mod config;
 pub mod drift;
+pub mod error_kind;
 pub mod log;
 pub mod runtime_limits;
 pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
+pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
 pub use runtime_limits::{
     DEV_MATRIXONE_PASSWORD, MAX_TOOL_ROUNDS_DEFAULT, RuntimeLimits, warn_default_credentials_once,
 };

@@ -32,6 +32,8 @@ pub struct AgenticTurnStreamSnapshot<'a> {
     pub cache_creation_tokens: u64,
     pub has_usage: bool,
     pub error_message: &'a Option<String>,
+    /// Pre-classified error kind from the host. When `Some`, skip string re-classification.
+    pub error_kind: Option<astra_core::ErrorKind>,
 }
 
 /// Build [`AgenticTurnStreamSnapshot`] from a [`ChatTurnSseAccum`] plus TTFT (CLI `TurnResult` derefs to accum).
@@ -39,6 +41,16 @@ pub struct AgenticTurnStreamSnapshot<'a> {
 pub fn agentic_turn_stream_snapshot_from_sse_accum<'a>(
     accum: &'a ChatTurnSseAccum,
     ttft_ms: Option<u64>,
+) -> AgenticTurnStreamSnapshot<'a> {
+    agentic_turn_stream_snapshot_with_kind(accum, ttft_ms, None)
+}
+
+/// Build snapshot with an optional pre-classified error kind.
+#[must_use]
+pub fn agentic_turn_stream_snapshot_with_kind<'a>(
+    accum: &'a ChatTurnSseAccum,
+    ttft_ms: Option<u64>,
+    error_kind: Option<astra_core::ErrorKind>,
 ) -> AgenticTurnStreamSnapshot<'a> {
     AgenticTurnStreamSnapshot {
         ttft_ms,
@@ -52,6 +64,7 @@ pub fn agentic_turn_stream_snapshot_from_sse_accum<'a>(
         cache_creation_tokens: accum.cache_creation_tokens,
         has_usage: accum.has_usage,
         error_message: &accum.error_message,
+        error_kind,
     }
 }
 
@@ -85,14 +98,14 @@ pub struct AgenticTurnIngestMut<'a> {
 pub enum AgenticTurnIngestOutcome {
     Break,
     Continue,
-    Fatal(String),
+    Fatal(astra_core::ClassifiedError),
     HasToolCalls,
 }
 
 /// Maps [`AgenticTurnIngestOutcome`] to multi-turn loop control (hosts map break/continue to their enums).
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgenticIngestIterationControl {
-    Fatal(String),
+    Fatal(astra_core::ClassifiedError),
     BreakLoop,
     ContinueIterating,
     ProceedWithToolCalls,
@@ -203,14 +216,31 @@ pub fn ingest_agentic_turn_stream(
     *st.has_any_usage = *st.has_any_usage || snap.has_usage;
 
     if let Some(err) = snap.error_message {
-        let lower = err.to_lowercase();
-        if crate::turn::llm_client::is_context_window_error(&lower) {
-            *st.consecutive_context_window_errors =
-                st.consecutive_context_window_errors.saturating_add(1);
+        // Use pre-classified error_kind when available (from HostTurnResult),
+        // falling back to string-based classification for SSE-path errors.
+        let kind = if let Some(k) = snap.error_kind {
+            if k == astra_core::ErrorKind::ContextWindow {
+                *st.consecutive_context_window_errors =
+                    st.consecutive_context_window_errors.saturating_add(1);
+            } else {
+                *st.consecutive_context_window_errors = 0;
+            }
+            k
         } else {
-            *st.consecutive_context_window_errors = 0;
-        }
-        return AgenticTurnIngestOutcome::Fatal(err.clone());
+            let lower = err.to_lowercase();
+            if crate::turn::llm_client::is_context_window_error(&lower) {
+                *st.consecutive_context_window_errors =
+                    st.consecutive_context_window_errors.saturating_add(1);
+                astra_core::ErrorKind::ContextWindow
+            } else {
+                *st.consecutive_context_window_errors = 0;
+                crate::turn::llm_client::classify_llm_error(err)
+            }
+        };
+        return AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(
+            kind,
+            err.clone(),
+        ));
     }
 
     if !round_has_edge_work {
@@ -361,9 +391,10 @@ mod tests {
 
     #[test]
     fn map_ingest_outcome_control() {
+        let err = astra_core::ClassifiedError::new(astra_core::ErrorKind::Unknown, "x");
         assert_eq!(
-            map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::Fatal("x".into())),
-            AgenticIngestIterationControl::Fatal("x".into())
+            map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::Fatal(err.clone())),
+            AgenticIngestIterationControl::Fatal(err)
         );
         assert_eq!(
             map_ingest_outcome_to_iteration_control(AgenticTurnIngestOutcome::Break),
@@ -394,6 +425,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: false,
             error_message: &err,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -405,7 +437,7 @@ mod tests {
             true,
             pack.ingest_mut(),
         );
-        assert_eq!(out, AgenticTurnIngestOutcome::Fatal("boom".to_string()));
+        assert!(matches!(out, AgenticTurnIngestOutcome::Fatal(ref e) if e.message == "boom"));
         assert_eq!(pack.consecutive_context_window_errors, 0);
     }
 
@@ -424,6 +456,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &err,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         pack.consecutive_context_window_errors = 1;
@@ -436,10 +469,10 @@ mod tests {
             true,
             pack.ingest_mut(),
         );
-        assert_eq!(
-            out,
-            AgenticTurnIngestOutcome::Fatal("prompt is too long".to_string())
-        );
+        assert!(matches!(out, AgenticTurnIngestOutcome::Fatal(ref e)
+            if e.kind == astra_core::ErrorKind::ContextWindow
+            && e.message == "prompt is too long"
+        ));
         assert_eq!(pack.consecutive_context_window_errors, 2);
     }
 
@@ -458,6 +491,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: false,
             error_message: &err,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         pack.consecutive_context_window_errors = 4;
@@ -470,9 +504,8 @@ mod tests {
             true,
             pack.ingest_mut(),
         );
-        assert_eq!(
-            out,
-            AgenticTurnIngestOutcome::Fatal("rate limited".to_string())
+        assert!(
+            matches!(out, AgenticTurnIngestOutcome::Fatal(ref e) if e.message == "rate limited")
         );
         assert_eq!(pack.consecutive_context_window_errors, 0);
     }
@@ -491,6 +524,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -525,6 +559,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: false,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -556,6 +591,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: false,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -593,6 +629,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: false,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -623,6 +660,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         pack.final_text = "previous stable answer".to_string();
@@ -659,6 +697,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -699,6 +738,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         pack.forced_factual_retry = true; // already retried once
@@ -730,6 +770,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         pack.total_tool_calls = 3;
@@ -762,6 +803,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         pack.total_tool_calls = 1; // ask_user was called previously
@@ -793,6 +835,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -824,6 +867,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -872,6 +916,7 @@ mod tests {
             cache_creation_tokens: 20,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         let out = ingest_agentic_turn_stream(
@@ -928,6 +973,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         ingest_agentic_turn_stream(
@@ -959,6 +1005,7 @@ mod tests {
             cache_creation_tokens: 50,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         assert!(!pack.has_any_usage);
@@ -991,6 +1038,7 @@ mod tests {
             cache_creation_tokens: 0,
             has_usage: true,
             error_message: &None,
+            error_kind: None,
         };
         let mut pack = Pack::new();
         ingest_agentic_turn_stream(

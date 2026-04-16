@@ -685,7 +685,7 @@ impl AgenticRunLifecycleService {
     }
 
     fn finalize_run_events(
-        loop_outcome: Result<AgenticLoopOutcome, String>,
+        loop_outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
         mut events: Vec<Value>,
         loop_state: &AgenticLoopState,
     ) -> (Vec<Value>, RunStatus, Option<String>) {
@@ -755,15 +755,16 @@ impl AgenticRunLifecycleService {
                     (RunStatus::Failed, Some(msg))
                 }
                 Err(err) => {
+                    let msg = err.to_string();
                     events.push(json!({
                         "event_type": "run_error",
-                        "data": {"error": err.clone()}
+                        "data": {"error": &msg, "error_kind": err.kind.as_str()}
                     }));
                     events.push(json!({
                         "event_type": "run_finished",
                         "data": usage,
                     }));
-                    (RunStatus::Failed, Some(err))
+                    (RunStatus::Failed, Some(msg))
                 }
             }
         };
@@ -2178,18 +2179,26 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     tool_calls: loop_state.total_tool_calls,
                 })
             }
-            Ok(AgenticLoopOutcome::Error(err)) | Err(err) => {
-                Ok(astra_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: STATUS_FAILED.to_string(),
-                    output: None,
-                    error: Some(err),
-                    prompt_tokens: loop_state.total_prompt,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
+            Ok(AgenticLoopOutcome::Error(err)) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: STATUS_FAILED.to_string(),
+                output: None,
+                error: Some(err),
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+            Err(err) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: STATUS_FAILED.to_string(),
+                output: None,
+                error: Some(err.to_string()),
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
         }
     }
 }

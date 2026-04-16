@@ -51,7 +51,7 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
             });
         }
 
-        if matches!(category, ErrorCategory::Transient) {
+        if category.is_retryable() {
             turn_guard.errors.record_retry(false);
         }
 

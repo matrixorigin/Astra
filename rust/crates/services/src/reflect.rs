@@ -571,72 +571,13 @@ pub fn classify_error(content: &str, event_type: &str) -> ErrorClass {
 }
 
 /// Classify an error string into a root-cause category (content only).
+///
+/// Delegates to [`astra_core::classify_tool_output`] for the core classification,
+/// then maps to the report-level [`ErrorClass`].
 pub fn classify_error_content(content: &str) -> ErrorClass {
     let lower = content.to_lowercase();
 
-    // Resource limits
-    if lower.contains("resource temporarily unavailable")
-        || lower.contains("cannot allocate memory")
-        || lower.contains("too many open files")
-        || lower.contains("no space left on device")
-        || lower.contains("fork:")
-        || lower.contains("oom")
-        || lower.contains("enomem")
-        || lower.contains("emfile")
-    {
-        return ErrorClass::ResourceLimit;
-    }
-
-    // Auth
-    if lower.contains("unauthorized")
-        || lower.contains("403")
-        || lower.contains("permission denied")
-        || lower.contains("credentials")
-        || lower.contains("authentication")
-        || lower.contains("could not validate")
-        || lower.contains("token expired")
-    {
-        return ErrorClass::Auth;
-    }
-
-    // Network
-    if lower.contains("connection refused")
-        || lower.contains("connection reset")
-        || lower.contains("timed out")
-        || lower.contains("dns")
-        || lower.contains("network unreachable")
-        || lower.contains("error sending request")
-        || lower.contains("connection closed")
-    {
-        return ErrorClass::Network;
-    }
-
-    // Timeout (distinct from network)
-    if lower.contains("timeout") || lower.contains("deadline exceeded") {
-        return ErrorClass::Timeout;
-    }
-
-    // Tool misuse (check BEFORE file_not_found since "not found" is ambiguous)
-    if lower.contains("missing 'path'")
-        || lower.contains("missing 'pattern'")
-        || lower.contains("missing 'command'")
-        || lower.contains("invalid argument")
-        || lower.contains("old_str not found")
-        || lower.contains("sandbox")
-    {
-        return ErrorClass::ToolMisuse;
-    }
-
-    // File not found
-    if lower.contains("no such file or directory")
-        || lower.contains("does not exist")
-        || lower.contains("not found")
-        || lower.contains("enoent")
-    {
-        return ErrorClass::FileNotFound;
-    }
-
-    // Database
+    // Database errors — domain-specific, not in ErrorKind
     if lower.contains("sql syntax error")
         || lower.contains("error returned from database")
         || lower.contains("sqlx")
@@ -645,7 +586,22 @@ pub fn classify_error_content(content: &str) -> ErrorClass {
         return ErrorClass::DatabaseError;
     }
 
-    ErrorClass::Unknown
+    // Delegate to the canonical classifier
+    match astra_core::classify_tool_output(content) {
+        astra_core::ErrorKind::ResourceLimit => ErrorClass::ResourceLimit,
+        astra_core::ErrorKind::Auth => ErrorClass::Auth,
+        astra_core::ErrorKind::Network
+        | astra_core::ErrorKind::RateLimit
+        | astra_core::ErrorKind::ServerError
+        | astra_core::ErrorKind::StreamIdle
+        | astra_core::ErrorKind::StreamTransport => ErrorClass::Network,
+        astra_core::ErrorKind::ToolTimeout => ErrorClass::Timeout,
+        astra_core::ErrorKind::ToolNotFound => ErrorClass::FileNotFound,
+        astra_core::ErrorKind::ToolInvalidArgs | astra_core::ErrorKind::InvalidRequest => {
+            ErrorClass::ToolMisuse
+        }
+        _ => ErrorClass::Unknown,
+    }
 }
 
 /// Build diagnoses from raw error records by classifying and grouping.
