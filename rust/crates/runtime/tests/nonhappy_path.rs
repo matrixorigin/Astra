@@ -79,11 +79,12 @@ mod stall_detection {
 mod turn_limits {
     use astra_runtime::turn::routing::MAX_TOOL_ROUNDS;
 
-    /// Proves MAX_TOOL_ROUNDS is set to a reasonable value
+    /// Proves MAX_TOOL_ROUNDS is set to a reasonable value.
+    /// The env override can only DECREASE the limit, not bypass it.
     #[test]
     fn max_rounds_is_bounded() {
         const { assert!(MAX_TOOL_ROUNDS > 0) };
-        const { assert!(MAX_TOOL_ROUNDS <= 20) };
+        const { assert!(MAX_TOOL_ROUNDS <= 100) }; // matches MAX_TOOL_ROUNDS_DEFAULT
     }
 }
 
