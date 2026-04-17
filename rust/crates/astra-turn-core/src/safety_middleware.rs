@@ -421,12 +421,11 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 5. Inline interpreter execution — runs arbitrary code behind a single shell token
-    if let Some(interpreter) = check_inline_interpreter_exec(command) {
-        return Some(format!(
-            "shell command uses inline interpreter execution via `{interpreter}`, which can run arbitrary code outside file-path validation"
-        ));
-    }
+    // 5. Inline interpreter execution check removed.
+    // Rationale: Cloud approval provides user oversight for bash commands.
+    // Users can review inline code (python3 -c, node -e) during approval.
+    // This matches Copilot CLI behavior which trusts user interaction.
+    // Heredoc/stdin checks (below) are retained as content is harder to review.
 
     // 6. Interpreter stdin/heredoc execution — feeds code through stdin instead of a file
     if let Some(interpreter) = check_interpreter_stdin_exec(command) {
@@ -629,69 +628,6 @@ fn is_safe_command_substitution(content: &str) -> bool {
     }
 
     true
-}
-
-fn check_inline_interpreter_exec(command: &str) -> Option<String> {
-    for segment in shell_command_segments(command) {
-        if let Some(detail) = check_inline_interpreter_exec_segment(segment) {
-            return Some(detail);
-        }
-    }
-    None
-}
-
-fn check_inline_interpreter_exec_segment(segment: &str) -> Option<String> {
-    let tokens = shell_tokenize_like_bash(segment);
-    if tokens.is_empty() {
-        return None;
-    }
-
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        if token.is_empty() {
-            idx += 1;
-            continue;
-        }
-        if looks_like_shell_assignment(token) {
-            idx += 1;
-            continue;
-        }
-
-        let base = token.rsplit('/').next().unwrap_or(token);
-
-        if is_shell_interpreter_command(base) {
-            for flag_idx in idx + 1..tokens.len() {
-                let arg = tokens[flag_idx].as_str();
-                if is_nested_shell_c_flag(arg) {
-                    if let Some(inner) = tokens.get(flag_idx + 1)
-                        && let Some(detail) = check_inline_interpreter_exec(inner)
-                    {
-                        return Some(detail);
-                    }
-                    break;
-                }
-                if !arg.starts_with('-') {
-                    break;
-                }
-            }
-            return None;
-        }
-
-        if base == "env" {
-            idx = skip_env_wrapper_tokens(&tokens, idx + 1);
-            continue;
-        }
-
-        if is_shell_wrapper_command(base) {
-            idx += 1;
-            continue;
-        }
-
-        return inline_exec_interpreter_detail(base, tokens.get(idx + 1).map(String::as_str));
-    }
-
-    None
 }
 
 fn check_interpreter_stdin_exec(command: &str) -> Option<String> {
@@ -922,22 +858,6 @@ fn shell_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
         "--command" => Some(ShellFlagValueKind::NestedCommand),
         "-C" | "--init-command" => Some(ShellFlagValueKind::InitCommand),
         "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O" => Some(ShellFlagValueKind::Other),
-        _ => None,
-    }
-}
-
-fn inline_exec_interpreter_detail(base: &str, flag: Option<&str>) -> Option<String> {
-    let flag = flag?;
-    if is_python_interpreter(base) && flag == "-c" {
-        return Some(format!("{base} -c"));
-    }
-
-    match base {
-        "node" | "nodejs" if matches!(flag, "-e" | "--eval") || flag.starts_with("--eval=") => {
-            Some(format!("{base} --eval"))
-        }
-        "perl" | "ruby" | "lua" if flag == "-e" => Some(format!("{base} -e")),
-        "php" if flag == "-r" => Some(format!("{base} -r")),
         _ => None,
     }
 }
@@ -1697,68 +1617,53 @@ mod tests {
     }
 
     #[test]
-    fn middleware_blocks_python_inline_exec() {
+    fn middleware_allows_python_inline_exec() {
+        // Inline interpreter execution is now allowed (user reviews during approval)
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"python3 -c "open('/etc/passwd').read()""#}),
         );
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
-        ));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
-    fn middleware_blocks_node_inline_exec() {
+    fn middleware_allows_node_inline_exec() {
+        // Inline interpreter execution is now allowed (user reviews during approval)
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"node --eval "require('fs').readFileSync('/etc/passwd', 'utf8')""#}),
         );
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
-        ));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
-    fn middleware_blocks_env_wrapped_python_inline_exec() {
+    fn middleware_allows_env_wrapped_python_inline_exec() {
+        // Inline interpreter execution is now allowed (user reviews during approval)
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"env PYTHONWARNINGS=ignore python3 -c "print('hi')""#}),
         );
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
-        ));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
-    fn middleware_blocks_nested_shell_python_inline_exec() {
+    fn middleware_allows_nested_shell_python_inline_exec() {
+        // Inline interpreter execution is now allowed (user reviews during approval)
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"bash -lc "python3 -c 'print(1)'""#}),
         );
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
-        ));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
-    fn middleware_blocks_nested_shell_python_inline_exec_with_clustered_c_flag() {
+    fn middleware_allows_nested_shell_python_inline_exec_with_clustered_c_flag() {
+        // Inline interpreter execution is now allowed (user reviews during approval)
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"bash -ceu "python3 -c 'print(1)'""#}),
         );
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
-        ));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
