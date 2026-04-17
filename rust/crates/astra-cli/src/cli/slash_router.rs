@@ -410,7 +410,7 @@ pub(super) async fn handle_slash_command(
         }
 
         "/resume" => {
-            slash_session::handle_resume_command(arg, profile, state).await;
+            slash_session::handle_resume_command(arg, profile, api, state).await;
         }
 
         "/stats" => {
