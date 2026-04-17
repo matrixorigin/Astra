@@ -239,6 +239,7 @@ version = "0.1.0"
 dependencies = [
  "astra-pipeline",
  "astra-turn-core",
+ "dirs 6.0.0",
  "serde",
  "serde_json",
  "tempfile",

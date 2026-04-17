@@ -1,10 +1,25 @@
 //! Core types for the evolution engine.
 
+use astra_pipeline::calibration::CalibrationExport;
+use astra_pipeline::pattern::ToolChainPattern;
 use astra_pipeline::routing::{DomainHint, TaskType};
 use astra_turn_core::action_compensation::FailureCategory;
 
 // Re-export CalibrationAxis from pipeline::routing (defined in astra-pipeline)
 pub use astra_pipeline::routing::CalibrationAxis;
+
+/// Persistent snapshot of an active canary proposal, including rollback state.
+///
+/// Stored in the pipeline persistence snapshot so that if the session crashes
+/// mid-canary, the next session can resume or roll back cleanly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PersistedActiveCanary {
+    pub proposal: EvolutionProposal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_patterns: Option<Vec<ToolChainPattern>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_calibration: Option<CalibrationExport>,
+}
 
 // ── Signals ──
 
