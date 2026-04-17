@@ -439,11 +439,10 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
-        let bcrypt_cost = if cfg!(debug_assertions) {
-            4
-        } else {
-            bcrypt::DEFAULT_COST
-        };
+        let bcrypt_cost = std::env::var("ASTRA_BCRYPT_COST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(bcrypt::DEFAULT_COST);
         let password_hash =
             bcrypt_hash(request.password.as_str(), bcrypt_cost).map_err(internal_error)?;
         let user_id = Uuid::new_v4().to_string();

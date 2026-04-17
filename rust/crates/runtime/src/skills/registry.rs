@@ -431,36 +431,40 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
 
         // Cache miss — load from providers using canonical name (not alias).
         let handle = tokio::runtime::Handle::current();
-        let result = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    handle.block_on(async {
-                        for provider in &registry.providers {
-                            match provider.load(&canonical_name).await {
-                                Ok(loaded) => {
-                                    if let Ok(mut cache) = registry.cache.write() {
-                                        cache.insert(
-                                            canonical_name.clone(),
-                                            CachedSkill {
-                                                manifest: loaded.manifest.clone(),
-                                                loaded: Some(loaded.clone()),
-                                            },
-                                        );
-                                    }
-                                    return Ok(loaded);
-                                }
-                                Err(SkillError::NotFound(_)) => continue,
-                                Err(e) => return Err(e),
+        let do_load = || {
+            handle.block_on(async {
+                for provider in &registry.providers {
+                    match provider.load(&canonical_name).await {
+                        Ok(loaded) => {
+                            if let Ok(mut cache) = registry.cache.write() {
+                                cache.insert(
+                                    canonical_name.clone(),
+                                    CachedSkill {
+                                        manifest: loaded.manifest.clone(),
+                                        loaded: Some(loaded.clone()),
+                                    },
+                                );
                             }
+                            return Ok(loaded);
                         }
-                        Err(SkillError::NotFound(format!(
-                            "unknown skill: {canonical_name}"
-                        )))
-                    })
-                })
-                .join()
-                .map_err(|_| SkillError::Internal("provider load thread panicked".into()))?
-        });
+                        Err(SkillError::NotFound(_)) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(SkillError::NotFound(format!(
+                    "unknown skill: {canonical_name}"
+                )))
+            })
+        };
+        let result = match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(do_load),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(do_load)
+                    .join()
+                    .map_err(|_| SkillError::Internal("provider load thread panicked".into()))?
+            }),
+        };
 
         result.map(|loaded| Self::loaded_to_resolved(&loaded))
     }

@@ -85,8 +85,16 @@ pub fn default_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistr
         let registry = std::sync::Arc::new(registry);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let r = registry.clone();
-            let _ =
-                std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
+                }
+                _ => {
+                    let _ = std::thread::scope(|s| {
+                        s.spawn(|| handle.block_on(r.discover_all())).join().ok()
+                    });
+                }
+            }
         }
         registry
     })
