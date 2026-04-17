@@ -96,7 +96,7 @@ pub trait RunLifecycleService: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
     pub session_id: Option<String>,
@@ -104,8 +104,50 @@ pub struct ChatRequestData {
     pub model: Option<String>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    pub forward_headers: std::collections::HashMap<String, String>,
     pub max_candidates: u32,
     pub explain: bool,
+}
+
+fn redacted_forward_header_names(headers: &std::collections::HashMap<String, String>) -> Vec<&str> {
+    let mut names = headers
+        .keys()
+        .filter(|name| !name.starts_with("__astra_"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+struct RedactedForwardHeadersDebug<'a>(&'a std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedForwardHeadersDebug<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = redacted_forward_header_names(self.0);
+        f.debug_struct("RedactedForwardHeaders")
+            .field("count", &names.len())
+            .field("names", &names)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ChatRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatRequestData")
+            .field("message", &self.message)
+            .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id)
+            .field("model", &self.model)
+            .field("skill_search", &self.skill_search)
+            .field("context", &self.context)
+            .field(
+                "forward_headers",
+                &RedactedForwardHeadersDebug(&self.forward_headers),
+            )
+            .field("max_candidates", &self.max_candidates)
+            .field("explain", &self.explain)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -807,6 +849,36 @@ mod tests {
         assert_eq!(out, event);
     }
 
+    #[test]
+    fn chat_request_data_debug_redacts_forward_header_values() {
+        let mut forward_headers = std::collections::HashMap::new();
+        forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        );
+        forward_headers.insert("x-workspace-id".to_string(), "ws-123".to_string());
+        forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
+
+        let request = ChatRequestData {
+            message: "hi".to_string(),
+            session_id: Some("sess-1".to_string()),
+            agent_id: None,
+            model: None,
+            skill_search: None,
+            context: None,
+            forward_headers,
+            max_candidates: 10,
+            explain: false,
+        };
+
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("authorization"));
+        assert!(rendered.contains("x-workspace-id"));
+        assert!(!rendered.contains("Bearer secret-token"));
+        assert!(!rendered.contains("ws-123"));
+        assert!(!rendered.contains("__astra_connection_tokens"));
+    }
+
     #[tokio::test]
     async fn unconfigured_service_uses_stable_error_code() {
         let service = UnconfiguredRunLifecycleService;
@@ -820,6 +892,7 @@ mod tests {
                     model: None,
                     skill_search: None,
                     context: None,
+                    forward_headers: std::collections::HashMap::new(),
                     max_candidates: 25,
                     explain: false,
                 },

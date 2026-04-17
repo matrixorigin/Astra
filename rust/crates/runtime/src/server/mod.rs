@@ -33,6 +33,7 @@ pub mod edge_connection_pool;
 mod edge_status_handler;
 mod edge_ws_handler;
 pub mod edge_ws_protocol;
+pub(crate) mod header_utils;
 mod http_helpers;
 mod http_types;
 mod learning_handlers;

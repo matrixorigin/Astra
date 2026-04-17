@@ -290,6 +290,7 @@ fn build_skill_context(state: &AgenticLoopState) -> crate::turn::skill_tool::Ski
         work_dir: state.hooks.workspace_root_hint.clone(),
         available_tools: state.telemetry.all_tools_used.iter().cloned().collect(),
         recursion_depth: state.recursion_depth,
+        forward_headers: state.hooks.forward_headers.clone(),
         extra: build_skill_extra(state),
     }
 }

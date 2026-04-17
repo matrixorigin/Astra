@@ -171,6 +171,8 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         input_schema: raw.input_schema,
         output_schema: raw.output_schema,
         remote_url: None,
+        forward_headers: Vec::new(),
+        required_headers: Vec::new(),
         success_criteria: raw.success_criteria,
         required_capabilities: raw.required_capabilities,
         composition: raw.composition,

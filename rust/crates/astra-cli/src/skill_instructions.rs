@@ -1359,6 +1359,8 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -1404,6 +1406,8 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             input_schema: None,
             output_schema: None,
             remote_url: None,
+            forward_headers: vec![],
+            required_headers: vec![],
             aliases: Vec::new(),
 
             effort: None,

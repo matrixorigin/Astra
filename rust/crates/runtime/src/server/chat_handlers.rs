@@ -1,4 +1,5 @@
 use super::bridge_prep::normalize_chat_turn_session_error;
+use super::header_utils::collect_forward_headers;
 use super::run_handlers::transform_stream_run_events_for_client;
 use super::*;
 
@@ -102,6 +103,7 @@ pub(super) async fn chat_handler(
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let mut chat_data = chat_request_into_data(request);
+    chat_data.forward_headers = collect_forward_headers(&headers);
     chat_data.session_id = resolve_or_create_chat_session_id(
         &state,
         &user,
@@ -128,6 +130,7 @@ pub(super) async fn chat_stream_handler(
     };
 
     let mut chat_data = chat_request_into_data(request);
+    chat_data.forward_headers = collect_forward_headers(&headers);
     chat_data.session_id = match resolve_or_create_chat_session_id(
         &state,
         &user,
@@ -439,6 +442,7 @@ mod tests {
                 surface_cap: 20,
             }),
             context: None,
+            forward_headers: std::collections::HashMap::new(),
             max_candidates: 3,
             explain: true,
         });

@@ -125,6 +125,7 @@ fn build_server_skill_executor(
     model_override: Option<&str>,
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
+    forward_headers: &HashMap<String, String>,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
@@ -141,6 +142,7 @@ fn build_server_skill_executor(
     .with_default_model(model_override.map(String::from))
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
+    .with_forward_headers(forward_headers.clone())
     .with_skill_resolver(skill_resolver);
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
@@ -877,6 +879,7 @@ impl AgenticRunLifecycleService {
             request.model.as_deref(),
             &edge_tools,
             &edge_profile,
+            &request.forward_headers,
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
@@ -927,6 +930,7 @@ impl AgenticRunLifecycleService {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
+                forward_headers: request.forward_headers.clone(),
                 ..Default::default()
             },
             cancellation: Default::default(),
@@ -2031,6 +2035,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
+                forward_headers: config.forward_headers.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -2263,6 +2268,7 @@ mod tests {
             model: None,
             skill_search: None,
             context: None,
+            forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
         }
@@ -2332,6 +2338,8 @@ mod tests {
                         metadata: Some(serde_json::json!({
                             "skill_type": "remote",
                             "remote_url": "http://127.0.0.1:18080/remote-skill",
+                            "forward_headers": ["authorization", "x-workspace-id"],
+                            "required_headers": ["x-workspace-id"],
                             "when_to_use": "when task needs remote orchestration"
                         })),
                         created_at: None,
@@ -2406,6 +2414,14 @@ mod tests {
         assert_eq!(
             resolved.remote_url.as_deref(),
             Some("http://127.0.0.1:18080/remote-skill")
+        );
+        assert_eq!(
+            resolved.forward_headers,
+            vec!["authorization".to_string(), "x-workspace-id".to_string()]
+        );
+        assert_eq!(
+            resolved.required_headers,
+            vec!["x-workspace-id".to_string()]
         );
     }
 
@@ -2831,6 +2847,7 @@ mod tests {
             model: None,
             skill_search: None,
             context: Some(ctx),
+            forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
         };
@@ -2858,6 +2875,7 @@ mod tests {
             model: None,
             skill_search: None,
             context: Some(ctx),
+            forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
         };

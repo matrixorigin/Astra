@@ -56,6 +56,9 @@ pub struct ServerSkillSubRunExecutor {
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     /// Parent cancellation token — propagated so stop/cancel interrupts sub-runs.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Inbound request headers propagated from parent run for remote skill callbacks.
+    /// Header names are normalized to lowercase.
+    forward_headers: HashMap<String, String>,
     /// Session ID for the parent run.
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
@@ -77,6 +80,7 @@ impl ServerSkillSubRunExecutor {
             edge_profile: Map::new(),
             skill_resolver: None,
             cancel_token: None,
+            forward_headers: HashMap::new(),
             session_id,
             edge_connection_pool: None,
         }
@@ -115,6 +119,11 @@ impl ServerSkillSubRunExecutor {
         token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Self {
         self.cancel_token = token;
+        self
+    }
+
+    pub fn with_forward_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.forward_headers = headers;
         self
     }
 
@@ -298,6 +307,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             },
             hooks: StopHookState {
                 workspace_root_hint,
+                forward_headers: self.forward_headers.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {

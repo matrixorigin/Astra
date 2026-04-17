@@ -39,6 +39,7 @@
 use super::chat_handlers::{
     is_session_service_unconfigured_error, resolve_or_create_chat_session_id,
 };
+use super::header_utils::collect_forward_headers;
 use super::http_types::merge_plan_subtask_context;
 use super::run_handlers::transform_stream_run_events_for_client_with_pending;
 use super::*;
@@ -229,6 +230,9 @@ struct WsConnection {
     user: AuthUserRecord,
     /// Normalized bearer header captured during WS auth and replayed on bridge fallback.
     authorization: String,
+    /// Inbound handshake headers eligible for remote skill forwarding.
+    /// Header names are normalized to lowercase.
+    forward_headers: std::collections::HashMap<String, String>,
     /// Trusted session bound by the server after validation or creation.
     session_id: Option<String>,
     /// Untrusted session requested during the initial handshake. This is only
@@ -257,14 +261,18 @@ pub(super) struct WsUpgradeQuery {
 /// an `auth` message as the first frame after upgrade.
 pub(super) async fn ws_chat_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     query: Query<WsUpgradeQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let token = query.token.clone();
     let session_id = query.session_id.clone();
+    let forward_headers = collect_forward_headers(&headers);
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| ws_connection_loop(socket, state, token, session_id))
+        .on_upgrade(move |socket| {
+            ws_connection_loop(socket, state, token, session_id, forward_headers)
+        })
 }
 
 /// Main WebSocket connection loop.
@@ -277,9 +285,18 @@ async fn ws_connection_loop(
     state: AppState,
     initial_token: Option<String>,
     initial_session_id: Option<String>,
+    forward_headers: std::collections::HashMap<String, String>,
 ) {
     // Phase 1: Authenticate
-    let conn = match authenticate(&mut socket, &state, initial_token, initial_session_id).await {
+    let conn = match authenticate(
+        &mut socket,
+        &state,
+        initial_token,
+        initial_session_id,
+        forward_headers,
+    )
+    .await
+    {
         Ok(conn) => conn,
         Err(_) => return, // Error already sent to client
     };
@@ -296,17 +313,20 @@ async fn authenticate(
     state: &AppState,
     initial_token: Option<String>,
     initial_session_id: Option<String>,
+    forward_headers: std::collections::HashMap<String, String>,
 ) -> Result<WsConnection, ()> {
     // Try query-param token first
     if let Some(token) = initial_token {
-        return authenticate_with_token(socket, state, &token, initial_session_id).await;
+        return authenticate_with_token(socket, state, &token, initial_session_id, forward_headers)
+            .await;
     }
 
     // Wait for auth message
     match timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<WsClientMessage>(&text) {
             Ok(WsClientMessage::Auth { token }) => {
-                authenticate_with_token(socket, state, &token, initial_session_id).await
+                authenticate_with_token(socket, state, &token, initial_session_id, forward_headers)
+                    .await
             }
             Ok(_) => {
                 send_msg(
@@ -369,6 +389,7 @@ async fn authenticate_with_token(
     state: &AppState,
     token: &str,
     session_id: Option<String>,
+    mut forward_headers: std::collections::HashMap<String, String>,
 ) -> Result<WsConnection, ()> {
     // Build a HeaderMap with the token for auth_service
     let bearer = if token.starts_with("Bearer ") {
@@ -384,6 +405,7 @@ async fn authenticate_with_token(
 
     match state.auth_service.current_user(&headers).await {
         Ok(user) => {
+            forward_headers.insert("authorization".to_string(), bearer.clone());
             send_msg(
                 socket,
                 &WsServerMessage::AuthOk {
@@ -395,6 +417,7 @@ async fn authenticate_with_token(
             Ok(WsConnection {
                 user,
                 authorization: bearer,
+                forward_headers,
                 session_id: None,
                 pending_session_id: session_id,
                 active_run_id: None,
@@ -567,6 +590,7 @@ async fn handle_chat_message(
         plan_subtask_id,
         is_plan_subtask,
     );
+    request.forward_headers = ws_forward_headers(conn);
     let fallback_context = request.context.clone();
     request.session_id = match resolve_or_create_chat_session_id(
         state,
@@ -795,9 +819,16 @@ fn build_ws_chat_request(
         model,
         skill_search,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
+        forward_headers: std::collections::HashMap::new(),
         max_candidates,
         explain,
     }
+}
+
+fn ws_forward_headers(conn: &WsConnection) -> std::collections::HashMap<String, String> {
+    let mut headers = conn.forward_headers.clone();
+    headers.insert("authorization".to_string(), conn.authorization.clone());
+    headers
 }
 
 fn build_ws_bridge_headers(
@@ -2501,6 +2532,7 @@ mod tests {
         let conn = WsConnection {
             user: test_user(),
             authorization: "Bearer good-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: None,
             active_run_id: None,
@@ -2512,6 +2544,30 @@ mod tests {
         assert_eq!(headers.get("x-mo-bridge-secret").unwrap(), "bridge-secret");
         assert_eq!(headers.get("x-mo-user-id").unwrap(), "u1");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer good-token");
+    }
+
+    #[test]
+    fn ws_forward_headers_preserve_handshake_headers() {
+        let conn = WsConnection {
+            user: test_user(),
+            authorization: "Bearer good-token".into(),
+            forward_headers: std::collections::HashMap::from([
+                ("x-workspace-id".to_string(), "ws-001".to_string()),
+                ("x-catalog-tenant".to_string(), "tenant-a".to_string()),
+            ]),
+            session_id: None,
+            pending_session_id: None,
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+
+        let headers = ws_forward_headers(&conn);
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"Bearer good-token".into())
+        );
+        assert_eq!(headers.get("x-workspace-id"), Some(&"ws-001".into()));
+        assert_eq!(headers.get("x-catalog-tenant"), Some(&"tenant-a".into()));
     }
 
     #[tokio::test]
@@ -2565,6 +2621,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
@@ -2591,6 +2648,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
@@ -2612,6 +2670,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
@@ -2633,6 +2692,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
@@ -2646,6 +2706,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
@@ -2929,6 +2990,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -2977,6 +3039,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -3065,6 +3128,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -3145,6 +3209,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
             pending_session_id: None,
             active_run_id: Some("run-1".into()),
@@ -3186,6 +3251,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -3247,6 +3313,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -3309,6 +3376,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -3340,6 +3408,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
             pending_session_id: Some("pending-session".into()),
             active_run_id: Some("prepared-run".into()),
@@ -3371,6 +3440,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -3411,6 +3481,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
             pending_session_id: Some("pending-session".into()),
             active_run_id: Some("real-run".into()),
@@ -3442,6 +3513,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-42".into()),
             pending_session_id: None,
             active_run_id: Some("run-9".into()),
@@ -3472,6 +3544,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
             session_id: Some("sess-1".into()),
             pending_session_id: None,
             active_run_id: Some("prepared-run".into()),
