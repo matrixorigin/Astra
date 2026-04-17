@@ -6,6 +6,9 @@
 
 pub mod evolver;
 pub mod persistence;
+pub mod promotion_gate;
+pub mod promotion_signals;
+pub mod reflection;
 pub mod signal_collector;
 pub mod store;
 pub mod types;
