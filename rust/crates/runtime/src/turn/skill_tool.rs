@@ -30,11 +30,13 @@
 //! still resolved and executed **inline** so composition can proceed.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use astra_core::SkillSearchSettings;
 use serde_json::Value;
 
+use crate::server::header_utils::CONNECTION_HEADER_TOKENS_KEY;
 use crate::skills::arguments::substitute_arguments;
 use crate::skills::hooks::HookAction;
 use crate::skills::manifest::{
@@ -84,7 +86,7 @@ impl Default for SkillToolInfo {
 ///
 /// Injected into skill instructions via `${CTX_*}` placeholders.
 /// Built at execution time from the agentic loop state.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SkillContext {
     /// Current session identifier.
     pub session_id: Option<String>,
@@ -101,6 +103,45 @@ pub struct SkillContext {
     pub forward_headers: HashMap<String, String>,
     /// Extensible key-value pairs for host-specific context.
     pub extra: HashMap<String, String>,
+}
+
+fn redacted_forward_header_names(headers: &HashMap<String, String>) -> Vec<&str> {
+    let mut names = headers
+        .keys()
+        .filter(|name| !name.starts_with("__astra_"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+struct RedactedForwardHeadersDebug<'a>(&'a HashMap<String, String>);
+
+impl fmt::Debug for RedactedForwardHeadersDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = redacted_forward_header_names(self.0);
+        f.debug_struct("RedactedForwardHeaders")
+            .field("count", &names.len())
+            .field("names", &names)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SkillContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SkillContext")
+            .field("session_id", &self.session_id)
+            .field("session_dir", &self.session_dir)
+            .field("work_dir", &self.work_dir)
+            .field("available_tools", &self.available_tools)
+            .field("recursion_depth", &self.recursion_depth)
+            .field(
+                "forward_headers",
+                &RedactedForwardHeadersDebug(&self.forward_headers),
+            )
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 impl SkillContext {
@@ -1463,15 +1504,12 @@ fn is_non_forwardable_header(name: &str) -> bool {
 }
 
 fn connection_declared_hop_by_hop_headers(skill_ctx: &SkillContext) -> HashSet<String> {
-    skill_ctx
-        .forward_headers
-        .get("connection")
-        .map(|raw| {
-            raw.split(',')
-                .filter_map(|token| normalize_header_name(token).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    [CONNECTION_HEADER_TOKENS_KEY, "connection"]
+        .into_iter()
+        .filter_map(|name| skill_ctx.forward_headers.get(name))
+        .flat_map(|raw| raw.split(','))
+        .filter_map(|token| normalize_header_name(token).ok())
+        .collect()
 }
 
 fn is_sensitive_remote_forward_header(name: &str) -> bool {
@@ -3351,6 +3389,31 @@ mod tests {
     fn skill_context_default_produces_empty_vars() {
         let ctx = SkillContext::default();
         assert!(ctx.as_substitution_vars().is_empty());
+    }
+
+    #[test]
+    fn skill_context_debug_redacts_forward_header_values() {
+        let mut ctx = SkillContext {
+            session_id: Some("sess-42".into()),
+            ..Default::default()
+        };
+        ctx.forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        );
+        ctx.forward_headers
+            .insert("x-workspace-id".to_string(), "ws-123".to_string());
+        ctx.forward_headers.insert(
+            CONNECTION_HEADER_TOKENS_KEY.to_string(),
+            "x-hop".to_string(),
+        );
+
+        let rendered = format!("{ctx:?}");
+        assert!(rendered.contains("authorization"));
+        assert!(rendered.contains("x-workspace-id"));
+        assert!(!rendered.contains("Bearer secret-token"));
+        assert!(!rendered.contains("ws-123"));
+        assert!(!rendered.contains(CONNECTION_HEADER_TOKENS_KEY));
     }
 
     #[test]
