@@ -32,6 +32,7 @@ dirs = "6.0.0"
 fastrand = "2"
 percent-encoding = "2.3"
 astra-config.workspace = true
+astra-evolution.workspace = true
 astra-core.workspace = true
 astra-learning.workspace = true
 astra-messaging.workspace = true

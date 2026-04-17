@@ -234,6 +234,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-evolution"
+version = "0.1.0"
+dependencies = [
+ "astra-pipeline",
+ "astra-turn-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "astra-learning"
 version = "0.1.0"
 dependencies = [
@@ -304,6 +317,7 @@ version = "0.1.0"
 dependencies = [
  "astra-config",
  "astra-core",
+ "astra-evolution",
  "astra-learning",
  "astra-messaging",
  "astra-pipeline",
