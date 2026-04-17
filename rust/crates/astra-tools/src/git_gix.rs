@@ -2755,11 +2755,13 @@ mod tests {
     #[test]
     fn git_show_without_file_no_hint_even_when_aggregate_high() {
         let root = repo_root();
-        // No file filter — hint should NOT appear even when aggregate is high
-        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 65_000);
+        // No file filter — hint should NOT appear even when aggregate is high.
+        // Use HEAD~5 to pick a commit whose diff doesn't contain the hint text.
+        let result = git_show(&root, &json!({"commit": "HEAD~5"}), 0.0, 65_000);
         assert!(
             !result.contains("[hint: aggregate output is high"),
-            "should NOT append hint without file filter: {result}"
+            "should NOT append hint without file filter: {}",
+            &result[..result.len().min(500)]
         );
     }
 

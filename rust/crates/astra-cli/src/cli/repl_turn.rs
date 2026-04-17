@@ -386,13 +386,8 @@ pub(super) async fn handle_chat_input(
                     use crossterm::style::Stylize;
                     eprintln!("{}", "  Token expired, attempting refresh…".yellow());
                     if repl_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
-                        if let Some(new_token) =
-                            repl_runtime::current_access_token(ctx.profile)
-                        {
-                            eprintln!(
-                                "  {} Token refreshed, retrying…",
-                                crate::theme::icon_ok()
-                            );
+                        if let Some(new_token) = repl_runtime::current_access_token(ctx.profile) {
+                            eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
                             match run_chat_turn(
                                 state,
                                 &ctx,

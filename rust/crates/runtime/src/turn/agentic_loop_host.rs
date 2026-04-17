@@ -6917,7 +6917,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
-        assert!(!skill_result_msgs.is_empty(), "skill tool result should exist");
+        assert!(
+            !skill_result_msgs.is_empty(),
+            "skill tool result should exist"
+        );
         let skill_content = skill_result_msgs[0]["content"].as_str().unwrap_or("");
         assert!(
             skill_content.contains("parallel tool call(s) were dropped"),
