@@ -380,6 +380,24 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 let _ = writer.append(&evt);
             }
         }
+
+        // Carry `UserCancelled` forward so the adaptive-tuning layer can
+        // skip scenario re-detection on the next turn. Without this gate,
+        // the aborted tool history leaks into ScenarioDetector and can
+        // falsely trigger an `Exploration` scenario (ratcheting the tool
+        // budget). Any non-UserCancelled interruption (timeout, error,
+        // stream_error, …) does NOT set the flag — only an explicit user
+        // cancel invalidates the tool-history-as-evidence signal.
+        if matches!(
+            interruption.kind,
+            astra_turn_core::interruption::InterruptionKind::UserCancelled
+        ) {
+            if let Some(ref session) = state.telemetry.observability_session {
+                if let Ok(mut guard) = session.write() {
+                    guard.previous_turn_user_cancelled = true;
+                }
+            }
+        }
     }
 
     if let Some(evo) = state.evolution_service.clone() {

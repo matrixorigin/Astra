@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 use serde_json::Value;
 
 use crate::turn::sse_stream_host::EdgeToolExecResult;
@@ -48,12 +48,16 @@ pub(crate) async fn prepare_intercepted_tool_round(
         });
     }
 
-    // Record surgically removed calls in telemetry (ok=false so stall detector
-    // counts them correctly) but do NOT add to pre_resolved_results.
+    // Record surgically removed calls as audit-only synthetic placeholders.
+    // These are intentional context optimizations (skill took over the work),
+    // NOT tool failures — so ok=true and they are filtered out of
+    // evaluation/analytics via ToolCallRecord::is_synthetic_placeholder().
+    // The stall detector does NOT treat synthetic placeholders as real
+    // attempts either, matching the existing skipped/deferred behavior.
     for id in &surgically_removed_ids {
         state.stall.tool_call_records.push(ToolCallRecord {
-            name: "(surgically_removed)".to_string(),
-            ok: false,
+            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+            ok: true,
             ms: 0,
             error: None,
             input_bytes: None,

@@ -770,6 +770,7 @@ pub(crate) mod tests {
     use astra_core::confidence::ConfidenceInterval;
     use astra_services::evaluation::types::ValueInterval;
     use astra_services::session_audit::RuntimePromotionOutcome;
+    use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
@@ -4127,8 +4128,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 ),
             ),
             tool_record(
-                "(surgically_removed)",
-                false,
+                SURGICAL_REMOVAL_TOOL_NAME,
+                true,
                 Some("(removed from context — skill covered this work)"),
             ),
             tool_record(
@@ -4319,6 +4320,96 @@ print(json.dumps({'context': 'user said: ' + msg}))
             Some(crate::user_profile::Scenario::Debugging)
         );
         assert!(state.max_turn_input_tokens >= 100_000);
+    }
+
+    #[test]
+    fn adaptive_profile_skips_scenario_after_user_cancellation() {
+        // Regression for session 721df7da: after the user hits Ctrl+C on a
+        // focused review task, the tool history of the cancelled turn was
+        // leaking into ScenarioDetector and falsely triggering the
+        // `Exploration` scenario (ratcheting tool_budget 722 → 1000).
+        // The fix gates `apply_adaptive_execution_profile` on the
+        // `previous_turn_user_cancelled` flag and consumes it after one
+        // turn.
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "继续啊".into();
+        // Exploratory tool history from the cancelled turn — would
+        // normally push the detector toward Exploration.
+        state.recent_tools = vec![
+            "glob".into(),
+            "grep".into(),
+            "view".into(),
+            "read_file".into(),
+            "git_show".into(),
+            "git_show".into(),
+            "view".into(),
+            "grep".into(),
+        ];
+
+        let scenario_before;
+        {
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            guard.previous_turn_user_cancelled = true;
+            scenario_before = guard.profile.current_scenario;
+        }
+
+        apply_adaptive_execution_profile(&mut state);
+
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        // Flag must be consumed (one-turn suppression only).
+        assert!(
+            !guard.previous_turn_user_cancelled,
+            "previous_turn_user_cancelled flag must be cleared after being consumed"
+        );
+        // Scenario must NOT have changed as a side-effect of the cancelled
+        // turn's tool history.
+        assert_eq!(
+            guard.profile.current_scenario, scenario_before,
+            "scenario should not be re-detected on the turn after a user cancellation"
+        );
+    }
+
+    #[test]
+    fn adaptive_profile_resumes_on_turn_after_cancellation_cleared() {
+        // Verifies the suppression is strictly one turn: the second
+        // apply_adaptive_execution_profile call after a cancellation must
+        // behave normally (i.e. detect Debugging for a matching query).
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "fix the bug in the parser".into();
+        state.recent_tools = vec!["bash".into(), "view".into()];
+
+        {
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            for _ in 0..5 {
+                guard.record_query("fix the bug in the parser");
+            }
+            guard.previous_turn_user_cancelled = true;
+        }
+
+        // First call: suppressed (flag was true) — scenario unchanged.
+        apply_adaptive_execution_profile(&mut state);
+        {
+            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            assert!(!guard.previous_turn_user_cancelled);
+            assert_eq!(guard.profile.current_scenario, None);
+        }
+
+        // Second call: normal detection path runs.
+        apply_adaptive_execution_profile(&mut state);
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            guard.profile.current_scenario,
+            Some(crate::user_profile::Scenario::Debugging),
+            "scenario detection must resume on the turn after the cancellation flag is consumed"
+        );
     }
 
     #[test]
@@ -6927,12 +7018,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "skill result should note the surgically removed calls, got: {skill_content}"
         );
 
-        // Stall detector should still have records for the removed calls.
+        // Stall detector should still have records for the removed calls
+        // (now as synthetic placeholders with ok=true — they are intentional
+        // context optimizations, not failures).
         let removed_records: Vec<_> = state
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| r.name == "(surgically_removed)")
+            .filter(|r| r.name == SURGICAL_REMOVAL_TOOL_NAME)
             .collect();
         assert_eq!(
             removed_records.len(),
@@ -6941,7 +7034,16 @@ print(json.dumps({'context': 'user said: ' + msg}))
             removed_records.len()
         );
         for r in &removed_records {
-            assert!(!r.ok, "surgically_removed records should have ok=false");
+            assert!(
+                r.ok,
+                "surgically_removed records should have ok=true (they are \
+                 intentional context optimizations, not tool failures)"
+            );
+            assert!(
+                r.is_synthetic_placeholder(),
+                "surgically_removed records must be classified as synthetic \
+                 placeholders so evaluation/analytics skip them"
+            );
         }
 
         // skill_produced_output flag should be set

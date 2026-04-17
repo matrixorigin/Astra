@@ -490,10 +490,25 @@ pub struct ToolCallRecord {
     pub file_path: Option<String>,
 }
 
+/// Tool call name sentinel used for assistant messages that had parallel tool
+/// calls surgically removed from context (see
+/// `runtime::turn::agentic_tool_interception`). These are intentional context
+/// optimizations — **not** tool failures — and are filtered out of
+/// evaluation/analytics by [`ToolCallRecord::is_synthetic_placeholder`].
+pub const SURGICAL_REMOVAL_TOOL_NAME: &str = "(surgically_removed)";
+
 impl ToolCallRecord {
     /// Synthetic placeholders are audit-only records emitted when skill routing
-    /// suppresses a tool call without actually executing it.
+    /// suppresses a tool call without actually executing it, **or** when a
+    /// parallel tool call was surgically removed from context after a skill
+    /// took over its work. Neither case represents real tool execution or
+    /// failure, so these records must be filtered out before computing
+    /// analytics (tool_error_rate, repeat_tool_call, failed_tool_calls, …).
     pub fn is_synthetic_placeholder(&self) -> bool {
+        if self.name == SURGICAL_REMOVAL_TOOL_NAME {
+            return true;
+        }
+
         let Some(result_preview) = self.result_preview.as_deref() else {
             return false;
         };
@@ -3160,6 +3175,63 @@ mod tests {
     use super::*;
     use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
+
+    fn base_tool_record(name: &str, ok: bool, preview: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            ok,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: preview.map(ToString::to_string),
+            file_path: None,
+        }
+    }
+
+    #[test]
+    fn surgical_removal_record_is_synthetic_placeholder() {
+        let rec = base_tool_record(
+            SURGICAL_REMOVAL_TOOL_NAME,
+            true,
+            Some("(removed from context — skill covered this work)"),
+        );
+        assert!(
+            rec.is_synthetic_placeholder(),
+            "surgically_removed records must be classified as synthetic \
+             placeholders so evaluation/analytics skip them"
+        );
+    }
+
+    #[test]
+    fn skipped_deferred_and_skill_records_remain_synthetic_placeholders() {
+        assert!(
+            base_tool_record("read_file", false, Some("Skipped: skill routed"))
+                .is_synthetic_placeholder()
+        );
+        assert!(
+            base_tool_record("read_file", false, Some("Deferred: skill invoked"))
+                .is_synthetic_placeholder()
+        );
+        assert!(
+            base_tool_record(
+                "skill",
+                true,
+                Some("Skill 'debug' was already loaded (turn 2). Follow those instructions.")
+            )
+            .is_synthetic_placeholder()
+        );
+    }
+
+    #[test]
+    fn real_tool_records_are_not_synthetic_placeholders() {
+        assert!(!base_tool_record("git_show", true, Some("diff")).is_synthetic_placeholder());
+        assert!(
+            !base_tool_record("grep", false, Some("error: bad regex")).is_synthetic_placeholder()
+        );
+        assert!(!base_tool_record("read_file", true, None).is_synthetic_placeholder());
+    }
 
     #[test]
     fn journal_dir_guard_overrides_local_sessions_dir_nested() {

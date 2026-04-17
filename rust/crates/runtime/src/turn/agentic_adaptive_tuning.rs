@@ -195,6 +195,18 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         Err(_) => return,
     };
 
+    // If the *previous* turn ended in a user cancellation, skip scenario
+    // re-detection for this turn. The tool history of a cancelled turn is
+    // an aborted plan, not evidence of a deliberate behavior pattern, and
+    // would otherwise leak into ScenarioDetector (e.g. many `glob`/`grep`/
+    // `view` calls from an interrupted review falsely score as
+    // `Exploration`, ratcheting the tool budget). Consume the flag so this
+    // is a one-turn suppression only.
+    if session_guard.previous_turn_user_cancelled {
+        session_guard.previous_turn_user_cancelled = false;
+        return;
+    }
+
     let mut detector = crate::user_profile::ScenarioDetector::new();
     for query in &session_guard.recent_queries {
         detector.observe_query(query);

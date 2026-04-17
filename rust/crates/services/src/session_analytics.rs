@@ -56,17 +56,27 @@ pub fn compute_session_stats(session_id: &str, events: &[JournalEvent]) -> Sessi
                 stats.total_cache_read += event.cache_read_tokens.unwrap_or(0);
                 stats.total_cache_creation += event.cache_creation_tokens.unwrap_or(0);
                 stats.total_duration_ms += event.duration_ms.unwrap_or(0);
-                stats.total_tool_calls += event.tool_count.unwrap_or(0);
-                if let Some(ref tools) = event.tools_used {
-                    for t in tools {
-                        tools_set.insert(t.clone());
-                    }
-                }
+                // Synthetic placeholders (skill skipped/deferred, surgically
+                // removed parallel calls) are not real tool executions — skip
+                // them from total + failed counts so tool_error_rate reflects
+                // actual tool reliability.
                 if let Some(ref calls) = event.tool_calls {
-                    for tc in calls {
+                    let real_calls: Vec<_> = calls
+                        .iter()
+                        .filter(|tc| !tc.is_synthetic_placeholder())
+                        .collect();
+                    stats.total_tool_calls += real_calls.len() as u32;
+                    for tc in &real_calls {
                         if !tc.ok {
                             stats.failed_tool_calls += 1;
                         }
+                    }
+                } else {
+                    stats.total_tool_calls += event.tool_count.unwrap_or(0);
+                }
+                if let Some(ref tools) = event.tools_used {
+                    for t in tools {
+                        tools_set.insert(t.clone());
                     }
                 }
             }
