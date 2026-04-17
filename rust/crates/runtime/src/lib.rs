@@ -33,7 +33,6 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use futures_util::StreamExt;
-use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{mysql::MySqlPoolOptions, query};
@@ -206,7 +205,7 @@ pub use astra_services::{
     },
 };
 
-pub(crate) use astra_services::runs::{RunMutationRecord, UnconfiguredRunLifecycleService};
+pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;
 
 // ── Re-exports: runtime app state ────────────────────────────────────────────
 
