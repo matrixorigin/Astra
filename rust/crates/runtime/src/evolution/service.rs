@@ -9,13 +9,13 @@ use super::promotion_gate::{ProposalPromotionContext, evaluate_proposal_promotio
 use super::signal_collector::SignalCollector;
 use super::store::EvolutionStore;
 use super::types::{
-    ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal,
+    ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal, PersistedActiveCanary,
     ProposalPromotionRecommendation, ProposalPromotionVerdict, ToolResultContext, TurnSummary,
 };
 
 use crate::liquid::reflection::ReflectionEngine;
-use crate::pipeline::calibration::{CalibrationExport, ProgressiveCalibrator};
-use crate::pipeline::pattern::{PatternLibrary, ToolChainPattern};
+use crate::pipeline::calibration::ProgressiveCalibrator;
+use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_promotion_signals::RuntimePromotionSignals;
 
 const MAX_APPLIED_LOG: usize = 100;
@@ -68,15 +68,6 @@ struct ProposalRoutingOutcome {
 struct CanaryExecutionSnapshot {
     pattern_library: Option<PatternLibrary>,
     calibrator: Option<ProgressiveCalibrator>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PersistedActiveCanary {
-    pub proposal: EvolutionProposal,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback_patterns: Option<Vec<ToolChainPattern>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback_calibration: Option<CalibrationExport>,
 }
 
 #[derive(Debug, Default)]
