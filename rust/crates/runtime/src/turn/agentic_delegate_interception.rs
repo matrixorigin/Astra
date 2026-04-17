@@ -264,31 +264,14 @@ pub(crate) fn parse_delegation_request(
     })
 }
 
-fn is_sensitive_delegation_context_header(name: &str) -> bool {
-    matches!(
-        name,
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
-    )
-}
-
 pub(crate) fn merge_forward_headers_into_delegation_context(
     context: &mut std::collections::HashMap<String, serde_json::Value>,
-    forward_headers: &std::collections::HashMap<String, String>,
+    _forward_headers: &std::collections::HashMap<String, String>,
 ) {
+    // Forwarded headers now travel only through trusted sideband state.
+    // Always clear the reserved context key so user/model supplied values
+    // cannot leak into delegated prompts or sub-run configuration.
     context.remove(FORWARD_HEADERS_CONTEXT_KEY);
-    let json_headers = serde_json::Map::from_iter(
-        forward_headers
-            .iter()
-            .filter(|(name, _)| !is_sensitive_delegation_context_header(name))
-            .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone()))),
-    );
-    if json_headers.is_empty() {
-        return;
-    }
-    context.insert(
-        FORWARD_HEADERS_CONTEXT_KEY.to_string(),
-        serde_json::Value::Object(json_headers),
-    );
 }
 
 #[derive(Debug, Clone)]
@@ -985,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_delegation_request_overrides_forward_headers_from_trusted_state() {
+    fn parse_delegation_request_strips_reserved_forward_headers_even_with_trusted_state() {
         let tool_call = json!({
             "id": "call_abc",
             "type": "function",
@@ -1011,11 +994,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let headers = req.context[FORWARD_HEADERS_CONTEXT_KEY]
-            .as_object()
-            .expect("forward headers should be an object");
-        assert!(!headers.contains_key("authorization"));
-        assert_eq!(headers["x-workspace-id"], "ws-001");
+        assert!(
+            !req.context.contains_key(FORWARD_HEADERS_CONTEXT_KEY),
+            "forwarded headers should stay in trusted sideband state"
+        );
     }
 
     #[test]

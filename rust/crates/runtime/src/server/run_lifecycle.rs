@@ -208,25 +208,6 @@ fn skill_search_from_context(
         .unwrap_or_default()
 }
 
-fn forward_headers_from_delegation_context(
-    context: &std::collections::HashMap<String, serde_json::Value>,
-) -> HashMap<String, String> {
-    context
-        .get(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY)
-        .and_then(serde_json::Value::as_object)
-        .map(|headers| {
-            headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .as_str()
-                        .map(|v| (name.to_ascii_lowercase(), v.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn build_runtime_evaluation_service(
     matrixone: &MatrixOneSettings,
     shared_pool: Option<&SharedPool>,
@@ -2048,11 +2029,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
-                forward_headers: if config.forward_headers.is_empty() {
-                    forward_headers_from_delegation_context(&config.context)
-                } else {
-                    config.forward_headers.clone()
-                },
+                forward_headers: config.forward_headers.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -3449,27 +3426,6 @@ mod tests {
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
         assert_eq!(profile.get("cwd").unwrap(), "/workspace");
         assert_eq!(profile.get("os").unwrap(), "linux");
-    }
-
-    #[test]
-    fn forward_headers_from_delegation_context_extracts_string_headers() {
-        let mut ctx = HashMap::new();
-        ctx.insert(
-            crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY.to_string(),
-            json!({
-                "Authorization": "Bearer token-1",
-                "x-workspace-id": "ws-001",
-                "x-ignore": 123
-            }),
-        );
-
-        let headers = forward_headers_from_delegation_context(&ctx);
-        assert_eq!(
-            headers.get("authorization"),
-            Some(&"Bearer token-1".to_string())
-        );
-        assert_eq!(headers.get("x-workspace-id"), Some(&"ws-001".to_string()));
-        assert!(!headers.contains_key("x-ignore"));
     }
 
     // ─── Background spawning integration tests ──────────────────────────

@@ -1452,43 +1452,27 @@ impl DelegationEngine {
     ///
     /// `cancel_token` is scoped to this execution — no global state. When
     /// cancelled, all spawned sub-runs receive the signal and stop gracefully.
-    fn forward_headers_from_request_context(
-        context: &HashMap<String, serde_json::Value>,
-    ) -> HashMap<String, String> {
-        context
-            .get(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY)
-            .and_then(serde_json::Value::as_object)
-            .map(|headers| {
-                headers
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .as_str()
-                            .map(|v| (name.to_ascii_lowercase(), v.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     pub async fn execute(
         &self,
         request: DelegationRequest,
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
-        let forward_headers = Self::forward_headers_from_request_context(&request.context);
-        self.execute_with_forward_headers(request, source_agent_id, cancel_token, forward_headers)
+        self.execute_with_forward_headers(request, source_agent_id, cancel_token, HashMap::new())
             .await
     }
 
     pub async fn execute_with_forward_headers(
         &self,
-        request: DelegationRequest,
+        mut request: DelegationRequest,
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
         forward_headers: HashMap<String, String>,
     ) -> Result<DelegationResult, String> {
+        request
+            .context
+            .remove(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
+
         // Validate first
         self.validate(&request, source_agent_id).await?;
         let child_recursion_depth =
@@ -4020,6 +4004,64 @@ mod tests {
         assert_eq!(
             result.agent_results[0].output.as_deref(),
             Some("auth_present=true;context_key_present=false")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_ignores_serialized_forward_headers_in_request_context() {
+        struct ForwardHeadersCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for ForwardHeadersCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let has_auth = config.forward_headers.contains_key("authorization");
+                let has_context_key = config.context.contains_key(
+                    crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY,
+                );
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!(
+                        "auth_present={has_auth};context_key_present={has_context_key}"
+                    )),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg,
+            engine,
+            tracker,
+            Arc::new(ForwardHeadersCheckExecutor),
+        );
+
+        let req = DelegationRequest {
+            delegation_id: "fh-context-test".into(),
+            parent_run_id: "p".into(),
+            task: "check serialized headers".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::from([(
+                crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY.to_string(),
+                serde_json::json!({"authorization": "Bearer evil", "x-workspace-id": "ws-001"}),
+            )]),
+        };
+
+        let result = de.execute(req, "orch", None).await.unwrap();
+        assert_eq!(
+            result.agent_results[0].output.as_deref(),
+            Some("auth_present=false;context_key_present=false")
         );
     }
 
