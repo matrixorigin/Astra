@@ -110,6 +110,68 @@ pub(super) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<Str
         .filter(|session_id| session_is_resumable(session_id))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionResumePreflight {
+    Valid,
+    Missing,
+    Unknown,
+}
+
+pub(super) fn clear_profile_last_session_if_matches(
+    cli_profile: Option<&str>,
+    session_id: &str,
+) -> Result<bool, String> {
+    let mut creds = load_credentials();
+    let name = profile_name(cli_profile, &creds);
+    let Some(entry) = creds.profiles.get_mut(&name) else {
+        return Ok(false);
+    };
+    if entry.last_session_id.as_deref() != Some(session_id) {
+        return Ok(false);
+    }
+    entry.last_session_id = None;
+    save_credentials(&creds)?;
+    Ok(true)
+}
+
+pub(super) async fn preflight_remote_resume_session(
+    api: &astra_thin_client::ThinClient,
+    cli_profile: Option<&str>,
+    session_id: &str,
+) -> SessionResumePreflight {
+    let creds = load_credentials();
+    let name = profile_name(cli_profile, &creds);
+    let Some(token) = creds
+        .profiles
+        .get(&name)
+        .and_then(|profile| profile.access_token.as_deref())
+    else {
+        return SessionResumePreflight::Unknown;
+    };
+
+    match api.get_session(Some(token), session_id).await {
+        Ok(_) => SessionResumePreflight::Valid,
+        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
+            SessionResumePreflight::Missing
+        }
+        Err(_) => SessionResumePreflight::Unknown,
+    }
+}
+
+pub(super) async fn validated_resumable_last_session_id(
+    api: &astra_thin_client::ThinClient,
+    cli_profile: Option<&str>,
+) -> Option<String> {
+    let session_id = resumable_last_session_id(cli_profile)?;
+    match preflight_remote_resume_session(api, cli_profile, &session_id).await {
+        SessionResumePreflight::Valid | SessionResumePreflight::Unknown => Some(session_id),
+        SessionResumePreflight::Missing => {
+            let _ = clear_profile_last_session_if_matches(cli_profile, &session_id);
+            None
+        }
+    }
+}
+
 pub(super) fn read_api_error(status: u16, body: &str) -> String {
     // Try to extract user-friendly message from JSON error response
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
@@ -479,7 +541,54 @@ pub(super) fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use astra_services::session_journal::{self, JournalDirGuard};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
+    fn write_resumable_session(session_id: &str) {
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(session_id),
+                1,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 1,
+                    "turns_completed": 1,
+                    "remaining_turns": 4,
+                }),
+            ))
+            .unwrap();
+    }
+
+    fn write_profile_with_token(session_id: &str) {
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".into()),
+                last_session_id: Some(session_id.to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+    }
 
     // ── urlencoding ───────────────────────────────────────────────────────────
 
@@ -545,6 +654,7 @@ mod tests {
 
     #[test]
     fn session_is_not_resumable_after_clean_end() {
+        let (_tmp, _guard) = isolated_sessions_dir();
         let sid = format!("test-ended-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -562,10 +672,8 @@ mod tests {
 
     #[test]
     fn resumable_last_session_id_filters_ended_sessions() {
-        let creds_dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
-        }
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
 
         let sid = format!("test-profile-ended-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
@@ -590,10 +698,97 @@ mod tests {
         save_credentials(&creds).unwrap();
 
         assert_eq!(resumable_last_session_id(None), None);
+    }
 
-        unsafe {
-            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
-        }
+    #[tokio::test]
+    async fn validated_resumable_last_session_id_keeps_live_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("live-session-{}", uuid::Uuid::new_v4());
+        write_resumable_session(&session_id);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = validated_resumable_last_session_id(&api, None).await;
+        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(session_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_resumable_last_session_id_drops_stale_404_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("stale-session-{}", uuid::Uuid::new_v4());
+        write_resumable_session(&session_id);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "Session not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = validated_resumable_last_session_id(&api, None).await;
+        assert_eq!(resolved, None);
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_resumable_last_session_id_keeps_session_on_transient_server_error() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("transient-session-{}", uuid::Uuid::new_v4());
+        write_resumable_session(&session_id);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "detail": "Service temporarily unavailable"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let resolved = validated_resumable_last_session_id(&api, None).await;
+        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some(session_id.as_str())
+        );
     }
 
     #[test]
@@ -616,10 +811,7 @@ mod tests {
 
     #[test]
     fn test_credentials_file_permissions() {
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_CREDENTIALS_DIR", tmp.path());
-        }
+        let _creds_guard = crate::tests::isolate_credentials();
         let creds = CredentialsFile {
             current_profile: Some("default".into()),
             profiles: HashMap::new(),
@@ -629,12 +821,9 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let path = tmp.path().join("credentials.json");
+            let path = credentials_path();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "credentials.json must be 0600, got {mode:o}");
-        }
-        unsafe {
-            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
         }
     }
 }

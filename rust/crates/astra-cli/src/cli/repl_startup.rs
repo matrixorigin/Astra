@@ -16,6 +16,23 @@ pub(crate) struct ReplStartupArtifacts {
     pub shutdown_signal_rx: tokio::sync::watch::Receiver<Option<session_guard::ShutdownSignal>>,
 }
 
+async fn prune_stale_pending_recovery(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut ReplState,
+) {
+    let Some(session_id) = state.pending_recovery.clone() else {
+        return;
+    };
+    if matches!(
+        preflight_remote_resume_session(api, profile, &session_id).await,
+        SessionResumePreflight::Missing
+    ) {
+        let _ = clear_profile_last_session_if_matches(profile, &session_id);
+        state.pending_recovery = None;
+    }
+}
+
 pub(crate) async fn complete_repl_startup(
     state: &mut ReplState,
     tracer: &mut StartupTracer,
@@ -260,11 +277,12 @@ pub(crate) async fn complete_repl_startup(
         }
     }
     tracer.phase("model_check");
+    prune_stale_pending_recovery(api, profile, state).await;
 
     if state.session_id.is_none()
         && let Some(sid) = resume_session_id
     {
-        slash_session::restore_session_into_state(sid, profile, state).await?;
+        slash_session::restore_session_into_state(sid, profile, api, state).await?;
     }
 
     print_repl_banner(profile, state);
@@ -329,4 +347,121 @@ pub(crate) async fn complete_repl_startup(
         pinned_skills_path,
         shutdown_signal_rx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::session_journal::{self, JournalDirGuard};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
+    fn write_resumable_session(session_id: &str) {
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(session_id),
+                1,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 1,
+                    "turns_completed": 1,
+                    "remaining_turns": 4,
+                }),
+            ))
+            .unwrap();
+    }
+
+    fn write_profile_with_token(session_id: &str) {
+        let mut creds = crate::cli_utils::CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            crate::cli_utils::Profile {
+                access_token: Some("test-token".into()),
+                last_session_id: Some(session_id.to_string()),
+                ..Default::default()
+            },
+        );
+        crate::cli_utils::save_credentials(&creds).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_stale_pending_recovery_clears_stale_last_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("pending-stale-{}", uuid::Uuid::new_v4());
+        write_resumable_session(&session_id);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "Session not found"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = ReplState {
+            pending_recovery: Some(session_id.clone()),
+            ..Default::default()
+        };
+        prune_stale_pending_recovery(&api, None, &mut state).await;
+
+        assert_eq!(state.pending_recovery, None);
+        assert_eq!(
+            crate::cli_utils::load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_stale_pending_recovery_keeps_live_session() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("pending-live-{}", uuid::Uuid::new_v4());
+        write_resumable_session(&session_id);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = ReplState {
+            pending_recovery: Some(session_id.clone()),
+            ..Default::default()
+        };
+        prune_stale_pending_recovery(&api, None, &mut state).await;
+
+        assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
+    }
 }

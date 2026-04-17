@@ -4737,8 +4737,19 @@ async fn apply_restored_session(
 pub(super) async fn restore_session_into_state(
     session_id: &str,
     profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
     state: &mut ReplState,
 ) -> Result<(), String> {
+    if matches!(
+        preflight_remote_resume_session(api, profile, session_id).await,
+        SessionResumePreflight::Missing
+    ) {
+        let _ = clear_profile_last_session_if_matches(profile, session_id);
+        return Err(format!(
+            "Session {session_id} no longer exists on the server and cannot be resumed for new chat turns."
+        ));
+    }
+
     let svc = resume_restore_service(state);
     let restored = svc
         .restore_session(session_id)
@@ -4754,7 +4765,12 @@ pub(super) async fn restore_session_into_state(
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
-pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut ReplState) {
+pub(super) async fn handle_resume_command(
+    arg: &str,
+    profile: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+    state: &mut ReplState,
+) {
     let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
     let svc = resume_restore_service(state);
 
@@ -5140,10 +5156,11 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
         }
     }
 
-    if let Err(e) = restore_session_into_state(&session_id, profile, state).await {
+    if let Err(e) = restore_session_into_state(&session_id, profile, api, state).await {
         let hint = if e.to_string().contains("not found")
             || e.to_string()
                 .contains("no resumable workspace/checkpoint state")
+            || e.to_string().contains("no longer exists on the server")
         {
             "Use /resume to see available sessions."
         } else {
@@ -5151,5 +5168,151 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
         };
         eprintln!("  {} {}", theme::icon_err(), e.red());
         eprintln!("{}", format!("  {hint}").dim());
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use astra_services::session_journal::{self, JournalDirGuard};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = JournalDirGuard::new(&sessions);
+        (tmp, guard)
+    }
+
+    fn write_local_resumable_session(session_id: &str, turn_count: u32) {
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(session_id),
+                turn_count,
+                Some("gpt-5"),
+                "continue",
+                "restored",
+                0,
+                15,
+                7,
+                8,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::interruption_recorded(
+                Some(session_id),
+                turn_count,
+                serde_json::json!({
+                    "kind": "rate_limited",
+                    "resumable": true,
+                    "has_checkpoint": true,
+                    "tool_calls_completed": 1,
+                    "turns_completed": turn_count,
+                    "remaining_turns": 4,
+                }),
+            ))
+            .unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        let mut ws = session_workspace::WorkspaceMetadata::with_context(
+            session_id,
+            "gpt-5",
+            &cwd.display().to_string(),
+            Some("main"),
+        );
+        ws.turn_count = turn_count;
+        ws.total_tokens_in = 15;
+        ws.total_tokens_out = 7;
+        ws.status = "active".to_string();
+        session_workspace::write_workspace(&ws).unwrap();
+    }
+
+    fn write_profile_with_token(session_id: &str) {
+        let mut creds = crate::cli_utils::CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            crate::cli_utils::Profile {
+                access_token: Some("test-token".into()),
+                last_session_id: Some(session_id.to_string()),
+                ..Default::default()
+            },
+        );
+        crate::cli_utils::save_credentials(&creds).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_session_into_state_rejects_stale_remote_session_before_local_restore() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-stale-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 3);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "detail": "Session not found"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = ReplState::default();
+        let err = restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("no longer exists on the server"), "got: {err}");
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.turn, 0);
+        assert_eq!(
+            crate::cli_utils::load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_session_into_state_restores_live_remote_session_from_local_workspace() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = format!("resume-live-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        write_profile_with_token(&session_id);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "status": "active"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = ReplState::default();
+        restore_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.total_prompt_tokens, 15);
+        assert_eq!(state.total_completion_tokens, 7);
     }
 }
