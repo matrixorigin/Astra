@@ -22,6 +22,8 @@ impl ShutdownSignal {
 struct PanicSessionGuard {
     session_id: String,
     turn: u32,
+    /// `true` once either path has written `session_end` for this session.
+    end_written: bool,
 }
 
 static PANIC_SESSION_GUARD: std::sync::Mutex<Option<PanicSessionGuard>> =
@@ -47,9 +49,14 @@ pub(crate) fn subscribe_shutdown_signal() -> tokio::sync::watch::Receiver<Option
 
 /// Best-effort write of `session_end` to journal from the global guard.
 /// Safe to call from panic hooks and emergency paths (no async, no cloud).
+/// Idempotent: only the first call per session writes the event.
 fn emergency_session_end() {
-    if let Ok(guard) = PANIC_SESSION_GUARD.lock() {
-        if let Some(ref ctx) = *guard {
+    if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
+        if let Some(ref mut ctx) = *guard {
+            if ctx.end_written {
+                return;
+            }
+            ctx.end_written = true;
             let end_event =
                 session_journal::JournalEvent::session_end(Some(ctx.session_id.as_str()), ctx.turn);
             if let Ok(writer) = session_journal::JournalWriter::new(&ctx.session_id) {
@@ -57,6 +64,31 @@ fn emergency_session_end() {
             }
         }
     }
+}
+
+/// Attempt to write `session_end` from normal (graceful) exit paths.
+/// Returns `true` if this call wrote the event; `false` if already written.
+pub(crate) fn try_write_session_end(
+    journal: &session_journal::JournalWriter,
+    session_id: Option<&str>,
+    turn: u32,
+) -> bool {
+    if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
+        if let Some(ref mut ctx) = *guard {
+            // Only apply idempotency when the guard matches this session.
+            if session_id == Some(ctx.session_id.as_str()) {
+                if ctx.end_written {
+                    return false;
+                }
+                ctx.end_written = true;
+            }
+        }
+    } else {
+        return false; // poisoned lock
+    }
+    let end_event = session_journal::JournalEvent::session_end(session_id, turn);
+    let _ = journal.append(&end_event);
+    true
 }
 
 /// Install a panic hook that writes `session_end` to the local journal.
@@ -100,11 +132,13 @@ pub(crate) fn update_panic_guard(session_id: &str, turn: u32) {
         *guard = Some(PanicSessionGuard {
             session_id: session_id.to_string(),
             turn,
+            end_written: false,
         });
     }
 }
 
-/// Clear the panic guard (e.g., on graceful exit after session_end is already written).
+/// Clear the panic guard.
+/// Called on graceful exit after session_end is already written.
 pub(crate) fn clear_panic_guard() {
     if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
         *guard = None;
@@ -132,5 +166,36 @@ mod tests {
     fn shutdown_signal_labels_are_stable() {
         assert_eq!(ShutdownSignal::Sigterm.label(), "SIGTERM");
         assert_eq!(ShutdownSignal::Sighup.label(), "SIGHUP");
+    }
+
+    #[test]
+    fn try_write_session_end_is_idempotent() {
+        // Set up a guard so the idempotency flag is tracked.
+        update_panic_guard("idem-test", 1);
+
+        let temp = tempfile::tempdir().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+
+        let writer = astra_services::session_journal::JournalWriter::new("idem-test").unwrap();
+
+        let first = try_write_session_end(&writer, Some("idem-test"), 1);
+        let second = try_write_session_end(&writer, Some("idem-test"), 1);
+
+        assert!(first, "first call should succeed");
+        assert!(!second, "second call should be suppressed");
+
+        let content = std::fs::read_to_string(temp.path().join("idem-test.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly 1 session_end event should be written"
+        );
+
+        // Clean up global state for other tests.
+        clear_panic_guard();
     }
 }

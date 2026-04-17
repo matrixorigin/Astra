@@ -111,6 +111,9 @@ async fn slash_quit_writes_session_end_to_journal() {
     ));
 
     let sid = format!("test-quit-end-{}", uuid::Uuid::new_v4());
+    // Set the panic guard for this session so try_write_session_end works.
+    crate::session_guard::update_panic_guard(&sid, 1);
+
     let writer = session_journal::JournalWriter::new(&sid).unwrap();
     writer
         .append(&session_journal::JournalEvent::session_start(

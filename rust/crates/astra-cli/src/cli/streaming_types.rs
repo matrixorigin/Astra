@@ -115,6 +115,8 @@ pub(crate) struct StreamResult {
     pub(crate) routing_domain_hint: Option<String>,
     /// Entity graph skipped learning: success with tools but no routing domain.
     pub(crate) entity_learn_skipped_no_domain: bool,
+    /// Deferred context assembly trace: journal event is only written on turn commit.
+    pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
 }
 
 impl StreamResult {

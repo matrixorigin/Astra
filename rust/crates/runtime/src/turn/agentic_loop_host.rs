@@ -324,6 +324,10 @@ pub struct TelemetryState {
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
     /// Number of turns completed in this loop invocation (for tuning cycle trigger).
     pub completed_turns_for_tuning: u32,
+    /// Deferred context assembly trace: written here by `finalize_turn_trace` so
+    /// the journal event is only emitted when the turn actually commits (not on
+    /// aborts/retries), preventing ghost `context_assembly_recorded` events.
+    pub pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
 }
 
 #[derive(Clone, Debug)]

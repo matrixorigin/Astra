@@ -113,6 +113,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) memoria_ms: Option<u64>,
     pub(crate) routing_domain_hint: Option<String>,
     pub(crate) entity_learn_skipped_no_domain: bool,
+    pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
@@ -174,6 +175,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         memoria_ms,
         routing_domain_hint,
         entity_learn_skipped_no_domain,
+        pending_context_assembly_trace,
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
@@ -236,6 +238,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         memoria_ms,
         routing_domain_hint,
         entity_learn_skipped_no_domain,
+        pending_context_assembly_trace,
     }
 }
 
@@ -285,6 +288,7 @@ mod tests {
             memoria_ms: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
         }
     }
 

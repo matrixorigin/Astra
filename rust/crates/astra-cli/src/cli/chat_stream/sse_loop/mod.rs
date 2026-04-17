@@ -502,6 +502,7 @@ pub(crate) async fn stream_chat_sse(
             evaluation_persistence: None,
             context_trace_persistence: None,
             promotion_events: Vec::new(),
+            pending_context_assembly_trace: None,
         },
         skills: SkillState {
             registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
@@ -672,6 +673,7 @@ pub(crate) async fn stream_chat_sse(
         memoria_ms: state.telemetry.first_memoria_ms,
         routing_domain_hint: None,
         entity_learn_skipped_no_domain: false,
+        pending_context_assembly_trace: state.telemetry.pending_context_assembly_trace,
     }))
 }
 

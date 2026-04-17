@@ -551,7 +551,16 @@ impl ScenarioDetector {
     }
 
     /// Detect the most likely scenario.
+    ///
+    /// Requires at least 3 total observations (queries + tool uses) to avoid
+    /// spurious matches on trivial inputs where the confidence interval is
+    /// too wide to be meaningful.
     pub fn detect(&self) -> Option<(Scenario, ConfidenceInterval)> {
+        let total_observations = self.recent_queries.len() + self.recent_tools.len();
+        if total_observations < 3 {
+            return None;
+        }
+
         let scores = self.score_scenarios();
 
         // Find the highest scoring scenario above threshold
@@ -1189,5 +1198,36 @@ mod tests {
         let profile = manager.get_profile("user1");
         assert_eq!(profile.stats.total_queries, 1);
         assert_eq!(profile.stats.total_tool_calls, 1);
+    }
+
+    #[test]
+    fn scenario_detect_returns_none_below_min_observations() {
+        let mut det = ScenarioDetector::new();
+        // A single strong keyword should NOT trigger a detection.
+        det.observe_query("review pull request code changes");
+        assert!(
+            det.detect().is_none(),
+            "1 query + 0 tools < 3 observations → should return None"
+        );
+
+        det.observe_tool("bash");
+        assert!(
+            det.detect().is_none(),
+            "1 query + 1 tool < 3 observations → should return None"
+        );
+
+        // After 3 total observations, score_scenarios actually runs.
+        // Verify by checking that the internal score_scenarios produces
+        // results when we bypass the gate (unit test of the gating logic).
+        det.observe_query("check the diff for bugs");
+        let total = det.recent_queries.len() + det.recent_tools.len();
+        assert!(total >= 3, "should have at least 3 observations now");
+        // detect() now runs the scoring engine (may or may not exceed
+        // threshold, but it is no longer short-circuited).
+        let scores = det.score_scenarios();
+        assert!(
+            !scores.is_empty(),
+            "scoring engine should run with >= 3 observations"
+        );
     }
 }

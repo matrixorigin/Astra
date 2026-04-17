@@ -715,6 +715,7 @@ pub(crate) fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool 
 }
 
 /// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
+/// Emits structured journal events so the failure is observable in telemetry.
 fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option<PlanSpinner>) {
     if let Some(s) = plan_spinner.take() {
         s.stop_clear();
@@ -725,6 +726,48 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
     if let Some(mut h) = state.plan_handle.take() {
         while h.try_recv().is_some() {}
     }
+
+    // Emit structured failure events before clearing state.
+    if let Some(ref journal) = state.journal {
+        // 1. plan_progress with action=plan_failed
+        if let Some(ref plan) = state.executing_plan {
+            let goal = state.executing_plan_goal.as_deref().unwrap_or("unknown");
+            let total = plan.subtasks.len();
+            let done = plan
+                .subtasks
+                .iter()
+                .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Completed)
+                .count();
+            let event = astra_services::session_journal::JournalEvent::plan_progress(
+                state.session_id.as_deref(),
+                state.turn,
+                state
+                    .current_plan_subtask_id
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                goal,
+                "plan_failed",
+                plan.progress_pct(),
+                total,
+                done,
+            );
+            let _ = journal.append(&event);
+            super::repl_turn::enqueue_ingestion_pub(state, &event);
+        }
+        // 2. interruption_recorded for the crash
+        let interruption = astra_services::session_journal::JournalEvent::interruption_recorded(
+            state.session_id.as_deref(),
+            state.turn,
+            serde_json::json!({
+                "kind": "plan_executor_crash",
+                "reason": "Plan executor channel closed without terminal status",
+                "resumable": false,
+            }),
+        );
+        let _ = journal.append(&interruption);
+        super::repl_turn::enqueue_ingestion_pub(state, &interruption);
+    }
+
     state.executing_plan = None;
     state.current_plan_subtask_id = None;
     if let Some(tx) = state.pending_approval.take() {

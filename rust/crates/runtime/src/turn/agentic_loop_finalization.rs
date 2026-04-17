@@ -32,6 +32,11 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     } else {
         state.telemetry.first_budget_pressure
     };
+    // Update peak pressure so the turn/eval journal events record the actual
+    // final pressure, not the stale initial value from the first payload prep.
+    if budget_pressure > state.telemetry.first_budget_pressure {
+        state.telemetry.first_budget_pressure = budget_pressure;
+    }
     collector.record_token_budget(crate::turn::context_assembly_trace::TokenBudgetTrace {
         max_tokens: max as u32,
         total_used: measured as u32,
@@ -45,16 +50,11 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         crate::observability_integration::on_context_assembled(&mut guard, trace.clone());
     }
     if collector.has_data() {
-        if let Some(ref sid) = state.current_session_id
-            && let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid)
-        {
-            let event = astra_services::session_journal::JournalEvent::context_assembly_recorded(
-                Some(sid),
-                session_turn,
-                trace.to_json_value(),
-            );
-            let _ = writer.append(&event);
-        }
+        // Defer journal write to turn-commit path to prevent ghost assemblies.
+        // Store the trace data so the caller can emit `context_assembly_recorded`
+        // only when the turn actually commits (not on aborts/retries).
+        state.telemetry.pending_context_assembly_trace =
+            Some((session_turn, trace.to_json_value()));
     }
     persist_latest_context_trace_signal(state).await;
 }
@@ -626,9 +626,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-
         let mut state = make_state();
         let hub = crate::observability_integration::ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
@@ -650,11 +647,14 @@ mod tests {
         assert_eq!(session_guard.context_traces[0].turn_id, "turn-3");
         drop(session_guard);
 
-        let journal = std::fs::read_to_string(temp.path().join("s1.jsonl")).unwrap();
-        let event: serde_json::Value =
-            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
-        assert_eq!(event["turn"], 3);
-        assert_eq!(event["context_assembly_trace"]["turn_id"], "turn-3");
+        // Journal write is now deferred — verify the pending trace instead.
+        let (turn_num, trace_json) = state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .expect("pending_context_assembly_trace should be set");
+        assert_eq!(*turn_num, 3);
+        assert_eq!(trace_json["turn_id"], "turn-3");
     }
 
     #[tokio::test]

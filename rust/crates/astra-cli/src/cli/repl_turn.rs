@@ -966,6 +966,21 @@ fn commit_turn_journal_workspace_and_sidecars(
         }
         enqueue_ingestion(state, &turn_event);
 
+        // Emit deferred context_assembly_recorded — only on successful turn commit.
+        if let Some((turn_num, trace_json)) = &result.pending_context_assembly_trace {
+            let assembly_event = session_journal::JournalEvent::context_assembly_recorded(
+                state.session_id.as_deref(),
+                *turn_num,
+                trace_json.clone(),
+            );
+            if let Err(e) = journal.append(&assembly_event) {
+                astra_core::agent_warn!(
+                    "journal",
+                    "failed to write deferred context_assembly event: {e}"
+                );
+            }
+        }
+
         // Update workspace metadata per-turn
         if let Some(sid) = state.session_id.as_deref()
             && let Ok(mut ws) = astra_services::session_workspace::read_workspace(sid)
@@ -3333,6 +3348,7 @@ mod tests {
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
         }
     }
 

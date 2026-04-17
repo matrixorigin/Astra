@@ -32,16 +32,21 @@ pub fn record_first_selector_confidence(slot: &mut Option<f64>, confidence: f64)
     }
 }
 
-/// Persist the first non-empty selection report and its budget pressure for cross-turn edge hints.
+/// Persist the first non-empty selection report and track peak budget pressure.
+/// The selection report is captured once (first non-empty call); budget pressure
+/// is updated on every call, keeping the maximum observed value so that
+/// turn/eval journal events reflect actual peak pressure, not stale initial 0.0.
 pub fn capture_first_selection_report_if_empty(
     slot: &mut Option<SelectionReport>,
-    first_budget_pressure: &mut f64,
+    peak_budget_pressure: &mut f64,
     report: SelectionReport,
     budget_pressure: f64,
 ) {
     if slot.is_none() {
         *slot = Some(report);
-        *first_budget_pressure = budget_pressure;
+    }
+    if budget_pressure > *peak_budget_pressure {
+        *peak_budget_pressure = budget_pressure;
     }
 }
 
@@ -139,9 +144,28 @@ mod tests {
             budget_used: 2,
             budget_total: 10,
         };
+        // Report stays first; pressure updates to peak
         capture_first_selection_report_if_empty(&mut slot, &mut bp, r2, 0.9);
         assert_eq!(slot.as_ref().unwrap().tools_selected, vec!["a"]);
-        assert!((bp - 0.3).abs() < f64::EPSILON);
+        assert!(
+            (bp - 0.9).abs() < f64::EPSILON,
+            "should track peak pressure"
+        );
+    }
+
+    #[test]
+    fn peak_pressure_does_not_regress() {
+        let mut slot = None;
+        let mut bp = 0.0;
+        let r = SelectionReport {
+            tools_selected: vec!["a".into()],
+            selected_count: 1,
+            budget_used: 1,
+            budget_total: 10,
+        };
+        capture_first_selection_report_if_empty(&mut slot, &mut bp, r.clone(), 0.8);
+        capture_first_selection_report_if_empty(&mut slot, &mut bp, r.clone(), 0.5);
+        assert!((bp - 0.8).abs() < f64::EPSILON, "peak should not regress");
     }
 
     #[test]

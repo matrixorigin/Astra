@@ -21,12 +21,15 @@ use super::theme;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.
 pub(super) async fn finalize_session(state: &ReplState) {
-    // 1. Journal: session end event
+    // 1. Journal: session end event (idempotent — panic hook may have already written it)
     if let Some(ref j) = state.journal {
-        let end_event =
-            session_journal::JournalEvent::session_end(state.session_id.as_deref(), state.turn);
-        let _ = j.append(&end_event);
-        enqueue_ingestion_pub(state, &end_event);
+        let wrote =
+            super::session_guard::try_write_session_end(j, state.session_id.as_deref(), state.turn);
+        if wrote {
+            let end_event =
+                session_journal::JournalEvent::session_end(state.session_id.as_deref(), state.turn);
+            enqueue_ingestion_pub(state, &end_event);
+        }
     }
     // 2. Finalize workspace: persist compact summary + mark completed
     if state.turn > 0 {

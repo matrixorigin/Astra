@@ -1646,6 +1646,9 @@ mod tests {
         ));
 
         let sid = format!("test-exit-end-{}", uuid::Uuid::new_v4());
+        // Set the panic guard for this session so try_write_session_end works.
+        session_guard::update_panic_guard(&sid, 3);
+
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
             .append(&session_journal::JournalEvent::session_start(
