@@ -145,12 +145,7 @@ pub enum SkillDiff {
     Remove { marker: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum PatternAction {
-    Demote,
-    Boost,
-    Block,
-}
+pub use astra_pipeline::pattern::PatternAction;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EntityAction {

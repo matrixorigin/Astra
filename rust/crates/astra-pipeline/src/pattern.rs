@@ -33,7 +33,7 @@
 use super::routing::{DomainHint, TaskType};
 use std::collections::HashMap;
 
-/// Action to apply to a matched pattern during evolution.
+/// Evolution action that can modify pattern behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PatternAction {
     Demote,
