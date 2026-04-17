@@ -166,5 +166,6 @@ pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
 }
 pub mod routing_engine;
+pub mod tool_registry_plugin;
 pub mod turn_guard;
 pub mod ws_approval_gate;
