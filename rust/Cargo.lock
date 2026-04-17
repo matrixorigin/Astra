@@ -332,6 +332,7 @@ dependencies = [
  "astra-server-types",
  "astra-services",
  "astra-skills",
+ "astra-sync-adapters",
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",
@@ -464,6 +465,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-sync-adapters"
+version = "0.1.0"
+dependencies = [
+ "astra-evolution",
+ "astra-pipeline",
+ "astra-services",
+ "astra-text-utils",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "astra-text-utils"
 version = "0.1.0"
 dependencies = [
@@ -526,6 +541,7 @@ name = "astra-turn-core"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-messaging",
  "astra-pipeline",
  "astra-sandbox",
  "astra-services",
