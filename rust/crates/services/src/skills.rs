@@ -423,7 +423,7 @@ impl SkillService for DatabaseSkillService {
     async fn get_skill(
         &self,
         skill_id: String,
-        _version: Option<String>,
+        version: Option<String>,
     ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
@@ -440,17 +440,32 @@ impl SkillService for DatabaseSkillService {
 
         let row = if row.is_none() {
             let name = skill_id.split('@').next().unwrap_or(&skill_id);
-            query(
-                "SELECT skill_id, skill_name, version, description, \
-                 IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
-                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-                 FROM skills_registry WHERE skill_name = ? AND is_active = 1 \
-                 ORDER BY created_at DESC LIMIT 1",
-            )
-            .bind(name)
-            .fetch_optional(&pool)
-            .await
-            .map_err(internal_error)?
+            if let Some(version) = version.as_deref() {
+                query(
+                    "SELECT skill_id, skill_name, version, description, \
+                     IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                     FROM skills_registry WHERE skill_name = ? AND version = ? AND is_active = 1 \
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(name)
+                .bind(version)
+                .fetch_optional(&pool)
+                .await
+                .map_err(internal_error)?
+            } else {
+                query(
+                    "SELECT skill_id, skill_name, version, description, \
+                     IFNULL(CAST(skill_definition AS CHAR), 'null') AS definition_json, \
+                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+                     FROM skills_registry WHERE skill_name = ? AND is_active = 1 \
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(internal_error)?
+            }
         } else {
             row
         };

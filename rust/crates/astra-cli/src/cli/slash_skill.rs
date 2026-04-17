@@ -3037,7 +3037,7 @@ mod tests {
             let resp = serde_json::json!({
                 "results": [{
                     "skill_name": "my-skill",
-                    "version": "2.0.0",
+                    "version": "1.0.0",
                     "description": null,
                     "publisher_id": null,
                     "trust_tier": null,
@@ -3046,16 +3046,38 @@ mod tests {
                     "avg_quality": 0.0,
                     "total_installs": 0,
                     "active_users_7d": 0,
+                }, {
+                    "skill_name": "my-skill",
+                    "version": "2.0.0",
+                    "description": null,
+                    "publisher_id": null,
+                    "trust_tier": null,
+                    "category": null,
+                    "ranking_score": 0.4,
+                    "avg_quality": 0.0,
+                    "total_installs": 0,
+                    "active_users_7d": 0,
+                }, {
+                    "skill_name": "my-skill",
+                    "version": "1.5.0",
+                    "description": null,
+                    "publisher_id": null,
+                    "trust_tier": null,
+                    "category": null,
+                    "ranking_score": 0.6,
+                    "avg_quality": 0.0,
+                    "total_installs": 0,
+                    "active_users_7d": 0,
                 }],
-                "total": 1,
-                "limit": 1,
+                "total": 3,
+                "limit": 50,
                 "offset": 0,
             });
 
             Mock::given(method("GET"))
                 .and(path("/marketplace/search"))
                 .and(query_param("name", "my-skill"))
-                .and(query_param("limit", "1"))
+                .and(query_param("limit", "50"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
                 .expect(1)
                 .mount(&srv)
@@ -3129,9 +3151,11 @@ mod tests {
             assert_eq!(super::default_skill_category(None), "general");
             assert_eq!(super::default_skill_category(Some("")), "general");
             assert_eq!(super::default_skill_category(Some("   ")), "general");
-            assert_eq!(super::default_skill_category(Some("automation")), "automation");
+            assert_eq!(
+                super::default_skill_category(Some("automation")),
+                "automation"
+            );
         }
-
     }
 }
 
@@ -3939,7 +3963,10 @@ async fn fetch_marketplace_version(
     api: &astra_thin_client::ThinClient,
     tok: &str,
 ) -> Option<String> {
-    let query_pairs = vec![("name", skill_name.to_string()), ("limit", "1".to_string())];
+    let query_pairs = vec![
+        ("name", skill_name.to_string()),
+        ("limit", "50".to_string()),
+    ];
     match api
         .get_bearer_path_query_text(tok, "/marketplace/search", &query_pairs)
         .await
@@ -3949,7 +3976,17 @@ async fn fetch_marketplace_version(
                 astra_services::marketplace_stats::SkillSearchResponse,
             >(&text)
             {
-                resp.results.first().map(|r| r.version.clone())
+                resp.results
+                    .iter()
+                    .filter_map(|result| {
+                        result
+                            .version
+                            .parse::<astra_runtime::skills::version::Version>()
+                            .ok()
+                            .map(|version| (version, result.version.clone()))
+                    })
+                    .max_by(|(left, _), (right, _)| left.cmp(right))
+                    .map(|(_, version)| version)
             } else {
                 None
             }
