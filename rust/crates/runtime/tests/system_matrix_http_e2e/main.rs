@@ -62,7 +62,7 @@ mod journey_trusted_moi;
 
 use harness::require_system_e2e_env;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn product_matrix_api_journey_hits_multiple_tables() {
     require_system_e2e_env();
@@ -77,70 +77,70 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     b.ctx.pool.close().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_tasks_lease_and_db_assertions() {
     require_system_e2e_env();
     journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_chat_run_pause_resume_http() {
     require_system_e2e_env();
     journey_tasks_runs::run_chat_run_pause_resume_http().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_session_cancel_delete() {
     require_system_e2e_env();
     journey_extended::run_session_cancel_then_delete().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_chat_stream_session_info() {
     require_system_e2e_env();
     journey_extended::run_chat_stream_session_info_smoke().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_auth_session_negative_paths() {
     require_system_e2e_env();
     journey_extended::run_auth_and_session_negative_paths().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_memory_proxy_user_isolation() {
     require_system_e2e_env();
     journey_extended::run_memory_proxy_user_isolation().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_models_admin_crud() {
     require_system_e2e_env();
     journey_extended::run_models_admin_crud_with_db().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_audit_cross_session_analytics_http() {
     require_system_e2e_env();
     journey_audit_cross_session::run_audit_cross_session_analytics_http().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_trusted_moi_user_system_integration() {
     require_system_e2e_env();
     journey_trusted_moi::run_trusted_moi_user_system_integration().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_remote_skill_registration_user_system_integration() {
     require_system_e2e_env();

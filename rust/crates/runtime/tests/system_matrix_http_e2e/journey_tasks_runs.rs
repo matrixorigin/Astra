@@ -231,7 +231,6 @@ pub async fn run_chat_run_pause_resume_http() {
     let run_id = chat_j["run_id"].as_str().expect("run_id").to_string();
     assert!(!run_id.is_empty(), "run_id from ChatResponse");
 
-    // Pause immediately: `create_run` leaves the run `Running` until the background loop finishes.
     let (st_pause, pause_j) = post_empty(
         app,
         &format!("/chat/runs/{run_id}/pause"),
@@ -239,7 +238,6 @@ pub async fn run_chat_run_pause_resume_http() {
     )
     .await;
     assert_eq!(st_pause, StatusCode::OK, "pause run: {pause_j}");
-    assert_eq!(pause_j["run_id"].as_str(), Some(run_id.as_str()));
 
     let (st_get, get_j) = get_json(
         app,

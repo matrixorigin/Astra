@@ -76,6 +76,11 @@ cp -r .claude/skills/some-skill .astra/skills/some-skill
 | `review_changes` | Context-aware code review with git diffs + code intelligence |
 | `trace_delegation` | Trace multi-agent delegation flows and verification gates |
 | `verify_task` | Verify task completion using the 8-type verification engine |
+| **`github_ci_check`** | Check CI/CD status, analyze failures, diagnose root causes |
+| **`github_pre_pr`** | Pre-PR checklist: make check, format, clippy, tests |
+| **`github_create_pr`** | Create PRs with gh CLI, auto-generate body from changes |
+| **`github_create_issue`** | Create issues with gh CLI, structured templates |
+| **`github_pr_review`** | Review PR comments, address feedback, draft responses |
 
 ## Skill structure
 

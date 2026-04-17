@@ -86,8 +86,21 @@ fn build_server_skill_resolver(
         let registry = Arc::new(registry);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let r = Arc::clone(&registry);
-            let _ =
-                std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
+            // Production runs on a multi-thread runtime where block_in_place
+            // is available.  For single-thread runtimes (unit tests) we
+            // detect the runtime flavor first and use thread::scope as a
+            // fallback — safe only because unit tests never wire a
+            // DatabaseSkillProvider, so discover_all does no async I/O.
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
+                }
+                _ => {
+                    let _ = std::thread::scope(|s| {
+                        s.spawn(|| handle.block_on(r.discover_all())).join().ok()
+                    });
+                }
+            }
         }
         if registry.is_empty() {
             return (None, None);
@@ -1153,7 +1166,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
-
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
@@ -1171,8 +1183,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &session_id,
         )
         .await;
-
-        // ── Server-side tool execution (web-only mode) ─────────────────
         // When no edge tools are provided (no CLI connected), use the
         // already-provisioned workspace for the ServerToolExecutor.
         if let Some(workspace) = server_workspace {

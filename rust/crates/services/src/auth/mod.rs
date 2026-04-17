@@ -412,12 +412,10 @@ impl AuthService for DatabaseAuthService {
         request: AuthRegisterRequestData,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
         validate_register_request(&request)?;
-
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.ensure_default_roles(&pool)
             .await
             .map_err(internal_error)?;
-
         if self
             .fetch_user_by_username(&pool, &request.username)
             .await
@@ -441,8 +439,13 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
+        let bcrypt_cost = if cfg!(debug_assertions) {
+            4
+        } else {
+            bcrypt::DEFAULT_COST
+        };
         let password_hash =
-            bcrypt_hash(request.password.as_str(), bcrypt::DEFAULT_COST).map_err(internal_error)?;
+            bcrypt_hash(request.password.as_str(), bcrypt_cost).map_err(internal_error)?;
         let user_id = Uuid::new_v4().to_string();
         let display_name = request.display_name.clone();
 
