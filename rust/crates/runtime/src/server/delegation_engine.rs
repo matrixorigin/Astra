@@ -55,6 +55,8 @@ pub struct SubRunConfig {
     pub previous_output: Option<String>,
     /// Context key-value pairs from the delegation request.
     pub context: HashMap<String, serde_json::Value>,
+    /// Trusted forwarded headers propagated out-of-band for child remote skills.
+    pub forward_headers: HashMap<String, String>,
     /// Current nested agent/sub-run depth for the child loop.
     pub recursion_depth: u8,
     /// Cooperative pause flag — checked between turns by the sub-run loop.
@@ -77,6 +79,7 @@ impl std::fmt::Debug for SubRunConfig {
             .field("session_id", &self.session_id)
             .field("user_id", &self.user_id)
             .field("previous_output", &self.previous_output)
+            .field("forward_headers", &!self.forward_headers.is_empty())
             .field("recursion_depth", &self.recursion_depth)
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
@@ -1449,11 +1452,42 @@ impl DelegationEngine {
     ///
     /// `cancel_token` is scoped to this execution — no global state. When
     /// cancelled, all spawned sub-runs receive the signal and stop gracefully.
+    fn forward_headers_from_request_context(
+        context: &HashMap<String, serde_json::Value>,
+    ) -> HashMap<String, String> {
+        context
+            .get(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY)
+            .and_then(serde_json::Value::as_object)
+            .map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|v| (name.to_ascii_lowercase(), v.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn execute(
         &self,
         request: DelegationRequest,
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    ) -> Result<DelegationResult, String> {
+        let forward_headers = Self::forward_headers_from_request_context(&request.context);
+        self.execute_with_forward_headers(request, source_agent_id, cancel_token, forward_headers)
+            .await
+    }
+
+    pub async fn execute_with_forward_headers(
+        &self,
+        request: DelegationRequest,
+        source_agent_id: &str,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+        forward_headers: HashMap<String, String>,
     ) -> Result<DelegationResult, String> {
         // Validate first
         self.validate(&request, source_agent_id).await?;
@@ -1547,6 +1581,7 @@ impl DelegationEngine {
                     &request,
                     agent_ids,
                     aggregation,
+                    &forward_headers,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1562,6 +1597,7 @@ impl DelegationEngine {
                     &request,
                     &agent_ids,
                     false,
+                    &forward_headers,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1577,6 +1613,7 @@ impl DelegationEngine {
                     &request,
                     agent_ids,
                     *stop_on_success,
+                    &forward_headers,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1595,6 +1632,7 @@ impl DelegationEngine {
                     producer_id,
                     reviewer_id,
                     *max_rounds,
+                    &forward_headers,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1614,6 +1652,7 @@ impl DelegationEngine {
                     agent_id,
                     *max_turns,
                     aggregation,
+                    &forward_headers,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1681,6 +1720,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
+        forward_headers: &HashMap<String, String>,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -1807,6 +1847,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: None,
                 context: request.context.clone(),
+                forward_headers: forward_headers.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
@@ -2070,6 +2111,7 @@ impl DelegationEngine {
                                 user_id: uid,
                                 previous_output: None,
                                 context: ctx,
+                                forward_headers: forward_headers.clone(),
                                 recursion_depth: child_recursion_depth,
                                 pause_flag: None,
                                 checkpoint_gate: None,
@@ -2099,6 +2141,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         stop_on_success: bool,
+        forward_headers: &HashMap<String, String>,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2232,6 +2275,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: previous_output.clone(),
                 context: request.context.clone(),
+                forward_headers: forward_headers.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
@@ -2336,6 +2380,7 @@ impl DelegationEngine {
                         user_id: uid.clone(),
                         previous_output: prev.clone(),
                         context: ctx.clone(),
+                        forward_headers: forward_headers.clone(),
                         recursion_depth: child_recursion_depth,
                         pause_flag: None,
                         checkpoint_gate: None,
@@ -2372,6 +2417,7 @@ impl DelegationEngine {
         producer_id: &str,
         reviewer_id: &str,
         max_rounds: u32,
+        forward_headers: &HashMap<String, String>,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2512,6 +2558,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
+                forward_headers: forward_headers.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
@@ -2610,6 +2657,7 @@ impl DelegationEngine {
                         user_id: uid.clone(),
                         previous_output: prev.clone(),
                         context: ctx.clone(),
+                        forward_headers: forward_headers.clone(),
                         recursion_depth: child_recursion_depth,
                         pause_flag: None,
                         checkpoint_gate: None,
@@ -2710,6 +2758,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
+                forward_headers: forward_headers.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
@@ -2802,6 +2851,7 @@ impl DelegationEngine {
         agent_id: &str,
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
+        forward_headers: &HashMap<String, String>,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2937,6 +2987,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: None,
                 context: fork_context,
+                forward_headers: forward_headers.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
@@ -3907,6 +3958,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_with_forward_headers_passes_sensitive_headers_sideband() {
+        struct ForwardHeadersCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for ForwardHeadersCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let has_auth = config.forward_headers.contains_key("authorization");
+                let has_context_key = config.context.contains_key(
+                    crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY,
+                );
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!(
+                        "auth_present={has_auth};context_key_present={has_context_key}"
+                    )),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg,
+            engine,
+            tracker,
+            Arc::new(ForwardHeadersCheckExecutor),
+        );
+
+        let req = DelegationRequest {
+            delegation_id: "fh-test".into(),
+            parent_run_id: "p".into(),
+            task: "check headers".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de
+            .execute_with_forward_headers(
+                req,
+                "orch",
+                None,
+                HashMap::from([(
+                    "authorization".to_string(),
+                    "Bearer trusted-token".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.agent_results[0].output.as_deref(),
+            Some("auth_present=true;context_key_present=false")
+        );
+    }
+
+    #[tokio::test]
     async fn worktree_path_per_agent_flows_through_context() {
         /// Executor that captures the agent-specific worktree_path from context.
         struct WorktreeCheckExecutor;
@@ -3994,6 +4111,7 @@ mod tests {
             user_id: "u1".into(),
             previous_output: None,
             context: HashMap::new(),
+            forward_headers: HashMap::new(),
             recursion_depth: 1,
             pause_flag: None,
             checkpoint_gate: None,

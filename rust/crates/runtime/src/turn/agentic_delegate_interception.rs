@@ -264,19 +264,27 @@ pub(crate) fn parse_delegation_request(
     })
 }
 
+fn is_sensitive_delegation_context_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+    )
+}
+
 pub(crate) fn merge_forward_headers_into_delegation_context(
     context: &mut std::collections::HashMap<String, serde_json::Value>,
     forward_headers: &std::collections::HashMap<String, String>,
 ) {
     context.remove(FORWARD_HEADERS_CONTEXT_KEY);
-    if forward_headers.is_empty() {
-        return;
-    }
     let json_headers = serde_json::Map::from_iter(
         forward_headers
             .iter()
+            .filter(|(name, _)| !is_sensitive_delegation_context_header(name))
             .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone()))),
     );
+    if json_headers.is_empty() {
+        return;
+    }
     context.insert(
         FORWARD_HEADERS_CONTEXT_KEY.to_string(),
         serde_json::Value::Object(json_headers),
@@ -625,7 +633,15 @@ pub(crate) async fn partition_and_execute_delegations(
                                     .and_then(|v| v.as_str().map(String::from))
                                     .unwrap_or_else(|| format!("{s:?}").to_lowercase())
                             });
-                    match engine.execute(request, source_agent_id, None).await {
+                    match engine
+                        .execute_with_forward_headers(
+                            request,
+                            source_agent_id,
+                            None,
+                            forward_headers.clone(),
+                        )
+                        .await
+                    {
                         Ok(result) => {
                             let succeeded =
                                 result.status == "completed" || result.status == "success";
@@ -998,7 +1014,7 @@ mod tests {
         let headers = req.context[FORWARD_HEADERS_CONTEXT_KEY]
             .as_object()
             .expect("forward headers should be an object");
-        assert_eq!(headers["authorization"], "Bearer trusted-token");
+        assert!(!headers.contains_key("authorization"));
         assert_eq!(headers["x-workspace-id"], "ws-001");
     }
 

@@ -2048,7 +2048,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
-                forward_headers: forward_headers_from_delegation_context(&config.context),
+                forward_headers: if config.forward_headers.is_empty() {
+                    forward_headers_from_delegation_context(&config.context)
+                } else {
+                    config.forward_headers.clone()
+                },
                 ..Default::default()
             },
             cancellation: CancellationState {

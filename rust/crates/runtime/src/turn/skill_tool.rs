@@ -1458,6 +1458,7 @@ fn is_non_forwardable_header(name: &str) -> bool {
             | "proxy-connection"
             | "host"
             | "content-length"
+            | "content-type"
     )
 }
 

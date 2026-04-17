@@ -13,10 +13,10 @@ pub(super) async fn delegate_run_handler(
     Json(mut request): Json<DelegationRequest>,
 ) -> Result<Json<DelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
-    crate::turn::agentic_delegate_interception::merge_forward_headers_into_delegation_context(
-        &mut request.context,
-        &collect_forward_headers(&headers),
-    );
+    let forward_headers = collect_forward_headers(&headers);
+    request
+        .context
+        .remove(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -42,7 +42,7 @@ pub(super) async fn delegate_run_handler(
 
     // Execute the delegation.
     let result = engine
-        .execute(request, &source_agent_id, None)
+        .execute_with_forward_headers(request, &source_agent_id, None, forward_headers)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
