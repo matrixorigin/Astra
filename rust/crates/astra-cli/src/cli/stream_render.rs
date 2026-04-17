@@ -1498,31 +1498,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None
         };
 
-        if let Some(rollback) = self
-            .aborted_turn_rollback
-            .as_ref()
-            .map(|aborted| aborted.rollback.clone())
-        {
-            let output = Self::append_turn_rollback_note(
-                "Error: skipped because this turn already failed earlier and rollback_on_failure aborted later tool execution",
-                "was already aborted",
-                rollback.as_ref(),
-            );
-            if let Some(idx) = tool_idx {
-                self.render.tool_done(idx, tool, args, "error", 0, &output);
-            }
-            return self
-                .finish_edge_tool_with_fields(
-                    request_id,
-                    tool,
-                    args,
-                    output,
-                    Self::merge_turn_rollback_fields(None, "aborted", rollback),
-                    "error".to_string(),
-                    0,
-                )
-                .await;
-        }
+        // NOTE: We no longer block subsequent tools when a prior tool triggered rollback.
+        // The agent sees the error and can decide whether to continue or abort.
+        // This allows more flexible recovery strategies.
 
         if !self.turn_rollback_boundary_emitted
             && let Some(active) = self.active_turn_rollback.clone()
