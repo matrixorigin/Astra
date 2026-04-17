@@ -238,6 +238,7 @@ name = "astra-evolution"
 version = "0.1.0"
 dependencies = [
  "astra-pipeline",
+ "astra-services",
  "astra-turn-core",
  "serde",
  "serde_json",
