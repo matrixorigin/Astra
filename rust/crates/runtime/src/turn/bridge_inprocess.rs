@@ -2963,11 +2963,13 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     );
                 }
                 if let Some(tt) = task_type {
-                    hook_payload
+                    if let Some(m) = hook_payload
                         .entry("routing_meta".to_string())
                         .or_insert_with(|| json!({}))
                         .as_object_mut()
-                        .map(|m| m.insert("task_type".to_string(), json!(tt)));
+                    {
+                        m.insert("task_type".to_string(), json!(tt));
+                    }
                 }
                 crate::bridge::side_effects::run_bridge_hook_side_effects(
                     Some(Value::Object(hook_payload)),
