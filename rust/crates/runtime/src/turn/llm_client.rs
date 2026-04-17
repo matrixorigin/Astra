@@ -31,6 +31,11 @@ use crate::prompts;
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
+/// Extended delay for TPM (tokens per minute) exhaustion (60 seconds).
+/// TPM limits typically reset after 60 seconds, so we wait longer.
+const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
+/// Maximum retries for TPM exhaustion (longer recovery period).
+const TPM_MAX_RETRIES: u32 = 5;
 /// TCP connect timeout for LLM API requests (seconds). Override: `MO_LLM_CONNECT_TIMEOUT_S`.
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
 /// Non-stream fallback hard timeout (seconds). Override: `MO_LLM_FALLBACK_TIMEOUT_S`.
@@ -136,6 +141,17 @@ pub(crate) fn is_context_window_error(lower: &str) -> bool {
         || lower.contains("input is too long")
         || lower.contains("context window")
         || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
+}
+
+/// Detect TPM (tokens per minute) exhaustion errors.
+///
+/// TPM errors require longer wait times because they indicate the account-level
+/// token quota has been exhausted. These typically reset after 60 seconds.
+fn is_tpm_exhaustion(error_text: &str) -> bool {
+    let lower = error_text.to_lowercase();
+    (lower.contains("tpm") && (lower.contains("exceed") || lower.contains("limit")))
+        || lower.contains("tokens per minute")
+        || lower.contains("rate limit exceeded") && lower.contains("token")
 }
 
 /// Collected result from a single LLM streaming call.
@@ -309,7 +325,20 @@ pub(crate) async fn call_llm_and_collect(
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
-    for attempt in 0..=LLM_MAX_RETRIES {
+    let mut tpm_exhaustion_detected = false;
+    let max_retries = LLM_MAX_RETRIES;
+
+    for attempt in 0..=max_retries {
+        // Extend retries if TPM exhaustion was detected (account-level limit)
+        let effective_max = if tpm_exhaustion_detected {
+            TPM_MAX_RETRIES
+        } else {
+            max_retries
+        };
+        if attempt > effective_max {
+            break;
+        }
+
         if cancel.is_triggered() {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Cancelled,
@@ -327,7 +356,21 @@ pub(crate) async fn call_llm_and_collect(
             ));
         }
         if attempt > 0 {
-            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
+            // Use longer delay for TPM exhaustion (60s) vs standard exponential (1s, 2s, 4s)
+            let delay = if tpm_exhaustion_detected {
+                TPM_EXHAUST_DELAY_MS
+            } else {
+                LLM_RETRY_BASE_MS * (1 << (attempt - 1))
+            };
+            if tpm_exhaustion_detected {
+                astra_core::agent_warn!(
+                    "llm",
+                    "TPM exhaustion detected, waiting {}s before retry {}/{}",
+                    delay / 1000,
+                    attempt,
+                    TPM_MAX_RETRIES
+                );
+            }
             tokio::select! {
                 biased;
                 _ = wait_llm_cancel(cancel) => return Err(astra_core::ClassifiedError::new(
@@ -431,6 +474,18 @@ pub(crate) async fn call_llm_and_collect(
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
             last_kind = astra_core::ErrorKind::RateLimit;
+
+            // Detect TPM exhaustion for extended retry behavior
+            if is_tpm_exhaustion(&text) && !tpm_exhaustion_detected {
+                tpm_exhaustion_detected = true;
+                astra_core::agent_warn!(
+                    "llm",
+                    "TPM exhaustion detected on {} — extending retry with {}s cooldown",
+                    model_key,
+                    TPM_EXHAUST_DELAY_MS / 1000
+                );
+            }
+
             let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
             astra_core::agent_warn!(
                 "llm",
@@ -439,7 +494,13 @@ pub(crate) async fn call_llm_and_collect(
                 action,
             );
             if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, cancel).await?;
+                // For TPM exhaustion, use longer delay
+                let actual_delay = if tpm_exhaustion_detected {
+                    delay_ms.max(TPM_EXHAUST_DELAY_MS)
+                } else {
+                    delay_ms
+                };
+                sleep_ms_or_llm_cancel(actual_delay, cancel).await?;
             }
             continue;
         }
@@ -492,9 +553,14 @@ pub(crate) async fn call_llm_and_collect(
         return Err(astra_core::ClassifiedError::new(last_kind, last_err));
     }
 
+    let retries_used = if tpm_exhaustion_detected {
+        TPM_MAX_RETRIES
+    } else {
+        LLM_MAX_RETRIES
+    };
     Err(astra_core::ClassifiedError::new(
         last_kind,
-        format!("{last_err} (after {} retries)", LLM_MAX_RETRIES),
+        format!("{last_err} (after {} retries)", retries_used),
     ))
 }
 
@@ -1148,6 +1214,20 @@ mod tests {
         assert!(!is_context_window_error("rate limit exceeded"));
         assert!(!is_context_window_error("internal server error"));
         assert!(!is_context_window_error(""));
+    }
+
+    #[test]
+    fn is_tpm_exhaustion_detects_patterns() {
+        // TPM (tokens per minute) exhaustion patterns
+        assert!(is_tpm_exhaustion("endpoint TPM exceeded"));
+        assert!(is_tpm_exhaustion("TPM limit exceeded for this endpoint"));
+        assert!(is_tpm_exhaustion("tokens per minute limit reached"));
+        assert!(is_tpm_exhaustion("Rate limit exceeded: token quota exhausted"));
+        // Negative cases - regular rate limits (not TPM)
+        assert!(!is_tpm_exhaustion("rate limit exceeded"));
+        assert!(!is_tpm_exhaustion("too many requests"));
+        assert!(!is_tpm_exhaustion("429 quota exceeded"));
+        assert!(!is_tpm_exhaustion(""));
     }
 
     #[test]
