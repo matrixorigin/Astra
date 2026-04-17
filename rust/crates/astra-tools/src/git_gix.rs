@@ -804,7 +804,18 @@ pub fn git_show(
         });
     }
 
-    truncate_show_at(out, limit)
+    let mut result = truncate_show_at(out, limit);
+
+    // When viewing many per-file diffs from the same commit, nudge the model
+    // to wrap up early rather than exhausting the aggregate budget.
+    if file_filter.is_some() && aggregate_bytes > super::AGGREGATE_SOFT_LIMIT / 2 {
+        result.push_str(
+            "\n[hint: aggregate output is high — finish reviewing with the files \
+             already read, or use stat_only:true to prioritize remaining files]",
+        );
+    }
+
+    result
 }
 
 fn truncate_show_at(out: String, limit: usize) -> String {
@@ -2723,6 +2734,33 @@ mod tests {
         );
         // If README.md was changed in HEAD, it should appear; otherwise no diff lines
         assert!(result.contains("commit "), "should show header: {result}");
+    }
+
+    #[test]
+    fn git_show_with_file_appends_hint_when_aggregate_high() {
+        let root = repo_root();
+        // aggregate_bytes above AGGREGATE_SOFT_LIMIT / 2 (60_000) with file filter
+        let result = git_show(
+            &root,
+            &json!({"commit": "HEAD", "file": "README.md"}),
+            0.0,
+            65_000,
+        );
+        assert!(
+            result.contains("[hint: aggregate output is high"),
+            "should append aggregate hint when file filter + high aggregate: {result}"
+        );
+    }
+
+    #[test]
+    fn git_show_without_file_no_hint_even_when_aggregate_high() {
+        let root = repo_root();
+        // No file filter — hint should NOT appear even when aggregate is high
+        let result = git_show(&root, &json!({"commit": "HEAD"}), 0.0, 65_000);
+        assert!(
+            !result.contains("[hint: aggregate output is high"),
+            "should NOT append hint without file filter: {result}"
+        );
     }
 
     // ─── git_blame enhanced tests ───────────────────────────────────────────

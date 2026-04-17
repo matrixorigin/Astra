@@ -4127,9 +4127,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 ),
             ),
             tool_record(
-                "bash",
+                "(surgically_removed)",
                 false,
-                Some("Skipped: the skill already completed this work. Do NOT call `bash` again."),
+                Some("(removed from context — skill covered this work)"),
             ),
             tool_record(
                 "read_file",
@@ -6838,6 +6838,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Regression: session 746b6423 — skill produced a full code review
         // but 18 deferred tool calls were re-executed in the next iteration,
         // causing 3x token waste.
+        //
+        // After surgery fix: intercepted non-skill calls are stripped entirely
+        // from the assistant message and tool results — no token cost at all.
         let mut resolver = StubSkillResolver::new();
         // Simulate a skill that produces substantial output (like a code review).
         // The formatted result includes "# Skill: ..." header (~120 chars) + instructions.
@@ -6851,7 +6854,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 100,
                 50,
             ),
-            // Iteration 2: LLM sees "Skipped" messages, produces final text
+            // Iteration 2: LLM sees skill output only, produces final text
             text_result("Final answer from skill output.", 200, 100, None),
         ];
 
@@ -6865,8 +6868,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // The deferred calls should have "Skipped" messages (not "Deferred")
-        // because the skill produced substantial output (>200 chars).
+        // Surgery: call_rf1 and call_rf2 should NOT appear in messages at all —
+        // not as tool_call objects in the assistant message, and not as tool results.
         let rf1_msgs: Vec<&Value> = state
             .messages
             .iter()
@@ -6874,18 +6877,69 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .collect();
         assert_eq!(
             rf1_msgs.len(),
-            1,
-            "expected exactly one tool result for call_rf1"
+            0,
+            "call_rf1 should be surgically removed from messages, found: {rf1_msgs:?}"
         );
-        let content = rf1_msgs[0]["content"].as_str().unwrap();
+        let rf2_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_rf2"))
+            .collect();
+        assert_eq!(
+            rf2_msgs.len(),
+            0,
+            "call_rf2 should be surgically removed from messages, found: {rf2_msgs:?}"
+        );
+
+        // The assistant message from iteration 1 should only contain the skill
+        // tool_call — not call_rf1 or call_rf2.
+        let assistant_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .filter(|m| m.get("tool_calls").is_some())
+            .collect();
+        for msg in &assistant_msgs {
+            if let Some(tool_calls) = msg["tool_calls"].as_array() {
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                    assert!(
+                        id != "call_rf1" && id != "call_rf2",
+                        "assistant message should not contain surgically removed tool_call: {id}"
+                    );
+                }
+            }
+        }
+
+        // The skill result should mention the dropped calls.
+        let skill_result_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
+            .collect();
+        assert!(!skill_result_msgs.is_empty(), "skill tool result should exist");
+        let skill_content = skill_result_msgs[0]["content"].as_str().unwrap_or("");
         assert!(
-            content.contains("Skipped"),
-            "expected 'Skipped' message for deferred call when skill produced output, got: {content}"
+            skill_content.contains("parallel tool call(s) were dropped"),
+            "skill result should note the surgically removed calls, got: {skill_content}"
         );
-        assert!(
-            content.contains("Do NOT call"),
-            "should tell LLM not to re-invoke, got: {content}"
+
+        // Stall detector should still have records for the removed calls.
+        let removed_records: Vec<_> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| r.name == "(surgically_removed)")
+            .collect();
+        assert_eq!(
+            removed_records.len(),
+            2,
+            "expected 2 surgically_removed stall records, got {}",
+            removed_records.len()
         );
+        for r in &removed_records {
+            assert!(!r.ok, "surgically_removed records should have ok=false");
+        }
 
         // skill_produced_output flag should be set
         assert!(
@@ -6893,9 +6947,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "skill_produced_output flag should be set when skill produces substantial output"
         );
 
-        // Soft constraint: deferred tools should NOT be hard-restricted — the soft
-        // prompt is sufficient, and hard-restricting prevents legitimate re-use with
-        // different arguments in later iterations.
+        // Soft constraint: deferred tools should NOT be hard-restricted
         assert!(
             !state.restricted_tools.contains("read_file"),
             "read_file should not be hard-restricted — soft prompt is the constraint"
