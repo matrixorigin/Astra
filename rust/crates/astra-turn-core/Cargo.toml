@@ -11,6 +11,7 @@ astra-sandbox.workspace = true
 astra-services.workspace = true
 astra-text-utils.workspace = true
 astra-thin-client.workspace = true
+astra-tools = { path = "../astra-tools" }
 astra-turn-types.workspace = true
 async-trait = { workspace = true }
 axum = { workspace = true }

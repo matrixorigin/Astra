@@ -549,6 +549,7 @@ dependencies = [
  "astra-services",
  "astra-text-utils",
  "astra-thin-client",
+ "astra-tools",
  "astra-turn-types",
  "async-trait",
  "axum",
