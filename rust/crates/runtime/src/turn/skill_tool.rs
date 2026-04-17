@@ -1407,10 +1407,13 @@ const REMOTE_SKILL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 fn remote_skill_http_client() -> &'static reqwest::Client {
     static REMOTE_SKILL_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     REMOTE_SKILL_HTTP.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        // In test mode, skip any system proxy so localhost requests work
+        // even when http_proxy/https_proxy is set without a no_proxy entry.
+        if cfg!(test) {
+            builder = builder.no_proxy();
+        }
+        builder.build().unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 

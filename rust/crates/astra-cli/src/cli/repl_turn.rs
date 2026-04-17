@@ -381,6 +381,55 @@ pub(super) async fn handle_chat_input(
                     }
                 }
 
+                // ── 401 auth error: attempt silent token refresh + retry ──
+                if is_auth_error(&failure.error) {
+                    use crossterm::style::Stylize;
+                    eprintln!("{}", "  Token expired, attempting refresh…".yellow());
+                    if repl_runtime::attempt_token_refresh(ctx.api, ctx.profile).await {
+                        if let Some(new_token) = repl_runtime::current_access_token(ctx.profile) {
+                            eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
+                            match run_chat_turn(
+                                state,
+                                &ctx,
+                                &new_token,
+                                &effective_line,
+                                session_id.as_deref(),
+                            )
+                            .await
+                            {
+                                TurnAttempt::Interrupted => {
+                                    state.last_turn_interrupted = true;
+                                    return Ok(());
+                                }
+                                TurnAttempt::Completed(result) => match *result {
+                                    Ok(result) => {
+                                        apply_turn_success(
+                                            state,
+                                            ctx.selector,
+                                            ctx.profile,
+                                            &line,
+                                            result,
+                                            turn_start,
+                                        );
+                                        return Ok(());
+                                    }
+                                    Err(retry_failure) => {
+                                        report_turn_failure(
+                                            state,
+                                            ctx.profile,
+                                            &line,
+                                            &retry_failure,
+                                            turn_start,
+                                        );
+                                        return Ok(());
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    // Refresh failed — fall through to report original failure.
+                }
+
                 report_turn_failure(state, ctx.profile, &line, &failure, turn_start);
             }
         },
@@ -1615,6 +1664,14 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
 }
 
 /// Report a turn failure with enriched partial data from the agentic loop.
+/// Detect 401 / credential-expired errors from a turn failure message.
+pub(super) fn is_auth_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    error.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("could not validate credentials")
+}
+
 fn report_turn_failure(
     state: &mut ReplState,
     profile: Option<&str>,
@@ -1622,11 +1679,7 @@ fn report_turn_failure(
     failure: &crate::TurnFailure,
     turn_start: Instant,
 ) {
-    let lower = failure.error.to_lowercase();
-    if failure.error.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("could not validate credentials")
-    {
+    if is_auth_error(&failure.error) {
         eprintln!("{}", "  Session expired. Run /login to refresh.".yellow());
     } else {
         eprintln!(

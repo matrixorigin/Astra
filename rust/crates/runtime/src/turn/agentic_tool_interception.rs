@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use astra_services::session_journal::ToolCallRecord;
@@ -24,7 +24,10 @@ pub(crate) async fn prepare_intercepted_tool_round(
         super::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls).into_owned();
     let (mut pre_resolved_results, post_send_tool_calls) =
         intercept_send_message_calls(state, &tool_calls).await;
-    let skill_results = intercept_skill_calls(state, &post_send_tool_calls).await;
+    let SkillInterceptionResult {
+        results: skill_results,
+        surgically_removed_ids,
+    } = intercept_skill_calls(state, &post_send_tool_calls).await;
 
     for result in &skill_results {
         pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
@@ -45,9 +48,39 @@ pub(crate) async fn prepare_intercepted_tool_round(
         });
     }
 
+    // Record surgically removed calls in telemetry (ok=false so stall detector
+    // counts them correctly) but do NOT add to pre_resolved_results.
+    for id in &surgically_removed_ids {
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "(surgically_removed)".to_string(),
+            ok: false,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(0),
+            args_preview: Some(id.clone()),
+            result_preview: Some("(removed from context — skill covered this work)".to_string()),
+            file_path: None,
+        });
+    }
+
     if !state.skill_produced_output && skill_results.iter().any(|r| r.result.len() > 500) {
         state.skill_produced_output = true;
     }
+
+    // Surgery: strip tool_calls whose IDs are in surgically_removed_ids.
+    // These calls will NOT appear in the assistant message or need tool results.
+    let tool_calls = if surgically_removed_ids.is_empty() {
+        tool_calls
+    } else {
+        tool_calls
+            .into_iter()
+            .filter(|tc| {
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                !surgically_removed_ids.contains(id)
+            })
+            .collect()
+    };
 
     let edge_tool_round = if delegation_intercepted {
         turn_result
@@ -123,12 +156,23 @@ async fn intercept_send_message_calls(
     (msg_results, remaining)
 }
 
+/// Result of skill interception. `results` are pre-resolved tool results to
+/// feed back to the model. `surgically_removed_ids` are tool_call IDs that
+/// should be stripped from the assistant message entirely (no tool result needed).
+struct SkillInterceptionResult {
+    results: Vec<crate::turn::skill_tool::InterceptedToolResult>,
+    surgically_removed_ids: HashSet<String>,
+}
+
 async fn intercept_skill_calls(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
-) -> Vec<crate::turn::skill_tool::InterceptedToolResult> {
+) -> SkillInterceptionResult {
     let Some(resolver) = state.skills.resolver.as_ref() else {
-        return Vec::new();
+        return SkillInterceptionResult {
+            results: Vec::new(),
+            surgically_removed_ids: HashSet::new(),
+        };
     };
 
     let skill_ctx = build_skill_context(state);
@@ -214,38 +258,63 @@ async fn intercept_skill_calls(
         .iter()
         .any(|tc| crate::turn::skill_tool::is_skill_call(tc));
     skill_results.extend(sr);
+    let mut surgically_removed_ids = HashSet::new();
     if new_skills_fired && !remaining.is_empty() {
         let skill_produced_output = skill_results.iter().any(|r| r.result.len() > 500);
         let dropped_count = remaining.len();
-        for tc in &remaining {
-            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-            let tool_name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let msg = if skill_produced_output {
-                format!(
-                    "Skipped: the skill already completed this work. \
-                     Do NOT call `{}` again — use the skill output above as your answer.",
-                    tool_name
-                )
-            } else {
-                format!(
+
+        if skill_produced_output {
+            // Surgery: remove intercepted tool_calls from the assistant message
+            // entirely. This saves ~100 tokens per call in EVERY subsequent LLM
+            // round (the assistant message is replayed as context each time).
+            // We still record them in stall.tool_call_records for telemetry.
+            let tool_names: Vec<&str> = remaining
+                .iter()
+                .filter_map(|tc| {
+                    tc.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .collect();
+            for tc in &remaining {
+                let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                surgically_removed_ids.insert(call_id.to_string());
+            }
+            // Append a note to the skill result so the model knows what was dropped.
+            if let Some(skill_result) = skill_results.iter_mut().find(|r| r.result.len() > 500) {
+                skill_result.result.push_str(&format!(
+                    "\n\n[{} parallel tool call(s) were dropped: [{}]. \
+                     The skill output above is your complete context — do NOT re-invoke \
+                     these tools.]",
+                    dropped_count,
+                    tool_names.join(", ")
+                ));
+            }
+        } else {
+            // Skill output was short — keep deferred calls in the conversation
+            // so the model can decide whether to retry each one.
+            for tc in &remaining {
+                let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                let tool_name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let msg = format!(
                     "Deferred: skill was invoked in this turn. Read the skill \
                      instructions above, then decide whether to call `{}` again.",
                     tool_name
-                )
-            };
-            skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
-                tool_call_id: call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                result: msg,
-                verification_summary: None,
-            });
+                );
+                skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
+                    tool_call_id: call_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    result: msg,
+                    verification_summary: None,
+                });
+            }
         }
         let verb = if skill_produced_output {
-            "skipped"
+            "surgically removed"
         } else {
             "deferred"
         };
@@ -270,7 +339,10 @@ async fn intercept_skill_calls(
         state.skills.sandbox_policy = act.sandbox_policy;
     }
 
-    skill_results
+    SkillInterceptionResult {
+        results: skill_results,
+        surgically_removed_ids,
+    }
 }
 
 fn build_skill_context(state: &AgenticLoopState) -> crate::turn::skill_tool::SkillContext {
