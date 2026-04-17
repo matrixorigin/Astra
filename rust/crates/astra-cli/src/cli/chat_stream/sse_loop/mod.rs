@@ -365,14 +365,12 @@ pub(crate) async fn stream_chat_sse(
         if reg_arc.is_empty() {
             let _ = reg_arc.discover_all().await;
         }
-        let inner_resolver = Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
-        let adapter =
-            astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
-        let skills = adapter.available_skills();
+        let resolver = Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(reg_arc));
+        let skills = resolver.available_skills();
         if skills.is_empty() {
             None
         } else {
-            Some(Arc::new(adapter) as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
+            Some(resolver as Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
         }
     };
 

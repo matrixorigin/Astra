@@ -91,6 +91,21 @@ pub struct SkillToolInfo {
     pub triggers: Vec<String>,
 }
 
+impl Default for SkillToolInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            when_to_use: None,
+            source: super::manifest::SkillSourceKind::Local,
+            aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            triggers: Vec::new(),
+        }
+    }
+}
+
 /// A fully resolved skill ready for execution.
 #[derive(Clone, Debug)]
 pub struct ResolvedSkill {

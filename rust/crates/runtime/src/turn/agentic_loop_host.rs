@@ -2167,7 +2167,10 @@ pub(crate) mod tests {
     }
 
     impl crate::turn::skill_tool::SkillResolver for StubSkillResolver {
-        fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
+        fn resolve(
+            &self,
+            name: &str,
+        ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
             self.skills
                 .iter()
                 .find(|(n, _, _, _, _)| n == name)
@@ -2196,7 +2199,9 @@ pub(crate) mod tests {
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     },
                 )
-                .ok_or_else(|| format!("unknown skill: {name}"))
+                .ok_or_else(|| {
+                    crate::skills::SkillError::NotFound(format!("unknown skill: {name}"))
+                })
         }
 
         fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {

@@ -21,10 +21,10 @@
 //! New execution modes implement [`traits::SkillExecutor`].
 //! The registry and resolver are trait-based to allow composition.
 //!
-//! # Backward Compatibility
+//! # Type Unification
 //!
-//! The existing `turn::skill_tool::SkillResolver` trait is bridged via
-//! [`registry::LegacySkillResolverAdapter`].
+//! `turn::skill_tool::{SkillResolver, ResolvedSkill, SkillToolInfo}` are re-exported
+//! from `astra_skills::traits` to avoid duplicate definitions.
 
 // Re-export core skill types from astra-skills crate.
 // These are the standalone, service-independent types.

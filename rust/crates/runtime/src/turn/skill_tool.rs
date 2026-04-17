@@ -44,41 +44,9 @@ use crate::skills::manifest::{
 };
 use crate::skills::traits::{SkillExecutionContext, SkillExecutor};
 
-// ─── Skill resolution trait ──────────────────────────────────────────────────
+// ─── Skill resolution types (re-exported from astra_skills) ──────────────────
 
-/// Lightweight description of a skill for tool schema generation.
-#[derive(Clone, Debug)]
-pub struct SkillToolInfo {
-    pub name: String,
-    pub description: String,
-    /// Natural-language hint for when the model should pick this skill.
-    pub when_to_use: Option<String>,
-    /// Where this skill was loaded from (bundled skills get priority in budget).
-    pub source: SkillSourceKind,
-    /// Alternative names for this skill.
-    pub aliases: Vec<String>,
-    /// Optional category from manifest (e.g. `code-review`).
-    pub category: Option<String>,
-    /// Free-form tags from manifest.
-    pub tags: Vec<String>,
-    /// Trigger phrases / keywords from manifest.
-    pub triggers: Vec<String>,
-}
-
-impl Default for SkillToolInfo {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            description: String::new(),
-            when_to_use: None,
-            source: SkillSourceKind::Local,
-            aliases: Vec::new(),
-            category: None,
-            tags: Vec::new(),
-            triggers: Vec::new(),
-        }
-    }
-}
+pub use astra_skills::traits::{ResolvedSkill, SkillResolver, SkillToolInfo};
 
 // ─── Skill context ───────────────────────────────────────────────────────────
 
@@ -182,62 +150,6 @@ pub struct InvokedSkill {
     pub content: String,
     /// Turn number when the skill was first invoked.
     pub invoked_at_turn: u32,
-}
-
-/// A fully resolved skill ready for execution.
-#[derive(Clone, Debug)]
-pub struct ResolvedSkill {
-    pub name: String,
-    pub instructions: String,
-    /// Model override (e.g. `"claude-sonnet-4-20250514"`).
-    pub model: Option<String>,
-    /// Token budget (0 or None = system default).
-    pub max_tokens: Option<u32>,
-    /// Tool allowlist (empty = all tools).
-    pub allowed_tools: Vec<String>,
-    /// Execution context — inline (inject into conversation) or fork (sub-agent).
-    pub execution_context: ExecutionContext,
-    /// Lifecycle hooks (pre/post invocation).
-    pub hooks: crate::skills::hooks::SkillHooks,
-    /// Skill directory path for `${SKILL_DIR}` substitution.
-    pub skill_dir: Option<String>,
-    /// Where this skill was loaded from. Used for security sandboxing
-    /// (e.g. MCP skills cannot run inline shell or hooks).
-    pub source: SkillSourceKind,
-    /// Machine-executable success criteria (empty = no verification).
-    pub success_criteria: Vec<astra_services::VerificationCriterion>,
-    /// Composition metadata (None = not declared, treated as non-composable in nested context).
-    pub composition: Option<crate::skills::manifest::SkillComposition>,
-    /// Input schema for argument validation (JSON Schema subset).
-    pub input_schema: Option<Value>,
-    /// Output schema for execution-result validation (JSON Schema subset).
-    pub output_schema: Option<Value>,
-    /// Remote execution endpoint. When set, runtime dispatches over HTTP.
-    pub remote_url: Option<String>,
-    /// Header names to forward from inbound request headers to remote callback.
-    pub forward_headers: Vec<String>,
-    /// Header names required to be present before remote callback is attempted.
-    pub required_headers: Vec<String>,
-    /// Alternative names for this skill.
-    pub aliases: Vec<String>,
-    /// Effort level hint for reasoning depth.
-    pub effort: Option<crate::skills::manifest::EffortLevel>,
-    /// Agent type for fork execution (e.g. "general-purpose").
-    pub agent_type: Option<String>,
-    /// Trust tier — determines sandbox policy during execution.
-    pub trust_tier: crate::skills::manifest::TrustTier,
-}
-
-/// Trait for resolving skill names to instructions.
-///
-/// Implementations live in host crates (astra-cli, server) since the runtime
-/// crate cannot depend on them.
-pub trait SkillResolver: Send + Sync {
-    /// Resolve a skill by name, loading instructions if needed.
-    fn resolve(&self, name: &str) -> Result<ResolvedSkill, String>;
-
-    /// List available skills for schema generation.
-    fn available_skills(&self) -> Vec<SkillToolInfo>;
 }
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
@@ -2006,12 +1918,8 @@ fn execute_skill<'a>(
                                     let verifier =
                                         crate::skills::verify::SkillVerifier::new(work_dir);
                                     let mut manifest = SkillManifest::default();
-                                    // Convert VerificationCriterion to serde_json::Value
-                                    manifest.success_criteria = skill
-                                        .success_criteria
-                                        .iter()
-                                        .filter_map(|c| serde_json::to_value(c).ok())
-                                        .collect();
+                                    // success_criteria is already Vec<serde_json::Value>
+                                    manifest.success_criteria = skill.success_criteria.clone();
                                     let (all_passed, results) = verifier.verify(&manifest).await;
 
                                     let mut output = result.output;
@@ -2202,7 +2110,7 @@ mod tests {
     }
 
     impl SkillResolver for StubResolver {
-        fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+        fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
             self.skills
                 .iter()
                 .find(|(n, _, _)| n == name)
@@ -2229,7 +2137,9 @@ mod tests {
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 })
-                .ok_or_else(|| format!("Unknown skill: {name}"))
+                .ok_or_else(|| {
+                    crate::skills::SkillError::NotFound(format!("unknown skill: {name}"))
+                })
         }
 
         fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -2533,7 +2443,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -2606,7 +2516,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -2695,7 +2605,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -2896,7 +2806,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -2955,7 +2865,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -3027,7 +2937,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -3107,7 +3017,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolverWithOutputSchema {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -3189,7 +3099,7 @@ mod tests {
             url: String,
         }
         impl SkillResolver for RemoteResolverWithOutputSchema {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Remote skill placeholder.".into(),
@@ -3271,7 +3181,7 @@ mod tests {
         }
 
         impl SkillResolver for ForkResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Run forked task.".into(),
@@ -3282,16 +3192,17 @@ mod tests {
                     hooks: crate::skills::hooks::SkillHooks::default(),
                     skill_dir: Some(self.skill_dir.clone()),
                     source: SkillSourceKind::Local,
-                    success_criteria: vec![astra_services::VerificationCriterion {
-                        id: "output-exists".into(),
-                        description: "Output file exists".into(),
-                        verifier: astra_services::VerifierKind::FileExists {
-                            paths: vec!["output.txt".into()],
+                    success_criteria: vec![serde_json::json!({
+                        "id": "output-exists",
+                        "description": "Output file exists",
+                        "verifier": {
+                            "kind": "file_exists",
+                            "paths": ["output.txt"]
                         },
-                        required: true,
-                        timeout_sec: 5,
-                        global_only: false,
-                    }],
+                        "required": true,
+                        "timeout_sec": 5,
+                        "global_only": false
+                    })],
                     composition: None,
                     input_schema: None,
                     output_schema: None,
@@ -3436,7 +3347,7 @@ mod tests {
         // Build a resolver that includes ${CTX_WORK_DIR} in instructions
         struct CtxResolver;
         impl SkillResolver for CtxResolver {
-            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: "ctx-test".into(),
                     instructions: "Working in ${CTX_WORK_DIR} with session ${CTX_SESSION_ID}"
@@ -3877,7 +3788,7 @@ mod tests {
     async fn execute_skill_shows_allowed_tools() {
         struct ToolRestrictedResolver;
         impl SkillResolver for ToolRestrictedResolver {
-            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: "restricted".into(),
                     instructions: "Do the thing.".into(),
@@ -3930,7 +3841,7 @@ mod tests {
     async fn execute_skill_returns_activation_with_model() {
         struct ModelOverrideResolver;
         impl SkillResolver for ModelOverrideResolver {
-            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: "fancy".into(),
                     instructions: "Be fancy.".into(),
@@ -4095,7 +4006,7 @@ mod tests {
         // Skill names with XML-reserved characters must be fully escaped.
         struct QuoteResolver;
         impl SkillResolver for QuoteResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Do things.".into(),
@@ -4156,7 +4067,7 @@ mod tests {
     async fn execute_skill_mcp_blocked_sets_success_false() {
         struct McpResolver;
         impl SkillResolver for McpResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     // Inline shell command — blocked for MCP skills
@@ -4483,7 +4394,7 @@ mod tests {
     async fn partition_multiple_skills_merges_activations() {
         struct MultiResolver;
         impl SkillResolver for MultiResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 match name {
                     "skill-a" => Ok(ResolvedSkill {
                         name: "skill-a".into(),
@@ -4531,7 +4442,9 @@ mod tests {
                         agent_type: None,
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
-                    _ => Err(format!("unknown: {name}")),
+                    _ => Err(crate::skills::SkillError::NotFound(format!(
+                        "unknown: {name}"
+                    ))),
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -4595,7 +4508,7 @@ mod tests {
     async fn partition_mixed_skill_and_failure_preserves_good_activation() {
         struct PartialResolver;
         impl SkillResolver for PartialResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 if name == "good" {
                     Ok(ResolvedSkill {
                         name: "good".into(),
@@ -4621,7 +4534,9 @@ mod tests {
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     })
                 } else {
-                    Err(format!("unknown: {name}"))
+                    Err(crate::skills::SkillError::NotFound(format!(
+                        "unknown: {name}"
+                    )))
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -4667,7 +4582,7 @@ mod tests {
         // Skill without composition metadata → not composable in nested context
         struct NonComposableResolver;
         impl SkillResolver for NonComposableResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Do things.".into(),
@@ -4721,7 +4636,7 @@ mod tests {
     async fn composable_skill_allowed_in_nested_context() {
         struct ComposableResolver;
         impl SkillResolver for ComposableResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Do composable things.".into(),
@@ -4782,7 +4697,7 @@ mod tests {
     async fn depth_limit_blocks_deeply_nested() {
         struct AnyResolver;
         impl SkillResolver for AnyResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Deep skill.".into(),
@@ -4846,7 +4761,7 @@ mod tests {
         // Non-composable skill should work fine at top level (depth=0)
         struct NonComposableResolver;
         impl SkillResolver for NonComposableResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Top level only.".into(),
@@ -4902,7 +4817,7 @@ mod tests {
     async fn input_schema_validation_blocks_invalid_args() {
         struct SchemaResolver;
         impl SkillResolver for SchemaResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 Ok(ResolvedSkill {
                     name: name.into(),
                     instructions: "Schema skill.".into(),
@@ -5009,7 +4924,7 @@ mod tests {
     /// that resolve to "step-a" and "step-b".
     struct PipelineResolver;
     impl SkillResolver for PipelineResolver {
-        fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+        fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
             match name {
                 "pipeline-skill" => Ok(ResolvedSkill {
                     name: name.into(),
@@ -5082,7 +4997,9 @@ mod tests {
                     agent_type: None,
                     trust_tier: crate::skills::manifest::TrustTier::Bundled,
                 }),
-                _ => Err(format!("Unknown skill: {name}")),
+                _ => Err(crate::skills::SkillError::NotFound(format!(
+                    "unknown skill: {name}"
+                ))),
             }
         }
         fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -5155,7 +5072,7 @@ mod tests {
     async fn pipeline_stops_on_required_step_failure() {
         struct FailingPipelineResolver;
         impl SkillResolver for FailingPipelineResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 match name {
                     "fail-pipeline" => Ok(ResolvedSkill {
                         name: name.into(),
@@ -5234,7 +5151,9 @@ mod tests {
                         agent_type: None,
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
-                    _ => Err(format!("Unknown skill: {name}")),
+                    _ => Err(crate::skills::SkillError::NotFound(format!(
+                        "unknown skill: {name}"
+                    ))),
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -5269,7 +5188,7 @@ mod tests {
         // execute_pipeline must return success=false and no sentinel tag.
         struct FailPipelineResolver2;
         impl SkillResolver for FailPipelineResolver2 {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 match name {
                     "fail-pipeline2" => Ok(ResolvedSkill {
                         name: name.into(),
@@ -5305,7 +5224,9 @@ mod tests {
                         agent_type: None,
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
-                    _ => Err(format!("Unknown skill: {name}")),
+                    _ => Err(crate::skills::SkillError::NotFound(format!(
+                        "unknown skill: {name}"
+                    ))),
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {
@@ -5337,7 +5258,7 @@ mod tests {
         use crate::skills::manifest::{PipelineStep, SkillComposition};
         struct TwoStepResolver;
         impl SkillResolver for TwoStepResolver {
-            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
                 match name {
                     "pipeline-two" => Ok(ResolvedSkill {
                         name: name.into(),
@@ -5410,7 +5331,9 @@ mod tests {
                         agent_type: None,
                         trust_tier: crate::skills::manifest::TrustTier::Bundled,
                     }),
-                    _ => Err(format!("Unknown skill: {name}")),
+                    _ => Err(crate::skills::SkillError::NotFound(format!(
+                        "unknown skill: {name}"
+                    ))),
                 }
             }
             fn available_skills(&self) -> Vec<SkillToolInfo> {

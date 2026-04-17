@@ -1327,7 +1327,10 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
     fn resolve(
         &self,
         name: &str,
-    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, String> {
+    ) -> Result<astra_runtime::turn::skill_tool::ResolvedSkill, astra_runtime::skills::SkillError>
+    {
+        use astra_runtime::skills::SkillError;
+
         // Fast path: read-lock to check if instructions are already loaded.
         // This avoids taking a write lock (and blocking all readers) for the
         // common case where the skill is already at Level 2.
@@ -1335,10 +1338,10 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
             let reg = self
                 .registry
                 .read()
-                .map_err(|e| format!("skill registry lock poisoned: {e}"))?;
+                .map_err(|e| SkillError::Internal(format!("skill registry lock poisoned: {e}")))?;
             let skill = reg
                 .get(name)
-                .ok_or_else(|| format!("unknown skill: {name}"))?;
+                .ok_or_else(|| SkillError::NotFound(format!("unknown skill: {name}")))?;
             if let Some(instruction) = skill.instructions() {
                 return Ok(astra_runtime::turn::skill_tool::ResolvedSkill {
                     name: name.to_string(),
@@ -1375,17 +1378,19 @@ impl astra_runtime::turn::skill_tool::SkillResolver for CliSkillResolver {
         let mut reg = self
             .registry
             .write()
-            .map_err(|e| format!("skill registry lock poisoned: {e}"))?;
+            .map_err(|e| SkillError::Internal(format!("skill registry lock poisoned: {e}")))?;
 
         let skill = reg
             .get_mut(name)
-            .ok_or_else(|| format!("unknown skill: {name}"))?;
+            .ok_or_else(|| SkillError::NotFound(format!("unknown skill: {name}")))?;
 
-        skill.load_instructions()?;
+        skill
+            .load_instructions()
+            .map_err(|e| SkillError::LoadFailed(e))?;
 
-        let instruction = skill
-            .instructions()
-            .ok_or_else(|| format!("skill '{name}' has no instructions after loading"))?;
+        let instruction = skill.instructions().ok_or_else(|| {
+            SkillError::LoadFailed(format!("skill '{name}' has no instructions after loading"))
+        })?;
 
         Ok(astra_runtime::turn::skill_tool::ResolvedSkill {
             name: name.to_string(),

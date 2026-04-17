@@ -10,18 +10,14 @@ async fn build_turn_skill_resolver(
         let _ = unified_skill_registry.discover_all().await;
     }
 
-    let inner_resolver = std::sync::Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(
+    let resolver = std::sync::Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(
         unified_skill_registry,
     ));
-    let adapter = astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
-    let skills = astra_runtime::turn::skill_tool::SkillResolver::available_skills(&adapter);
+    let skills = astra_runtime::turn::skill_tool::SkillResolver::available_skills(&*resolver);
     if skills.is_empty() {
         None
     } else {
-        Some(std::sync::Arc::new(adapter)
-            as std::sync::Arc<
-                dyn astra_runtime::turn::skill_tool::SkillResolver,
-            >)
+        Some(resolver as std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>)
     }
 }
 

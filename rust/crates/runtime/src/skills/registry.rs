@@ -498,73 +498,6 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
     }
 }
 
-/// Adapter that implements `turn::skill_tool::SkillResolver` (the original trait)
-/// by delegating to a `traits::SkillResolver`.
-pub struct LegacySkillResolverAdapter {
-    inner: Arc<dyn super::traits::SkillResolver>,
-}
-
-impl LegacySkillResolverAdapter {
-    pub fn new(inner: Arc<dyn super::traits::SkillResolver>) -> Self {
-        Self { inner }
-    }
-}
-
-impl crate::turn::skill_tool::SkillResolver for LegacySkillResolverAdapter {
-    fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
-        match self.inner.resolve(name) {
-            Ok(resolved) => {
-                // Convert serde_json::Value to VerificationCriterion
-                let success_criteria: Vec<astra_services::VerificationCriterion> = resolved
-                    .success_criteria
-                    .iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect();
-                Ok(crate::turn::skill_tool::ResolvedSkill {
-                    name: resolved.name,
-                    instructions: resolved.instructions,
-                    model: resolved.model,
-                    max_tokens: resolved.max_tokens,
-                    allowed_tools: resolved.allowed_tools,
-                    execution_context: resolved.execution_context,
-                    hooks: resolved.hooks,
-                    skill_dir: resolved.skill_dir,
-                    source: resolved.source,
-                    success_criteria,
-                    composition: resolved.composition,
-                    input_schema: resolved.input_schema,
-                    output_schema: resolved.output_schema,
-                    remote_url: resolved.remote_url,
-                    forward_headers: resolved.forward_headers,
-                    required_headers: resolved.required_headers,
-                    aliases: resolved.aliases,
-                    effort: resolved.effort,
-                    agent_type: resolved.agent_type,
-                    trust_tier: resolved.trust_tier,
-                })
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
-        self.inner
-            .available_skills()
-            .into_iter()
-            .map(|s| crate::turn::skill_tool::SkillToolInfo {
-                name: s.name,
-                description: s.description,
-                when_to_use: s.when_to_use,
-                source: s.source,
-                aliases: s.aliases,
-                category: s.category,
-                tags: s.tags,
-                triggers: s.triggers,
-            })
-            .collect()
-    }
-}
-
 /// Thread-safe shared registry.
 pub type SharedSkillRegistry = Arc<UnifiedSkillRegistry>;
 
@@ -1069,7 +1002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_adapter_delegates_correctly() {
+    async fn unified_resolver_delegates_correctly() {
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![(
@@ -1085,26 +1018,24 @@ mod tests {
         registry.discover_all().await.unwrap();
         registry.load("adapt-me").await.unwrap();
 
-        let unified_resolver = Arc::new(UnifiedSkillResolver::new(Arc::new(registry)));
-        let adapter = LegacySkillResolverAdapter::new(unified_resolver);
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
 
         use crate::turn::skill_tool::SkillResolver;
-        let resolved = adapter.resolve("adapt-me").unwrap();
+        let resolved = resolver.resolve("adapt-me").unwrap();
         assert_eq!(resolved.instructions, "Adapted instructions.");
 
-        let skills = adapter.available_skills();
+        let skills = resolver.available_skills();
         assert_eq!(skills.len(), 1);
     }
 
     #[tokio::test]
-    async fn legacy_adapter_maps_error_to_string() {
+    async fn unified_resolver_maps_error_correctly() {
         let registry = Arc::new(UnifiedSkillRegistry::new());
-        let resolver = Arc::new(UnifiedSkillResolver::new(registry));
-        let adapter = LegacySkillResolverAdapter::new(resolver);
+        let resolver = UnifiedSkillResolver::new(registry);
 
         use crate::turn::skill_tool::SkillResolver;
-        let err = adapter.resolve("missing").unwrap_err();
-        assert!(err.contains("unknown skill"));
+        let err = resolver.resolve("missing").unwrap_err();
+        assert!(err.to_string().contains("unknown skill"));
     }
 
     #[tokio::test]
