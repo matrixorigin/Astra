@@ -1461,10 +1461,83 @@ fn is_non_forwardable_header(name: &str) -> bool {
     )
 }
 
+fn connection_declared_hop_by_hop_headers(skill_ctx: &SkillContext) -> HashSet<String> {
+    skill_ctx
+        .forward_headers
+        .get("connection")
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|token| normalize_header_name(token).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_sensitive_remote_forward_header(name: &str) -> bool {
+    matches!(
+        name,
+        "cookie"
+            | "set-cookie"
+            | "forwarded"
+            | "origin"
+            | "referer"
+            | "x-csrf-token"
+            | "x-xsrf-token"
+            | "csrf-token"
+            | "x-csrftoken"
+            | "x-csrf"
+            | "x-xsrf"
+            | "x-real-ip"
+            | "true-client-ip"
+            | "cf-connecting-ip"
+    ) || name.starts_with("sec-")
+        || name.starts_with("x-forwarded-")
+}
+
+fn validate_remote_forward_header_policy(
+    skill: &ResolvedSkill,
+    header_kind: &str,
+    name: &str,
+    connection_hop_by_hop: &HashSet<String>,
+) -> Result<(), String> {
+    if is_non_forwardable_header(name) {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' is hop-by-hop/transport and cannot be forwarded",
+            skill.name, name
+        ));
+    }
+    if connection_hop_by_hop.contains(name) {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' is referenced by the inbound Connection header and cannot be forwarded",
+            skill.name, name
+        ));
+    }
+    if name == "authorization"
+        && !matches!(
+            skill.trust_tier,
+            crate::skills::manifest::TrustTier::Bundled
+                | crate::skills::manifest::TrustTier::Verified
+        )
+    {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' requires verified/bundled trust tier for remote forwarding",
+            skill.name, name
+        ));
+    }
+    if is_sensitive_remote_forward_header(name) {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' is sensitive and cannot be forwarded to remote skills",
+            skill.name, name
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_remote_forward_headers(
     skill: &ResolvedSkill,
     skill_ctx: &SkillContext,
 ) -> Result<Vec<(String, String)>, String> {
+    let connection_hop_by_hop = connection_declared_hop_by_hop_headers(skill_ctx);
     let mut required = Vec::new();
     for raw in &skill.required_headers {
         let normalized = normalize_header_name(raw).map_err(|err| {
@@ -1473,12 +1546,12 @@ fn resolve_remote_forward_headers(
                 skill.name, raw
             )
         })?;
-        if is_non_forwardable_header(&normalized) {
-            return Err(format!(
-                "skill '{}' required header '{}' is hop-by-hop/transport and cannot be forwarded",
-                skill.name, normalized
-            ));
-        }
+        validate_remote_forward_header_policy(
+            skill,
+            "required header",
+            &normalized,
+            &connection_hop_by_hop,
+        )?;
         if !required.iter().any(|existing| existing == &normalized) {
             required.push(normalized);
         }
@@ -1493,12 +1566,12 @@ fn resolve_remote_forward_headers(
                 skill.name, raw
             )
         })?;
-        if is_non_forwardable_header(&normalized) {
-            return Err(format!(
-                "skill '{}' forward header '{}' is hop-by-hop/transport and cannot be forwarded",
-                skill.name, normalized
-            ));
-        }
+        validate_remote_forward_header_policy(
+            skill,
+            "forward header",
+            &normalized,
+            &connection_hop_by_hop,
+        )?;
         if seen.insert(normalized.clone()) {
             requested.push(normalized);
         }
@@ -2512,7 +2585,7 @@ mod tests {
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                    trust_tier: crate::skills::manifest::TrustTier::Verified,
                 })
             }
 
@@ -2601,7 +2674,7 @@ mod tests {
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
-                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                    trust_tier: crate::skills::manifest::TrustTier::Verified,
                 })
             }
 
@@ -2661,6 +2734,118 @@ mod tests {
             .expect_err("invalid required_headers entry should fail");
         assert!(err.contains("invalid required_headers entry"));
         assert!(err.contains("bad header"));
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_rejects_authorization_for_community_skill() {
+        let skill = ResolvedSkill {
+            name: "remote-community-auth-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec!["authorization".into()],
+            required_headers: vec![],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Community,
+        };
+
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx.forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer trusted-token".to_string(),
+        );
+
+        let err = resolve_remote_forward_headers(&skill, &skill_ctx)
+            .expect_err("community skill should not forward authorization");
+        assert!(err.contains("requires verified/bundled trust tier"));
+        assert!(err.contains("authorization"));
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_rejects_cookie_header() {
+        let skill = ResolvedSkill {
+            name: "remote-cookie-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec!["cookie".into()],
+            required_headers: vec![],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Verified,
+        };
+
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx
+            .forward_headers
+            .insert("cookie".to_string(), "session=secret".to_string());
+
+        let err = resolve_remote_forward_headers(&skill, &skill_ctx)
+            .expect_err("cookie should be rejected for remote forwarding");
+        assert!(err.contains("sensitive"));
+        assert!(err.contains("cookie"));
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_rejects_dynamic_connection_token_headers() {
+        let skill = ResolvedSkill {
+            name: "remote-connection-token-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec!["x-hop".into()],
+            required_headers: vec![],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Verified,
+        };
+
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx
+            .forward_headers
+            .insert("connection".to_string(), "x-hop".to_string());
+        skill_ctx
+            .forward_headers
+            .insert("x-hop".to_string(), "secret".to_string());
+
+        let err = resolve_remote_forward_headers(&skill, &skill_ctx)
+            .expect_err("connection-declared header should not be forwardable");
+        assert!(err.contains("Connection"));
+        assert!(err.contains("x-hop"));
     }
 
     #[tokio::test]
