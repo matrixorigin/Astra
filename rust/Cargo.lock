@@ -418,7 +418,10 @@ dependencies = [
 name = "astra-skills"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
+ "astra-services",
  "async-trait",
+ "axum",
  "dirs 5.0.1",
  "flate2",
  "regex",

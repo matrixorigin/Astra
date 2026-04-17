@@ -1,3 +1,4 @@
+#[allow(clippy::useless_format)]
 pub fn skill_content() -> String {
     format!(
         r#"---
