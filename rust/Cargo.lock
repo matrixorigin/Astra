@@ -264,6 +264,7 @@ name = "astra-pipeline"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-learning",
  "astra-services",
  "astra-text-utils",
  "astra-turn-types",
@@ -272,8 +273,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

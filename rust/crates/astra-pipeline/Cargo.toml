@@ -10,6 +10,7 @@ default = []
 
 [dependencies]
 astra-core.workspace = true
+astra-learning.workspace = true
 astra-services.workspace = true
 astra-text-utils = { path = "../astra-text-utils" }
 astra-turn-types = { path = "../astra-turn-types" }
@@ -17,6 +18,9 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
