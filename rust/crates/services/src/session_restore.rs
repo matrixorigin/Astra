@@ -765,6 +765,7 @@ impl SessionRestoreService for HybridRestoreService {
 }
 
 /// Push a checkpoint to MatrixOne for cross-device availability.
+/// Also logs to session_sync_log for audit trail.
 pub async fn push_checkpoint_to_cloud(
     pool: &sqlx::Pool<sqlx::MySql>,
     session_id: &str,
@@ -839,11 +840,61 @@ pub async fn push_checkpoint_to_cloud(
                 .await
                 .map_err(|err| format!("push_checkpoint retry update: {err}"))?;
             } else {
+                // Log sync failure for audit trail
+                let _ = log_checkpoint_sync(
+                    pool,
+                    user_id,
+                    session_id,
+                    checkpoint.number,
+                    "error",
+                    Some(&format!("{e}")),
+                )
+                .await;
                 return Err(format!("push_checkpoint insert: {e}"));
             }
         }
     }
 
+    // Log successful sync for audit trail (BUG FIX: Session 7875e355 had no sync_log records)
+    let _ = log_checkpoint_sync(
+        pool,
+        user_id,
+        session_id,
+        checkpoint.number,
+        "success",
+        None,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Log checkpoint sync to session_sync_log for audit trail.
+/// This helps diagnose sync issues like Session 7875e355 where cloud had 0 checkpoints.
+async fn log_checkpoint_sync(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    checkpoint_number: u32,
+    status: &str,
+    error_msg: Option<&str>,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO session_sync_log \
+         (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(session_id)
+    .bind(format!("checkpoint_{}", checkpoint_number))
+    .bind("push")
+    .bind(0i64) // payload_size not tracked for checkpoints
+    .bind(status)
+    .bind(error_msg)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("log_checkpoint_sync: {e}"))?;
     Ok(())
 }
 

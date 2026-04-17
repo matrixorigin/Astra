@@ -1028,14 +1028,21 @@ fn commit_turn_journal_workspace_and_sidecars(
                     let sid_owned = sid.to_string();
                     let user_id_owned = user_id.to_string();
                     let cp_clone = cp.clone();
+                    let cp_number = cp.number;
                     tokio::spawn(async move {
-                        let _ = astra_services::session_restore::push_checkpoint_to_cloud(
+                        if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
                             &pool,
                             &sid_owned,
                             &user_id_owned,
                             &cp_clone,
                         )
-                        .await;
+                        .await
+                        {
+                            astra_core::agent_warn!(
+                                "checkpoint_sync",
+                                "failed to push checkpoint {cp_number} to cloud for session {sid_owned}: {e}"
+                            );
+                        }
                     });
                 }
                 let cp_event = session_journal::JournalEvent::checkpoint(
@@ -1083,7 +1090,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                     }
                 };
                 tokio::spawn(async move {
-                    let _ = astra_services::session_restore::push_step_checkpoint_to_cloud(
+                    if let Err(e) = astra_services::session_restore::push_step_checkpoint_to_cloud(
                         &pool,
                         &sid_owned,
                         &user_id_owned,
@@ -1094,7 +1101,13 @@ fn commit_turn_journal_workspace_and_sidecars(
                         &tools_json,
                         &state_json,
                     )
-                    .await;
+                    .await
+                    {
+                        astra_core::agent_warn!(
+                            "checkpoint_sync",
+                            "failed to push step checkpoint {cp_number} to cloud for session {sid_owned}: {e}"
+                        );
+                    }
                 });
             }
 

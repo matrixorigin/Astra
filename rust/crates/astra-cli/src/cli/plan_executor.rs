@@ -1254,7 +1254,12 @@ async fn plan_executor_task(
                     // Retry: mark subtask back to Pending so the next loop iteration
                     // picks it up again. Use local turn_retry_counts for LLM turn failures
                     // (separate from durable verification retries in contract.subtasks[].retry_count).
-                    const MAX_TURN_RETRIES: u32 = 2;
+                    //
+                    // BUG FIX (Session 7875e355): After 2 failures, inject a strategy hint
+                    // to encourage the agent to try a different approach instead of
+                    // repeating the same failing pattern.
+                    const MAX_TURN_RETRIES: u32 = 3; // Increased from 2 to allow strategy escalation
+                    const STRATEGY_ESCALATION_THRESHOLD: u32 = 2;
 
                     // Increment local turn failure count for this subtask
                     let retry_count = ctx
@@ -1262,6 +1267,27 @@ async fn plan_executor_task(
                         .entry(next_id.clone())
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
+
+                    // After 2 failures, add strategy escalation hint to corrections
+                    if *retry_count >= STRATEGY_ESCALATION_THRESHOLD
+                        && *retry_count <= MAX_TURN_RETRIES
+                    {
+                        let strategy_hint = format!(
+                            "⚠ Subtask '{}' has failed {} times. Try a DIFFERENT approach:\n\
+                             1. Break the task into smaller, simpler steps\n\
+                             2. Use alternative tools (e.g., grep instead of find, or vice versa)\n\
+                             3. Verify prerequisites are met before proceeding\n\
+                             4. If stuck, describe what you've tried and ask for clarification",
+                            title, *retry_count
+                        );
+                        ctx.plan_corrections.push(strategy_hint);
+                        astra_core::agent_warn!(
+                            "plan_executor",
+                            "subtask '{}' failed {} times, injecting strategy escalation hint",
+                            next_id,
+                            *retry_count
+                        );
+                    }
 
                     if *retry_count > MAX_TURN_RETRIES {
                         if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {

@@ -268,21 +268,27 @@ pub fn escalation_level(
 ) -> EscalationLevel {
     // Critical: nudges + errors coupled (prevents pure-stall sessions from
     // force-stopping when the agent is actually making progress with 0 errors),
-    // or 8+ errors with at least one deprioritized tool,
-    // or 10+ total errors regardless (scattered failures are still broken).
+    // or many errors with deprioritized tools,
+    // or very high total errors (scattered failures are still broken).
     //
     // Previously nudge_count >= 3 alone triggered Critical, which meant a session
     // with repeated exploration patterns (grep→read→grep) and ZERO tool errors
-    // could be force-stopped. Now we require at least 2 actionable errors to
+    // could be force-stopped. Now we require at least 3 actionable errors to
     // accompany the stall signal, ensuring genuine stuck-ness.
-    if (nudge_count >= 3 && total_errors >= 2)
-        || (total_errors >= 8 && deprioritized_count >= 1)
-        || total_errors >= 10
+    //
+    // Thresholds raised after Session 7875e355 diagnostic showed:
+    // - str_replace errors (old_str == new_str) were escalating too fast
+    // - 5 errors → Warning was too aggressive for normal retry patterns
+    // - Single-tool loops should not escalate; genuine stuck-ness requires
+    //   failures across multiple tools or high error counts.
+    if (nudge_count >= 4 && total_errors >= 3)
+        || (total_errors >= 12 && deprioritized_count >= 2)
+        || total_errors >= 15
     {
         return EscalationLevel::Critical;
     }
-    // Warning: 2 nudges, or 5+ errors
-    if nudge_count >= 2 || total_errors >= 5 {
+    // Warning: 3 nudges, or 8+ errors
+    if nudge_count >= 3 || total_errors >= 8 {
         return EscalationLevel::Warning;
     }
     EscalationLevel::Normal
@@ -674,69 +680,77 @@ mod tests {
     }
 
     #[test]
-    fn escalation_warning_two_nudges() {
-        // 2 nudges → Warning (lowered from 3)
-        assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Warning);
+    fn escalation_warning_three_nudges() {
+        // 3 nudges → Warning (raised from 2 to reduce false positives)
+        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
     }
 
     #[test]
-    fn escalation_critical_three_nudges() {
-        // 3 nudges alone (0 errors) → Warning, NOT Critical.
-        // Critical requires nudge_count >= 3 AND total_errors >= 2.
+    fn escalation_two_nudges_is_normal() {
+        // 2 nudges alone → Normal (threshold raised after Session 7875e355)
+        assert_eq!(escalation_level(2, 0, 0), EscalationLevel::Normal);
+    }
+
+    #[test]
+    fn escalation_critical_four_nudges_with_errors() {
+        // 4 nudges alone (0 errors) → Warning, NOT Critical.
+        // Critical requires nudge_count >= 4 AND total_errors >= 3.
         // This prevents force-stopping sessions with exploration patterns
         // (grep→read→grep) that produce stall nudges but zero tool errors.
-        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
         assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
-        // But with 2+ errors, nudges trigger Critical
-        assert_eq!(escalation_level(3, 2, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Warning);
+        // But with 3+ errors, nudges trigger Critical
         assert_eq!(escalation_level(4, 3, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(5, 4, 0), EscalationLevel::Critical);
     }
 
     #[test]
-    fn escalation_warning_five_errors() {
-        assert_eq!(escalation_level(0, 5, 0), EscalationLevel::Warning);
+    fn escalation_warning_eight_errors() {
+        // 8 errors → Warning (raised from 5 after Session 7875e355)
+        assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
     }
 
     #[test]
     fn escalation_normal_few_errors() {
-        // 3-4 errors: still Normal (raised from old threshold of 3)
+        // 3-7 errors: still Normal (raised thresholds)
         assert_eq!(escalation_level(0, 3, 0), EscalationLevel::Normal);
-        assert_eq!(escalation_level(0, 4, 0), EscalationLevel::Normal);
+        assert_eq!(escalation_level(0, 5, 0), EscalationLevel::Normal);
+        assert_eq!(escalation_level(0, 7, 0), EscalationLevel::Normal);
     }
 
     #[test]
     fn escalation_critical_from_nudges() {
         // Nudges alone stay Warning; coupled with errors → Critical
-        assert_eq!(escalation_level(3, 0, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(4, 0, 0), EscalationLevel::Warning);
         assert_eq!(escalation_level(5, 0, 0), EscalationLevel::Warning);
-        assert_eq!(escalation_level(3, 2, 0), EscalationLevel::Critical);
-        assert_eq!(escalation_level(5, 3, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(4, 3, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(5, 4, 0), EscalationLevel::Critical);
     }
 
     #[test]
     fn escalation_critical_many_errors_with_deprioritized() {
-        // 8+ errors with at least 1 deprioritized tool → Critical (was 2, now 1)
-        assert_eq!(escalation_level(0, 8, 1), EscalationLevel::Critical);
-        assert_eq!(escalation_level(0, 8, 2), EscalationLevel::Critical);
+        // 12+ errors with at least 2 deprioritized tools → Critical (raised thresholds)
+        assert_eq!(escalation_level(0, 12, 2), EscalationLevel::Critical);
+        assert_eq!(escalation_level(0, 13, 3), EscalationLevel::Critical);
     }
 
     #[test]
-    fn escalation_not_critical_errors_without_deprioritized() {
-        // 8 errors but no deprioritized tools → Warning, not Critical
-        assert_eq!(escalation_level(0, 8, 0), EscalationLevel::Warning);
+    fn escalation_not_critical_errors_without_enough_deprioritized() {
+        // 12 errors but only 1 deprioritized tool → Warning, not Critical
+        assert_eq!(escalation_level(0, 12, 1), EscalationLevel::Warning);
     }
 
     #[test]
-    fn escalation_critical_ten_errors_regardless() {
-        // 10+ errors with zero deprioritized → Critical (new: standalone high-error gate)
-        assert_eq!(escalation_level(0, 10, 0), EscalationLevel::Critical);
-        assert_eq!(escalation_level(0, 12, 0), EscalationLevel::Critical);
+    fn escalation_critical_fifteen_errors_regardless() {
+        // 15+ errors with zero deprioritized → Critical (new: standalone high-error gate)
+        assert_eq!(escalation_level(0, 15, 0), EscalationLevel::Critical);
+        assert_eq!(escalation_level(0, 18, 0), EscalationLevel::Critical);
     }
 
     #[test]
-    fn escalation_nine_errors_no_deprioritized_is_warning() {
+    fn escalation_fourteen_errors_no_deprioritized_is_warning() {
         // Below the standalone threshold, no deprioritized → stays Warning
-        assert_eq!(escalation_level(0, 9, 0), EscalationLevel::Warning);
+        assert_eq!(escalation_level(0, 14, 0), EscalationLevel::Warning);
     }
 
     #[test]

@@ -566,41 +566,44 @@ impl EventIngestionWorker {
         let rows_inserted = insert_result.rows_affected() as usize;
 
         // Update event_count on agent_sessions for each affected session.
-        // When INSERT IGNORE skips duplicates, rows_inserted < events.len();
-        // in that case fall back to an accurate COUNT(*) per session to avoid
-        // inflating event_count.
+        //
+        // BUG FIX (Session 7875e355): Race condition between fast path increment
+        // and slow path COUNT(*) reconcile. Multiple flush_batch() calls running
+        // concurrently could cause count drift.
+        //
+        // Solution: Always use COUNT(*) reconcile to ensure accuracy. The performance
+        // cost is negligible (indexed query) and correctness is more important.
+        // Additionally, record last_event_sync_at to help diagnose future issues.
         let mut session_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for event in events {
             *session_counts.entry(&event.session_id).or_default() += 1;
         }
 
-        if rows_inserted == events.len() {
-            // Fast path: no duplicates — batch counts are accurate.
-            for (session_id, count) in &session_counts {
-                sqlx::query(
-                    "UPDATE agent_sessions SET event_count = event_count + ? WHERE session_id = ?",
-                )
-                .bind(*count as i64)
-                .bind(*session_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("event_count update for {session_id}: {e}"))?;
-            }
-        } else {
-            // Slow path: duplicates detected — reconcile from actual row count.
-            for session_id in session_counts.keys() {
-                sqlx::query(
-                    "UPDATE agent_sessions SET event_count = \
-                     (SELECT COUNT(*) FROM agent_events WHERE session_id = ?) \
-                     WHERE session_id = ?",
-                )
-                .bind(*session_id)
-                .bind(*session_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("event_count reconcile for {session_id}: {e}"))?;
-            }
+        // Log if duplicates were detected (useful for debugging)
+        if rows_inserted < events.len() {
+            let skipped = events.len() - rows_inserted;
+            astra_core::agent_info!(
+                "event_ingestion",
+                "INSERT IGNORE skipped {skipped} duplicates out of {} events",
+                events.len()
+            );
+        }
+
+        // Always reconcile from actual row count to prevent drift from concurrent flushes.
+        // This is more expensive than increment but guarantees accuracy.
+        for session_id in session_counts.keys() {
+            sqlx::query(
+                "UPDATE agent_sessions SET \
+                 event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ?), \
+                 updated_at = NOW() \
+                 WHERE session_id = ?",
+            )
+            .bind(*session_id)
+            .bind(*session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("event_count reconcile for {session_id}: {e}"))?;
         }
 
         // Close sessions that have a session_end event
