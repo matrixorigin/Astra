@@ -11,7 +11,9 @@ tracing = { workspace = true }
 dirs = "6.0.0"
 
 # Internal crates
+astra-core = { path = "../core" }
 astra-pipeline = { path = "../astra-pipeline" }
+astra-services = { path = "../services" }
 astra-turn-core = { path = "../astra-turn-core" }
 
 [dev-dependencies]
