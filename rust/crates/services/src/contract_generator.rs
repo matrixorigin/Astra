@@ -180,13 +180,11 @@ pub fn acceptance_checks_to_criteria(
     }
 }
 
-/// Strip `tmp/`, `/tmp/`, and leading `/` from paths in criteria to keep them
-/// project-relative. LLMs frequently hallucinate these prefixes.
+/// Strip absolute `/tmp/` prefix and leading `/` from paths in criteria to keep
+/// them project-relative. Only absolute `/tmp/` is stripped — relative `tmp/` is
+/// preserved because it may be a legitimate project subdirectory.
 fn sanitize_criteria_path(path: &str) -> String {
-    let p = path
-        .strip_prefix("/tmp/")
-        .or_else(|| path.strip_prefix("tmp/"))
-        .unwrap_or(path);
+    let p = path.strip_prefix("/tmp/").unwrap_or(path);
     // Also strip leading `/` to make absolute paths relative
     p.strip_prefix('/').unwrap_or(p).to_string()
 }
@@ -870,23 +868,39 @@ mod tests {
 
     #[test]
     fn sanitize_criteria_path_strips_tmp_prefix() {
-        assert_eq!(sanitize_criteria_path("tmp/app.js"), "app.js");
+        // Relative tmp/ is preserved — it may be a legitimate project subdirectory
+        assert_eq!(sanitize_criteria_path("tmp/app.js"), "tmp/app.js");
+        // Absolute /tmp/ is stripped — system temp dir is never project-relative
         assert_eq!(sanitize_criteria_path("/tmp/app.js"), "app.js");
         assert_eq!(sanitize_criteria_path("/tmp/src/main.rs"), "src/main.rs");
+        // Non-tmp paths preserved as-is
         assert_eq!(sanitize_criteria_path("src/app.js"), "src/app.js");
+        // Leading / stripped from absolute non-tmp paths
         assert_eq!(sanitize_criteria_path("/usr/local/bin"), "usr/local/bin");
     }
 
     #[test]
     fn sanitize_verifier_paths_cleans_all_variants() {
+        // Absolute /tmp/ prefix is stripped
         let vk = VerifierKind::GrepCheck {
-            file: "tmp/index.html".into(),
+            file: "/tmp/index.html".into(),
             pattern: "hello".into(),
             should_match: true,
         };
         let cleaned = sanitize_verifier_paths(vk);
         match cleaned {
             VerifierKind::GrepCheck { file, .. } => assert_eq!(file, "index.html"),
+            _ => panic!("wrong variant"),
+        }
+        // Relative tmp/ prefix is preserved
+        let vk2 = VerifierKind::GrepCheck {
+            file: "tmp/index.html".into(),
+            pattern: "hello".into(),
+            should_match: true,
+        };
+        let cleaned2 = sanitize_verifier_paths(vk2);
+        match cleaned2 {
+            VerifierKind::GrepCheck { file, .. } => assert_eq!(file, "tmp/index.html"),
             _ => panic!("wrong variant"),
         }
     }
@@ -910,7 +924,8 @@ mod tests {
         assert_eq!(criteria.len(), 1);
         match &criteria[0].verifier {
             VerifierKind::FileExists { paths } => {
-                assert_eq!(paths, &["app.js", "index.html"]);
+                // tmp/app.js preserved (relative), /tmp/index.html stripped (absolute)
+                assert_eq!(paths, &["tmp/app.js", "index.html"]);
             }
             _ => panic!("expected FileExists"),
         }
