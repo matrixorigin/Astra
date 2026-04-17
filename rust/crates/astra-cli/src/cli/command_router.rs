@@ -404,7 +404,7 @@ pub(super) async fn execute_cli_command(
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id = resumable_last_session_id(profile.as_deref());
+            let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = PermissionManager::with_project(
                 auto_approve,
@@ -596,7 +596,7 @@ pub(super) async fn execute_cli_command(
         Some(Command::Plan(plan_cmd)) => match plan_cmd {
             PlanCmd::Decompose { goal, json, quiet } => {
                 let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-                let session_id = resumable_last_session_id(profile.as_deref());
+                let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
                 let plan = crate::slash_memory::headless_plan_decompose(
                     api,
                     &token,
@@ -778,9 +778,10 @@ pub(super) async fn execute_cli_command(
             };
 
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id = args
-                .session_id
-                .or_else(|| resumable_last_session_id(profile.as_deref()));
+            let session_id = match args.session_id {
+                Some(session_id) => Some(session_id),
+                None => validated_resumable_last_session_id(api, profile.as_deref()).await,
+            };
             let is_tty = terminal::size().is_ok();
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = {
@@ -1263,7 +1264,7 @@ pub(super) async fn run_print_mode(
     let message = apply_system_prompt(&raw_message, system_prompt);
 
     let (mut creds, name, _, token) = get_profile_and_token(profile)?;
-    let session_id = resumable_last_session_id(profile);
+    let session_id = validated_resumable_last_session_id(api, profile).await;
     let selector = create_tool_selector(api, profile);
     let mut pm = PermissionManager::with_project(
         true, // print mode is headless, always auto-approve
