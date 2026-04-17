@@ -33,7 +33,7 @@ pub fn apply_cli_agentic_stall_preflight(ctx: CliAgenticStallPreflightRequest<'_
 
     turn_guard.record_tool_calls(tool_calls_for_guard);
 
-    if detect_cli_tool_name_stall(turn_tool_names, turn_guard.stall_window()) {
+    if detect_cli_tool_name_stall(turn_tool_names, turn_guard.stall_window()).unwrap_or(false) {
         stall_events.push(("name_stall".to_string(), turn_index));
     }
 }

@@ -15,23 +15,23 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::build_test;
+use crate::env_tools;
 
 /// Max chars for injected diagnostic text (keeps `/chat` payload bounded).
 const MAX_PASSIVE_DIAG_CHARS: usize = 12_000;
 
 fn passive_cargo_check_enabled() -> bool {
-    match std::env::var("ASTRA_PASSIVE_CARGO_CHECK") {
-        Ok(v) => {
+    match env_tools::session_env_overlay_get("ASTRA_PASSIVE_CARGO_CHECK") {
+        Some(v) => {
             let v = v.trim().to_lowercase();
             !(v.is_empty() || v == "0" || v == "false" || v == "off")
         }
-        Err(_) => true,
+        None => true,
     }
 }
 
 fn passive_cargo_timeout() -> Duration {
-    let secs = std::env::var("ASTRA_PASSIVE_CARGO_TIMEOUT_SECS")
-        .ok()
+    let secs = env_tools::session_env_overlay_get("ASTRA_PASSIVE_CARGO_TIMEOUT_SECS")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(45);
     Duration::from_secs(secs.clamp(1, 300))
@@ -232,16 +232,10 @@ mod tests {
         struct ClearPassiveEnv;
         impl Drop for ClearPassiveEnv {
             fn drop(&mut self) {
-                // SAFETY: `serial` test; no concurrent readers of this env var in other threads.
-                unsafe {
-                    std::env::remove_var("ASTRA_PASSIVE_CARGO_CHECK");
-                }
+                env_tools::session_env_overlay_remove("ASTRA_PASSIVE_CARGO_CHECK");
             }
         }
-        // SAFETY: `serial` test; no concurrent env access in other threads.
-        unsafe {
-            std::env::set_var("ASTRA_PASSIVE_CARGO_CHECK", "0");
-        }
+        env_tools::session_env_overlay_set("ASTRA_PASSIVE_CARGO_CHECK", "0");
         let _clear = ClearPassiveEnv;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

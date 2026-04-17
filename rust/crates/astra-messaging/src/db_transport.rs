@@ -506,7 +506,18 @@ impl MessageTransport for DatabaseTransport {
             );
         }
         // Abort any poll tasks that haven't noticed the signal yet.
-        for h in self.poll_abort_handles.lock().unwrap().drain(..) {
+        for h in self
+            .poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "astra_runtime::messaging::db_transport",
+                    "poll_abort_handles mutex poisoned; recovering"
+                );
+                poisoned.into_inner()
+            })
+            .drain(..)
+        {
             h.abort();
         }
         // Release all claimed messages back to pending.

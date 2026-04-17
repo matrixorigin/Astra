@@ -1166,9 +1166,16 @@ pub enum StepVerdict {
 // ─── Retry Policy ────────────────────────────────────────────────────────────
 
 /// Step-level retry policy (fallback when tool-level not specified).
+fn default_retry_max_retries() -> u32 {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
+    /// Absolute ceiling on step-level retry attempts (defense in depth vs misconfigured `max_attempts`).
+    #[serde(default = "default_retry_max_retries")]
+    pub max_retries: u32,
     pub backoff_base_ms: u64,
     pub backoff_max_ms: u64,
     pub retry_on: Vec<ErrorCategory>,
@@ -1178,6 +1185,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 3,
+            max_retries: default_retry_max_retries(),
             backoff_base_ms: 500,
             backoff_max_ms: 30_000,
             retry_on: vec![ErrorCategory::Transient, ErrorCategory::Timeout],
@@ -1193,7 +1201,8 @@ impl RetryPolicy {
     }
 
     pub fn should_retry(&self, attempt: u32, category: &ErrorCategory) -> bool {
-        attempt < self.max_attempts && self.retry_on.contains(category)
+        let limit = self.max_attempts.min(self.max_retries.max(1));
+        attempt < limit && self.retry_on.contains(category)
     }
 }
 
@@ -1202,6 +1211,8 @@ impl RetryPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRetryPolicy {
     pub max_attempts: u32,
+    #[serde(default = "default_retry_max_retries")]
+    pub max_retries: u32,
     pub backoff_base_ms: u64,
     pub backoff_max_ms: u64,
 }
@@ -1210,6 +1221,7 @@ impl Default for ToolRetryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 2,
+            max_retries: default_retry_max_retries(),
             backoff_base_ms: 300,
             backoff_max_ms: 5_000,
         }
@@ -1224,7 +1236,8 @@ impl ToolRetryPolicy {
     }
 
     pub fn should_retry(&self, attempt: u32) -> bool {
-        attempt < self.max_attempts
+        let limit = self.max_attempts.min(self.max_retries.max(1));
+        attempt < limit
     }
 }
 
@@ -1234,18 +1247,21 @@ pub fn tool_retry_policy(tool_name: &str) -> ToolRetryPolicy {
         // Pure reads: retry aggressively (no side effects)
         ToolIdempotency::PureRead => ToolRetryPolicy {
             max_attempts: 3,
+            max_retries: default_retry_max_retries(),
             backoff_base_ms: 200,
             backoff_max_ms: 2_000,
         },
         // Idempotent writes: retry cautiously
         ToolIdempotency::IdempotentWrite => ToolRetryPolicy {
             max_attempts: 2,
+            max_retries: default_retry_max_retries(),
             backoff_base_ms: 500,
             backoff_max_ms: 5_000,
         },
         // Non-idempotent: do NOT auto-retry (let LLM decide)
         ToolIdempotency::NonIdempotent => ToolRetryPolicy {
             max_attempts: 1, // no retry
+            max_retries: 1,
             backoff_base_ms: 0,
             backoff_max_ms: 0,
         },
@@ -2248,6 +2264,18 @@ mod tests {
         assert!(policy.should_retry(2, &ErrorCategory::Timeout));
         assert!(!policy.should_retry(3, &ErrorCategory::Transient)); // max_attempts=3
         assert!(!policy.should_retry(1, &ErrorCategory::AuthFailure)); // not in retry_on
+    }
+
+    #[test]
+    fn retry_policy_max_retries_caps_max_attempts() {
+        let policy = RetryPolicy {
+            max_attempts: 100,
+            max_retries: 5,
+            ..RetryPolicy::default()
+        };
+        assert!(policy.should_retry(0, &ErrorCategory::Transient));
+        assert!(policy.should_retry(4, &ErrorCategory::Transient));
+        assert!(!policy.should_retry(5, &ErrorCategory::Transient));
     }
 
     // ── Tool Retry Policy ──

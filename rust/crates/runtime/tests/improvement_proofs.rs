@@ -1689,7 +1689,7 @@ mod non_happy_path {
             &["list_dir"],
             &["read_file"],
         ]);
-        let status = detect_divergence(&sigs);
+        let status = detect_divergence(&sigs).unwrap();
         assert!(
             matches!(status, DivergenceStatus::Diverging(_)),
             "Pure exploration (8 rounds) should be flagged as diverging"
@@ -1699,7 +1699,7 @@ mod non_happy_path {
     #[test]
     fn divergence_resets_on_productive_tool() {
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["memory_store"], &["bash"]]);
-        let status = detect_divergence(&sigs);
+        let status = detect_divergence(&sigs).unwrap();
         assert!(
             !matches!(status, DivergenceStatus::Diverging(_)),
             "Productive tool use should reset divergence counter"
@@ -1720,14 +1720,17 @@ mod non_happy_path {
             &["read_file"],
         ]);
 
-        assert!(detect_server_stall(&stall_sigs, 3), "Should detect stall");
         assert!(
-            !detect_server_stall(&diverge_sigs, 3),
+            detect_server_stall(&stall_sigs, 3).unwrap(),
+            "Should detect stall"
+        );
+        assert!(
+            !detect_server_stall(&diverge_sigs, 3).unwrap(),
             "Not stall — tools differ"
         );
         assert!(
             matches!(
-                detect_divergence(&diverge_sigs),
+                detect_divergence(&diverge_sigs).unwrap(),
                 DivergenceStatus::Diverging(_)
             ),
             "Should detect divergence — all exploration (8 rounds)"
@@ -3202,8 +3205,11 @@ mod stall_enforcement_proofs {
                 s
             })
             .collect();
-        assert!(detect_server_stall(&stall_sigs, 2));
-        assert_eq!(detect_divergence(&stall_sigs), DivergenceStatus::Healthy); // not exploration tools
+        assert!(detect_server_stall(&stall_sigs, 2).unwrap());
+        assert_eq!(
+            detect_divergence(&stall_sigs).unwrap(),
+            DivergenceStatus::Healthy
+        ); // not exploration tools
 
         // Case 2: divergence (exploration tools only) — not stall
         let div_sigs: Vec<BTreeSet<String>> = vec![
@@ -3228,9 +3234,12 @@ mod stall_enforcement_proofs {
                 s
             },
         ];
-        assert!(!detect_server_stall(&div_sigs, 2)); // different tools each turn
+        assert!(!detect_server_stall(&div_sigs, 2).unwrap()); // different tools each turn
         // `MAX_EXPLORATION_ROUNDS` is 3: four consecutive exploration-only rounds are Diverging.
-        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Diverging(4));
+        assert_eq!(
+            detect_divergence(&div_sigs).unwrap(),
+            DivergenceStatus::Diverging(4)
+        );
     }
 }
 

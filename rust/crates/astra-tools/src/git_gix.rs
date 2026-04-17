@@ -60,13 +60,92 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
 
 // ~4K tokens; was 30K
 
-/// Reject file paths with `..` components that could escape the repository tree.
-fn reject_path_traversal(file: &str) -> Result<(), String> {
-    if file.contains("..") {
-        Err("Error: path traversal ('..') not allowed in file parameter".to_string())
-    } else {
-        Ok(())
+fn percent_decode_path_token(input: &str) -> Result<String, String> {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
     }
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let Some(hi) = hex(bytes[i + 1]) else {
+                return Err("Error: invalid percent-encoding in path".to_string());
+            };
+            let Some(lo) = hex(bytes[i + 2]) else {
+                return Err("Error: invalid percent-encoding in path".to_string());
+            };
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| "Error: path is not valid UTF-8".to_string())
+}
+
+/// Reject unsafe file paths: traversal, absolute paths, glob/control chars, percent-encoded `..`,
+/// and (when paths exist) symlink escapes via `canonicalize`.
+fn reject_path_traversal(file: &str, project_root: &Path) -> Result<(), String> {
+    use std::path::Component;
+
+    if file.is_empty() {
+        return Err("Error: path must not be empty".to_string());
+    }
+    if file.contains('\0') {
+        return Err("Error: null bytes not allowed in path".to_string());
+    }
+    if file
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '\t' | '\r'))
+    {
+        return Err("Error: glob or control characters not allowed in file parameter".to_string());
+    }
+    let mut decoded = percent_decode_path_token(file)?;
+    decoded = percent_decode_path_token(&decoded)?;
+    if decoded.contains("..") {
+        return Err("Error: path traversal ('..') not allowed in file parameter".to_string());
+    }
+    #[cfg(windows)]
+    {
+        let lower = decoded.to_ascii_lowercase();
+        if lower.starts_with("\\\\?\\")
+            || lower.starts_with("\\\\")
+            || (decoded.len() >= 2 && lower.as_bytes()[1] == b':')
+        {
+            return Err("Error: absolute Windows paths are not allowed".to_string());
+        }
+    }
+    let rel = Path::new(&decoded);
+    if rel.is_absolute() {
+        return Err("Error: absolute paths are not allowed in file parameter".to_string());
+    }
+    let mut resolved = project_root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("Error: path traversal via parent directory is not allowed".to_string());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("Error: absolute path components are not allowed".to_string());
+            }
+        }
+    }
+    if let (Ok(root_canon), Ok(path_canon)) = (project_root.canonicalize(), resolved.canonicalize())
+    {
+        if !path_canon.starts_with(&root_canon) {
+            return Err("Error: resolved path escapes project root".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Reject git ref strings containing shell metacharacters.
@@ -841,7 +920,7 @@ pub fn git_blame(project_root: &Path, args: &Value) -> String {
         Some(f) => f,
         None => return "Error: missing 'file' parameter".to_string(),
     };
-    if let Err(e) = reject_path_traversal(file) {
+    if let Err(e) = reject_path_traversal(file, project_root) {
         return e;
     }
 
@@ -1011,7 +1090,7 @@ pub fn git_diff(
     let base_ref = args.get("base_ref").and_then(Value::as_str);
     let path_filter = args.get("path").and_then(Value::as_str);
     if let Some(p) = path_filter {
-        if let Err(e) = reject_path_traversal(p) {
+        if let Err(e) = reject_path_traversal(p, project_root) {
             return e;
         }
     }
@@ -1401,7 +1480,7 @@ pub fn git_file_history(project_root: &Path, args: &Value) -> String {
         Some(f) => f,
         None => return "Error: missing 'file' parameter".to_string(),
     };
-    if let Err(e) = reject_path_traversal(file) {
+    if let Err(e) = reject_path_traversal(file, project_root) {
         return e;
     }
 
@@ -1703,7 +1782,7 @@ pub fn git_contributors(project_root: &Path, args: &Value) -> String {
 
     let path_filter = args.get("path").and_then(Value::as_str);
     if let Some(p) = path_filter {
-        if let Err(e) = reject_path_traversal(p) {
+        if let Err(e) = reject_path_traversal(p, project_root) {
             return e;
         }
     }
@@ -2264,6 +2343,37 @@ mod tests {
     }
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn reject_path_traversal_blocks_empty_and_parent_walk() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        assert!(reject_path_traversal("", root).is_err());
+        assert!(reject_path_traversal("../outside", root).is_err());
+        assert!(reject_path_traversal("foo/../../etc/passwd", root).is_err());
+    }
+
+    #[test]
+    fn reject_path_traversal_allows_plain_relative_under_root() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        assert!(reject_path_traversal("src/main.rs", root).is_ok());
+        assert!(reject_path_traversal("README.md", root).is_ok());
+    }
+
+    #[test]
+    fn reject_path_traversal_rejects_percent_encoded_dot_dot() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        assert!(reject_path_traversal("%2e%2e%2fsecret", root).is_err());
+    }
+
+    #[test]
+    fn reject_path_traversal_rejects_glob_metacharacters() {
+        let dir = TempDir::new().expect("tempdir");
+        assert!(reject_path_traversal("*.rs", dir.path()).is_err());
+        assert!(reject_path_traversal("file?.txt", dir.path()).is_err());
+    }
 
     fn repo_root() -> std::path::PathBuf {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

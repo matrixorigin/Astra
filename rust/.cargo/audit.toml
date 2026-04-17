@@ -1,0 +1,8 @@
+# cargo-audit configuration (https://github.com/rustsec/rustsec/tree/main/cargo-audit)
+#
+# RUSTSEC-2023-0071 (rsa / Marvin timing): pulled in by sqlx-mysql → rsa. There is no patched rsa
+# release in the ecosystem path we use; MatrixOne access is over TLS and we do not use rsa for
+# application-side private-key operations. Revisit when sqlx or mysql driver drops rsa.
+
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

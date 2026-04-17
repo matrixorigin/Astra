@@ -16,6 +16,7 @@ use astra_runtime::turn::tool_result_semantics::{
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use crossterm::style::Stylize;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use serde_json::{Map, Value};
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
@@ -256,7 +257,7 @@ impl<'a> CliSseStreamHost<'a> {
             turn_index: ctx
                 .executor
                 .journal_turn_index
-                .load(std::sync::atomic::Ordering::Relaxed),
+                .load(std::sync::atomic::Ordering::Acquire),
             file_checkpoint: ctx.executor.file_journal_checkpoint(),
             database_checkpoint: ctx.executor.database_snapshot_journal_checkpoint(),
             stash_checkpoint: ctx.executor.git_stash_journal_checkpoint(),
@@ -1084,7 +1085,7 @@ impl<'a> CliSseStreamHost<'a> {
                     turn_index: self
                         .executor
                         .journal_turn_index
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                        .load(std::sync::atomic::Ordering::Acquire),
                     file_checkpoint: self.executor.file_journal_checkpoint(),
                     database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
                     stash_checkpoint: self.executor.git_stash_journal_checkpoint(),
@@ -2306,68 +2307,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             ui_indices.push(tool_idx);
         }
 
-        // ── Phase 2: Parallel execution via tokio::spawn ──
-        // Each tool runs on a separate runtime thread for true parallelism
-        // (sync tools block their thread; async tools yield normally).
-        //
-        // SAFETY: `ScopedJoinHandles` aborts all spawned tasks on drop,
-        // guaranteeing `executor` remains valid for every task's lifetime.
+        // ── Phase 2: Concurrent execution (no `tokio::spawn` + raw executor pointers) ──
+        // `ToolExecutor::execute_with_metadata` takes `&self` and is `Sync`; we run all
+        // tool futures concurrently on the current runtime via `join_all` so the shared
+        // `&ToolExecutor` stays sound without `unsafe impl Send` around raw pointers.
         let executor: &crate::edge_tools::ToolExecutor = &*self.executor;
-
-        /// Wrapper that makes a `*const ToolExecutor` safely `Send`.
-        /// Dereferencing requires an `unsafe` call via [`as_ref`](Self::as_ref).
-        struct ExecHandle(*const crate::edge_tools::ToolExecutor);
-        // SAFETY: ToolExecutor is Sync, so &ToolExecutor is Send.
-        // ExecHandle is used only to ferry the pointer into spawned tasks.
-        unsafe impl Send for ExecHandle {}
-        unsafe impl Sync for ExecHandle {}
-        impl ExecHandle {
-            /// # Safety
-            /// The pointee must still be alive.
-            unsafe fn as_ref(&self) -> &crate::edge_tools::ToolExecutor {
-                unsafe { &*self.0 }
-            }
-        }
-
-        struct ScopedJoinHandles(
-            Vec<tokio::task::JoinHandle<(crate::edge_tools::ToolExecutionOutcome, u64)>>,
-        );
-        impl Drop for ScopedJoinHandles {
-            fn drop(&mut self) {
-                for h in &self.0 {
-                    h.abort();
-                }
-            }
-        }
-
-        let handle = ExecHandle(executor as *const _);
-        let mut scope = ScopedJoinHandles(Vec::with_capacity(conc_reqs.len()));
-        for (_, req) in &conc_reqs {
-            let tool = req.tool.clone();
-            let args = req.args.clone();
-            let h = ExecHandle(handle.0);
-            scope.0.push(tokio::spawn(async move {
-                // SAFETY: ScopedJoinHandles aborts on drop — pointee is alive.
-                let exec = unsafe { h.as_ref() };
-                let t0 = Instant::now();
-                let output = exec.execute_with_metadata(&tool, &args).await;
-                (output, t0.elapsed().as_millis() as u64)
-            }));
-        }
-        let mut outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> =
-            Vec::with_capacity(scope.0.len());
-        for jh in std::mem::take(&mut scope.0) {
-            match jh.await {
-                Ok(result) => outputs.push(result),
-                Err(e) => outputs.push((
-                    crate::edge_tools::ToolExecutionOutcome {
-                        output: format!("Tool execution panicked: {e}"),
-                        tool_result_fields: None,
-                    },
-                    0,
-                )),
-            }
-        }
+        let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
+            conc_reqs
+                .iter()
+                .map(|(_, req)| {
+                    let tool = req.tool.clone();
+                    let args = req.args.clone();
+                    async move {
+                        let t0 = Instant::now();
+                        let output = executor.execute_with_metadata(&tool, &args).await;
+                        (output, t0.elapsed().as_millis() as u64)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await;
 
         // ── Phase 3: Post-execution (sequential, &mut self) ──
         // Stop grouped spinner if we used one.

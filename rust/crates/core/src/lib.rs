@@ -15,6 +15,8 @@ pub mod drift;
 pub mod error_kind;
 pub mod log;
 pub mod runtime_limits;
+pub mod session_env_overlay;
+pub mod sync_poison;
 pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};

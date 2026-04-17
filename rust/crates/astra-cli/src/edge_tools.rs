@@ -1227,7 +1227,7 @@ impl ToolExecutor {
         let rollback_on_failure = chain.rollback_on_failure;
         let rollback_turn_index = self
             .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Acquire);
         let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
         let database_checkpoint =
             rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());

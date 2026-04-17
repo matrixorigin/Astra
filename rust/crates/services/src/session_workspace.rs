@@ -547,7 +547,7 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let dir = workspace_dir(&metadata.session_id);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("workspace.yaml");
-    let yaml = serde_yaml::to_string(metadata)
+    let yaml = serde_yml::to_string(metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = dir.join(".workspace.yaml.tmp");
     // Write to tmp, set perms, fsync, then atomically rename.
@@ -585,7 +585,7 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
         ));
     }
     let content = std::fs::read_to_string(&path)?;
-    serde_yaml::from_str(&content)
+    serde_yml::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn workspace_serializes_to_yaml() {
         let ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
-        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
         assert!(yaml.contains("session_id: sess-1"));
         assert!(yaml.contains("model: gpt-4"));
         assert!(yaml.contains("status: active"));
@@ -813,8 +813,8 @@ mod tests {
         ws.pinned_tools = vec!["bash".into()];
         ws.deprioritized_tools = vec!["web_fetch".into()];
 
-        let yaml = serde_yaml::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(parsed.session_id, "sess-1");
         assert_eq!(parsed.turn_count, 1);
         assert_eq!(parsed.checkpoints, vec![1]);
@@ -871,8 +871,8 @@ mod tests {
             explanations: vec!["Kept LSP because symbol-aware navigation was required.".into()],
         });
 
-        let yaml = serde_yaml::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.last_context_trace, ws.last_context_trace);
     }
@@ -885,8 +885,8 @@ mod tests {
         ws.fork_note = Some("experiment".into());
         ws.correlation_id = Some("corr-abc".into());
         ws.agent_role = Some("planner".into());
-        let yaml = serde_yaml::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(parsed.parent_session_id.as_deref(), Some("parent-uuid"));
         assert_eq!(parsed.forked_at_turn, Some(7));
         assert_eq!(parsed.fork_note.as_deref(), Some("experiment"));
@@ -906,12 +906,12 @@ mod tests {
 
         // Write to the temp dir
         let path = dir.join("workspace.yaml");
-        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
         std::fs::write(&path, &yaml).unwrap();
 
         // Read back
         let content = std::fs::read_to_string(&path).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&content).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&content).unwrap();
         assert_eq!(parsed.session_id, session_id);
         assert_eq!(parsed.turn_count, 1);
         assert_eq!(parsed.total_tokens_in, 200);
@@ -921,7 +921,7 @@ mod tests {
     fn workspace_backward_compat_no_checkpoints() {
         // YAML without checkpoints field should deserialize with empty vec
         let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 0\ntotal_tokens_in: 0\ntotal_tokens_out: 0\nstatus: active\n";
-        let ws: WorkspaceMetadata = serde_yaml::from_str(yaml).unwrap();
+        let ws: WorkspaceMetadata = serde_yml::from_str(yaml).unwrap();
         assert!(ws.checkpoints.is_empty());
         // Plan fields default to None/0
         assert!(ws.executing_plan_json.is_none());
@@ -943,8 +943,8 @@ mod tests {
         ws.plan_config_json = Some(r#"{"step_by_step":true,"auto_execute":false}"#.to_string());
         ws.plan_execution_rounds = 3;
 
-        let yaml = serde_yaml::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.executing_plan_json, ws.executing_plan_json);
         assert_eq!(parsed.plan_goal, Some("Implement feature X".to_string()));
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn workspace_no_plan_omits_fields() {
         let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
-        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
         // Plan fields should be omitted when None/0
         assert!(!yaml.contains("executing_plan_json"));
         assert!(!yaml.contains("plan_goal"));
@@ -991,8 +991,8 @@ mod tests {
             ],
         });
 
-        let yaml = serde_yaml::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.goal_progress, ws.goal_progress);
         assert!(yaml.contains("goal_progress"));
@@ -1139,8 +1139,8 @@ mod tests {
         ws.active_variant = Some("treatment-a".to_string());
         ws.tuned_config_json = Some(r#"{"max_tokens":4096}"#.to_string());
 
-        let yaml = serde_yaml::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.last_scenario_change_turn, Some(12));
         assert_eq!(parsed.last_token_budget_direction, -1);
@@ -1157,7 +1157,7 @@ mod tests {
     fn workspace_adaptive_state_defaults_on_missing_fields() {
         // YAML from older versions without adaptive fields should deserialize cleanly
         let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 5\ntotal_tokens_in: 100\ntotal_tokens_out: 50\nstatus: active\n";
-        let ws: WorkspaceMetadata = serde_yaml::from_str(yaml).unwrap();
+        let ws: WorkspaceMetadata = serde_yml::from_str(yaml).unwrap();
         assert_eq!(ws.last_scenario_change_turn, None);
         assert_eq!(ws.last_token_budget_direction, 0);
         assert_eq!(ws.last_token_budget_change_turn, None);
@@ -1171,7 +1171,7 @@ mod tests {
     #[test]
     fn workspace_adaptive_state_omitted_when_default() {
         let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
-        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let yaml = serde_yml::to_string(&ws).unwrap();
         assert!(
             !yaml.contains("last_scenario_change_turn"),
             "should omit None fields"

@@ -98,14 +98,23 @@ pub enum SafetyMiddlewareDecision {
     Deny(String),
 }
 
+/// Error returned when a safety guard cannot evaluate input (fail-closed: treated as deny).
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SafetyGuardEvalError {
+    #[error("guard evaluation failed: {0}")]
+    Failed(String),
+}
+
+pub type SafetyGuardFn = fn(&str, &Value) -> Result<Option<String>, SafetyGuardEvalError>;
+
 #[derive(Clone, Copy)]
 pub struct SafetyGuard {
     name: &'static str,
-    evaluate: fn(&str, &Value) -> Option<String>,
+    evaluate: SafetyGuardFn,
 }
 
 impl SafetyGuard {
-    pub const fn new(name: &'static str, evaluate: fn(&str, &Value) -> Option<String>) -> Self {
+    pub const fn new(name: &'static str, evaluate: SafetyGuardFn) -> Self {
         Self { name, evaluate }
     }
 }
@@ -133,11 +142,20 @@ impl SafetyMiddleware {
     #[must_use]
     pub fn evaluate(&self, tool_name: &str, tool_args: &Value) -> SafetyMiddlewareDecision {
         for guard in &self.guards {
-            if let Some(reason) = (guard.evaluate)(tool_name, tool_args) {
-                return SafetyMiddlewareDecision::Deny(format!(
-                    "blocked by safety guard '{}': {reason}",
-                    guard.name
-                ));
+            match (guard.evaluate)(tool_name, tool_args) {
+                Ok(Some(reason)) => {
+                    return SafetyMiddlewareDecision::Deny(format!(
+                        "blocked by safety guard '{}': {reason}",
+                        guard.name
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return SafetyMiddlewareDecision::Deny(format!(
+                        "blocked by safety guard '{}' (fail-closed): {e}",
+                        guard.name
+                    ));
+                }
             }
         }
         SafetyMiddlewareDecision::Allow
@@ -346,31 +364,41 @@ fn redact_credentials_in_text(text: &str) -> (String, usize) {
     (result, total)
 }
 
-fn destructive_sql_guard(tool_name: &str, tool_args: &Value) -> Option<String> {
+fn destructive_sql_guard(
+    tool_name: &str,
+    tool_args: &Value,
+) -> Result<Option<String>, SafetyGuardEvalError> {
     if tool_name != "mo_query" {
-        return None;
+        return Ok(None);
     }
-    let sql = tool_args.get("sql").and_then(Value::as_str)?;
+    let Some(sql) = tool_args.get("sql").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     let allow_destructive = tool_args
         .get("allow_destructive")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if allow_destructive {
-        return None;
+        return Ok(None);
     }
-    check_sql_safety(sql).map(|kind| {
+    Ok(check_sql_safety(sql).map(|kind| {
         format!(
             "{kind} statements are blocked by default. Pass \"allow_destructive\": true to confirm execution."
         )
-    })
+    }))
 }
 
-fn shell_obfuscation_guard(tool_name: &str, tool_args: &Value) -> Option<String> {
+fn shell_obfuscation_guard(
+    tool_name: &str,
+    tool_args: &Value,
+) -> Result<Option<String>, SafetyGuardEvalError> {
     if !SHELL_EXECUTION_TOOLS.contains(&tool_name) {
-        return None;
+        return Ok(None);
     }
-    let command = tool_args.get("command").and_then(Value::as_str)?;
-    check_shell_command_safety(command)
+    let Some(command) = tool_args.get("command").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    Ok(check_shell_command_safety(command))
 }
 
 #[must_use]
@@ -1486,6 +1514,19 @@ mod tests {
             &json!({"sql": "DROP TABLE users", "allow_destructive": true}),
         );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    fn guard_that_errors(_: &str, _: &Value) -> Result<Option<String>, SafetyGuardEvalError> {
+        Err(SafetyGuardEvalError::Failed("simulated".into()))
+    }
+
+    #[test]
+    fn middleware_fail_closed_when_guard_returns_err() {
+        let mw = SafetyMiddleware::new(vec![SafetyGuard::new("broken", guard_that_errors)]);
+        let decision = mw.evaluate("read_file", &json!({"path": "x"}));
+        assert!(
+            matches!(decision, SafetyMiddlewareDecision::Deny(ref r) if r.contains("fail-closed") && r.contains("broken"))
+        );
     }
 
     #[test]

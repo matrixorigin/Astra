@@ -755,7 +755,7 @@ Follow these steps:
                         }
                     } else if let Some(end) = src[3..].find("\n---") {
                         let yaml = &src[3..3 + end];
-                        if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(yaml) {
+                        if let Ok(val) = serde_yml::from_str::<serde_json::Value>(yaml) {
                             let sname = val.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             eprintln!("  {} {}", "Manifest name:".dim(), sname.cyan());
                         }
@@ -1861,7 +1861,7 @@ fn collect_skill_md_issues(_skill_name: &str, src: &str) -> Vec<String> {
         issues.push("missing YAML frontmatter (must start with ---)".to_string());
     } else if let Some(end) = src[3..].find("\n---") {
         let yaml_block = &src[3..3 + end];
-        match serde_yaml::from_str::<serde_json::Value>(yaml_block) {
+        match serde_yml::from_str::<serde_json::Value>(yaml_block) {
             Ok(val) => {
                 if val
                     .get("name")

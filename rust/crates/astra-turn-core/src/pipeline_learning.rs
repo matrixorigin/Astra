@@ -270,7 +270,14 @@ pub fn build_learning_outcome_from_payload(
 
     // Extract quality from tool_quality_assessments
     let raw_quality = extract_aggregate_quality(obj);
-    let reward_hacking = assess_reward_hacking(&tool_calls, raw_quality, user_feedback_score);
+    let reward_hacking = assess_reward_hacking(&tool_calls, raw_quality, user_feedback_score)
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "pipeline_learning", error = %e, "reward hacking assessment failed");
+            crate::stall::RewardHackingAssessment {
+                risk: 0.0,
+                flags: Vec::new(),
+            }
+        });
     let causal_support = assess_causal_support(obj, &tools_used, raw_quality);
     let quality =
         dampen_quality_for_reward_hacking(raw_quality, &reward_hacking) * causal_support.score;
