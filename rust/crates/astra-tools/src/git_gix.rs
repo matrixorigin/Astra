@@ -2356,6 +2356,15 @@ mod tests {
         dir
     }
 
+    fn init_temp_repo_with_followup_change() -> TempDir {
+        let dir = init_temp_repo();
+        let root = dir.path();
+        std::fs::write(root.join("tracked.txt"), "two\n").expect("write tracked file");
+        run_git(root, &["add", "tracked.txt"]);
+        run_git(root, &["commit", "-m", "update tracked"]);
+        dir
+    }
+
     #[test]
     fn git_status_returns_output() {
         let root = repo_root();
@@ -2725,24 +2734,27 @@ mod tests {
 
     #[test]
     fn git_show_file_filter() {
-        let root = repo_root();
+        let dir = init_temp_repo_with_followup_change();
         let result = git_show(
-            &root,
-            &json!({"commit": "HEAD", "file": "README.md"}),
+            dir.path(),
+            &json!({"commit": "HEAD", "file": "tracked.txt"}),
             0.0,
             0,
         );
-        // If README.md was changed in HEAD, it should appear; otherwise no diff lines
         assert!(result.contains("commit "), "should show header: {result}");
+        assert!(
+            result.contains("--- a/tracked.txt") || result.contains("+++ b/tracked.txt"),
+            "file filter should keep the requested path: {result}"
+        );
     }
 
     #[test]
     fn git_show_with_file_appends_hint_when_aggregate_high() {
-        let root = repo_root();
+        let dir = init_temp_repo_with_followup_change();
         // aggregate_bytes above AGGREGATE_SOFT_LIMIT / 2 (60_000) with file filter
         let result = git_show(
-            &root,
-            &json!({"commit": "HEAD", "file": "README.md"}),
+            dir.path(),
+            &json!({"commit": "HEAD", "file": "tracked.txt"}),
             0.0,
             65_000,
         );
@@ -2754,10 +2766,8 @@ mod tests {
 
     #[test]
     fn git_show_without_file_no_hint_even_when_aggregate_high() {
-        let root = repo_root();
-        // No file filter — hint should NOT appear even when aggregate is high.
-        // Use HEAD~5 to pick a commit whose diff doesn't contain the hint text.
-        let result = git_show(&root, &json!({"commit": "HEAD~5"}), 0.0, 65_000);
+        let dir = init_temp_repo_with_followup_change();
+        let result = git_show(dir.path(), &json!({"commit": "HEAD"}), 0.0, 65_000);
         assert!(
             !result.contains("[hint: aggregate output is high"),
             "should NOT append hint without file filter: {}",
