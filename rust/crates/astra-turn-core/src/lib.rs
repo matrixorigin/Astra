@@ -90,6 +90,7 @@ pub mod delegation_tree;
 pub mod goal_tracker;
 pub mod headless_tool_journal;
 pub mod orchestration_types;
+pub mod permission_sync;
 pub mod permission_types;
 pub mod persist;
 pub mod progress_display;

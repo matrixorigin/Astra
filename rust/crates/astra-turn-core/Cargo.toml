@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 astra-core.workspace = true
+astra-messaging.workspace = true
 astra-pipeline.workspace = true
 astra-sandbox.workspace = true
 astra-services.workspace = true
