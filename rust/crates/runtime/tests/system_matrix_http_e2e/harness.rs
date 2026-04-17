@@ -338,20 +338,33 @@ pub async fn collect_sse_body_text(
     }
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
+    let mut matched = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
         let chunk = chunk.expect("body chunk");
         acc.extend_from_slice(&chunk);
         if acc.len() >= max_bytes {
+            matched = true;
             break;
         }
         let preview = String::from_utf8_lossy(&acc);
         if preview.contains("\"run_id\"") && preview.contains("session_info") {
+            matched = true;
             break;
         }
         if preview.contains("\"type\":\"error\"") {
+            matched = true;
             break;
         }
+    }
+    if !matched {
+        let preview = String::from_utf8_lossy(&acc);
+        panic!(
+            "SSE stream timed out (5s) without expected events (run_id/session_info/error). \
+             Collected {} bytes, preview: {}",
+            acc.len(),
+            &preview[..preview.len().min(500)]
+        );
     }
     (status, String::from_utf8_lossy(&acc).to_string())
 }
@@ -597,6 +610,10 @@ pub async fn bootstrap() -> BootstrapResult {
 }
 
 async fn bootstrap_local_jwt() -> BootstrapResult {
+    // Use low bcrypt cost in tests to avoid multi-second hashing in debug builds.
+    // SAFETY: set before any code reads this variable; the tokio runtime has
+    // worker threads but none are reading ASTRA_BCRYPT_COST yet.
+    unsafe { std::env::set_var("ASTRA_BCRYPT_COST", "4") };
     let memoria = Arc::new(E2eMemoriaStub::default());
     let (state, matrixone_database, url) = build_state_with_mode(memoria.clone(), false).await;
 

@@ -86,11 +86,6 @@ fn build_server_skill_resolver(
         let registry = Arc::new(registry);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let r = Arc::clone(&registry);
-            // Production runs on a multi-thread runtime where block_in_place
-            // is available.  For single-thread runtimes (unit tests) we
-            // detect the runtime flavor first and use thread::scope as a
-            // fallback — safe only because unit tests never wire a
-            // DatabaseSkillProvider, so discover_all does no async I/O.
             match handle.runtime_flavor() {
                 tokio::runtime::RuntimeFlavor::MultiThread => {
                     let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
