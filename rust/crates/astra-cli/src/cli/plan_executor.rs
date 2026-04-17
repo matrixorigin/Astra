@@ -570,6 +570,11 @@ pub(super) struct BackgroundPlanContext {
     /// Local tracking for LLM turn failures (separate from durable verification retries).
     /// Maps subtask_id → count of turn failures for that subtask.
     pub turn_retry_counts: std::collections::HashMap<String, u32>,
+
+    /// Per-subtask strategy hints for retry attempts.
+    /// Cleared after each subtask completes (success or max retries exceeded).
+    /// This avoids polluting the shared `plan_corrections` vector.
+    pub current_subtask_strategy_hint: Option<String>,
 }
 
 /// Spawn a background plan executor task.
@@ -925,10 +930,13 @@ async fn plan_executor_task(
                     return;
                 };
                 st.status = TaskStatus::InProgress;
-                let prompt = plan_decompose::format_subtask_prompt_with_operator_notes(
-                    st,
-                    &ctx.plan_corrections,
-                );
+                // Combine plan_corrections with per-subtask strategy hint
+                let mut corrections = ctx.plan_corrections.clone();
+                if let Some(ref hint) = ctx.current_subtask_strategy_hint {
+                    corrections.push(hint.clone());
+                }
+                let prompt =
+                    plan_decompose::format_subtask_prompt_with_operator_notes(st, &corrections);
                 (prompt, st.title.clone())
             };
 
@@ -1132,6 +1140,8 @@ async fn plan_executor_task(
                             st.status = TaskStatus::Completed;
                             let elapsed = subtask_start.elapsed();
                             subtask_durations.push(elapsed);
+                            // Clear per-subtask strategy hint on success
+                            ctx.current_subtask_strategy_hint = None;
                             sink.subtask_completed(
                                 next_id,
                                 &title,
@@ -1255,9 +1265,11 @@ async fn plan_executor_task(
                     // picks it up again. Use local turn_retry_counts for LLM turn failures
                     // (separate from durable verification retries in contract.subtasks[].retry_count).
                     //
-                    // BUG FIX (Session 7875e355): After 2 failures, inject a strategy hint
+                    // BUG FIX (Session 7875e355): After 2 failures, set a per-subtask strategy hint
                     // to encourage the agent to try a different approach instead of
                     // repeating the same failing pattern.
+                    // NOTE: We use `current_subtask_strategy_hint` instead of `plan_corrections`
+                    // to avoid cross-subtask pollution and prompt size growth.
                     const MAX_TURN_RETRIES: u32 = 3; // Increased from 2 to allow strategy escalation
                     const STRATEGY_ESCALATION_THRESHOLD: u32 = 2;
 
@@ -1268,7 +1280,7 @@ async fn plan_executor_task(
                         .and_modify(|c| *c += 1)
                         .or_insert(1);
 
-                    // After 2 failures, add strategy escalation hint to corrections
+                    // After 2 failures, set strategy escalation hint (overwrite, not accumulate)
                     if *retry_count >= STRATEGY_ESCALATION_THRESHOLD
                         && *retry_count <= MAX_TURN_RETRIES
                     {
@@ -1280,16 +1292,18 @@ async fn plan_executor_task(
                              4. If stuck, describe what you've tried and ask for clarification",
                             title, *retry_count
                         );
-                        ctx.plan_corrections.push(strategy_hint);
+                        ctx.current_subtask_strategy_hint = Some(strategy_hint);
                         astra_core::agent_warn!(
                             "plan_executor",
-                            "subtask '{}' failed {} times, injecting strategy escalation hint",
+                            "subtask '{}' failed {} times, setting strategy escalation hint",
                             next_id,
                             *retry_count
                         );
                     }
 
                     if *retry_count > MAX_TURN_RETRIES {
+                        // Clear per-subtask strategy hint on max retries failure
+                        ctx.current_subtask_strategy_hint = None;
                         if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                             st.status = TaskStatus::Failed;
                         }
@@ -1447,6 +1461,7 @@ mod tests {
             plan_execution_config: None,
             turn: 0,
             turn_retry_counts: std::collections::HashMap::new(),
+            current_subtask_strategy_hint: None,
         }
     }
 

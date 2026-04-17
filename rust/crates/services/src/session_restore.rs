@@ -776,7 +776,25 @@ pub async fn push_checkpoint_to_cloud(
     let tools_json =
         serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
 
-    let updated = sqlx::query(
+    // Helper: log sync result (success or failure) and propagate result
+    let log_and_return = |result: Result<(), String>| async {
+        let (status, error_msg) = match &result {
+            Ok(()) => ("success", None),
+            Err(e) => ("error", Some(e.as_str())),
+        };
+        let _ = log_checkpoint_sync(
+            pool,
+            user_id,
+            session_id,
+            checkpoint.number,
+            status,
+            error_msg,
+        )
+        .await;
+        result
+    };
+
+    let updated = match sqlx::query(
         "UPDATE session_checkpoints SET \
             turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
             had_stalls = ?, error_count = ?, contract_state_json = ? \
@@ -794,7 +812,13 @@ pub async fn push_checkpoint_to_cloud(
     .bind(checkpoint.number as i32)
     .execute(pool)
     .await
-    .map_err(|e| format!("push_checkpoint update: {e}"))?;
+    {
+        Ok(u) => u,
+        Err(e) => {
+            let err = format!("push_checkpoint update: {e}");
+            return log_and_return(Err(err)).await;
+        }
+    };
 
     if updated.rows_affected() == 0 {
         let inserted = sqlx::query(
@@ -820,7 +844,7 @@ pub async fn push_checkpoint_to_cloud(
 
         if let Err(e) = inserted {
             if is_duplicate_key_error(&e) {
-                sqlx::query(
+                if let Err(e) = sqlx::query(
                     "UPDATE session_checkpoints SET \
                         turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
                         had_stalls = ?, error_count = ?, contract_state_json = ? \
@@ -838,35 +862,18 @@ pub async fn push_checkpoint_to_cloud(
                 .bind(checkpoint.number as i32)
                 .execute(pool)
                 .await
-                .map_err(|err| format!("push_checkpoint retry update: {err}"))?;
+                {
+                    let err = format!("push_checkpoint retry update: {e}");
+                    return log_and_return(Err(err)).await;
+                }
             } else {
-                // Log sync failure for audit trail
-                let _ = log_checkpoint_sync(
-                    pool,
-                    user_id,
-                    session_id,
-                    checkpoint.number,
-                    "error",
-                    Some(&format!("{e}")),
-                )
-                .await;
-                return Err(format!("push_checkpoint insert: {e}"));
+                let err = format!("push_checkpoint insert: {e}");
+                return log_and_return(Err(err)).await;
             }
         }
     }
 
-    // Log successful sync for audit trail (BUG FIX: Session 7875e355 had no sync_log records)
-    let _ = log_checkpoint_sync(
-        pool,
-        user_id,
-        session_id,
-        checkpoint.number,
-        "success",
-        None,
-    )
-    .await;
-
-    Ok(())
+    log_and_return(Ok(())).await
 }
 
 /// Log checkpoint sync to session_sync_log for audit trail.
@@ -879,6 +886,9 @@ async fn log_checkpoint_sync(
     status: &str,
     error_msg: Option<&str>,
 ) -> Result<(), String> {
+    // Use fixed sync_type "checkpoint" for easy aggregation.
+    // Include checkpoint number in error_message for debugging if needed.
+    let error_with_number = error_msg.map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
     sqlx::query(
         "INSERT INTO session_sync_log \
          (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
@@ -887,11 +897,11 @@ async fn log_checkpoint_sync(
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(user_id)
     .bind(session_id)
-    .bind(format!("checkpoint_{}", checkpoint_number))
+    .bind("checkpoint") // Fixed sync_type for easy aggregation
     .bind("push")
     .bind(0i64) // payload_size not tracked for checkpoints
     .bind(status)
-    .bind(error_msg)
+    .bind(error_with_number.as_deref().or(error_msg))
     .execute(pool)
     .await
     .map_err(|e| format!("log_checkpoint_sync: {e}"))?;

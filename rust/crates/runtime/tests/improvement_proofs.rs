@@ -3042,12 +3042,12 @@ mod error_recovery_proofs {
         let l0 = escalation_level(0, 0, 0);
         assert_eq!(l0, EscalationLevel::Normal);
 
-        // After 2 nudges: warning
-        let l1 = escalation_level(2, 0, 0);
+        // After 3 nudges: warning (threshold raised from 2 to 3)
+        let l1 = escalation_level(3, 0, 0);
         assert_eq!(l1, EscalationLevel::Warning);
 
-        // After 3 nudges + 2 errors: critical (nudges alone stay Warning)
-        let l2 = escalation_level(3, 2, 0);
+        // After 4 nudges + 3 errors: critical (threshold raised from 3+2 to 4+3)
+        let l2 = escalation_level(4, 3, 0);
         assert_eq!(l2, EscalationLevel::Critical);
 
         // Severity only increases
@@ -3079,17 +3079,17 @@ mod error_recovery_proofs {
     #[test]
     fn session_error_summary_informs_escalation() {
         let mut summary = SessionErrorSummary::new();
-        // Simulate a problematic session
-        for _ in 0..8 {
+        // Simulate a problematic session — need 15 errors for standalone Critical
+        for _ in 0..15 {
             summary.record_error(ErrorCategory::Network);
         }
         summary.record_retry(false);
         summary.record_retry(false);
 
-        assert_eq!(summary.total_errors, 8);
+        assert_eq!(summary.total_errors, 15);
         assert_eq!(summary.retry_success_rate(), 0.0);
 
-        // This level of errors should trigger escalation
+        // 15 errors should trigger Critical (standalone threshold)
         let level = escalation_level(1, summary.total_errors, 2);
         assert_eq!(level, EscalationLevel::Critical);
     }

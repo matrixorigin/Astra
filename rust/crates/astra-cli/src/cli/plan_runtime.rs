@@ -88,6 +88,7 @@ fn take_plan_context(
         plan_execution_config: state.plan_execution_config.clone(),
         turn: state.turn,
         turn_retry_counts: std::collections::HashMap::new(),
+        current_subtask_strategy_hint: None,
     })
 }
 
