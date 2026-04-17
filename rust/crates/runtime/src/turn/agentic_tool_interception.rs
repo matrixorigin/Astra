@@ -285,7 +285,14 @@ async fn intercept_skill_calls(
                 surgically_removed_ids.insert(call_id.to_string());
             }
             // Append a note to the skill result so the model knows what was dropped.
-            if let Some(skill_result) = skill_results.iter_mut().find(|r| r.result.len() > 500) {
+            // Prefer the most recently-added large result (the one that triggered
+            // the interception) — `sr` is appended last, so iterating in reverse
+            // picks the newly-run skill output rather than a leftover dedup entry.
+            if let Some(skill_result) = skill_results
+                .iter_mut()
+                .rev()
+                .find(|r| r.result.len() > 500)
+            {
                 skill_result.result.push_str(&format!(
                     "\n\n[{} parallel tool call(s) were dropped: [{}]. \
                      The skill output above is your complete context — do NOT re-invoke \

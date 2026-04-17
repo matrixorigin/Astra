@@ -153,3 +153,82 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Shared evolution service for multi-axis self-evolution.
     pub(crate) evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
 }
+
+/// Bundle of "basic CLI" fields shared across one-shot CLI chat invocations
+/// (non-REPL, non-plan-subtask paths). These are the fields that vary per
+/// caller context but stay identical across auth-refresh / session-not-found
+/// retries within the same call site.
+///
+/// Used via [`ChatTurnParams::basic_cli`] to avoid repeating ~30 default fields
+/// at each retry site in `command_router.rs`.
+pub(crate) struct BasicCliChatContext<'a> {
+    pub api: &'a astra_thin_client::ThinClient,
+    pub message: &'a str,
+    pub model: Option<&'a str>,
+    pub explain: ExplainMode,
+    pub render_md: bool,
+    pub verbose_mode: bool,
+    pub render_policy: super::super::stream_render::RenderPolicy,
+    pub selector: &'a dyn ToolSelector,
+    pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+    pub skill_search: &'a astra_core::SkillSearchSettings,
+}
+
+impl<'a> ChatTurnParams<'a> {
+    /// Build a `ChatTurnParams` for a basic one-shot CLI chat invocation with
+    /// optional session-id and a freshly-borrowed `PermissionManager` /
+    /// `SkillQualityTracker` / token. All multi-agent / observability /
+    /// journal fields default to `None`.
+    pub(crate) fn basic_cli(
+        ctx: &'a BasicCliChatContext<'a>,
+        token: &'a str,
+        session_id: Option<&'a str>,
+        perm_manager: &'a mut PermissionManager,
+        skill_quality_tracker: &'a mut astra_runtime::skills::quality::SkillQualityTracker,
+    ) -> ChatTurnParams<'a> {
+        ChatTurnParams {
+            api: ctx.api,
+            token,
+            message: ctx.message,
+            session_id,
+            model: ctx.model,
+            explain: ctx.explain,
+            render_md: ctx.render_md,
+            history: &[],
+            perm_manager,
+            verbose_mode: ctx.verbose_mode,
+            render_policy: ctx.render_policy,
+            selector: ctx.selector,
+            recent_tools: &[],
+            tool_health_entries: &[],
+            unified_skill_registry: ctx.unified_skill_registry,
+            plan_only_chat: false,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            delegation_engine: None,
+            cancel_token: None,
+            plan_assemble_line_release: None,
+            stream_event_tx: None,
+            approval_request_tx: None,
+            mcp_manager: None,
+            skill_search: ctx.skill_search,
+            skill_quality_tracker,
+            discovered_skills: None,
+            messaging_metrics: None,
+            agent_spawner: None,
+            root_agent_id: None,
+            root_mailbox_slot: None,
+            observability_hub: None,
+            observability_session: None,
+            file_journal: None,
+            database_snapshot_journal: None,
+            git_stash_journal: None,
+            git_commit_journal: None,
+            git_worktree_journal: None,
+            session_state_journal: None,
+            task_manager: None,
+            turn_index: 0,
+            evolution_service: None,
+        }
+    }
+}
