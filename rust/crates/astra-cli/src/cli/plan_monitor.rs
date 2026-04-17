@@ -264,12 +264,18 @@ fn display_plan_updates_live(
                 subtask_id,
                 prompt_tokens,
                 completion_tokens,
+                session_id,
                 ..
             } => {
                 state.total_prompt_tokens += prompt_tokens;
                 state.total_completion_tokens += completion_tokens;
                 state.turn += 1;
                 state.current_plan_subtask_id = Some(subtask_id);
+                if let Some(sid) = session_id {
+                    if state.session_id.is_none() {
+                        state.session_id = Some(sid);
+                    }
+                }
                 continue;
             }
             PlanUpdate::SubtaskStatusSync { id, status } => {
@@ -924,12 +930,18 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut ReplStat
             subtask_id,
             prompt_tokens,
             completion_tokens,
+            session_id,
             ..
         } => {
             state.total_prompt_tokens += prompt_tokens;
             state.total_completion_tokens += completion_tokens;
             state.turn += 1;
             state.current_plan_subtask_id = Some(subtask_id);
+            if let Some(sid) = session_id {
+                if state.session_id.is_none() {
+                    state.session_id = Some(sid);
+                }
+            }
         }
         PlanUpdate::SubtaskStatusSync { id, status } => {
             sync_subtask_status(state, &id, status);
