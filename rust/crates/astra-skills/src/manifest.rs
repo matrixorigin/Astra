@@ -123,6 +123,12 @@ pub struct SkillManifest {
     /// Remote execution endpoint. When set, runtime dispatches skill calls over HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_url: Option<String>,
+    /// Header names to forward from the inbound Astra request to remote callbacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_headers: Vec<String>,
+    /// Header names that must be present before invoking the remote callback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_headers: Vec<String>,
     /// Machine-executable success criteria as raw JSON.
     /// The actual verification types are defined in astra_services.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -367,6 +373,8 @@ impl Default for SkillManifest {
             input_schema: None,
             output_schema: None,
             remote_url: None,
+            forward_headers: Vec::new(),
+            required_headers: Vec::new(),
             success_criteria: Vec::new(),
             required_capabilities: Vec::new(),
             composition: None,

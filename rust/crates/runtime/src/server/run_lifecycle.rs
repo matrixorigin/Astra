@@ -117,6 +117,7 @@ fn build_server_skill_executor(
     model_override: Option<&str>,
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
+    forward_headers: &HashMap<String, String>,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
@@ -133,6 +134,7 @@ fn build_server_skill_executor(
     .with_default_model(model_override.map(String::from))
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
+    .with_forward_headers(forward_headers.clone())
     .with_skill_resolver(skill_resolver);
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
@@ -203,6 +205,25 @@ fn skill_search_from_context(
         .get("skill_search")
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+fn forward_headers_from_delegation_context(
+    context: &std::collections::HashMap<String, serde_json::Value>,
+) -> HashMap<String, String> {
+    context
+        .get(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY)
+        .and_then(serde_json::Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .as_str()
+                        .map(|v| (name.to_ascii_lowercase(), v.to_string()))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -868,6 +889,7 @@ impl AgenticRunLifecycleService {
             request.model.as_deref(),
             &edge_tools,
             &edge_profile,
+            &request.forward_headers,
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
@@ -918,6 +940,7 @@ impl AgenticRunLifecycleService {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
+                forward_headers: request.forward_headers.clone(),
                 ..Default::default()
             },
             cancellation: Default::default(),
@@ -2025,6 +2048,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 stop_hooks: hook_sets.stop_hooks,
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
+                forward_headers: forward_headers_from_delegation_context(&config.context),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -2249,6 +2273,7 @@ mod tests {
             model: None,
             skill_search: None,
             context: None,
+            forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
         }
@@ -2318,6 +2343,8 @@ mod tests {
                         metadata: Some(serde_json::json!({
                             "skill_type": "remote",
                             "remote_url": "http://127.0.0.1:18080/remote-skill",
+                            "forward_headers": ["authorization", "x-workspace-id"],
+                            "required_headers": ["x-workspace-id"],
                             "when_to_use": "when task needs remote orchestration"
                         })),
                         created_at: None,
@@ -2392,6 +2419,14 @@ mod tests {
         assert_eq!(
             resolved.remote_url.as_deref(),
             Some("http://127.0.0.1:18080/remote-skill")
+        );
+        assert_eq!(
+            resolved.forward_headers,
+            vec!["authorization".to_string(), "x-workspace-id".to_string()]
+        );
+        assert_eq!(
+            resolved.required_headers,
+            vec!["x-workspace-id".to_string()]
         );
     }
 
@@ -2817,6 +2852,7 @@ mod tests {
             model: None,
             skill_search: None,
             context: Some(ctx),
+            forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
         };
@@ -2844,6 +2880,7 @@ mod tests {
             model: None,
             skill_search: None,
             context: Some(ctx),
+            forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
         };
@@ -3408,6 +3445,27 @@ mod tests {
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
         assert_eq!(profile.get("cwd").unwrap(), "/workspace");
         assert_eq!(profile.get("os").unwrap(), "linux");
+    }
+
+    #[test]
+    fn forward_headers_from_delegation_context_extracts_string_headers() {
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY.to_string(),
+            json!({
+                "Authorization": "Bearer token-1",
+                "x-workspace-id": "ws-001",
+                "x-ignore": 123
+            }),
+        );
+
+        let headers = forward_headers_from_delegation_context(&ctx);
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"Bearer token-1".to_string())
+        );
+        assert_eq!(headers.get("x-workspace-id"), Some(&"ws-001".to_string()));
+        assert!(!headers.contains_key("x-ignore"));
     }
 
     // ─── Background spawning integration tests ──────────────────────────

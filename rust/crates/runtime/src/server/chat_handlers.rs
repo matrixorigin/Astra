@@ -13,6 +13,18 @@ fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
     })
 }
 
+fn collect_forward_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
+}
+
 pub(super) async fn resolve_or_create_chat_session_id(
     state: &AppState,
     user: &AuthUserRecord,
@@ -102,6 +114,7 @@ pub(super) async fn chat_handler(
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let mut chat_data = chat_request_into_data(request);
+    chat_data.forward_headers = collect_forward_headers(&headers);
     chat_data.session_id = resolve_or_create_chat_session_id(
         &state,
         &user,
@@ -128,6 +141,7 @@ pub(super) async fn chat_stream_handler(
     };
 
     let mut chat_data = chat_request_into_data(request);
+    chat_data.forward_headers = collect_forward_headers(&headers);
     chat_data.session_id = match resolve_or_create_chat_session_id(
         &state,
         &user,
@@ -439,6 +453,7 @@ mod tests {
                 surface_cap: 20,
             }),
             context: None,
+            forward_headers: std::collections::HashMap::new(),
             max_candidates: 3,
             explain: true,
         });

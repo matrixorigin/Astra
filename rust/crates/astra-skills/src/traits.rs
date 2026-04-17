@@ -109,6 +109,8 @@ pub struct ResolvedSkill {
     pub input_schema: Option<serde_json::Value>,
     pub output_schema: Option<serde_json::Value>,
     pub remote_url: Option<String>,
+    pub forward_headers: Vec<String>,
+    pub required_headers: Vec<String>,
     pub aliases: Vec<String>,
     pub effort: Option<super::manifest::EffortLevel>,
     pub agent_type: Option<String>,

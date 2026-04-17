@@ -104,6 +104,7 @@ pub struct ChatRequestData {
     pub model: Option<String>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    pub forward_headers: std::collections::HashMap<String, String>,
     pub max_candidates: u32,
     pub explain: bool,
 }
@@ -820,6 +821,7 @@ mod tests {
                     model: None,
                     skill_search: None,
                     context: None,
+                    forward_headers: std::collections::HashMap::new(),
                     max_candidates: 25,
                     explain: false,
                 },

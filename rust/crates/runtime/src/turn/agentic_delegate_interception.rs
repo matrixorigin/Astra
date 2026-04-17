@@ -7,6 +7,7 @@ use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use super::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
 
 pub(crate) const DELEGATE_TOOL_NAME: &str = "delegate";
+pub(crate) const FORWARD_HEADERS_CONTEXT_KEY: &str = "__astra_forward_headers";
 
 pub(crate) struct DelegationInterceptionResult {
     pub(crate) effective_tool_calls: Vec<Value>,
@@ -69,6 +70,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             state.recursion_depth,
             "orchestrator",
             state.hooks.workspace_root_hint.as_deref(),
+            &state.hooks.forward_headers,
             &state.skills.search,
             adaptive_delegation_context.as_ref(),
         )
@@ -202,6 +204,7 @@ pub(crate) fn parse_delegation_request(
     parent_run_id: &str,
     session_id: &str,
     recursion_depth: u8,
+    forward_headers: &std::collections::HashMap<String, String>,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<astra_services::coordination::DelegationRequest, String> {
@@ -247,6 +250,7 @@ pub(crate) fn parse_delegation_request(
     if let Some(policy) = adaptive_policy {
         context.insert("adaptive_coordination".to_string(), policy);
     }
+    merge_forward_headers_into_delegation_context(&mut context, forward_headers);
     crate::turn::agentic_recursion_guard::checked_child_recursion_depth(recursion_depth)?;
 
     Ok(astra_services::coordination::DelegationRequest {
@@ -258,6 +262,24 @@ pub(crate) fn parse_delegation_request(
         depth: u32::from(recursion_depth),
         context,
     })
+}
+
+pub(crate) fn merge_forward_headers_into_delegation_context(
+    context: &mut std::collections::HashMap<String, serde_json::Value>,
+    forward_headers: &std::collections::HashMap<String, String>,
+) {
+    if forward_headers.is_empty() {
+        return;
+    }
+    let json_headers = serde_json::Map::from_iter(
+        forward_headers
+            .iter()
+            .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone()))),
+    );
+    context.insert(
+        FORWARD_HEADERS_CONTEXT_KEY.to_string(),
+        serde_json::Value::Object(json_headers),
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -566,6 +588,7 @@ pub(crate) async fn partition_and_execute_delegations(
     recursion_depth: u8,
     source_agent_id: &str,
     workspace_hint: Option<&str>,
+    forward_headers: &std::collections::HashMap<String, String>,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
@@ -585,6 +608,7 @@ pub(crate) async fn partition_and_execute_delegations(
                 parent_run_id,
                 session_id,
                 recursion_depth,
+                forward_headers,
                 skill_search,
                 adaptive_context,
             ) {
@@ -930,6 +954,7 @@ mod tests {
             "run-123",
             "session-456",
             2,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -940,6 +965,40 @@ mod tests {
         assert!(req.context.contains_key("session_id"));
         assert!(req.context.contains_key("skill_search"));
         assert!(req.context.contains_key("repo"));
+    }
+
+    #[test]
+    fn parse_delegation_request_overrides_forward_headers_from_trusted_state() {
+        let tool_call = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_forward_headers\": {\"x-workspace-id\": \"evil\"}}}"
+            }
+        });
+        let forwarded = std::collections::HashMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer trusted-token".to_string(),
+            ),
+            ("x-workspace-id".to_string(), "ws-001".to_string()),
+        ]);
+        let req = parse_delegation_request(
+            &tool_call,
+            "run-123",
+            "session-456",
+            2,
+            &forwarded,
+            &astra_core::SkillSearchSettings::default(),
+            None,
+        )
+        .unwrap();
+        let headers = req.context[FORWARD_HEADERS_CONTEXT_KEY]
+            .as_object()
+            .expect("forward headers should be an object");
+        assert_eq!(headers["authorization"], "Bearer trusted-token");
+        assert_eq!(headers["x-workspace-id"], "ws-001");
     }
 
     #[test]
@@ -956,6 +1015,7 @@ mod tests {
             "run-1",
             "sess-1",
             0,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         );
@@ -978,6 +1038,7 @@ mod tests {
             "run-1",
             "sess-1",
             crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         );
@@ -1008,6 +1069,7 @@ mod tests {
             "run-123",
             "session-456",
             0,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
@@ -1042,6 +1104,7 @@ mod tests {
             "run-123",
             "session-456",
             0,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
@@ -1384,6 +1447,7 @@ mod tests {
             0,
             "orchestrator",
             None,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1418,6 +1482,7 @@ mod tests {
             0,
             "orchestrator",
             None,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1443,6 +1508,7 @@ mod tests {
             0,
             "orchestrator",
             None,
+            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )

@@ -1,6 +1,18 @@
 use super::*;
 use astra_services::{DelegationRequest, DelegationResult};
 
+fn collect_forward_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
+}
+
 /// POST /chat/runs/{run_id}/delegate
 ///
 /// Delegates a run to one or more sub-agents according to a coordination
@@ -9,9 +21,13 @@ pub(super) async fn delegate_run_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<DelegationRequest>,
+    Json(mut request): Json<DelegationRequest>,
 ) -> Result<Json<DelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _user = state.auth_service.current_user(&headers).await?;
+    crate::turn::agentic_delegate_interception::merge_forward_headers_into_delegation_context(
+        &mut request.context,
+        &collect_forward_headers(&headers),
+    );
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
