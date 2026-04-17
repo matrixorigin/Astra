@@ -193,8 +193,15 @@ struct CliSseStreamHost<'a> {
     active_turn_rollback: Option<ActiveTurnRollback>,
     /// True once the current turn has emitted an execution-boundary-opened event.
     turn_rollback_boundary_emitted: bool,
-    /// Once a turn-level rollback policy fires, later tool requests are short-circuited.
-    aborted_turn_rollback: Option<AbortedTurnRollback>,
+    /// Tracks whether a turn-level rollback has already fired this turn.
+    /// This is used to:
+    /// 1. Prevent transactional batch from running (turn rollback and batch transaction
+    ///    are separate rollback strategies that should not be mixed).
+    /// 2. Record rollback metadata for the cloud event stream.
+    ///
+    /// NOTE: This does NOT block subsequent tool execution — the agent sees the error
+    /// and decides whether to continue or abort.
+    turn_rollback_fired: Option<TurnRollbackFired>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
 }
@@ -234,7 +241,7 @@ struct ActiveTurnRollback {
 }
 
 #[derive(Clone, Debug)]
-struct AbortedTurnRollback {
+struct TurnRollbackFired {
     rollback: Option<Value>,
 }
 
@@ -290,7 +297,7 @@ impl<'a> CliSseStreamHost<'a> {
             cloud_pre_approved: std::collections::HashSet::new(),
             active_turn_rollback,
             turn_rollback_boundary_emitted: false,
-            aborted_turn_rollback: None,
+            turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
         }
     }
@@ -1901,7 +1908,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Soft errors (e.g., "old_str == new_str", "file not found") let the agent retry.
         if status == "error"
             && Self::tool_error_triggers_turn_rollback(tool, args)
-            && tool_error_triggers_rollback(&output)
+            && tool_error_triggers_rollback(tool, &output)
             && let Some(active) = self.active_turn_rollback.clone()
         {
             let rollback = self.rollback_active_turn(&active);
@@ -1923,7 +1930,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 Some(tool),
                 rollback.clone(),
             );
-            self.aborted_turn_rollback = Some(AbortedTurnRollback { rollback });
+            self.turn_rollback_fired = Some(TurnRollbackFired { rollback });
             self.active_turn_rollback = None;
         }
 
@@ -2122,7 +2129,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if n <= 1 {
             if has_batch_transaction
                 && self.active_turn_rollback.is_none()
-                && self.aborted_turn_rollback.is_none()
+                && self.turn_rollback_fired.is_none()
             {
                 let out = self.execute_transactional_batch(&requests).await;
                 self.render.tool_batch_progress = None;
@@ -2139,7 +2146,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             return out;
         }
 
-        if self.active_turn_rollback.is_some() || self.aborted_turn_rollback.is_some() {
+        if self.active_turn_rollback.is_some() || self.turn_rollback_fired.is_some() {
             let mut out = Vec::with_capacity(n);
             for (i, req) in requests.iter().enumerate() {
                 self.render.tool_batch_progress = Some((i + 1, n));
