@@ -42,6 +42,119 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     }
 }
 
+/// Classification of tool errors for rollback policy decisions.
+///
+/// **HardError**: Unrecoverable errors that may have left inconsistent state.
+/// Examples: permission denied, disk full, sandbox violation, git conflicts.
+/// These SHOULD trigger rollback in plan-subtask context.
+///
+/// **SoftError**: Recoverable errors where the tool simply couldn't complete
+/// but left no side effects. The agent can retry or try a different approach.
+/// Examples: file not found, old_str not unique, old_str == new_str.
+/// These should NOT trigger rollback — let the agent decide what to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorSeverity {
+    /// No error — tool succeeded.
+    Success,
+    /// Soft error: recoverable, no side effects, agent can decide next step.
+    SoftError,
+    /// Hard error: may have inconsistent state, should trigger rollback.
+    HardError,
+}
+
+/// Well-known soft error patterns that should NOT trigger rollback.
+///
+/// These errors indicate the tool couldn't complete its task but left no
+/// side effects. The agent can retry with different parameters or try
+/// a different approach.
+const SOFT_ERROR_PATTERNS: &[&str] = &[
+    // str_replace benign failures
+    "old_str and new_str are identical",
+    "old_str not found",
+    "must be unique",
+    "no change needed",
+    // File access (file doesn't exist but no write attempted)
+    "file not found",
+    "no such file",
+    "does not exist",
+    // Read-only failures (no mutation)
+    "nothing to commit",
+    "no changes detected",
+    "already exists", // create_file on existing file
+    // Timeout / transient
+    "timed out",
+    "timeout",
+    "connection refused",
+    "network error",
+];
+
+/// Well-known hard error patterns that SHOULD trigger rollback.
+///
+/// These errors indicate potential inconsistent state that requires cleanup.
+const HARD_ERROR_PATTERNS: &[&str] = &[
+    // Permission / access violations
+    "permission denied",
+    "access denied",
+    "operation not permitted",
+    // Resource exhaustion
+    "no space left",
+    "disk full",
+    "out of memory",
+    "cannot allocate",
+    "too many open files",
+    // Safety violations
+    "sandbox:",
+    "blocked by safety",
+    "security violation",
+    // Git state issues
+    "merge conflict",
+    "rebase in progress",
+    "cannot lock",
+    // Partial write failures
+    "write failed",
+    "partial write",
+    "interrupted system call",
+];
+
+/// Classify a tool error output for rollback policy decisions.
+///
+/// Returns [`ToolErrorSeverity::Success`] for successful outputs,
+/// [`ToolErrorSeverity::SoftError`] for recoverable errors,
+/// [`ToolErrorSeverity::HardError`] for errors that may need rollback.
+pub fn classify_tool_error(output: &str) -> ToolErrorSeverity {
+    // Not an error at all
+    if cloud_tool_result_status_label(output) != "error" {
+        return ToolErrorSeverity::Success;
+    }
+
+    let lower = output.to_lowercase();
+
+    // Check hard errors first (more specific)
+    for pattern in HARD_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::HardError;
+        }
+    }
+
+    // Check soft errors
+    for pattern in SOFT_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::SoftError;
+        }
+    }
+
+    // Default: unknown errors are treated as hard (safer for rollback)
+    ToolErrorSeverity::HardError
+}
+
+/// Returns true if this tool error should trigger turn rollback.
+///
+/// Only hard errors trigger rollback. Soft errors (recoverable, no side effects)
+/// allow the turn to continue so the agent can retry or try alternatives.
+pub fn tool_error_triggers_rollback(output: &str) -> bool {
+    matches!(classify_tool_error(output), ToolErrorSeverity::HardError)
+}
+
 /// Detect OS-level resource exhaustion in tool output that wasn't flagged by [`is_tool_error`].
 ///
 /// Scans **per-line** to avoid false positives in source or large file contents.
@@ -408,5 +521,83 @@ if let Err(e) = writeln!(file, "{line}") {
         let norm = normalize_tool_arguments(&args);
         assert_eq!(norm["count"], 5);
         assert_eq!(norm["verbose"], true);
+    }
+
+    // ── Error severity classification tests ──────────────────────────────────
+
+    #[test]
+    fn classify_success_output() {
+        assert_eq!(
+            classify_tool_error("File created successfully"),
+            ToolErrorSeverity::Success
+        );
+        assert_eq!(
+            classify_tool_error("Replaced 3 occurrences"),
+            ToolErrorSeverity::Success
+        );
+    }
+
+    #[test]
+    fn classify_soft_error_str_replace_identical() {
+        let output = "Error: old_str and new_str are identical — no change needed";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::SoftError);
+        assert!(!tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_soft_error_file_not_found() {
+        let output = "Error: file not found: /path/to/missing.rs";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::SoftError);
+        assert!(!tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_soft_error_not_unique() {
+        let output = "Error: old_str found 3 times — must be unique";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::SoftError);
+        assert!(!tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_soft_error_timeout() {
+        let output = "Error: command timed out after 30s";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::SoftError);
+        assert!(!tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_hard_error_permission_denied() {
+        let output = "Error: permission denied: /etc/passwd";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::HardError);
+        assert!(tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_hard_error_disk_full() {
+        let output = "Error: no space left on device";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::HardError);
+        assert!(tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_hard_error_sandbox_violation() {
+        let output = "Sandbox: blocked write to /etc/hosts";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::HardError);
+        assert!(tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_hard_error_git_conflict() {
+        let output = "Error: merge conflict in src/main.rs";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::HardError);
+        assert!(tool_error_triggers_rollback(output));
+    }
+
+    #[test]
+    fn classify_unknown_error_defaults_to_hard() {
+        // Unknown errors should be treated as hard (safer for rollback)
+        let output = "Error: some unknown catastrophic failure";
+        assert_eq!(classify_tool_error(output), ToolErrorSeverity::HardError);
+        assert!(tool_error_triggers_rollback(output));
     }
 }

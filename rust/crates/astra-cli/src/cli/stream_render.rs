@@ -10,8 +10,9 @@ use astra_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, ToolBatchRequest,
     consume_sse_stream_cancellable, is_tool_concurrency_safe, stream_idle_timeout,
 };
-use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
-use astra_runtime::turn::tool_result_semantics::tool_dedup_signature;
+use astra_runtime::turn::tool_result_semantics::{
+    cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
+};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use crossterm::style::Stylize;
 use futures_util::StreamExt;
@@ -1918,8 +1919,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         .to_string();
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Rollback policy: only trigger turn rollback for HARD errors on mutation tools.
+        // Soft errors (e.g., "old_str == new_str", "file not found") let the agent retry.
         if status == "error"
             && Self::tool_error_triggers_turn_rollback(tool, args)
+            && tool_error_triggers_rollback(&output)
             && let Some(active) = self.active_turn_rollback.clone()
         {
             let rollback = self.rollback_active_turn(&active);
