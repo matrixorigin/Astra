@@ -30,11 +30,13 @@
 //! still resolved and executed **inline** so composition can proceed.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use astra_core::SkillSearchSettings;
 use serde_json::Value;
 
+use crate::server::header_utils::CONNECTION_HEADER_TOKENS_KEY;
 use crate::skills::arguments::substitute_arguments;
 use crate::skills::hooks::HookAction;
 use crate::skills::manifest::{
@@ -84,7 +86,7 @@ impl Default for SkillToolInfo {
 ///
 /// Injected into skill instructions via `${CTX_*}` placeholders.
 /// Built at execution time from the agentic loop state.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SkillContext {
     /// Current session identifier.
     pub session_id: Option<String>,
@@ -96,8 +98,50 @@ pub struct SkillContext {
     pub available_tools: Vec<String>,
     /// Current nested agent/sub-run depth of the caller.
     pub recursion_depth: u8,
+    /// Inbound request headers eligible for remote skill forwarding.
+    /// Header names are normalized to lowercase.
+    pub forward_headers: HashMap<String, String>,
     /// Extensible key-value pairs for host-specific context.
     pub extra: HashMap<String, String>,
+}
+
+fn redacted_forward_header_names(headers: &HashMap<String, String>) -> Vec<&str> {
+    let mut names = headers
+        .keys()
+        .filter(|name| !name.starts_with("__astra_"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+struct RedactedForwardHeadersDebug<'a>(&'a HashMap<String, String>);
+
+impl fmt::Debug for RedactedForwardHeadersDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = redacted_forward_header_names(self.0);
+        f.debug_struct("RedactedForwardHeaders")
+            .field("count", &names.len())
+            .field("names", &names)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SkillContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SkillContext")
+            .field("session_id", &self.session_id)
+            .field("session_dir", &self.session_dir)
+            .field("work_dir", &self.work_dir)
+            .field("available_tools", &self.available_tools)
+            .field("recursion_depth", &self.recursion_depth)
+            .field(
+                "forward_headers",
+                &RedactedForwardHeadersDebug(&self.forward_headers),
+            )
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 impl SkillContext {
@@ -170,6 +214,10 @@ pub struct ResolvedSkill {
     pub output_schema: Option<Value>,
     /// Remote execution endpoint. When set, runtime dispatches over HTTP.
     pub remote_url: Option<String>,
+    /// Header names to forward from inbound request headers to remote callback.
+    pub forward_headers: Vec<String>,
+    /// Header names required to be present before remote callback is attempted.
+    pub required_headers: Vec<String>,
     /// Alternative names for this skill.
     pub aliases: Vec<String>,
     /// Effort level hint for reasoning depth.
@@ -1426,6 +1474,178 @@ fn validate_remote_skill_endpoint(remote_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_header_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("header name cannot be empty".to_string());
+    }
+    let parsed = reqwest::header::HeaderName::from_bytes(trimmed.as_bytes())
+        .map_err(|err| format!("invalid header name '{name}': {err}"))?;
+    Ok(parsed.as_str().to_ascii_lowercase())
+}
+
+fn is_non_forwardable_header(name: &str) -> bool {
+    // RFC 7230 hop-by-hop headers + transport-owned headers we never forward.
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-connection"
+            | "host"
+            | "content-length"
+            | "content-type"
+    )
+}
+
+fn connection_declared_hop_by_hop_headers(skill_ctx: &SkillContext) -> HashSet<String> {
+    [CONNECTION_HEADER_TOKENS_KEY, "connection"]
+        .into_iter()
+        .filter_map(|name| skill_ctx.forward_headers.get(name))
+        .flat_map(|raw| raw.split(','))
+        .filter_map(|token| normalize_header_name(token).ok())
+        .collect()
+}
+
+fn is_sensitive_remote_forward_header(name: &str) -> bool {
+    matches!(
+        name,
+        "cookie"
+            | "set-cookie"
+            | "forwarded"
+            | "origin"
+            | "referer"
+            | "x-csrf-token"
+            | "x-xsrf-token"
+            | "csrf-token"
+            | "x-csrftoken"
+            | "x-csrf"
+            | "x-xsrf"
+            | "x-real-ip"
+            | "true-client-ip"
+            | "cf-connecting-ip"
+    ) || name.starts_with("sec-")
+        || name.starts_with("x-forwarded-")
+}
+
+fn validate_remote_forward_header_policy(
+    skill: &ResolvedSkill,
+    header_kind: &str,
+    name: &str,
+    connection_hop_by_hop: &HashSet<String>,
+) -> Result<(), String> {
+    if is_non_forwardable_header(name) {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' is hop-by-hop/transport and cannot be forwarded",
+            skill.name, name
+        ));
+    }
+    if connection_hop_by_hop.contains(name) {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' is referenced by the inbound Connection header and cannot be forwarded",
+            skill.name, name
+        ));
+    }
+    if name == "authorization"
+        && !matches!(
+            skill.trust_tier,
+            crate::skills::manifest::TrustTier::Bundled
+                | crate::skills::manifest::TrustTier::Verified
+        )
+    {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' requires verified/bundled trust tier for remote forwarding",
+            skill.name, name
+        ));
+    }
+    if is_sensitive_remote_forward_header(name) {
+        return Err(format!(
+            "skill '{}' {header_kind} '{}' is sensitive and cannot be forwarded to remote skills",
+            skill.name, name
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_remote_forward_headers(
+    skill: &ResolvedSkill,
+    skill_ctx: &SkillContext,
+) -> Result<Vec<(String, String)>, String> {
+    let connection_hop_by_hop = connection_declared_hop_by_hop_headers(skill_ctx);
+    let mut required = Vec::new();
+    for raw in &skill.required_headers {
+        let normalized = normalize_header_name(raw).map_err(|err| {
+            format!(
+                "skill '{}' has invalid required_headers entry '{}': {err}",
+                skill.name, raw
+            )
+        })?;
+        validate_remote_forward_header_policy(
+            skill,
+            "required header",
+            &normalized,
+            &connection_hop_by_hop,
+        )?;
+        if !required.iter().any(|existing| existing == &normalized) {
+            required.push(normalized);
+        }
+    }
+
+    let mut requested = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in &skill.forward_headers {
+        let normalized = normalize_header_name(raw).map_err(|err| {
+            format!(
+                "skill '{}' has invalid forward_headers entry '{}': {err}",
+                skill.name, raw
+            )
+        })?;
+        validate_remote_forward_header_policy(
+            skill,
+            "forward header",
+            &normalized,
+            &connection_hop_by_hop,
+        )?;
+        if seen.insert(normalized.clone()) {
+            requested.push(normalized);
+        }
+    }
+    for normalized in &required {
+        if seen.insert(normalized.clone()) {
+            requested.push(normalized.clone());
+        }
+    }
+
+    let missing_required: Vec<String> = required
+        .into_iter()
+        .filter(|name| !skill_ctx.forward_headers.contains_key(name))
+        .collect();
+    if !missing_required.is_empty() {
+        return Err(format!(
+            "missing required forwarded headers for skill '{}': {}",
+            skill.name,
+            missing_required.join(", ")
+        ));
+    }
+
+    let forwarded = requested
+        .into_iter()
+        .filter_map(|name| {
+            skill_ctx
+                .forward_headers
+                .get(&name)
+                .cloned()
+                .map(|value| (name, value))
+        })
+        .collect();
+    Ok(forwarded)
+}
+
 async fn read_remote_skill_body_limited(
     response: reqwest::Response,
     max_bytes: usize,
@@ -1506,6 +1726,7 @@ async fn execute_remote_skill(
     skill_ctx: &SkillContext,
 ) -> Result<RemoteSkillExecutionResult, String> {
     validate_remote_skill_endpoint(remote_url)?;
+    let forwarded_headers = resolve_remote_forward_headers(skill, skill_ctx)?;
 
     // Forward a minimal context subset to reduce data-exfiltration surface for
     // user-registered remote endpoints.
@@ -1520,11 +1741,15 @@ async fn execute_remote_skill(
             "recursion_depth": skill_ctx.recursion_depth,
         }
     });
-    let response = remote_skill_http_client()
+    let mut request = remote_skill_http_client()
         .post(remote_url)
         .timeout(std::time::Duration::from_secs(30))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&payload)
+        .json(&payload);
+    for (name, value) in forwarded_headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .send()
         .await
         .map_err(|err| format!("request failed: {err}"))?;
@@ -1993,6 +2218,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -2319,6 +2546,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: Some(self.url.clone()),
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2367,6 +2596,355 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_skill_remote_forwards_configured_headers() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    forward_headers: vec!["authorization".into(), "x-workspace-id".into()],
+                    required_headers: vec!["x-workspace-id".into()],
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Verified,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|headers: HeaderMap, Json(_body): Json<Value>| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let workspace = headers
+                    .get("x-workspace-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                Json(serde_json::json!({
+                    "result": format!("auth={auth};workspace={workspace}")
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolver {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx.forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer trusted-token".to_string(),
+        );
+        skill_ctx
+            .forward_headers
+            .insert("x-workspace-id".to_string(), "ws-001".to_string());
+        skill_ctx
+            .forward_headers
+            .insert("x-ignored".to_string(), "skip-me".to_string());
+        let result = execute_skill(
+            &resolver,
+            None,
+            "remote-forwarded-headers",
+            "ping remote",
+            None,
+            &skill_ctx,
+        )
+        .await;
+        assert_eq!(result.output, "auth=Bearer trusted-token;workspace=ws-001");
+        assert!(result.activation.is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_missing_required_header_fails() {
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    forward_headers: vec!["authorization".into()],
+                    required_headers: vec!["x-workspace-id".into()],
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Verified,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let resolver = RemoteResolver {
+            url: "https://example.com/remote-skill".to_string(),
+        };
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx.forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer trusted-token".to_string(),
+        );
+        let result = execute_skill(
+            &resolver,
+            None,
+            "remote-missing-required-header",
+            "ping remote",
+            None,
+            &skill_ctx,
+        )
+        .await;
+        assert!(result.output.contains("missing required forwarded headers"));
+        assert!(result.output.contains("x-workspace-id"));
+        assert!(result.activation.is_none());
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_reports_invalid_required_header_entry() {
+        let skill = ResolvedSkill {
+            name: "remote-invalid-required-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec![],
+            required_headers: vec!["bad header".into()],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Community,
+        };
+
+        let err = resolve_remote_forward_headers(&skill, &SkillContext::default())
+            .expect_err("invalid required_headers entry should fail");
+        assert!(err.contains("invalid required_headers entry"));
+        assert!(err.contains("bad header"));
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_rejects_authorization_for_community_skill() {
+        let skill = ResolvedSkill {
+            name: "remote-community-auth-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec!["authorization".into()],
+            required_headers: vec![],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Community,
+        };
+
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx.forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer trusted-token".to_string(),
+        );
+
+        let err = resolve_remote_forward_headers(&skill, &skill_ctx)
+            .expect_err("community skill should not forward authorization");
+        assert!(err.contains("requires verified/bundled trust tier"));
+        assert!(err.contains("authorization"));
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_rejects_cookie_header() {
+        let skill = ResolvedSkill {
+            name: "remote-cookie-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec!["cookie".into()],
+            required_headers: vec![],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Verified,
+        };
+
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx
+            .forward_headers
+            .insert("cookie".to_string(), "session=secret".to_string());
+
+        let err = resolve_remote_forward_headers(&skill, &skill_ctx)
+            .expect_err("cookie should be rejected for remote forwarding");
+        assert!(err.contains("sensitive"));
+        assert!(err.contains("cookie"));
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_rejects_dynamic_connection_token_headers() {
+        let skill = ResolvedSkill {
+            name: "remote-connection-token-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec!["x-hop".into()],
+            required_headers: vec![],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Verified,
+        };
+
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx
+            .forward_headers
+            .insert("connection".to_string(), "x-hop".to_string());
+        skill_ctx
+            .forward_headers
+            .insert("x-hop".to_string(), "secret".to_string());
+
+        let err = resolve_remote_forward_headers(&skill, &skill_ctx)
+            .expect_err("connection-declared header should not be forwardable");
+        assert!(err.contains("Connection"));
+        assert!(err.contains("x-hop"));
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_hop_by_hop_header_is_rejected() {
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    forward_headers: vec!["connection".into()],
+                    required_headers: vec![],
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let resolver = RemoteResolver {
+            url: "https://example.com/remote-skill".to_string(),
+        };
+        let mut skill_ctx = SkillContext::default();
+        skill_ctx
+            .forward_headers
+            .insert("connection".to_string(), "keep-alive".to_string());
+        let result = execute_skill(
+            &resolver,
+            None,
+            "remote-hop-by-hop-header",
+            "ping remote",
+            None,
+            &skill_ctx,
+        )
+        .await;
+        assert!(result.output.contains("cannot be forwarded"));
+        assert!(result.output.contains("connection"));
+        assert!(result.activation.is_none());
+    }
+
+    #[tokio::test]
     async fn execute_skill_remote_does_not_follow_redirects() {
         use axum::{Router, response::Redirect, routing::post};
 
@@ -2390,6 +2968,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: Some(self.url.clone()),
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2417,7 +2997,7 @@ mod tests {
         let resolver = RemoteResolver {
             url: format!("http://{addr}/remote-skill"),
         };
-        let r = execute_skill(
+        let result = execute_skill(
             &resolver,
             None,
             "remote-redirect",
@@ -2427,11 +3007,11 @@ mod tests {
         )
         .await;
         assert!(
-            r.output.contains("HTTP 307"),
+            result.output.contains("HTTP 307"),
             "unexpected output: {}",
-            r.output
+            result.output
         );
-        assert!(r.activation.is_none());
+        assert!(result.activation.is_none());
 
         server.abort();
     }
@@ -2460,6 +3040,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: Some(self.url.clone()),
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2494,7 +3076,7 @@ mod tests {
         let resolver = RemoteResolver {
             url: format!("http://{addr}/remote-skill"),
         };
-        let r = execute_skill(
+        let result = execute_skill(
             &resolver,
             None,
             "remote-large-body",
@@ -2504,12 +3086,12 @@ mod tests {
         )
         .await;
         assert!(
-            r.output.contains("response body too large")
-                || r.output.contains("response body exceeds"),
+            result.output.contains("response body too large")
+                || result.output.contains("response body exceeds"),
             "unexpected output: {}",
-            r.output
+            result.output
         );
-        assert!(r.activation.is_none());
+        assert!(result.activation.is_none());
 
         server.abort();
     }
@@ -2544,6 +3126,8 @@ mod tests {
                         "required": ["result"]
                     })),
                     remote_url: Some(self.url.clone()),
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2624,6 +3208,8 @@ mod tests {
                         "required": ["result"]
                     })),
                     remote_url: Some(self.url.clone()),
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2707,6 +3293,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2781,6 +3369,7 @@ mod tests {
             work_dir: Some("/home/user/project".into()),
             available_tools: vec!["bash".into(), "read_file".into()],
             recursion_depth: 0,
+            forward_headers: HashMap::new(),
             extra: {
                 let mut m = HashMap::new();
                 m.insert("git_branch".into(), "main".into());
@@ -2800,6 +3389,31 @@ mod tests {
     fn skill_context_default_produces_empty_vars() {
         let ctx = SkillContext::default();
         assert!(ctx.as_substitution_vars().is_empty());
+    }
+
+    #[test]
+    fn skill_context_debug_redacts_forward_header_values() {
+        let mut ctx = SkillContext {
+            session_id: Some("sess-42".into()),
+            ..Default::default()
+        };
+        ctx.forward_headers.insert(
+            "authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        );
+        ctx.forward_headers
+            .insert("x-workspace-id".to_string(), "ws-123".to_string());
+        ctx.forward_headers.insert(
+            CONNECTION_HEADER_TOKENS_KEY.to_string(),
+            "x-hop".to_string(),
+        );
+
+        let rendered = format!("{ctx:?}");
+        assert!(rendered.contains("authorization"));
+        assert!(rendered.contains("x-workspace-id"));
+        assert!(!rendered.contains("Bearer secret-token"));
+        assert!(!rendered.contains("ws-123"));
+        assert!(!rendered.contains(CONNECTION_HEADER_TOKENS_KEY));
     }
 
     #[test]
@@ -2836,6 +3450,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -3274,6 +3890,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3325,6 +3943,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3488,6 +4108,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -3548,6 +4170,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -3613,6 +4237,8 @@ mod tests {
             input_schema: None,
             output_schema: None,
             remote_url: None,
+            forward_headers: vec![],
+            required_headers: vec![],
             aliases: Vec::new(),
 
             effort: None,
@@ -3641,6 +4267,8 @@ mod tests {
             input_schema: None,
             output_schema: None,
             remote_url: None,
+            forward_headers: vec![],
+            required_headers: vec![],
             aliases: Vec::new(),
 
             effort: None,
@@ -3810,6 +4438,8 @@ mod tests {
             input_schema: None,
             output_schema: None,
             remote_url: None,
+            forward_headers: vec![],
+            required_headers: vec![],
             aliases: Vec::new(),
 
             effort: Some(EffortLevel::High),
@@ -3867,6 +4497,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: Vec::new(),
 
                         effort: None,
@@ -3888,6 +4520,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: Vec::new(),
 
                         effort: None,
@@ -3975,6 +4609,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: Vec::new(),
 
                         effort: None,
@@ -4044,6 +4680,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -4103,6 +4741,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -4162,6 +4802,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -4217,6 +4859,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -4276,6 +4920,8 @@ mod tests {
                     })),
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
 
                     effort: None,
@@ -4397,6 +5043,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -4424,6 +5072,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -4545,6 +5195,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
@@ -4572,6 +5224,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
@@ -4641,6 +5295,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: vec![],
                         effort: None,
                         agent_type: None,
@@ -4715,6 +5371,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: vec![],
                         effort: None,
                         agent_type: None,
@@ -4742,6 +5400,8 @@ mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: vec![],
                         effort: None,
                         agent_type: None,

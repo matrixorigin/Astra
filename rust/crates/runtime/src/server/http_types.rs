@@ -590,6 +590,7 @@ pub(super) fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestDat
         model: request.model,
         skill_search: request.skill_search,
         context,
+        forward_headers: std::collections::HashMap::new(),
         max_candidates: request.max_candidates,
         explain: request.explain,
     }

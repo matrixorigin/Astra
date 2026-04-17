@@ -131,6 +131,8 @@ impl SkillProvider for DatabaseSkillProvider {
         let remote_url = Self::get_str(&metadata_obj, "remote_url").map(str::to_string);
         let input_schema = metadata_obj.get("input_schema").cloned();
         let output_schema = metadata_obj.get("output_schema").cloned();
+        let forward_headers = Self::get_string_vec(&metadata_obj, "forward_headers");
+        let required_headers = Self::get_string_vec(&metadata_obj, "required_headers");
         let user_invocable = metadata_obj
             .get("user_invocable")
             .and_then(serde_json::Value::as_bool)
@@ -152,6 +154,8 @@ impl SkillProvider for DatabaseSkillProvider {
             input_schema,
             output_schema,
             remote_url,
+            forward_headers,
+            required_headers,
             aliases: Self::get_string_vec(&metadata_obj, "aliases"),
             trust_tier: Self::parse_trust_tier(&metadata_obj),
             ..Default::default()
@@ -233,7 +237,14 @@ mod tests {
                                 "properties": {
                                     "result": {"type": "string"}
                                 }
-                            }
+                            },
+                            "forward_headers": [
+                                "authorization",
+                                "x-workspace-id"
+                            ],
+                            "required_headers": [
+                                "x-workspace-id"
+                            ]
                         })
                     } else {
                         serde_json::json!({"instructions": "DB skill instructions."})
@@ -380,5 +391,13 @@ mod tests {
         );
         assert!(loaded.manifest.input_schema.is_some());
         assert!(loaded.manifest.output_schema.is_some());
+        assert_eq!(
+            loaded.manifest.forward_headers,
+            vec!["authorization".to_string(), "x-workspace-id".to_string()]
+        );
+        assert_eq!(
+            loaded.manifest.required_headers,
+            vec!["x-workspace-id".to_string()]
+        );
     }
 }

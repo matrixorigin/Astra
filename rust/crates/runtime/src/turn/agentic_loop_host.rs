@@ -399,6 +399,9 @@ pub struct StopHookState {
     /// Edge/chat project root (`git_root` or `cwd`) for enriching `delegate` sub-run context
     /// so server-side sub-runs load `.astra/stop-hooks.yaml` from the same tree.
     pub workspace_root_hint: Option<String>,
+    /// Inbound request headers eligible for remote skill forwarding.
+    /// Header names are normalized to lowercase.
+    pub forward_headers: HashMap<String, String>,
 }
 
 /// Cancellation state for the agentic loop.
@@ -2179,6 +2182,8 @@ pub(crate) mod tests {
                         input_schema: None,
                         output_schema: None,
                         remote_url: None,
+                        forward_headers: vec![],
+                        required_headers: vec![],
                         aliases: Vec::new(),
 
                         effort: None,

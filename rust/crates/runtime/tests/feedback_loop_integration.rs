@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use astra_runtime::TurnLearningWriter;
 use astra_runtime::orchestration::permission_sync::PermissionRule;
 use astra_runtime::pipeline::{
     calibration::ProgressiveCalibrator,
@@ -633,4 +634,271 @@ fn concurrent_injection_generation() {
     for handle in handles {
         handle.join().expect("thread should complete");
     }
+}
+
+// ─── Phase E: Correction Signal Chain (hook payload → calibrator) ────────────
+//
+// These tests verify the fix for the calibrator signal chain break:
+// bridge_inprocess.rs now injects "is_correction" into the hook payload,
+// which flows through build_learning_outcome_from_payload → record_outcome
+// → ProgressiveCalibrator.
+
+/// E2E: hook payload with is_correction=true flows through the full pipeline
+/// and actually lowers the calibrated threshold.
+#[tokio::test]
+async fn correction_signal_chain_payload_to_calibrator_threshold() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    let initial_threshold = cal.lock().unwrap().calibrated_threshold(
+        "fetch",
+        Some(DomainHint::GitHub),
+        TaskType::Fetch,
+    );
+
+    // Simulate the hook payload that bridge_inprocess.rs now produces
+    // when implicit feedback detects a correction.
+    for i in 0..6 {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": format!("no that's wrong, try again {i}")},
+                {"role": "assistant", "content": "Here are the results..."}
+            ],
+            "tool_calls": [
+                {"function": {"name": "github_list_prs"}}
+            ],
+            "tool_quality_assessments": [
+                {"tool_name": "github_list_prs", "grade": "good", "quality_score": 0.8}
+            ],
+            "tool_results": [
+                {"content": "{\"status\":\"ok\"}"}
+            ],
+            "is_correction": true,
+            "routing_meta": {
+                "task_type": "fetch",
+                "domain_hint": "github"
+            }
+        });
+
+        let outcome =
+            astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+                .expect("should parse payload");
+        assert!(
+            outcome.was_corrected,
+            "turn {i}: was_corrected must be true when is_correction is in payload"
+        );
+        let _ = writer.record_outcome(outcome).await;
+    }
+
+    let final_threshold = cal.lock().unwrap().calibrated_threshold(
+        "fetch",
+        Some(DomainHint::GitHub),
+        TaskType::Fetch,
+    );
+
+    assert!(
+        final_threshold < initial_threshold,
+        "threshold should decrease after corrections: initial={initial_threshold}, final={final_threshold}"
+    );
+}
+
+/// E2E: payload WITHOUT is_correction → was_corrected=false → threshold unchanged.
+#[tokio::test]
+async fn no_correction_signal_leaves_threshold_unchanged() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    let initial_threshold = cal
+        .lock()
+        .unwrap()
+        .calibrated_threshold("code", None, TaskType::Code);
+
+    for i in 0..6 {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": format!("show me the code {i}")}
+            ],
+            "tool_calls": [
+                {"function": {"name": "read_file"}}
+            ],
+            "tool_quality_assessments": [
+                {"tool_name": "read_file", "grade": "good", "quality_score": 0.9}
+            ],
+            "tool_results": [
+                {"content": "fn main() {}"}
+            ]
+        });
+
+        let outcome =
+            astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+                .expect("should parse payload");
+        assert!(
+            !outcome.was_corrected,
+            "turn {i}: was_corrected must be false when is_correction absent"
+        );
+        let _ = writer.record_outcome(outcome).await;
+    }
+
+    let final_threshold = cal
+        .lock()
+        .unwrap()
+        .calibrated_threshold("code", None, TaskType::Code);
+
+    assert_eq!(
+        initial_threshold, final_threshold,
+        "threshold should not change without corrections"
+    );
+}
+
+/// Frustration signal (not just correction) also sets was_corrected=true.
+#[tokio::test]
+async fn frustration_signal_also_triggers_calibrator_correction() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    // Frustration detected by bridge → is_correction=true in payload
+    for i in 0..6 {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": format!("this is completely useless {i}")},
+                {"role": "assistant", "content": "Let me try again..."}
+            ],
+            "tool_calls": [
+                {"function": {"name": "bash"}}
+            ],
+            "tool_quality_assessments": [
+                {"tool_name": "bash", "grade": "poor", "quality_score": 0.3}
+            ],
+            "tool_results": [
+                {"content": "error: command not found"}
+            ],
+            "is_correction": true
+        });
+
+        let outcome =
+            astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+                .expect("should parse payload");
+        assert!(outcome.was_corrected);
+        let _ = writer.record_outcome(outcome).await;
+    }
+
+    let guard = cal.lock().unwrap();
+    let stats = guard.intent_stats("unknown");
+    assert!(
+        stats.is_some(),
+        "calibrator should have recorded observations"
+    );
+    assert!(
+        stats.unwrap().correction_rate() > 0.0,
+        "correction rate should be positive after frustration signals"
+    );
+}
+
+/// Empty messages in payload → build_learning_outcome returns None (no panic).
+#[tokio::test]
+async fn empty_messages_payload_returns_none() {
+    let payload = serde_json::json!({
+        "messages": [],
+        "is_correction": true
+    });
+    assert!(
+        astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload).is_none(),
+        "empty messages should return None"
+    );
+}
+
+/// Payload with no tool_calls → outcome has empty tools, low quality, was_corrected still works.
+#[tokio::test]
+async fn no_tool_calls_still_propagates_correction() {
+    let payload = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "wrong answer"}
+        ],
+        "is_correction": true
+    });
+
+    let outcome = astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+        .expect("should parse even without tool_calls");
+    assert!(outcome.was_corrected);
+    assert!(outcome.tools_used.is_empty());
+    assert!(!outcome.success, "no tools used → not successful");
+}
+
+/// is_correction=false explicitly set → was_corrected=false.
+#[tokio::test]
+async fn explicit_false_correction_flag() {
+    let payload = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "looks good"}
+        ],
+        "tool_calls": [
+            {"function": {"name": "read_file"}}
+        ],
+        "tool_quality_assessments": [
+            {"quality_score": 0.9}
+        ],
+        "tool_results": [
+            {"content": "ok"}
+        ],
+        "is_correction": false
+    });
+
+    let outcome = astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+        .expect("should parse");
+    assert!(!outcome.was_corrected);
+}
+
+/// Malformed is_correction (string instead of bool) → was_corrected=false (no panic).
+#[tokio::test]
+async fn malformed_correction_flag_no_panic() {
+    let payload = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "test"}
+        ],
+        "tool_calls": [
+            {"function": {"name": "read_file"}}
+        ],
+        "tool_results": [
+            {"content": "ok"}
+        ],
+        "is_correction": "yes"
+    });
+
+    let outcome = astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+        .expect("should parse without panic");
+    assert!(
+        !outcome.was_corrected,
+        "malformed flag should default to false"
+    );
+}
+
+/// Quality gate may reject trivial outcomes — correction still recorded if gate passes.
+#[tokio::test]
+async fn quality_gate_blocks_trivial_correction_from_calibrator() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    // Very short query — quality gate should reject this
+    let payload = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "no"}
+        ],
+        "is_correction": true
+    });
+
+    let outcome = astra_runtime::pipeline::learning::build_learning_outcome_from_payload(&payload)
+        .expect("should parse");
+    assert!(outcome.was_corrected);
+
+    // record_outcome may be rejected by quality gate (short query)
+    let _ = writer.record_outcome(outcome).await;
+
+    // Calibrator should NOT have data — quality gate should have blocked it
+    let guard = cal.lock().unwrap();
+    let stats = guard.intent_stats("unknown");
+    let has_data = stats.map(|s| s.total > 0).unwrap_or(false);
+    assert!(
+        !has_data,
+        "quality gate should block trivially short correction from reaching calibrator"
+    );
 }
