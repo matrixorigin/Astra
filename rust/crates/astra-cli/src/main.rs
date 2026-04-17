@@ -208,9 +208,11 @@ use astra_runtime::turn::chat_turn_heuristics::{
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
 use cli_utils::{
-    compact_or_raw, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
-    prefix_chars, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
-    resumable_last_session_id, save_credentials, truncate_str, urlencoding,
+    SessionResumePreflight, clear_profile_last_session_if_matches, compact_or_raw,
+    get_profile_and_token, interactive_select, load_credentials, map_thin_err, prefix_chars,
+    preflight_remote_resume_session, print_json_or_raw, profile_name, prompt_or,
+    prompt_password_masked, resumable_last_session_id, save_credentials, truncate_str, urlencoding,
+    validated_resumable_last_session_id,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};
 use dynamic_completions::refresh_dynamic_completions;

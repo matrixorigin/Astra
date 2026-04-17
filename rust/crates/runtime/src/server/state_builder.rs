@@ -337,7 +337,7 @@ pub(super) struct PipelineLearningStack {
     pub entity_graph: Arc<Mutex<crate::pipeline::entity::EntityGraph>>,
     pub pattern_library: Arc<Mutex<crate::pipeline::pattern::PatternLibrary>>,
     pub calibrator: Arc<Mutex<crate::pipeline::calibration::ProgressiveCalibrator>>,
-    pub active_canary: Option<crate::evolution::service::PersistedActiveCanary>,
+    pub active_canary: Option<crate::evolution::types::PersistedActiveCanary>,
     /// Profile name used for cross-session persistence.
     pub profile: Option<String>,
 }
@@ -346,7 +346,7 @@ impl PipelineLearningStack {
     /// Persist current learning state to disk if a profile was configured.
     pub fn save_with_active_canary(
         &self,
-        active_canary: Option<crate::evolution::service::PersistedActiveCanary>,
+        active_canary: Option<crate::evolution::types::PersistedActiveCanary>,
     ) {
         if let Some(ref profile) = self.profile {
             let _ = crate::pipeline::persistence::save_learning_state_with_health_and_canary(

@@ -274,7 +274,8 @@ pub(super) async fn handle_chat_input(
     {
         if is_short_continuation_prompt(&line) {
             if let Err(e) =
-                slash_session::restore_session_into_state(&session_id, ctx.profile, state).await
+                slash_session::restore_session_into_state(&session_id, ctx.profile, ctx.api, state)
+                    .await
             {
                 eprintln!("  {} {}", theme::icon_err(), e.red());
                 return Ok(());

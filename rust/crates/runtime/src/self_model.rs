@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auto_tuning::{FeedbackSignal, SignalType};
 use crate::runtime_config::RuntimeConfig;
+use crate::str_preview::truncate_str;
 use crate::turn::context_assembly_trace::TokenBudgetTrace;
 use crate::turn::goal_tracker::{GoalProgress, Milestone};
 use crate::turn::tool_health::ToolHealthTracker;
@@ -372,11 +373,7 @@ impl SelfModel {
 
         // ── Goal progress ──
         if let Some(ref goal) = self.goals.goal {
-            let truncated = if goal.len() > 100 {
-                format!("{}...", &goal[..97])
-            } else {
-                goal.clone()
-            };
+            let truncated = truncate_str(goal, 100);
             let _ = write!(s, "Goal: \"{}\"", truncated);
             if self.goals.goal_source != "none" && self.goals.goal_source != "session_goal" {
                 let _ = write!(s, " [{}]", self.goals.goal_source);
@@ -861,6 +858,49 @@ mod tests {
         assert!(section.contains("Fix the auth bug"));
         assert!(section.contains("5 available"));
         assert!(section.contains("1 skills"));
+    }
+
+    #[test]
+    fn system_prompt_section_handles_multibyte_goal_without_panicking() {
+        let config = RuntimeConfig::default();
+        let goal = "在tmp目录下面生成一个非常漂亮的介绍astra的web文档,内容丰富,动态展示,科技风格";
+        assert!(
+            goal.len() > 100,
+            "regression requires byte length > 100 to trigger the old slicing bug"
+        );
+        assert!(
+            goal.chars().count() < 100,
+            "regression requires char count < 100 so UTF-8 bytes, not logical length, caused truncation"
+        );
+
+        let model = SelfModel::snapshot(
+            &["bash", "write_file"],
+            &[],
+            &[],
+            &[],
+            None,
+            3,
+            None,
+            None,
+            None,
+            240,
+            0,
+            0,
+            Some(goal),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+
+        let section = model.to_system_prompt_section();
+        assert!(section.contains("Goal:"));
+        assert!(
+            section.contains(goal),
+            "goal should remain intact when it is under the char limit even if its UTF-8 byte length exceeds 100: {section}"
+        );
     }
 
     #[test]
