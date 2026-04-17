@@ -57,10 +57,10 @@ pub use astra_skills::quality::{SkillOutcome, SkillQualityEntry, SkillQualityTra
 pub use astra_skills::traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 pub use astra_skills::version::{Dependency, DependencyResolver, Version, VersionConstraint};
 
-pub use improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
-pub use providers::DatabaseSkillProvider;
+pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
+pub use astra_skills::providers::DatabaseSkillProvider;
+pub use astra_skills::verify::SkillVerifier;
 pub use registry::{SharedSkillRegistry, UnifiedSkillRegistry, UnifiedSkillResolver};
-pub use verify::SkillVerifier;
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.
 /// Useful in tests and server contexts where no local skill providers apply.
@@ -100,22 +100,4 @@ pub fn default_unified_registry() -> &'static std::sync::Arc<UnifiedSkillRegistr
     })
 }
 
-/// Detect inline shell command lines (`! ...`) in skill instructions.
-///
-/// Returns `true` if any line, after stripping leading whitespace, starts
-/// with `!` followed by any whitespace character (space, tab, NBSP, etc.)
-/// or is exactly `!`. Used to sandbox MCP skills.
-pub fn has_inline_shell(instructions: &str) -> bool {
-    instructions.lines().any(|line| {
-        let t = line.trim_start();
-        if t == "!" {
-            return true;
-        }
-        if let Some(rest) = t.strip_prefix('!') {
-            // Any whitespace after `!` indicates a shell command.
-            rest.starts_with(char::is_whitespace)
-        } else {
-            false
-        }
-    })
-}
+pub use astra_skills::has_inline_shell;

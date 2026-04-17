@@ -34,6 +34,13 @@ toml = "0.8"
 flate2 = { workspace = true }
 tar = { workspace = true }
 
+# HTTP types (for database provider error handling)
+axum = { workspace = true }
+
+# Service integration
+astra-services = { path = "../services" }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+astra-core = { path = "../core" }
