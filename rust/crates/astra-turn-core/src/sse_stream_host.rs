@@ -1532,4 +1532,96 @@ mod tests {
             "text should be tombstoned on cancel"
         );
     }
+
+    /// When `approval_required` and `tool_request` share the same `request_id`,
+    /// verify both are processed: the approval is resolved first, then the
+    /// tool executes. This mirrors the production flow where the cloud sends
+    /// approval_required, waits for approval, then sends tool_request.
+    #[tokio::test]
+    async fn approval_then_tool_request_same_id_both_processed() {
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "approval_required",
+                ",\"request_id\":\"shared-1\",\"tool\":\"str_replace\",\"approval_kind\":\"standard\",\"detail\":\"src/x.rs\"",
+            ),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"shared-1\",\"tool\":\"str_replace\",\"args\":{\"path\":\"src/x.rs\",\"old_str\":\"a\",\"new_str\":\"b\"}",
+            ),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        struct TrackingHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        #[async_trait]
+        impl SseStreamHost for TrackingHost {
+            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("exec:{request_id}:{tool}"));
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "ok".to_string(),
+                    tool_result_fields: None,
+                    status: "ok".to_string(),
+                    duration_ms: 0,
+                }
+            }
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                _approval_kind: ApprovalKind,
+                _session_id: Option<&str>,
+                _detail: Option<&str>,
+            ) -> EdgeApprovalResult {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("approve:{request_id}:{tool}"));
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let mut host = TrackingHost(ops.clone());
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
+
+        // Both approval and tool execution should be recorded.
+        let recorded = ops.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected approve + exec, got: {recorded:?}"
+        );
+        assert_eq!(recorded[0], "approve:shared-1:str_replace");
+        assert_eq!(recorded[1], "exec:shared-1:str_replace");
+
+        // Both results should be in the output.
+        assert_eq!(result.approval_results.len(), 1);
+        assert_eq!(result.approval_results[0].decision, "allow");
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].request_id, "shared-1");
+    }
 }
