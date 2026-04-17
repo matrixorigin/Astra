@@ -1860,16 +1860,15 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
             };
 
-            let implicit_feedback_hint = {
+            let (implicit_feedback_hint, is_correction_turn) = {
                 let signal = crate::turn::implicit_feedback::detect_implicit_feedback_signal(
                     user_content_for_signal,
                     latest_assistant_message_text(&messages),
                 );
+                let is_correction = matches!(signal.signal_type.as_str(), "correction" | "frustration");
                 // Store heuristic-extracted feedback only on correction/frustration signals
                 // and only when we have a valid session_id (avoid cross-session leakage)
-                if !session_id.is_empty()
-                    && matches!(signal.signal_type.as_str(), "correction" | "frustration")
-                {
+                if !session_id.is_empty() && is_correction {
                     if let Some(fb) = crate::pipeline::feedback_extraction::heuristic_extract(
                         user_content_for_signal,
                         &signal.signal_type,
@@ -1878,9 +1877,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         feedback_store.add(&session_id, fb);
                     }
                 }
-                crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
+                let hint = crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
                     .map(|s| format!("\n\n{s}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                (hint, is_correction)
             };
 
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
@@ -2936,7 +2936,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             // Hook side effects: decision audit, skill selection, implicit feedback, reflection
             {
-                let hook_payload = crate::turn::tail_persist::build_turn_hook_args(
+                let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
                     &user_id,
                     &session_id,
                     &messages,
@@ -2954,6 +2954,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     false, // run_implicit_feedback = false → triggers feedback
                     false, // run_reflection_learning = false → triggers reflection
                 );
+                // Propagate correction signal and routing metadata so pipeline
+                // learning can update ProgressiveCalibrator with actual data.
+                if is_correction_turn {
+                    hook_payload.insert(
+                        "is_correction".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+                if let Some(tt) = task_type {
+                    if let Some(m) = hook_payload
+                        .entry("routing_meta".to_string())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                    {
+                        m.insert("task_type".to_string(), json!(tt));
+                    }
+                }
                 crate::bridge::side_effects::run_bridge_hook_side_effects(
                     Some(Value::Object(hook_payload)),
                     turn_hook_db_writer.clone(),

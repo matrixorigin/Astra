@@ -1232,7 +1232,13 @@ fn record_selector_turn_outcome(
     line: &str,
     result: &StreamResult,
     snap: &ReplTurnLearningSnapshot,
+    prev_assistant_text: Option<&str>,
 ) {
+    let signal = astra_runtime::turn::implicit_feedback::detect_implicit_feedback_signal(
+        line,
+        prev_assistant_text,
+    );
+    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
     selector.record_outcome(
         line,
         &result.tools_used,
@@ -1240,7 +1246,7 @@ fn record_selector_turn_outcome(
         snap.routing.domain_hint,
         snap.eval.success,
         snap.eval.quality,
-        false,
+        was_corrected,
         None,
     );
 }
@@ -1328,7 +1334,15 @@ fn apply_turn_success(
     result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
 
     commit_turn_journal_workspace_and_sidecars(state, line, &result, &learning_snap, turn_start);
-    record_selector_turn_outcome(selector, line, &result, &learning_snap);
+    // Previous assistant response = second-to-last history entry (last is current turn,
+    // already pushed above). Used to detect if the user is correcting the prior response.
+    let prev_assistant_text = state
+        .history
+        .len()
+        .checked_sub(2)
+        .and_then(|i| state.history.get(i))
+        .map(|(_, resp)| resp.as_str());
+    record_selector_turn_outcome(selector, line, &result, &learning_snap, prev_assistant_text);
 
     // ── Skill auto-improvement check ─────────────────────────────────────
     check_skill_improvement(state, line, &result);
