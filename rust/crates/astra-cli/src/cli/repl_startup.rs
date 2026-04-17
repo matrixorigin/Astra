@@ -237,7 +237,19 @@ pub(crate) async fn complete_repl_startup(
                     ),
                 ))
             }
-            Err(_) => None,
+            Err(e) => {
+                // Log the error so users know cloud sync won't work for this session.
+                // This is a common cause of missing checkpoint/event sync in diagnostics.
+                astra_core::agent_warn!(
+                    "matrix_pool",
+                    "Cloud sync disabled for this session: failed to connect to MatrixOne — {e}"
+                );
+                eprintln!(
+                    "  {} Cloud sync disabled: MatrixOne connection failed",
+                    theme::icon_warn()
+                );
+                None
+            }
         };
         if let Some(ref mc) = state.matrix_runtime {
             let pool = mc.shared_pool().get().clone();
