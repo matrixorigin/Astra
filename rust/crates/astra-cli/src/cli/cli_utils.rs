@@ -542,7 +542,6 @@ pub(super) fn urlencoding(s: &str) -> String {
 mod tests {
     use super::*;
     use astra_services::session_journal::{self, JournalDirGuard};
-    use tempfile::tempdir;
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
