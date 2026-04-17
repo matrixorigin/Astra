@@ -165,4 +165,5 @@ pub mod headless_types;
 pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
 }
+pub mod routing_engine;
 pub mod turn_guard;
