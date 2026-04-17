@@ -14,18 +14,6 @@ fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
     })
 }
 
-fn collect_forward_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
-        })
-        .collect()
-}
-
 pub(super) async fn resolve_or_create_chat_session_id(
     state: &AppState,
     user: &AuthUserRecord,
