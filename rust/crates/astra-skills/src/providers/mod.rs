@@ -11,3 +11,8 @@ pub mod mcp;
 pub use bundled::BundledSkillProvider;
 pub use local::LocalSkillProvider;
 pub use mcp::McpSkillProvider;
+
+pub mod database;
+pub mod dynamic_skills;
+
+pub use database::DatabaseSkillProvider;

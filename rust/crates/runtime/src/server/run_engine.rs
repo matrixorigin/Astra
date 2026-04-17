@@ -204,6 +204,66 @@ impl RunEngine {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
+// ─── Trait Implementation ─────────────────────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine {
+    async fn start_run_ext(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: Option<&str>,
+        delegation_id: Option<&str>,
+        agent_id: Option<&str>,
+        retry_of: Option<&str>,
+    ) -> Result<(), String> {
+        RunEngine::start_run_ext(
+            self,
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+        )
+        .await
+    }
+
+    async fn persist_status(
+        &self,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        RunEngine::persist_status(self, run_id, status, waiting_for, error_message).await
+    }
+
+    async fn persist_usage(
+        &self,
+        run_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: u32,
+    ) -> Result<bool, String> {
+        RunEngine::persist_usage(self, run_id, prompt_tokens, completion_tokens, tool_calls).await
+    }
+
+    async fn persist_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint_json: &str,
+    ) -> Result<bool, String> {
+        RunEngine::persist_checkpoint(self, run_id, checkpoint_json).await
+    }
+
+    async fn append_event(&self, run_id: &str, event: serde_json::Value) -> Result<(), String> {
+        RunEngine::append_event(self, run_id, event).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

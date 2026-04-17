@@ -1,0 +1,18 @@
+[package]
+name = "astra-evolution"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-axis self-evolution engine types and core logic for Astra"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+# Internal crates
+astra-pipeline = { path = "../astra-pipeline" }
+astra-turn-core = { path = "../astra-turn-core" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

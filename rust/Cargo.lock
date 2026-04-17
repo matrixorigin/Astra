@@ -234,6 +234,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-evolution"
+version = "0.1.0"
+dependencies = [
+ "astra-pipeline",
+ "astra-turn-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "astra-learning"
 version = "0.1.0"
 dependencies = [
@@ -264,6 +277,7 @@ name = "astra-pipeline"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-learning",
  "astra-services",
  "astra-text-utils",
  "astra-turn-types",
@@ -272,8 +286,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -304,6 +321,7 @@ version = "0.1.0"
 dependencies = [
  "astra-config",
  "astra-core",
+ "astra-evolution",
  "astra-learning",
  "astra-messaging",
  "astra-pipeline",
@@ -377,9 +395,18 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-services",
+ "astra-tools",
+ "async-trait",
+ "chrono",
+ "dashmap",
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -416,7 +443,10 @@ dependencies = [
 name = "astra-skills"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
+ "astra-services",
  "async-trait",
+ "axum",
  "dirs 5.0.1",
  "flate2",
  "regex",

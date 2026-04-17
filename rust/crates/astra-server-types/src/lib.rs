@@ -1,5 +1,13 @@
+pub mod agent_mailbox;
+pub mod agent_mcp;
 mod chat_route;
-mod edge_ws_protocol;
+pub mod conflict_resolver;
+pub mod edge_connection_pool;
+pub mod edge_ws_protocol;
+pub mod team_orchestrator_traits;
+pub mod team_orchestrator_types;
+pub mod worktree_isolation;
+pub mod ws_progress_callback;
 
 use astra_services::auth::SessionActivityRecord;
 use astra_services::{
@@ -888,3 +896,6 @@ mod sse_error_payload_tests {
         assert_eq!(payload["message"], "upstream unavailable");
     }
 }
+
+#[cfg(test)]
+mod http_type_tests;

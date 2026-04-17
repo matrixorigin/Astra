@@ -7,6 +7,17 @@ description = "Server request and response types for astra runtime"
 [dependencies]
 astra-core.workspace = true
 astra-services.workspace = true
+astra-tools.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dashmap = "6.1.0"
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9.34"
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
