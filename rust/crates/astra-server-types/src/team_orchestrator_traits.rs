@@ -62,10 +62,7 @@ pub trait DelegationExecutor: Send + Sync {
     ) -> Result<DelegationResult, String>;
 
     /// Get real-time progress for an active delegation.
-    async fn get_delegation_progress(
-        &self,
-        delegation_id: &str,
-    ) -> Option<DelegationProgress>;
+    async fn get_delegation_progress(&self, delegation_id: &str) -> Option<DelegationProgress>;
 }
 
 /// Tracks delegation hierarchies and pause state.
@@ -91,6 +88,7 @@ pub trait DelegationTracking: Send + Sync {
 #[async_trait]
 pub trait RunPersistence: Send + Sync {
     /// Create a durable run record with delegation metadata.
+    #[allow(clippy::too_many_arguments)]
     async fn start_run_ext(
         &self,
         run_id: &str,
@@ -121,11 +119,8 @@ pub trait RunPersistence: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Save a checkpoint for crash recovery.
-    async fn persist_checkpoint(
-        &self,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String>;
+    async fn persist_checkpoint(&self, run_id: &str, checkpoint_json: &str)
+    -> Result<bool, String>;
 
     /// Append an event to the durable event log.
     async fn append_event(&self, run_id: &str, event: Value) -> Result<(), String>;

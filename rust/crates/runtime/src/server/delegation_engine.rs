@@ -359,9 +359,7 @@ pub trait CheckpointGate: Send + Sync {
 // ─── Sub-run Tracking ─────────────────────────────────────────────────────────────
 
 // SubRunRecord and DelegationProgress are now defined in astra-server-types.
-pub use astra_server_types::team_orchestrator_traits::{
-    DelegationProgress, SubRunRecord,
-};
+pub use astra_server_types::team_orchestrator_traits::{DelegationProgress, SubRunRecord};
 
 /// In-memory tracker for delegation hierarchies and pause state.
 ///
@@ -3259,9 +3257,7 @@ impl DelegationEngine {
 
 // ─── Trait Implementations ────────────────────────────────────────────────────────
 
-use astra_server_types::team_orchestrator_traits::{
-    DelegationExecutor, DelegationTracking,
-};
+use astra_server_types::team_orchestrator_traits::{DelegationExecutor, DelegationTracking};
 
 #[async_trait::async_trait]
 impl DelegationExecutor for DelegationEngine {
@@ -3274,10 +3270,7 @@ impl DelegationExecutor for DelegationEngine {
         self.execute(request, source_agent_id, cancel_token).await
     }
 
-    async fn get_delegation_progress(
-        &self,
-        delegation_id: &str,
-    ) -> Option<DelegationProgress> {
+    async fn get_delegation_progress(&self, delegation_id: &str) -> Option<DelegationProgress> {
         self.tracker().get_progress(delegation_id).await
     }
 }
@@ -3304,7 +3297,6 @@ impl DelegationTracking for DelegationTracker {
         DelegationTracker::cleanup_delegation(self, delegation_id).await
     }
 }
-
 
 #[cfg(test)]
 mod tests {

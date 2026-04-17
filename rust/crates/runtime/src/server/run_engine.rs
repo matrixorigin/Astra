@@ -218,7 +218,17 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
         agent_id: Option<&str>,
         retry_of: Option<&str>,
     ) -> Result<(), String> {
-        RunEngine::start_run_ext(self, run_id, user_id, session_id, parent_run_id, delegation_id, agent_id, retry_of).await
+        RunEngine::start_run_ext(
+            self,
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+        )
+        .await
     }
 
     async fn persist_status(
@@ -253,7 +263,6 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
         RunEngine::append_event(self, run_id, event).await
     }
 }
-
 
 #[cfg(test)]
 mod tests {

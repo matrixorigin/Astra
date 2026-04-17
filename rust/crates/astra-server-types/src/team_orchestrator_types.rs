@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use astra_services::coordination::{AgentResult, DelegationResult};
-use astra_services::learning_merge::{AgentLearning, MergedLearning, VersionVector, merge_agent_learnings};
+use astra_services::learning_merge::{
+    AgentLearning, MergedLearning, VersionVector, merge_agent_learnings,
+};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -200,7 +202,7 @@ pub fn merge_team_learnings(agent_results: &[AgentResult]) -> Option<MergedLearn
     let learnings: Vec<AgentLearning> = agent_results
         .iter()
         .filter(|r| r.is_success())
-        .map(|r| extract_learning_from_result(r))
+        .map(extract_learning_from_result)
         .collect();
     if learnings.is_empty() {
         None

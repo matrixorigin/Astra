@@ -50,7 +50,6 @@ pub struct TeamExecutionReport {
     pub error: Option<String>,
 }
 
-
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 /// Orchestrates a full team execution lifecycle.
