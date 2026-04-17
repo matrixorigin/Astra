@@ -306,9 +306,16 @@ impl EventService for DatabaseEventService {
         .await
         .map_err(internal_error)?;
 
+        // BUG FIX (Session 7875e355 diagnostic): Use COUNT(*) reconcile instead of
+        // increment to prevent drift from concurrent requests or duplicate detection.
+        // This matches the fix in event_ingestion.rs flush_batch().
         query(
-            "UPDATE agent_sessions SET event_count = event_count + 1, updated_at = NOW() WHERE session_id = ?",
+            "UPDATE agent_sessions SET \
+             event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ?), \
+             updated_at = NOW() \
+             WHERE session_id = ?",
         )
+        .bind(&session_id)
         .bind(&session_id)
         .execute(&mut *tx)
         .await

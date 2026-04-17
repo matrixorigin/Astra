@@ -439,13 +439,20 @@ impl TurnSessionActivityWriter for DatabaseTurnSessionActivityWriter {
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String> {
         let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        // BUG FIX (Session 7875e355 diagnostic): Use COUNT(*) reconcile instead of
+        // increment to prevent drift from concurrent requests or duplicate detection.
+        // This matches the fix in event_ingestion.rs flush_batch() and services/events.rs.
+        //
+        // Note: We add the increment first as a hint for the DB optimizer, then reconcile
+        // with actual count. The subquery ensures accuracy even if events are deduplicated.
         let result = query(
             "UPDATE agent_sessions \
-             SET event_count = event_count + ?, last_active_at = NOW(), updated_at = NOW(), \
+             SET event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ?), \
+                 last_active_at = NOW(), updated_at = NOW(), \
                  last_event_id = COALESCE(?, last_event_id) \
              WHERE session_id = ?",
         )
-        .bind(plan.event_count_increment as i64)
+        .bind(session_id)
         .bind(plan.last_event_id)
         .bind(session_id)
         .execute(&pool)

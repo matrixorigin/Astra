@@ -102,7 +102,9 @@ fn decompress_json_payload(encoded: &str) -> Result<String, String> {
     Ok(json)
 }
 
-fn sync_log_retain_limit(status: &str) -> Option<usize> {
+/// Returns the retention limit for sync logs based on status.
+/// Exposed for checkpoint sync to reuse the same pruning policy.
+pub(crate) fn sync_log_retain_limit(status: &str) -> Option<usize> {
     match status {
         "success" => Some(SYNC_LOG_SUCCESS_RETAIN),
         "error" => Some(SYNC_LOG_ERROR_RETAIN),
@@ -110,7 +112,9 @@ fn sync_log_retain_limit(status: &str) -> Option<usize> {
     }
 }
 
-fn build_sync_log_prune_query() -> &'static str {
+/// SQL query to prune old sync logs keeping the most recent N entries.
+/// Exposed for checkpoint sync to reuse the same pruning policy.
+pub(crate) fn build_sync_log_prune_query() -> &'static str {
     "DELETE FROM session_sync_log \
      WHERE user_id = ? AND status = ? \
        AND sync_id NOT IN ( \
