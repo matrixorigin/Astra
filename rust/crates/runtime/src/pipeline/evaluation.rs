@@ -549,9 +549,9 @@ mod tests {
 
         // Must contain exactly one error_rate=0.0 signal AND AllToolsHealthy
         // — proves surgical/skipped/deferred were filtered before analysis.
-        let has_zero_error = eval.signals.iter().any(|s| {
-            matches!(s, EvalSignal::ToolErrorRate(rate) if (*rate - 0.0).abs() < f64::EPSILON)
-        });
+        let has_zero_error = eval.signals.iter().any(
+            |s| matches!(s, EvalSignal::ToolErrorRate(rate) if (*rate - 0.0).abs() < f64::EPSILON),
+        );
         assert!(
             has_zero_error,
             "expected ToolErrorRate(0.0) after filtering synthetic placeholders, got {:?}",

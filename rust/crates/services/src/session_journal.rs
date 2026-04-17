@@ -3227,7 +3227,9 @@ mod tests {
     #[test]
     fn real_tool_records_are_not_synthetic_placeholders() {
         assert!(!base_tool_record("git_show", true, Some("diff")).is_synthetic_placeholder());
-        assert!(!base_tool_record("grep", false, Some("error: bad regex")).is_synthetic_placeholder());
+        assert!(
+            !base_tool_record("grep", false, Some("error: bad regex")).is_synthetic_placeholder()
+        );
         assert!(!base_tool_record("read_file", true, None).is_synthetic_placeholder());
     }
 
