@@ -2520,9 +2520,6 @@ mod tests {
             }
         }
 
-        // SAFETY: test-scoped env var required for localhost remote-skill fixtures.
-        unsafe { std::env::set_var("ASTRA_REMOTE_SKILL_ALLOW_PRIVATE_NET", "1") };
-
         let app = Router::new().route(
             "/remote-skill",
             post(|headers: HeaderMap, Json(_body): Json<Value>| async move {
@@ -2753,7 +2750,11 @@ mod tests {
             &SkillContext::default(),
         )
         .await;
-        assert!(result.output.contains("HTTP 307"), "unexpected output: {}", result.output);
+        assert!(
+            result.output.contains("HTTP 307"),
+            "unexpected output: {}",
+            result.output
+        );
         assert!(result.activation.is_none());
 
         server.abort();

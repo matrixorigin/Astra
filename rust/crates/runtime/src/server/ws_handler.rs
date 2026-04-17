@@ -39,6 +39,7 @@
 use super::chat_handlers::{
     is_session_service_unconfigured_error, resolve_or_create_chat_session_id,
 };
+use super::header_utils::collect_forward_headers;
 use super::http_types::merge_plan_subtask_context;
 use super::run_handlers::transform_stream_run_events_for_client_with_pending;
 use super::*;
@@ -822,18 +823,6 @@ fn build_ws_chat_request(
         max_candidates,
         explain,
     }
-}
-
-fn collect_forward_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
-        })
-        .collect()
 }
 
 fn ws_forward_headers(conn: &WsConnection) -> std::collections::HashMap<String, String> {

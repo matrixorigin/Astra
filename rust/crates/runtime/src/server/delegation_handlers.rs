@@ -1,17 +1,6 @@
+use super::header_utils::collect_forward_headers;
 use super::*;
 use astra_services::{DelegationRequest, DelegationResult};
-
-fn collect_forward_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
-        })
-        .collect()
-}
 
 /// POST /chat/runs/{run_id}/delegate
 ///
