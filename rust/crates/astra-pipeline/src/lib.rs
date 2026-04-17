@@ -21,5 +21,14 @@ pub mod step_protocol;
 pub mod step_recorder;
 pub mod tool_health_types;
 
+pub mod defaults;
+pub mod evaluate;
+pub mod mo_persistence;
+pub mod pattern;
+pub mod reflect;
+pub mod scheduling;
+pub mod step_restore;
+pub mod task_learning;
+pub use pattern::PatternAction;
 pub use routing::{CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label};
 pub use tool_health_types::ToolHealthEntry;
