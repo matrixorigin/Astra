@@ -21,6 +21,7 @@ members = [
     "crates/astra-config",
     "crates/astra-evolution",
     "crates/astra-learning",
+    "crates/astra-sync-adapters",
 ]
 resolver = "2"
 
@@ -33,6 +34,7 @@ astra-core = { path = "crates/core" }
 astra-config = { path = "crates/astra-config" }
 astra-evolution = { path = "crates/astra-evolution" }
 astra-learning = { path = "crates/astra-learning" }
+astra-sync-adapters = { path = "crates/astra-sync-adapters" }
 astra-messaging = { path = "crates/astra-messaging" }
 astra-text-utils = { path = "crates/astra-text-utils" }
 astra-pipeline = { path = "crates/astra-pipeline" }
