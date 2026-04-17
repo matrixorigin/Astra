@@ -1267,18 +1267,33 @@ impl PermissionManager {
             }
         }
 
-        // Step 5: Dangerous file path (bypass-immune).
+        // Step 5: Dangerous file path — respects Auto mode (user explicitly opted in).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
-            if self.mode == PermissionMode::Deny {
-                return PermissionDecision::Deny("Sensitive path (deny mode)".into());
+            match self.mode {
+                PermissionMode::Auto => return PermissionDecision::Allow,
+                PermissionMode::Deny => {
+                    return PermissionDecision::Deny("Sensitive path (deny mode)".into());
+                }
+                PermissionMode::Prompt => {
+                    if let Some(allowed) = self
+                        .session_overrides
+                        .check(&content_aware_fingerprint(name, args))
+                    {
+                        return if allowed {
+                            PermissionDecision::Allow
+                        } else {
+                            PermissionDecision::Deny("Skipped for session".into())
+                        };
+                    }
+                    let (header, detail) = Self::format_tool_display(name, args);
+                    return PermissionDecision::NeedApproval {
+                        tool: name.to_string(),
+                        header,
+                        detail,
+                        reason: warning.to_string(),
+                    };
+                }
             }
-            let (header, detail) = Self::format_tool_display(name, args);
-            return PermissionDecision::NeedApproval {
-                tool: name.to_string(),
-                header,
-                detail,
-                reason: warning.to_string(),
-            };
         }
 
         // Step 4: Execute decision.
@@ -2149,14 +2164,15 @@ mod tests {
 
     #[test]
     fn session_override_cannot_bypass_dangerous_path() {
-        // CRITICAL: "always approve write_file" must not auto-approve writes to .git/
+        // In Auto mode, dangerous-path writes are allowed because the user
+        // explicitly opted in to unattended execution.
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "session override must not bypass dangerous path check: got {decision:?}"
+            matches!(decision, PermissionDecision::Allow),
+            "Auto mode should allow dangerous path writes: got {decision:?}"
         );
     }
 
@@ -2170,6 +2186,18 @@ mod tests {
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "session override should allow safe commands: got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn dangerous_path_still_prompts_in_prompt_mode() {
+        // In Prompt mode, dangerous-path writes still require approval.
+        let mut pm = PermissionManager::new(false); // prompt mode
+        let args = serde_json::json!({"path": ".git/config", "content": "bad"});
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "Prompt mode should require approval for dangerous path: got {decision:?}"
         );
     }
 

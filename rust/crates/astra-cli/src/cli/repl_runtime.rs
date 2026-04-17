@@ -521,6 +521,36 @@ async fn try_refresh_token(
     Ok(())
 }
 
+/// Attempt to refresh an expired token mid-session.
+///
+/// Returns `true` (and persists new credentials) on success.
+/// On failure, also tries the refresh-race recovery path before giving up.
+pub(super) async fn attempt_token_refresh(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> bool {
+    let creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    let Some(refresh) = creds
+        .profiles
+        .get(&name)
+        .and_then(|p| p.refresh_token.as_ref())
+    else {
+        return false;
+    };
+    let refresh_str = refresh.clone();
+    drop(creds);
+    match try_refresh_token(api, profile, &refresh_str).await {
+        Ok(()) => true,
+        Err(err) => {
+            if err.keep_credentials() {
+                return false;
+            }
+            recover_credentials_after_refresh_race(api, profile, &refresh_str).await
+        }
+    }
+}
+
 pub(super) fn build_repl_editor() -> Result<(Editor<ReplHelper, FileHistory>, PathBuf), String> {
     let hist_path = history_path();
     if let Some(parent) = hist_path.parent() {
