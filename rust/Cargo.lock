@@ -237,7 +237,9 @@ dependencies = [
 name = "astra-evolution"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-pipeline",
+ "astra-services",
  "astra-turn-core",
  "dirs 6.0.0",
  "serde",
