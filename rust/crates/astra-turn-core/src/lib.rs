@@ -42,6 +42,7 @@ pub mod history;
 pub mod hook_plans;
 pub mod interaction_types;
 pub mod interruption;
+pub mod learning_quality_gate;
 pub mod microcompact;
 pub mod observer;
 pub mod parallel_tool_exec;
