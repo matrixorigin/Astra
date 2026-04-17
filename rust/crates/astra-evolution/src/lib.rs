@@ -5,6 +5,7 @@
 //! service loop) remains in the runtime crate.
 
 pub mod evolver;
+pub mod persistence;
 pub mod signal_collector;
 pub mod store;
 pub mod types;
