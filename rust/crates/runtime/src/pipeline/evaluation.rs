@@ -180,8 +180,14 @@ pub fn evaluate_tool_call_records(
     verdict_warning: bool,
     budget_pressure: f64,
 ) -> TurnEvaluation {
+    // Synthetic placeholders (skill skipped/deferred, surgically removed
+    // parallel tool calls) are audit-only records that do NOT represent real
+    // tool execution. Filtering them here is the single choke-point that
+    // keeps tool_error_rate, RepeatToolCall, EmptyToolOutput, and the
+    // success/quality verdict honest.
     let tool_calls = tool_call_records
         .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             ok: record.ok,
@@ -499,5 +505,116 @@ mod tests {
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
         assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn evaluate_records_skips_synthetic_placeholders() {
+        use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
+
+        let rec = |name: &str, ok: bool, preview: Option<&str>| ToolCallRecord {
+            name: name.to_string(),
+            ok,
+            ms: 50,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(200),
+            args_preview: None,
+            result_preview: preview.map(ToString::to_string),
+            file_path: None,
+        };
+
+        // 1 real successful tool + 3 synthetic placeholders (skipped,
+        // deferred, surgically_removed). A naive counter would see
+        // error_rate = 3/4 = 0.75 and quality collapse. With filtering,
+        // only the real success is counted and the turn scores as healthy.
+        let records = vec![
+            rec("git_show", true, Some("diff contents here")),
+            rec(
+                SURGICAL_REMOVAL_TOOL_NAME,
+                true,
+                Some("(removed from context — skill covered this work)"),
+            ),
+            rec("read_file", false, Some("Skipped: skill routed")),
+            rec("read_file", false, Some("Deferred: skill invoked")),
+        ];
+
+        let eval = evaluate_tool_call_records(
+            "review commit 179afcb",
+            &["git_show".to_string()],
+            &records,
+            0,
+            false,
+            0.1,
+        );
+
+        // Must contain exactly one error_rate=0.0 signal AND AllToolsHealthy
+        // — proves surgical/skipped/deferred were filtered before analysis.
+        let has_zero_error = eval.signals.iter().any(|s| {
+            matches!(s, EvalSignal::ToolErrorRate(rate) if (*rate - 0.0).abs() < f64::EPSILON)
+        });
+        assert!(
+            has_zero_error,
+            "expected ToolErrorRate(0.0) after filtering synthetic placeholders, got {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::AllToolsHealthy)),
+            "expected AllToolsHealthy signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.success,
+            "turn with one real success and synthetic placeholders must be success=true"
+        );
+        assert!(
+            eval.quality > 0.6,
+            "quality should be high after filtering, got {}",
+            eval.quality
+        );
+    }
+
+    #[test]
+    fn repeat_tool_call_ignores_surgical_removals() {
+        use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
+
+        // Four surgically_removed records in a single turn used to surface
+        // as RepeatToolCall("(surgically_removed)") — a false "retry loop"
+        // signal. After filtering they must not appear at all.
+        let records: Vec<ToolCallRecord> = (0..4)
+            .map(|_| ToolCallRecord {
+                name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+                ok: true,
+                ms: 0,
+                error: None,
+                input_bytes: None,
+                output_bytes: Some(0),
+                args_preview: None,
+                result_preview: Some("(removed from context — skill covered this work)".into()),
+                file_path: None,
+            })
+            .chain(std::iter::once(ToolCallRecord {
+                name: "git_show".to_string(),
+                ok: true,
+                ms: 20,
+                error: None,
+                input_bytes: None,
+                output_bytes: Some(400),
+                args_preview: None,
+                result_preview: Some("diff".into()),
+                file_path: None,
+            }))
+            .collect();
+
+        let eval = evaluate_tool_call_records("noop", &[], &records, 0, false, 0.1);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(_))),
+            "no RepeatToolCall signal should be emitted for synthetic placeholders, got {:?}",
+            eval.signals
+        );
     }
 }
