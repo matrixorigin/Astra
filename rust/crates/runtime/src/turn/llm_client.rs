@@ -1222,7 +1222,9 @@ mod tests {
         assert!(is_tpm_exhaustion("endpoint TPM exceeded"));
         assert!(is_tpm_exhaustion("TPM limit exceeded for this endpoint"));
         assert!(is_tpm_exhaustion("tokens per minute limit reached"));
-        assert!(is_tpm_exhaustion("Rate limit exceeded: token quota exhausted"));
+        assert!(is_tpm_exhaustion(
+            "Rate limit exceeded: token quota exhausted"
+        ));
         // Negative cases - regular rate limits (not TPM)
         assert!(!is_tpm_exhaustion("rate limit exceeded"));
         assert!(!is_tpm_exhaustion("too many requests"));
