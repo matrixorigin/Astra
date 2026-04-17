@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime};
-
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::Serialize;
 
 use crate::cli_args::{
@@ -9,7 +6,6 @@ use crate::cli_args::{
     SelfReflectArgs,
 };
 use crate::cli_utils::resumable_last_session_id;
-use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::liquid::reflection::{
     GoalSummary as ReflectionGoalSummary, HealthSummary as ReflectionHealthSummary,
     ReflectionEventSummary, VerificationSummary as ReflectionVerificationSummary,
@@ -17,10 +13,8 @@ use astra_runtime::liquid::reflection::{
     summarize_recent_performance_deltas,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
-use astra_runtime::self_model::{ConstraintSet, SelfModel};
-use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
-use astra_runtime::turn::context_assembly_trace::TokenBudgetTrace;
-use astra_runtime::turn::tool_health::ToolHealthTracker;
+use astra_runtime::self_model::ConstraintSet;
+use astra_runtime::tool_registry::ToolRegistry;
 use astra_runtime::user_profile::Scenario;
 use astra_services::self_surface::{
     EventPreview as SurfaceEventPreview, EvolutionRecord, GoalSurface,
@@ -33,7 +27,7 @@ use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_restore::{
     HybridRestoreService, RestoredSession, SessionRestoreService,
 };
-use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
+use astra_services::session_workspace::{self, WorkspaceMetadata};
 
 #[path = "self_surface.rs"]
 mod self_surface;
@@ -44,7 +38,6 @@ struct SessionArtifacts {
     workspace: Option<WorkspaceMetadata>,
     restored: Option<RestoredSession>,
     journal_events: Vec<JournalEvent>,
-    latest_full_context_trace: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,83 +45,6 @@ struct IdentityView {
     name: &'static str,
     version: &'static str,
     runtime: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionView {
-    session_id: String,
-    cwd: Option<String>,
-    git_branch: Option<String>,
-    git_head: Option<String>,
-    model: Option<String>,
-    status: Option<String>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    resolved_sources: Vec<&'static str>,
-}
-
-#[derive(Debug, Serialize)]
-struct AdaptiveView {
-    last_scenario_change_turn: Option<u32>,
-    last_token_budget_direction: i8,
-    last_token_budget_change_turn: Option<u32>,
-    active_experiment_id: Option<String>,
-    active_variant: Option<String>,
-    tuned_config_present: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct JournalSummary {
-    total_events: usize,
-    last_event_type: Option<String>,
-    recent_event_types: Vec<String>,
-    failure_event_count: usize,
-    recent_failures: Vec<ToolFailureView>,
-}
-
-#[derive(Debug, Serialize)]
-struct SnapshotResponse {
-    identity: IdentityView,
-    session: SessionView,
-    self_model: SelfModel,
-    adaptive: AdaptiveView,
-    trace: TraceResponse,
-    journal: JournalSummary,
-}
-
-#[derive(Debug, Serialize)]
-struct ProfileResponse {
-    session_id: String,
-    identity: IdentityView,
-    self_model: SelfModel,
-}
-
-#[derive(Debug, Serialize)]
-struct GoalResponse {
-    session_id: String,
-    session_goal: Option<String>,
-    plan_goal: Option<String>,
-    plan_execution_rounds: usize,
-    plan_corrections: Vec<String>,
-    recent_goal_events: Vec<EventPreview>,
-}
-
-#[derive(Debug, Serialize)]
-struct BudgetResponse {
-    session_id: String,
-    token_budget: Option<astra_runtime::self_model::TokenBudgetSnapshot>,
-    tool_budget_tokens: u32,
-    compression_threshold: f64,
-    max_turn_input_tokens: u32,
-    compression_threshold_min: f64,
-    compression_threshold_max: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct SignalsResponse {
-    session_id: String,
-    recent_signals: Vec<astra_runtime::self_model::SignalSummary>,
-    recent_events: Vec<EventPreview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,42 +58,6 @@ struct ReflectResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct TraceResponse {
-    session_id: String,
-    compact_trace: Option<ContextTraceSignal>,
-    compact_preview: Option<String>,
-    latest_selection_trace: Option<serde_json::Value>,
-    latest_full_context_trace: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    session_id: String,
-    blocked_tools: Vec<String>,
-    tool_health: Vec<ToolHealthView>,
-    recent_failures: Vec<ToolFailureView>,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolHealthView {
-    name: String,
-    total_calls: usize,
-    total_failures: usize,
-    success_rate: f64,
-    deprioritized: bool,
-    consecutive_failures: usize,
-    rehabilitation_count: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolFailureView {
-    ts: String,
-    tool: String,
-    error: Option<String>,
-    turn: Option<u32>,
-}
-
-#[derive(Debug, Serialize)]
 struct EventPreview {
     event_type: String,
     ts: String,
@@ -187,13 +67,6 @@ struct EventPreview {
     metadata: Option<serde_json::Value>,
     user_input_preview: Option<String>,
     assistant_output_preview: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct VerifyResponse {
-    session_id: String,
-    ok: bool,
-    checks: Vec<CheckResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -426,87 +299,11 @@ async fn load_artifacts(session_id: String) -> Result<SessionArtifacts, String> 
             "no persistent local state found for session {session_id}"
         ));
     }
-    let latest_full_context_trace = journal_events
-        .iter()
-        .rev()
-        .find_map(|event| event.context_assembly_trace.clone());
     Ok(SessionArtifacts {
         session_id,
         workspace,
         restored,
         journal_events,
-        latest_full_context_trace,
-    })
-}
-
-fn build_snapshot_response(artifacts: &SessionArtifacts) -> Result<SnapshotResponse, String> {
-    let workspace = artifacts.workspace.as_ref();
-    let mut resolved_sources = Vec::new();
-    if workspace.is_some() {
-        resolved_sources.push("workspace");
-    }
-    if artifacts.restored.is_some() {
-        resolved_sources.push("restore");
-    }
-    if !artifacts.journal_events.is_empty() {
-        resolved_sources.push("journal");
-    }
-
-    Ok(SnapshotResponse {
-        identity: identity_view(),
-        session: SessionView {
-            session_id: artifacts.session_id.clone(),
-            cwd: workspace.map(|ws| ws.cwd.clone()),
-            git_branch: workspace.and_then(|ws| ws.git_branch.clone()),
-            git_head: workspace.and_then(|ws| ws.git_head.clone()),
-            model: workspace
-                .map(|ws| ws.model.clone())
-                .or_else(|| artifacts.restored.as_ref().and_then(|r| r.model.clone())),
-            status: workspace.map(|ws| ws.status.clone()),
-            created_at: workspace.map(|ws| ws.created_at.clone()),
-            updated_at: workspace.map(|ws| ws.updated_at.clone()),
-            resolved_sources,
-        },
-        self_model: build_self_model(artifacts)?,
-        adaptive: AdaptiveView {
-            last_scenario_change_turn: workspace.and_then(|ws| ws.last_scenario_change_turn),
-            last_token_budget_direction: workspace
-                .map(|ws| ws.last_token_budget_direction)
-                .unwrap_or_default(),
-            last_token_budget_change_turn: workspace
-                .and_then(|ws| ws.last_token_budget_change_turn),
-            active_experiment_id: workspace.and_then(|ws| ws.active_experiment_id.clone()),
-            active_variant: workspace.and_then(|ws| ws.active_variant.clone()),
-            tuned_config_present: workspace
-                .and_then(|ws| ws.tuned_config_json.as_ref())
-                .is_some(),
-        },
-        trace: build_trace_response(artifacts),
-        journal: JournalSummary {
-            total_events: artifacts.journal_events.len(),
-            last_event_type: artifacts
-                .journal_events
-                .last()
-                .map(|event| event_type_name(&event.event_type)),
-            recent_event_types: artifacts
-                .journal_events
-                .iter()
-                .rev()
-                .take(8)
-                .map(|event| event_type_name(&event.event_type))
-                .collect(),
-            failure_event_count: artifacts
-                .journal_events
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event.event_type,
-                        JournalEventType::TurnError | JournalEventType::Error
-                    )
-                })
-                .count(),
-            recent_failures: recent_tool_failures(&artifacts.journal_events, 8),
-        },
     })
 }
 
@@ -916,216 +713,6 @@ fn reflection_kind_label(kind: &str) -> String {
     }
 }
 
-fn build_self_model(artifacts: &SessionArtifacts) -> Result<SelfModel, String> {
-    let workspace = artifacts.workspace.as_ref();
-    let restored = artifacts.restored.as_ref();
-    let mut blocked_tools = restored
-        .map(|r| r.blocked_tools.clone())
-        .unwrap_or_default();
-    if let Some(ws) = workspace {
-        for tool in &ws.deprioritized_tools {
-            if !blocked_tools.contains(tool) {
-                blocked_tools.push(tool.clone());
-            }
-        }
-        blocked_tools.sort();
-    }
-    let tracker = build_tool_health_tracker(&artifacts.journal_events, &blocked_tools);
-    let skills = merged_skills(workspace);
-    let session_goal = workspace.and_then(|ws| ws.session_goal.as_deref());
-    let plan_goal = workspace.and_then(|ws| ws.plan_goal.as_deref());
-    let tracked_goal = workspace
-        .and_then(|ws| ws.goal_progress.as_ref())
-        .map(|progress| progress.goal.as_str());
-    let scenario = latest_scenario(&artifacts.journal_events);
-    let active_experiment = workspace.and_then(|ws| ws.active_experiment_id.as_deref());
-    let session_elapsed_secs = workspace
-        .and_then(|ws| parse_rfc3339(&ws.created_at))
-        .and_then(|created| SystemTime::now().duration_since(created).ok())
-        .unwrap_or_default()
-        .as_secs();
-    let correction_count = workspace.map(|ws| ws.plan_corrections.len()).unwrap_or(0);
-    let compression_count = artifacts
-        .journal_events
-        .iter()
-        .filter(|event| event.event_type == JournalEventType::Compact)
-        .count();
-    let recent_signals = build_feedback_signals(&artifacts.journal_events);
-    let effective_config = effective_runtime_config(workspace)?;
-    let tool_names = ToolRegistry::all_tool_names();
-    let mut pinned_tools = TOOL_CATALOG
-        .iter()
-        .filter(|tool| tool.pinned)
-        .map(|tool| tool.name.to_string())
-        .collect::<Vec<_>>();
-    if let Some(ws) = workspace {
-        for tool in &ws.pinned_tools {
-            if !pinned_tools.contains(tool) {
-                pinned_tools.push(tool.clone());
-            }
-        }
-        pinned_tools.sort();
-    }
-    let budget_trace = workspace
-        .and_then(|ws| ws.last_context_trace.as_ref())
-        .and_then(token_budget_from_trace);
-
-    Ok(SelfModel::snapshot(
-        &tool_names,
-        &pinned_tools,
-        &blocked_tools,
-        &skills,
-        Some(&tracker),
-        restored.map(|r| r.turn_count).unwrap_or_default(),
-        budget_trace.as_ref(),
-        scenario.as_ref(),
-        active_experiment,
-        session_elapsed_secs,
-        correction_count,
-        compression_count,
-        session_goal,
-        plan_goal,
-        tracked_goal,
-        None,
-        None,
-        &recent_signals,
-        &effective_config,
-    ))
-}
-
-fn build_goal_response(artifacts: &SessionArtifacts) -> GoalResponse {
-    let workspace = artifacts.workspace.as_ref();
-    GoalResponse {
-        session_id: artifacts.session_id.clone(),
-        session_goal: workspace.and_then(|ws| ws.session_goal.clone()),
-        plan_goal: workspace.and_then(|ws| ws.plan_goal.clone()),
-        plan_execution_rounds: workspace
-            .map(|ws| ws.plan_execution_rounds)
-            .unwrap_or_default(),
-        plan_corrections: workspace
-            .map(|ws| ws.plan_corrections.clone())
-            .unwrap_or_default(),
-        recent_goal_events: recent_event_previews(
-            &artifacts.journal_events,
-            10,
-            &[
-                JournalEventType::PlanProgress,
-                JournalEventType::PlanEdit,
-                JournalEventType::PlanLifecycle,
-                JournalEventType::GoalSteered,
-                JournalEventType::VerificationCompleted,
-            ],
-        ),
-    }
-}
-
-fn build_trace_response(artifacts: &SessionArtifacts) -> TraceResponse {
-    let compact_trace = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.last_context_trace.clone());
-    let latest_selection_trace = artifacts
-        .journal_events
-        .iter()
-        .rev()
-        .find_map(|event| serde_json::to_value(event.selection_trace.as_ref()?).ok());
-
-    TraceResponse {
-        session_id: artifacts.session_id.clone(),
-        compact_preview: compact_trace.as_ref().map(ContextTraceSignal::preview),
-        compact_trace,
-        latest_selection_trace,
-        latest_full_context_trace: artifacts.latest_full_context_trace.clone(),
-    }
-}
-
-fn build_health_response(artifacts: &SessionArtifacts) -> HealthResponse {
-    let blocked_tools = artifacts
-        .restored
-        .as_ref()
-        .map(|restored| restored.blocked_tools.clone())
-        .unwrap_or_default();
-    let tracker = build_tool_health_tracker(&artifacts.journal_events, &blocked_tools);
-    let mut tool_health = tracker
-        .all()
-        .iter()
-        .map(|(name, health)| ToolHealthView {
-            name: name.clone(),
-            total_calls: health.total_calls,
-            total_failures: health.total_failures,
-            success_rate: health.success_rate(),
-            deprioritized: health.deprioritized,
-            consecutive_failures: health.consecutive_failures,
-            rehabilitation_count: health.rehabilitation_count,
-        })
-        .collect::<Vec<_>>();
-    tool_health.sort_by(|a, b| {
-        b.total_calls
-            .cmp(&a.total_calls)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-
-    HealthResponse {
-        session_id: artifacts.session_id.clone(),
-        blocked_tools,
-        tool_health,
-        recent_failures: recent_tool_failures(&artifacts.journal_events, 12),
-    }
-}
-
-fn verify_artifacts(artifacts: &SessionArtifacts) -> VerifyResponse {
-    let workspace = artifacts.workspace.as_ref();
-    let mut checks = Vec::new();
-    checks.push(CheckResult {
-        name: "workspace_present".to_string(),
-        ok: workspace.is_some(),
-        detail: if workspace.is_some() {
-            "workspace.yaml loaded".to_string()
-        } else {
-            "workspace.yaml missing".to_string()
-        },
-    });
-    checks.push(CheckResult {
-        name: "journal_present".to_string(),
-        ok: !artifacts.journal_events.is_empty(),
-        detail: format!("{} journal events", artifacts.journal_events.len()),
-    });
-    checks.push(CheckResult {
-        name: "restore_present".to_string(),
-        ok: artifacts.restored.is_some(),
-        detail: if artifacts.restored.is_some() {
-            "restored session available".to_string()
-        } else {
-            "restore snapshot unavailable".to_string()
-        },
-    });
-
-    if let Some(ws) = workspace {
-        checks.push(CheckResult {
-            name: "workspace_session_match".to_string(),
-            ok: ws.session_id == artifacts.session_id,
-            detail: format!("workspace session_id={}", ws.session_id),
-        });
-        checks.extend(verify_runtime_config(ws.tuned_config_json.as_deref()));
-        if let Some(trace) = ws.last_context_trace.as_ref() {
-            checks.push(verify_trace_budget(trace));
-        }
-    } else {
-        checks.push(CheckResult {
-            name: "runtime_config_parse".to_string(),
-            ok: true,
-            detail: "no workspace override present".to_string(),
-        });
-    }
-
-    let ok = checks.iter().all(|check| check.ok);
-    VerifyResponse {
-        session_id: artifacts.session_id.clone(),
-        ok,
-        checks,
-    }
-}
-
 fn preview_config_mutation(
     session_id: &str,
     args: &SelfMutateConfigArgs,
@@ -1470,136 +1057,6 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
         assistant_output_preview: event.assistant_output.as_deref().map(|s| truncate(s, 160)),
     }
-}
-
-fn recent_tool_failures(events: &[JournalEvent], limit: usize) -> Vec<ToolFailureView> {
-    let mut failures = Vec::new();
-    for event in events.iter().rev() {
-        if let Some(tool_calls) = event.tool_calls.as_ref() {
-            for call in tool_calls.iter().rev().filter(|call| !call.ok) {
-                failures.push(ToolFailureView {
-                    ts: event.ts.clone(),
-                    tool: call.name.clone(),
-                    error: call.error.clone(),
-                    turn: event.turn,
-                });
-                if failures.len() >= limit {
-                    return failures;
-                }
-            }
-        }
-    }
-    failures
-}
-
-fn merged_skills(workspace: Option<&WorkspaceMetadata>) -> Vec<String> {
-    let mut skills = BTreeSet::new();
-    if let Some(ws) = workspace {
-        for skill in ws.pinned_skills.iter().chain(ws.discovered_skills.iter()) {
-            skills.insert(skill.clone());
-        }
-    }
-    skills.into_iter().collect()
-}
-
-fn build_tool_health_tracker(
-    events: &[JournalEvent],
-    blocked_tools: &[String],
-) -> ToolHealthTracker {
-    let mut tracker = ToolHealthTracker::new();
-    for event in events {
-        if let Some(tool_calls) = event.tool_calls.as_ref() {
-            for call in tool_calls {
-                if call.ok {
-                    tracker.record_success(&call.name);
-                } else if call
-                    .error
-                    .as_deref()
-                    .map(|err| err.to_ascii_lowercase().contains("timeout"))
-                    .unwrap_or(false)
-                {
-                    tracker.record_timeout(&call.name);
-                } else {
-                    tracker.record_failure(&call.name);
-                }
-            }
-        }
-    }
-    for tool in blocked_tools {
-        tracker.force_deprioritize(tool);
-    }
-    tracker
-}
-
-fn build_feedback_signals(events: &[JournalEvent]) -> Vec<FeedbackSignal> {
-    let mut signals = Vec::new();
-    for event in events {
-        let timestamp = parse_rfc3339(&event.ts).unwrap_or_else(SystemTime::now);
-        match event.event_type {
-            JournalEventType::Turn => {
-                if event
-                    .budget_pressure
-                    .is_some_and(|pressure| pressure >= 0.85)
-                {
-                    signals.push(FeedbackSignal {
-                        signal_type: SignalType::HighTokenUsage {
-                            tokens: event.budget_used.unwrap_or_default() as u64,
-                            threshold: 0,
-                        },
-                        timestamp,
-                        turn_id: event.turn.map(|turn| turn.to_string()),
-                        context: Default::default(),
-                    });
-                } else {
-                    signals.push(FeedbackSignal {
-                        signal_type: SignalType::TaskSuccess,
-                        timestamp,
-                        turn_id: event.turn.map(|turn| turn.to_string()),
-                        context: Default::default(),
-                    });
-                }
-            }
-            JournalEventType::TurnError | JournalEventType::Error => {
-                signals.push(FeedbackSignal {
-                    signal_type: SignalType::TaskFailure {
-                        reason: event
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| event_type_name(&event.event_type)),
-                    },
-                    timestamp,
-                    turn_id: event.turn.map(|turn| turn.to_string()),
-                    context: Default::default(),
-                });
-            }
-            JournalEventType::DriftDetected => {
-                signals.push(FeedbackSignal {
-                    signal_type: SignalType::FocusDrift,
-                    timestamp,
-                    turn_id: event.turn.map(|turn| turn.to_string()),
-                    context: Default::default(),
-                });
-            }
-            JournalEventType::StallDetected => {
-                let unique_tools = event
-                    .tools_used
-                    .as_ref()
-                    .map(|tools| tools.iter().collect::<BTreeSet<_>>().len() as u32)
-                    .unwrap_or_default();
-                signals.push(FeedbackSignal {
-                    signal_type: SignalType::ToolChurn {
-                        calls: event.tool_count.unwrap_or_default(),
-                        unique_tools,
-                    },
-                    timestamp,
-                    turn_id: event.turn.map(|turn| turn.to_string()),
-                    context: Default::default(),
-                });
-            }
-            _ => {}
-        }
-    }
-    signals
 }
 
 fn latest_scenario(events: &[JournalEvent]) -> Option<Scenario> {
@@ -2093,21 +1550,6 @@ fn latest_experiment_enrollment(events: &[JournalEvent]) -> (Option<String>, Opt
         .unwrap_or((None, None))
 }
 
-fn token_budget_from_trace(trace: &ContextTraceSignal) -> Option<TokenBudgetTrace> {
-    let budget = trace.budget.as_ref()?;
-    Some(TokenBudgetTrace {
-        max_tokens: budget.max_tokens,
-        system_prompt_tokens: 0,
-        history_tokens: 0,
-        memory_tokens: 0,
-        tool_schema_tokens: 0,
-        user_message_tokens: 0,
-        total_used: budget.total_used,
-        budget_pressure: budget.budget_pressure,
-        compression_triggered: budget.compression_triggered,
-    })
-}
-
 fn effective_runtime_config(
     workspace: Option<&WorkspaceMetadata>,
 ) -> Result<RuntimeConfig, String> {
@@ -2194,32 +1636,6 @@ fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<CheckResult> {
     checks
 }
 
-fn verify_trace_budget(trace: &ContextTraceSignal) -> CheckResult {
-    if let Some(budget) = trace.budget.as_ref() {
-        let pressure_ok = if budget.max_tokens == 0 {
-            true
-        } else if budget.total_used > budget.max_tokens {
-            budget.budget_pressure >= 1.0
-        } else {
-            budget.budget_pressure <= 1.05
-        };
-        CheckResult {
-            name: "trace_budget_coherence".to_string(),
-            ok: pressure_ok,
-            detail: format!(
-                "used={} max={} pressure={}",
-                budget.total_used, budget.max_tokens, budget.budget_pressure
-            ),
-        }
-    } else {
-        CheckResult {
-            name: "trace_budget_coherence".to_string(),
-            ok: true,
-            detail: "no compact budget trace recorded".to_string(),
-        }
-    }
-}
-
 fn replace_json_path(
     root: &mut serde_json::Value,
     path: &str,
@@ -2254,17 +1670,6 @@ fn replace_json_path(
 
 fn parse_value_arg(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-}
-
-fn parse_rfc3339(ts: &str) -> Option<SystemTime> {
-    let dt = DateTime::parse_from_rfc3339(ts).ok()?;
-    let utc = dt.with_timezone(&Utc);
-    let secs = utc.timestamp();
-    if secs >= 0 {
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
-    } else {
-        SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs((-secs) as u64))
-    }
 }
 
 fn event_type_name(event_type: &JournalEventType) -> String {
@@ -2336,6 +1741,7 @@ mod tests {
     use super::*;
     use crate::cli_args::{SelfReflectArgs, SelfSessionArgs};
     use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
+    use astra_services::session_workspace::ContextTraceSignal;
 
     #[test]
     fn replace_json_path_updates_existing_leaf() {
