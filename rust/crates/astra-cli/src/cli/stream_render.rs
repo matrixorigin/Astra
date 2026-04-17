@@ -184,6 +184,10 @@ struct CliSseStreamHost<'a> {
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Skills already invoked during this SSE stream (for edge-path dedup).
     skills_invoked: std::collections::HashSet<String>,
+    /// Request IDs that were already approved through the cloud approval gate.
+    /// When a `tool_request` arrives with one of these IDs, the local permission
+    /// check is skipped — the user has already approved the operation.
+    cloud_pre_approved: std::collections::HashSet<String>,
     /// Turn-scoped rollback checkpoints when the whole turn opts into rollback-on-failure.
     active_turn_rollback: Option<ActiveTurnRollback>,
     /// True once the current turn has emitted an execution-boundary-opened event.
@@ -282,6 +286,7 @@ impl<'a> CliSseStreamHost<'a> {
             approval_request_tx: ctx.approval_request_tx,
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
+            cloud_pre_approved: std::collections::HashSet::new(),
             active_turn_rollback,
             turn_rollback_boundary_emitted: false,
             aborted_turn_rollback: None,
@@ -1576,13 +1581,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .await;
         }
 
-        let decision = match self.perm_manager.as_mut() {
-            Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                Some(&mut **pm),
-                tool,
-                args,
-            ),
-            None => crate::tool_safety_guard::ToolSafetyGuard::check_request(None, tool, args),
+        // Skip local permission check if this tool was already approved through
+        // the cloud approval gate (approval_required → user approved → tool_request).
+        // This eliminates the double-prompt issue where the same operation requires
+        // both cloud approval and local approval.
+        let cloud_approved = self.cloud_pre_approved.remove(request_id);
+
+        let decision = if cloud_approved {
+            crate::permission_manager::PermissionDecision::Allow
+        } else {
+            match self.perm_manager.as_mut() {
+                Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                    Some(&mut **pm),
+                    tool,
+                    args,
+                ),
+                None => crate::tool_safety_guard::ToolSafetyGuard::check_request(None, tool, args),
+            }
         };
         let mut denied_output = None;
         let mut allowed = match decision {
@@ -2050,7 +2065,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None => astra_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {
-            astra_thin_client::ApprovalDecision::Allow => "allow",
+            astra_thin_client::ApprovalDecision::Allow
+            | astra_thin_client::ApprovalDecision::AllowSession => {
+                // Track this request_id so the subsequent tool_request
+                // skips the redundant local permission check.
+                self.cloud_pre_approved.insert(request_id.to_string());
+                "allow"
+            }
             _ => "deny",
         };
         let body = astra_thin_client::ApprovalRespondRequest {

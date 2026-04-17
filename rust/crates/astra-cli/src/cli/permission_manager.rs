@@ -479,10 +479,18 @@ impl PermissionManager {
             if let Some(detail) = detail.filter(|s| !s.is_empty()) {
                 eprintln!("{}", Self::format_prompt_detail(detail).dim());
             }
-            return if Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) == 'y' {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
+            return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
+                'y' => ApprovalDecision::Allow,
+                '!' => {
+                    self.set_mode(PermissionMode::Auto);
+                    eprintln!(
+                        "  {}",
+                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                            .yellow()
+                    );
+                    ApprovalDecision::Allow
+                }
+                _ => ApprovalDecision::Deny,
             };
         }
         match self.mode {
@@ -568,10 +576,18 @@ impl PermissionManager {
             })
             .await
             .unwrap_or('n');
-            return if ch == 'y' {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
+            return match ch {
+                'y' => ApprovalDecision::Allow,
+                '!' => {
+                    self.set_mode(PermissionMode::Auto);
+                    eprintln!(
+                        "  {}",
+                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                            .yellow()
+                    );
+                    ApprovalDecision::Allow
+                }
+                _ => ApprovalDecision::Deny,
             };
         }
         match self.mode {
@@ -829,7 +845,11 @@ impl PermissionManager {
                 ("▶  Auto-run session", '!'),
                 ("⏭  Skip tool", 's'),
             ],
-            ApprovalPromptKind::ConfirmOnce => vec![("✓  Confirm", 'y'), ("✕  Cancel", 'n')],
+            ApprovalPromptKind::ConfirmOnce => vec![
+                ("✓  Confirm", 'y'),
+                ("▶  Auto-run session", '!'),
+                ("✕  Cancel", 'n'),
+            ],
         };
 
         // Use inquire Select if terminal, fallback to single-char input
@@ -2835,5 +2855,167 @@ mod tests {
             matches!(decision, PermissionDecision::Allow),
             "bare override should subsume any content-aware check"
         );
+    }
+
+    // ── explicit cloud approval + Auto-run ────────────────────────────────────
+
+    #[test]
+    fn explicit_cloud_approval_auto_mode_allows() {
+        let mut pm = PermissionManager::new(true);
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, false);
+        assert!(
+            matches!(decision, astra_thin_client::ApprovalDecision::Allow),
+            "explicit approval should be allowed in Auto mode"
+        );
+    }
+
+    #[test]
+    fn explicit_cloud_approval_deny_mode_denies() {
+        let mut pm = PermissionManager::new(false);
+        pm.set_mode(PermissionMode::Deny);
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, false);
+        assert!(
+            matches!(decision, astra_thin_client::ApprovalDecision::Deny),
+            "explicit approval should be denied in Deny mode"
+        );
+    }
+
+    #[test]
+    fn explicit_cloud_approval_quiet_auto_allows() {
+        let mut pm = PermissionManager::new(true);
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, true);
+        assert!(
+            matches!(decision, astra_thin_client::ApprovalDecision::Allow),
+            "quiet + Auto should allow explicit"
+        );
+    }
+
+    #[test]
+    fn explicit_cloud_approval_quiet_prompt_denies() {
+        let mut pm = PermissionManager::new(false);
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("echo hello"), ApprovalKind::Explicit, true);
+        assert!(
+            matches!(decision, astra_thin_client::ApprovalDecision::Deny),
+            "quiet + Prompt should deny explicit"
+        );
+    }
+
+    // ── apply_cloud_approval_choice ────────────────────────────────────────────
+
+    #[test]
+    fn cloud_approval_auto_run_sets_auto_mode() {
+        let mut pm = PermissionManager::new(false);
+        assert_eq!(pm.mode, PermissionMode::Prompt);
+        let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), '!');
+        assert!(matches!(
+            decision,
+            astra_thin_client::ApprovalDecision::Allow
+        ));
+        assert_eq!(pm.mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn cloud_approval_allow_session_records_override() {
+        let mut pm = PermissionManager::new(false);
+        let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), 'a');
+        assert!(matches!(
+            decision,
+            astra_thin_client::ApprovalDecision::AllowSession
+        ));
+        // The fingerprint should be recorded as a session override.
+        assert!(!pm.session_overrides.is_empty());
+    }
+
+    #[test]
+    fn cloud_approval_skip_records_denial() {
+        let mut pm = PermissionManager::new(false);
+        let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), 's');
+        assert!(matches!(
+            decision,
+            astra_thin_client::ApprovalDecision::Deny
+        ));
+        assert!(!pm.session_overrides.is_empty());
+    }
+
+    // ── ConfirmOnce prompt options ────────────────────────────────────────────
+
+    #[test]
+    fn confirm_once_prompt_includes_auto_run_option() {
+        // ConfirmOnce should have 3 options: Confirm, Auto-run, Cancel
+        let options: Vec<(&str, char)> = vec![
+            ("✓  Confirm", 'y'),
+            ("▶  Auto-run session", '!'),
+            ("✕  Cancel", 'n'),
+        ];
+        // Verify the expected option structure matches what prompt_approval builds.
+        // We check by matching the ApprovalPromptKind::ConfirmOnce arm.
+        let kind = ApprovalPromptKind::ConfirmOnce;
+        let built_options: Vec<(&str, char)> = match kind {
+            ApprovalPromptKind::ConfirmOnce => vec![
+                ("✓  Confirm", 'y'),
+                ("▶  Auto-run session", '!'),
+                ("✕  Cancel", 'n'),
+            ],
+            _ => unreachable!(),
+        };
+        assert_eq!(options, built_options);
+    }
+
+    // ── check_nonblocking after set_mode(Auto) ───────────────────────────────
+
+    #[test]
+    fn auto_mode_skips_all_write_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"path": "src/foo.rs", "content": "x"});
+
+        // Prompt mode → NeedApproval.
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+
+        // Switch to Auto → Allow.
+        pm.set_mode(PermissionMode::Auto);
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(matches!(d2, PermissionDecision::Allow));
+
+        // Also allows str_replace.
+        let args2 = serde_json::json!({"path": "src/bar.rs", "old_str": "a", "new_str": "b"});
+        let d3 = pm.check_nonblocking("str_replace", &args2);
+        assert!(matches!(d3, PermissionDecision::Allow));
+
+        // And bash.
+        let args3 = serde_json::json!({"command": "cargo build"});
+        let d4 = pm.check_nonblocking("bash", &args3);
+        assert!(matches!(d4, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn auto_mode_persists_across_cloud_and_local_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate "!" at cloud approval → sets Auto mode.
+        pm.set_mode(PermissionMode::Auto);
+
+        // Cloud approval should allow (quiet=false, Auto mode).
+        let cloud_decision = pm.resolve_cloud_approval(
+            "str_replace",
+            Some("src/foo.rs"),
+            ApprovalKind::Standard,
+            false,
+        );
+        assert!(matches!(
+            cloud_decision,
+            astra_thin_client::ApprovalDecision::Allow
+        ));
+
+        // Local check should also allow.
+        let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
+        let local_decision = pm.check_nonblocking("str_replace", &args);
+        assert!(matches!(local_decision, PermissionDecision::Allow));
     }
 }

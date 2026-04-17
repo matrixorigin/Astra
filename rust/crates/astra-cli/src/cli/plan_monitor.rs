@@ -829,10 +829,10 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut ReplState) {
             let approved = tokio::task::spawn_blocking(|| {
                 use std::io::IsTerminal;
                 if std::io::stdin().is_terminal() {
-                    inquire::Confirm::new("Approve?")
-                        .with_default(false)
-                        .prompt()
-                        .unwrap_or(false)
+                    let ch = crate::permission_manager::PermissionManager::prompt_approval(
+                        crate::permission_manager::ApprovalPromptKind::LocalStandard,
+                    );
+                    matches!(ch, 'y' | 'a' | '!')
                 } else {
                     use std::io::Write;
                     let _ = std::io::stderr().flush();
