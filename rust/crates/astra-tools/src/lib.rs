@@ -387,6 +387,10 @@ pub const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
 /// Soft threshold for aggregate-aware gating.
 pub const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
+/// Hint threshold: when aggregate bytes exceed this while a file filter is set,
+/// suggest narrowing further before hitting the hard soft-limit.
+pub const AGGREGATE_HINT_THRESHOLD: usize = AGGREGATE_SOFT_LIMIT / 2;
+
 /// Per-tool persistence threshold (chars).
 pub const PERSIST_THRESHOLD: usize = 50_000;
 

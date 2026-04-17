@@ -412,99 +412,37 @@ pub(super) async fn execute_cli_command(
             );
             let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
             let skill_search = astra_core::SkillSearchSettings::default();
-            let sr = match stream_chat_sse(ChatTurnParams {
+            let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
-                token: &token,
                 message: &message,
-                session_id: session_id.as_deref(),
                 model: global_model.as_deref(),
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
-                history: &[],
-                perm_manager: &mut pm,
                 verbose_mode: true,
                 render_policy: crate::stream_render::RenderPolicy::Stream,
                 selector: &*selector.0,
-                recent_tools: &[],
-                tool_health_entries: &[],
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                plan_only_chat: false,
-                is_plan_subtask: false,
-                plan_subtask_id: None,
-                delegation_engine: None,
-                cancel_token: None,
-                plan_assemble_line_release: None,
-                stream_event_tx: None,
-                approval_request_tx: None,
-                mcp_manager: None,
                 skill_search: &skill_search,
-                skill_quality_tracker: &mut skill_qt,
-                discovered_skills: None,
-                messaging_metrics: None,
-                agent_spawner: None,
-                root_agent_id: None,
-                root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
-                file_journal: None,
-                database_snapshot_journal: None,
-                git_stash_journal: None,
-                git_commit_journal: None,
-                git_worktree_journal: None,
-                session_state_journal: None,
-                task_manager: None,
-                turn_index: 0,
-                evolution_service: None,
-            })
+            };
+            let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+                &chat_ctx,
+                &token,
+                session_id.as_deref(),
+                &mut pm,
+                &mut skill_qt,
+            ))
             .await
             {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
-                    stream_chat_sse(ChatTurnParams {
-                        api,
-                        token: &token,
-                        message: &message,
-                        session_id: None,
-                        model: global_model.as_deref(),
-                        explain: ExplainMode::Off,
-                        render_md: terminal::size().is_ok(),
-                        history: &[],
-                        perm_manager: &mut pm,
-                        verbose_mode: true,
-                        render_policy: crate::stream_render::RenderPolicy::Stream,
-                        selector: &*selector.0,
-                        recent_tools: &[],
-                        tool_health_entries: &[],
-                        unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                        plan_only_chat: false,
-                        is_plan_subtask: false,
-                        plan_subtask_id: None,
-                        delegation_engine: None,
-                        cancel_token: None,
-                        plan_assemble_line_release: None,
-                        stream_event_tx: None,
-                        approval_request_tx: None,
-                        mcp_manager: None,
-                        skill_search: &skill_search,
-                        skill_quality_tracker: &mut skill_qt,
-                        discovered_skills: None,
-                        messaging_metrics: None,
-                        agent_spawner: None,
-                        root_agent_id: None,
-                        root_mailbox_slot: None,
-                        observability_hub: None,
-                        observability_session: None,
-                        file_journal: None,
-                        database_snapshot_journal: None,
-                        git_stash_journal: None,
-                        git_commit_journal: None,
-                        git_worktree_journal: None,
-                        session_state_journal: None,
-                        task_manager: None,
-                        turn_index: 0,
-                        evolution_service: None,
-                    })
+                    stream_chat_sse(ChatTurnParams::basic_cli(
+                        &chat_ctx,
+                        &token,
+                        None,
+                        &mut pm,
+                        &mut skill_qt,
+                    ))
                     .await
                     .map_err(|f| f.error)?
                 }
@@ -514,51 +452,13 @@ pub(super) async fn execute_cli_command(
                             repl_runtime::current_access_token(profile.as_deref())
                         {
                             eprintln!("  {} Token refreshed, retrying…", crate::theme::icon_ok());
-                            stream_chat_sse(ChatTurnParams {
-                                api,
-                                token: &new_token,
-                                message: &message,
-                                session_id: session_id.as_deref(),
-                                model: global_model.as_deref(),
-                                explain: ExplainMode::Off,
-                                render_md: terminal::size().is_ok(),
-                                history: &[],
-                                perm_manager: &mut pm,
-                                verbose_mode: true,
-                                render_policy: crate::stream_render::RenderPolicy::Stream,
-                                selector: &*selector.0,
-                                recent_tools: &[],
-                                tool_health_entries: &[],
-                                unified_skill_registry:
-                                    astra_runtime::skills::default_unified_registry(),
-                                plan_only_chat: false,
-                                is_plan_subtask: false,
-                                plan_subtask_id: None,
-                                delegation_engine: None,
-                                cancel_token: None,
-                                plan_assemble_line_release: None,
-                                stream_event_tx: None,
-                                approval_request_tx: None,
-                                mcp_manager: None,
-                                skill_search: &skill_search,
-                                skill_quality_tracker: &mut skill_qt,
-                                discovered_skills: None,
-                                messaging_metrics: None,
-                                agent_spawner: None,
-                                root_agent_id: None,
-                                root_mailbox_slot: None,
-                                observability_hub: None,
-                                observability_session: None,
-                                file_journal: None,
-                                database_snapshot_journal: None,
-                                git_stash_journal: None,
-                                git_commit_journal: None,
-                                git_worktree_journal: None,
-                                session_state_journal: None,
-                                task_manager: None,
-                                turn_index: 0,
-                                evolution_service: None,
-                            })
+                            stream_chat_sse(ChatTurnParams::basic_cli(
+                                &chat_ctx,
+                                &new_token,
+                                session_id.as_deref(),
+                                &mut pm,
+                                &mut skill_qt,
+                            ))
                             .await
                             .map_err(|f| f.error)?
                         } else {
@@ -911,107 +811,42 @@ pub(super) async fn execute_cli_command(
 
             let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
             let skill_search = astra_core::SkillSearchSettings::default();
-            let sr = match stream_chat_sse(ChatTurnParams {
+            let render_policy = if quiet {
+                crate::stream_render::RenderPolicy::Silent
+            } else {
+                crate::stream_render::RenderPolicy::Stream
+            };
+            let chat_ctx = crate::chat_stream::BasicCliChatContext {
                 api,
-                token: &token,
                 message: &message,
-                session_id: session_id.as_deref(),
                 model: args.model.as_deref().or(global_model.as_deref()),
                 explain: explain_mode,
                 render_md,
-                history: &[],
-                perm_manager: &mut pm,
                 verbose_mode: !quiet,
-                render_policy: if quiet {
-                    crate::stream_render::RenderPolicy::Silent
-                } else {
-                    crate::stream_render::RenderPolicy::Stream
-                },
+                render_policy,
                 selector: &*selector.0,
-                recent_tools: &[],
-                tool_health_entries: &[],
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                plan_only_chat: false,
-                is_plan_subtask: false,
-                plan_subtask_id: None,
-                delegation_engine: None,
-                cancel_token: None,
-                plan_assemble_line_release: None,
-                stream_event_tx: None,
-                approval_request_tx: None,
-                mcp_manager: None,
                 skill_search: &skill_search,
-                skill_quality_tracker: &mut skill_qt,
-                discovered_skills: None,
-                messaging_metrics: None,
-                agent_spawner: None,
-                root_agent_id: None,
-                root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
-                file_journal: None,
-                database_snapshot_journal: None,
-                git_stash_journal: None,
-                git_commit_journal: None,
-                git_worktree_journal: None,
-                session_state_journal: None,
-                task_manager: None,
-                turn_index: 0,
-                evolution_service: None,
-            })
+            };
+            let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+                &chat_ctx,
+                &token,
+                session_id.as_deref(),
+                &mut pm,
+                &mut skill_qt,
+            ))
             .await
             {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
-                    stream_chat_sse(ChatTurnParams {
-                        api,
-                        token: &token,
-                        message: &message,
-                        session_id: None,
-                        model: args.model.as_deref().or(global_model.as_deref()),
-                        explain: explain_mode,
-                        render_md,
-                        history: &[],
-                        perm_manager: &mut pm,
-                        verbose_mode: !quiet,
-                        render_policy: if quiet {
-                            crate::stream_render::RenderPolicy::Silent
-                        } else {
-                            crate::stream_render::RenderPolicy::Stream
-                        },
-                        selector: &*selector.0,
-                        recent_tools: &[],
-                        tool_health_entries: &[],
-                        unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                        plan_only_chat: false,
-                        is_plan_subtask: false,
-                        plan_subtask_id: None,
-                        delegation_engine: None,
-                        cancel_token: None,
-                        plan_assemble_line_release: None,
-                        stream_event_tx: None,
-                        approval_request_tx: None,
-                        mcp_manager: None,
-                        skill_search: &skill_search,
-                        skill_quality_tracker: &mut skill_qt,
-                        discovered_skills: None,
-                        messaging_metrics: None,
-                        agent_spawner: None,
-                        root_agent_id: None,
-                        root_mailbox_slot: None,
-                        observability_hub: None,
-                        observability_session: None,
-                        file_journal: None,
-                        database_snapshot_journal: None,
-                        git_stash_journal: None,
-                        git_commit_journal: None,
-                        git_worktree_journal: None,
-                        session_state_journal: None,
-                        task_manager: None,
-                        turn_index: 0,
-                        evolution_service: None,
-                    })
+                    stream_chat_sse(ChatTurnParams::basic_cli(
+                        &chat_ctx,
+                        &token,
+                        None,
+                        &mut pm,
+                        &mut skill_qt,
+                    ))
                     .await
                     .map_err(|f| f.error)?
                 }
@@ -1437,103 +1272,40 @@ pub(super) async fn run_print_mode(
     let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
     let skill_search = astra_core::SkillSearchSettings::default();
 
-    let sr = match stream_chat_sse(ChatTurnParams {
+    let chat_ctx = crate::chat_stream::BasicCliChatContext {
         api,
-        token: &token,
         message: &message,
-        session_id: session_id.as_deref(),
         model,
         explain: ExplainMode::Off,
         render_md: false,
-        history: &[],
-        perm_manager: &mut pm,
         verbose_mode: std::env::var("ASTRA_VERBOSE")
             .map(|v| v == "1")
             .unwrap_or(false),
         render_policy: crate::stream_render::RenderPolicy::Silent,
         selector: &*selector.0,
-        recent_tools: &[],
-        tool_health_entries: &[],
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-        plan_only_chat: false,
-        is_plan_subtask: false,
-        plan_subtask_id: None,
-        delegation_engine: None,
-        cancel_token: None,
-        plan_assemble_line_release: None,
-        stream_event_tx: None,
-        approval_request_tx: None,
-        mcp_manager: None,
         skill_search: &skill_search,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
-        messaging_metrics: None,
-        agent_spawner: None,
-        root_agent_id: None,
-        root_mailbox_slot: None,
-        observability_hub: None,
-        observability_session: None,
-        file_journal: None,
-        database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
-        git_worktree_journal: None,
-        session_state_journal: None,
-        task_manager: None,
-        turn_index: 0,
-        evolution_service: None,
-    })
+    };
+
+    let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+        &chat_ctx,
+        &token,
+        session_id.as_deref(),
+        &mut pm,
+        &mut skill_qt,
+    ))
     .await
     {
         Ok(sr) => sr,
         Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
             let _ = clear_profile_last_session(profile);
-            stream_chat_sse(ChatTurnParams {
-                api,
-                token: &token,
-                message: &message,
-                session_id: None,
-                model,
-                explain: ExplainMode::Off,
-                render_md: false,
-                history: &[],
-                perm_manager: &mut pm,
-                verbose_mode: std::env::var("ASTRA_VERBOSE")
-                    .map(|v| v == "1")
-                    .unwrap_or(false),
-                render_policy: crate::stream_render::RenderPolicy::Silent,
-                selector: &*selector.0,
-                recent_tools: &[],
-                tool_health_entries: &[],
-                unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                plan_only_chat: false,
-                is_plan_subtask: false,
-                plan_subtask_id: None,
-                delegation_engine: None,
-                cancel_token: None,
-                plan_assemble_line_release: None,
-                stream_event_tx: None,
-                approval_request_tx: None,
-                mcp_manager: None,
-                skill_search: &skill_search,
-                skill_quality_tracker: &mut skill_qt,
-                discovered_skills: None,
-                messaging_metrics: None,
-                agent_spawner: None,
-                root_agent_id: None,
-                root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
-                file_journal: None,
-                database_snapshot_journal: None,
-                git_stash_journal: None,
-                git_commit_journal: None,
-                git_worktree_journal: None,
-                session_state_journal: None,
-                task_manager: None,
-                turn_index: 0,
-                evolution_service: None,
-            })
+            stream_chat_sse(ChatTurnParams::basic_cli(
+                &chat_ctx,
+                &token,
+                None,
+                &mut pm,
+                &mut skill_qt,
+            ))
             .await
             .map_err(|f| f.error)?
         }

@@ -1270,7 +1270,13 @@ impl PermissionManager {
         // Step 5: Dangerous file path — respects Auto mode (user explicitly opted in).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             match self.mode {
-                PermissionMode::Auto => return PermissionDecision::Allow,
+                PermissionMode::Auto => {
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Auto mode allowed write to sensitive path: tool={name} warning={warning}"
+                    );
+                    return PermissionDecision::Allow;
+                }
                 PermissionMode::Deny => {
                     return PermissionDecision::Deny("Sensitive path (deny mode)".into());
                 }
