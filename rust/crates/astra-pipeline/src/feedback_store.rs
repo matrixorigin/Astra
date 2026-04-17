@@ -51,10 +51,10 @@ impl FeedbackStore {
 
         // LRU eviction of oldest session if at capacity
         if !inner.sessions.contains_key(session_id) {
-            if inner.order.len() >= MAX_SESSIONS {
-                if let Some(oldest) = inner.order.pop_front() {
-                    inner.sessions.remove(&oldest);
-                }
+            if inner.order.len() >= MAX_SESSIONS
+                && let Some(oldest) = inner.order.pop_front()
+            {
+                inner.sessions.remove(&oldest);
             }
             inner.order.push_back(session_id.to_string());
         }

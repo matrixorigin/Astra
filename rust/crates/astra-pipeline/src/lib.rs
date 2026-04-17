@@ -16,5 +16,10 @@ pub mod feedback_extraction;
 pub mod feedback_store;
 pub mod routing;
 pub mod state;
+pub mod step_checkpoint;
+pub mod step_protocol;
+pub mod step_recorder;
+pub mod tool_health_types;
 
-pub use routing::{domain_hint_to_label, CalibrationAxis, DomainHint, TaskType, ToolFilter};
+pub use routing::{CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label};
+pub use tool_health_types::ToolHealthEntry;

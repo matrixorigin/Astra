@@ -62,6 +62,7 @@ pub mod tail_persist;
 pub mod task;
 pub mod tool_args_repair;
 pub mod tool_call_shape;
+pub mod tool_health;
 pub mod tool_result_sanitize;
 pub mod tool_result_semantics;
 pub mod tool_result_storage;
@@ -146,3 +147,18 @@ pub mod sse_stream_host;
 
 // Phase 21: retrieval
 pub mod retrieval;
+
+// Phase 24: interaction types, chat_turn_heuristics, result_quality, turn_guard, stall preflight, turn flow, stop_hooks_yaml
+// + agentic_turn_ingest, agentic_post_tool_policy, headless_tool_postprocess, headless_types
+pub mod agentic_post_tool_policy;
+pub mod agentic_stall_preflight;
+pub mod agentic_turn_flow;
+pub mod agentic_turn_ingest;
+pub mod chat_turn_step_plan;
+pub mod headless_tool_body_preview;
+pub mod headless_tool_postprocess;
+pub mod headless_types;
+pub mod result_quality {
+    pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};
+}
+pub mod turn_guard;

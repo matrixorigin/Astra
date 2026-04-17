@@ -263,11 +263,16 @@ dependencies = [
 name = "astra-pipeline"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
+ "astra-services",
+ "astra-text-utils",
  "astra-turn-types",
  "async-trait",
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
 ]
 
@@ -495,6 +500,7 @@ dependencies = [
  "astra-services",
  "astra-text-utils",
  "astra-thin-client",
+ "astra-turn-types",
  "async-trait",
  "axum",
  "base64",

@@ -1,7 +1,7 @@
 [package]
 name = "astra-pipeline"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 description = "Astra agent learning pipeline — calibration, routing, patterns"
 license = "MIT"
 
@@ -9,11 +9,16 @@ license = "MIT"
 default = []
 
 [dependencies]
+astra-core.workspace = true
+astra-services.workspace = true
+astra-text-utils = { path = "../astra-text-utils" }
 astra-turn-types = { path = "../astra-turn-types" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros"] }

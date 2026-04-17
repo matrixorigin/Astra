@@ -551,17 +551,23 @@ mod tests {
     #[test]
     fn phase_valid_transitions() {
         // Perceive → Plan is valid
-        assert!(AgentPhase::Perceive
-            .valid_next()
-            .contains(&AgentPhase::Plan));
+        assert!(
+            AgentPhase::Perceive
+                .valid_next()
+                .contains(&AgentPhase::Plan)
+        );
         // Perceive → Execute is NOT valid
-        assert!(!AgentPhase::Perceive
-            .valid_next()
-            .contains(&AgentPhase::Execute));
+        assert!(
+            !AgentPhase::Perceive
+                .valid_next()
+                .contains(&AgentPhase::Execute)
+        );
         // Evaluate → Reflect is valid
-        assert!(AgentPhase::Evaluate
-            .valid_next()
-            .contains(&AgentPhase::Reflect));
+        assert!(
+            AgentPhase::Evaluate
+                .valid_next()
+                .contains(&AgentPhase::Reflect)
+        );
         // Complete is terminal
         assert!(AgentPhase::Complete.is_terminal());
         assert!(AgentPhase::Complete.valid_next().is_empty());
