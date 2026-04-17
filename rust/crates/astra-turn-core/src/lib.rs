@@ -47,6 +47,7 @@ pub mod microcompact;
 pub mod observer;
 pub mod parallel_tool_exec;
 pub mod persist_inputs;
+pub mod pipeline_learning;
 pub mod prepare_turn_explain_text;
 pub mod refresh;
 pub mod response_guard;
