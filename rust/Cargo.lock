@@ -377,9 +377,11 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-services",
+ "async-trait",
  "regex",
  "serde",
  "serde_json",
+ "tokio-util",
 ]
 
 [[package]]

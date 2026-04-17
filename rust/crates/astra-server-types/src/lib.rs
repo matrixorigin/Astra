@@ -1,5 +1,7 @@
 mod chat_route;
 mod edge_ws_protocol;
+pub mod team_orchestrator_traits;
+pub mod team_orchestrator_types;
 
 use astra_services::auth::SessionActivityRecord;
 use astra_services::{

@@ -353,40 +353,12 @@ pub trait CheckpointGate: Send + Sync {
     }
 }
 
-// ─── Sub-run Tracking ───────────────────────────────────────────────────────
+// ─── Sub-run Tracking ─────────────────────────────────────────────────────────────
 
-/// Tracks parent→child relationships for delegation hierarchies.
-#[derive(Debug, Clone)]
-pub struct SubRunRecord {
-    /// The sub-run's own ID.
-    pub run_id: String,
-    /// Parent run that spawned this sub-run.
-    pub parent_run_id: String,
-    /// Delegation this sub-run belongs to.
-    pub delegation_id: String,
-    /// Agent executing this sub-run.
-    pub agent_id: String,
-    /// Current depth in the delegation tree.
-    pub depth: u32,
-    /// Lifecycle state (enforced state machine).
-    pub state: SubRunState,
-    /// If this run is a gate-retry, links to the original run_id.
-    pub retry_of: Option<String>,
-}
-
-/// Real-time progress snapshot for an active delegation.
-#[derive(Debug, Clone)]
-pub struct DelegationProgress {
-    pub delegation_id: String,
-    /// Per-agent current state.
-    pub agent_states: HashMap<String, SubRunState>,
-    /// When execution started.
-    pub started_at: std::time::Instant,
-    /// Number of completed (terminal) sub-runs.
-    pub completed_count: usize,
-    /// Total sub-runs expected.
-    pub total_count: usize,
-}
+// SubRunRecord and DelegationProgress are now defined in astra-server-types.
+pub use astra_server_types::team_orchestrator_traits::{
+    DelegationProgress, SubRunRecord,
+};
 
 /// In-memory tracker for delegation hierarchies and pause state.
 ///
@@ -3249,6 +3221,55 @@ impl DelegationEngine {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+// ─── Trait Implementations ────────────────────────────────────────────────────────
+
+use astra_server_types::team_orchestrator_traits::{
+    DelegationExecutor, DelegationTracking,
+};
+
+#[async_trait::async_trait]
+impl DelegationExecutor for DelegationEngine {
+    async fn execute_delegation(
+        &self,
+        request: DelegationRequest,
+        source_agent_id: &str,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    ) -> Result<DelegationResult, String> {
+        self.execute(request, source_agent_id, cancel_token).await
+    }
+
+    async fn get_delegation_progress(
+        &self,
+        delegation_id: &str,
+    ) -> Option<DelegationProgress> {
+        self.tracker().get_progress(delegation_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl DelegationTracking for DelegationTracker {
+    async fn get_sub_runs(&self, delegation_id: &str) -> Vec<SubRunRecord> {
+        DelegationTracker::get_sub_runs(self, delegation_id).await
+    }
+
+    async fn is_run_paused(&self, run_id: &str) -> bool {
+        self.is_paused(run_id).await
+    }
+
+    async fn pause_delegation(&self, delegation_id: &str) -> usize {
+        DelegationTracker::pause_delegation(self, delegation_id).await
+    }
+
+    async fn resume_delegation(&self, delegation_id: &str) -> usize {
+        DelegationTracker::resume_delegation(self, delegation_id).await
+    }
+
+    async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String> {
+        DelegationTracker::cleanup_delegation(self, delegation_id).await
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
