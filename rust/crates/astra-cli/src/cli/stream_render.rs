@@ -853,12 +853,25 @@ impl<'a> CliSseStreamHost<'a> {
         );
     }
 
-    fn turn_rollback_boundary_violation(tool: &str, args: &Value) -> Option<String> {
-        Self::bash_boundary_violation(
-            tool,
-            args,
-            "Error: non-read-only bash commands do not participate in rollback_on_failure turn boundaries. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test when available for build/test work, or keep bash read-only inside this plan subtask.",
-        )
+    /// Bash mutations are allowed inside turn-level rollback boundaries.
+    /// They simply don't participate in checkpoint-based rollback — their
+    /// side effects persist even if a later tool triggers rollback.
+    /// Returning `None` means "no violation — let the tool execute".
+    fn turn_rollback_boundary_violation(_tool: &str, _args: &Value) -> Option<String> {
+        None
+    }
+
+    /// Returns `true` when an error from `tool` should trigger the turn-level
+    /// rollback policy.  Read-only tools and bash read-only commands have no
+    /// side effects so their errors are recoverable — the model can retry or
+    /// use a different approach.
+    fn tool_error_triggers_turn_rollback(tool: &str, args: &Value) -> bool {
+        if tool == "bash" {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            return !astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only(command);
+        }
+        // Non-bash tools: only cloud-gated (mutation) tools trigger rollback.
+        astra_runtime::turn::cloud_approval_policy::cloud_gated_tool_kind(tool).is_some()
     }
 
     fn batch_transaction_boundary_violation(tool: &str, args: &Value) -> Option<String> {
@@ -1891,6 +1904,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if status == "error"
+            && Self::tool_error_triggers_turn_rollback(tool, args)
             && let Some(active) = self.active_turn_rollback.clone()
         {
             let rollback = self.rollback_active_turn(&active);
@@ -5401,9 +5415,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 },
                 ToolBatchRequest {
                     request_id: "turn-2".to_string(),
-                    tool: "read_file".to_string(),
+                    tool: "bash".to_string(),
                     args: serde_json::json!({
-                        "path": "missing.txt",
+                        "command": "exit 1",
                     }),
                 },
             ])
@@ -5476,6 +5490,8 @@ diff --git a/src/a.rs b/src/a.rs\n\
             false,
         );
 
+        // write_file succeeds, then bash "exit 1" (non-read-only mutation
+        // error) triggers rollback + aborts later tools.
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
@@ -5488,9 +5504,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 },
                 ToolBatchRequest {
                     request_id: "turn-2".to_string(),
-                    tool: "read_file".to_string(),
+                    tool: "bash".to_string(),
                     args: serde_json::json!({
-                        "path": "missing.txt",
+                        "command": "exit 1",
                     }),
                 },
                 ToolBatchRequest {
@@ -5524,7 +5540,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[tokio::test]
-    async fn turn_rollback_rejects_mutating_bash_and_restores_prior_state() {
+    async fn turn_rollback_allows_bash_and_persists_through_mutation_rollback() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -5560,10 +5576,14 @@ diff --git a/src/a.rs b/src/a.rs\n\
             false,
         );
 
+        // bash mkdir should execute (no boundary violation), then bash "exit 1"
+        // (non-read-only mutation error) triggers rollback.  write_file from
+        // the first request is rolled back, but mkdir side-effect persists (no
+        // checkpoint for bash).
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
-                    request_id: "turn-bash-1".to_string(),
+                    request_id: "turn-bash-0".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "turn.txt",
@@ -5571,37 +5591,40 @@ diff --git a/src/a.rs b/src/a.rs\n\
                     }),
                 },
                 ToolBatchRequest {
+                    request_id: "turn-bash-1".to_string(),
+                    tool: "bash".to_string(),
+                    args: serde_json::json!({
+                        "command": "mkdir -p subdir",
+                    }),
+                },
+                ToolBatchRequest {
                     request_id: "turn-bash-2".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
-                        "command": "mkdir unsafe-dir",
+                        "command": "exit 1",
                     }),
                 },
             ])
             .await;
 
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[1].status, "error");
-        assert!(
-            results[1]
-                .output
-                .contains("non-read-only bash commands do not participate"),
-            "{}",
+        assert_eq!(results.len(), 3);
+        // bash mkdir should have succeeded
+        assert_ne!(
+            results[1].status, "error",
+            "bash mkdir should be allowed: {}",
             results[1].output
         );
-        let fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(fields["rollback_boundary"].as_str(), Some("turn"));
-        assert_eq!(fields["rollback_state"].as_str(), Some("rolled_back"));
+        // bash "exit 1" should have errored and triggered rollback
+        assert_eq!(results[2].status, "error");
+        // write_file should be rolled back
         assert!(
             !temp.path().join("turn.txt").exists(),
-            "prior bounded state should be rolled back"
+            "write_file should be rolled back"
         );
+        // bash side-effect persists (no rollback for bash)
         assert!(
-            !temp.path().join("unsafe-dir").exists(),
-            "mutating bash should be blocked before execution"
+            temp.path().join("subdir").exists(),
+            "bash mkdir side-effect should persist through rollback"
         );
     }
 
@@ -5658,6 +5681,97 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 .contains(temp.path().to_string_lossy().as_ref()),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_rollback_read_only_error_does_not_trigger_rollback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("keep.txt"), "keep me\n").expect("seed");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(13, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        // write_file succeeds, read_file(missing) errors but should NOT
+        // trigger rollback because read_file is read-only.  The 3rd tool
+        // should still execute normally.
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "ro-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "new.txt",
+                        "content": "created\n",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "ro-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "ro-3".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "keep.txt",
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 3);
+        // write_file should succeed
+        assert_ne!(results[0].status, "error", "{}", results[0].output);
+        // read_file(missing) should error
+        assert_eq!(results[1].status, "error");
+        // read_file(keep) should still execute (no rollback triggered)
+        assert_ne!(
+            results[2].status, "error",
+            "read-only error should not abort turn: {}",
+            results[2].output
+        );
+        assert!(
+            results[2].output.contains("keep me"),
+            "{}",
+            results[2].output
+        );
+        // File from write_file should still exist (no rollback)
+        assert!(
+            temp.path().join("new.txt").exists(),
+            "write_file should not be rolled back by read-only error"
         );
     }
 
@@ -5788,9 +5902,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 },
                 ToolBatchRequest {
                     request_id: "turn-boundary-2".to_string(),
-                    tool: "read_file".to_string(),
+                    tool: "bash".to_string(),
                     args: serde_json::json!({
-                        "path": "missing.txt",
+                        "command": "exit 1",
                     }),
                 },
             ])
@@ -5816,12 +5930,12 @@ diff --git a/src/a.rs b/src/a.rs\n\
             aborted["trigger_request_id"].as_str(),
             Some("turn-boundary-2")
         );
-        assert_eq!(aborted["trigger_tool_name"].as_str(), Some("read_file"));
+        assert_eq!(aborted["trigger_tool_name"].as_str(), Some("bash"));
         assert!(
             aborted["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("No such file or directory")),
-            "{aborted}"
+                .is_some_and(|reason| !reason.is_empty()),
+            "reason should contain the error message: {aborted}"
         );
         assert_eq!(
             aborted["rollback"]["files"]["reverted"]
