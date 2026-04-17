@@ -188,6 +188,45 @@ struct ServerRollbackBoundary {
     session_state_checkpoint: Option<u64>,
 }
 
+/// Returns true if `name` is a server-side mutator whose side effects are
+/// captured by one of the server rollback journals (file / database / git /
+/// session_state).
+///
+/// This is the single source of truth used by both boundary opening (per
+/// category, via the `server_*_mutator_in_round` helpers) and failure-triggered
+/// rollback (this predicate, applied to `ToolCallRecord::name`).
+///
+/// **Why this predicate matters for rollback scoping**: `finalize_server_rollback_boundary`
+/// must distinguish between a mutator failing (where partial mutations may need
+/// reverting) and a co-scheduled read-only tool (grep, read_file, glob, …)
+/// failing inside the same parallel round. A read-only failure has no side
+/// effects and must not trigger a rollback of successful mutator calls — doing
+/// so would make the model's action history diverge from disk state and waste
+/// work.
+pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        // file
+        "write_file"
+            | "str_replace"
+            | "delete_file"
+            // database
+            | "mo_query"
+            // git
+            | "git_commit"
+            | "git_revert_commit"
+            // session state
+            | "adjust_config"
+            | "prioritize_tool"
+            | "deprioritize_tool"
+            | "set_goal"
+            | "compress_context"
+            | "task_create"
+            | "task_update"
+            | "task_stop"
+    )
+}
+
 fn server_file_mutator_in_round(tool_calls: &[Value]) -> bool {
     tool_calls.iter().any(|tool_call| {
         matches!(
@@ -590,7 +629,16 @@ async fn finalize_server_rollback_boundary(
         Vec::new()
     };
     let git_mutations_recorded = git_mutation_targets.len() as u64;
-    if let Some(failed_record) = new_records.iter().find(|record| !record.ok) {
+
+    // **Rollback scoping rule**: Only a *mutator* failure triggers rollback. A
+    // read-only tool (grep, read_file, glob, …) failing inside the same
+    // parallel round has no side effects and must not revert successful
+    // mutations. This prevents "one cognitive error trashes the whole round"
+    // behavior that otherwise makes model action-history diverge from disk.
+    let failed_mutator_record = new_records
+        .iter()
+        .find(|record| !record.ok && is_server_mutator_tool_name(&record.name));
+    if let Some(failed_record) = failed_mutator_record {
         let file_rollback = if let Some(file_checkpoint) = active.file_checkpoint {
             (file_entries_added > 0).then(|| {
                 parse_server_rollback_output(
@@ -1616,7 +1664,10 @@ esac
             Some(&session_id),
             &executor,
             7,
-            &[json!({"function": {"name": "write_file", "arguments": "{}"}})],
+            &[
+                json!({"function": {"name": "write_file", "arguments": "{}"}}),
+                json!({"function": {"name": "str_replace", "arguments": "{}"}}),
+            ],
         )
         .expect("boundary should open for write_file");
 
@@ -1629,11 +1680,16 @@ esac
         assert!(write_out.contains("Successfully wrote"));
         assert!(dir.path().join("turn.txt").exists());
 
+        // A mutator (str_replace) fails in the round alongside a successful
+        // write_file → rollback MUST fire and revert the write.
         finalize_server_rollback_boundary(
             Some(&session_id),
             &executor,
             &active,
-            &[tool_record("write_file", true), tool_record("grep", false)],
+            &[
+                tool_record("write_file", true),
+                tool_record("str_replace", false),
+            ],
             &[],
         )
         .await;
@@ -1651,7 +1707,7 @@ esac
         let boundary = &events[1].metadata.as_ref().unwrap()["execution_boundary"];
         assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
         assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("grep"));
+        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("str_replace"));
         assert_eq!(
             boundary["rollback"]["file_edits"]["reverted"]
                 .as_array()
@@ -1721,7 +1777,11 @@ esac
             Some(&session_id),
             &executor,
             &active,
-            &[tool_record("git_commit", true), tool_record("grep", false)],
+            &[
+                tool_record("git_commit", true),
+                // A second mutator in the same round fails → rollback MUST fire.
+                tool_record("git_revert_commit", false),
+            ],
             &[tool_result_row("git_commit", commit_result)],
         )
         .await;
@@ -1741,7 +1801,10 @@ esac
         let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
         assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
         assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("grep"));
+        assert_eq!(
+            boundary["trigger_tool_name"].as_str(),
+            Some("git_revert_commit")
+        );
         assert_eq!(
             boundary["rollback"]["git_mutations"]["reverted"]
                 .as_array()
@@ -1796,7 +1859,11 @@ esac
             Some(&session_id),
             &executor,
             &active,
-            &[tool_record("mo_query", true), tool_record("grep", false)],
+            &[
+                tool_record("mo_query", true),
+                // A second mutator (mo_query) in the same round fails → rollback MUST fire.
+                tool_record("mo_query", false),
+            ],
             &[],
         )
         .await;
@@ -1816,7 +1883,7 @@ esac
         let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
         assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
         assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("grep"));
+        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("mo_query"));
         assert_eq!(
             boundary["rollback"]["database_snapshots"]["restored"]
                 .as_array()
@@ -1866,7 +1933,8 @@ esac
             &active,
             &[
                 tool_record("adjust_config", true),
-                tool_record("grep", false),
+                // A second session-state mutator fails → rollback MUST fire.
+                tool_record("prioritize_tool", false),
             ],
             &[],
         )
@@ -1887,7 +1955,10 @@ esac
         let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
         assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
         assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("grep"));
+        assert_eq!(
+            boundary["trigger_tool_name"].as_str(),
+            Some("prioritize_tool")
+        );
         assert_eq!(
             boundary["rollback"]["session_state"]["restored"]
                 .as_array()
@@ -1898,6 +1969,179 @@ esac
             session.read().unwrap().config.memory.retrieval_top_k,
             original_top_k
         );
+
+        cleanup_session_artifacts(&session_id);
+    }
+
+    // --------------------------------------------------------------------------
+    // Rollback scoping rule: only mutator failures roll back mutator successes.
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn is_server_mutator_tool_name_classifies_all_four_surfaces() {
+        // File mutators
+        assert!(is_server_mutator_tool_name("write_file"));
+        assert!(is_server_mutator_tool_name("str_replace"));
+        assert!(is_server_mutator_tool_name("delete_file"));
+        // Database mutators
+        assert!(is_server_mutator_tool_name("mo_query"));
+        // Git mutators
+        assert!(is_server_mutator_tool_name("git_commit"));
+        assert!(is_server_mutator_tool_name("git_revert_commit"));
+        // Session-state mutators
+        assert!(is_server_mutator_tool_name("adjust_config"));
+        assert!(is_server_mutator_tool_name("prioritize_tool"));
+        assert!(is_server_mutator_tool_name("deprioritize_tool"));
+        assert!(is_server_mutator_tool_name("set_goal"));
+        assert!(is_server_mutator_tool_name("compress_context"));
+        assert!(is_server_mutator_tool_name("task_create"));
+        assert!(is_server_mutator_tool_name("task_update"));
+        assert!(is_server_mutator_tool_name("task_stop"));
+
+        // Common read-only tools must NOT be classified as mutators.
+        for name in [
+            "grep",
+            "read_file",
+            "glob",
+            "ls",
+            "git_show",
+            "git_status",
+            "git_diff",
+            "web_fetch",
+            "think",
+        ] {
+            assert!(
+                !is_server_mutator_tool_name(name),
+                "{name} should not be a mutator"
+            );
+        }
+    }
+
+    /// The round contains a successful `write_file` alongside a failing
+    /// read-only tool. The read-only failure has no side effects, so the
+    /// mutator's success must be committed — NOT rolled back.
+    ///
+    /// This is the central regression test for the rollback scoping rule:
+    /// before the fix, a `grep` returning `!ok` would blow away the
+    /// `write_file` it was scheduled next to and leave the model's action
+    /// history diverged from disk state.
+    #[tokio::test]
+    async fn server_file_boundary_commits_when_only_read_only_tool_fails() {
+        let session_id = format!("server-scope-readonly-{}", uuid::Uuid::new_v4());
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            session_id.clone(),
+            None,
+            None,
+        );
+        executor.set_turn_index(13);
+
+        let active = open_server_rollback_boundary(
+            Some(&session_id),
+            &executor,
+            13,
+            &[
+                json!({"function": {"name": "write_file", "arguments": "{}"}}),
+                json!({"function": {"name": "grep",        "arguments": "{}"}}),
+            ],
+        )
+        .expect("boundary should open for write_file");
+
+        let write_out = executor
+            .execute(
+                "write_file",
+                &json!({"path": "kept.txt", "content": "survives"}),
+            )
+            .await;
+        assert!(write_out.contains("Successfully wrote"));
+        assert!(dir.path().join("kept.txt").exists());
+
+        finalize_server_rollback_boundary(
+            Some(&session_id),
+            &executor,
+            &active,
+            &[
+                tool_record("write_file", true),
+                // Read-only grep failure must NOT trigger rollback.
+                tool_record("grep", false),
+            ],
+            &[],
+        )
+        .await;
+
+        let events = read_journal_events(&session_id);
+        assert_eq!(events.len(), 2, "expected open + committed, got {events:?}");
+        assert_eq!(
+            events[0].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryCommitted,
+            "read-only failure must commit, not abort"
+        );
+        assert!(
+            dir.path().join("kept.txt").exists(),
+            "write_file must survive a co-scheduled read-only failure"
+        );
+
+        cleanup_session_artifacts(&session_id);
+    }
+
+    /// Multiple read-only tools all fail in a mutator round. Still commits —
+    /// no number of read-only errors should cascade into a rollback.
+    #[tokio::test]
+    async fn server_file_boundary_commits_when_multiple_read_only_tools_fail() {
+        let session_id = format!("server-scope-multi-readonly-{}", uuid::Uuid::new_v4());
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            session_id.clone(),
+            None,
+            None,
+        );
+        executor.set_turn_index(14);
+
+        let active = open_server_rollback_boundary(
+            Some(&session_id),
+            &executor,
+            14,
+            &[json!({"function": {"name": "write_file", "arguments": "{}"}})],
+        )
+        .expect("boundary should open for write_file");
+
+        let write_out = executor
+            .execute(
+                "write_file",
+                &json!({"path": "persist.txt", "content": "data"}),
+            )
+            .await;
+        assert!(write_out.contains("Successfully wrote"));
+
+        finalize_server_rollback_boundary(
+            Some(&session_id),
+            &executor,
+            &active,
+            &[
+                tool_record("write_file", true),
+                tool_record("grep", false),
+                tool_record("read_file", false),
+                tool_record("git_show", false),
+            ],
+            &[],
+        )
+        .await;
+
+        let events = read_journal_events(&session_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryCommitted
+        );
+        assert!(dir.path().join("persist.txt").exists());
 
         cleanup_session_artifacts(&session_id);
     }
