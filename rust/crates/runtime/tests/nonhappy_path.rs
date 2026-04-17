@@ -1063,6 +1063,7 @@ mod chat_stream_turnguard_e2e {
         // Phase 4: add tool errors to couple with nudges → first Critical → restricted
         guard.record_tool_result("bash", "error: no such file");
         guard.record_tool_result("bash", "error: not found");
+        guard.record_tool_result("bash", "Error: unexpected failure");
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
         assert!(

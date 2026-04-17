@@ -878,12 +878,12 @@ mod tests {
     #[test]
     fn force_stop_requires_nudges_plus_errors() {
         let mut guard = TurnGuard::new();
-        // 2 nudges, 0 errors → Warning, no force_stop
+        // 2 nudges, 0 errors → Normal (below Warning threshold of 3)
         guard.nudge_count = 2;
         let v = guard.evaluate();
         assert!(!v.force_stop);
 
-        // 3 nudges, 0 errors → still Warning (not Critical without errors)
+        // 3 nudges, 0 errors → Warning (not Critical without errors)
         guard.nudge_count = 3;
         let v = guard.evaluate();
         assert!(
@@ -891,8 +891,9 @@ mod tests {
             "pure stalls without errors should not force_stop"
         );
 
-        // 3 nudges + 2 errors → first Critical → restricted, NOT force_stop
-        for _ in 0..2 {
+        // 4 nudges + 3 errors → first Critical → restricted, NOT force_stop
+        guard.nudge_count = 4;
+        for _ in 0..3 {
             guard.record_tool_result("test_tool", "Error: something failed");
         }
         let v = guard.evaluate();
