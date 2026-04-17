@@ -10,8 +10,9 @@ use astra_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, ToolBatchRequest,
     consume_sse_stream_cancellable, is_tool_concurrency_safe, stream_idle_timeout,
 };
-use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
-use astra_runtime::turn::tool_result_semantics::tool_dedup_signature;
+use astra_runtime::turn::tool_result_semantics::{
+    cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
+};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use crossterm::style::Stylize;
 use futures_util::StreamExt;
@@ -192,8 +193,15 @@ struct CliSseStreamHost<'a> {
     active_turn_rollback: Option<ActiveTurnRollback>,
     /// True once the current turn has emitted an execution-boundary-opened event.
     turn_rollback_boundary_emitted: bool,
-    /// Once a turn-level rollback policy fires, later tool requests are short-circuited.
-    aborted_turn_rollback: Option<AbortedTurnRollback>,
+    /// Tracks whether a turn-level rollback has already fired this turn.
+    /// This is used to:
+    /// 1. Prevent transactional batch from running (turn rollback and batch transaction
+    ///    are separate rollback strategies that should not be mixed).
+    /// 2. Record rollback metadata for the cloud event stream.
+    ///
+    /// NOTE: This does NOT block subsequent tool execution — the agent sees the error
+    /// and decides whether to continue or abort.
+    turn_rollback_fired: Option<TurnRollbackFired>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
 }
@@ -233,7 +241,7 @@ struct ActiveTurnRollback {
 }
 
 #[derive(Clone, Debug)]
-struct AbortedTurnRollback {
+struct TurnRollbackFired {
     rollback: Option<Value>,
 }
 
@@ -289,7 +297,7 @@ impl<'a> CliSseStreamHost<'a> {
             cloud_pre_approved: std::collections::HashSet::new(),
             active_turn_rollback,
             turn_rollback_boundary_emitted: false,
-            aborted_turn_rollback: None,
+            turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
         }
     }
@@ -1497,31 +1505,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None
         };
 
-        if let Some(rollback) = self
-            .aborted_turn_rollback
-            .as_ref()
-            .map(|aborted| aborted.rollback.clone())
-        {
-            let output = Self::append_turn_rollback_note(
-                "Error: skipped because this turn already failed earlier and rollback_on_failure aborted later tool execution",
-                "was already aborted",
-                rollback.as_ref(),
-            );
-            if let Some(idx) = tool_idx {
-                self.render.tool_done(idx, tool, args, "error", 0, &output);
-            }
-            return self
-                .finish_edge_tool_with_fields(
-                    request_id,
-                    tool,
-                    args,
-                    output,
-                    Self::merge_turn_rollback_fields(None, "aborted", rollback),
-                    "error".to_string(),
-                    0,
-                )
-                .await;
-        }
+        // NOTE: We no longer block subsequent tools when a prior tool triggered rollback.
+        // The agent sees the error and can decide whether to continue or abort.
+        // This allows more flexible recovery strategies.
 
         if !self.turn_rollback_boundary_emitted
             && let Some(active) = self.active_turn_rollback.clone()
@@ -1918,8 +1904,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         .to_string();
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Rollback policy: only trigger turn rollback for HARD errors on mutation tools.
+        // Soft errors (e.g., "old_str == new_str", "file not found") let the agent retry.
         if status == "error"
             && Self::tool_error_triggers_turn_rollback(tool, args)
+            && tool_error_triggers_rollback(tool, &output)
             && let Some(active) = self.active_turn_rollback.clone()
         {
             let rollback = self.rollback_active_turn(&active);
@@ -1941,7 +1930,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 Some(tool),
                 rollback.clone(),
             );
-            self.aborted_turn_rollback = Some(AbortedTurnRollback { rollback });
+            self.turn_rollback_fired = Some(TurnRollbackFired { rollback });
             self.active_turn_rollback = None;
         }
 
@@ -2140,7 +2129,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if n <= 1 {
             if has_batch_transaction
                 && self.active_turn_rollback.is_none()
-                && self.aborted_turn_rollback.is_none()
+                && self.turn_rollback_fired.is_none()
             {
                 let out = self.execute_transactional_batch(&requests).await;
                 self.render.tool_batch_progress = None;
@@ -2157,7 +2146,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             return out;
         }
 
-        if self.active_turn_rollback.is_some() || self.aborted_turn_rollback.is_some() {
+        if self.active_turn_rollback.is_some() || self.turn_rollback_fired.is_some() {
             let mut out = Vec::with_capacity(n);
             for (i, req) in requests.iter().enumerate() {
                 self.render.tool_batch_progress = Some((i + 1, n));
@@ -5541,22 +5530,32 @@ diff --git a/src/a.rs b/src/a.rs\n\
             .await;
 
         assert_eq!(results.len(), 3);
-        assert_eq!(results[2].status, "error");
-        assert!(
-            results[2].output.contains("already failed earlier"),
-            "{}",
-            results[2].output
-        );
-        let fields = results[2]
+
+        // After the PR fix: rollback fires on the bash error (results[1]),
+        // but subsequent tools (results[2]) execute normally instead of being blocked.
+        // The agent sees the error and decides whether to continue.
+
+        // Bash error triggers rollback
+        assert_eq!(results[1].status, "error");
+        let bash_fields = results[1]
             .tool_result_fields
             .as_ref()
-            .expect("rollback fields");
-        assert_eq!(fields["rollback_boundary"].as_str(), Some("turn"));
-        assert_eq!(fields["rollback_state"].as_str(), Some("aborted"));
-        assert_eq!(fields["rollback_on_failure"].as_bool(), Some(true));
+            .expect("bash rollback fields");
+        assert_eq!(
+            bash_fields["rollback_boundary"].as_str(),
+            Some("turn"),
+            "bash error should trigger turn rollback"
+        );
+
+        // Subsequent tool executes normally (not blocked)
+        assert_eq!(
+            results[2].status, "success",
+            "read_file should execute normally after rollback"
+        );
         assert!(
-            !results[2].output.contains("existing"),
-            "aborted turn request should not execute normally"
+            results[2].output.contains("existing"),
+            "read_file should return actual file content: {}",
+            results[2].output
         );
     }
 

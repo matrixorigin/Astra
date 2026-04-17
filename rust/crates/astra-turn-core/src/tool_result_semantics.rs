@@ -42,6 +42,160 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     }
 }
 
+/// Classification of tool errors for rollback policy decisions.
+///
+/// **HardError**: Unrecoverable errors that may have left inconsistent state.
+/// Examples: permission denied, disk full, sandbox violation, git conflicts.
+/// These SHOULD trigger rollback in plan-subtask context.
+///
+/// **SoftError**: Recoverable errors where the tool simply couldn't complete
+/// but left no side effects. The agent can retry or try a different approach.
+/// Examples: file not found, old_str not unique, old_str == new_str.
+/// These should NOT trigger rollback — let the agent decide what to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorSeverity {
+    /// No error — tool succeeded.
+    Success,
+    /// Soft error: recoverable, no side effects, agent can decide next step.
+    SoftError,
+    /// Hard error: may have inconsistent state, should trigger rollback.
+    HardError,
+}
+
+/// Well-known soft error patterns that should NOT trigger rollback.
+///
+/// These errors indicate the tool couldn't complete its task but left no
+/// side effects. The agent can retry with different parameters or try
+/// a different approach.
+///
+/// NOTE: timeout/transient errors are handled separately in `classify_tool_error`
+/// because they need tool-type awareness (mutation tool timeout → HardError).
+const SOFT_ERROR_PATTERNS: &[&str] = &[
+    // str_replace benign failures
+    "old_str and new_str are identical",
+    "old_str not found",
+    "must be unique",
+    "no change needed",
+    // File access — specific patterns to avoid false positives
+    "file not found",
+    "no such file",
+    "no such file or directory",
+    "path does not exist",
+    // Read-only failures (no mutation)
+    "nothing to commit",
+    "no changes detected",
+    // create_file on existing file — specific pattern
+    "file already exists",
+];
+
+/// Timeout/transient error patterns — soft for read-only tools, hard for mutation tools.
+const TRANSIENT_ERROR_PATTERNS: &[&str] = &[
+    "timed out",
+    "timeout",
+    "connection refused",
+    "network error",
+];
+
+/// Check whether a tool name refers to a mutation tool (may leave side effects).
+///
+/// Uses the canonical [`crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS`] list
+/// plus MCP tools (`mcp_*` prefix) which run external server code with unknown side effects.
+fn is_mutation_tool(tool: &str) -> bool {
+    crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS.contains(&tool)
+        || tool.starts_with("mcp_")
+}
+
+/// Well-known hard error patterns that SHOULD trigger rollback.
+///
+/// These errors indicate potential inconsistent state that requires cleanup.
+const HARD_ERROR_PATTERNS: &[&str] = &[
+    // Permission / access violations
+    "permission denied",
+    "access denied",
+    "operation not permitted",
+    // Resource exhaustion
+    "no space left",
+    "disk full",
+    "out of memory",
+    "cannot allocate",
+    "too many open files",
+    // Safety violations
+    "sandbox:",
+    "blocked by safety",
+    "security violation",
+    // Git state issues
+    "merge conflict",
+    "rebase in progress",
+    "cannot lock",
+    // Partial write failures
+    "write failed",
+    "partial write",
+    "interrupted system call",
+];
+
+/// Classify a tool error output for rollback policy decisions.
+///
+/// Returns [`ToolErrorSeverity::Success`] for successful outputs,
+/// [`ToolErrorSeverity::SoftError`] for recoverable errors,
+/// [`ToolErrorSeverity::HardError`] for errors that may need rollback.
+///
+/// The `tool` parameter affects classification of timeout/transient errors:
+/// - Mutation tools (bash, str_replace, etc.) + timeout → HardError (partial writes possible)
+/// - Read-only tools (grep, view, etc.) + timeout → SoftError (no side effects)
+pub fn classify_tool_error(tool: &str, output: &str) -> ToolErrorSeverity {
+    // Not an error at all
+    if cloud_tool_result_status_label(output) != "error" {
+        return ToolErrorSeverity::Success;
+    }
+
+    let lower = output.to_lowercase();
+
+    // Check hard errors first (more specific)
+    for pattern in HARD_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::HardError;
+        }
+    }
+
+    // Check transient errors — severity depends on tool type
+    for pattern in TRANSIENT_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            let is_mutation = is_mutation_tool(tool);
+            return if is_mutation {
+                // Mutation tool timeout may have left partial state
+                ToolErrorSeverity::HardError
+            } else {
+                // Read-only tool timeout is recoverable
+                ToolErrorSeverity::SoftError
+            };
+        }
+    }
+
+    // Check soft errors
+    for pattern in SOFT_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::SoftError;
+        }
+    }
+
+    // Default: unknown errors are treated as hard (safer for rollback)
+    ToolErrorSeverity::HardError
+}
+
+/// Returns true if this tool error should trigger turn rollback.
+///
+/// Only hard errors trigger rollback. Soft errors (recoverable, no side effects)
+/// allow the turn to continue so the agent can retry or try alternatives.
+///
+/// The `tool` parameter is used to distinguish mutation vs read-only tools
+/// for timeout/transient error handling.
+pub fn tool_error_triggers_rollback(tool: &str, output: &str) -> bool {
+    matches!(
+        classify_tool_error(tool, output),
+        ToolErrorSeverity::HardError
+    )
+}
+
 /// Detect OS-level resource exhaustion in tool output that wasn't flagged by [`is_tool_error`].
 ///
 /// Scans **per-line** to avoid false positives in source or large file contents.
@@ -408,5 +562,159 @@ if let Err(e) = writeln!(file, "{line}") {
         let norm = normalize_tool_arguments(&args);
         assert_eq!(norm["count"], 5);
         assert_eq!(norm["verbose"], true);
+    }
+
+    // ── Error severity classification tests ──────────────────────────────────
+
+    #[test]
+    fn classify_success_output() {
+        assert_eq!(
+            classify_tool_error("grep", "File created successfully"),
+            ToolErrorSeverity::Success
+        );
+        assert_eq!(
+            classify_tool_error("str_replace", "Replaced 3 occurrences"),
+            ToolErrorSeverity::Success
+        );
+    }
+
+    #[test]
+    fn classify_soft_error_str_replace_identical() {
+        let output = "Error: old_str and new_str are identical — no change needed";
+        assert_eq!(
+            classify_tool_error("str_replace", output),
+            ToolErrorSeverity::SoftError
+        );
+        assert!(!tool_error_triggers_rollback("str_replace", output));
+    }
+
+    #[test]
+    fn classify_soft_error_file_not_found() {
+        let output = "Error: file not found: /path/to/missing.rs";
+        assert_eq!(
+            classify_tool_error("read_file", output),
+            ToolErrorSeverity::SoftError
+        );
+        assert!(!tool_error_triggers_rollback("read_file", output));
+    }
+
+    #[test]
+    fn classify_soft_error_not_unique() {
+        let output = "Error: old_str found 3 times — must be unique";
+        assert_eq!(
+            classify_tool_error("str_replace", output),
+            ToolErrorSeverity::SoftError
+        );
+        assert!(!tool_error_triggers_rollback("str_replace", output));
+    }
+
+    #[test]
+    fn classify_timeout_soft_for_read_only_tool() {
+        // Read-only tool timeout → SoftError
+        let output = "Error: command timed out after 30s";
+        assert_eq!(
+            classify_tool_error("grep", output),
+            ToolErrorSeverity::SoftError
+        );
+        assert!(!tool_error_triggers_rollback("grep", output));
+    }
+
+    #[test]
+    fn classify_timeout_hard_for_mutation_tool() {
+        // Mutation tool timeout → HardError (may have partial writes)
+        let output = "Error: command timed out after 30s";
+        assert_eq!(
+            classify_tool_error("bash", output),
+            ToolErrorSeverity::HardError
+        );
+        assert!(tool_error_triggers_rollback("bash", output));
+
+        // str_replace timeout
+        assert_eq!(
+            classify_tool_error("str_replace", output),
+            ToolErrorSeverity::HardError
+        );
+
+        // write_file timeout
+        assert_eq!(
+            classify_tool_error("write_file", output),
+            ToolErrorSeverity::HardError
+        );
+    }
+
+    #[test]
+    fn classify_hard_error_permission_denied() {
+        let output = "Error: permission denied: /etc/passwd";
+        assert_eq!(
+            classify_tool_error("read_file", output),
+            ToolErrorSeverity::HardError
+        );
+        assert!(tool_error_triggers_rollback("read_file", output));
+    }
+
+    #[test]
+    fn classify_hard_error_disk_full() {
+        let output = "Error: no space left on device";
+        assert_eq!(
+            classify_tool_error("write_file", output),
+            ToolErrorSeverity::HardError
+        );
+        assert!(tool_error_triggers_rollback("write_file", output));
+    }
+
+    #[test]
+    fn classify_hard_error_sandbox_violation() {
+        let output = "Sandbox: blocked write to /etc/hosts";
+        assert_eq!(
+            classify_tool_error("bash", output),
+            ToolErrorSeverity::HardError
+        );
+        assert!(tool_error_triggers_rollback("bash", output));
+    }
+
+    #[test]
+    fn classify_hard_error_git_conflict() {
+        let output = "Error: merge conflict in src/main.rs";
+        assert_eq!(
+            classify_tool_error("git_pull", output),
+            ToolErrorSeverity::HardError
+        );
+        assert!(tool_error_triggers_rollback("git_pull", output));
+    }
+
+    #[test]
+    fn classify_unknown_error_defaults_to_hard() {
+        // Unknown errors should be treated as hard (safer for rollback)
+        let output = "Error: some unknown catastrophic failure";
+        assert_eq!(
+            classify_tool_error("unknown_tool", output),
+            ToolErrorSeverity::HardError
+        );
+        assert!(tool_error_triggers_rollback("unknown_tool", output));
+    }
+
+    #[test]
+    fn classify_hard_wins_over_soft_when_both_present() {
+        // Issue #141 review comment: add test for overlapping patterns
+        let output = "Error: permission denied — file does not exist";
+        assert_eq!(
+            classify_tool_error("read_file", output),
+            ToolErrorSeverity::HardError
+        );
+    }
+
+    #[test]
+    fn classify_connection_refused_by_tool_type() {
+        let output = "Error: connection refused";
+        // Read-only → SoftError
+        assert_eq!(
+            classify_tool_error("curl", output),
+            ToolErrorSeverity::SoftError
+        );
+        // Mutation → HardError
+        assert_eq!(
+            classify_tool_error("bash", output),
+            ToolErrorSeverity::HardError
+        );
     }
 }
