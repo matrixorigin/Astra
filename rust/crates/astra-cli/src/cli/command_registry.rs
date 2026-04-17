@@ -153,6 +153,7 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("list", "List skills"),
     ("new", "Create skill"),
     ("pin", "Pin skill to always load"),
+    ("publish", "Publish to marketplace"),
     ("search", "Keyword search catalog"),
     ("stats", "Learning summary"),
     ("surfacing", "Agent catalog surfacing (dynamic/min/cap)"),
@@ -592,11 +593,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Skills ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/skill",
-        "Skills: list|info|search|surfacing|health|new|test|dev|system|…",
+        "Skills: browse|list|info|install|publish|search|new|test|dev|system|…",
         CommandGroup::Skills,
     )
     .with_subcommands(SKILL_SUBCOMMANDS)
-    .with_arg_hint("[list|info|search|new|test|dev|feedback|…]"),
+    .with_arg_hint("[browse|list|info|install|publish|search|new|test|dev|feedback|…]"),
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
@@ -902,6 +903,7 @@ mod tests {
         let subs = subs.unwrap();
         assert!(subs.iter().any(|(tok, _)| *tok == "list"));
         assert!(subs.iter().any(|(tok, _)| *tok == "info"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "publish"));
     }
 
     #[test]
