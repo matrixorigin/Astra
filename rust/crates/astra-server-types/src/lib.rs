@@ -887,3 +887,6 @@ mod sse_error_payload_tests {
         assert_eq!(payload["message"], "upstream unavailable");
     }
 }
+
+#[cfg(test)]
+mod http_type_tests;
