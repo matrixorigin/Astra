@@ -377,6 +377,7 @@ pub(super) async fn check_server_has_models(
 }
 
 /// Outcome of `try_refresh_token` for deciding whether on-disk credentials may still be valid.
+#[derive(Debug)]
 enum SilentRefreshError {
     Thin(astra_thin_client::ThinClientError),
     /// HTTP 200 body was not usable; keep existing tokens.
@@ -524,7 +525,8 @@ async fn try_refresh_token(
 /// Attempt to refresh an expired token mid-session.
 ///
 /// Returns `true` (and persists new credentials) on success.
-/// On failure, also tries the refresh-race recovery path before giving up.
+/// On failure, logs the underlying reason before returning `false`, so users
+/// can see why a refresh did not recover their session.
 pub(super) async fn attempt_token_refresh(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -536,6 +538,10 @@ pub(super) async fn attempt_token_refresh(
         .get(&name)
         .and_then(|p| p.refresh_token.as_ref())
     else {
+        astra_core::agent_warn!(
+            "auth",
+            "token refresh skipped: no refresh_token stored for profile '{name}'"
+        );
         return false;
     };
     let refresh_str = refresh.clone();
@@ -544,9 +550,25 @@ pub(super) async fn attempt_token_refresh(
         Ok(()) => true,
         Err(err) => {
             if err.keep_credentials() {
+                astra_core::agent_warn!(
+                    "auth",
+                    "token refresh failed (credentials preserved): {err:?}"
+                );
                 return false;
             }
-            recover_credentials_after_refresh_race(api, profile, &refresh_str).await
+            astra_core::agent_warn!(
+                "auth",
+                "token refresh failed, attempting race-recovery path: {err:?}"
+            );
+            let recovered =
+                recover_credentials_after_refresh_race(api, profile, &refresh_str).await;
+            if !recovered {
+                astra_core::agent_warn!(
+                    "auth",
+                    "token refresh race-recovery also failed for profile '{name}'"
+                );
+            }
+            recovered
         }
     }
 }

@@ -808,7 +808,7 @@ pub fn git_show(
 
     // When viewing many per-file diffs from the same commit, nudge the model
     // to wrap up early rather than exhausting the aggregate budget.
-    if file_filter.is_some() && aggregate_bytes > super::AGGREGATE_SOFT_LIMIT / 2 {
+    if file_filter.is_some() && aggregate_bytes > super::AGGREGATE_HINT_THRESHOLD {
         result.push_str(
             "\n[hint: aggregate output is high — finish reviewing with the files \
              already read, or use stat_only:true to prioritize remaining files]",
