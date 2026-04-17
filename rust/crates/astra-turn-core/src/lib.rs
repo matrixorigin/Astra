@@ -28,6 +28,7 @@ pub mod confidence_contract;
 pub mod context_assembly_trace;
 pub mod edge_executor_id;
 pub mod error_recovery;
+pub mod evaluation;
 pub mod execution_state;
 pub mod explain;
 pub mod explain_report_lines;
