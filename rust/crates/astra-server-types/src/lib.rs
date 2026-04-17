@@ -4,6 +4,8 @@ mod chat_route;
 pub mod conflict_resolver;
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+pub mod team_orchestrator_traits;
+pub mod team_orchestrator_types;
 pub mod worktree_isolation;
 pub mod ws_progress_callback;
 

@@ -15,64 +15,27 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use astra_services::coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, DelegationResult,
+    AgentProfile, AgentProfileRegistry, AgentTier, DelegationResult,
 };
-use astra_services::learning_merge::{AgentLearning, MergedLearning, merge_agent_learnings};
+use astra_services::learning_merge::MergedLearning;
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode, resolve_team};
 
-use super::delegation_engine::{DelegationEngine, DelegationTracker};
-use super::run_engine::RunEngine;
-use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
+use astra_server_types::team_orchestrator_traits::{
+    DelegationExecutor, DelegationTracking, RunPersistence,
+};
+pub use astra_server_types::team_orchestrator_types::{
+    ExecutionPhase, OrchestratorConfig, ProgressCallback, TeamExecutionStatus,
+    append_merge_conflict_summary, derive_team_status, extract_learning_from_result,
+    merge_team_learnings, sum_usage, summarize_failed_agents,
+};
+use astra_server_types::warn_persist;
 
-/// Log a warning when a best-effort persistence operation fails.
-macro_rules! warn_persist {
-    ($op:expr, $label:expr) => {
-        if let Err(e) = $op {
-            astra_core::agent_warn!("orchestrator", "{}: {e}", $label);
-        }
-    };
-}
+use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-/// Progress phases emitted during team execution.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionPhase {
-    /// Team loaded and validated, profiles resolved.
-    Preparing {
-        team_name: String,
-        member_count: usize,
-    },
-    /// Worktrees created (only for Isolated mode).
-    WorktreesCreated { agent_ids: Vec<String> },
-    /// Delegation started via DelegationEngine.
-    Executing { delegation_id: String },
-    /// Real-time agent state update within a delegation.
-    AgentProgress {
-        delegation_id: String,
-        /// agent_id → current state
-        agent_states: std::collections::HashMap<String, String>,
-        completed_count: usize,
-        total_count: usize,
-    },
-    /// Delegation completed, merging worktrees.
-    Merging { agent_count: usize },
-    /// Merge complete, producing final report.
-    Reporting { status: TeamExecutionStatus },
-}
-
-/// Callback for reporting execution progress to the UI layer.
-pub type ProgressCallback = Arc<dyn Fn(ExecutionPhase) + Send + Sync>;
-
-/// Configuration for creating a TeamExecutionOrchestrator.
-pub struct OrchestratorConfig {
-    pub user_id: String,
-    pub session_id: String,
-    /// Source agent ID requesting the team execution (for delegation validation).
-    pub source_agent_id: String,
-    /// Optional progress callback for UI integration.
-    pub progress: Option<ProgressCallback>,
-}
+// ExecutionPhase, ProgressCallback, OrchestratorConfig, TeamExecutionStatus
+// are re-exported from astra_server_types above.
 
 /// Outcome of a full team execution lifecycle.
 #[derive(Debug)]
@@ -87,26 +50,6 @@ pub struct TeamExecutionReport {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TeamExecutionStatus {
-    Completed,
-    Partial,
-    CompletedWithConflicts,
-    CompletedOverBudget,
-    Failed,
-}
-
-impl std::fmt::Display for TeamExecutionStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Completed => write!(f, "completed"),
-            Self::Partial => write!(f, "partial"),
-            Self::CompletedWithConflicts => write!(f, "completed_with_conflicts"),
-            Self::CompletedOverBudget => write!(f, "completed_over_budget"),
-            Self::Failed => write!(f, "failed"),
-        }
-    }
-}
 
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
@@ -116,9 +59,9 @@ impl std::fmt::Display for TeamExecutionStatus {
 /// passed in via constructor args.
 pub struct TeamExecutionOrchestrator {
     team_store: Arc<dyn TeamPersistenceService>,
-    delegation_engine: Arc<DelegationEngine>,
-    delegation_tracker: Arc<DelegationTracker>,
-    run_engine: Arc<RunEngine>,
+    delegation_engine: Arc<dyn DelegationExecutor>,
+    delegation_tracker: Arc<dyn DelegationTracking>,
+    run_engine: Arc<dyn RunPersistence>,
     profile_registry: Arc<RwLock<AgentProfileRegistry>>,
     config: OrchestratorConfig,
     repo_lock: RepoLock,
@@ -129,9 +72,9 @@ pub struct TeamExecutionOrchestrator {
 impl TeamExecutionOrchestrator {
     pub fn new(
         team_store: Arc<dyn TeamPersistenceService>,
-        delegation_engine: Arc<DelegationEngine>,
-        delegation_tracker: Arc<DelegationTracker>,
-        run_engine: Arc<RunEngine>,
+        delegation_engine: Arc<dyn DelegationExecutor>,
+        delegation_tracker: Arc<dyn DelegationTracking>,
+        run_engine: Arc<dyn RunPersistence>,
         profile_registry: Arc<RwLock<AgentProfileRegistry>>,
         config: OrchestratorConfig,
     ) -> Self {
@@ -397,7 +340,7 @@ impl TeamExecutionOrchestrator {
         // instead of being orphaned when the delegation future is dropped.
         let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-        let delegation_future = self.delegation_engine.execute(
+        let delegation_future = self.delegation_engine.execute_delegation(
             effective_request,
             &self.config.source_agent_id,
             Some(cancel_token.clone()),
@@ -440,8 +383,7 @@ impl TeamExecutionOrchestrator {
                     // Poll and emit intermediate progress
                     if let Some(progress) = self
                         .delegation_engine
-                        .tracker()
-                        .get_progress(&delegation_id)
+                        .get_delegation_progress(&delegation_id)
                         .await
                     {
                         let agent_states: std::collections::HashMap<String, String> = progress
@@ -512,8 +454,7 @@ impl TeamExecutionOrchestrator {
         // Emit final agent progress snapshot
         if let Some(progress) = self
             .delegation_engine
-            .tracker()
-            .get_progress(&delegation_id)
+            .get_delegation_progress(&delegation_id)
             .await
         {
             let agent_states: std::collections::HashMap<String, String> = progress
@@ -598,17 +539,7 @@ impl TeamExecutionOrchestrator {
         };
 
         // Aggregate learnings from agent results
-        let learnings: Vec<AgentLearning> = delegation_result
-            .agent_results
-            .iter()
-            .filter(|r: &&AgentResult| r.is_success())
-            .map(|r| extract_learning_from_result(r))
-            .collect();
-        let merged_learning = if learnings.is_empty() {
-            None
-        } else {
-            Some(merge_agent_learnings(&learnings))
-        };
+        let merged_learning = aggregate_learnings(&delegation_result);
 
         // ── Phase 4: Report ─────────────────────────────────────────────
         let conflict_count = merge_result
@@ -734,7 +665,7 @@ impl TeamExecutionOrchestrator {
         }
         // Paused if any sub-run is paused
         for sr in &sub_runs {
-            if self.delegation_tracker.is_paused(&sr.run_id).await {
+            if self.delegation_tracker.is_run_paused(&sr.run_id).await {
                 return true;
             }
         }
@@ -767,132 +698,12 @@ impl TeamExecutionOrchestrator {
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// Helper functions (sum_usage, summarize_failed_agents, derive_team_status, etc.)
+// are re-exported from astra_server_types::team_orchestrator_types via `pub use` above.
 
-/// Sum token usage across all agent results.
-fn sum_usage(result: &DelegationResult) -> (u64, u64, u32) {
-    let mut prompt = 0u64;
-    let mut completion = 0u64;
-    let mut tools = 0u32;
-    for r in &result.agent_results {
-        prompt += r.prompt_tokens;
-        completion += r.completion_tokens;
-        tools += r.tool_calls;
-    }
-    (prompt, completion, tools)
-}
-
-fn summarize_failed_agents(result: &DelegationResult) -> String {
-    if result.agent_results.is_empty() {
-        return "delegation produced no agent results".to_string();
-    }
-
-    let failed: Vec<&AgentResult> = result
-        .agent_results
-        .iter()
-        .filter(|agent| !agent.is_success())
-        .collect();
-    if failed.is_empty() {
-        return "delegation did not produce a successful result".to_string();
-    }
-
-    let details: Vec<String> = failed
-        .iter()
-        .take(3)
-        .map(|agent| {
-            let reason = agent
-                .error
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(agent.status.as_str());
-            format!("{}: {}", agent.agent_id, reason)
-        })
-        .collect();
-    let remainder = failed.len().saturating_sub(details.len());
-    let suffix = if remainder > 0 {
-        format!(" (+{} more)", remainder)
-    } else {
-        String::new()
-    };
-
-    format!(
-        "{} of {} agents failed ({}){}",
-        failed.len(),
-        result.agent_results.len(),
-        details.join("; "),
-        suffix
-    )
-}
-
-fn append_merge_conflict_summary(summary: String, conflict_count: usize) -> String {
-    if conflict_count == 0 {
-        return summary;
-    }
-
-    format!("{summary}; merge produced {conflict_count} conflict(s)")
-}
-
-fn derive_team_status(
-    result: &DelegationResult,
-    conflict_count: usize,
-) -> (TeamExecutionStatus, Option<String>) {
-    match result.status.as_str() {
-        "completed" => {
-            let status = if conflict_count > 0 {
-                TeamExecutionStatus::CompletedWithConflicts
-            } else {
-                TeamExecutionStatus::Completed
-            };
-            let error = if conflict_count > 0 {
-                Some(format!("merge produced {conflict_count} conflict(s)"))
-            } else {
-                None
-            };
-            (status, error)
-        }
-        "partial" => (
-            TeamExecutionStatus::Partial,
-            Some(append_merge_conflict_summary(
-                summarize_failed_agents(result),
-                conflict_count,
-            )),
-        ),
-        "failed" => (
-            TeamExecutionStatus::Failed,
-            Some(append_merge_conflict_summary(
-                summarize_failed_agents(result),
-                conflict_count,
-            )),
-        ),
-        other => (
-            TeamExecutionStatus::Failed,
-            Some(append_merge_conflict_summary(
-                format!("delegation ended in unexpected status '{other}'"),
-                conflict_count,
-            )),
-        ),
-    }
-}
-
-/// Extract a synthetic AgentLearning from an agent result.
-///
-/// Real implementations would parse structured output from the agent's
-/// response. This creates a minimal placeholder.
-fn extract_learning_from_result(result: &AgentResult) -> AgentLearning {
-    use astra_services::learning_merge::VersionVector;
-
-    let mut version = VersionVector::new();
-    version.increment(&result.agent_id);
-
-    AgentLearning {
-        agent_id: result.agent_id.clone(),
-        session_id: result.run_id.clone(),
-        version,
-        successful_patterns: vec![],
-        failed_patterns: vec![],
-        discovered_facts: vec![],
-        quality_score: if result.is_success() { 0.8 } else { 0.2 },
-    }
+/// Aggregate learnings from delegation agent results.
+fn aggregate_learnings(delegation_result: &DelegationResult) -> Option<MergedLearning> {
+    merge_team_learnings(&delegation_result.agent_results)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -900,8 +711,9 @@ fn extract_learning_from_result(result: &AgentResult) -> AgentLearning {
 #[cfg(test)]
 mod tests {
     use super::super::delegation_engine::{
-        DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
+        DelegationEngine, DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
     };
+    use super::super::run_engine::RunEngine;
     use super::*;
     use astra_services::coordination::{AgentResult, AgentTier};
     use astra_services::runs::InMemoryRunStateStore;
