@@ -398,6 +398,7 @@ pub struct PermissionTelemetry {
     pub recent_denials: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct PermissionSyncContext {
     /// Permissions inherited from parent agent.
     pub inherited: InheritedPermissions,

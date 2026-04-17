@@ -7,6 +7,7 @@
 use serde_json::Value;
 
 /// Token budget for a single turn.
+#[derive(Debug, Clone)]
 pub struct TokenBudget {
     /// Maximum prompt tokens for the current turn.
     pub max_prompt_tokens: u64,
