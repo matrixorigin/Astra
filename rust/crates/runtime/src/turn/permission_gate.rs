@@ -195,7 +195,9 @@ pub fn permission_denied_error_result(tool_name: &str, reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::permission_sync::{InheritedPermissions, PermissionRule};
+    use crate::orchestration::permission_sync::{
+        InheritedPermissions, PermissionResponseMessaging, PermissionRule,
+    };
     use std::collections::HashSet;
 
     #[tokio::test]
