@@ -5530,22 +5530,32 @@ diff --git a/src/a.rs b/src/a.rs\n\
             .await;
 
         assert_eq!(results.len(), 3);
-        assert_eq!(results[2].status, "error");
-        assert!(
-            results[2].output.contains("already failed earlier"),
-            "{}",
-            results[2].output
-        );
-        let fields = results[2]
+
+        // After the PR fix: rollback fires on the bash error (results[1]),
+        // but subsequent tools (results[2]) execute normally instead of being blocked.
+        // The agent sees the error and decides whether to continue.
+
+        // Bash error triggers rollback
+        assert_eq!(results[1].status, "error");
+        let bash_fields = results[1]
             .tool_result_fields
             .as_ref()
-            .expect("rollback fields");
-        assert_eq!(fields["rollback_boundary"].as_str(), Some("turn"));
-        assert_eq!(fields["rollback_state"].as_str(), Some("aborted"));
-        assert_eq!(fields["rollback_on_failure"].as_bool(), Some(true));
+            .expect("bash rollback fields");
+        assert_eq!(
+            bash_fields["rollback_boundary"].as_str(),
+            Some("turn"),
+            "bash error should trigger turn rollback"
+        );
+
+        // Subsequent tool executes normally (not blocked)
+        assert_eq!(
+            results[2].status, "success",
+            "read_file should execute normally after rollback"
+        );
         assert!(
-            !results[2].output.contains("existing"),
-            "aborted turn request should not execute normally"
+            results[2].output.contains("existing"),
+            "read_file should return actual file content: {}",
+            results[2].output
         );
     }
 
