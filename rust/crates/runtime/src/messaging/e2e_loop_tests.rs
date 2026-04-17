@@ -18,8 +18,8 @@ mod tests {
     use crate::messaging::router::AgentMailboxRouter;
     use crate::messaging::types::*;
     use crate::orchestration::permission_sync::{
-        InheritedPermissions, PermissionMode, PermissionRequest, PermissionResponse,
-        PermissionSyncContext,
+        InheritedPermissions, PermissionMode, PermissionRequest, PermissionRequestMessaging,
+        PermissionResponse, PermissionResponseMessaging, PermissionSyncContext,
     };
     use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
     use crate::pipeline::step_recorder::StepRecorder;
