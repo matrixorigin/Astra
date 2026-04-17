@@ -109,6 +109,7 @@ const DYN_SECOND_TOKEN: &[(&str, &str, DynKey)] = &[
     ("/skill", "info", DynKey::SkillName),
     ("/skill", "feedback", DynKey::SkillName),
     ("/skill", "pin", DynKey::SkillName),
+    ("/skill", "publish", DynKey::SkillName),
     ("/skill", "unpin", DynKey::SkillName),
     ("/mcp", "ping", DynKey::McpServer),
     ("/mcp", "log-level", DynKey::McpServer),
@@ -838,7 +839,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill info" => Some("<name> [--raw]"),
         "/skill search" => Some("<query>"),
         "/skill surfacing" => Some("[show|dynamic <on|off>|min <n>|cap <n>]"),
-        "/skill new" | "/skill create" => Some("<name>"),
+        "/skill new" | "/skill create" | "/skill publish" => Some("<name>"),
         "/skill test" => Some("<name> [json_args]"),
         "/skill dev" => Some("<name|off>"),
         "/skill health" => None, // no args
