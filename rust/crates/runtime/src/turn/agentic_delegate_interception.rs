@@ -268,6 +268,7 @@ pub(crate) fn merge_forward_headers_into_delegation_context(
     context: &mut std::collections::HashMap<String, serde_json::Value>,
     forward_headers: &std::collections::HashMap<String, String>,
 ) {
+    context.remove(FORWARD_HEADERS_CONTEXT_KEY);
     if forward_headers.is_empty() {
         return;
     }
@@ -999,6 +1000,32 @@ mod tests {
             .expect("forward headers should be an object");
         assert_eq!(headers["authorization"], "Bearer trusted-token");
         assert_eq!(headers["x-workspace-id"], "ws-001");
+    }
+
+    #[test]
+    fn parse_delegation_request_removes_untrusted_forward_headers_when_trusted_map_empty() {
+        let tool_call = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_forward_headers\": {\"x-workspace-id\": \"evil\"}}}"
+            }
+        });
+        let req = parse_delegation_request(
+            &tool_call,
+            "run-123",
+            "session-456",
+            2,
+            &std::collections::HashMap::new(),
+            &astra_core::SkillSearchSettings::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !req.context.contains_key(FORWARD_HEADERS_CONTEXT_KEY),
+            "trusted state should clear any user-supplied forward headers"
+        );
     }
 
     #[test]

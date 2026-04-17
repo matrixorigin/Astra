@@ -1486,11 +1486,7 @@ fn resolve_remote_forward_headers(
 
     let mut requested = Vec::new();
     let mut seen = HashSet::new();
-    for raw in skill
-        .forward_headers
-        .iter()
-        .chain(skill.required_headers.iter())
-    {
+    for raw in &skill.forward_headers {
         let normalized = normalize_header_name(raw).map_err(|err| {
             format!(
                 "skill '{}' has invalid forward_headers entry '{}': {err}",
@@ -1505,6 +1501,11 @@ fn resolve_remote_forward_headers(
         }
         if seen.insert(normalized.clone()) {
             requested.push(normalized);
+        }
+    }
+    for normalized in &required {
+        if seen.insert(normalized.clone()) {
+            requested.push(normalized.clone());
         }
     }
 
@@ -2629,6 +2630,37 @@ mod tests {
         assert!(result.output.contains("missing required forwarded headers"));
         assert!(result.output.contains("x-workspace-id"));
         assert!(result.activation.is_none());
+    }
+
+    #[test]
+    fn resolve_remote_forward_headers_reports_invalid_required_header_entry() {
+        let skill = ResolvedSkill {
+            name: "remote-invalid-required-header".into(),
+            instructions: "Remote skill placeholder.".into(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: vec![],
+            execution_context: ExecutionContext::Inline,
+            hooks: crate::skills::hooks::SkillHooks::default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: Vec::new(),
+            composition: None,
+            input_schema: None,
+            output_schema: None,
+            remote_url: Some("https://example.com/remote-skill".into()),
+            forward_headers: vec![],
+            required_headers: vec!["bad header".into()],
+            aliases: vec![],
+            effort: None,
+            agent_type: None,
+            trust_tier: crate::skills::manifest::TrustTier::Community,
+        };
+
+        let err = resolve_remote_forward_headers(&skill, &SkillContext::default())
+            .expect_err("invalid required_headers entry should fail");
+        assert!(err.contains("invalid required_headers entry"));
+        assert!(err.contains("bad header"));
     }
 
     #[tokio::test]
