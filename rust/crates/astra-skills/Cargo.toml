@@ -25,7 +25,8 @@ walkdir = "2.5"
 dirs = "5"
 
 # YAML for manifest parsing
-serde_yml.workspace = true
+serde_yaml_ng.workspace = true
+
 
 # TOML for manifest parsing
 toml = "0.8"

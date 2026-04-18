@@ -212,7 +212,7 @@ pub fn parse_skill_md(content: &str) -> Result<SkillInstruction, String> {
     let markdown_body = rest[end_marker + 4..].trim();
 
     // Parse YAML frontmatter
-    let mut instruction: SkillInstruction = serde_yml::from_str(yaml_content)
+    let mut instruction: SkillInstruction = serde_yaml_ng::from_str(yaml_content)
         .map_err(|e| format!("Failed to parse YAML frontmatter: {e}"))?;
 
     // Set the markdown body

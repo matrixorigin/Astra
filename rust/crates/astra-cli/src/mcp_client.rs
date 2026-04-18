@@ -2134,11 +2134,11 @@ mod tests {
             retry: RetryConfig::default(),
         };
 
-        let yaml = serde_yml::to_string(&config).unwrap();
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
         assert!(yaml.contains("name: test"));
         assert!(yaml.contains("type: stdio"));
 
-        let parsed: McpServerConfig = serde_yml::from_str(&yaml).unwrap();
+        let parsed: McpServerConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(parsed.name, "test");
     }
 
@@ -2177,7 +2177,7 @@ transport:
   type: stdio
   command: ["echo"]
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(config.enabled);
         assert!(config.description.is_empty());
     }
@@ -2213,7 +2213,7 @@ transport:
     DEBUG: "true"
     LOG_LEVEL: "info"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert_eq!(config.name, "filesystem");
         assert_eq!(config.description, "Local filesystem access");
@@ -2241,7 +2241,7 @@ transport:
   type: stdio
   command: ["python", "-m", "mcp_server"]
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert_eq!(config.name, "simple");
         assert!(config.enabled); // default
@@ -2286,7 +2286,7 @@ mcp_servers:
             mcp_servers: Vec<McpServerConfig>,
         }
 
-        let configs: ConfigList = serde_yml::from_str(yaml).unwrap();
+        let configs: ConfigList = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert_eq!(configs.mcp_servers.len(), 3);
 
@@ -2415,8 +2415,8 @@ mcp_servers:
             },
         };
 
-        let yaml = serde_yml::to_string(&original).unwrap();
-        let parsed: McpServerConfig = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&original).unwrap();
+        let parsed: McpServerConfig = serde_yaml_ng::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.name, original.name);
         assert_eq!(parsed.description, original.description);
@@ -2476,7 +2476,7 @@ retry:
   initial_delay_ms: 500
   max_delay_ms: 10000
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.initial_delay_ms, 500);
         assert_eq!(config.retry.max_delay_ms, 10_000);
@@ -2490,7 +2490,7 @@ transport:
   type: stdio
   command: ["echo"]
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.initial_delay_ms, 1000);
         assert_eq!(config.retry.max_delay_ms, 30_000);
@@ -2715,7 +2715,7 @@ transport:
   headers:
     X-Api-Key: "abc123"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.name, "remote-server");
         match &config.transport {
             Transport::Sse {
@@ -2739,7 +2739,7 @@ transport:
   type: http
   url: "http://localhost:8080/mcp"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Sse {
                 url,
@@ -2762,7 +2762,7 @@ transport:
   type: sse
   url: "http://localhost:3000"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Sse {
                 url,
@@ -2797,7 +2797,7 @@ mcp_servers:
             mcp_servers: Vec<McpServerConfig>,
         }
 
-        let configs: ConfigList = serde_yml::from_str(yaml).unwrap();
+        let configs: ConfigList = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(configs.mcp_servers.len(), 2);
 
         assert!(matches!(
@@ -2819,7 +2819,7 @@ transport:
   url: "wss://api.example.com/mcp"
   auth_token: "ws-token"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.name, "ws-server");
         match &config.transport {
             Transport::Ws {
@@ -2840,7 +2840,7 @@ transport:
   type: websocket
   url: "ws://localhost:9090/mcp"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Ws {
                 url, auth_token, ..
@@ -2860,7 +2860,7 @@ transport:
   type: ws
   url: "ws://localhost:3000"
 "#;
-        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Ws {
                 url, auth_token, ..
@@ -2895,7 +2895,7 @@ mcp_servers:
             mcp_servers: Vec<McpServerConfig>,
         }
 
-        let configs: ConfigList = serde_yml::from_str(yaml).unwrap();
+        let configs: ConfigList = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(configs.mcp_servers.len(), 3);
         assert!(matches!(
             configs.mcp_servers[0].transport,

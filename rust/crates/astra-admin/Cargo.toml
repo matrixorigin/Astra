@@ -17,7 +17,7 @@ rpassword = "7"
 rustyline = { version = "14", features = ["with-file-history"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
+serde_yaml_ng.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

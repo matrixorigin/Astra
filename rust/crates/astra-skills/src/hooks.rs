@@ -319,7 +319,7 @@ fn parse_all_hooks_yaml(
     path: &std::path::Path,
 ) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
     // Try direct array (legacy: tool hooks only)
-    if let Ok(hooks) = serde_yml::from_str::<Vec<ToolEventHook>>(content) {
+    if let Ok(hooks) = serde_yaml_ng::from_str::<Vec<ToolEventHook>>(content) {
         return (hooks, Vec::new());
     }
 
@@ -332,7 +332,7 @@ fn parse_all_hooks_yaml(
         session_hooks: Vec<SessionEventHook>,
         default_timeout_secs: Option<u32>,
     }
-    if let Ok(w) = serde_yml::from_str::<Wrapper>(content) {
+    if let Ok(w) = serde_yaml_ng::from_str::<Wrapper>(content) {
         return (
             apply_default_timeout(w.hooks, w.default_timeout_secs),
             apply_default_timeout_session(w.session_hooks, w.default_timeout_secs),
@@ -1372,8 +1372,8 @@ mod tests {
             on_error: vec![],
         };
 
-        let yaml = serde_yml::to_string(&hooks).unwrap();
-        let parsed: SkillHooks = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&hooks).unwrap();
+        let parsed: SkillHooks = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(hooks, parsed);
     }
 
@@ -1714,8 +1714,8 @@ mod tests {
         ];
 
         // Roundtrip through YAML (skill frontmatter format)
-        let yaml = serde_yml::to_string(&hooks).unwrap();
-        let parsed: Vec<ToolEventHook> = serde_yml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml_ng::to_string(&hooks).unwrap();
+        let parsed: Vec<ToolEventHook> = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(hooks, parsed);
 
         // Roundtrip through JSON (project config format)

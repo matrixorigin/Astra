@@ -69,11 +69,11 @@ pub struct ToolManifest {
     #[serde(default)]
     pub tables: Vec<String>,
     #[serde(default)]
-    pub settings: Vec<serde_yml::Value>,
+    pub settings: Vec<serde_yaml_ng::Value>,
     #[serde(default)]
-    pub secrets: Vec<serde_yml::Value>,
+    pub secrets: Vec<serde_yaml_ng::Value>,
     #[serde(default)]
-    pub resources: Option<serde_yml::Value>,
+    pub resources: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub requires: Vec<String>,
     #[serde(default)]
@@ -214,7 +214,7 @@ pub fn load_manifest(path: &Path) -> Result<ToolManifest, String> {
 
 /// Parse a manifest from a YAML string.
 pub fn parse_manifest(yaml: &str) -> Result<ToolManifest, String> {
-    serde_yml::from_str(yaml).map_err(|e| format!("Failed to parse manifest: {e}"))
+    serde_yaml_ng::from_str(yaml).map_err(|e| format!("Failed to parse manifest: {e}"))
 }
 
 // ─── Loaded Skill (Manifest + Instructions) ─────────────────────────────────

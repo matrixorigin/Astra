@@ -257,12 +257,13 @@ async fn main() -> Result<(), String> {
         }
         Command::Model(ModelCmd::Load(args)) => {
             let content = fs::read_to_string(&args.path).map_err(|e| e.to_string())?;
-            let doc: serde_yml::Value = serde_yml::from_str(&content).map_err(|e| e.to_string())?;
+            let doc: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(&content).map_err(|e| e.to_string())?;
             let models = if let Some(seq) = doc.as_sequence() {
                 seq
             } else {
                 doc.get("models")
-                    .and_then(serde_yml::Value::as_sequence)
+                    .and_then(serde_yaml_ng::Value::as_sequence)
                     .ok_or_else(|| "missing models list in yaml".to_string())?
             };
 
@@ -270,19 +271,19 @@ async fn main() -> Result<(), String> {
             for entry in models {
                 let model_name = entry
                     .get("name")
-                    .and_then(serde_yml::Value::as_str)
+                    .and_then(serde_yaml_ng::Value::as_str)
                     .ok_or_else(|| "model.name missing".to_string())?;
                 let provider = entry
                     .get("provider")
-                    .and_then(serde_yml::Value::as_str)
+                    .and_then(serde_yaml_ng::Value::as_str)
                     .ok_or_else(|| "model.provider missing".to_string())?;
                 let api_key = entry
                     .get("api_key")
-                    .and_then(serde_yml::Value::as_str)
+                    .and_then(serde_yaml_ng::Value::as_str)
                     .unwrap_or("");
                 let base_url = entry
                     .get("base_url")
-                    .and_then(serde_yml::Value::as_str)
+                    .and_then(serde_yaml_ng::Value::as_str)
                     .map(ToString::to_string);
                 let payload = serde_json::json!({
                     "name": model_name,

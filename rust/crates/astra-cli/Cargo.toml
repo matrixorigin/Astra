@@ -27,7 +27,7 @@ rpassword = "7.4"
 rustyline = { version = "14", features = ["with-file-history"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
+serde_yaml_ng.workspace = true
 sha2.workspace = true
 base64.workspace = true
 sqlx.workspace = true
