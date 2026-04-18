@@ -391,6 +391,7 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "multi_edit",
     "delete_file",
     "git_commit",
+    "github_create_issue",
 ];
 
 // ─── Output management utilities ────────────────────────────────────────────
@@ -812,6 +813,7 @@ mod tests {
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"multi_edit"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"github_create_issue"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"grep"));
     }

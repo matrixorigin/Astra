@@ -10,6 +10,7 @@ pub const CLOUD_APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "create_file",
     "edit_file",
     "exec",
+    "github_create_issue",
     "multi_edit",
     "rollback_database_snapshots",
     "rollback_file_edits",
@@ -363,6 +364,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn github_create_issue_is_write_gated() {
+        assert_eq!(
+            cloud_gated_tool_kind("github_create_issue"),
+            Some(CloudGatedToolKind::Write)
+        );
     }
 
     // ── bash_command_is_read_only tests ──
