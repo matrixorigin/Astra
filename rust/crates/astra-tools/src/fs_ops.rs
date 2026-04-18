@@ -133,17 +133,19 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         }
     }
 
+    // Hard ceiling: refuse to load extremely large files into memory for full/preview reads.
+    // Range reads (start_line/end_line) and outline are still allowed — they read the file
+    // but produce bounded output, and 10MB is still manageable for a single read_to_string.
+    if !has_range && !outline && metadata.len() as usize > READ_FILE_HARD_LIMIT {
+        return ToolResult::error(format!(
+            "Error: file is too large ({} bytes). Use start_line/end_line to read a specific range, or outline=true.",
+            metadata.len()
+        ));
+    }
+
     // For large files without explicit range, provide a helpful preview instead of error.
     // This auto-pagination helps the agent understand file structure without manual range specification.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
-        // Hard ceiling: refuse to load extremely large files into memory.
-        if metadata.len() as usize > READ_FILE_HARD_LIMIT {
-            return ToolResult::error(format!(
-                "Error: file is too large ({} bytes). Use start_line/end_line to read a specific range, or outline=true.",
-                metadata.len()
-            ));
-        }
-
         // Read the file anyway for preview
         let content = match read_to_string_lossy(&path) {
             Ok(content) => content,
@@ -207,14 +209,13 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
             preview.push_str(&outline_str);
         }
 
-        preview.push_str(
-            "\n**Tip**: Use `start_line`/`end_line` to read specific sections, or `outline=true` for definitions only."
-        );
-
+        // Truncate before appending tip so the tip is always intact when within limit.
         let limit = per_tool_output_limit("read_file");
-        if preview.len() > limit {
-            preview = truncate_output(preview, limit);
+        let tip = "\n**Tip**: Use `start_line`/`end_line` to read specific sections, or `outline=true` for definitions only.";
+        if preview.len() + tip.len() > limit {
+            preview = truncate_output(preview, limit.saturating_sub(tip.len()));
         }
+        preview.push_str(tip);
 
         return ToolResult::text(preview);
     }
@@ -810,7 +811,11 @@ mod tests {
 
         let result = read_file(tmp.path(), &serde_json::json!({"path": "huge.txt"}));
         assert!(result.is_error, "expected error, got: {}", result.output);
-        assert!(result.output.contains("too large"), "got: {}", result.output);
+        assert!(
+            result.output.contains("too large"),
+            "got: {}",
+            result.output
+        );
     }
 
     #[test]

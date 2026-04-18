@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_fallback_surfaces_read_file_large_returns_preview() {
+    async fn server_fallback_surfaces_read_file_large_file_preview() {
         let mut harness = PipelineHarness::new();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
@@ -608,17 +608,16 @@ mod tests {
         };
 
         let executed = pipeline.execute_execution(permitted).await;
-        // After auto-pagination, large files return a preview (not an error)
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
         assert!(
-            !executed.is_err,
-            "expected success with preview, got error: {}",
+            executed.execution.result_str.contains("Large file preview"),
+            "got: {}",
             executed.execution.result_str
         );
         assert!(
-            executed.execution.result_str.contains("Large file preview")
-                || executed.execution.result_str.contains("First lines"),
-            "expected preview output, got: {}",
-            &executed.execution.result_str[..executed.execution.result_str.len().min(200)]
+            executed.execution.result_str.contains("start_line"),
+            "got: {}",
+            executed.execution.result_str
         );
     }
 
