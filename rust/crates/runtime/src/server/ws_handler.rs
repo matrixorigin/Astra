@@ -803,6 +803,8 @@ fn build_bridge_chat_payload(
     max_candidates: u32,
     explain: bool,
 ) -> Value {
+    let allow_skills = normalize_bridge_allowlist(allow_skills.as_deref());
+    let allow_tools = normalize_bridge_allowlist(allow_tools.as_deref());
     serde_json::json!({
         "session_id": session_id,
         "agent_id": agent_id,
@@ -817,6 +819,16 @@ fn build_bridge_chat_payload(
             "role": "user",
             "content": content
         }]
+    })
+}
+
+fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
+    entries.map(|entries| {
+        let mut normalized = std::collections::BTreeSet::new();
+        for entry in entries {
+            normalized.insert(entry.trim().to_ascii_lowercase());
+        }
+        normalized.into_iter().collect()
     })
 }
 
@@ -2519,6 +2531,31 @@ mod tests {
         assert_eq!(payload["explain"], true);
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn bridge_payload_normalizes_allowlists() {
+        let payload = build_bridge_chat_payload(
+            Some("session-1".into()),
+            "hello",
+            Some("agent-1".into()),
+            Some("gpt-5.4".into()),
+            None,
+            Some(vec![" plan ".into(), "PLAN".into(), "analyze".into()]),
+            Some(vec![" bash ".into(), "BASH".into(), "read_file".into()]),
+            None,
+            3,
+            true,
+        );
+
+        assert_eq!(
+            payload["allow_skills"],
+            serde_json::json!(["analyze", "plan"])
+        );
+        assert_eq!(
+            payload["allow_tools"],
+            serde_json::json!(["bash", "read_file"])
+        );
     }
 
     #[test]

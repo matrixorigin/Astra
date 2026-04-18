@@ -79,13 +79,15 @@ pub(super) fn is_session_service_unconfigured_error(
 fn chat_stream_bridge_fallback_payload(
     chat_data: &astra_services::runs::ChatRequestData,
 ) -> serde_json::Value {
+    let allow_skills = normalize_bridge_allowlist(chat_data.allow_skills.as_deref());
+    let allow_tools = normalize_bridge_allowlist(chat_data.allow_tools.as_deref());
     serde_json::json!({
         "session_id": chat_data.session_id.as_deref(),
         "agent_id": chat_data.agent_id.as_deref(),
         "model": chat_data.model.as_deref(),
         "skill_search": chat_data.skill_search.as_ref(),
-        "allow_skills": chat_data.allow_skills.as_ref(),
-        "allow_tools": chat_data.allow_tools.as_ref(),
+        "allow_skills": allow_skills,
+        "allow_tools": allow_tools,
         "context": chat_data.context.as_ref(),
         "max_candidates": chat_data.max_candidates,
         "explain": chat_data.explain,
@@ -95,6 +97,16 @@ fn chat_stream_bridge_fallback_payload(
                 "content": chat_data.message.as_str(),
             }
         ],
+    })
+}
+
+fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
+    entries.map(|entries| {
+        let mut normalized = std::collections::BTreeSet::new();
+        for entry in entries {
+            normalized.insert(entry.trim().to_ascii_lowercase());
+        }
+        normalized.into_iter().collect()
     })
 }
 
@@ -463,6 +475,34 @@ mod tests {
         let messages = obj["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn chat_stream_fallback_payload_normalizes_allowlists() {
+        let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
+            message: "hello".to_string(),
+            session_id: Some("s1".to_string()),
+            agent_id: Some("a1".to_string()),
+            model: Some("gpt-4".to_string()),
+            skill_search: None,
+            allow_skills: Some(vec![
+                " plan ".to_string(),
+                "PLAN".to_string(),
+                "analyze".to_string(),
+            ]),
+            allow_tools: Some(vec![
+                " bash ".to_string(),
+                "BASH".to_string(),
+                "read_file".to_string(),
+            ]),
+            context: None,
+            forward_headers: std::collections::HashMap::new(),
+            max_candidates: 3,
+            explain: true,
+        });
+        let obj = payload.as_object().unwrap();
+        assert_eq!(obj["allow_skills"], serde_json::json!(["analyze", "plan"]));
+        assert_eq!(obj["allow_tools"], serde_json::json!(["bash", "read_file"]));
     }
 
     #[test]
