@@ -32,7 +32,12 @@ fn schema_lock_component(raw: &str) -> String {
 fn acquire_core_schema_file_lock(
     settings: &MatrixOneSettings,
 ) -> Result<CoreSchemaFileLock, sqlx::Error> {
-    let lock_dir = std::env::temp_dir().join("astra-engine-locks");
+    let user = schema_lock_component(
+        &std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "unknown".into()),
+    );
+    let lock_dir = std::env::temp_dir().join(format!("astra-engine-locks-{user}"));
     std::fs::create_dir_all(&lock_dir).map_err(sqlx::Error::Io)?;
     let lock_path = lock_dir.join(format!(
         "core-schema-{}-{}-{}.lock",

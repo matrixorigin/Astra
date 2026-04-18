@@ -1075,6 +1075,7 @@ mod tests {
     use futures_util::StreamExt;
     use futures_util::stream;
     use serde_json::json;
+    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -1458,7 +1459,13 @@ mod tests {
         assert!(st.next().await.is_none());
     }
 
+    // ── serial(stream_idle_env): all tests below mutate MO_STREAM_IDLE_TIMEOUT_MS
+    // which is read at startup and cached globally. Parallel execution causes
+    // race conditions where one test's timeout value bleeds into another test's
+    // LlmClient construction. Any new test that sets this env var MUST be tagged.
+
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_surfaces_transport_error() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let err = sample_reqwest_stream_error().await;
@@ -1481,6 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_aggregates_delta_text_reasoning_usage() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
@@ -1511,6 +1519,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
@@ -1533,6 +1542,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_extracts_finish_reason_length() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let d1 = json!({"choices":[{"delta":{"content":"truncated"}}]});
@@ -1554,6 +1564,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_merges_tool_call_argument_chunks() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let c1 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"foo"}}]}}]});
@@ -1581,6 +1592,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn stream_idle_timeout_triggers() {
         // Keep this test fast: override idle timeout to 1ms.
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "1") };
@@ -1610,6 +1622,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn stream_idle_timeout_after_partial_output_marks_progress() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "1") };
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS", "1") };
@@ -1640,6 +1653,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_respects_cancel_flag() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let flag = Arc::new(AtomicBool::new(false));
@@ -1668,6 +1682,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_respects_cancel_token() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let token = CancellationToken::new();
@@ -1696,6 +1711,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_flag_and_token_cancels_on_token() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let flag = Arc::new(AtomicBool::new(false));
@@ -1880,6 +1896,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let mut v: Vec<u8> = Vec::new();
@@ -1903,6 +1920,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_429_retry_after_zero() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         reset_rate_limit_cooldown_for_tests();
@@ -1964,6 +1982,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_529_retry_after_zero() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         reset_rate_limit_cooldown_for_tests();
@@ -1992,6 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_after_503_retry_after_zero() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         reset_rate_limit_cooldown_for_tests();
@@ -2080,6 +2100,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn output_escalation_e2e_length_then_stop() {
         // Verifies: first call returns finish_reason=length, second returns stop.
         // This is the data path used by server_loop_host's escalation loop.
@@ -2130,6 +2151,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn finish_reason_stop_no_retry() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         reset_rate_limit_cooldown_for_tests();
@@ -2169,6 +2191,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn finish_reason_tool_calls_extracted() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
         let d = json!({"choices":[{
@@ -2193,6 +2216,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_falls_back_immediately_after_partial_stream_idle() {
         let _guard = set_test_stream_timeouts(10, Some(10));
         let state = StreamIdleHit {
@@ -2230,6 +2254,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
         let _guard = set_test_stream_timeouts(10, None);
         let hits = Arc::new(AtomicU32::new(0));
@@ -2268,6 +2293,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_returns_context_window_error_kind() {
         reset_rate_limit_cooldown_for_tests();
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
@@ -2301,6 +2327,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_returns_auth_error_kind() {
         reset_rate_limit_cooldown_for_tests();
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
