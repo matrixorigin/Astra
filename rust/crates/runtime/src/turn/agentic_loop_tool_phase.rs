@@ -169,7 +169,10 @@ fn refresh_runtime_promotion_signals_from_turn(
         .then(|| {
             RuntimeTurnEvaluationSignal::from_turn_evaluation(
                 &evaluation,
-                tool_call_records.len(),
+                tool_call_records
+                    .iter()
+                    .filter(|r| !r.is_synthetic_placeholder())
+                    .count(),
                 stall_count,
                 verdict_warning,
             )
@@ -1344,6 +1347,8 @@ mod tests {
             args_preview: Some("{\"command\":\"echo hi\"}".into()),
             result_preview: result_preview.map(str::to_string),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 
@@ -1399,6 +1404,8 @@ mod tests {
             args_preview: None,
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 

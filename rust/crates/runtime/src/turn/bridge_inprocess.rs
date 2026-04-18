@@ -229,6 +229,8 @@ fn build_bridge_tool_call_records(
                 .map(|arguments| preview_chars(arguments, 80)),
             result_preview: output.as_deref().map(|output| preview_chars(output, 500)),
             file_path,
+            surgically_removed: None,
+            original_tool_name: None,
         });
     }
 
@@ -248,6 +250,8 @@ fn build_bridge_tool_call_records(
                 .map(|arguments| preview_chars(arguments, 80)),
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         });
     }
 

@@ -1338,6 +1338,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -1349,6 +1351,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -1360,6 +1364,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ];
 

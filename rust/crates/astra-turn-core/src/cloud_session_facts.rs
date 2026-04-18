@@ -267,6 +267,8 @@ mod tests {
             args_preview: args.map(|s| s.to_string()),
             result_preview: None,
             file_path: file_path.map(|s| s.to_string()),
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 

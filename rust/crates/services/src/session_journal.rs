@@ -488,6 +488,16 @@ pub struct ToolCallRecord {
     /// More reliable than parsing `args_preview` (which is truncated to ~80 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+    /// Explicit flag for surgically removed tool calls. When `true`, this record
+    /// is an audit-only placeholder — the parallel tool call was removed from
+    /// context because a skill covered the work. Prefer this over checking
+    /// `name == SURGICAL_REMOVAL_TOOL_NAME`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surgically_removed: Option<bool>,
+    /// Original tool name before surgical removal replaced it with the sentinel.
+    /// Only set when `surgically_removed == Some(true)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tool_name: Option<String>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
@@ -505,6 +515,9 @@ impl ToolCallRecord {
     /// failure, so these records must be filtered out before computing
     /// analytics (tool_error_rate, repeat_tool_call, failed_tool_calls, …).
     pub fn is_synthetic_placeholder(&self) -> bool {
+        if self.surgically_removed == Some(true) {
+            return true;
+        }
         if self.name == SURGICAL_REMOVAL_TOOL_NAME {
             return true;
         }
@@ -3263,6 +3276,8 @@ mod tests {
             args_preview: None,
             result_preview: preview.map(ToString::to_string),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 
@@ -3850,6 +3865,8 @@ mod tests {
             args_preview: Some("owner/repo".into()),
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -3873,6 +3890,8 @@ mod tests {
             args_preview: None,
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -3897,6 +3916,8 @@ mod tests {
                     .into(),
             ),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let deferred = ToolCallRecord {
             name: "bash".into(),
@@ -3911,6 +3932,8 @@ mod tests {
                     .into(),
             ),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let dedup = ToolCallRecord {
             name: "skill".into(),
@@ -3925,6 +3948,8 @@ mod tests {
                     .into(),
             ),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let actual_failure = ToolCallRecord {
             name: "skill".into(),
@@ -3936,6 +3961,8 @@ mod tests {
             args_preview: None,
             result_preview: Some("Unknown skill 'debug'.".into()),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
 
         assert!(skipped.is_synthetic_placeholder());
@@ -3973,6 +4000,8 @@ mod tests {
             args_preview: Some("owner/repo".into()),
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -4022,6 +4051,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -4043,6 +4074,8 @@ mod tests {
             args_preview: None,
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -4061,6 +4094,8 @@ mod tests {
             args_preview: None,
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -5015,5 +5050,77 @@ mod tests {
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert_eq!(result.bytes_freed, 0);
+    }
+
+    #[test]
+    fn tool_call_record_serde_roundtrip_with_surgical_fields() {
+        // New-style record with both surgical fields populated
+        let rec = ToolCallRecord {
+            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+            ok: true,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(0),
+            args_preview: None,
+            result_preview: Some("(removed)".into()),
+            file_path: None,
+            surgically_removed: Some(true),
+            original_tool_name: Some("read_file".to_string()),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"surgically_removed\":true"));
+        assert!(json.contains("\"original_tool_name\":\"read_file\""));
+        let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.surgically_removed, Some(true));
+        assert_eq!(deser.original_tool_name.as_deref(), Some("read_file"));
+        assert!(deser.is_synthetic_placeholder());
+    }
+
+    #[test]
+    fn tool_call_record_serde_omits_none_surgical_fields() {
+        // Normal record: surgical fields should be omitted from JSON
+        let rec = base_tool_record("bash", true, Some("ok"));
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("surgically_removed"),
+            "None surgical fields should be skipped in serialization"
+        );
+        assert!(
+            !json.contains("original_tool_name"),
+            "None original_tool_name should be skipped in serialization"
+        );
+    }
+
+    #[test]
+    fn tool_call_record_backward_compat_deserialize() {
+        // Legacy JSON without the new fields — should deserialize with defaults
+        let legacy_json = r#"{"name":"read_file","ok":true,"ms":10}"#;
+        let rec: ToolCallRecord = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(rec.surgically_removed, None);
+        assert_eq!(rec.original_tool_name, None);
+        assert!(!rec.is_synthetic_placeholder());
+    }
+
+    #[test]
+    fn is_synthetic_placeholder_flag_takes_priority() {
+        // Even if name is normal, flag=true marks as synthetic
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(100),
+            args_preview: None,
+            result_preview: Some("content".into()),
+            file_path: None,
+            surgically_removed: Some(true),
+            original_tool_name: Some("read_file".to_string()),
+        };
+        assert!(
+            rec.is_synthetic_placeholder(),
+            "surgically_removed=true must classify as synthetic regardless of name"
+        );
     }
 }

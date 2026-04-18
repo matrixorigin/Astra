@@ -17,6 +17,8 @@ pub fn journal_record_duplicate_within_turn(
         args_preview,
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     }
 }
 
@@ -36,6 +38,8 @@ pub fn journal_record_cross_turn_cache_hit(
         args_preview,
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     }
 }
 
@@ -51,6 +55,8 @@ pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCa
         args_preview: None,
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     }
 }
 
@@ -71,6 +77,8 @@ pub fn journal_record_blocked_tool(
         args_preview,
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     }
 }
 
@@ -111,6 +119,8 @@ pub fn journal_record_executed_tool_call(
         args_preview,
         result_preview,
         file_path,
+        surgically_removed: None,
+        original_tool_name: None,
     }
 }
 

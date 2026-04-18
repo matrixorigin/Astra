@@ -18,6 +18,8 @@ fn tool_call_record_covers_early_exit_paths() {
         args_preview: Some("src/main.rs".to_string()),
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     };
     assert!(dup.ok);
     assert_eq!(dup.ms, 0);
@@ -33,6 +35,8 @@ fn tool_call_record_covers_early_exit_paths() {
         args_preview: Some("/TODO/ in src/".to_string()),
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     };
     assert!(cached.ok);
 
@@ -47,6 +51,8 @@ fn tool_call_record_covers_early_exit_paths() {
         args_preview: None,
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     };
     assert!(!unknown.ok);
     assert!(unknown.error.as_ref().unwrap().starts_with("unknown_tool:"));
@@ -62,6 +68,8 @@ fn tool_call_record_covers_early_exit_paths() {
         args_preview: Some("rm -rf /".to_string()),
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     };
     assert!(!denied.ok);
 
@@ -89,6 +97,8 @@ fn tool_call_record_json_roundtrip() {
         args_preview: Some("https://example.com".to_string()),
         result_preview: None,
         file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
     };
     let json = serde_json::to_string(&original).unwrap();
     let restored: ToolCallRecord = serde_json::from_str(&json).unwrap();

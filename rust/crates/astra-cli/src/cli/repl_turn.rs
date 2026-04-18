@@ -968,10 +968,12 @@ fn commit_turn_journal_workspace_and_sidecars(
         enqueue_ingestion(state, &turn_event);
 
         // Emit deferred context_assembly_recorded — only on successful turn commit.
-        if let Some((turn_num, trace_json)) = &result.pending_context_assembly_trace {
+        if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
+            // Use the REPL's user-visible turn number, not the internal agentic
+            // loop counter that was stored in the trace.
             let assembly_event = session_journal::JournalEvent::context_assembly_recorded(
                 state.session_id.as_deref(),
-                *turn_num,
+                state.turn,
                 trace_json.clone(),
             );
             if let Err(e) = journal.append(&assembly_event) {
@@ -3386,6 +3388,8 @@ mod tests {
             args_preview: None,
             result_preview: result_preview.map(str::to_string),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 
@@ -3503,6 +3507,8 @@ mod tests {
             args_preview: None,
             result_preview: Some("clean".into()),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }];
 
         let learning =

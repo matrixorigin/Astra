@@ -706,6 +706,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: Some("src/main.rs".to_string()),
+                surgically_removed: None,
+                original_tool_name: None,
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "str_replace".to_string(),
@@ -717,6 +719,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: Some("src/lib.rs".to_string()),
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ];
         state.total_prompt = 5000;
@@ -761,6 +765,8 @@ mod tests {
             args_preview: None,
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }];
         state.total_prompt = 15000;
 

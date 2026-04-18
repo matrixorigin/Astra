@@ -272,7 +272,12 @@ pub fn build_turn_evaluation_journal_event(
         budget_pressure,
         stall_count,
         verdict_warning,
-        tool_call_records.len(),
+        // Exclude synthetic placeholders (surgical removals, skipped skills) from
+        // the user-visible tool_call_count — they are audit-only records.
+        tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .count(),
         eval_signals_to_json(&eval.signals),
     )
 }
@@ -325,6 +330,8 @@ mod tests {
             args_preview: None,
             result_preview: Some("ok".to_string()),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 
@@ -521,6 +528,8 @@ mod tests {
             args_preview: None,
             result_preview: preview.map(ToString::to_string),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         };
 
         // 1 real successful tool + 3 synthetic placeholders (skipped,
@@ -593,6 +602,8 @@ mod tests {
                 args_preview: None,
                 result_preview: Some("(removed from context — skill covered this work)".into()),
                 file_path: None,
+                surgically_removed: Some(true),
+                original_tool_name: Some("read_file".to_string()),
             })
             .chain(std::iter::once(ToolCallRecord {
                 name: "git_show".to_string(),
@@ -604,6 +615,8 @@ mod tests {
                 args_preview: None,
                 result_preview: Some("diff".into()),
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             }))
             .collect();
 
@@ -616,5 +629,120 @@ mod tests {
             "no RepeatToolCall signal should be emitted for synthetic placeholders, got {:?}",
             eval.signals
         );
+    }
+
+    #[test]
+    fn tool_call_count_excludes_synthetic_placeholders() {
+        use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
+
+        // 3 real tool calls + 2 surgical removals = 5 records total,
+        // but tool_call_count should be 3 (only real).
+        let real = || ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(200),
+            args_preview: None,
+            result_preview: Some("content".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+        };
+        let surgical = || ToolCallRecord {
+            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+            ok: true,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(0),
+            args_preview: None,
+            result_preview: Some("(removed)".into()),
+            file_path: None,
+            surgically_removed: Some(true),
+            original_tool_name: Some("glob".to_string()),
+        };
+        let records = vec![real(), surgical(), real(), surgical(), real()];
+
+        let event = build_turn_evaluation_journal_event(
+            Some("sess-1"),
+            Some(1),
+            "test-model",
+            "do something",
+            &[],
+            &records,
+            0,
+            false,
+            0.5,
+            &TurnEvaluation {
+                success: true,
+                quality: 0.8,
+                confidence: 0.9,
+                signals: vec![],
+            },
+        );
+
+        // Extract tool_call_count from the metadata JSON.
+        let metadata = event.metadata.as_ref().expect("metadata should be present");
+        let tool_call_count = metadata["tool_call_count"].as_u64().unwrap();
+        assert_eq!(
+            tool_call_count, 3,
+            "tool_call_count must exclude synthetic placeholders, got {}",
+            tool_call_count
+        );
+    }
+
+    #[test]
+    fn is_synthetic_placeholder_via_flag() {
+        use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
+
+        // New-style: surgically_removed flag set
+        let flagged = ToolCallRecord {
+            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+            ok: true,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+            file_path: None,
+            surgically_removed: Some(true),
+            original_tool_name: Some("bash".to_string()),
+        };
+        assert!(flagged.is_synthetic_placeholder());
+
+        // Backward-compat: legacy sentinel name only (no flag)
+        let legacy = ToolCallRecord {
+            name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+            ok: true,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: None,
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+        };
+        assert!(legacy.is_synthetic_placeholder());
+
+        // Normal tool call: neither flag nor sentinel name
+        let normal = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(200),
+            args_preview: None,
+            result_preview: None,
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+        };
+        assert!(!normal.is_synthetic_placeholder());
     }
 }

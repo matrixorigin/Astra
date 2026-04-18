@@ -2686,6 +2686,8 @@ mod tests {
             args_preview: None,
             result_preview: Some("clean".into()),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         });
 
         let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);

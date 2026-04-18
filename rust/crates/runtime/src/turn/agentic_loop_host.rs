@@ -3963,6 +3963,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             args_preview: None,
             result_preview: result_preview.map(str::to_string),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 
@@ -5895,6 +5897,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: Some("npm test".into()),
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -5906,6 +5910,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: Some("npm test".into()),
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ];
 
@@ -6048,6 +6054,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: Some("ls -la".into()),
                 result_preview: Some("error".into()),
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6059,6 +6067,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: Some("cat foo".into()),
                 result_preview: Some("not found".into()),
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6070,6 +6080,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: Some("rm bar".into()),
                 result_preview: Some("permission denied".into()),
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ];
 
@@ -6628,6 +6640,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -6639,6 +6653,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 },
             ]);
             if !bash_ok {
@@ -6694,6 +6710,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 }]),
                 budget_used: None,
                 budget_pressure: None,
@@ -6780,6 +6798,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6791,6 +6811,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -6802,6 +6824,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ];
         state.recent_tactical_actions = vec![

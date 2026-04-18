@@ -2798,6 +2798,8 @@ total_tokens_out: 500
                 args_preview: Some("npm test".into()),
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -2809,6 +2811,8 @@ total_tokens_out: 500
                 args_preview: Some("cargo build".into()),
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -2820,6 +2824,8 @@ total_tokens_out: 500
                 args_preview: Some("/error/ in src/".into()),
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ]);
         writer.append(&event).unwrap();
