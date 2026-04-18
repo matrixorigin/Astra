@@ -1224,6 +1224,7 @@ impl ServerToolExecutor {
             "task_get" => tool_result_from_output(self.task_get(args)),
             "task_update" => tool_result_from_output(self.task_update(args)),
             "task_stop" => tool_result_from_output(self.task_stop(args)),
+            "sleep" => self.default_executor.execute("sleep", args).await,
             // ── MatrixOne operations ────────────────────────────────────
             "mo_query" => self.server_mo_query(args),
             "rollback_database_snapshots" => {
@@ -1260,8 +1261,9 @@ impl ServerToolExecutor {
                 "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
-                     rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
+                     rollback_session_state, task_*, sleep, mo_query, rollback_database_snapshots, grep, glob, \
+                     git_status, git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, \
+                     memory_*, web_search"
             )),
         };
 
@@ -3603,6 +3605,16 @@ esac
             .execute("grep", &json!({"pattern": "ZZZZNOTFOUND"}))
             .await;
         assert!(result.contains("No matches found"));
+    }
+
+    #[tokio::test]
+    async fn sleep_is_available_in_server_mode() {
+        let (exec, _dir) = test_executor();
+        let start = std::time::Instant::now();
+        let result = exec.execute("sleep", &json!({"duration_ms": 20})).await;
+        assert!(result.contains("Slept"), "{result}");
+        assert!(start.elapsed().as_millis() >= 15);
+        assert!(!result.contains("not available in server-side execution mode"));
     }
 
     #[tokio::test]
