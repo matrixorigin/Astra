@@ -640,6 +640,12 @@ if let Err(e) = writeln!(file, "{line}") {
             classify_tool_error("write_file", output),
             ToolErrorSeverity::HardError
         );
+
+        // github_create_issue timeout
+        assert_eq!(
+            classify_tool_error("github_create_issue", output),
+            ToolErrorSeverity::HardError
+        );
     }
 
     #[test]

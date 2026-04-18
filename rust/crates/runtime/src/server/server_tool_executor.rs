@@ -1268,7 +1268,7 @@ impl ServerToolExecutor {
                     .await
             }
             // ── GitHub operations ────────────────────────────────────────
-            // Read-only GitHub tools delegate to DefaultToolExecutor.
+            // GitHub tools delegate to DefaultToolExecutor.
             "github_list_prs" => self.default_executor.execute("github_list_prs", args).await,
             "github_get_pr" => self.default_executor.execute("github_get_pr", args).await,
             "github_ci_status" => {
@@ -1291,6 +1291,11 @@ impl ServerToolExecutor {
                     .execute("github_repo_stats", args)
                     .await
             }
+            "github_create_issue" => {
+                self.default_executor
+                    .execute("github_create_issue", args)
+                    .await
+            }
             // ── Delegation placeholder ─────────────────────────────────
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
@@ -1305,7 +1310,7 @@ impl ServerToolExecutor {
                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
                      git_show, git_blame, symbols, git_commit, git_revert_commit, github_list_prs, github_get_pr, \
-                     github_ci_status, github_list_issues, github_get_issue, github_repo_stats, memory_*, web_fetch, \
+                     github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
                      web_search"
             )),
         };
@@ -3972,24 +3977,50 @@ esac
 
     #[tokio::test]
     async fn github_tools_delegate_to_default_executor() {
+        let _guard = env_guard();
+        let _github_token_guard = EnvVarGuard {
+            key: "GITHUB_TOKEN",
+            previous: std::env::var_os("GITHUB_TOKEN"),
+        };
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+        let empty_path = TempDir::new().unwrap();
+        let _path_guard = set_env_var("PATH", empty_path.path().as_os_str().to_os_string());
+
         let (exec, _dir) = test_executor();
-        let result = exec
-            .execute_with_metadata(
+        for (tool, args) in [
+            (
                 "github_list_prs",
-                &json!({"repo": "matrixorigin/mo-agent-runtime"}),
-            )
-            .await;
-        assert!(result.is_error);
-        assert!(
-            result
-                .output
-                .contains("requires a configured GitHub client")
-        );
-        assert!(
-            !result
-                .output
-                .contains("not available in server-side execution mode")
-        );
+                json!({"repo": "matrixorigin/mo-agent-runtime"}),
+            ),
+            (
+                "github_create_issue",
+                json!({
+                    "repo": "matrixorigin/mo-agent-runtime",
+                    "title": "server parity regression test"
+                }),
+            ),
+        ] {
+            let result = exec.execute_with_metadata(tool, &args).await;
+            assert!(
+                result.is_error,
+                "{tool} should error without a GitHub client"
+            );
+            assert!(
+                result
+                    .output
+                    .contains("requires a configured GitHub client"),
+                "{tool} should delegate to the GitHub executor path, got: {}",
+                result.output
+            );
+            assert!(
+                !result
+                    .output
+                    .contains("not available in server-side execution mode"),
+                "{tool} should be exposed in server mode"
+            );
+        }
     }
 
     // ── Output management ──────────────────────────────────────────────
