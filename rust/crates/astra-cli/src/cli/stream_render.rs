@@ -3845,9 +3845,14 @@ pub(super) async fn consume_turn_sse(
             if host.render.md.is_none() {
                 host.render.lines_written = pre_clear_lines;
             }
-            let (result, _abort) =
-                consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token)
-                    .await;
+            let (result, _abort) = consume_sse_stream_cancellable(
+                &mut byte_stream,
+                &mut host,
+                idle,
+                cancel_token,
+                None,
+            )
+            .await;
             let lw = host.render.lines_written;
             let md = host.render.md.take();
             let pending = std::mem::take(&mut host.xml_tag_buffer);
@@ -3862,9 +3867,14 @@ pub(super) async fn consume_turn_sse(
                 render.lines_written = pre_clear_lines;
             }
             let mut host = NoopSseStreamHost;
-            let (result, _abort) =
-                consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token)
-                    .await;
+            let (result, _abort) = consume_sse_stream_cancellable(
+                &mut byte_stream,
+                &mut host,
+                idle,
+                cancel_token,
+                None,
+            )
+            .await;
             let lw = render.lines_written;
             let md = render.md.take();
             (result, Vec::new(), md, lw, String::new())

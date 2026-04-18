@@ -292,7 +292,7 @@ pub async fn consume_sse_stream<H: SseStreamHost>(
     host: &mut H,
     idle_timeout: std::time::Duration,
 ) -> (SseConsumeResult, Option<SseAbortReason>) {
-    consume_sse_stream_cancellable(chunks, host, idle_timeout, None).await
+    consume_sse_stream_cancellable(chunks, host, idle_timeout, None, None).await
 }
 
 /// Consume an SSE byte stream with optional cancellation support.
@@ -307,6 +307,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     host: &mut H,
     idle_timeout: std::time::Duration,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    idle_timeout_after_progress: Option<std::time::Duration>,
 ) -> (SseConsumeResult, Option<SseAbortReason>) {
     use futures_util::StreamExt;
 
@@ -322,7 +323,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     host.on_before_sse_read_loop();
 
     let idle_pre = idle_timeout;
-    let idle_post = stream_idle_timeout_after_progress();
+    let idle_post = idle_timeout_after_progress.unwrap_or_else(stream_idle_timeout_after_progress);
     // Short tick for UI heartbeat (thinking pane elapsed timer refresh).
     let tick = std::time::Duration::from_secs(1);
     loop {
@@ -1051,8 +1052,10 @@ mod tests {
             .chain(stream::pending::<Result<Vec<u8>, String>>());
 
         let mut host = RecordingSseStreamHost::new();
+        let timeout = std::time::Duration::from_millis(5);
         let (result, abort) =
-            consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_millis(5)).await;
+            consume_sse_stream_cancellable(&mut stream, &mut host, timeout, None, Some(timeout))
+                .await;
 
         assert_eq!(abort, Some(astra_core::ErrorKind::StreamIdle));
         assert!(host.stream_completed);
@@ -1091,6 +1094,7 @@ mod tests {
             &mut host,
             std::time::Duration::from_millis(60_000), // Long timeout - won't fire
             Some(&cancel_token),
+            None,
         )
         .await;
 
@@ -1503,12 +1507,10 @@ mod tests {
             .await
             .unwrap();
 
-        let (result, abort) = consume_sse_stream(
-            &mut stream,
-            &mut host,
-            std::time::Duration::from_millis(100),
-        )
-        .await;
+        let timeout = std::time::Duration::from_millis(100);
+        let (result, abort) =
+            consume_sse_stream_cancellable(&mut stream, &mut host, timeout, None, Some(timeout))
+                .await;
 
         assert_eq!(abort, Some(astra_core::ErrorKind::StreamIdle));
         assert!(
@@ -1558,6 +1560,7 @@ mod tests {
             &mut host,
             std::time::Duration::from_secs(10),
             Some(&cancel),
+            None,
         )
         .await;
 
