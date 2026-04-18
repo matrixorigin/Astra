@@ -878,6 +878,23 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "memory_retrieve",
+                "description": "Retrieve the most relevant memories for a semantic query (hybrid / graph-backed when configured). Use at conversation start or when you need grounded context from Memoria before answering. Prefer memory_search when the user asks for keyword/topic browse; use memory_retrieve for focused semantic recall.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Semantic query describing what to retrieve"},
+                        "top_k": {"type": "integer", "description": "Max memories to return (default 5)"},
+                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results. Omit to use the default."},
+                        "session_id": {"type": "string", "description": "Session ID for scoped retrieval. Omit to use current session when provided by the host."}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "memory_search",
                 "description": "Search memories by keyword or topic. Use when user asks 'what do you know about X'.",
                 "parameters": {

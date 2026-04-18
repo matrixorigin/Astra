@@ -52,6 +52,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_log",
     "git_show",
     "git_blame",
+    "symbols",
     "git_commit",
     "git_revert_commit",
     "web_search",
@@ -946,6 +947,23 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "labels": {"type": "string", "description": "Comma-separated label names"}
                     },
                     "required": ["repo", "title"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "memory_retrieve",
+                "description": "Retrieve the most relevant memories for a semantic query (hybrid / graph-backed when configured). Use at conversation start or when you need grounded context from Memoria before answering. Prefer memory_search when the user asks for keyword/topic browse; use memory_retrieve for focused semantic recall.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Semantic query describing what to retrieve"},
+                        "top_k": {"type": "integer", "description": "Max memories to return (default 5)"},
+                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results. Omit to use the default."},
+                        "session_id": {"type": "string", "description": "Session ID for scoped retrieval. Omit to use current session when provided by the host."}
+                    },
+                    "required": ["query"]
                 }
             }
         }),
@@ -1874,6 +1892,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn schema_names(schemas: &[Value]) -> Vec<&str> {
@@ -1893,6 +1913,7 @@ mod tests {
         let schemas = default_executor_tool_schemas();
         let names = schema_names(&schemas);
         assert!(names.contains(&"git_revert_commit"));
+        assert!(!names.contains(&"symbols"));
         assert!(!names.contains(&"rollback_file_edits"));
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
@@ -1917,11 +1938,49 @@ mod tests {
         assert!(names.contains(&"task_stop"));
         assert!(names.contains(&"mo_query"));
         assert!(names.contains(&"rollback_database_snapshots"));
+        assert!(names.contains(&"memory_retrieve"));
+        assert!(names.contains(&"symbols"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"git_revert_commit"));
         assert!(!names.contains(&"rollback_turn_actions"));
         assert!(!names.contains(&"powershell"));
         assert!(!names.contains(&"memory_feedback"));
         assert!(!names.contains(&"multi_edit"));
+    }
+
+    #[test]
+    fn server_allowlist_each_name_has_function_schema() {
+        let schemas = all_tool_schemas();
+        let names = schema_names(&schemas);
+        let set: HashSet<&str> = names.into_iter().collect();
+        for &name in SERVER_EXECUTOR_TOOL_NAMES {
+            assert!(
+                set.contains(name),
+                "SERVER_EXECUTOR_TOOL_NAMES contains `{name}` but all_tool_schemas() has no matching function.name"
+            );
+        }
+    }
+
+    /// Catches the opposite drift class: a `memory_*` schema exists but the tool was never added to the server allowlist.
+    #[test]
+    fn memory_tool_schemas_are_in_server_allowlist() {
+        let allow: HashSet<&str> = SERVER_EXECUTOR_TOOL_NAMES.iter().copied().collect();
+        let schemas = all_tool_schemas();
+        for schema in &schemas {
+            let Some(name) = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if !name.starts_with("memory_") {
+                continue;
+            }
+            assert!(
+                allow.contains(name),
+                "schema defines `{name}` but it is missing from SERVER_EXECUTOR_TOOL_NAMES"
+            );
+        }
     }
 }

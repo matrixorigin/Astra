@@ -1242,6 +1242,7 @@ impl ServerToolExecutor {
             "git_log" => self.default_executor.execute("git_log", args).await,
             "git_show" => self.default_executor.execute("git_show", args).await,
             "git_blame" => self.default_executor.execute("git_blame", args).await,
+            "symbols" => self.default_executor.execute("symbols", args).await,
             "git_commit" => self.default_executor.execute("git_commit", args).await,
             "git_revert_commit" => {
                 self.default_executor
@@ -1260,7 +1261,7 @@ impl ServerToolExecutor {
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, git_commit, git_revert_commit, memory_*, web_search"
+                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
             )),
         };
 
@@ -3602,6 +3603,19 @@ esac
             .execute("grep", &json!({"pattern": "ZZZZNOTFOUND"}))
             .await;
         assert!(result.contains("No matches found"));
+    }
+
+    #[tokio::test]
+    async fn symbols_extracts_rust_symbols() {
+        let (exec, dir) = test_executor();
+        std::fs::write(
+            dir.path().join("sample.rs"),
+            "fn hello() {}\nstruct Foo {}\n",
+        )
+        .unwrap();
+        let result = exec.execute("symbols", &json!({"path": "sample.rs"})).await;
+        assert!(result.contains("hello"));
+        assert!(result.contains("Foo"));
     }
 
     // ── Git operations ─────────────────────────────────────────────────
