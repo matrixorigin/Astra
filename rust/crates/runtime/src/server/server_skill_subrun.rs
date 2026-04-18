@@ -24,8 +24,8 @@ use crate::pipeline::step_recorder::StepRecorder;
 use crate::semantic_dedup::SemanticDedup;
 use crate::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use crate::turn::agentic_loop_host::{
-    AgenticLoopHost as _, AgenticLoopState, CancellationState, SkillState, StopHookState,
-    TurnInteractionPolicy, run_agentic_loop_with_host,
+    AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
+    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
 };
 use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
 use crate::turn::turn_guard::TurnGuard;
@@ -59,6 +59,8 @@ pub struct ServerSkillSubRunExecutor {
     /// Inbound request headers propagated from parent run for remote skill callbacks.
     /// Header names are normalized to lowercase.
     forward_headers: HashMap<String, String>,
+    /// Request-scoped capability constraints inherited from the parent run.
+    request_constraints: RequestConstraints,
     /// Session ID for the parent run.
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
@@ -81,6 +83,7 @@ impl ServerSkillSubRunExecutor {
             skill_resolver: None,
             cancel_token: None,
             forward_headers: HashMap::new(),
+            request_constraints: Default::default(),
             session_id,
             edge_connection_pool: None,
         }
@@ -124,6 +127,11 @@ impl ServerSkillSubRunExecutor {
 
     pub fn with_forward_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.forward_headers = headers;
+        self
+    }
+
+    pub fn with_request_constraints(mut self, constraints: RequestConstraints) -> Self {
+        self.request_constraints = constraints;
         self
     }
 
@@ -296,6 +304,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 // Inherit resolver for nested inline skills, but NO executor
                 // to prevent Fork→Fork recursion (same as CLI design).
                 resolver: self.skill_resolver.clone(),
+                request_constraints: self.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,

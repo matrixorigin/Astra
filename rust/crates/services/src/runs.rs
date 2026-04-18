@@ -103,6 +103,8 @@ pub struct ChatRequestData {
     pub agent_id: Option<String>,
     pub model: Option<String>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
+    pub allow_skills: Option<Vec<String>>,
+    pub allow_tools: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub max_candidates: u32,
@@ -139,6 +141,8 @@ impl std::fmt::Debug for ChatRequestData {
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
             .field("skill_search", &self.skill_search)
+            .field("allow_skills", &self.allow_skills)
+            .field("allow_tools", &self.allow_tools)
             .field("context", &self.context)
             .field(
                 "forward_headers",
@@ -865,6 +869,8 @@ mod tests {
             agent_id: None,
             model: None,
             skill_search: None,
+            allow_skills: None,
+            allow_tools: None,
             context: None,
             forward_headers,
             max_candidates: 10,
@@ -891,6 +897,8 @@ mod tests {
                     agent_id: None,
                     model: None,
                     skill_search: None,
+                    allow_skills: None,
+                    allow_tools: None,
                     context: None,
                     forward_headers: std::collections::HashMap::new(),
                     max_candidates: 25,

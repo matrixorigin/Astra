@@ -64,6 +64,10 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub skill_search: Option<astra_core::SkillSearchSettings>,
+    #[serde(default)]
+    pub allow_skills: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_tools: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default = "default_max_candidates")]
     pub max_candidates: u32,
@@ -868,6 +872,8 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         agent_id: request.agent_id,
         model: request.model,
         skill_search: request.skill_search,
+        allow_skills: request.allow_skills,
+        allow_tools: request.allow_tools,
         context,
         forward_headers: std::collections::HashMap::new(),
         max_candidates: request.max_candidates,

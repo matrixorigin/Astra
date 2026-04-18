@@ -19,11 +19,12 @@ pub(crate) async fn prepare_intercepted_tool_round(
     turn_result: &HostTurnResult,
     effective_tool_calls: &[Value],
     delegation_intercepted: bool,
+    valid_tool_names: &HashSet<String>,
 ) -> PreparedToolRound {
     let tool_calls =
         super::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls).into_owned();
     let (mut pre_resolved_results, post_send_tool_calls) =
-        intercept_send_message_calls(state, &tool_calls).await;
+        intercept_send_message_calls(state, &tool_calls, valid_tool_names).await;
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
@@ -107,6 +108,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
 async fn intercept_send_message_calls(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
+    valid_tool_names: &HashSet<String>,
 ) -> (Vec<(String, String)>, Vec<Value>) {
     let Some(mailbox) = state.messaging.mailbox.as_ref() else {
         return (Vec::new(), tool_calls.to_vec());
@@ -115,7 +117,9 @@ async fn intercept_send_message_calls(
     let mut msg_results = Vec::new();
     let mut remaining = Vec::new();
     for tc in tool_calls {
-        if crate::messaging::send_tool::is_send_message_call(tc) {
+        if crate::messaging::send_tool::is_send_message_call(tc)
+            && valid_tool_names.contains(crate::messaging::send_tool::SEND_MESSAGE_TOOL_NAME)
+        {
             if let Some((call_id, args)) = crate::messaging::send_tool::parse_send_message_call(tc)
             {
                 let send_result =
@@ -518,4 +522,87 @@ pub(crate) fn detect_project_types(root: &std::path::Path) -> Vec<&'static str> 
         }
     }
     types
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::messaging::in_process::InProcessTransport;
+    use crate::messaging::router::AgentMailboxRouter;
+    use crate::messaging::types::AgentAddress;
+    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+    use crate::turn::agentic_loop_host::tests::make_state;
+
+    async fn setup_mailboxes() -> (
+        crate::messaging::router::AgentMailbox,
+        crate::messaging::router::AgentMailbox,
+    ) {
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
+
+        let parent = router
+            .register(AgentAddress::new("run-parent", "orchestrator"), None)
+            .await
+            .expect("parent mailbox should register");
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-child".into(),
+                parent_run_id: "run-parent".into(),
+                delegation_id: "del-1".into(),
+                agent_id: "worker".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+
+        let child = router
+            .register(
+                AgentAddress::new("run-child", "worker"),
+                Some("del-1".into()),
+            )
+            .await
+            .expect("child mailbox should register");
+
+        (parent, child)
+    }
+
+    #[tokio::test]
+    async fn send_message_interception_respects_valid_tool_names() {
+        let (mut parent, child) = setup_mailboxes().await;
+        let mut state = make_state();
+        state.messaging.mailbox = Some(child);
+
+        let tool_calls = vec![json!({
+            "id": "call-send-1",
+            "type": "function",
+            "function": {
+                "name": "send_message",
+                "arguments": r#"{"target":"parent","content":"blocked","message_type":"text"}"#
+            }
+        })];
+
+        let (results, remaining) =
+            intercept_send_message_calls(&mut state, &tool_calls, &HashSet::new()).await;
+
+        assert!(
+            results.is_empty(),
+            "disallowed send_message should not be intercepted"
+        );
+        assert_eq!(
+            remaining, tool_calls,
+            "tool call should remain for unknown-tool handling"
+        );
+        assert!(
+            parent.try_recv().is_none(),
+            "no message should be delivered when send_message is disallowed"
+        );
+    }
 }

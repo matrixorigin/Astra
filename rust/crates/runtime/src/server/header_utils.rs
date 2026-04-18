@@ -74,6 +74,9 @@ pub(super) fn collect_forward_headers(headers: &HeaderMap) -> HashMap<String, St
                 continue;
             }
 
+            // Duplicate inbound headers are currently collapsed to the first value.
+            // This matches the request headers we forward today (authorization/workspace ids),
+            // but multi-value forwarding would need a wider representation than HashMap<String, String>.
             forwarded_headers.entry(name).or_insert(value);
         }
     }

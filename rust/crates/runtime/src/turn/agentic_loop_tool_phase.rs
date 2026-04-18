@@ -779,10 +779,11 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &mut state.turn_guard,
     );
 
+    let valid_tool_names = host.valid_tool_names().clone();
     let DelegationInterceptionResult {
         effective_tool_calls,
         intercepted_any: delegation_intercepted,
-    } = intercept_delegations(host, state, &turn_result, prep.quiet).await;
+    } = intercept_delegations(host, state, &turn_result, prep.quiet, &valid_tool_names).await;
 
     let PreparedToolRound {
         tool_calls,
@@ -793,6 +794,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &turn_result,
         &effective_tool_calls,
         delegation_intercepted,
+        &valid_tool_names,
     )
     .await;
     let all_tool_calls = tool_calls.as_slice();
@@ -826,7 +828,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let evo_records_before = state.stall.tool_call_records.len();
     let tool_results_before = state.tool_results.len();
     {
-        let valid_tool_names = host.valid_tool_names().clone();
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {

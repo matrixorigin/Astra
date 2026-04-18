@@ -1,13 +1,19 @@
+use std::collections::HashSet;
+
 use astra_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
 use crate::str_preview::truncate_str;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 
-use super::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
+use super::agentic_loop_host::{
+    AgenticLoopHost, AgenticLoopState, HostTurnResult, RequestConstraints,
+};
 
 pub(crate) const DELEGATE_TOOL_NAME: &str = "delegate";
 pub(crate) const FORWARD_HEADERS_CONTEXT_KEY: &str = "__astra_forward_headers";
+pub(crate) const REQUEST_ALLOWED_TOOLS_CONTEXT_KEY: &str = "__astra_request_allowed_tools";
+pub(crate) const REQUEST_ALLOWED_SKILLS_CONTEXT_KEY: &str = "__astra_request_allowed_skills";
 
 pub(crate) struct DelegationInterceptionResult {
     pub(crate) effective_tool_calls: Vec<Value>,
@@ -31,7 +37,17 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
     quiet: bool,
+    valid_tool_names: &HashSet<String>,
 ) -> DelegationInterceptionResult {
+    if turn_result.accum.tool_calls.iter().any(is_delegation_call)
+        && !valid_tool_names.contains(DELEGATE_TOOL_NAME)
+    {
+        return DelegationInterceptionResult {
+            effective_tool_calls: turn_result.accum.tool_calls.clone(),
+            intercepted_any: false,
+        };
+    }
+
     let (delegation_results, remaining_tool_calls) = if let Some(engine) = &state.delegation_engine
     {
         let adaptive_delegation_context =
@@ -71,6 +87,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             "orchestrator",
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
+            &state.skills.request_constraints,
             &state.skills.search,
             adaptive_delegation_context.as_ref(),
         )
@@ -204,7 +221,6 @@ pub(crate) fn parse_delegation_request(
     parent_run_id: &str,
     session_id: &str,
     recursion_depth: u8,
-    forward_headers: &std::collections::HashMap<String, String>,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<astra_services::coordination::DelegationRequest, String> {
@@ -250,7 +266,7 @@ pub(crate) fn parse_delegation_request(
     if let Some(policy) = adaptive_policy {
         context.insert("adaptive_coordination".to_string(), policy);
     }
-    merge_forward_headers_into_delegation_context(&mut context, forward_headers);
+    merge_forward_headers_into_delegation_context(&mut context);
     crate::turn::agentic_recursion_guard::checked_child_recursion_depth(recursion_depth)?;
 
     Ok(astra_services::coordination::DelegationRequest {
@@ -266,7 +282,6 @@ pub(crate) fn parse_delegation_request(
 
 pub(crate) fn merge_forward_headers_into_delegation_context(
     context: &mut std::collections::HashMap<String, serde_json::Value>,
-    _forward_headers: &std::collections::HashMap<String, String>,
 ) {
     // Forwarded headers now travel only through trusted sideband state.
     // Always clear the reserved context key so user/model supplied values
@@ -558,6 +573,23 @@ pub(crate) fn parse_coordination_pattern(
     }
 }
 
+fn merge_request_allowlist_into_delegation_request(
+    request: &mut astra_services::coordination::DelegationRequest,
+    key: &str,
+    allowlist: Option<&HashSet<String>>,
+) {
+    let Some(allowlist) = allowlist else {
+        request.context.remove(key);
+        return;
+    };
+    let mut values = allowlist.iter().cloned().collect::<Vec<_>>();
+    values.sort();
+    request.context.insert(
+        key.to_string(),
+        Value::Array(values.into_iter().map(Value::String).collect()),
+    );
+}
+
 pub(crate) fn merge_workspace_hint_into_delegation_request(
     request: &mut astra_services::coordination::DelegationRequest,
     hint: Option<&str>,
@@ -581,6 +613,7 @@ pub(crate) async fn partition_and_execute_delegations(
     source_agent_id: &str,
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
+    request_constraints: &RequestConstraints,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
@@ -600,12 +633,21 @@ pub(crate) async fn partition_and_execute_delegations(
                 parent_run_id,
                 session_id,
                 recursion_depth,
-                forward_headers,
                 skill_search,
                 adaptive_context,
             ) {
                 Ok(mut request) => {
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
+                    merge_request_allowlist_into_delegation_request(
+                        &mut request,
+                        REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
+                        request_constraints.allowed_tools.as_ref(),
+                    );
+                    merge_request_allowlist_into_delegation_request(
+                        &mut request,
+                        REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
+                        request_constraints.allowed_skills.as_ref(),
+                    );
                     let pattern_name = coordination_pattern_name(&request.pattern).to_string();
                     let scenario_name =
                         adaptive_context
@@ -811,6 +853,9 @@ pub(crate) fn format_delegation_terminal_preview(
 mod tests {
     use std::sync::Arc;
 
+    use crate::turn::agentic_loop_host::tests::{
+        MockHost, make_state, make_test_delegation_engine,
+    };
     use astra_services::AgentProfileRegistry;
     use astra_services::coordination::{AgentProfile, AgentTier};
     use serde_json::json;
@@ -954,7 +999,6 @@ mod tests {
             "run-123",
             "session-456",
             2,
-            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -977,19 +1021,11 @@ mod tests {
                 "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_forward_headers\": {\"x-workspace-id\": \"evil\"}}}"
             }
         });
-        let forwarded = std::collections::HashMap::from([
-            (
-                "authorization".to_string(),
-                "Bearer trusted-token".to_string(),
-            ),
-            ("x-workspace-id".to_string(), "ws-001".to_string()),
-        ]);
         let req = parse_delegation_request(
             &tool_call,
             "run-123",
             "session-456",
             2,
-            &forwarded,
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1015,7 +1051,6 @@ mod tests {
             "run-123",
             "session-456",
             2,
-            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1040,7 +1075,6 @@ mod tests {
             "run-1",
             "sess-1",
             0,
-            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         );
@@ -1063,7 +1097,6 @@ mod tests {
             "run-1",
             "sess-1",
             crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
-            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             None,
         );
@@ -1094,7 +1127,6 @@ mod tests {
             "run-123",
             "session-456",
             0,
-            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
@@ -1129,7 +1161,6 @@ mod tests {
             "run-123",
             "session-456",
             0,
-            &std::collections::HashMap::new(),
             &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
@@ -1473,6 +1504,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1508,6 +1540,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1534,6 +1567,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
         )
@@ -1546,5 +1580,47 @@ mod tests {
                 .contains("Invalid delegation request")
         );
         assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intercept_delegations_respects_valid_tool_names() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&[]);
+        let mut state = make_state();
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let turn_result = HostTurnResult {
+            accum: crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                has_tool_calls: true,
+                tool_calls: vec![json!({
+                    "id": "call_delegate",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate",
+                        "arguments": "{\"task\":\"write tests\",\"agents\":[\"coder\"]}"
+                    }
+                })],
+                ..crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(10),
+            edge_tool_round: Vec::new(),
+        };
+
+        let valid_tool_names = host.valid_tool_names().clone();
+        let result =
+            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
+                .await;
+
+        assert!(
+            !result.intercepted_any,
+            "disallowed delegate should not be intercepted"
+        );
+        assert_eq!(
+            result.effective_tool_calls, turn_result.accum.tool_calls,
+            "delegate call should remain for unknown-tool handling"
+        );
+        assert!(
+            state.tool_results.is_empty(),
+            "no synthetic delegation result should be injected when delegate is disallowed"
+        );
     }
 }

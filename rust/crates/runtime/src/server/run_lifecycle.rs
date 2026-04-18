@@ -7,7 +7,7 @@
 //! Run state is held in-memory (`DashMap`) for low-latency queries; events are
 //! buffered per-run so `stream_run()` can replay from any offset.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -39,7 +39,7 @@ use crate::pipeline::step_recorder::StepRecorder;
 use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
-    EvaluationPersistenceContext, MessagingState, SkillState, StopHookState,
+    EvaluationPersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
     run_agentic_loop_with_host,
 };
 use crate::{
@@ -115,6 +115,140 @@ fn build_server_skill_resolver(
     bundle.clone()
 }
 
+fn normalize_allowlist_entry(entry: &str, field: &str) -> Result<String, String> {
+    let normalized = entry.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        Err(format!("{field} must not contain empty values"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn normalize_request_allowlist(
+    entries: Option<&[String]>,
+    field: &str,
+) -> Result<Option<HashSet<String>>, String> {
+    let Some(entries) = entries else {
+        return Ok(None);
+    };
+    let mut normalized = HashSet::new();
+    for entry in entries {
+        normalized.insert(normalize_allowlist_entry(entry, field)?);
+    }
+    Ok(Some(normalized))
+}
+
+fn skill_tool_names(skill: &crate::turn::skill_tool::SkillToolInfo) -> Vec<String> {
+    std::iter::once(skill.name.as_str())
+        .chain(skill.aliases.iter().map(String::as_str))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn resolved_skill_names(skill: &crate::turn::skill_tool::ResolvedSkill) -> Vec<String> {
+    std::iter::once(skill.name.as_str())
+        .chain(skill.aliases.iter().map(String::as_str))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+struct RequestScopedSkillResolver {
+    inner: Arc<dyn crate::turn::skill_tool::SkillResolver>,
+    allowed_lookup: HashSet<String>,
+    visible_skills: Vec<crate::turn::skill_tool::SkillToolInfo>,
+}
+
+impl RequestScopedSkillResolver {
+    fn new(
+        inner: Arc<dyn crate::turn::skill_tool::SkillResolver>,
+        requested: HashSet<String>,
+    ) -> Result<Self, String> {
+        let mut visible_skills = Vec::new();
+        let mut allowed_lookup = HashSet::new();
+        let mut matched = HashSet::new();
+
+        for skill in inner.available_skills() {
+            let names = skill_tool_names(&skill);
+            let skill_matches = names
+                .iter()
+                .filter(|name| requested.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if skill_matches.is_empty() {
+                continue;
+            }
+            matched.extend(skill_matches);
+            allowed_lookup.extend(names);
+            visible_skills.push(skill);
+        }
+
+        let mut unmatched = requested.difference(&matched).cloned().collect::<Vec<_>>();
+        unmatched.sort();
+        if !unmatched.is_empty() {
+            return Err(format!(
+                "allow_skills contains unknown entries: {}",
+                unmatched.join(", ")
+            ));
+        }
+
+        Ok(Self {
+            inner,
+            allowed_lookup,
+            visible_skills,
+        })
+    }
+}
+
+impl crate::turn::skill_tool::SkillResolver for RequestScopedSkillResolver {
+    fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
+        let lookup = name.trim().to_ascii_lowercase();
+        if lookup.is_empty() || !self.allowed_lookup.contains(&lookup) {
+            return Err(format!("skill '{name}' is not allowed for this request"));
+        }
+
+        let resolved = self.inner.resolve(name)?;
+        if resolved_skill_names(&resolved)
+            .into_iter()
+            .any(|candidate| self.allowed_lookup.contains(&candidate))
+        {
+            Ok(resolved)
+        } else {
+            Err(format!(
+                "skill '{}' resolved outside the request allowlist",
+                resolved.name
+            ))
+        }
+    }
+
+    fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
+        self.visible_skills.clone()
+    }
+}
+
+fn apply_normalized_skill_allowlist(
+    resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    allow_skills: Option<&HashSet<String>>,
+) -> Result<Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>, String> {
+    let Some(allow_skills) = allow_skills else {
+        return Ok(resolver);
+    };
+
+    let Some(inner) = resolver else {
+        return if allow_skills.is_empty() {
+            Ok(None)
+        } else {
+            Err("allow_skills was provided, but no skills are configured on this server".into())
+        };
+    };
+
+    Ok(Some(Arc::new(RequestScopedSkillResolver::new(
+        inner,
+        allow_skills.clone(),
+    )?)))
+}
+
 /// Build a server-side skill executor that supports both Inline and Fork
 /// execution contexts via [`SkillExecutionRouter`].
 fn build_server_skill_executor(
@@ -125,6 +259,7 @@ fn build_server_skill_executor(
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
     forward_headers: &HashMap<String, String>,
+    request_constraints: RequestConstraints,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
@@ -142,6 +277,7 @@ fn build_server_skill_executor(
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
     .with_forward_headers(forward_headers.clone())
+    .with_request_constraints(request_constraints)
     .with_skill_resolver(skill_resolver);
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
@@ -781,6 +917,24 @@ impl AgenticRunLifecycleService {
         (events, final_status, error_msg)
     }
 
+    fn validate_request_constraints(
+        &self,
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        let (_, resolver) = build_server_skill_resolver(
+            self.skill_service.clone(),
+            &self.server_skill_resolver_cache,
+        );
+        let allowed_skills =
+            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        apply_normalized_skill_allowlist(resolver, allowed_skills.as_ref())
+            .map(|_| ())
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))
+    }
+
     /// Build a [`ServerAgenticLoopHost`] for a single run.
     fn build_host(
         &self,
@@ -832,10 +986,21 @@ impl AgenticRunLifecycleService {
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
-        let (skill_registry, skill_resolver) = build_server_skill_resolver(
+        let (skill_registry, raw_skill_resolver) = build_server_skill_resolver(
             self.skill_service.clone(),
             &self.server_skill_resolver_cache,
         );
+        let request_constraints = RequestConstraints::new(
+            normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
+                .expect("request allow_tools should be validated before state build"),
+            normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")
+                .expect("request allow_skills should be validated before state build"),
+        );
+        let skill_resolver = apply_normalized_skill_allowlist(
+            raw_skill_resolver,
+            request_constraints.allowed_skills.as_ref(),
+        )
+        .expect("request allow_skills should be validated before state build");
         use crate::turn::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -879,6 +1044,7 @@ impl AgenticRunLifecycleService {
             &edge_tools,
             &edge_profile,
             &request.forward_headers,
+            request_constraints.clone(),
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
@@ -915,9 +1081,14 @@ impl AgenticRunLifecycleService {
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
-                registry_for_activation: skill_registry,
+                registry_for_activation: if request_constraints.allowed_skills.is_some() {
+                    None
+                } else {
+                    skill_registry
+                },
                 resolver: skill_resolver,
                 executor: skill_executor,
+                request_constraints,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
                 search: skill_search,
@@ -1122,6 +1293,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.validate_request_constraints(&request)?;
+
         // ── Resource governance check (Phase 5) ─────────────────────
         if let Some(ref gov) = self.resource_governor {
             if let astra_services::resource_governor::LimitCheck::Denied { reason } =
@@ -1393,6 +1566,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.validate_request_constraints(&request)?;
+
         let run_id = Uuid::new_v4().to_string();
         let session_id = request
             .session_id
@@ -1987,8 +2162,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let (skill_registry, skill_resolver) =
+        let (skill_registry, raw_skill_resolver) =
             build_server_skill_resolver(self.skill_service.clone(), &self.skill_resolver_cache);
+        let skill_resolver = apply_normalized_skill_allowlist(
+            raw_skill_resolver,
+            config.request_constraints.allowed_skills.as_ref(),
+        )?;
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
@@ -2021,8 +2200,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
-                registry_for_activation: skill_registry,
+                registry_for_activation: if config.request_constraints.allowed_skills.is_some() {
+                    None
+                } else {
+                    skill_registry
+                },
                 resolver: skill_resolver,
+                request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
                 search: skill_search_from_context(&config.context),
@@ -2266,6 +2450,8 @@ mod tests {
             agent_id: None,
             model: None,
             skill_search: None,
+            allow_skills: None,
+            allow_tools: None,
             context: None,
             forward_headers: HashMap::new(),
             max_candidates: 5,
@@ -2422,6 +2608,42 @@ mod tests {
             resolved.required_headers,
             vec!["x-workspace-id".to_string()]
         );
+
+        let mut filtered_request = test_request("hello");
+        filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
+        let filtered_state = svc.build_initial_state(&filtered_request, "session-1", "run-1", None);
+        assert!(
+            filtered_state.skills.registry_for_activation.is_none(),
+            "request-scoped allow_skills should disable automatic conditional activation"
+        );
+        let filtered_resolver = filtered_state
+            .skills
+            .resolver
+            .as_ref()
+            .expect("filtered resolver should be configured");
+        let filtered_names: Vec<String> = filtered_resolver
+            .available_skills()
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(filtered_names, vec!["remote-db".to_string()]);
+        filtered_resolver
+            .resolve("remote-db")
+            .expect("allowed remote-db skill should resolve");
+    }
+
+    #[tokio::test]
+    async fn create_run_rejects_unknown_request_skill_allowlist() {
+        let svc = test_service();
+        let mut request = test_request("hello");
+        request.allow_skills = Some(vec!["__missing_skill__".into()]);
+
+        let err = svc
+            .create_run("user-1".into(), request)
+            .await
+            .expect_err("unknown allow_skills entry should be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.0.detail.contains("allow_skills"));
     }
 
     #[test]
@@ -2845,6 +3067,8 @@ mod tests {
             agent_id: None,
             model: None,
             skill_search: None,
+            allow_skills: None,
+            allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
             max_candidates: 5,
@@ -2873,6 +3097,8 @@ mod tests {
             agent_id: None,
             model: None,
             skill_search: None,
+            allow_skills: None,
+            allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
             max_candidates: 5,

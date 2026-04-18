@@ -95,6 +95,10 @@ pub(super) enum WsClientMessage {
         #[serde(default)]
         skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
+        allow_skills: Option<Vec<String>>,
+        #[serde(default)]
+        allow_tools: Option<Vec<String>>,
+        #[serde(default)]
         context: Option<serde_json::Map<String, serde_json::Value>>,
         #[serde(default = "default_ws_max_candidates")]
         max_candidates: u32,
@@ -453,6 +457,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 agent_id,
                                 model,
                                 skill_search,
+                                allow_skills,
+                                allow_tools,
                                 context,
                                 max_candidates,
                                 explain,
@@ -468,6 +474,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     agent_id,
                                     model,
                                     skill_search,
+                                    allow_skills,
+                                    allow_tools,
                                     context,
                                     max_candidates,
                                     explain,
@@ -559,6 +567,8 @@ async fn handle_chat_message(
     agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
+    allow_skills: Option<Vec<String>>,
+    allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     max_candidates: u32,
     explain: bool,
@@ -576,6 +586,8 @@ async fn handle_chat_message(
     let fallback_agent_id = agent_id.clone();
     let fallback_model = model.clone();
     let fallback_skill_search = skill_search.clone();
+    let fallback_allow_skills = allow_skills.clone();
+    let fallback_allow_tools = allow_tools.clone();
     let fallback_max_candidates = max_candidates;
     let fallback_explain = explain;
     let mut request = build_ws_chat_request(
@@ -584,6 +596,8 @@ async fn handle_chat_message(
         agent_id,
         model,
         skill_search,
+        allow_skills,
+        allow_tools,
         context,
         max_candidates,
         explain,
@@ -664,6 +678,8 @@ async fn handle_chat_message(
                 fallback_agent_id,
                 fallback_model,
                 fallback_skill_search,
+                fallback_allow_skills,
+                fallback_allow_tools,
                 fallback_context,
                 fallback_max_candidates,
                 fallback_explain,
@@ -781,6 +797,8 @@ fn build_bridge_chat_payload(
     agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
+    allow_skills: Option<Vec<String>>,
+    allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     max_candidates: u32,
     explain: bool,
@@ -790,6 +808,8 @@ fn build_bridge_chat_payload(
         "agent_id": agent_id,
         "model": model,
         "skill_search": skill_search,
+        "allow_skills": allow_skills,
+        "allow_tools": allow_tools,
         "context": context,
         "max_candidates": max_candidates,
         "explain": explain,
@@ -806,6 +826,8 @@ fn build_ws_chat_request(
     agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
+    allow_skills: Option<Vec<String>>,
+    allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     max_candidates: u32,
     explain: bool,
@@ -818,6 +840,8 @@ fn build_ws_chat_request(
         agent_id,
         model,
         skill_search,
+        allow_skills,
+        allow_tools,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         forward_headers: std::collections::HashMap::new(),
         max_candidates,
@@ -1450,6 +1474,8 @@ async fn handle_chat_message_via_bridge(
     agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
+    allow_skills: Option<Vec<String>>,
+    allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
     max_candidates: u32,
     explain: bool,
@@ -1470,6 +1496,8 @@ async fn handle_chat_message_via_bridge(
         agent_id,
         model,
         skill_search,
+        allow_skills,
+        allow_tools,
         context,
         max_candidates,
         explain,
@@ -2383,7 +2411,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "max_candidates": 3, "explain": true, "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_tools": ["bash"], "max_candidates": 3, "explain": true, "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage {
@@ -2392,6 +2420,8 @@ mod tests {
                 agent_id,
                 model,
                 skill_search,
+                allow_skills,
+                allow_tools,
                 context,
                 max_candidates,
                 explain,
@@ -2410,6 +2440,8 @@ mod tests {
                         surface_cap: 20,
                     })
                 );
+                assert_eq!(allow_skills, Some(vec!["plan".into()]));
+                assert_eq!(allow_tools, Some(vec!["bash".into()]));
                 assert!(context.is_none());
                 assert_eq!(max_candidates, 3);
                 assert!(explain);
@@ -2429,6 +2461,8 @@ mod tests {
                 content,
                 agent_id,
                 skill_search,
+                allow_skills,
+                allow_tools,
                 max_candidates,
                 explain,
                 plan_subtask_id,
@@ -2438,6 +2472,8 @@ mod tests {
                 assert_eq!(content, "你好");
                 assert!(agent_id.is_none());
                 assert!(skill_search.is_none());
+                assert!(allow_skills.is_none());
+                assert!(allow_tools.is_none());
                 assert_eq!(max_candidates, default_ws_max_candidates());
                 assert!(!explain);
                 assert!(plan_subtask_id.is_none());
@@ -2463,6 +2499,8 @@ mod tests {
                 min_catalog_size: 12,
                 surface_cap: 20,
             }),
+            Some(vec!["plan".into()]),
+            Some(vec!["bash".into()]),
             Some(context.clone()),
             3,
             true,
@@ -2474,6 +2512,8 @@ mod tests {
         assert_eq!(payload["skill_search"]["dynamic_surface"], false);
         assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
         assert_eq!(payload["skill_search"]["surface_cap"], 20);
+        assert_eq!(payload["allow_skills"], serde_json::json!(["plan"]));
+        assert_eq!(payload["allow_tools"], serde_json::json!(["bash"]));
         assert_eq!(payload["context"], serde_json::Value::Object(context));
         assert_eq!(payload["max_candidates"], 3);
         assert_eq!(payload["explain"], true);
@@ -2493,6 +2533,8 @@ mod tests {
                 min_catalog_size: 12,
                 surface_cap: 20,
             }),
+            Some(vec!["plan".into()]),
+            Some(vec!["bash".into(), "read_file".into()]),
             Some(serde_json::Map::from_iter([(
                 "cwd".to_string(),
                 serde_json::Value::String("/tmp".into()),
@@ -2514,6 +2556,11 @@ mod tests {
                 min_catalog_size: 12,
                 surface_cap: 20,
             })
+        );
+        assert_eq!(request.allow_skills, Some(vec!["plan".into()]));
+        assert_eq!(
+            request.allow_tools,
+            Some(vec!["bash".into(), "read_file".into()])
         );
         assert_eq!(request.context.as_ref().unwrap()["cwd"], "/tmp");
         assert_eq!(

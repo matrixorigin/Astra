@@ -84,6 +84,8 @@ fn chat_stream_bridge_fallback_payload(
         "agent_id": chat_data.agent_id.as_deref(),
         "model": chat_data.model.as_deref(),
         "skill_search": chat_data.skill_search.as_ref(),
+        "allow_skills": chat_data.allow_skills.as_ref(),
+        "allow_tools": chat_data.allow_tools.as_ref(),
         "context": chat_data.context.as_ref(),
         "max_candidates": chat_data.max_candidates,
         "explain": chat_data.explain,
@@ -441,6 +443,8 @@ mod tests {
                 min_catalog_size: 12,
                 surface_cap: 20,
             }),
+            allow_skills: Some(vec!["plan".to_string()]),
+            allow_tools: Some(vec!["bash".to_string()]),
             context: None,
             forward_headers: std::collections::HashMap::new(),
             max_candidates: 3,
@@ -454,6 +458,8 @@ mod tests {
         assert_eq!(obj["skill_search"]["dynamic_surface"], false);
         assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
         assert_eq!(obj["skill_search"]["surface_cap"], 20);
+        assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
+        assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
         let messages = obj["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");

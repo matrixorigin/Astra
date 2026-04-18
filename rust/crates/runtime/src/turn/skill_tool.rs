@@ -1389,13 +1389,34 @@ fn validate_remote_skill_endpoint(remote_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_header_name(name: &str) -> Result<String, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeaderNameNormalizationError {
+    Empty,
+    Invalid { name: String, detail: String },
+}
+
+impl fmt::Display for HeaderNameNormalizationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "header name cannot be empty"),
+            Self::Invalid { name, detail } => {
+                write!(f, "invalid header name '{name}': {detail}")
+            }
+        }
+    }
+}
+
+fn normalize_header_name(name: &str) -> Result<String, HeaderNameNormalizationError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("header name cannot be empty".to_string());
+        return Err(HeaderNameNormalizationError::Empty);
     }
-    let parsed = reqwest::header::HeaderName::from_bytes(trimmed.as_bytes())
-        .map_err(|err| format!("invalid header name '{name}': {err}"))?;
+    let parsed = reqwest::header::HeaderName::from_bytes(trimmed.as_bytes()).map_err(|err| {
+        HeaderNameNormalizationError::Invalid {
+            name: name.to_string(),
+            detail: err.to_string(),
+        }
+    })?;
     Ok(parsed.as_str().to_ascii_lowercase())
 }
 

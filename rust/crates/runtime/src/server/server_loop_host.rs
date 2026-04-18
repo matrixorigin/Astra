@@ -393,13 +393,65 @@ impl ServerAgenticLoopHost {
         filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
     }
 
+    fn effective_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
+        let mut allowed = state.skills.request_constraints.allowed_tools.clone();
+        if let Some(skill_allowed) = &state.skills.allowed_tools {
+            let skill_allowed = skill_allowed
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            allowed = Some(match allowed {
+                Some(request_allowed) => request_allowed
+                    .intersection(&skill_allowed)
+                    .cloned()
+                    .collect(),
+                None => skill_allowed,
+            });
+        }
+
+        let Some(allowed) = allowed else {
+            return HashSet::new();
+        };
+
+        self.edge_tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .filter(|name| {
+                name.as_str() != crate::turn::skill_tool::SKILL_TOOL_NAME
+                    && name.as_str() != crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
+                    && !allowed.contains(&name.trim().to_ascii_lowercase())
+            })
+            .collect()
+    }
+
+    fn sync_valid_tools_to_visible(&mut self, visible_tools: &[Value]) {
+        self.valid_tools = visible_tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .collect();
+    }
+
     /// Compute the tool schemas visible for the current turn after applying
     /// health-based restrictions. This is the server-path equivalent of the
     /// CLI's deny-at-assembly behavior.
     #[cfg(test)]
-    fn visible_turn_tools(&self, state: &mut AgenticLoopState) -> Vec<Value> {
+    fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
         merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
-        self.filtered_turn_tools(&state.restricted_tools)
+        let mut effective_restricted = state.restricted_tools.clone();
+        effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        let visible = self.filtered_turn_tools(&effective_restricted);
+        self.sync_valid_tools_to_visible(&visible);
+        visible
     }
 
     /// Test-only: returns the plain-text system prompt (no cache annotations).
@@ -765,10 +817,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
         let mut effective_restricted = state.restricted_tools.clone();
+        effective_restricted.extend(self.effective_allowlist_restrictions(state));
         effective_restricted.extend(interaction_scoped_tool_restrictions(
             TurnInteractionMode::Headless,
         ));
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
+        self.sync_valid_tools_to_visible(&visible_tools);
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
@@ -1649,7 +1703,7 @@ mod tests {
 
     #[test]
     fn visible_turn_tools_excludes_restricted_and_deprioritized_tools() {
-        let host = ServerAgenticLoopHostBuilder::new(
+        let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "u".to_string(),
@@ -1670,6 +1724,40 @@ mod tests {
         assert!(visible.is_empty(), "both tools should be filtered out");
         assert!(state.restricted_tools.contains("bash"));
         assert!(state.restricted_tools.contains("read_file"));
+    }
+
+    #[test]
+    fn visible_turn_tools_respects_request_and_skill_allowlists() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let mut state = create_test_state();
+        state.skills.request_constraints.allowed_tools = Some(
+            ["bash".to_string(), "read_file".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.skills.allowed_tools = Some(["bash".to_string()].into_iter().collect());
+
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names = visible
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible_names, vec!["bash"]);
+        assert!(host.valid_tool_names().contains("bash"));
+        assert!(!host.valid_tool_names().contains("read_file"));
     }
 
     #[test]
