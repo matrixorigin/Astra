@@ -354,6 +354,7 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "bash",
     "write_file",
     "str_replace",
+    "multi_edit",
     "delete_file",
     "git_commit",
 ];
@@ -774,6 +775,7 @@ mod tests {
     fn approval_required_tools_includes_dangerous_ops() {
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"bash"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"write_file"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"multi_edit"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
