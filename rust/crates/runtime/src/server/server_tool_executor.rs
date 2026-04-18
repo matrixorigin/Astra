@@ -814,7 +814,7 @@ fn mo_database() -> &'static str {
     use std::sync::OnceLock;
 
     static DB: OnceLock<String> = OnceLock::new();
-    DB.get_or_init(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()))
+    DB.get_or_init(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()))
 }
 
 fn resolved_mo_database(database: Option<&str>) -> String {
@@ -883,7 +883,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
         .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string());
     let db = database
         .map(ToString::to_string)
-        .unwrap_or_else(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()));
+        .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
 
     let mut cmd = Command::new("mysql");
     cmd.arg(format!("-h{host}"))
@@ -4171,8 +4171,7 @@ esac
                 .as_str()
                 .is_some_and(|snapshot_id| snapshot_id.starts_with("moq_"))
         );
-        let expected_database =
-            astra_core::resolve_matrixone_database_name(&|key| std::env::var(key).ok());
+        let expected_database = astra_core::resolve_database_name(&|key| std::env::var(key).ok());
         assert_eq!(
             fields["pre_state_snapshot_database"].as_str(),
             Some(expected_database.as_str())

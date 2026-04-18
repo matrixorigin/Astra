@@ -12,9 +12,7 @@
 //! created before `idx_skill_active_created_at` existed, this suite runs a **test-only** `CREATE INDEX`
 //! (ignores duplicate-name errors) so the listing path is validated against the intended DDL.
 
-use astra_core::{
-    DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_matrixone_database_name,
-};
+use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
 use astra_services::session_audit::{
     AuditSessionListParams, CrossSessionMutationListParams, CrossSessionRuntimePromotionListParams,
     CrossSessionStatsParams, DatabaseSessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE,
@@ -50,7 +48,7 @@ fn require_db_it_env() -> MatrixOneSettings {
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
             .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_matrixone_database_name(&|k| std::env::var(k).ok()),
+        database: resolve_database_name(&|k| std::env::var(k).ok()),
     }
 }
 

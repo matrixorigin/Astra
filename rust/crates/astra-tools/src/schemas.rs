@@ -812,7 +812,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "sql": {"type": "string", "description": "SQL query to execute"},
-                        "database": {"type": "string", "description": "Database name (default: MATRIXONE_DATABASE_PREFIX + MATRIXONE_DATABASE from env)"},
+                        "database": {"type": "string", "description": "Database name (default: ASTRA_DATABASE_PREFIX + ASTRA_DATABASE from env)"},
                         "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
                         "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
@@ -830,7 +830,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "action": {"type": "string", "enum": ["create", "list", "drop", "restore"], "description": "Snapshot operation"},
                         "name": {"type": "string", "description": "Snapshot name (required for create/drop/restore)"},
-                        "database": {"type": "string", "description": "Database name for create/restore (default: from MATRIXONE_DATABASE env)"}
+                        "database": {"type": "string", "description": "Database name for create/restore (default: from ASTRA_DATABASE env)"}
                     },
                     "required": ["action"]
                 }
@@ -977,7 +977,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "query": {"type": "string", "description": "Semantic query describing what to retrieve"},
                         "top_k": {"type": "integer", "description": "Max memories to return (default 5)"},
                         "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results. Omit to use the default."},
-                        "session_id": {"type": "string", "description": "Session ID for scoped retrieval. Omit to use current session when provided by the host."}
+                        "session_id": {"type": "string", "description": "Session ID for scoped retrieval. Omit to use current session when provided by the host."},
+                        "filter_session": {"type": "boolean", "description": "When true, restrict retrieval to the given session_id and bypass cross-session graph retrieval. Requires session_id."},
+                        "include_cross_session": {"type": "boolean", "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set. Default true."}
                     },
                     "required": ["query"]
                 }
@@ -1004,13 +1006,16 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_search",
-                "description": "Search memories by keyword or topic. Use when user asks 'what do you know about X'.",
+                "description": "Search memories by keyword or topic. Use when user asks 'what do you know about X'. Supports session-scoped filtering via session_id and filter_session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Search query"},
                         "top_k": {"type": "integer", "description": "Max results (default 10)"},
-                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results."}
+                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results."},
+                        "session_id": {"type": "string", "description": "Session ID for scoped search. When provided with filter_session=true, restricts results to this session."},
+                        "filter_session": {"type": "boolean", "description": "When true, restrict search to the given session_id. Requires session_id."},
+                        "include_cross_session": {"type": "boolean", "description": "Legacy flag. false is equivalent to filter_session=true when session_id is set. Default true."}
                     },
                     "required": ["query"]
                 }

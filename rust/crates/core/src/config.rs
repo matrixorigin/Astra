@@ -73,7 +73,7 @@ impl AppSettings {
                     "MATRIXONE_PASSWORD",
                     super::runtime_limits::DEV_MATRIXONE_PASSWORD,
                 ),
-                database: resolve_matrixone_database_name(&lookup),
+                database: resolve_database_name(&lookup),
             },
             application: ApplicationSettings {
                 app_env: value_or_default(&lookup, "APP_ENV", "development"),
@@ -181,18 +181,18 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
-/// Resolves the logical MatrixOne database name used in URLs and DDL.
+/// Resolves the logical database name used in URLs and DDL.
 ///
-/// When `MATRIXONE_DATABASE_PREFIX` is set and non-empty, the effective name is
-/// `{prefix}{MATRIXONE_DATABASE}` (base name from `MATRIXONE_DATABASE`, default
+/// When `ASTRA_DATABASE_PREFIX` is set and non-empty, the effective name is
+/// `{prefix}{ASTRA_DATABASE}` (base name from `ASTRA_DATABASE`, default
 /// `database_default`). This lets you keep a shared base name (e.g. `astra_runtime`) and isolate
 /// dev/CI/test from production with a prefix (`test_` → `test_astra_runtime`).
-pub fn resolve_matrixone_database_name_or<F>(lookup: &F, database_default: &str) -> String
+pub fn resolve_database_name_or<F>(lookup: &F, database_default: &str) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
-    let base = value_or_default(lookup, "MATRIXONE_DATABASE", database_default);
-    let prefix = optional_value(lookup, "MATRIXONE_DATABASE_PREFIX").unwrap_or_default();
+    let base = value_or_default(lookup, "ASTRA_DATABASE", database_default);
+    let prefix = optional_value(lookup, "ASTRA_DATABASE_PREFIX").unwrap_or_default();
     if prefix.is_empty() {
         base
     } else {
@@ -200,12 +200,12 @@ where
     }
 }
 
-/// Same as [`resolve_matrixone_database_name_or`] with default base name `astra_runtime`.
-pub fn resolve_matrixone_database_name<F>(lookup: &F) -> String
+/// Same as [`resolve_database_name_or`] with default base name `astra_runtime`.
+pub fn resolve_database_name<F>(lookup: &F) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
-    resolve_matrixone_database_name_or(lookup, "astra_runtime")
+    resolve_database_name_or(lookup, "astra_runtime")
 }
 
 fn value_or_default<F>(lookup: &F, key: &'static str, default: &str) -> String
@@ -287,23 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_matrixone_database_prefix_concat() {
+    fn resolve_database_prefix_concat() {
         let mut m: HashMap<String, String> = HashMap::new();
-        m.insert("MATRIXONE_DATABASE".into(), "prod".into());
-        m.insert("MATRIXONE_DATABASE_PREFIX".into(), "ci_".into());
-        assert_eq!(
-            resolve_matrixone_database_name(&|k| m.get(k).cloned()),
-            "ci_prod"
-        );
+        m.insert("ASTRA_DATABASE".into(), "prod".into());
+        m.insert("ASTRA_DATABASE_PREFIX".into(), "ci_".into());
+        assert_eq!(resolve_database_name(&|k| m.get(k).cloned()), "ci_prod");
     }
 
     #[test]
-    fn resolve_matrixone_database_empty_prefix_uses_base_only() {
+    fn resolve_database_empty_prefix_uses_base_only() {
         let mut m: HashMap<String, String> = HashMap::new();
-        m.insert("MATRIXONE_DATABASE".into(), "astra_runtime".into());
-        m.insert("MATRIXONE_DATABASE_PREFIX".into(), "".into());
+        m.insert("ASTRA_DATABASE".into(), "astra_runtime".into());
+        m.insert("ASTRA_DATABASE_PREFIX".into(), "".into());
         assert_eq!(
-            resolve_matrixone_database_name(&|k| m.get(k).cloned()),
+            resolve_database_name(&|k| m.get(k).cloned()),
             "astra_runtime"
         );
     }
@@ -325,10 +322,10 @@ mod tests {
     }
 
     #[test]
-    fn app_settings_matrixone_database_includes_prefix() {
+    fn app_settings_database_includes_prefix() {
         let mut m = HashMap::new();
-        m.insert("MATRIXONE_DATABASE".into(), "agent_db".into());
-        m.insert("MATRIXONE_DATABASE_PREFIX".into(), "ci_".into());
+        m.insert("ASTRA_DATABASE".into(), "agent_db".into());
+        m.insert("ASTRA_DATABASE_PREFIX".into(), "ci_".into());
         let settings = AppSettings::from_map(&m).expect("parse");
         assert_eq!(settings.matrixone.database, "ci_agent_db");
     }

@@ -2206,24 +2206,10 @@ mod tests {
         assert!(hint.contains("help"));
     }
 
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Serialize tests that mutate ASTRA_CREDENTIALS_DIR.
-    fn creds_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ensure_team_run_session_creates_remote_session_when_missing() {
-        let _lock = creds_lock();
-        let creds_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
-        }
+        let _creds_guard = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
@@ -2261,11 +2247,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ensure_team_run_session_replaces_stale_remote_session() {
-        let _lock = creds_lock();
-        let creds_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
-        }
+        let _creds_guard = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(

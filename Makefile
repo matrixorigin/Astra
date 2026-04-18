@@ -216,7 +216,8 @@ dev-deps-wait:
 
 .PHONY: dev-db-connect
 dev-db-connect:
-	@mysql -h127.0.0.1 -P6001 -uroot -p111
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	mysql -h$${MATRIXONE_HOST:-127.0.0.1} -P$${MATRIXONE_PORT:-6001} -u$${MATRIXONE_USER:-root} -p$${MATRIXONE_PASSWORD:-111}
 
 # ============================================================================
 # API Server (Source Code Mode)
@@ -351,12 +352,18 @@ dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
-	@mysql -h127.0.0.1 -P6001 -uroot -p111 \
-		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
-	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl \
-		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
-	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl \
-		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;"
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
+	DB_PORT=$${MATRIXONE_PORT:-6001}; \
+	DB_USER=$${MATRIXONE_USER:-root}; \
+	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
+	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
+	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS \
+		-e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
+	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
+		-e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
+	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip_ssl \
+		-e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"
 	@$(MAKE) dev-api-restart build-cli-release
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
@@ -579,13 +586,17 @@ db-reset:
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
 		if [ -f .env ]; then \
 			export $$(cat .env | grep -v '^#' | xargs); \
-			DB_NAME=$${MATRIXONE_DATABASE_PREFIX:-}$${MATRIXONE_DATABASE:-dev_agent}; \
+			DB_NAME=$${ASTRA_DATABASE_PREFIX:-}$${ASTRA_DATABASE:-dev_agent}; \
 		else \
 			DB_NAME=dev_agent; \
 		fi; \
-		mysql -h127.0.0.1 -P6001 -uroot -p111 -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
-		mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
-		mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
+		DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
+		DB_PORT=$${MATRIXONE_PORT:-6001}; \
+		DB_USER=$${MATRIXONE_USER:-root}; \
+		DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
+		mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
+		mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
+		mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip_ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 		echo "✅ Database reset complete"; \
 	else \
 		echo "Cancelled"; \

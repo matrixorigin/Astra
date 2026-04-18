@@ -26,8 +26,8 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY`
 | `MATRIXONE_PORT` | DB | Default `6001` |
 | `MATRIXONE_USER` | DB | Default `root` |
 | `MATRIXONE_PASSWORD` | DB | Default dev password in `astra_core::runtime_limits` if unset |
-| `MATRIXONE_DATABASE` | DB | Base name; default `astra_runtime` |
-| `MATRIXONE_DATABASE_PREFIX` | DB | Optional; effective DB = prefix + `MATRIXONE_DATABASE` (e.g. `test_` + `astra_runtime`) |
+| `ASTRA_DATABASE` | DB | Base name; default `astra_runtime` |
+| `ASTRA_DATABASE_PREFIX` | DB | Optional; effective DB = prefix + `ASTRA_DATABASE` (e.g. `test_` + `astra_runtime`) |
 | `JWT_SECRET_KEY` | Auth tokens | Default dev string if unset (not for production) |
 | `SECRET_KEY` | App crypto | Default dev string if unset |
 | `REDIS_HOST` / `REDIS_PORT` | Cache | Defaults `localhost` / `6379` |

@@ -18,10 +18,18 @@ fi
 # Clean up old process record
 rm -f "$PID_FILE"
 
+# Load .env early so DB host/port are available for the readiness check
+if [ -f .env ]; then
+    set -a; source .env; set +a
+fi
+
+DB_HOST="${MATRIXONE_HOST:-127.0.0.1}"
+DB_PORT="${MATRIXONE_PORT:-6001}"
+
 # Wait for database to be ready (retry up to 30 seconds)
-echo "Waiting for database..."
+echo "Waiting for database ($DB_HOST:$DB_PORT)..."
 for i in {1..15}; do
-    if bash -c 'echo >/dev/tcp/127.0.0.1/6001' 2>/dev/null; then
+    if bash -c "echo >/dev/tcp/$DB_HOST/$DB_PORT" 2>/dev/null; then
         echo "✅ Database ready"
         break
     fi
@@ -33,11 +41,6 @@ for i in {1..15}; do
         exit 1
     fi
 done
-
-# Load .env into environment
-if [ -f .env ]; then
-    set -a; source .env; set +a
-fi
 
 echo "Building release API binary..."
 cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server

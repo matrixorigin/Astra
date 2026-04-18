@@ -19,8 +19,8 @@ jobs:
       MATRIXONE_PORT: "6001"
       MATRIXONE_USER: root
       MATRIXONE_PASSWORD: "111"
-      MATRIXONE_DATABASE: astra_runtime
-      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      ASTRA_DATABASE: astra_runtime
+      ASTRA_AUTO_CREATE_DATABASE: "1"
       JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
       SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
       TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars

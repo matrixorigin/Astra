@@ -86,7 +86,7 @@ cd deployment/all-in-one && docker-compose --profile full up -d
 | `MATRIXONE_PORT` | `6001` | MatrixOne port |
 | `MATRIXONE_USER` | `root` | MatrixOne user |
 | `MATRIXONE_PASSWORD` | `111` | MatrixOne password |
-| `MATRIXONE_DATABASE` | `dev_agent` | Platform state database |
+| `ASTRA_DATABASE` | `dev_agent` | Platform state database |
 | `REDIS_URL` | `redis://localhost:6379` | Redis URL |
 | `JWT_SECRET` | (required) | JWT signing secret |
 | `OPENAI_API_KEY` | (optional) | OpenAI provider |

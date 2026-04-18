@@ -523,7 +523,7 @@ pub async fn wait_for_agent_event_types(
 pub struct MatrixE2eCtx {
     pub app: Router,
     pub pool: sqlx::MySqlPool,
-    /// Logical MatrixOne database (includes `MATRIXONE_DATABASE_PREFIX` + `MATRIXONE_DATABASE`).
+    /// Logical MatrixOne database (includes `ASTRA_DATABASE_PREFIX` + `ASTRA_DATABASE`).
     pub matrixone_database: String,
     pub memoria: Arc<E2eMemoriaStub>,
     pub user_id: String,

@@ -84,8 +84,8 @@ pub(crate) const ENV_BASELINE: &[&str] = &[
     "MATRIXONE_PORT",
     "MATRIXONE_USER",
     "MATRIXONE_PASSWORD",
-    "MATRIXONE_DATABASE",
-    "MATRIXONE_DATABASE_PREFIX",
+    "ASTRA_DATABASE",
+    "ASTRA_DATABASE_PREFIX",
 ];
 
 impl SandboxPolicy {
@@ -349,8 +349,8 @@ mod tests {
             "MATRIXONE_PORT",
             "MATRIXONE_USER",
             "MATRIXONE_PASSWORD",
-            "MATRIXONE_DATABASE",
-            "MATRIXONE_DATABASE_PREFIX",
+            "ASTRA_DATABASE",
+            "ASTRA_DATABASE_PREFIX",
         ] {
             assert!(p.is_env_allowed(var), "Baseline missing: {}", var);
         }

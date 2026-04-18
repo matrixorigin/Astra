@@ -17,7 +17,7 @@
     "MATRIXONE_PORT": "6601",
     "MATRIXONE_USER": "agent",
     "MATRIXONE_PASSWORD": "super-secret",
-    "MATRIXONE_DATABASE": "agent_db",
+    "ASTRA_DATABASE": "agent_db",
     "APP_ENV": "production",
     "LOG_LEVEL": "INFO",
     "SECRET_KEY": "prod-secret",

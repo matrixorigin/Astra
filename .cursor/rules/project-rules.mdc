@@ -20,7 +20,7 @@ make dev-start          # Start deps + API server
 make dev-stop           # Stop all
 ```
 
-Optional **`MATRIXONE_DATABASE_PREFIX`**: effective DB name is `{prefix}{MATRIXONE_DATABASE}` (see `astra_core::resolve_matrixone_database_name`). Use it so local/CI schemas never share the same logical database name as production.
+Optional **`ASTRA_DATABASE_PREFIX`**: effective DB name is `{prefix}{ASTRA_DATABASE}` (see `astra_core::resolve_database_name`). Use it so local/CI schemas never share the same logical database name as production.
 
 ## Workspace Structure
 

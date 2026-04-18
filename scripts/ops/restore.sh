@@ -28,7 +28,7 @@ DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
 DB_PASSWORD="${MATRIXONE_PASSWORD:-111}"
-DB_NAME="${MATRIXONE_DATABASE:-astra}"
+DB_NAME="${ASTRA_DATABASE:-astra}"
 
 echo "⚠️  WARNING: This will replace all data in database '${DB_NAME}'"
 echo "   Host: ${DB_HOST}:${DB_PORT}"

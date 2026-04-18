@@ -205,7 +205,7 @@ impl MemoriaClient {
             Err(_) => return vec![],
         };
         match client
-            .post(format!("{base}/v1/memories/search"))
+            .post(format!("{base}/v1/memories/retrieve"))
             .header("Authorization", format!("Bearer {key}"))
             .json(&json!({
                 "query": query,
@@ -292,6 +292,13 @@ impl MemoriaClient {
                     pl["min_confidence"] = json!(mc);
                 }
                 inject_identity(&mut pl);
+                // Forward filter_session and include_cross_session for session-scoped retrieval
+                if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {
+                    pl["filter_session"] = json!(fs);
+                }
+                if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
+                    pl["include_cross_session"] = json!(ics);
+                }
                 (format!("{base}/v1/memories/retrieve"), pl)
             }
             "store" => {
@@ -308,6 +315,8 @@ impl MemoriaClient {
                 (format!("{base}/v1/memories"), payload)
             }
             "search" => {
+                // Route to /v1/memories/retrieve (not /search) so session_id and
+                // filter_session are honoured by the Memoria API.
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(10);
                 let mut pl = json!({"query": query, "top_k": top_k});
@@ -315,7 +324,16 @@ impl MemoriaClient {
                     pl["min_confidence"] = json!(mc);
                 }
                 inject_identity(&mut pl);
-                (format!("{base}/v1/memories/search"), pl)
+                if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+                    pl["session_id"] = json!(sid);
+                }
+                if let Some(fs) = args.get("filter_session").and_then(Value::as_bool) {
+                    pl["filter_session"] = json!(fs);
+                }
+                if let Some(ics) = args.get("include_cross_session").and_then(Value::as_bool) {
+                    pl["include_cross_session"] = json!(ics);
+                }
+                (format!("{base}/v1/memories/retrieve"), pl)
             }
             "purge" => {
                 let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
@@ -465,5 +483,74 @@ mod tests {
         let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("user_id").is_none());
+    }
+
+    // ── Session isolation: retrieve forwards filter_session & include_cross_session ──
+
+    #[test]
+    fn retrieve_forwards_filter_session_and_include_cross_session() {
+        let args = json!({
+            "query": "test query",
+            "top_k": 5,
+            "filter_session": true,
+            "include_cross_session": false,
+        });
+        let (endpoint, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
+        assert_eq!(pl["filter_session"], true);
+        assert_eq!(pl["include_cross_session"], false);
+    }
+
+    #[test]
+    fn retrieve_omits_filter_and_include_when_absent() {
+        let args = json!({"query": "test", "top_k": 5});
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        assert!(pl.get("filter_session").is_none());
+        assert!(pl.get("include_cross_session").is_none());
+    }
+
+    // ── Session isolation: search routes to /retrieve, forwards session fields ──
+
+    #[test]
+    fn search_routes_to_retrieve_endpoint() {
+        let args = json!({"query": "test", "top_k": 10});
+        let (endpoint, _) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        assert_eq!(
+            endpoint, "http://mem/v1/memories/retrieve",
+            "search must route to /retrieve (not /search) for session_id support"
+        );
+    }
+
+    #[test]
+    fn search_forwards_session_id_and_filter_session() {
+        let args = json!({
+            "query": "test",
+            "top_k": 10,
+            "session_id": "sess-abc",
+            "filter_session": true,
+        });
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        assert_eq!(pl["session_id"], "sess-abc");
+        assert_eq!(pl["filter_session"], true);
+    }
+
+    #[test]
+    fn search_forwards_include_cross_session() {
+        let args = json!({
+            "query": "test",
+            "top_k": 10,
+            "include_cross_session": false,
+        });
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        assert_eq!(pl["include_cross_session"], false);
+    }
+
+    #[test]
+    fn search_omits_session_fields_when_absent() {
+        let args = json!({"query": "test", "top_k": 10});
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        assert!(pl.get("session_id").is_none());
+        assert!(pl.get("filter_session").is_none());
+        assert!(pl.get("include_cross_session").is_none());
     }
 }

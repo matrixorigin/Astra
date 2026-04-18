@@ -49,7 +49,7 @@ cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development. To isolate from production on one MatrixOne host, set **`MATRIXONE_DATABASE_PREFIX`** (effective DB = prefix + `MATRIXONE_DATABASE`). Optionally set **`MATRIXONE_AUTO_CREATE_DATABASE=1`** so the first `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
+Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development. To isolate from production on one MatrixOne host, set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`). Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
 

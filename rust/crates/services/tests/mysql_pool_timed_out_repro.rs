@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use astra_core::{MatrixOneSettings, resolve_matrixone_database_name};
+use astra_core::{MatrixOneSettings, resolve_database_name};
 use sqlx::mysql::MySqlPoolOptions;
 
 fn load_repo_dotenv() {
@@ -31,7 +31,7 @@ fn matrixone_from_env() -> MatrixOneSettings {
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
             .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_matrixone_database_name(&|k| std::env::var(k).ok()),
+        database: resolve_database_name(&|k| std::env::var(k).ok()),
     }
 }
 

@@ -5,11 +5,9 @@
 //! ```
 //!
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev.
-//! Effective database name includes optional `MATRIXONE_DATABASE_PREFIX` (same as `AppSettings`).
+//! Effective database name includes optional `ASTRA_DATABASE_PREFIX` (same as `AppSettings`).
 
-use astra_core::{
-    DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_matrixone_database_name,
-};
+use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_database_name};
 use astra_services::storage::ensure_core_schema;
 use astra_services::team_persistence::{
     MatrixOneTeamStore, TeamBudget, TeamCoordination, TeamDefinition, TeamMemberDef,
@@ -34,7 +32,7 @@ fn require_it_env() -> MatrixOneSettings {
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
             .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: resolve_matrixone_database_name(&|k| std::env::var(k).ok()),
+        database: resolve_database_name(&|k| std::env::var(k).ok()),
     }
 }
 

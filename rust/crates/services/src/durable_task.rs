@@ -2193,7 +2193,7 @@ pub struct MatrixOneDurableTaskLifecycle {
 impl MatrixOneDurableTaskLifecycle {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, work_dir: std::path::PathBuf) -> Self {
         // Default: database-level snapshot for the configured database.
-        let database = astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok());
+        let database = astra_core::resolve_database_name(&|k| std::env::var(k).ok());
         let branch_ops: Arc<dyn TaskBranchOps> =
             Arc::new(TaskBranchService::new(pool.clone(), database));
         Self {

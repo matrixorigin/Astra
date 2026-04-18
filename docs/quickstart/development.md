@@ -72,7 +72,7 @@ Each DB test must be fully isolated: unique IDs, no shared mutable state, no ord
 make dev-db-connect       # mysql CLI into MatrixOne
 ```
 
-- Schema auto-created on API startup when `MATRIXONE_AUTO_CREATE_DATABASE=1`
+- Schema auto-created on API startup when `ASTRA_AUTO_CREATE_DATABASE=1`
 - DDL lives in `rust/crates/services/src/storage.rs`
 - All tables use `IF NOT EXISTS` — safe to re-run
 

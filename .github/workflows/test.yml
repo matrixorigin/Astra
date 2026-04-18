@@ -166,9 +166,9 @@ jobs:
       MATRIXONE_PORT: "6001"
       MATRIXONE_USER: root
       MATRIXONE_PASSWORD: "111"
-      MATRIXONE_DATABASE: astra_runtime
-      MATRIXONE_DATABASE_PREFIX: "test_"
-      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      ASTRA_DATABASE: astra_runtime
+      ASTRA_DATABASE_PREFIX: "test_"
+      ASTRA_AUTO_CREATE_DATABASE: "1"
       JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
       SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
       TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
@@ -176,8 +176,11 @@ jobs:
       CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key
-      MEMORIA_EMBEDDING_PROVIDER: mock
-      MEMORIA_EMBEDDING_DIM: "384"
+      MEMORIA_EMBEDDING_PROVIDER: openai
+      MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
+      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
+      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM }}
     steps:
       - uses: actions/checkout@v4
       - name: Prepare dependency env
@@ -186,6 +189,9 @@ jobs:
           {
             echo "MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}"
             echo "MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER}"
+            echo "MEMORIA_EMBEDDING_API_KEY=${MEMORIA_EMBEDDING_API_KEY}"
+            echo "MEMORIA_EMBEDDING_BASE_URL=${MEMORIA_EMBEDDING_BASE_URL}"
+            echo "MEMORIA_EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL}"
             echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
           } >> .env
       - name: Start dependencies

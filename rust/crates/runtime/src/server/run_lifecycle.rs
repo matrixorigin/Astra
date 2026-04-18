@@ -2471,7 +2471,7 @@ mod tests {
                 .unwrap_or(6001),
             user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
             password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
-            database: astra_core::resolve_matrixone_database_name_or(&lookup, "test_astra_runtime"),
+            database: astra_core::resolve_database_name_or(&lookup, "test_astra_runtime"),
         }
     }
 

@@ -70,7 +70,7 @@ api_reachable() {
 
 matrixone_db_name() {
     if [ -f .env ]; then
-        grep -E '^MATRIXONE_DATABASE=' .env | tail -1 | cut -d'=' -f2- | tr -d '' || true
+        grep -E '^ASTRA_DATABASE=' .env | tail -1 | cut -d'=' -f2- | tr -d '' || true
     fi
 }
 

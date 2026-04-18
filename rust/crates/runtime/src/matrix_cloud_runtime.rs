@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
-use astra_core::{MatrixOneSettings, SharedPool, resolve_matrixone_database_name};
+use astra_core::{MatrixOneSettings, SharedPool, resolve_database_name};
 use astra_services::{
     CloudTransport, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
@@ -38,7 +38,7 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
             .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.into()),
-        database: resolve_matrixone_database_name(&|k| std::env::var(k).ok()),
+        database: resolve_database_name(&|k| std::env::var(k).ok()),
     }
 }
 

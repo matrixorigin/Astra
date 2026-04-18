@@ -194,7 +194,7 @@ where
     Ok(result.rows_affected())
 }
 
-/// When `MATRIXONE_AUTO_CREATE_DATABASE=1`, connect to a bootstrap catalog (default `mysql`) and
+/// When `ASTRA_AUTO_CREATE_DATABASE=1`, connect to a bootstrap catalog (default `mysql`) and
 /// run `CREATE DATABASE IF NOT EXISTS` for [`MatrixOneSettings::database`] before normal DDL.
 async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
     use std::error::Error;
@@ -237,7 +237,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         .await;
     let _file_lock = acquire_core_schema_file_lock(settings)?;
 
-    if std::env::var("MATRIXONE_AUTO_CREATE_DATABASE")
+    if std::env::var("ASTRA_AUTO_CREATE_DATABASE")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
