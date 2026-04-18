@@ -46,6 +46,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -72,6 +73,7 @@ jobs:
     name: "Test: astra-runtime"
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,6 +111,7 @@ jobs:
     name: "Test: turn-core + services"
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -128,6 +131,7 @@ jobs:
     name: "Test: core crates + bridge hooks"
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -152,10 +156,10 @@ jobs:
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
           --features bridge-e2e-hooks --profile ci
 
-  # ── Stage 3: online tests (needs DB, runs after offline passes) ────
+  # ── Stage 3: online tests (needs DB, runs in parallel with offline) ──
   test-online:
     name: "Test: online (DB)"
-    needs: [shard-a, shard-b, shard-c, shard-d]
+    needs: [build]
     runs-on: ubuntu-latest
     env:
       MATRIXONE_HOST: localhost
