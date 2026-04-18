@@ -391,6 +391,7 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "multi_edit",
     "delete_file",
     "git_commit",
+    "git_revert_commit",
     "git_stash",
     "github_create_issue",
 ];
@@ -814,6 +815,7 @@ mod tests {
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"multi_edit"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_revert_commit"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_stash"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"github_create_issue"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
