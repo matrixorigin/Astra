@@ -21,6 +21,8 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use astra_core::sync_poison::{recover_rwlock_read, recover_rwlock_write};
+
 use crate::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
     HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
@@ -76,20 +78,18 @@ impl TurnTraceCollector {
     }
 
     pub fn set_session_id(&self, session_id: impl Into<String>) {
-        if let Ok(mut state) = self.inner.write() {
-            let session_id = session_id.into();
-            if !session_id.is_empty() {
-                state.session_id = session_id;
-            }
+        let mut state = recover_rwlock_write(&self.inner);
+        let session_id = session_id.into();
+        if !session_id.is_empty() {
+            state.session_id = session_id;
         }
     }
 
     pub fn set_turn_id(&self, turn_id: impl Into<String>) {
-        if let Ok(mut state) = self.inner.write() {
-            let turn_id = turn_id.into();
-            if !turn_id.is_empty() {
-                state.turn_id = turn_id;
-            }
+        let mut state = recover_rwlock_write(&self.inner);
+        let turn_id = turn_id.into();
+        if !turn_id.is_empty() {
+            state.turn_id = turn_id;
         }
     }
 
@@ -97,9 +97,8 @@ impl TurnTraceCollector {
 
     /// Record system prompt breakdown.
     pub fn record_system_prompt(&self, breakdown: SystemPromptBreakdown) {
-        if let Ok(mut state) = self.inner.write() {
-            state.system_prompt = Some(breakdown);
-        }
+        let mut state = recover_rwlock_write(&self.inner);
+        state.system_prompt = Some(breakdown);
     }
 
     /// Record tool selection results.
@@ -120,28 +119,26 @@ impl TurnTraceCollector {
             per_tool_costs,
             latency_ms,
         );
-        if let Ok(mut state) = self.inner.write() {
-            state.tools = Some(trace);
-        }
+        let mut state = recover_rwlock_write(&self.inner);
+        state.tools = Some(trace);
     }
 
     /// Record memory retrieval results.
     /// Set per-turn history retention data.
     pub fn set_history_retained(&self, turns: &[crate::context_assembly_trace::TurnRetention]) {
-        if let Ok(mut state) = self.inner.write() {
-            let had_history = state.history.is_some();
-            let hist = state
-                .history
-                .get_or_insert_with(HistorySelectionTrace::default);
-            hist.turns_retained = turns.to_vec();
-            hist.total_turns_available = turns.len() as u32;
-            let total: u32 = turns.iter().map(|t| t.tokens).sum();
-            hist.tokens_after = total;
-            // If record_compression was never called (no prior history trace),
-            // default tokens_before to tokens_after (no compression occurred).
-            if !had_history {
-                hist.tokens_before = total;
-            }
+        let mut state = recover_rwlock_write(&self.inner);
+        let had_history = state.history.is_some();
+        let hist = state
+            .history
+            .get_or_insert_with(HistorySelectionTrace::default);
+        hist.turns_retained = turns.to_vec();
+        hist.total_turns_available = turns.len() as u32;
+        let total: u32 = turns.iter().map(|t| t.tokens).sum();
+        hist.tokens_after = total;
+        // If record_compression was never called (no prior history trace),
+        // default tokens_before to tokens_after (no compression occurred).
+        if !had_history {
+            hist.tokens_before = total;
         }
     }
 
@@ -154,9 +151,8 @@ impl TurnTraceCollector {
     ) {
         let trace =
             build_memory_trace_from_retrieval(query, candidates_count, ranked_results, latency_ms);
-        if let Ok(mut state) = self.inner.write() {
-            state.memory = Some(trace);
-        }
+        let mut state = recover_rwlock_write(&self.inner);
+        state.memory = Some(trace);
     }
 
     /// Record compression pipeline results.
@@ -175,9 +171,8 @@ impl TurnTraceCollector {
             final_tokens,
             layer_results,
         );
-        if let Ok(mut state) = self.inner.write() {
-            state.history = Some(trace);
-        }
+        let mut state = recover_rwlock_write(&self.inner);
+        state.history = Some(trace);
     }
 
     /// Record token budget allocation.
@@ -185,42 +180,41 @@ impl TurnTraceCollector {
     /// Merges with any existing estimate: preserves non-zero component breakdowns
     /// from `record_token_budget_estimate` while updating measured totals.
     pub fn record_token_budget(&self, budget: TokenBudgetTrace) {
-        if let Ok(mut state) = self.inner.write() {
-            if let Some(ref mut existing) = state.token_budget {
-                // Preserve CLI-estimated component breakdown; overwrite measured fields.
-                existing.max_tokens = budget.max_tokens;
-                existing.budget_pressure = budget.budget_pressure;
-                existing.compression_triggered = budget.compression_triggered;
-                // Only overwrite component fields if the new budget has non-zero values.
-                if budget.system_prompt_tokens > 0 {
-                    existing.system_prompt_tokens = budget.system_prompt_tokens;
-                }
-                if budget.history_tokens > 0 {
-                    existing.history_tokens = budget.history_tokens;
-                }
-                if budget.memory_tokens > 0 {
-                    existing.memory_tokens = budget.memory_tokens;
-                }
-                if budget.tool_schema_tokens > 0 {
-                    existing.tool_schema_tokens = budget.tool_schema_tokens;
-                }
-                if budget.user_message_tokens > 0 {
-                    existing.user_message_tokens = budget.user_message_tokens;
-                }
-                let component_total = budget_component_total(existing);
-                existing.total_used = if component_total > 0 {
-                    component_total
-                } else {
-                    budget.total_used
-                };
-            } else {
-                let mut budget = budget;
-                let component_total = budget_component_total(&budget);
-                if component_total > 0 {
-                    budget.total_used = component_total;
-                }
-                state.token_budget = Some(budget);
+        let mut state = recover_rwlock_write(&self.inner);
+        if let Some(ref mut existing) = state.token_budget {
+            // Preserve CLI-estimated component breakdown; overwrite measured fields.
+            existing.max_tokens = budget.max_tokens;
+            existing.budget_pressure = budget.budget_pressure;
+            existing.compression_triggered = budget.compression_triggered;
+            // Only overwrite component fields if the new budget has non-zero values.
+            if budget.system_prompt_tokens > 0 {
+                existing.system_prompt_tokens = budget.system_prompt_tokens;
             }
+            if budget.history_tokens > 0 {
+                existing.history_tokens = budget.history_tokens;
+            }
+            if budget.memory_tokens > 0 {
+                existing.memory_tokens = budget.memory_tokens;
+            }
+            if budget.tool_schema_tokens > 0 {
+                existing.tool_schema_tokens = budget.tool_schema_tokens;
+            }
+            if budget.user_message_tokens > 0 {
+                existing.user_message_tokens = budget.user_message_tokens;
+            }
+            let component_total = budget_component_total(existing);
+            existing.total_used = if component_total > 0 {
+                component_total
+            } else {
+                budget.total_used
+            };
+        } else {
+            let mut budget = budget;
+            let component_total = budget_component_total(&budget);
+            if component_total > 0 {
+                budget.total_used = component_total;
+            }
+            state.token_budget = Some(budget);
         }
     }
 
@@ -241,50 +235,47 @@ impl TurnTraceCollector {
         max_tokens: u32,
         budget_pressure: f64,
     ) {
-        if let Ok(mut state) = self.inner.write() {
-            let budget = state
-                .token_budget
-                .get_or_insert_with(TokenBudgetTrace::default);
-            budget.system_prompt_tokens = system_prompt_tokens;
-            budget.history_tokens = history_tokens;
-            budget.memory_tokens = memory_tokens;
-            budget.tool_schema_tokens = tool_schema_tokens;
-            budget.user_message_tokens = user_message_tokens;
-            // Set estimated total (runtime will overwrite with actual measured value later)
-            if budget.total_used == 0 {
-                budget.total_used = estimated_total;
-            }
-            if budget.max_tokens == 0 {
-                budget.max_tokens = max_tokens;
-            }
-            if budget.budget_pressure == 0.0 {
-                budget.budget_pressure = budget_pressure;
-            }
+        let mut state = recover_rwlock_write(&self.inner);
+        let budget = state
+            .token_budget
+            .get_or_insert_with(TokenBudgetTrace::default);
+        budget.system_prompt_tokens = system_prompt_tokens;
+        budget.history_tokens = history_tokens;
+        budget.memory_tokens = memory_tokens;
+        budget.tool_schema_tokens = tool_schema_tokens;
+        budget.user_message_tokens = user_message_tokens;
+        // Set estimated total (runtime will overwrite with actual measured value later)
+        if budget.total_used == 0 {
+            budget.total_used = estimated_total;
+        }
+        if budget.max_tokens == 0 {
+            budget.max_tokens = max_tokens;
+        }
+        if budget.budget_pressure == 0.0 {
+            budget.budget_pressure = budget_pressure;
         }
     }
 
     /// Update just the system_prompt_tokens field without clobbering other budget fields.
     pub fn set_system_prompt_tokens(&self, tokens: u32) {
-        if let Ok(mut state) = self.inner.write() {
-            let budget = state
-                .token_budget
-                .get_or_insert_with(TokenBudgetTrace::default);
-            budget.system_prompt_tokens = tokens;
-        }
+        let mut state = recover_rwlock_write(&self.inner);
+        let budget = state
+            .token_budget
+            .get_or_insert_with(TokenBudgetTrace::default);
+        budget.system_prompt_tokens = tokens;
     }
 
     /// Add a decision explanation.
     pub fn add_explanation(&self, explanation: DecisionExplanation) {
-        if let Ok(mut state) = self.inner.write() {
-            state.explanations.push(explanation);
-        }
+        let mut state = recover_rwlock_write(&self.inner);
+        state.explanations.push(explanation);
     }
 
     // ─── Finalization ────────────────────────────────────────────────────────
 
     /// Finalize and return the complete trace.
     pub fn finalize(&self) -> ContextAssemblyTrace {
-        let state = self.inner.read().expect("lock poisoned");
+        let state = recover_rwlock_read(&self.inner);
 
         let mut builder = ContextAssemblyTraceBuilder::new(&state.turn_id, &state.session_id);
 
@@ -327,7 +318,7 @@ impl TurnTraceCollector {
             return Ok(trace);
         }
 
-        let state = self.inner.read().expect("lock poisoned");
+        let state = recover_rwlock_read(&self.inner);
         let writer = JournalWriter::new(&state.session_id)?;
         let event = JournalEvent::context_assembly_recorded(
             Some(&state.session_id),
@@ -341,7 +332,7 @@ impl TurnTraceCollector {
 
     /// Check if any data has been recorded.
     pub fn has_data(&self) -> bool {
-        let state = self.inner.read().expect("lock poisoned");
+        let state = recover_rwlock_read(&self.inner);
         state.system_prompt.is_some()
             || state.history.is_some()
             || state.memory.is_some()
@@ -351,12 +342,12 @@ impl TurnTraceCollector {
 
     /// Check if tool selection trace has already been recorded.
     pub fn has_tool_trace(&self) -> bool {
-        self.inner.read().expect("lock poisoned").tools.is_some()
+        recover_rwlock_read(&self.inner).tools.is_some()
     }
 
     /// Get elapsed time since collector creation.
     pub fn elapsed_ms(&self) -> u64 {
-        let state = self.inner.read().expect("lock poisoned");
+        let state = recover_rwlock_read(&self.inner);
         state.started_at.elapsed().as_millis() as u64
     }
 }

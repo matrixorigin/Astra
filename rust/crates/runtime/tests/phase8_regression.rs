@@ -391,19 +391,19 @@ mod divergence_detection {
 
     #[test]
     fn healthy_empty() {
-        assert_eq!(detect_divergence(&[]), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&[]).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
     fn healthy_all_productive() {
         let sigs = make_sigs(&[&["memory_store"], &["github_list_prs"], &["write_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
     fn healthy_alternating() {
         let sigs = make_sigs(&[&["bash"], &["write_file"], &["bash"], &["memory_store"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     // ── Exploring patterns ──
@@ -411,14 +411,20 @@ mod divergence_detection {
     #[test]
     fn exploring_one_round() {
         let sigs = make_sigs(&[&["write_file"], &["bash"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(1));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(1)
+        );
     }
 
     #[test]
     fn exploring_two_rounds() {
         // With MAX_EXPLORATION_ROUNDS=3, two consecutive exploration-only tail rounds → Exploring(2)
         let sigs = make_sigs(&[&["write_file"], &["bash"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(2)
+        );
     }
 
     // ── Diverging patterns (the bad path) ──
@@ -427,7 +433,10 @@ mod divergence_detection {
     fn diverging_three_rounds() {
         // 3 consecutive exploration rounds → Diverging(3) at default MAX_EXPLORATION_ROUNDS
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(3)
+        );
     }
 
     #[test]
@@ -440,7 +449,10 @@ mod divergence_detection {
             &["read_file"],
             &["grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(5)
+        );
     }
 
     #[test]
@@ -456,7 +468,10 @@ mod divergence_detection {
             &["list_dir"],
             &["read_file"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(8));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(8)
+        );
     }
 
     #[test]
@@ -467,7 +482,10 @@ mod divergence_detection {
             &["list_dir", "glob"],
             &["read_file", "bash"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(3)
+        );
     }
 
     // ── Reset behavior ──
@@ -485,14 +503,17 @@ mod divergence_detection {
             &["bash"],
             &["bash"], // 2 more exploration → Exploring(2)
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(2)
+        );
     }
 
     #[test]
     fn reset_mixed_round_with_productive() {
         // A round with BOTH exploration and productive tools is NOT exploration-only
         let sigs = make_sigs(&[&["bash"], &["bash"], &["bash", "write_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     // ── Correction prompt ──

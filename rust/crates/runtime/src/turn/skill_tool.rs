@@ -2067,9 +2067,7 @@ fn run_hooks(actions: &[HookAction], skip_shell: bool) {
                     eprintln!("  ⚠ Skipping set_env hook for MCP skill: {key}={value}");
                     continue;
                 }
-                // SAFETY: hook env vars are set in the current process and are
-                // expected to be scoped to this skill invocation.
-                unsafe { std::env::set_var(key, value) };
+                astra_core::session_env_overlay::set(key, value);
             }
             HookAction::Custom { id, .. } => {
                 eprintln!("  ⚠ Custom hook '{id}' not yet implemented");

@@ -2,6 +2,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use astra_core::sync_poison::recover_mutex_lock;
+
 /// Circuit breaker states
 const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
@@ -105,10 +107,7 @@ impl CircuitBreaker {
 
     pub fn record_failure(&self) {
         self.failure_count.fetch_add(1, Ordering::SeqCst);
-        *self
-            .last_failure_time
-            .lock()
-            .expect("circuit breaker mutex") = Some(Instant::now());
+        *recover_mutex_lock(&self.last_failure_time) = Some(Instant::now());
 
         let current = self.state.load(Ordering::SeqCst);
         match current {
@@ -207,7 +206,7 @@ impl BridgeHealthMetrics {
             self.total_timeouts.fetch_add(1, Ordering::Relaxed);
         }
 
-        let mut window = self.recent_latencies.lock().expect("circuit breaker mutex");
+        let mut window = recover_mutex_lock(&self.recent_latencies);
         if window.len() >= LATENCY_WINDOW {
             window.remove(0);
         }
@@ -227,7 +226,7 @@ impl BridgeHealthMetrics {
         };
 
         let p99 = {
-            let window = self.recent_latencies.lock().expect("circuit breaker mutex");
+            let window = recover_mutex_lock(&self.recent_latencies);
             if window.is_empty() {
                 0
             } else {

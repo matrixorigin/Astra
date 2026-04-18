@@ -706,6 +706,13 @@ async fn do_elicitation(
 }
 
 /// Running MCP client connection.
+///
+/// # Concurrency Safety
+///
+/// `McpConnection` holds `Arc<AtomicBool>` flags for change notifications —
+/// these are lock-free and safe for concurrent access. For WebSocket
+/// connections, the bridge `JoinHandle`s are stored so task failures can be
+/// detected instead of silently degrading the connection.
 pub struct McpConnection {
     /// Server name.
     pub name: String,
@@ -723,6 +730,10 @@ pub struct McpConnection {
     prompts_changed: Arc<AtomicBool>,
     /// Flag set by the notification handler when the server's resource list changes.
     resources_changed: Arc<AtomicBool>,
+    /// JoinHandles for WebSocket reader/writer bridge tasks (None for stdio/SSE).
+    /// Stored so that task panics or unexpected exits are detectable instead of
+    /// silently degrading the connection.
+    ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
 }
 
 impl McpConnection {
@@ -828,6 +839,19 @@ impl McpConnection {
     /// Check if this server has a specific tool.
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.iter().any(|t| t.name == name)
+    }
+
+    /// Check whether WebSocket bridge tasks are still running.
+    ///
+    /// Returns `true` for non-WebSocket connections (stdio/SSE) since they
+    /// don't rely on bridge tasks. For WebSocket connections, returns `false`
+    /// if either bridge task has finished (error/panic/clean exit), which
+    /// means data flow is degraded or stopped.
+    pub fn ws_bridge_alive(&self) -> bool {
+        match &self.ws_bridge_handles {
+            None => true, // stdio/SSE — no bridge tasks needed
+            Some((read_h, write_h)) => !read_h.is_finished() && !write_h.is_finished(),
+        }
     }
 
     /// List all resources from this server.
@@ -1683,6 +1707,7 @@ async fn connect_stdio(
         tools_changed,
         prompts_changed,
         resources_changed,
+        ws_bridge_handles: None,
     })
 }
 
@@ -1748,6 +1773,7 @@ async fn connect_sse(
         tools_changed,
         prompts_changed,
         resources_changed,
+        ws_bridge_handles: None,
     })
 }
 
@@ -1809,7 +1835,7 @@ async fn connect_ws(
 
     // Bridge: WebSocket text frames → bytes for rmcp to read
     let reader_name = ws_name.clone();
-    tokio::spawn(async move {
+    let ws_read_handle = tokio::spawn(async move {
         loop {
             match ws_read.next().await {
                 Some(Ok(tungstenite::Message::Text(text))) => {
@@ -1837,7 +1863,7 @@ async fn connect_ws(
 
     // Bridge: rmcp writes → WebSocket text frames
     let writer_name = ws_name;
-    tokio::spawn(async move {
+    let ws_write_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(&mut bridge_read);
         let mut line = String::new();
         loop {
@@ -1887,6 +1913,7 @@ async fn connect_ws(
         tools_changed,
         prompts_changed,
         resources_changed,
+        ws_bridge_handles: Some((ws_read_handle, ws_write_handle)),
     })
 }
 
@@ -1961,14 +1988,22 @@ const BLOCKED_ENV_PREFIXES: &[&str] = &[
 const BLOCKED_ENV_EXACT: &[&str] = &[
     // Note: PATH is intentionally NOT blocked — MCP servers (especially Node.js)
     // need it to find executables. The server's env config can override if needed.
-    "IFS",            // Shell word-splitting attacks
-    "BASH_ENV",       // Bash startup injection
-    "ENV",            // POSIX shell startup injection
-    "CDPATH",         // Directory traversal manipulation
-    "GLOBIGNORE",     // Glob bypass
-    "SHELLOPTS",      // Shell option manipulation
-    "BASHOPTS",       // Bash option manipulation
-    "PROMPT_COMMAND", // Bash prompt injection
+    "IFS",               // Shell word-splitting attacks
+    "BASH_ENV",          // Bash startup injection
+    "ENV",               // POSIX shell startup injection
+    "CDPATH",            // Directory traversal manipulation
+    "GLOBIGNORE",        // Glob bypass
+    "SHELLOPTS",         // Shell option manipulation
+    "BASHOPTS",          // Bash option manipulation
+    "PROMPT_COMMAND",    // Bash prompt injection
+    "PYTHONPATH",        // Python import path injection
+    "NODE_PATH",         // Node.js module resolution injection
+    "JAVA_TOOL_OPTIONS", // JVM agent / property injection
+    "HOME",              // Tooling that follows $HOME (credentials, RC files)
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "DISPLAY",        // X11 socket hijack / GUI side channels
+    "RUST_BACKTRACE", // Verbose panic paths may leak paths / secrets
 ];
 
 /// Check if an environment variable name is dangerous and should be blocked.
@@ -2099,11 +2134,11 @@ mod tests {
             retry: RetryConfig::default(),
         };
 
-        let yaml = serde_yaml::to_string(&config).unwrap();
+        let yaml = serde_yml::to_string(&config).unwrap();
         assert!(yaml.contains("name: test"));
         assert!(yaml.contains("type: stdio"));
 
-        let parsed: McpServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let parsed: McpServerConfig = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(parsed.name, "test");
     }
 
@@ -2142,7 +2177,7 @@ transport:
   type: stdio
   command: ["echo"]
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         assert!(config.enabled);
         assert!(config.description.is_empty());
     }
@@ -2178,7 +2213,7 @@ transport:
     DEBUG: "true"
     LOG_LEVEL: "info"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
 
         assert_eq!(config.name, "filesystem");
         assert_eq!(config.description, "Local filesystem access");
@@ -2206,7 +2241,7 @@ transport:
   type: stdio
   command: ["python", "-m", "mcp_server"]
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
 
         assert_eq!(config.name, "simple");
         assert!(config.enabled); // default
@@ -2251,7 +2286,7 @@ mcp_servers:
             mcp_servers: Vec<McpServerConfig>,
         }
 
-        let configs: ConfigList = serde_yaml::from_str(yaml).unwrap();
+        let configs: ConfigList = serde_yml::from_str(yaml).unwrap();
 
         assert_eq!(configs.mcp_servers.len(), 3);
 
@@ -2380,8 +2415,8 @@ mcp_servers:
             },
         };
 
-        let yaml = serde_yaml::to_string(&original).unwrap();
-        let parsed: McpServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yml::to_string(&original).unwrap();
+        let parsed: McpServerConfig = serde_yml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.name, original.name);
         assert_eq!(parsed.description, original.description);
@@ -2441,7 +2476,7 @@ retry:
   initial_delay_ms: 500
   max_delay_ms: 10000
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.initial_delay_ms, 500);
         assert_eq!(config.retry.max_delay_ms, 10_000);
@@ -2455,7 +2490,7 @@ transport:
   type: stdio
   command: ["echo"]
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.initial_delay_ms, 1000);
         assert_eq!(config.retry.max_delay_ms, 30_000);
@@ -2680,7 +2715,7 @@ transport:
   headers:
     X-Api-Key: "abc123"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         assert_eq!(config.name, "remote-server");
         match &config.transport {
             Transport::Sse {
@@ -2704,7 +2739,7 @@ transport:
   type: http
   url: "http://localhost:8080/mcp"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Sse {
                 url,
@@ -2727,7 +2762,7 @@ transport:
   type: sse
   url: "http://localhost:3000"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Sse {
                 url,
@@ -2762,7 +2797,7 @@ mcp_servers:
             mcp_servers: Vec<McpServerConfig>,
         }
 
-        let configs: ConfigList = serde_yaml::from_str(yaml).unwrap();
+        let configs: ConfigList = serde_yml::from_str(yaml).unwrap();
         assert_eq!(configs.mcp_servers.len(), 2);
 
         assert!(matches!(
@@ -2784,7 +2819,7 @@ transport:
   url: "wss://api.example.com/mcp"
   auth_token: "ws-token"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         assert_eq!(config.name, "ws-server");
         match &config.transport {
             Transport::Ws {
@@ -2805,7 +2840,7 @@ transport:
   type: websocket
   url: "ws://localhost:9090/mcp"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Ws {
                 url, auth_token, ..
@@ -2825,7 +2860,7 @@ transport:
   type: ws
   url: "ws://localhost:3000"
 "#;
-        let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: McpServerConfig = serde_yml::from_str(yaml).unwrap();
         match &config.transport {
             Transport::Ws {
                 url, auth_token, ..
@@ -2860,7 +2895,7 @@ mcp_servers:
             mcp_servers: Vec<McpServerConfig>,
         }
 
-        let configs: ConfigList = serde_yaml::from_str(yaml).unwrap();
+        let configs: ConfigList = serde_yml::from_str(yaml).unwrap();
         assert_eq!(configs.mcp_servers.len(), 3);
         assert!(matches!(
             configs.mcp_servers[0].transport,
@@ -3664,11 +3699,18 @@ mcp_servers:
         assert!(is_dangerous_env_var("SHELLOPTS"));
         assert!(is_dangerous_env_var("BASHOPTS"));
         assert!(is_dangerous_env_var("PROMPT_COMMAND"));
+        assert!(is_dangerous_env_var("PYTHONPATH"));
+        assert!(is_dangerous_env_var("NODE_PATH"));
+        assert!(is_dangerous_env_var("JAVA_TOOL_OPTIONS"));
+        assert!(is_dangerous_env_var("HOME"));
+        assert!(is_dangerous_env_var("XDG_CONFIG_HOME"));
+        assert!(is_dangerous_env_var("XDG_DATA_HOME"));
+        assert!(is_dangerous_env_var("DISPLAY"));
+        assert!(is_dangerous_env_var("RUST_BACKTRACE"));
     }
 
     #[test]
     fn safe_env_vars_allowed() {
-        assert!(!is_dangerous_env_var("HOME"));
         assert!(!is_dangerous_env_var("USER"));
         assert!(!is_dangerous_env_var("TERM"));
         assert!(!is_dangerous_env_var("LANG"));

@@ -747,6 +747,10 @@ pub(super) async fn execute_cli_command(
                 || (!std::io::IsTerminal::is_terminal(&std::io::stderr())
                     && std::env::var("NO_COLOR").is_err())
             {
+                astra_core::session_env_overlay::set("NO_COLOR", "1");
+                // `crossterm` reads the real process environment for ANSI suppression, not the
+                // overlay. SAFETY: CLI `/chat` dispatch runs before concurrent tool work; setting
+                // `NO_COLOR` here matches the prior single-threaded initialization pattern.
                 unsafe {
                     std::env::set_var("NO_COLOR", "1");
                 }

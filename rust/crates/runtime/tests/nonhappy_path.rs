@@ -55,7 +55,7 @@ mod stall_detection {
         let tool_sigs = vec![sig.clone(), sig.clone(), sig.clone()];
 
         assert!(
-            detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "Should detect stall when same tool call repeats {} times",
             SERVER_STALL_WINDOW
         );
@@ -70,7 +70,7 @@ mod stall_detection {
         let tool_sigs = vec![sig1, sig2, sig3];
 
         assert!(
-            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "Should NOT detect stall with varied tool calls"
         );
     }

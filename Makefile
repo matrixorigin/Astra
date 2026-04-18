@@ -36,6 +36,7 @@ help:
 	@echo "  make check              - Run all static checks (lint + format + type)"
 	@echo "  make ci                 - Run CI checks (check + test)"
 	@echo "  make lint               - Run clippy (warnings are errors)"
+	@echo "  make audit              - Run cargo-audit on rust/ (needs: cargo install cargo-audit)"
 	@echo "  make format             - Format code"
 	@echo "  make format-check       - Check formatting"
 	@echo ""
@@ -411,6 +412,12 @@ clean:
 	@$(CARGO) clean $(CARGO_MANIFEST_FLAG)
 	@echo "✅ Build artifacts removed"
 
+.PHONY: clean-debug
+clean-debug:
+	@echo "Removing debug build artifacts..."
+	@rm -rf $(RUST_TARGET_DIR)/debug
+	@echo "✅ Debug artifacts removed"
+
 .PHONY: clean-incremental
 clean-incremental:
 	@echo "Cleaning incremental compilation cache..."
@@ -505,7 +512,7 @@ ci: check test
 .PHONY: lint
 lint:
 	@echo "Running clippy..."
-	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
+	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --release --all-targets -- -D warnings
 
 .PHONY: lint-fix
 lint-fix:
@@ -520,10 +527,16 @@ format-check:
 	@echo "Checking formatting..."
 	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all -- --check
 
+# RustSec dependency audit (same gate as GitHub static-checks workflow).
+.PHONY: audit
+audit:
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found; install with: cargo install cargo-audit"; exit 1; }
+	@cd rust && cargo audit
+
 .PHONY: type-check
 type-check:
 	@echo "Running compile checks..."
-	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
+	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --release --all-targets
 
 # ============================================================================
 # Memoria (Memory Service)

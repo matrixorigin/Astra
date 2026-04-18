@@ -9,6 +9,21 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Mutex;
+use url::Url;
+
+fn enforce_github_api_url(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url).map_err(|e| format!("Error: invalid GitHub URL: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("Error: GitHub API requests must use HTTPS".to_string());
+    }
+    match parsed.host_str() {
+        Some("api.github.com") => Ok(()),
+        Some(h) => Err(format!(
+            "Error: GitHub requests are restricted to https://api.github.com (got host {h:?})"
+        )),
+        None => Err("Error: GitHub URL must include host api.github.com".to_string()),
+    }
+}
 
 /// GitHub API client for tool operations.
 ///
@@ -65,6 +80,7 @@ impl GitHubClient {
         url: &str,
         payload: Option<&Value>,
     ) -> Result<Value, String> {
+        enforce_github_api_url(url)?;
         let mut request = self
             .client
             .request(method, url)
@@ -1809,6 +1825,24 @@ pub fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn enforce_github_api_url_accepts_official_host_https() {
+        assert!(enforce_github_api_url("https://api.github.com/repos/o/r").is_ok());
+        assert!(enforce_github_api_url("https://api.github.com:443/user").is_ok());
+    }
+
+    #[test]
+    fn enforce_github_api_url_rejects_non_https() {
+        assert!(enforce_github_api_url("http://api.github.com/user").is_err());
+    }
+
+    #[test]
+    fn enforce_github_api_url_rejects_non_github_host() {
+        assert!(enforce_github_api_url("https://github.com/repos/o/r").is_err());
+        assert!(enforce_github_api_url("https://evil.com/").is_err());
+        assert!(enforce_github_api_url("https://api.github.com.evil.com/").is_err());
+    }
 
     #[test]
     pub fn github_detail_defaults_to_brief() {

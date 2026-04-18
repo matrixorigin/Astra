@@ -225,7 +225,7 @@ pub fn load_user_themes() -> Vec<ThemeConfig> {
                 .is_some_and(|ext| ext == "yaml" || ext == "yml")
             {
                 if let Ok(contents) = std::fs::read_to_string(&path) {
-                    match serde_yaml::from_str::<ThemeConfig>(&contents) {
+                    match serde_yml::from_str::<ThemeConfig>(&contents) {
                         Ok(theme) => themes.push(theme),
                         Err(e) => {
                             eprintln!("  ⚠ Failed to parse theme {}: {e}", path.display());

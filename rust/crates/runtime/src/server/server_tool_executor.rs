@@ -2839,6 +2839,9 @@ impl ServerToolExecutor {
             Some(c) => c,
             None => return "Error: Missing 'command' parameter".to_string(),
         };
+        if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command(command) {
+            return reason;
+        }
         let timeout_secs = args
             .get("timeout")
             .and_then(|v| v.as_f64())

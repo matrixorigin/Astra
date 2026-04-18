@@ -260,7 +260,11 @@ impl TurnGuard {
         let mut severity = VerdictSeverity::Healthy;
 
         // 1. Stall detection
-        let stall_detected = stall::detect_server_stall(&self.tool_sigs, self.stall_window());
+        let stall_detected = stall::detect_server_stall(&self.tool_sigs, self.stall_window())
+            .unwrap_or_else(|e| {
+                tracing::warn!(target: "turn_guard", error = %e, "server stall detection failed; assuming no stall");
+                false
+            });
 
         if stall_detected {
             let deprioritized = self.health.deprioritized_tools();
@@ -285,7 +289,11 @@ impl TurnGuard {
         let divergence = stall::detect_divergence_with_budget(
             &self.tool_sigs,
             self.task_profile.exploration_round_budget,
-        );
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "turn_guard", error = %e, "divergence detection failed; assuming healthy");
+            DivergenceStatus::Healthy
+        });
         let divergence_detected = matches!(divergence, DivergenceStatus::Diverging(_));
         if divergence_detected {
             injections.push(stall::DIVERGENCE_CORRECTION.to_string());
@@ -296,7 +304,14 @@ impl TurnGuard {
         }
 
         // 3. Reward-hacking detection for the current turn.
-        let reward_hacking = stall::assess_reward_hacking(&self.latest_tool_calls, 0.0, None);
+        let reward_hacking = stall::assess_reward_hacking(&self.latest_tool_calls, 0.0, None)
+            .unwrap_or_else(|e| {
+                tracing::warn!(target: "turn_guard", error = %e, "reward hacking assessment failed; using zero risk");
+                stall::RewardHackingAssessment {
+                    risk: 0.0,
+                    flags: Vec::new(),
+                }
+            });
         if reward_hacking.risk >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
             && !reward_hacking.flags.is_empty()
         {

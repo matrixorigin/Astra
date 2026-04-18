@@ -1,6 +1,6 @@
 use crate::complete::build_turn_complete_event;
 use crate::execution_state::normalize_execution_state;
-use crate::stall::{SERVER_STALL_WINDOW, detect_divergence, detect_server_stall};
+use crate::stall::{DivergenceStatus, SERVER_STALL_WINDOW, detect_divergence, detect_server_stall};
 use crate::stream_events::build_edge_tool_call_event;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -511,8 +511,8 @@ pub fn build_turn_complete_event_from_bridge_state(
 ) -> serde_json::Map<String, serde_json::Value> {
     let tool_sigs = bridge_state_tool_signatures(bridge_state).unwrap_or_default();
     let has_tool_calls = !tool_sigs.is_empty();
-    let stall_detected = detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW);
-    let divergence_status = detect_divergence(&tool_sigs);
+    let stall_detected = detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap_or(false);
+    let divergence_status = detect_divergence(&tool_sigs).unwrap_or(DivergenceStatus::Healthy);
     let mut event = build_turn_complete_event(
         has_tool_calls,
         stall_detected,

@@ -51,7 +51,7 @@ struct RawFrontmatter {
     #[serde(default)]
     arguments: Vec<RawArgument>,
     #[serde(default)]
-    depends_on: Vec<serde_yaml::Value>,
+    depends_on: Vec<serde_yml::Value>,
     #[serde(default)]
     category: Option<String>,
     #[serde(default)]
@@ -118,7 +118,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
     let yaml_content = rest[..end_marker].trim();
     let markdown_body = rest[end_marker + 4..].trim().to_string();
 
-    let raw: RawFrontmatter = serde_yaml::from_str(yaml_content)
+    let raw: RawFrontmatter = serde_yml::from_str(yaml_content)
         .map_err(|e| SkillError::ParseFailed(format!("Failed to parse YAML frontmatter: {e}")))?;
 
     validate_skill_name(&raw.name)?;
@@ -197,20 +197,20 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
 
 /// Parse the `depends_on` field which supports both old format (list of strings)
 /// and new format (list of {name, version, type} objects).
-fn parse_dependencies(raw: &[serde_yaml::Value]) -> Result<Vec<Dependency>, SkillError> {
+fn parse_dependencies(raw: &[serde_yml::Value]) -> Result<Vec<Dependency>, SkillError> {
     let mut deps = Vec::new();
     for item in raw {
         match item {
-            serde_yaml::Value::String(name) => {
+            serde_yml::Value::String(name) => {
                 deps.push(Dependency {
                     name: name.clone(),
                     version: super::version::VersionConstraint::any(),
                     dep_type: super::version::DependencyType::Skill,
                 });
             }
-            serde_yaml::Value::Mapping(map) => {
+            serde_yml::Value::Mapping(map) => {
                 let name = map
-                    .get(serde_yaml::Value::String("name".into()))
+                    .get(serde_yml::Value::String("name".into()))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
                         SkillError::ParseFailed("dependency missing 'name' field".into())
@@ -218,14 +218,14 @@ fn parse_dependencies(raw: &[serde_yaml::Value]) -> Result<Vec<Dependency>, Skil
                     .to_string();
 
                 let version = map
-                    .get(serde_yaml::Value::String("version".into()))
+                    .get(serde_yml::Value::String("version".into()))
                     .and_then(|v| v.as_str())
                     .unwrap_or("*")
                     .parse()
                     .map_err(|e: String| SkillError::ParseFailed(e))?;
 
                 let dep_type = match map
-                    .get(serde_yaml::Value::String("type".into()))
+                    .get(serde_yml::Value::String("type".into()))
                     .and_then(|v| v.as_str())
                 {
                     Some("tool") => super::version::DependencyType::Tool,

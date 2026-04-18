@@ -148,7 +148,7 @@ fn load_declarative_config(project_root: &Path) -> FileRoot {
                 return FileRoot::default();
             }
         };
-        match serde_yaml::from_str::<FileRoot>(&raw) {
+        match serde_yml::from_str::<FileRoot>(&raw) {
             Ok(cfg) => {
                 if cfg.version != 1 {
                     astra_core::agent_warn!(

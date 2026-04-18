@@ -90,7 +90,7 @@ impl ToolSafetyGuard {
                 std::slice::from_ref(&tool_call),
                 SERVER_STALL_WINDOW,
             );
-            if detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW) {
+            if detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap_or(false) {
                 return Err(format!(
                     "Error: run_chain repeats the same step {SERVER_STALL_WINDOW} times in a row and was blocked as a likely stall."
                 ));

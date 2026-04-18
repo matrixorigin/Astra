@@ -3,8 +3,18 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use astra_core::RuntimeLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::tool_call_shape::{tool_call_arguments_value, tool_call_name};
+
+/// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
+#[derive(Debug, Clone, Error, PartialEq)]
+pub enum StallDetectionError {
+    #[error("stall window or exploration budget must be > 0 (got {0})")]
+    InvalidWindowOrBudget(usize),
+    #[error("quality score must be finite (got {0})")]
+    InvalidQuality(f64),
+}
 
 /// Require 3 consecutive identical tool call turns (not 2) to detect stall.
 /// Window=2 was too aggressive: legitimate retries and exploration patterns
@@ -105,13 +115,19 @@ pub fn record_server_tool_signatures(
 }
 
 /// Detect exact-repetition stall: same tool calls with same args repeated N times.
-pub fn detect_server_stall(tool_sigs: &[BTreeSet<String>], window: usize) -> bool {
+pub fn detect_server_stall(
+    tool_sigs: &[BTreeSet<String>],
+    window: usize,
+) -> Result<bool, StallDetectionError> {
+    if window == 0 {
+        return Err(StallDetectionError::InvalidWindowOrBudget(0));
+    }
     if tool_sigs.len() < window {
-        return false;
+        return Ok(false);
     }
 
     let recent = &tool_sigs[tool_sigs.len() - window..];
-    recent.iter().all(|sig| sig == &recent[window - 1])
+    Ok(recent.iter().all(|sig| sig == &recent[window - 1]))
 }
 
 // ─── CLI stream_chat_sse agentic loop (astra) ──────────────────────────────
@@ -146,11 +162,17 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
 }
 
 /// True when the last `window` rounds have **identical** tool-name sets (name-only stall in CLI loop).
-pub fn detect_cli_tool_name_stall(turn_tool_names: &[HashSet<String>], window: usize) -> bool {
-    turn_tool_names.len() >= window
+pub fn detect_cli_tool_name_stall(
+    turn_tool_names: &[HashSet<String>],
+    window: usize,
+) -> Result<bool, StallDetectionError> {
+    if window == 0 {
+        return Err(StallDetectionError::InvalidWindowOrBudget(0));
+    }
+    Ok(turn_tool_names.len() >= window
         && turn_tool_names[turn_tool_names.len() - window..]
             .windows(2)
-            .all(|w| w[0] == w[1])
+            .all(|w| w[0] == w[1]))
 }
 
 // ─── Divergence detection ───────────────────────────────────────────────────
@@ -213,13 +235,16 @@ pub fn assess_reward_hacking(
     tool_calls: &[Value],
     quality: f64,
     user_feedback_score: Option<i64>,
-) -> RewardHackingAssessment {
+) -> Result<RewardHackingAssessment, StallDetectionError> {
+    if !quality.is_finite() {
+        return Err(StallDetectionError::InvalidQuality(quality));
+    }
     let tool_names = ordered_tool_call_names(tool_calls);
     if tool_names.is_empty() {
-        return RewardHackingAssessment {
+        return Ok(RewardHackingAssessment {
             risk: 0.0,
             flags: Vec::new(),
-        };
+        });
     }
 
     let mut risk = 0.0_f64;
@@ -264,10 +289,10 @@ pub fn assess_reward_hacking(
         risk += 0.20;
     }
 
-    RewardHackingAssessment {
+    Ok(RewardHackingAssessment {
         risk: risk.clamp(0.0, 0.95),
         flags,
-    }
+    })
 }
 
 pub fn dampen_quality_for_reward_hacking(
@@ -330,16 +355,21 @@ Stop repeating cheap actions that do not advance the task.",
 
 /// Detect if the agent is diverging: last N rounds used ONLY exploration tools
 /// (bash, list_dir, read_file, grep, glob) with no productive tool calls.
-pub fn detect_divergence(tool_sigs: &[BTreeSet<String>]) -> DivergenceStatus {
+pub fn detect_divergence(
+    tool_sigs: &[BTreeSet<String>],
+) -> Result<DivergenceStatus, StallDetectionError> {
     detect_divergence_with_budget(tool_sigs, MAX_EXPLORATION_ROUNDS)
 }
 
 pub fn detect_divergence_with_budget(
     tool_sigs: &[BTreeSet<String>],
     exploration_round_budget: usize,
-) -> DivergenceStatus {
+) -> Result<DivergenceStatus, StallDetectionError> {
+    if exploration_round_budget == 0 {
+        return Err(StallDetectionError::InvalidWindowOrBudget(0));
+    }
     if tool_sigs.is_empty() {
-        return DivergenceStatus::Healthy;
+        return Ok(DivergenceStatus::Healthy);
     }
 
     let mut consecutive_exploration = 0;
@@ -358,11 +388,11 @@ pub fn detect_divergence_with_budget(
         }
     }
 
-    match consecutive_exploration {
+    Ok(match consecutive_exploration {
         0 => DivergenceStatus::Healthy,
         n if n >= exploration_round_budget => DivergenceStatus::Diverging(n),
         n => DivergenceStatus::Exploring(n),
-    }
+    })
 }
 
 /// Correction prompt injected when divergence is detected.
@@ -719,19 +749,19 @@ mod tests {
     #[test]
     fn stall_not_detected_below_window() {
         let sigs = make_sigs(&[&["bash"], &["bash"]]);
-        assert!(!detect_server_stall(&sigs, 3));
+        assert!(!detect_server_stall(&sigs, 3).unwrap());
     }
 
     #[test]
     fn stall_detected_repeated_exact() {
         let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        assert!(detect_server_stall(&sigs, 3));
+        assert!(detect_server_stall(&sigs, 3).unwrap());
     }
 
     #[test]
     fn stall_not_detected_different_tools() {
         let sigs = make_sigs(&[&["bash"], &["read_file"], &["bash"]]);
-        assert!(!detect_server_stall(&sigs, 3));
+        assert!(!detect_server_stall(&sigs, 3).unwrap());
     }
 
     // ── CLI agentic: sig/name helpers + name-only stall ──
@@ -772,7 +802,7 @@ mod tests {
     fn cli_tool_name_stall_three_identical_name_rounds() {
         let one: HashSet<String> = HashSet::from_iter([String::from("read_file")]);
         let v = vec![one.clone(), one.clone(), one];
-        assert!(detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW));
+        assert!(detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW).unwrap());
     }
 
     #[test]
@@ -780,47 +810,59 @@ mod tests {
         let rf: HashSet<String> = HashSet::from_iter([String::from("read_file")]);
         let bash: HashSet<String> = HashSet::from_iter([String::from("bash")]);
         let v = vec![rf.clone(), bash, rf];
-        assert!(!detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW));
+        assert!(!detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW).unwrap());
     }
 
     // ── Divergence detection ──
 
     #[test]
     fn divergence_healthy_empty() {
-        assert_eq!(detect_divergence(&[]), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&[]).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
     fn divergence_healthy_productive() {
         let sigs = make_sigs(&[&["github_list_prs"], &["memory_store"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
     fn divergence_exploring_one() {
         let sigs = make_sigs(&[&["bash"], &["github_list_prs"], &["bash"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(1));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(1)
+        );
     }
 
     #[test]
     fn divergence_exploring_two() {
         // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
         let sigs = make_sigs(&[&["github_list_prs"], &["bash"], &["list_dir"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(2)
+        );
     }
 
     #[test]
     fn divergence_exploring_three() {
         // 3 consecutive exploration rounds → Diverging (hits threshold of 3)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(3)
+        );
     }
 
     #[test]
     fn divergence_exploring_four() {
         // 4 consecutive exploration rounds → Diverging (past threshold of 3)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["grep"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(4));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(4)
+        );
     }
 
     #[test]
@@ -833,7 +875,10 @@ mod tests {
             &["read_file"],
             &["glob"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(5)
+        );
     }
 
     #[test]
@@ -849,7 +894,10 @@ mod tests {
             &["list_dir"],
             &["grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(8));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(8)
+        );
     }
 
     #[test]
@@ -865,7 +913,10 @@ mod tests {
             &["grep"],
             &["read_file"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(9));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(9)
+        );
     }
 
     #[test]
@@ -879,13 +930,16 @@ mod tests {
             &["bash"],
             &["list_dir"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(2)
+        );
     }
 
     #[test]
     fn divergence_multi_tool_with_productive() {
         let sigs = make_sigs(&[&["bash", "memory_store"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Healthy);
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
@@ -896,7 +950,10 @@ mod tests {
             &["list_dir", "read_file"],
             &["bash", "glob"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(3)
+        );
     }
 
     #[test]
@@ -909,7 +966,10 @@ mod tests {
             &["grep", "read_file"],
             &["bash", "list_dir"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(5));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(5)
+        );
     }
 
     /// Regression test for session f9903b97: grep→read_file→grep→grep is
@@ -924,7 +984,10 @@ mod tests {
             &["grep", "grep"], // round 3: more search
         ]);
         // 4 consecutive exploration rounds → Diverging(4) with threshold=3
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(4));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(4)
+        );
     }
 
     #[test]
@@ -934,7 +997,7 @@ mod tests {
             serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
             serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
         ];
-        let assessment = assess_reward_hacking(&tool_calls, 0.9, None);
+        let assessment = assess_reward_hacking(&tool_calls, 0.9, None).unwrap();
         assert!(assessment.risk >= 0.8, "{assessment:?}");
         assert!(
             assessment
@@ -961,7 +1024,7 @@ mod tests {
             serde_json::json!({"name": "str_replace", "arguments": {"path": "c.rs", "old": "x", "new": "y"}}),
             serde_json::json!({"name": "str_replace", "arguments": {"path": "d.rs", "old": "x", "new": "y"}}),
         ];
-        let assessment = assess_reward_hacking(&tool_calls, 0.5, None);
+        let assessment = assess_reward_hacking(&tool_calls, 0.5, None).unwrap();
         assert!(
             !assessment
                 .flags
@@ -1372,7 +1435,7 @@ mod tests {
             "arguments": {"path": "rust/crates/astra/Cargo.toml"}
         })];
         record_server_tool_signatures(&mut tool_sigs, &calls_1, window);
-        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
+        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap());
 
         // Round 2: list_dir + read_file(different path)
         let calls_2 = vec![
@@ -1381,7 +1444,7 @@ mod tests {
         ];
         record_server_tool_signatures(&mut tool_sigs, &calls_2, window);
         assert!(
-            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "different tool calls across rounds must not trigger stall"
         );
 
@@ -1392,7 +1455,7 @@ mod tests {
         })];
         record_server_tool_signatures(&mut tool_sigs, &calls_3, window);
         assert!(
-            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "read_file with different paths across rounds must not trigger stall"
         );
 
@@ -1403,7 +1466,7 @@ mod tests {
         })];
         record_server_tool_signatures(&mut tool_sigs, &calls_4, window);
         assert!(
-            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "str_replace after read_file must not trigger stall"
         );
     }
@@ -1420,17 +1483,17 @@ mod tests {
             "arguments": {"path": "src/main.rs"}
         })];
         record_server_tool_signatures(&mut tool_sigs, &calls, window);
-        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW));
+        assert!(!detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap());
 
         record_server_tool_signatures(&mut tool_sigs, &calls, window);
         assert!(
-            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            !detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "2 identical calls should not trigger stall with window=3"
         );
 
         record_server_tool_signatures(&mut tool_sigs, &calls, window);
         assert!(
-            detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW),
+            detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW).unwrap(),
             "3 identical tool calls across rounds must trigger stall"
         );
     }
@@ -1590,20 +1653,20 @@ mod tests {
 
     #[test]
     fn stall_empty_input() {
-        assert!(!detect_server_stall(&[], 3));
+        assert!(!detect_server_stall(&[], 3).unwrap());
     }
 
     #[test]
     fn stall_detected_in_longer_history() {
         // Varied history followed by 3 identical → stall
         let sigs = make_sigs(&[&["grep"], &["list_dir"], &["bash"], &["bash"], &["bash"]]);
-        assert!(detect_server_stall(&sigs, 3));
+        assert!(detect_server_stall(&sigs, 3).unwrap());
     }
 
     #[test]
     fn stall_not_detected_when_last_entry_differs() {
         let sigs = make_sigs(&[&["bash"], &["bash"], &["grep"]]);
-        assert!(!detect_server_stall(&sigs, 3));
+        assert!(!detect_server_stall(&sigs, 3).unwrap());
     }
 
     #[test]
@@ -1613,7 +1676,7 @@ mod tests {
             .into_iter()
             .collect();
         let sigs = vec![round.clone(), round.clone(), round];
-        assert!(detect_server_stall(&sigs, 3));
+        assert!(detect_server_stall(&sigs, 3).unwrap());
     }
 
     #[test]
@@ -1625,7 +1688,7 @@ mod tests {
             .into_iter()
             .collect();
         let sigs = vec![round_a.clone(), round_b, round_a];
-        assert!(!detect_server_stall(&sigs, 3));
+        assert!(!detect_server_stall(&sigs, 3).unwrap());
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1634,13 +1697,13 @@ mod tests {
 
     #[test]
     fn cli_name_stall_empty_input() {
-        assert!(!detect_cli_tool_name_stall(&[], 3));
+        assert!(!detect_cli_tool_name_stall(&[], 3).unwrap());
     }
 
     #[test]
     fn cli_name_stall_single_entry() {
         let one: HashSet<String> = HashSet::from_iter([String::from("bash")]);
-        assert!(!detect_cli_tool_name_stall(&[one], 3));
+        assert!(!detect_cli_tool_name_stall(&[one], 3).unwrap());
     }
 
     #[test]
@@ -1648,13 +1711,13 @@ mod tests {
         let set: HashSet<String> =
             HashSet::from_iter(["bash".to_string(), "read_file".to_string()]);
         let v = vec![set.clone(), set.clone(), set];
-        assert!(detect_cli_tool_name_stall(&v, 3));
+        assert!(detect_cli_tool_name_stall(&v, 3).unwrap());
     }
 
     #[test]
     fn cli_name_stall_window_of_one() {
         let one: HashSet<String> = HashSet::from_iter([String::from("bash")]);
-        assert!(detect_cli_tool_name_stall(&[one], 1));
+        assert!(detect_cli_tool_name_stall(&[one], 1).unwrap());
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1665,7 +1728,7 @@ mod tests {
     fn divergence_with_budget_2_triggers_at_2() {
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 2),
+            detect_divergence_with_budget(&sigs, 2).unwrap(),
             DivergenceStatus::Diverging(2)
         );
     }
@@ -1674,7 +1737,7 @@ mod tests {
     fn divergence_with_budget_2_exploring_at_1() {
         let sigs = make_sigs(&[&["github_list_prs"], &["bash"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 2),
+            detect_divergence_with_budget(&sigs, 2).unwrap(),
             DivergenceStatus::Exploring(1)
         );
     }
@@ -1683,7 +1746,7 @@ mod tests {
     fn divergence_with_budget_1_triggers_immediately() {
         let sigs = make_sigs(&[&["bash"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 1),
+            detect_divergence_with_budget(&sigs, 1).unwrap(),
             DivergenceStatus::Diverging(1)
         );
     }
@@ -1692,7 +1755,7 @@ mod tests {
     fn divergence_with_budget_larger_than_history() {
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 10),
+            detect_divergence_with_budget(&sigs, 10).unwrap(),
             DivergenceStatus::Exploring(2)
         );
     }
@@ -1700,8 +1763,16 @@ mod tests {
     #[test]
     fn divergence_with_budget_empty_sigs() {
         assert_eq!(
-            detect_divergence_with_budget(&[], 5),
+            detect_divergence_with_budget(&[], 5).unwrap(),
             DivergenceStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn divergence_with_budget_zero_is_error() {
+        assert_eq!(
+            detect_divergence_with_budget(&[], 0),
+            Err(StallDetectionError::InvalidWindowOrBudget(0))
         );
     }
 
@@ -1711,7 +1782,10 @@ mod tests {
         let mut sigs = make_sigs(&[&["bash"], &["read_file"]]);
         sigs.push(BTreeSet::new()); // empty round
         sigs.extend(make_sigs(&[&["bash"]]));
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(1));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(1)
+        );
     }
 
     #[test]
@@ -1724,7 +1798,10 @@ mod tests {
             &["bash"],
             &["grep"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
+        assert_eq!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Exploring(2)
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════

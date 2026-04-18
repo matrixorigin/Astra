@@ -92,4 +92,6 @@ review/
 .mo-session/
 rust/budget-app/
 .mo-delivery-*.json
-rust/.cargo/
+# Local cargo config lives here; only audit policy is tracked for CI.
+rust/.cargo/*
+!rust/.cargo/audit.toml

@@ -117,7 +117,7 @@ impl AgentRegistry {
     fn load_file(&mut self, path: &Path) -> Result<(), String> {
         let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
         let config: TeamConfigFile =
-            serde_yaml::from_str(&content).map_err(|e| format!("YAML parse error: {e}"))?;
+            serde_yml::from_str(&content).map_err(|e| format!("YAML parse error: {e}"))?;
 
         for agent_config in config.agents {
             let def = self.resolve_config(agent_config)?;
@@ -303,7 +303,7 @@ agents:
       - view
     read_only: true
 "#;
-        let config: TeamConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let config: TeamConfigFile = serde_yml::from_str(yaml).expect("fixture YAML must parse");
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "test-agent");
         assert_eq!(config.agents[0].extends, Some("task".to_string()));

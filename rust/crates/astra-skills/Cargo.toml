@@ -25,7 +25,7 @@ walkdir = "2.5"
 dirs = "5"
 
 # YAML for manifest parsing
-serde_yaml = "0.9"
+serde_yml.workspace = true
 
 # TOML for manifest parsing
 toml = "0.8"
@@ -39,8 +39,8 @@ axum = { workspace = true }
 
 # Service integration
 astra-services = { path = "../services" }
+astra-core = { path = "../core" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
-astra-core = { path = "../core" }

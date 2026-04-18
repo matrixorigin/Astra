@@ -30,3 +30,9 @@ jobs:
         run: make format-check
       - name: Run cargo check
         run: make type-check
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.1
+      - name: cargo audit (RustSec advisory DB)
+        working-directory: rust
+        run: cargo audit

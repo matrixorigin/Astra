@@ -16,22 +16,23 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::env_tools;
+
 /// Keep in sync with [`super::passive_cargo_check`] budget.
 const MAX_PASSIVE_DIAG_CHARS: usize = 12_000;
 
 fn passive_tsc_check_enabled() -> bool {
-    match std::env::var("ASTRA_PASSIVE_TSC_CHECK") {
-        Ok(v) => {
+    match env_tools::session_env_overlay_get("ASTRA_PASSIVE_TSC_CHECK") {
+        Some(v) => {
             let v = v.trim().to_lowercase();
             !(v.is_empty() || v == "0" || v == "false" || v == "off")
         }
-        Err(_) => true,
+        None => true,
     }
 }
 
 fn passive_tsc_timeout() -> Duration {
-    let secs = std::env::var("ASTRA_PASSIVE_TSC_TIMEOUT_SECS")
-        .ok()
+    let secs = env_tools::session_env_overlay_get("ASTRA_PASSIVE_TSC_TIMEOUT_SECS")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(90);
     Duration::from_secs(secs.clamp(1, 300))
@@ -227,14 +228,10 @@ mod tests {
         struct Clear;
         impl Drop for Clear {
             fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("ASTRA_PASSIVE_TSC_CHECK");
-                }
+                env_tools::session_env_overlay_remove("ASTRA_PASSIVE_TSC_CHECK");
             }
         }
-        unsafe {
-            std::env::set_var("ASTRA_PASSIVE_TSC_CHECK", "0");
-        }
+        env_tools::session_env_overlay_set("ASTRA_PASSIVE_TSC_CHECK", "0");
         let _c = Clear;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

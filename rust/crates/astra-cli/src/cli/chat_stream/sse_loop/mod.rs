@@ -149,7 +149,7 @@ pub(crate) async fn stream_chat_sse(
         };
         // Set turn index so journal entries are tagged for undo
         ex.journal_turn_index
-            .store(p.turn_index, std::sync::atomic::Ordering::Relaxed);
+            .store(p.turn_index, std::sync::atomic::Ordering::Release);
         let ex = if let Some(ref mgr) = p.mcp_manager {
             ex.with_mcp_manager(mgr.clone())
         } else {

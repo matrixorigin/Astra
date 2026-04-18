@@ -6,13 +6,14 @@ description = "Extracted tool execution library for astra-engine. Shared by CLI 
 
 [dependencies]
 astra-core.workspace = true
+astra-sandbox = { path = "../astra-sandbox" }
 async-trait.workspace = true
 chrono.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9.34"
+serde_yml.workspace = true
 sha2.workspace = true
 base64.workspace = true
 tokio.workspace = true
