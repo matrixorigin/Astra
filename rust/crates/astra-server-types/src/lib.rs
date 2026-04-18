@@ -878,6 +878,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         forward_headers: std::collections::HashMap::new(),
         max_candidates: request.max_candidates,
         explain: request.explain,
+        interactive_client: false,
     }
 }
 

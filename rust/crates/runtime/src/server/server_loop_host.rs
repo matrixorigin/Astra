@@ -83,6 +83,8 @@ pub struct ServerAgenticLoopHost {
     selection_confidence: f64,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
+    /// `true` when the connected client can answer ask_user prompts.
+    interactive_client: bool,
 
     // ── Tool execution (used by RunLifecycleService wiring) ──
     #[allow(dead_code)] // needed once RunLifecycleService uses ledger-based tool execution
@@ -113,6 +115,7 @@ pub struct ServerAgenticLoopHostBuilder {
     user_id: String,
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
+    interactive_client: bool,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -134,6 +137,7 @@ impl ServerAgenticLoopHostBuilder {
             user_id,
             session_id,
             progress_broadcaster: None,
+            interactive_client: false,
         }
     }
 
@@ -178,6 +182,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_interactive_client(mut self, interactive_client: bool) -> Self {
+        self.interactive_client = interactive_client;
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
@@ -210,6 +219,7 @@ impl ServerAgenticLoopHostBuilder {
             valid_tools,
             selection_confidence: self.selection_confidence,
             server_side_tools,
+            interactive_client: self.interactive_client,
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
@@ -220,6 +230,14 @@ impl ServerAgenticLoopHostBuilder {
 }
 
 impl ServerAgenticLoopHost {
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        if self.interactive_client {
+            TurnInteractionMode::Prompt
+        } else {
+            TurnInteractionMode::Headless
+        }
+    }
+
     fn push_reasoning_events(emitted_events: &mut Vec<Value>, reasoning: &str) {
         if reasoning.is_empty() {
             return;
@@ -818,9 +836,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(self.effective_allowlist_restrictions(state));
-        effective_restricted.extend(interaction_scoped_tool_restrictions(
-            TurnInteractionMode::Headless,
-        ));
+        let interaction_mode = self.turn_interaction_mode();
+        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible(&visible_tools);
 
@@ -869,7 +886,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Annotate tool schemas with cache_control for Anthropic.
         annotate_tool_schemas_for_caching(&mut final_tools, &cache_cfg);
         state.last_turn_policy =
-            TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
+            TurnInteractionPolicy::from_tool_schemas(interaction_mode, &final_tools);
 
         let llm_cancel = llm_cancel_for_state(state);
 
@@ -1789,6 +1806,45 @@ mod tests {
         );
         assert_eq!(policy.evidence_tool_names, policy.visible_tool_names);
         assert!(!policy.allow_ask_user);
+    }
+
+    #[test]
+    fn interactive_turn_policy_keeps_ask_user_in_final_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_ask_user())
+        .with_interactive_client(true)
+        .build();
+
+        let mut state = create_test_state();
+        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        let mut effective_restricted = state.restricted_tools.clone();
+        effective_restricted.extend(interaction_scoped_tool_restrictions(
+            host.turn_interaction_mode(),
+        ));
+        let visible_tools = host.filtered_turn_tools(&effective_restricted);
+        let final_tools =
+            prune_tool_schemas(&visible_tools, crate::prompts::CompactionTier::Normal);
+        let policy =
+            TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
+
+        assert_eq!(
+            policy.visible_tool_names,
+            vec![
+                "bash".to_string(),
+                "read_file".to_string(),
+                "ask_user".to_string()
+            ]
+        );
+        assert_eq!(
+            policy.evidence_tool_names,
+            vec!["bash".to_string(), "read_file".to_string()]
+        );
+        assert!(policy.allow_ask_user);
     }
 
     #[tokio::test]

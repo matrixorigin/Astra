@@ -39,6 +39,11 @@ pub fn approval_callback_key(user_id: &str, request_id: &str) -> String {
     format!("{user_id}:approval:{request_id}")
 }
 
+#[inline]
+pub fn user_prompt_callback_key(user_id: &str, request_id: &str) -> String {
+    format!("{user_id}:user_prompt:{request_id}")
+}
+
 /// Remove and return the value for `key`, waiting up to `timeout` (50ms polling).
 pub async fn take_ledger_entry(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,

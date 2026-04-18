@@ -68,6 +68,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "github_repo_stats",
     "web_fetch",
     "web_search",
+    "ask_user",
     "memory_retrieve",
     "memory_store",
     "memory_search",

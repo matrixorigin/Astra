@@ -84,6 +84,17 @@ pub trait RunLifecycleService: Send + Sync {
         vec![]
     }
 
+    /// Drain pending ask_user prompt requests for a run.
+    ///
+    /// Returns JSON objects with `request_id`, `question`, `choices`, `default`,
+    /// and `context` fields. The WS handler calls this during its polling loop to
+    /// forward prompts to the client.
+    ///
+    /// Default: no-op (returns empty vec).
+    async fn drain_user_prompt_requests(&self, _run_id: &str) -> Vec<serde_json::Value> {
+        vec![]
+    }
+
     /// Drain pending tool progress events for a run.
     ///
     /// Returns JSON objects with `kind` field (`started`, `delta`, `completed`).
@@ -109,6 +120,7 @@ pub struct ChatRequestData {
     pub forward_headers: std::collections::HashMap<String, String>,
     pub max_candidates: u32,
     pub explain: bool,
+    pub interactive_client: bool,
 }
 
 fn redacted_forward_header_names(headers: &std::collections::HashMap<String, String>) -> Vec<&str> {
@@ -150,6 +162,7 @@ impl std::fmt::Debug for ChatRequestData {
             )
             .field("max_candidates", &self.max_candidates)
             .field("explain", &self.explain)
+            .field("interactive_client", &self.interactive_client)
             .finish()
     }
 }
@@ -875,6 +888,7 @@ mod tests {
             forward_headers,
             max_candidates: 10,
             explain: false,
+            interactive_client: false,
         };
 
         let rendered = format!("{request:?}");
@@ -903,6 +917,7 @@ mod tests {
                     forward_headers: std::collections::HashMap::new(),
                     max_candidates: 25,
                     explain: false,
+                    interactive_client: false,
                 },
             )
             .await
