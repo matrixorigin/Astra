@@ -212,6 +212,7 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
         // file
         "write_file"
             | "str_replace"
+            | "multi_edit"
             | "delete_file"
             // database
             | "mo_query"
@@ -234,7 +235,7 @@ fn server_file_mutator_in_round(tool_calls: &[Value]) -> bool {
     tool_calls.iter().any(|tool_call| {
         matches!(
             tool_call_name(tool_call),
-            Some("write_file" | "str_replace" | "delete_file")
+            Some("write_file" | "str_replace" | "multi_edit" | "delete_file")
         )
     })
 }
@@ -1728,6 +1729,76 @@ esac
     }
 
     #[tokio::test]
+    async fn server_file_boundary_aborts_and_rolls_back_when_multi_edit_fails() {
+        let session_id = format!("server-file-boundary-multi-edit-{}", uuid::Uuid::new_v4());
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            session_id.clone(),
+            None,
+            None,
+        );
+        executor.set_turn_index(15);
+
+        let active = open_server_rollback_boundary(
+            Some(&session_id),
+            &executor,
+            15,
+            &[
+                json!({"function": {"name": "write_file", "arguments": "{}"}}),
+                json!({"function": {"name": "multi_edit", "arguments": "{}"}}),
+            ],
+        )
+        .expect("boundary should open for file mutators");
+
+        let write_out = executor
+            .execute(
+                "write_file",
+                &json!({"path": "turn.txt", "content": "hello"}),
+            )
+            .await;
+        assert!(write_out.contains("Successfully wrote"));
+        assert!(dir.path().join("turn.txt").exists());
+
+        finalize_server_rollback_boundary(
+            Some(&session_id),
+            &executor,
+            &active,
+            &[
+                tool_record("write_file", true),
+                tool_record("multi_edit", false),
+            ],
+            &[],
+        )
+        .await;
+
+        let events = read_journal_events(&session_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryAborted
+        );
+        let boundary = &events[1].metadata.as_ref().unwrap()["execution_boundary"];
+        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
+        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
+        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("multi_edit"));
+        assert_eq!(
+            boundary["rollback"]["file_edits"]["reverted"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(!dir.path().join("turn.txt").exists());
+
+        cleanup_session_artifacts(&session_id);
+    }
+
+    #[tokio::test]
     async fn server_git_boundary_aborts_and_reverts_failed_turn() {
         let session_id = format!("server-git-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
@@ -1990,6 +2061,7 @@ esac
         // File mutators
         assert!(is_server_mutator_tool_name("write_file"));
         assert!(is_server_mutator_tool_name("str_replace"));
+        assert!(is_server_mutator_tool_name("multi_edit"));
         assert!(is_server_mutator_tool_name("delete_file"));
         // Database mutators
         assert!(is_server_mutator_tool_name("mo_query"));
