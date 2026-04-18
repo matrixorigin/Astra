@@ -3244,12 +3244,20 @@ esac
     }
 
     #[tokio::test]
-    async fn read_file_large_full_read_requires_range_or_outline() {
+    async fn read_file_large_full_read_returns_preview() {
         let (exec, dir) = test_executor();
-        std::fs::write(dir.path().join("big.txt"), "abcdefghij".repeat(9_000)).unwrap();
+        // Use multi-line content exceeding 80KB so the preview path triggers.
+        let mut large = String::new();
+        for i in 1..=3000 {
+            large.push_str(&format!(
+                "line {}: some padding content here to make the file larger\n",
+                i
+            ));
+        }
+        std::fs::write(dir.path().join("big.txt"), &large).unwrap();
         let result = exec.execute("read_file", &json!({"path": "big.txt"})).await;
-        assert!(result.contains("file is too large"), "got: {result}");
-        assert!(result.contains("outline=true"), "got: {result}");
+        assert!(result.contains("Large file preview"), "got: {result}");
+        assert!(result.contains("start_line"), "got: {result}");
     }
 
     #[tokio::test]

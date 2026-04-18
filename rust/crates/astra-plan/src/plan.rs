@@ -563,7 +563,11 @@ impl PlanCommand {
     /// natural-language plan edit or goal description).
     pub fn parse(input: &str) -> Option<PlanCommand> {
         let trimmed = input.trim();
-        let lower = trimmed.to_lowercase();
+        // Strip only emphatic/question punctuation used for command-like inputs.
+        // Avoid ASCII '.' and ',' because paused-plan parsing runs on all input.
+        // Also avoid '。' (CJK full stop) — it's declarative like '.' not emphatic.
+        let stripped = trimmed.trim_end_matches(['!', '！', '?', '？']);
+        let lower = stripped.to_lowercase();
 
         // Help
         if matches!(lower.as_str(), "help" | "?" | "帮助" | "commands") {
@@ -1058,6 +1062,31 @@ mod tests {
                 anchor: "setup".to_string()
             })
         );
+    }
+
+    #[test]
+    fn plan_command_parse_strips_trailing_punctuation() {
+        // Chinese punctuation
+        assert_eq!(PlanCommand::parse("继续!"), Some(PlanCommand::Resume));
+        assert_eq!(PlanCommand::parse("继续！"), Some(PlanCommand::Resume));
+        // CJK full stop (。) is declarative like ASCII '.', so NOT stripped
+        assert_eq!(PlanCommand::parse("执行。"), None);
+        // English punctuation
+        assert_eq!(PlanCommand::parse("continue!"), Some(PlanCommand::Resume));
+        assert_eq!(
+            PlanCommand::parse("go!"),
+            Some(PlanCommand::Execute {
+                step_by_step: false
+            })
+        );
+        assert_eq!(PlanCommand::parse("status?"), Some(PlanCommand::Status));
+        // Multiple punctuation
+        assert_eq!(PlanCommand::parse("继续!!"), Some(PlanCommand::Resume));
+        // No punctuation still works
+        assert_eq!(PlanCommand::parse("继续"), Some(PlanCommand::Resume));
+        // ASCII sentence punctuation stays literal to avoid accidental matches.
+        assert_eq!(PlanCommand::parse("done."), None);
+        assert_eq!(PlanCommand::parse("continue,"), None);
     }
 
     #[test]

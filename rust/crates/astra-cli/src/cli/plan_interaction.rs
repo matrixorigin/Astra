@@ -12,6 +12,20 @@ use astra_runtime::plan::progress_bar_segments;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 
+/// Result from [`handle_plan_mode_input`].
+///
+/// Using an enum instead of Err("__SEND_AS_CHAT__:…") provides type-safe
+/// communication between the plan handler and the main REPL loop.
+#[derive(Debug)]
+pub enum PlanInputResult {
+    /// Input was fully handled within plan mode.
+    Handled,
+    /// Re-dispatch the enclosed slash command through the main REPL slash handler.
+    DispatchSlash(String),
+    /// Plan was abandoned; the enclosed message should be sent as normal chat.
+    SendAsChat(String),
+}
+
 /// Replace `plan_state.plan` when `text` is non-empty valid plan JSON.
 ///
 /// Returns `Ok(false)` if `text` is empty or whitespace only; `Ok(true)` if the plan
@@ -578,12 +592,17 @@ pub fn plan_idle_review_not_started(ps: &plan::PlanModeState) -> bool {
 /// input matches a structured command (execute, status, cancel, etc.), the
 /// command is dispatched directly. Otherwise, the input is treated as a
 /// natural-language plan edit and sent to the LLM.
+///
+/// Returns [`PlanInputResult::Handled`] when input was processed within plan mode,
+/// [`PlanInputResult::DispatchSlash`] when slash input should be re-dispatched
+/// through the main REPL slash handler, or [`PlanInputResult::SendAsChat`] when
+/// the plan was abandoned and the message should be sent as normal chat.
 pub async fn handle_plan_mode_input(
     input: String,
     token: Option<&str>,
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
-) -> Result<(), String> {
+) -> Result<PlanInputResult, String> {
     use plan::{
         ClarificationAnswer, PlanEntryChoice, PlanModeState, decomposition_prompt,
         parse_clarification_response, parse_plan_entry_choice, parse_plan_response,
@@ -593,7 +612,7 @@ pub async fn handle_plan_mode_input(
         Some(ps) => ps,
         None => {
             eprintln!("  {} {}", theme::icon_warn(), "Not in plan mode".yellow());
-            return Ok(());
+            return Ok(PlanInputResult::Handled);
         }
     };
 
@@ -620,7 +639,7 @@ pub async fn handle_plan_mode_input(
                 eprintln!("  {} {}", theme::icon_err(), msg);
                 eprintln!();
                 eprint_clarification_question(&question);
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
         }
 
@@ -628,7 +647,7 @@ pub async fn handle_plan_mode_input(
             eprintln!();
             eprint_clarification_question(next_q);
             let _ = plan_state.save_to_file(&PlanModeState::state_path());
-            return Ok(());
+            return Ok(PlanInputResult::Handled);
         }
 
         // All questions answered — regenerate plan with clarifications
@@ -652,7 +671,7 @@ pub async fn handle_plan_mode_input(
                 theme::icon_err(),
                 "Not logged in. Run /login first.".red()
             );
-            return Ok(());
+            return Ok(PlanInputResult::Handled);
         };
 
         enrich_with_templates(
@@ -677,7 +696,7 @@ pub async fn handle_plan_mode_input(
                 let sse_result = collect_sse_with_preview(r).await;
                 if let Some(err) = sse_result.completion_error() {
                     eprintln!("  {} {}", theme::icon_err(), err.red());
-                    return Ok(());
+                    return Ok(PlanInputResult::Handled);
                 }
                 let full_text = sse_result.text;
 
@@ -738,7 +757,7 @@ pub async fn handle_plan_mode_input(
             }
         }
 
-        return Ok(());
+        return Ok(PlanInputResult::Handled);
     }
 
     // ── Try structured PlanCommand first ─────────────────────────────────
@@ -756,11 +775,11 @@ pub async fn handle_plan_mode_input(
                 state.plan_mode = None;
                 eprintln!();
                 eprintln!("  {} Left plan mode → back to normal chat.", "←".cyan());
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Continue => {
                 eprintln!("  {} Continuing with current plan", "→".cyan());
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Restart => {
                 plan_state.plan = Default::default();
@@ -769,7 +788,7 @@ pub async fn handle_plan_mode_input(
                     "  {} Plan cleared. Describe what you want to do:",
                     "🔄".yellow()
                 );
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Resume => {
                 if state.plan_handle.is_some() {
@@ -781,12 +800,12 @@ pub async fn handle_plan_mode_input(
                 } else if state.executing_plan.is_some() {
                     eprintln!("  {} Resuming plan execution...", "▶".cyan());
                 }
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::New(_) => {
                 plan_state.plan = Default::default();
                 eprintln!("  {} Describe what you want to do:", "📝".cyan());
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             PlanEntryChoice::Goal(goal) => {
                 return handle_goal_submission(goal, token, state, api).await;
@@ -804,10 +823,10 @@ pub async fn handle_plan_mode_input(
                 "  {} Cannot use done while a plan run is active (background executor).",
                 theme::icon_warn()
             );
-            return Ok(());
+            return Ok(PlanInputResult::Handled);
         }
         let Some(plan_state) = state.plan_mode.as_mut() else {
-            return Ok(());
+            return Ok(PlanInputResult::Handled);
         };
         match plan_state.complete_subtask(done_id) {
             Ok(title) => {
@@ -873,29 +892,56 @@ pub async fn handle_plan_mode_input(
             }
             Err(e) => eprintln!("  {} {}", theme::icon_warn(), e),
         }
-        return Ok(());
+        return Ok(PlanInputResult::Handled);
     }
 
     // ── Natural-language plan editing via LLM ───────────────────────────
     if plan_execution_ui_active(state) {
+        // When plan is paused (handle exists but monitor exited), route input through
+        // PlanCommand parser first. If it's a valid command (continue, status, etc.),
+        // execute it. If it's a /slash command, re-dispatch it through the main REPL
+        // slash handler. Otherwise, abandon the plan per documented behavior:
+        // "Any other message — abandons the plan and sends it as a normal chat turn"
+
+        // First check for valid PlanCommand (continue, status, exit, etc.)
+        if let Some(cmd) = PlanCommand::parse(&input) {
+            return handle_plan_command(cmd, token, state, api).await;
+        }
+
+        // Re-dispatch /slash commands through the main REPL slash handler.
+        if input.starts_with('/') {
+            return Ok(PlanInputResult::DispatchSlash(input));
+        }
+
+        // Not a command, not a slash — abandon plan and send as chat
+        if let Some(ref handle) = state.plan_handle {
+            if let Err(e) = handle.send_command(crate::plan_executor::PlanCommand::Cancel) {
+                astra_core::agent_warn!(
+                    "plan",
+                    "failed to send Cancel to executor during abandon: {e}"
+                );
+            }
+        }
+        state.plan_handle = None;
+        state.plan_mode = None;
+        state.plan_resume_pending = false;
+        state.executing_plan = None;
         eprintln!(
-            "  {} Plan run is active; LLM edits are paused. Try {}, {}, or {}.",
-            theme::icon_warn(),
-            "status".cyan(),
-            "show".cyan(),
-            "exit".cyan()
+            "  {} Plan abandoned. Sending as normal chat...",
+            theme::icon_warn()
         );
-        return Ok(());
+        // Return typed result to signal caller should handle as chat
+        return Ok(PlanInputResult::SendAsChat(input));
     }
     let Some(plan_state) = state.plan_mode.as_mut() else {
-        return Ok(());
+        return Ok(PlanInputResult::Handled);
     };
     let prompt = plan_state.plan_mode_prompt(&input);
     plan_state.add_turn(&input, "");
 
     let Some(tok) = token else {
         eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
-        return Ok(());
+        return Ok(PlanInputResult::Handled);
     };
 
     let messages = vec![serde_json::json!({
@@ -922,7 +968,7 @@ pub async fn handle_plan_mode_input(
             let sse_result = collect_sse_with_preview(r).await;
             if let Some(err) = sse_result.completion_error() {
                 eprintln!("  {} {}", theme::icon_err(), err.red());
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
 
             if sse_result.text.is_empty() {
@@ -943,7 +989,7 @@ pub async fn handle_plan_mode_input(
 
             if !sse_result.text.is_empty() {
                 let Some(plan_state) = state.plan_mode.as_mut() else {
-                    return Ok(());
+                    return Ok(PlanInputResult::Handled);
                 };
                 match try_replace_plan_from_llm_json(&sse_result.text, plan_state) {
                     Ok(true) => {
@@ -1035,7 +1081,7 @@ pub async fn handle_plan_mode_input(
         }
     }
 
-    Ok(())
+    Ok(PlanInputResult::Handled)
 }
 
 // ─── Plan Resume Recovery ────────────────────────────────────────────────────
@@ -1080,7 +1126,7 @@ async fn handle_plan_command(
     token: Option<&str>,
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
-) -> Result<(), String> {
+) -> Result<PlanInputResult, String> {
     use plan::{PlanExecutionConfig, PlanModeState};
 
     match cmd {
@@ -1227,7 +1273,7 @@ async fn handle_plan_command(
         PlanCommand::Execute { step_by_step } => {
             let plan_state = match state.plan_mode.as_ref() {
                 Some(ps) => ps,
-                None => return Ok(()),
+                None => return Ok(PlanInputResult::Handled),
             };
 
             if plan_execution_ui_active(state) {
@@ -1237,7 +1283,7 @@ async fn handle_plan_command(
                     "pause".cyan(),
                     "exit".cyan()
                 );
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
 
             if plan_state.plan.subtasks.is_empty() {
@@ -1245,7 +1291,7 @@ async fn handle_plan_command(
                     "  {} Plan has no subtasks. Describe what you want to do first.",
                     theme::icon_warn()
                 );
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
 
             let plan = plan_state.plan.clone();
@@ -1510,7 +1556,7 @@ async fn handle_plan_command(
                     "  {} Rollback is disabled while a plan run is active. Pause or cancel first.",
                     theme::icon_warn()
                 );
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             if let Some(ref mut ps) = state.plan_mode {
                 match ps.rollback_to_version(version) {
@@ -1620,13 +1666,13 @@ async fn handle_plan_command(
                     "  {} Cannot edit the plan via LLM while a plan run is active.",
                     theme::icon_warn()
                 );
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             return Box::pin(handle_plan_mode_input(instruction, token, state, api)).await;
         }
     }
 
-    Ok(())
+    Ok(PlanInputResult::Handled)
 }
 
 /// Handle initial goal submission — scan project and generate plan via LLM.
@@ -1635,7 +1681,7 @@ async fn handle_goal_submission(
     token: Option<&str>,
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
-) -> Result<(), String> {
+) -> Result<PlanInputResult, String> {
     use plan::{
         PendingClarifications, PlanModeState, decomposition_prompt, detect_clarification_questions,
         format_project_context, parse_plan_response,
@@ -1643,11 +1689,11 @@ async fn handle_goal_submission(
 
     let Some(tok) = token else {
         eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
-        return Ok(());
+        return Ok(PlanInputResult::Handled);
     };
 
     let Some(plan_state) = state.plan_mode.as_mut() else {
-        return Ok(());
+        return Ok(PlanInputResult::Handled);
     };
     plan_state.goal = goal.clone();
 
@@ -1690,7 +1736,7 @@ async fn handle_goal_submission(
             let sse_result = collect_sse_with_preview(r).await;
             if let Some(err) = sse_result.completion_error() {
                 eprintln!("  {} {}", theme::icon_err(), err.red());
-                return Ok(());
+                return Ok(PlanInputResult::Handled);
             }
             let full_text = sse_result.text;
 
@@ -1710,7 +1756,7 @@ async fn handle_goal_submission(
                 eprintln!();
 
                 let Some(plan_state) = state.plan_mode.as_mut() else {
-                    return Ok(());
+                    return Ok(PlanInputResult::Handled);
                 };
                 let pending = PendingClarifications {
                     questions: questions.clone(),
@@ -1724,7 +1770,7 @@ async fn handle_goal_submission(
                 match parse_plan_response(&full_text) {
                     Ok(plan) => {
                         let Some(plan_state) = state.plan_mode.as_mut() else {
-                            return Ok(());
+                            return Ok(PlanInputResult::Handled);
                         };
                         plan_state.set_plan(plan);
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
@@ -1783,7 +1829,7 @@ async fn handle_goal_submission(
         }
     }
 
-    Ok(())
+    Ok(PlanInputResult::Handled)
 }
 
 /// Extract a normalized goal pattern for matching similar tasks.
@@ -1932,6 +1978,66 @@ mod tests {
         assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
         assert_eq!(ps.plan.subtasks.len(), 1);
         assert_eq!(ps.plan.subtasks[0].id, "t1");
+    }
+
+    #[tokio::test]
+    async fn paused_plan_slash_command_is_redispatched() {
+        let mut state = ReplState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            "goal".into(),
+            plan::ProjectContext::default(),
+        ));
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("/help".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        match result {
+            PlanInputResult::DispatchSlash(cmd) => assert_eq!(cmd, "/help"),
+            other => panic!("expected DispatchSlash, got {other:?}"),
+        }
+        assert!(
+            state.plan_mode.is_some(),
+            "slash command should not abandon the plan"
+        );
+        assert!(
+            state.plan_handle.is_some(),
+            "slash command should leave the paused executor intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_plan_plain_text_abandons_and_sends_chat() {
+        let mut state = ReplState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            "goal".into(),
+            plan::ProjectContext::default(),
+        ));
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("tell me more".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        match result {
+            PlanInputResult::SendAsChat(msg) => assert_eq!(msg, "tell me more"),
+            other => panic!("expected SendAsChat, got {other:?}"),
+        }
+        assert!(
+            state.plan_mode.is_none(),
+            "plain chat should abandon paused plan mode"
+        );
+        assert!(
+            state.plan_handle.is_none(),
+            "plain chat should clear the paused executor handle"
+        );
     }
 
     #[test]

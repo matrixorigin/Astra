@@ -22,14 +22,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-offline
-          save-if: false
+          shared-key: ci-static
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: make lint
       - name: Check formatting
         run: make format-check
-      - name: Run cargo check
-        run: make type-check
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit@0.22.1
