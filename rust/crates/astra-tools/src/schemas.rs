@@ -952,6 +952,22 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "memory_retrieve",
+                "description": "Recall relevant memories for the current topic or user request. Use when previous sessions, preferences, or prior facts may help answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What memory or topic to retrieve"},
+                        "top_k": {"type": "integer", "description": "Max results (default 5)"},
+                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 to filter weak matches"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "memory_store",
                 "description": "Store a new memory. Use when user shares a fact, preference, decision, or anything worth remembering for future sessions.",
                 "parameters": {
@@ -1894,6 +1910,7 @@ mod tests {
         let names = schema_names(&schemas);
         assert!(names.contains(&"git_revert_commit"));
         assert!(!names.contains(&"rollback_file_edits"));
+        assert!(!names.contains(&"memory_retrieve"));
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
         assert!(!names.contains(&"multi_edit"));
@@ -1903,6 +1920,12 @@ mod tests {
     fn server_executor_tool_schemas_match_server_supported_surface() {
         let schemas = server_executor_tool_schemas();
         let names = schema_names(&schemas);
+        for allowed in SERVER_EXECUTOR_TOOL_NAMES {
+            assert!(
+                names.contains(allowed),
+                "server allowlist entry `{allowed}` is missing a tool schema"
+            );
+        }
         assert!(names.contains(&"rollback_file_edits"));
         assert!(names.contains(&"adjust_config"));
         assert!(names.contains(&"prioritize_tool"));
@@ -1917,6 +1940,7 @@ mod tests {
         assert!(names.contains(&"task_stop"));
         assert!(names.contains(&"mo_query"));
         assert!(names.contains(&"rollback_database_snapshots"));
+        assert!(names.contains(&"memory_retrieve"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"git_revert_commit"));
         assert!(!names.contains(&"rollback_turn_actions"));
