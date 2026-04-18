@@ -22,7 +22,11 @@ fn real_tool(name: &str, ok: bool, ms: u64) -> ToolCallRecord {
         input_bytes: Some(100),
         output_bytes: Some(if ok { 500 } else { 0 }),
         args_preview: Some(format!("{name} args...")),
-        result_preview: Some(if ok { "ok result".into() } else { "error".into() }),
+        result_preview: Some(if ok {
+            "ok result".into()
+        } else {
+            "error".into()
+        }),
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
@@ -177,14 +181,22 @@ fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
     let turn = &events[0];
     assert_eq!(turn.event_type, JournalEventType::Turn);
     let tool_calls = turn.tool_calls.as_ref().unwrap();
-    assert_eq!(tool_calls.len(), 8, "all 8 records persisted for audit trail");
+    assert_eq!(
+        tool_calls.len(),
+        8,
+        "all 8 records persisted for audit trail"
+    );
 
     // Verify surgical removal records roundtrip correctly
     let surgical_records: Vec<_> = tool_calls
         .iter()
         .filter(|r| r.is_synthetic_placeholder())
         .collect();
-    assert_eq!(surgical_records.len(), 5, "5 surgical removals survived serde");
+    assert_eq!(
+        surgical_records.len(),
+        5,
+        "5 surgical removals survived serde"
+    );
     for rec in &surgical_records {
         assert_eq!(rec.surgically_removed, Some(true));
         assert!(rec.original_tool_name.is_some());
@@ -220,7 +232,10 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
 
     // Simulate 3 user turns with context assembly events
     for turn_num in 1..=3u32 {
-        let records = vec![real_tool("read_file", true, 30), real_tool("bash", true, 200)];
+        let records = vec![
+            real_tool("read_file", true, 30),
+            real_tool("bash", true, 200),
+        ];
 
         // Context assembly uses REPL turn number (the fix)
         let assembly = JournalEvent::context_assembly_recorded(
@@ -465,7 +480,10 @@ fn e2e_zero_tool_calls_conversational() {
 
     let events = session_journal::read_journal(session_id).unwrap();
     let turn = &events[0];
-    assert!(turn.tool_calls.is_none(), "no tool_calls field for empty turns");
+    assert!(
+        turn.tool_calls.is_none(),
+        "no tool_calls field for empty turns"
+    );
     assert_eq!(extract_tool_call_count(&events[1]), 0);
 }
 
@@ -676,11 +694,11 @@ fn e2e_all_tools_fail_with_surgical_removals_worst_case() {
     let session_id = "e2e-worst-case";
 
     let records = vec![
-        real_tool("bash", false, 200),       // real failure
-        real_tool("write_file", false, 30),   // real failure
-        surgical_removal("read_file"),        // not a failure
-        surgical_removal("glob"),             // not a failure
-        skipped_tool("grep"),                 // skill-routed, not a failure
+        real_tool("bash", false, 200),      // real failure
+        real_tool("write_file", false, 30), // real failure
+        surgical_removal("read_file"),      // not a failure
+        surgical_removal("glob"),           // not a failure
+        skipped_tool("grep"),               // skill-routed, not a failure
     ];
 
     let eval_event = build_turn_evaluation_journal_event(
@@ -690,9 +708,9 @@ fn e2e_all_tools_fail_with_surgical_removals_worst_case() {
         "do something",
         &[],
         &records,
-        3, // stalls
+        3,    // stalls
         true, // verdict warning
-        0.9, // high budget pressure
+        0.9,  // high budget pressure
         &make_eval(false, 0.1),
     );
 
