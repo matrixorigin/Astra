@@ -2,9 +2,9 @@ name: Test Suite
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -14,170 +14,137 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Offline: split by crate for parallel execution and easier fault isolation ──
-
-  test-offline-cli:
-    name: "Offline: astra-cli"
+  # ── Stage 1: compile once, cache for all downstream jobs ───────────
+  build:
+    name: "Build & Cache"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-offline
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # astra-cli is binary-only (no lib target, no crate-root integration tests/).
-      # Partition by Rust test path: `edge_tools::` marks tests under src/edge_tools/.
-      # `source()` is invalid filterset DSL; `/edge_tools/` alone parses as a broken regex.
-      - name: "Test astra-cli (bins: non-edge_tools modules)"
-        run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins -E 'not test(/edge_tools::/)' --no-fail-fast
-      - name: "Test astra-cli (bins: edge_tools shell proc/cleanup)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::shell::tests::(bash_timeout_.*|bash_background_command_does_not_block|run_command_with_cleanup_.*|grep_uses_process_group_cleanup|glob_uses_process_group_cleanup)/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools shell proc/cleanup failure"
-        if: failure()
+          shared-key: ci-test
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
+      # Compile all test binaries (default + bridge-e2e-hooks) without running
+      - name: Compile test binaries
         run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools shell grep timeout)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::shell::tests::(grep_streaming_preserves_partial_on_timeout|grep_timeout_.*)/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools shell grep timeout failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools shell remaining)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::shell::/) and not test(/edge_tools::shell::tests::(bash_timeout_.*|bash_background_command_does_not_block|run_command_with_cleanup_.*|grep_uses_process_group_cleanup|glob_uses_process_group_cleanup)/) and not test(/edge_tools::shell::tests::(grep_streaming_preserves_partial_on_timeout|grep_timeout_.*)/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools shell remaining failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools lsp/worktree)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::tests::lsp_tests::/) or test(/edge_tools::tests::worktree_tests::/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools lsp/worktree failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
-      - name: "Test astra-cli (bins: edge_tools remaining)"
-        timeout-minutes: 15
-        run: >-
-          timeout --signal=TERM --kill-after=30s 15m
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --bins
-          -E 'test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::tests::lsp_tests::/) and not test(/edge_tools::tests::worktree_tests::/)'
-          --no-fail-fast
-      - name: "Dump processes after edge_tools remaining failure"
-        if: failure()
-        run: |
-          ps -ef
-          pgrep -a -f 'cargo|nextest|astra|bash|sleep|git|rust-analyzer|fake-rust-analyzer' || true
+          cargo nextest run --manifest-path rust/Cargo.toml --workspace --no-run
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks --no-run
 
-  test-offline-runtime:
-    name: "Offline: astra-runtime"
+  # ── Stage 2: parallel offline test shards (all need: build) ────────
+  #
+  # Shard balance (test counts):
+  #   shard-a: astra-cli (2550)                    — heaviest, shell tests need process isolation
+  #   shard-b: astra-runtime (3151) + contracts (19) + trusted_moi (4)
+  #   shard-c: astra-turn-core (2167) + astra-services (1186)
+  #   shard-d: core crates ~2460 + bridge-e2e-hooks (3176, mostly overlaps runtime)
+
+  shard-a:
+    name: "Test: astra-cli"
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-offline
+          shared-key: ci-test
           save-if: false
-      - name: Test astra-runtime (default features)
-        run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --no-fail-fast
+      - name: "Test astra-cli (non-edge_tools)"
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
+          --profile ci --bins -E 'not test(/edge_tools::/)'
+      - name: "Test astra-cli (edge_tools)"
+        timeout-minutes: 15
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
+          --profile ci --bins -E 'test(/edge_tools::/)'
+      - name: Dump processes on failure
+        if: failure()
+        run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
+
+  shard-b:
+    name: "Test: astra-runtime"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-test
+          save-if: false
+      - name: Test astra-runtime
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
+          --profile ci
+      - name: Test contract (http + admin + settings)
+        run: |
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --profile ci --test http_contract --test admin_contract
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-core --profile ci --lib -E 'test(/settings_contract/)'
       - name: Test trusted_moi auth integration
-        run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --test trusted_moi_auth_integration --no-capture
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
+          --profile ci --test trusted_moi_auth_integration
 
-  test-offline-runtime-e2e:
-    name: "Offline: bridge-e2e-hooks"
+  shard-c:
+    name: "Test: turn-core + services"
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-offline
+          shared-key: ci-test
           save-if: false
-      - name: Test bridge-e2e-hooks
-        run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks --no-fail-fast
+      - name: Test astra-turn-core + astra-services
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml
+          -p astra-turn-core -p astra-services
+          --profile ci
 
-  test-offline-services:
-    name: "Offline: astra-services"
+  shard-d:
+    name: "Test: core crates + bridge hooks"
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-offline
+          shared-key: ci-test
           save-if: false
-      - name: Test astra-services
-        run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-services --no-fail-fast
-
-  test-offline-core:
-    name: "Offline: core crates"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-          shared-key: ci-offline
-          save-if: false
-      - name: Test all core crates
+      - name: Test core crates
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml
           -p astra-core -p astra-thin-client -p astra-admin-cli
           -p astra-tools -p astra-pipeline -p astra-turn-types
-          -p astra-skills -p astra-sandbox -p astra-server-types -p astra-turn-core
+          -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils
           -p astra-config -p astra-learning
-          -p astra-plan
-          -p astra-prompts
-          --no-fail-fast
+          -p astra-plan -p astra-prompts
+          --profile ci
+      - name: Test bridge-e2e-hooks
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
+          --features bridge-e2e-hooks --profile ci
 
-  # ── Online: needs MatrixOne + Memoria ─────────────────────────────────
+  # ── Stage 3: online tests (needs DB, runs after offline passes) ────
   test-online:
-    name: Online Tests
+    name: "Test: online (DB)"
+    needs: [shard-a, shard-b, shard-c, shard-d]
     runs-on: ubuntu-latest
     env:
       MATRIXONE_HOST: localhost
@@ -212,8 +179,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci-online
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-test
+          save-if: false
       - name: Wait for dependencies
         run: make dev-deps-wait
       - name: Run online tests
