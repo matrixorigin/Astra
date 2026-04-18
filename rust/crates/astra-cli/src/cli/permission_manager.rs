@@ -1570,6 +1570,10 @@ mod tests {
             PermissionManager::classify("str_replace"),
             SideEffect::Write
         );
+        assert_eq!(
+            PermissionManager::classify("delete_file"),
+            SideEffect::Write
+        );
     }
 
     #[test]

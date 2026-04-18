@@ -641,6 +641,12 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
+        // delete_file timeout
+        assert_eq!(
+            classify_tool_error("delete_file", output),
+            ToolErrorSeverity::HardError
+        );
+
         // git_stash timeout
         assert_eq!(
             classify_tool_error("git_stash", output),

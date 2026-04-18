@@ -8,6 +8,7 @@
 pub const CLOUD_APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "bash",
     "create_file",
+    "delete_file",
     "edit_file",
     "exec",
     "git_stash",
@@ -371,6 +372,14 @@ mod tests {
     fn git_stash_is_write_gated() {
         assert_eq!(
             cloud_gated_tool_kind("git_stash"),
+            Some(CloudGatedToolKind::Write)
+        );
+    }
+
+    #[test]
+    fn delete_file_is_write_gated() {
+        assert_eq!(
+            cloud_gated_tool_kind("delete_file"),
             Some(CloudGatedToolKind::Write)
         );
     }
