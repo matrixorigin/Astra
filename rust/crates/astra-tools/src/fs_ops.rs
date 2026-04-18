@@ -147,14 +147,6 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     // For large files without explicit range, provide a helpful preview instead of error.
     // This auto-pagination helps the agent understand file structure without manual range specification.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
-        // Hard ceiling: refuse to load extremely large files into memory.
-        if metadata.len() as usize > READ_FILE_HARD_LIMIT {
-            return ToolResult::error(format!(
-                "Error: file is too large ({} bytes). Use start_line/end_line to read a specific range, or outline=true.",
-                metadata.len()
-            ));
-        }
-
         // Use streaming approach for large files to avoid allocating ~10MB
         // for preview. Read only head lines + seek to tail.
         const HEAD_LINES: usize = 50;
@@ -246,18 +238,9 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         // But only do this for reasonably sized code files (< 1MB)
         if file_size < 1_000_000
             && let Ok(content) = read_to_string_lossy(&path)
+            && let Some(outline_str) = render_outline(&path, &content, total_lines)
         {
-            let outline_str = render_outline(&path, &content, total_lines);
-            // Check for actual definitions rather than relying on error message format
-            if outline_str.contains("fn ")
-                || outline_str.contains("struct ")
-                || outline_str.contains("impl ")
-                || outline_str.contains("class ")
-                || outline_str.contains("def ")
-                || outline_str.contains("function ")
-            {
-                preview.push_str(&outline_str);
-            }
+            preview.push_str(&outline_str);
         }
 
         // Truncate before appending tip so the tip is always intact when within limit.
@@ -278,7 +261,8 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     let total_lines = content.lines().count();
 
     if outline {
-        let rendered = render_outline(&path, &content, total_lines);
+        let rendered = render_outline(&path, &content, total_lines)
+            .unwrap_or_else(|| no_definitions_outline_message(total_lines));
         return ToolResult::text(rendered);
     }
 
@@ -347,47 +331,41 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 /// Uses reverse reading from the end of the file to avoid loading
 /// the entire file into memory for large files.
 fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
+    let file_size = file.metadata()?.len() as usize;
 
     if file_size == 0 {
         return Ok(Vec::new());
     }
 
-    // Read from the end, looking for newlines
-    // Start with a reasonable buffer size
-    let mut buffer_size = 8192usize.min(file_size as usize);
-    let mut lines = Vec::new();
+    // Read raw bytes from the end and only decode once we've aligned to a newline
+    // boundary. That avoids starting in the middle of a UTF-8 codepoint.
+    let mut buffer_size = 8192usize.min(file_size);
+    let mut suffix = Vec::new();
+    let mut newline_count = 0usize;
     let mut position = file_size;
 
     loop {
-        let seek_pos = position.saturating_sub(buffer_size as u64);
-        file.seek(SeekFrom::Start(seek_pos))?;
+        let seek_pos = position.saturating_sub(buffer_size);
+        file.seek(SeekFrom::Start(seek_pos as u64))?;
 
-        let to_read = (position - seek_pos) as usize;
+        let to_read = position - seek_pos;
         let mut buffer = vec![0u8; to_read];
         file.read_exact(&mut buffer)?;
+        newline_count += buffer.iter().filter(|&&byte| byte == b'\n').count();
 
-        // Convert to string (lossy)
-        let chunk = String::from_utf8_lossy(&buffer);
-
-        // Split into lines and prepend to result
-        let mut chunk_lines: Vec<String> = chunk.lines().map(|s| s.to_string()).collect();
-
-        // Handle partial line at the beginning of the buffer
-        // The last line of this chunk may be incomplete - it will be completed by the next iteration
-        if !lines.is_empty()
-            && seek_pos > 0
-            && let (Some(first_existing), Some(last_chunk)) = (lines.first_mut(), chunk_lines.pop())
-        {
-            *first_existing = format!("{}{}", last_chunk, first_existing);
+        if suffix.is_empty() {
+            suffix = buffer;
+        } else {
+            buffer.extend_from_slice(&suffix);
+            suffix = buffer;
         }
 
-        // Prepend chunk lines to result
-        chunk_lines.append(&mut lines);
-        lines = chunk_lines;
-
-        if lines.len() >= n || seek_pos == 0 {
+        if newline_count >= n || seek_pos == 0 {
             break;
         }
 
@@ -395,12 +373,23 @@ fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
         buffer_size = (buffer_size * 2).min(65536); // Double buffer size, cap at 64KB
     }
 
-    // Return only the last N lines
-    if lines.len() > n {
-        Ok(lines.split_off(lines.len() - n))
-    } else {
-        Ok(lines)
+    let scan_end = suffix
+        .len()
+        .saturating_sub(usize::from(matches!(suffix.last(), Some(b'\n'))));
+    let mut start = 0usize;
+    let mut seen_newlines = 0usize;
+    for idx in (0..scan_end).rev() {
+        if suffix[idx] == b'\n' {
+            seen_newlines += 1;
+            if seen_newlines == n {
+                start = idx + 1;
+                break;
+            }
+        }
     }
+
+    let text = String::from_utf8_lossy(&suffix[start..]);
+    Ok(text.lines().map(|line| line.to_string()).collect())
 }
 
 fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
@@ -424,20 +413,22 @@ fn add_line_numbers(content: &str, start_line: usize) -> String {
         .join("\n")
 }
 
-fn render_outline(path: &Path, content: &str, total_lines: usize) -> String {
+fn render_outline(path: &Path, content: &str, total_lines: usize) -> Option<String> {
     if let Some(lang) = code_intel::detect_language(path) {
         let outline = code_intel::generate_outline(content, lang);
         if !outline.is_empty() {
             let symbol_count = outline.lines().count();
-            return format!("# Outline ({total_lines} lines, {symbol_count} symbols)\n{outline}");
+            return Some(format!(
+                "# Outline ({total_lines} lines, {symbol_count} symbols)\n{outline}"
+            ));
         }
     }
 
     let fallback = fallback_outline(content);
     if fallback.is_empty() {
-        format!("(no definitions found in {total_lines}-line file)")
+        None
     } else {
-        format!(
+        Some(format!(
             "# Outline ({total_lines} lines total, {} definitions)\n{}",
             fallback.len(),
             fallback
@@ -445,8 +436,12 @@ fn render_outline(path: &Path, content: &str, total_lines: usize) -> String {
                 .map(|(line_no, sig)| format!("L{line_no}: {sig}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        )
+        ))
     }
+}
+
+fn no_definitions_outline_message(total_lines: usize) -> String {
+    format!("(no definitions found in {total_lines}-line file)")
 }
 
 fn fallback_outline(content: &str) -> Vec<(usize, String)> {
@@ -863,6 +858,28 @@ mod tests {
     }
 
     #[test]
+    fn read_file_outline_without_definitions_returns_fallback_message() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("notes.txt"),
+            "plain text\nstill plain text\n",
+        )
+        .unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "notes.txt", "outline": true}),
+        );
+
+        assert!(!result.is_error);
+        assert!(
+            result.output.contains("no definitions found"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn read_file_auto_paginates_large_files() {
         let tmp = TempDir::new().unwrap();
         // Create file larger than READ_FILE_SIZE_LIMIT (80KB) with 3000 lines
@@ -927,6 +944,44 @@ mod tests {
             result.output.contains("too large"),
             "got: {}",
             result.output
+        );
+    }
+
+    #[test]
+    fn read_last_n_lines_preserves_multibyte_characters() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("utf8-tail.txt");
+
+        let prefix = "头\n";
+        let body = "你".repeat(4000);
+        let mut pad = String::new();
+        let suffix = loop {
+            let candidate = format!("\npad{pad}\n倒数第二行\n最终行");
+            let total_len = prefix.len() + body.len() + candidate.len();
+            let seek_pos = total_len.saturating_sub(8192);
+            let body_start = prefix.len();
+            let body_end = body_start + body.len();
+            if total_len > 8192
+                && seek_pos > body_start
+                && seek_pos < body_end
+                && !(seek_pos - body_start).is_multiple_of(3)
+            {
+                break candidate;
+            }
+            pad.push('x');
+        };
+
+        std::fs::write(&path, format!("{prefix}{body}{suffix}")).unwrap();
+
+        let lines = read_last_n_lines(&path, 2).unwrap();
+        assert_eq!(lines, vec!["倒数第二行".to_string(), "最终行".to_string()]);
+    }
+
+    #[test]
+    fn render_outline_returns_none_when_no_definitions() {
+        assert_eq!(
+            render_outline(Path::new("notes.txt"), "plain text\n", 1),
+            None
         );
     }
 

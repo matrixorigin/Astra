@@ -16,9 +16,12 @@ use crossterm::style::Stylize;
 ///
 /// Using an enum instead of Err("__SEND_AS_CHAT__:…") provides type-safe
 /// communication between the plan handler and the main REPL loop.
+#[derive(Debug)]
 pub enum PlanInputResult {
     /// Input was fully handled within plan mode.
     Handled,
+    /// Re-dispatch the enclosed slash command through the main REPL slash handler.
+    DispatchSlash(String),
     /// Plan was abandoned; the enclosed message should be sent as normal chat.
     SendAsChat(String),
 }
@@ -591,8 +594,9 @@ pub fn plan_idle_review_not_started(ps: &plan::PlanModeState) -> bool {
 /// natural-language plan edit and sent to the LLM.
 ///
 /// Returns [`PlanInputResult::Handled`] when input was processed within plan mode,
-/// or [`PlanInputResult::SendAsChat`] when the plan was abandoned and the message
-/// should be sent as normal chat.
+/// [`PlanInputResult::DispatchSlash`] when slash input should be re-dispatched
+/// through the main REPL slash handler, or [`PlanInputResult::SendAsChat`] when
+/// the plan was abandoned and the message should be sent as normal chat.
 pub async fn handle_plan_mode_input(
     input: String,
     token: Option<&str>,
@@ -895,19 +899,18 @@ pub async fn handle_plan_mode_input(
     if plan_execution_ui_active(state) {
         // When plan is paused (handle exists but monitor exited), route input through
         // PlanCommand parser first. If it's a valid command (continue, status, etc.),
-        // execute it. If it's a /slash command, allow it through. Otherwise, abandon
-        // the plan per documented behavior: "Any other message — abandons the plan
-        // and sends it as a normal chat turn"
+        // execute it. If it's a /slash command, re-dispatch it through the main REPL
+        // slash handler. Otherwise, abandon the plan per documented behavior:
+        // "Any other message — abandons the plan and sends it as a normal chat turn"
 
         // First check for valid PlanCommand (continue, status, exit, etc.)
         if let Some(cmd) = PlanCommand::parse(&input) {
             return handle_plan_command(cmd, token, state, api).await;
         }
 
-        // Allow /slash commands through to slash handling
+        // Re-dispatch /slash commands through the main REPL slash handler.
         if input.starts_with('/') {
-            // Fall through to slash command handling below
-            return Ok(PlanInputResult::Handled);
+            return Ok(PlanInputResult::DispatchSlash(input));
         }
 
         // Not a command, not a slash — abandon plan and send as chat
@@ -1970,6 +1973,66 @@ mod tests {
         assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
         assert_eq!(ps.plan.subtasks.len(), 1);
         assert_eq!(ps.plan.subtasks[0].id, "t1");
+    }
+
+    #[tokio::test]
+    async fn paused_plan_slash_command_is_redispatched() {
+        let mut state = ReplState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            "goal".into(),
+            plan::ProjectContext::default(),
+        ));
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("/help".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        match result {
+            PlanInputResult::DispatchSlash(cmd) => assert_eq!(cmd, "/help"),
+            other => panic!("expected DispatchSlash, got {other:?}"),
+        }
+        assert!(
+            state.plan_mode.is_some(),
+            "slash command should not abandon the plan"
+        );
+        assert!(
+            state.plan_handle.is_some(),
+            "slash command should leave the paused executor intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_plan_plain_text_abandons_and_sends_chat() {
+        let mut state = ReplState::default();
+        state.plan_mode = Some(plan::PlanModeState::new(
+            "goal".into(),
+            plan::ProjectContext::default(),
+        ));
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("tell me more".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        match result {
+            PlanInputResult::SendAsChat(msg) => assert_eq!(msg, "tell me more"),
+            other => panic!("expected SendAsChat, got {other:?}"),
+        }
+        assert!(
+            state.plan_mode.is_none(),
+            "plain chat should abandon paused plan mode"
+        );
+        assert!(
+            state.plan_handle.is_none(),
+            "plain chat should clear the paused executor handle"
+        );
     }
 
     #[test]

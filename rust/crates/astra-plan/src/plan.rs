@@ -563,10 +563,9 @@ impl PlanCommand {
     /// natural-language plan edit or goal description).
     pub fn parse(input: &str) -> Option<PlanCommand> {
         let trimmed = input.trim();
-        // Strip trailing punctuation (!, !, ?，。etc.) for fuzzy matching
-        let stripped = trimmed.trim_end_matches(|c: char| {
-            matches!(c, '!' | '！' | '?' | '？' | '。' | '，' | ',' | '.')
-        });
+        // Strip only emphatic/question punctuation used for command-like inputs.
+        // Avoid ASCII '.' and ',' because paused-plan parsing runs on all input.
+        let stripped = trimmed.trim_end_matches(['!', '！', '?', '？', '。']);
         let lower = stripped.to_lowercase();
 
         // Help
@@ -1088,6 +1087,9 @@ mod tests {
         assert_eq!(PlanCommand::parse("继续!!"), Some(PlanCommand::Resume));
         // No punctuation still works
         assert_eq!(PlanCommand::parse("继续"), Some(PlanCommand::Resume));
+        // ASCII sentence punctuation stays literal to avoid accidental matches.
+        assert_eq!(PlanCommand::parse("done."), None);
+        assert_eq!(PlanCommand::parse("continue,"), None);
     }
 
     #[test]

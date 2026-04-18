@@ -502,6 +502,37 @@ async fn run_chat_repl(
                         .await
                         {
                             Ok(plan_interaction::PlanInputResult::Handled) => {}
+                            Ok(plan_interaction::PlanInputResult::DispatchSlash(cmd)) => {
+                                let should_exit = handle_slash_command(
+                                    &cmd,
+                                    api,
+                                    profile,
+                                    &mut state,
+                                    current_token.as_deref(),
+                                    &*selector,
+                                )
+                                .await?;
+                                if should_exit {
+                                    break ReplExit::Command;
+                                }
+                                if let Some(json) = state.learning_snapshot.take() {
+                                    merge_learning_snapshot(
+                                        &json,
+                                        &pipeline_modules.entity_graph,
+                                        &pipeline_modules.pattern_library,
+                                        &pipeline_modules.calibrator,
+                                    );
+                                }
+                                if state.executing_plan.is_some() && state.plan_mode.is_none() {
+                                    start_and_monitor_plan(
+                                        &mut state,
+                                        current_token.as_deref(),
+                                        api,
+                                        profile,
+                                    )
+                                    .await?;
+                                }
+                            }
                             Ok(plan_interaction::PlanInputResult::SendAsChat(msg)) => {
                                 // Plan was abandoned; send the message as normal chat
                                 handle_chat_input(
