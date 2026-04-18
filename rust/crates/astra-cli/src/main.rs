@@ -501,12 +501,11 @@ async fn run_chat_repl(
                         )
                         .await
                         {
-                            Ok(()) => {}
-                            Err(e) if e.starts_with("__SEND_AS_CHAT__:") => {
+                            Ok(plan_interaction::PlanInputResult::Handled) => {}
+                            Ok(plan_interaction::PlanInputResult::SendAsChat(msg)) => {
                                 // Plan was abandoned; send the message as normal chat
-                                let msg = e.strip_prefix("__SEND_AS_CHAT__:").unwrap_or(&line);
                                 handle_chat_input(
-                                    msg.to_string(),
+                                    msg,
                                     current_token.as_deref(),
                                     &mut state,
                                     ReplTurnContext {

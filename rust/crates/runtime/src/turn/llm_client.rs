@@ -326,7 +326,11 @@ pub(crate) async fn call_llm_and_collect(
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
     let mut tpm_exhaustion_detected = false;
-    let mut idle_timeout_count = 0u32; // Track idle timeouts for retry-before-fallback
+    // Track consecutive idle timeouts for the retry-before-fallback logic.
+    // This counter persists across all retry attempts (rate-limit, network, etc.)
+    // to ensure we get exactly one streaming retry before falling back to non-stream.
+    // A first idle timeout triggers a retry (still streaming); a second falls back.
+    let mut idle_timeout_count = 0u32;
     let max_retries = LLM_MAX_RETRIES;
 
     for attempt in 0..=max_retries {

@@ -3,6 +3,7 @@
 //! All operations are sandboxed to a workspace root directory. Path traversal
 //! via `..` is normalized before the boundary check to prevent escapes.
 
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -146,38 +147,75 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     // For large files without explicit range, provide a helpful preview instead of error.
     // This auto-pagination helps the agent understand file structure without manual range specification.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
-        // Read the file anyway for preview
-        let content = match read_to_string_lossy(&path) {
-            Ok(content) => content,
-            Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
-        };
+        // Hard ceiling: refuse to load extremely large files into memory.
+        if metadata.len() as usize > READ_FILE_HARD_LIMIT {
+            return ToolResult::error(format!(
+                "Error: file is too large ({} bytes). Use start_line/end_line to read a specific range, or outline=true.",
+                metadata.len()
+            ));
+        }
 
-        let lines: Vec<&str> = content.lines().collect();
-        let total_lines = lines.len();
-
-        // Provide head (first 50 lines) + tail (last 20 lines) + outline
+        // Use streaming approach for large files to avoid allocating ~10MB
+        // for preview. Read only head lines + seek to tail.
         const HEAD_LINES: usize = 50;
         const TAIL_LINES: usize = 20;
 
-        let head_count = HEAD_LINES.min(total_lines);
-        let tail_start = if total_lines > HEAD_LINES + TAIL_LINES {
-            total_lines - TAIL_LINES
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+        };
+        let file_size = metadata.len();
+
+        // Read head lines
+        let mut reader = BufReader::new(file);
+        let mut head_lines = Vec::with_capacity(HEAD_LINES);
+        let mut line_buf = String::new();
+        let mut total_lines = 0usize;
+
+        // Count total lines (streaming) and collect head
+        loop {
+            line_buf.clear();
+            match reader.read_line(&mut line_buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    total_lines += 1;
+                    if head_lines.len() < HEAD_LINES {
+                        // Remove trailing newline for consistent formatting
+                        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+                        head_lines.push(trimmed.to_string());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // For tail, we need to re-read from near the end
+        // Use a simple approach: seek backward and read last N lines
+        let tail_lines = if total_lines > HEAD_LINES + TAIL_LINES {
+            read_last_n_lines(&path, TAIL_LINES).unwrap_or_default()
         } else {
-            head_count // no gap, just show sequential
+            Vec::new() // No tail needed if file fits in head
+        };
+
+        let head_count = head_lines.len();
+        let tail_count = tail_lines.len();
+        let tail_start = if total_lines > HEAD_LINES + TAIL_LINES {
+            total_lines - tail_count
+        } else {
+            head_count
         };
 
         let mut preview = String::new();
         preview.push_str(&format!(
             "# Large file preview ({} bytes, {} lines)\n\n",
-            metadata.len(),
-            total_lines
+            file_size, total_lines
         ));
 
         // Head section
         preview.push_str("## First lines (1-");
         preview.push_str(&head_count.to_string());
         preview.push_str(")\n```\n");
-        for (i, line) in lines.iter().take(head_count).enumerate() {
+        for (i, line) in head_lines.iter().enumerate() {
             preview.push_str(&format!("{:4}. {}\n", i + 1, line));
         }
         preview.push_str("```\n\n");
@@ -191,22 +229,35 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         }
 
         // Tail section (only if there's content after head)
-        if tail_start > head_count && TAIL_LINES > 0 {
+        if !tail_lines.is_empty() && tail_start > head_count {
             preview.push_str("## Last lines (");
             preview.push_str(&(tail_start + 1).to_string());
             preview.push('-');
             preview.push_str(&total_lines.to_string());
             preview.push_str(")\n```\n");
-            for (i, line) in lines.iter().skip(tail_start).enumerate() {
+            for (i, line) in tail_lines.iter().enumerate() {
                 preview.push_str(&format!("{:4}. {}\n", tail_start + i + 1, line));
             }
             preview.push_str("```\n\n");
         }
 
-        // Try to add outline for code files
-        let outline_str = render_outline(&path, &content, total_lines);
-        if !outline_str.contains("(no definitions found") {
-            preview.push_str(&outline_str);
+        // For outline, we need the full file content (only for code files)
+        // Since outline uses tree-sitter, we need to read the full file anyway
+        // But only do this for reasonably sized code files (< 1MB)
+        if file_size < 1_000_000
+            && let Ok(content) = read_to_string_lossy(&path)
+        {
+            let outline_str = render_outline(&path, &content, total_lines);
+            // Check for actual definitions rather than relying on error message format
+            if outline_str.contains("fn ")
+                || outline_str.contains("struct ")
+                || outline_str.contains("impl ")
+                || outline_str.contains("class ")
+                || outline_str.contains("def ")
+                || outline_str.contains("function ")
+            {
+                preview.push_str(&outline_str);
+            }
         }
 
         // Truncate before appending tip so the tip is always intact when within limit.
@@ -289,6 +340,67 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         ));
     }
     ToolResult::text(result)
+}
+
+/// Read the last N lines of a file efficiently.
+///
+/// Uses reverse reading from the end of the file to avoid loading
+/// the entire file into memory for large files.
+fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+
+    if file_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Read from the end, looking for newlines
+    // Start with a reasonable buffer size
+    let mut buffer_size = 8192usize.min(file_size as usize);
+    let mut lines = Vec::new();
+    let mut position = file_size;
+
+    loop {
+        let seek_pos = position.saturating_sub(buffer_size as u64);
+        file.seek(SeekFrom::Start(seek_pos))?;
+
+        let to_read = (position - seek_pos) as usize;
+        let mut buffer = vec![0u8; to_read];
+        file.read_exact(&mut buffer)?;
+
+        // Convert to string (lossy)
+        let chunk = String::from_utf8_lossy(&buffer);
+
+        // Split into lines and prepend to result
+        let mut chunk_lines: Vec<String> = chunk.lines().map(|s| s.to_string()).collect();
+
+        // Handle partial line at the beginning of the buffer
+        // The last line of this chunk may be incomplete - it will be completed by the next iteration
+        if !lines.is_empty()
+            && seek_pos > 0
+            && let (Some(first_existing), Some(last_chunk)) = (lines.first_mut(), chunk_lines.pop())
+        {
+            *first_existing = format!("{}{}", last_chunk, first_existing);
+        }
+
+        // Prepend chunk lines to result
+        chunk_lines.append(&mut lines);
+        lines = chunk_lines;
+
+        if lines.len() >= n || seek_pos == 0 {
+            break;
+        }
+
+        position = seek_pos;
+        buffer_size = (buffer_size * 2).min(65536); // Double buffer size, cap at 64KB
+    }
+
+    // Return only the last N lines
+    if lines.len() > n {
+        Ok(lines.split_off(lines.len() - n))
+    } else {
+        Ok(lines)
+    }
 }
 
 fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
