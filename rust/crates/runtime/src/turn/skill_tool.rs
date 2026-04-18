@@ -2251,7 +2251,6 @@ mod tests {
         assert!(text.contains("hidden-deploy"), "{text}");
         assert_eq!(names, vec!["hidden-deploy".to_string()]);
     }
-
     #[tokio::test]
     async fn partition_runs_discover_before_skill() {
         let resolver = stub_resolver();
@@ -3027,7 +3026,6 @@ mod tests {
 
         server.abort();
     }
-
 
     #[tokio::test]
     async fn execute_skill_remote_output_schema_is_verified() {
