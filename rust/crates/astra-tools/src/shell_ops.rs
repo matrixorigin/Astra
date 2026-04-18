@@ -98,9 +98,15 @@ struct SearchIgnoreRule {
 }
 
 /// Hard validation for `execute_bash` (and server-side `bash` when routed through the same path).
-/// Fails closed on destructive filesystem/process/network-shell patterns and selected
-/// [`analyze_command_risks`] categories (excluding generic `NetworkAccess` / `PathTraversal`
-/// so normal `curl` / `cd ..` workflows are not blocked here — those are gated elsewhere).
+///
+/// Layering:
+/// 1. Local substring/heuristic rules (destructive `rm`, pipe-to-shell, netcat, etc.).
+/// 2. [`analyze_command_risks`] (tree-sitter + legacy): any reported risk **blocks** except
+///    [`CommandRisk::PathTraversal`] and [`CommandRisk::NetworkAccess`], which are allowed here
+///    so normal `cd ../..` and `curl`/`wget` workflows remain usable (network still subject to
+///    sandbox/permissions elsewhere). All other sandbox risks (e.g. [`CommandRisk::Eval`],
+///    [`CommandRisk::ProcessSubstitution`]) fail closed so we never return Ok when the sandbox
+///    flags a higher-severity pattern only in AST.
 pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     let cmd = command.trim();
     if cmd.is_empty() {
@@ -136,8 +142,21 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             ));
         }
     }
-    if lower.starts_with("rm ") || lower.contains("; rm ") || lower.contains("&& rm ") {
+    // Every `rm` form is blocked here (including `rm -r`, `rm -f`, flags-only variants): never
+    // treat recursive remove as "safe" — use structured file/delete tools instead.
+    if lower.starts_with("rm ")
+        || lower.contains("; rm ")
+        || lower.contains("&& rm ")
+        || lower.contains("| rm ")
+    {
         return Err("Error: `rm` is blocked in execute_bash — use structured file tools".into());
+    }
+    if lower.starts_with("rmdir")
+        || lower.contains("; rmdir")
+        || lower.contains("&& rmdir")
+        || lower.contains("| rmdir")
+    {
+        return Err("Error: `rmdir` is blocked in execute_bash — use structured file tools".into());
     }
     if (lower.contains("curl ") || lower.contains("wget "))
         && (lower.contains("| bash")
@@ -153,20 +172,23 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     }
 
     for risk in analyze_command_risks(command) {
-        match risk {
+        match &risk {
+            // Allowed here only — still constrained by local rules + permission layer.
+            CommandRisk::PathTraversal | CommandRisk::NetworkAccess => {}
+            // Intentionally still allowed: benign redirects / `$(...)` are common in build scripts;
+            // AST marks them aggressively; blocking would break typical `cargo`/`make` usage.
+            CommandRisk::OutputRedirection | CommandRisk::CommandSubstitution => {}
+            // Fail closed on every other sandbox-reported risk (eval, process substitution, etc.).
             CommandRisk::RemoteCodeExecution
             | CommandRisk::PrivilegeEscalation
             | CommandRisk::ProcessControl
             | CommandRisk::EnvManipulation
-            | CommandRisk::ZshDangerous(_) => {
+            | CommandRisk::ZshDangerous(_)
+            | CommandRisk::SensitivePathAccess(_)
+            | CommandRisk::Eval
+            | CommandRisk::ProcessSubstitution => {
                 return Err(format!("Error: bash command blocked ({risk})"));
             }
-            CommandRisk::SensitivePathAccess(p) => {
-                return Err(format!(
-                    "Error: bash command blocked (sensitive path access: {p})"
-                ));
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -3211,6 +3233,25 @@ printf 'probe.txt:1:needle\n'
     #[test]
     fn validate_execute_bash_rejects_destructive_rm_rf() {
         assert!(validate_execute_bash_command("rm -rf ./build").is_err());
+    }
+
+    #[test]
+    fn validate_execute_bash_rejects_rm_recursive_even_if_substring_order_differs() {
+        assert!(validate_execute_bash_command("rm -r ./build").is_err());
+        assert!(validate_execute_bash_command("rm ./build").is_err());
+    }
+
+    #[test]
+    fn validate_execute_bash_rejects_rmdir() {
+        assert!(validate_execute_bash_command("rmdir empty_dir").is_err());
+        assert!(validate_execute_bash_command("true && rmdir x").is_err());
+    }
+
+    #[test]
+    fn validate_execute_bash_rejects_eval_and_process_substitution_when_ast_flags_them() {
+        assert!(validate_execute_bash_command("eval echo hi").is_err());
+        // Process substitution is parsed as a distinct risk when the shell AST recognizes it.
+        assert!(validate_execute_bash_command("cat <(echo 1)").is_err());
     }
 
     #[test]

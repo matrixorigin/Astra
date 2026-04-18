@@ -1165,9 +1165,12 @@ pub enum StepVerdict {
 
 // ─── Retry Policy ────────────────────────────────────────────────────────────
 
+/// Default absolute ceiling for automatic retries (step + tool policies, serde default).
+pub const DEFAULT_RETRY_MAX_ATTEMPTS_CEILING: u32 = 5;
+
 /// Step-level retry policy (fallback when tool-level not specified).
 fn default_retry_max_retries() -> u32 {
-    5
+    DEFAULT_RETRY_MAX_ATTEMPTS_CEILING
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

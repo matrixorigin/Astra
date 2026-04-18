@@ -706,6 +706,13 @@ async fn do_elicitation(
 }
 
 /// Running MCP client connection.
+///
+/// # Concurrency Safety
+///
+/// `McpConnection` holds `Arc<AtomicBool>` flags for change notifications —
+/// these are lock-free and safe for concurrent access. For WebSocket
+/// connections, the bridge `JoinHandle`s are stored so task failures can be
+/// detected instead of silently degrading the connection.
 pub struct McpConnection {
     /// Server name.
     pub name: String,
@@ -723,6 +730,10 @@ pub struct McpConnection {
     prompts_changed: Arc<AtomicBool>,
     /// Flag set by the notification handler when the server's resource list changes.
     resources_changed: Arc<AtomicBool>,
+    /// JoinHandles for WebSocket reader/writer bridge tasks (None for stdio/SSE).
+    /// Stored so that task panics or unexpected exits are detectable instead of
+    /// silently degrading the connection.
+    ws_bridge_handles: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
 }
 
 impl McpConnection {
@@ -828,6 +839,19 @@ impl McpConnection {
     /// Check if this server has a specific tool.
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.iter().any(|t| t.name == name)
+    }
+
+    /// Check whether WebSocket bridge tasks are still running.
+    ///
+    /// Returns `true` for non-WebSocket connections (stdio/SSE) since they
+    /// don't rely on bridge tasks. For WebSocket connections, returns `false`
+    /// if either bridge task has finished (error/panic/clean exit), which
+    /// means data flow is degraded or stopped.
+    pub fn ws_bridge_alive(&self) -> bool {
+        match &self.ws_bridge_handles {
+            None => true, // stdio/SSE — no bridge tasks needed
+            Some((read_h, write_h)) => !read_h.is_finished() && !write_h.is_finished(),
+        }
     }
 
     /// List all resources from this server.
@@ -1683,6 +1707,7 @@ async fn connect_stdio(
         tools_changed,
         prompts_changed,
         resources_changed,
+        ws_bridge_handles: None,
     })
 }
 
@@ -1748,6 +1773,7 @@ async fn connect_sse(
         tools_changed,
         prompts_changed,
         resources_changed,
+        ws_bridge_handles: None,
     })
 }
 
@@ -1809,7 +1835,7 @@ async fn connect_ws(
 
     // Bridge: WebSocket text frames → bytes for rmcp to read
     let reader_name = ws_name.clone();
-    tokio::spawn(async move {
+    let ws_read_handle = tokio::spawn(async move {
         loop {
             match ws_read.next().await {
                 Some(Ok(tungstenite::Message::Text(text))) => {
@@ -1837,7 +1863,7 @@ async fn connect_ws(
 
     // Bridge: rmcp writes → WebSocket text frames
     let writer_name = ws_name;
-    tokio::spawn(async move {
+    let ws_write_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(&mut bridge_read);
         let mut line = String::new();
         loop {
@@ -1887,6 +1913,7 @@ async fn connect_ws(
         tools_changed,
         prompts_changed,
         resources_changed,
+        ws_bridge_handles: Some((ws_read_handle, ws_write_handle)),
     })
 }
 
