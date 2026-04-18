@@ -1228,6 +1228,7 @@ impl ServerToolExecutor {
             "read_file" => self.default_executor.execute("read_file", args).await,
             "write_file" => tool_result_from_output(self.server_write_file(args)),
             "str_replace" => tool_result_from_output(self.server_str_replace(args)),
+            "multi_edit" => tool_result_from_output(self.server_multi_edit(args)),
             "delete_file" => tool_result_from_output(self.server_delete_file(args)),
             "rollback_file_edits" => tool_result_from_output(self.rollback_file_edits(args)),
             "list_dir" => self.default_executor.execute("list_dir", args).await,
@@ -1317,11 +1318,11 @@ impl ServerToolExecutor {
             // ── Unknown tool fallback ──────────────────────────────────
             _ => astra_tools::ToolResult::error(format!(
                 "Error: Tool '{name}' is not available in server-side execution mode. \
-                     Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
-                     list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
-                     rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
-                     grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
-                     git_show, git_blame, symbols, git_commit, git_revert_commit, github_list_prs, github_get_pr, \
+                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
+                      multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
+                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
+                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
+                      git_show, git_blame, symbols, git_commit, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, memory_*, web_fetch, \
                      web_search, ask_user"
             )),
@@ -2743,6 +2744,39 @@ impl ServerToolExecutor {
         result.output
     }
 
+    fn server_multi_edit(&self, args: &Value) -> String {
+        let prepared = match astra_tools::fs_ops::prepare_multi_edit(&self.workspace_root, args) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.output,
+        };
+
+        if !args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+            journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
+        }
+
+        let result = prepared.apply();
+        if !result.is_error
+            && !args
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            journal.record_after(
+                prepared.path(),
+                "server-multi-edit",
+                prepared.new_content_bytes(),
+            );
+        }
+        result.output
+    }
+
     fn server_delete_file(&self, args: &Value) -> String {
         let prepared = match astra_tools::fs_ops::prepare_delete_file(&self.workspace_root, args) {
             Ok(prepared) => prepared,
@@ -3668,6 +3702,41 @@ esac
     }
 
     #[tokio::test]
+    async fn rollback_file_edits_current_turn_reverts_server_multi_edit() {
+        let (exec, dir) = test_executor();
+        exec.set_turn_index(8);
+        let target = dir.path().join("edit.txt");
+        std::fs::write(&target, "aaa bbb ccc").unwrap();
+
+        let edited = exec
+            .execute(
+                "multi_edit",
+                &json!({
+                    "path": "edit.txt",
+                    "edits": [
+                        {"old_str": "aaa", "new_str": "AAA"},
+                        {"old_str": "ccc", "new_str": "CCC"}
+                    ]
+                }),
+            )
+            .await;
+        assert!(edited.contains("Successfully applied"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC");
+
+        let rollback = exec
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .await;
+        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(
+            rollback_json["success"].as_bool(),
+            Some(true),
+            "got: {rollback}"
+        );
+        assert_eq!(rollback_json["turn_index"].as_u64(), Some(8));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "aaa bbb ccc");
+    }
+
+    #[tokio::test]
     async fn rollback_file_edits_file_scope_restores_deleted_file() {
         let (exec, dir) = test_executor();
         let target = dir.path().join("gone.txt");
@@ -3845,6 +3914,32 @@ esac
             !result.contains("not available in server-side execution mode"),
             "{result}"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_edit_is_available_in_server_mode() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("edit.txt"), "foo bar baz").unwrap();
+
+        let result = exec
+            .execute(
+                "multi_edit",
+                &json!({
+                    "path": "edit.txt",
+                    "edits": [
+                        {"old_str": "foo", "new_str": "FOO"},
+                        {"old_str": "baz", "new_str": "BAZ"}
+                    ]
+                }),
+            )
+            .await;
+
+        assert!(result.contains("Successfully applied"), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
+            "FOO bar BAZ"
+        );
+        assert!(!result.contains("not available in server-side execution mode"));
     }
 
     #[tokio::test]

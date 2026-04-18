@@ -1327,7 +1327,7 @@ mod tests {
                 .contains("rollback_database_snapshots")
         );
         assert!(host.valid_tool_names().contains("memory_store"));
-        assert!(!host.valid_tool_names().contains("multi_edit"));
+        assert!(host.valid_tool_names().contains("multi_edit"));
         assert!(!host.valid_tool_names().contains("powershell"));
         assert!(host.emitted_events.is_empty());
     }
