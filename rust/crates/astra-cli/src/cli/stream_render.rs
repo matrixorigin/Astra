@@ -6268,7 +6268,6 @@ mod tests {
         assert!(outcome.output.contains("Tool execution panicked: boom"));
         assert!(outcome.tool_result_fields.is_none());
     }
-
     // ── Skill/MCP output summary tests ──
 
     #[test]
