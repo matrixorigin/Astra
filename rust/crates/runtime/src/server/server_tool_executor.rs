@@ -1280,6 +1280,7 @@ impl ServerToolExecutor {
             "git_blame" => self.default_executor.execute("git_blame", args).await,
             "symbols" => self.default_executor.execute("symbols", args).await,
             "git_commit" => self.default_executor.execute("git_commit", args).await,
+            "git_stash" => self.default_executor.execute("git_stash", args).await,
             "git_revert_commit" => {
                 self.default_executor
                     .execute("git_revert_commit", args)
@@ -1327,7 +1328,7 @@ impl ServerToolExecutor {
                      multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
-                     git_show, git_blame, symbols, git_commit, git_revert_commit, github_list_prs, github_get_pr, \
+                     git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
                      github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
                      web_search, ask_user"
             )),
@@ -4076,6 +4077,34 @@ esac
         assert!(
             contributors.contains("## Top Contributors"),
             "{contributors}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_stash_is_available_in_server_mode() {
+        let (exec, dir) = test_executor();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let stash_list = exec.execute("git_stash", &json!({"action": "list"})).await;
+        assert!(
+            stash_list.contains("No stashes found")
+                || stash_list.contains("stash@")
+                || stash_list.is_empty(),
+            "{stash_list}"
         );
     }
 

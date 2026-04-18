@@ -60,6 +60,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_blame",
     "symbols",
     "git_commit",
+    "git_stash",
     "git_revert_commit",
     "github_list_prs",
     "github_get_pr",
@@ -1963,6 +1964,7 @@ mod tests {
         assert!(names.contains(&"git_log_search"));
         assert!(names.contains(&"github_list_prs"));
         assert!(names.contains(&"github_ci_status"));
+        assert!(names.contains(&"git_stash"));
         assert!(names.contains(&"github_create_issue"));
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"memory_retrieve"));
