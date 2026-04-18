@@ -1603,6 +1603,7 @@ mod tests {
             },
             ttft_ms: Some(10),
             edge_tool_round: Vec::new(),
+            error_kind: None,
         };
 
         let valid_tool_names = host.valid_tool_names().clone();

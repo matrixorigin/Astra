@@ -202,10 +202,15 @@ impl RequestScopedSkillResolver {
 }
 
 impl crate::turn::skill_tool::SkillResolver for RequestScopedSkillResolver {
-    fn resolve(&self, name: &str) -> Result<crate::turn::skill_tool::ResolvedSkill, String> {
+    fn resolve(
+        &self,
+        name: &str,
+    ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
         let lookup = name.trim().to_ascii_lowercase();
         if lookup.is_empty() || !self.allowed_lookup.contains(&lookup) {
-            return Err(format!("skill '{name}' is not allowed for this request"));
+            return Err(crate::skills::SkillError::PermissionDenied(format!(
+                "skill '{name}' is not allowed for this request"
+            )));
         }
 
         let resolved = self.inner.resolve(name)?;
@@ -215,10 +220,10 @@ impl crate::turn::skill_tool::SkillResolver for RequestScopedSkillResolver {
         {
             Ok(resolved)
         } else {
-            Err(format!(
+            Err(crate::skills::SkillError::PermissionDenied(format!(
                 "skill '{}' resolved outside the request allowlist",
                 resolved.name
-            ))
+            )))
         }
     }
 
