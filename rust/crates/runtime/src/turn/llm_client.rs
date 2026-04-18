@@ -326,6 +326,7 @@ pub(crate) async fn call_llm_and_collect(
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
     let mut tpm_exhaustion_detected = false;
+    let mut idle_timeout_count = 0u32; // Track idle timeouts for retry-before-fallback
     let max_retries = LLM_MAX_RETRIES;
 
     for attempt in 0..=max_retries {
@@ -424,7 +425,7 @@ pub(crate) async fn call_llm_and_collect(
                             "LLM call cancelled",
                         ));
                     }
-                    // Check total budget before attempting fallback.
+                    // Check total budget before attempting retry/fallback.
                     let elapsed = started.elapsed();
                     if elapsed > total_budget {
                         return Err(astra_core::ClassifiedError::new(
@@ -435,13 +436,30 @@ pub(crate) async fn call_llm_and_collect(
                             ),
                         ));
                     }
-                    // Abort streaming and fall back to non-stream request (single response).
+
+                    idle_timeout_count += 1;
+
+                    // On first idle timeout, retry streaming before falling back to non-stream.
+                    // Some transient stalls recover on retry.
+                    if idle_timeout_count == 1 {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "stream idle timeout after {}ms — retrying streaming once before fallback",
+                            elapsed_ms
+                        );
+                        last_err = format!("stream idle timeout after {elapsed_ms}ms");
+                        last_kind = astra_core::ErrorKind::StreamIdle;
+                        continue; // retry streaming
+                    }
+
+                    // Second idle timeout — fall back to non-stream request.
                     // Cap the fallback timeout at min(fallback_timeout, remaining budget).
                     let remaining = total_budget.saturating_sub(elapsed);
                     let fb_timeout = llm_fallback_timeout().min(remaining);
                     astra_core::agent_warn!(
                         "llm",
-                        "stream idle timeout after {}ms — attempting non-stream fallback (timeout {}s)",
+                        "stream idle timeout #{} after {}ms — attempting non-stream fallback (timeout {}s)",
+                        idle_timeout_count,
                         elapsed_ms,
                         fb_timeout.as_secs()
                     );

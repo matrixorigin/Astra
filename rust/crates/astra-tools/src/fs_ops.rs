@@ -131,13 +131,77 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         }
     }
 
+    // For large files without explicit range, provide a helpful preview instead of error.
+    // This auto-pagination helps the agent understand file structure without manual range specification.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
-        let rough_lines = (metadata.len() as usize / 40).max(1);
-        return ToolResult::error(format!(
-            "Error: file is too large ({} bytes, ~{} lines). Use start_line/end_line to read a specific range, or outline=true to see definitions only.",
+        // Read the file anyway for preview
+        let content = match read_to_string_lossy(&path) {
+            Ok(content) => content,
+            Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+        };
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+
+        // Provide head (first 50 lines) + tail (last 20 lines) + outline
+        const HEAD_LINES: usize = 50;
+        const TAIL_LINES: usize = 20;
+
+        let head_count = HEAD_LINES.min(total_lines);
+        let tail_start = if total_lines > HEAD_LINES + TAIL_LINES {
+            total_lines - TAIL_LINES
+        } else {
+            head_count // no gap, just show sequential
+        };
+
+        let mut preview = String::new();
+        preview.push_str(&format!(
+            "# Large file preview ({} bytes, {} lines)\n\n",
             metadata.len(),
-            rough_lines
+            total_lines
         ));
+
+        // Head section
+        preview.push_str("## First lines (1-");
+        preview.push_str(&head_count.to_string());
+        preview.push_str(")\n```\n");
+        for (i, line) in lines.iter().take(head_count).enumerate() {
+            preview.push_str(&format!("{:4}. {}\n", i + 1, line));
+        }
+        preview.push_str("```\n\n");
+
+        // Gap indicator if there's a gap
+        if tail_start > head_count {
+            preview.push_str(&format!(
+                "... ({} lines omitted, use start_line/end_line to read specific ranges) ...\n\n",
+                tail_start - head_count
+            ));
+        }
+
+        // Tail section (only if there's content after head)
+        if tail_start > head_count && TAIL_LINES > 0 {
+            preview.push_str("## Last lines (");
+            preview.push_str(&(tail_start + 1).to_string());
+            preview.push('-');
+            preview.push_str(&total_lines.to_string());
+            preview.push_str(")\n```\n");
+            for (i, line) in lines.iter().skip(tail_start).enumerate() {
+                preview.push_str(&format!("{:4}. {}\n", tail_start + i + 1, line));
+            }
+            preview.push_str("```\n\n");
+        }
+
+        // Try to add outline for code files
+        let outline_str = render_outline(&path, &content, total_lines);
+        if !outline_str.contains("(no outline available)") {
+            preview.push_str(&outline_str);
+        }
+
+        preview.push_str(
+            "\n**Tip**: Use `start_line`/`end_line` to read specific sections, or `outline=true` for definitions only."
+        );
+
+        return ToolResult::text(preview);
     }
 
     let content = match read_to_string_lossy(&path) {
@@ -671,21 +735,51 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_large_full_reads() {
+    fn read_file_auto_paginates_large_files() {
         let tmp = TempDir::new().unwrap();
-        let large = "abcdefghij".repeat(9_000);
-        std::fs::write(tmp.path().join("big.txt"), large).unwrap();
+        // Create file larger than READ_FILE_SIZE_LIMIT (80KB) with 3000 lines
+        let mut large = String::new();
+        for i in 1..=3000 {
+            large.push_str(&format!(
+                "Line {}: Some content here to make the file larger\n",
+                i
+            ));
+        }
+        std::fs::write(tmp.path().join("big.txt"), &large).unwrap();
 
         let result = read_file(tmp.path(), &serde_json::json!({"path": "big.txt"}));
 
-        assert!(result.is_error);
+        // Should NOT be an error anymore - returns preview instead
+        assert!(!result.is_error, "got error: {}", result.output);
+        // Should contain preview header
         assert!(
-            result.output.contains("file is too large"),
+            result.output.contains("Large file preview"),
             "got: {}",
             result.output
         );
+        // Should have first lines section
         assert!(
-            result.output.contains("outline=true"),
+            result.output.contains("First lines"),
+            "got: {}",
+            result.output
+        );
+        // Should have line 1 content
+        assert!(result.output.contains("Line 1:"), "got: {}", result.output);
+        // Should mention omitted lines
+        assert!(
+            result.output.contains("lines omitted"),
+            "got: {}",
+            result.output
+        );
+        // Should have last lines section
+        assert!(
+            result.output.contains("Last lines"),
+            "got: {}",
+            result.output
+        );
+        // Should have tip about using start_line/end_line
+        assert!(
+            result.output.contains("start_line"),
             "got: {}",
             result.output
         );
