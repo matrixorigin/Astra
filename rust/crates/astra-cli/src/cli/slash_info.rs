@@ -1361,17 +1361,35 @@ pub(super) async fn handle_info_command(
                 format!("astra v{}", env!("CARGO_PKG_VERSION")),
             ));
 
-            // API health
+            // API base URL (same origin used for /health, /login, etc.)
+            rows.push((true, "api url", api.api_origin()));
+
+            // API health (+ embedded DB probe summary — note: health may use a separate short-lived pool)
             match api.get_health_text().await {
-                Ok(_) => {
-                    rows.push((true, "api health", "OK".to_string()));
+                Ok(body) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+                    let status = parsed
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let database = parsed
+                        .get("database")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let health_ok = status == "healthy" && database == "connected";
+                    rows.push((
+                        health_ok,
+                        "api health",
+                        format!("status={status}, database={database}"),
+                    ));
                 }
                 Err(e) => {
                     rows.push((false, "api health", e.to_string()));
                 }
             }
 
-            // Auth status
+            // Auth status — absence of a token is normal, not a "failed check"
             if let Some(tok) = token {
                 match api.get_auth_me_text(tok).await {
                     Ok(b) => {
@@ -1392,7 +1410,11 @@ pub(super) async fn handle_info_command(
                     }
                 }
             } else {
-                rows.push((false, "auth", "not logged in".to_string()));
+                rows.push((
+                    true,
+                    "auth",
+                    "not logged in — use /login or /register".to_string(),
+                ));
             }
 
             // Git repo
@@ -1471,6 +1493,11 @@ pub(super) async fn handle_info_command(
                 eprintln!("  {}", "All checks passed".green().bold());
             } else {
                 eprintln!("  {}", format!("{fail_count} check(s) failed").red().bold());
+                eprintln!(
+                    "  {}",
+                    "Hint: GET /health may pass while auth pool-times out — they use different connection paths."
+                        .dim()
+                );
             }
             eprintln!();
         }

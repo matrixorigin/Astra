@@ -26,6 +26,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: make lint
+      - name: Server tool schema guards (astra-tools)
+        run: make check-server-tool-schemas
       - name: Check formatting
         run: make format-check
       - uses: taiki-e/install-action@v2

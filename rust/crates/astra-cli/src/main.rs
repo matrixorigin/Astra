@@ -964,7 +964,8 @@ use project_instructions::{
 async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
-    let base = cli.api_url.trim_end_matches('/').to_string();
+    // Resolve API URL: --api-url flag > ASTRA_API_URL env var > config file > default
+    let base = command_router::resolve_api_url(cli.api_url.as_deref());
     let api = match astra_thin_client::ThinClient::new(&base, None) {
         Ok(api) => api,
         Err(err) => {
@@ -3863,13 +3864,13 @@ total_tokens_out: 500
     #[test]
     fn cli_api_url_default() {
         let cli = Cli::try_parse_from(["astra"]).unwrap();
-        assert_eq!(cli.api_url, "http://127.0.0.1:8000");
+        assert_eq!(cli.api_url, None);
     }
 
     #[test]
     fn cli_api_url_custom() {
         let cli = Cli::try_parse_from(["astra", "--api-url", "http://remote:9000"]).unwrap();
-        assert_eq!(cli.api_url, "http://remote:9000");
+        assert_eq!(cli.api_url.as_deref(), Some("http://remote:9000"));
     }
 
     #[test]

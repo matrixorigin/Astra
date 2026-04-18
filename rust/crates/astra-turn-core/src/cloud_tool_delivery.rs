@@ -587,6 +587,48 @@ pub async fn wait_tool_result_ledger_for_tool(
     out
 }
 
+/// Same SSE / persistence bundle as [`wait_tool_result_ledger_for_tool`], but for outputs
+/// computed on the server when no edge agent posts `POST /tools/result` (legacy `/chat/turn`
+/// with empty `edge_tools` and `edge_profile.cwd` set).
+pub fn local_tool_execution_delivery(
+    tc: &Value,
+    output: &str,
+    is_error: bool,
+) -> EdgeToolRoundDelivery {
+    let mut out = EdgeToolRoundDelivery::default();
+    let Some(tc_map) = tc.as_object() else {
+        astra_core::agent_warn!(
+            "tool_delivery",
+            "local_tool_execution_delivery: tool call is not a JSON object, skipping"
+        );
+        return out;
+    };
+    let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
+    let tool_name = tc_map
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let status = if is_error { "error" } else { "ok" };
+    let synthetic = json!({ "body": { "status": status, "output": output } });
+    let raw_content = tool_content_from_ledger_entry(&synthetic);
+    let content = llm_safe_tool_content(&raw_content, tool_name);
+    out.tool_messages.push(json!({
+        "role": "tool",
+        "tool_call_id": id,
+        "content": content,
+    }));
+    out.sse_maps
+        .push(build_tool_call_end_event(id, Value::String(raw_content)));
+    out.persist_tool_results
+        .push(persist_value_for_ledger_tool_result(
+            tc,
+            Some(&synthetic),
+            false,
+        ));
+    out
+}
+
 pub fn cloud_tool_requires_approval_for_delivery(tool_call: &Value) -> bool {
     cloud_tool_requires_approval(tool_call)
 }
@@ -1345,5 +1387,24 @@ mod tests {
         });
         let detail = tool_approval_detail(&tc);
         assert_eq!(detail.as_deref(), Some("git status"));
+    }
+
+    #[test]
+    fn local_tool_execution_delivery_matches_ok_ledger_shape() {
+        let tc = json!({
+            "id": "srv-1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"x"}"#}
+        });
+        let tail = local_tool_execution_delivery(&tc, "body text", false);
+        assert_eq!(tail.sse_maps.len(), 1);
+        assert_eq!(tail.tool_messages.len(), 1);
+        assert_eq!(tail.persist_tool_results.len(), 1);
+        assert!(
+            tail.tool_messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("body text")
+        );
     }
 }

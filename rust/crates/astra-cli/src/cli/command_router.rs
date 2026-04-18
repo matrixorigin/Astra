@@ -1867,14 +1867,19 @@ fn mcp_get(name: &str) -> Result<(), String> {
 // ═══════════════════════════════════════════════════════ Config ═══════════
 
 /// Path to `~/.astra/settings.json`.
-fn settings_path() -> Result<std::path::PathBuf, String> {
+fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = override_path {
+        return Ok(p.clone());
+    }
     dirs::home_dir()
         .map(|h| h.join(".astra").join("settings.json"))
         .ok_or_else(|| "Cannot determine home directory".to_string())
 }
 
-fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let path = settings_path()?;
+fn read_settings_from(
+    path_override: Option<&std::path::PathBuf>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let path = settings_path(path_override)?;
     if !path.is_file() {
         return Ok(serde_json::Map::new());
     }
@@ -1887,6 +1892,10 @@ fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String>
         .ok_or_else(|| format!("{} is not a JSON object", path.display()))
 }
 
+fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    read_settings_from(None)
+}
+
 /// Read `default_model` from settings.json, if set.
 pub fn read_config_default_model() -> Result<Option<String>, String> {
     let settings = read_settings()?;
@@ -1896,8 +1905,54 @@ pub fn read_config_default_model() -> Result<Option<String>, String> {
         .map(|s| s.to_string()))
 }
 
+/// Read `api_url` from settings.json, if set.
+pub fn read_config_api_url() -> Result<Option<String>, String> {
+    read_config_api_url_from(None)
+}
+
+/// Read `api_url` from a specific path (for testing) or the default settings path.
+fn read_config_api_url_from(
+    path_override: Option<&std::path::PathBuf>,
+) -> Result<Option<String>, String> {
+    let settings = read_settings_from(path_override)?;
+    Ok(settings
+        .get("api_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+const DEFAULT_API_URL: &str = "http://127.0.0.1:8000";
+
+/// Resolve API URL with priority: flag > env var > config file > default.
+pub fn resolve_api_url(flag: Option<&str>) -> String {
+    resolve_api_url_with(
+        flag,
+        || std::env::var("ASTRA_API_URL").ok(),
+        read_config_api_url,
+    )
+}
+
+/// Testable core: resolve API URL with injectable env and config sources.
+fn resolve_api_url_with(
+    flag: Option<&str>,
+    env_fn: impl FnOnce() -> Option<String>,
+    config_fn: impl FnOnce() -> Result<Option<String>, String>,
+) -> String {
+    flag.map(|s| s.trim_end_matches('/').to_string())
+        .or_else(|| env_fn().map(|s| s.trim_end_matches('/').to_string()))
+        .or_else(|| match config_fn() {
+            Ok(Some(url)) => Some(url.trim_end_matches('/').to_string()),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("warning: failed to read config for api_url: {e}");
+                None
+            }
+        })
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string())
+}
+
 fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
-    let path = settings_path()?;
+    let path = settings_path(None)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
@@ -1933,7 +1988,7 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
 
 fn config_list() -> Result<(), String> {
     let settings = read_settings()?;
-    let path = settings_path()?;
+    let path = settings_path(None)?;
 
     if settings.is_empty() {
         println!("  {}", "No settings configured.".dim());
@@ -2628,5 +2683,122 @@ mod default_model_tests {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         assert_eq!(model, None); // non-string returns None
+    }
+}
+
+#[cfg(test)]
+mod api_url_config_tests {
+    use super::*;
+
+    fn no_env() -> Option<String> {
+        None
+    }
+    fn no_config() -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn env_val(url: &str) -> impl FnOnce() -> Option<String> {
+        let s = url.to_string();
+        move || Some(s)
+    }
+    fn config_val(url: &str) -> impl FnOnce() -> Result<Option<String>, String> {
+        let s = url.to_string();
+        move || Ok(Some(s))
+    }
+
+    #[test]
+    fn flag_wins_over_env_and_config() {
+        let url = resolve_api_url_with(
+            Some("http://flag:8000"),
+            env_val("http://env:8000"),
+            config_val("http://config:8000"),
+        );
+        assert_eq!(url, "http://flag:8000");
+    }
+
+    #[test]
+    fn env_wins_over_config() {
+        let url = resolve_api_url_with(
+            None,
+            env_val("http://env:8000"),
+            config_val("http://config:8000"),
+        );
+        assert_eq!(url, "http://env:8000");
+    }
+
+    #[test]
+    fn config_wins_over_default() {
+        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000"));
+        assert_eq!(url, "http://config:8000");
+    }
+
+    #[test]
+    fn falls_back_to_default_when_all_none() {
+        let url = resolve_api_url_with(None, no_env, no_config);
+        assert_eq!(url, DEFAULT_API_URL);
+    }
+
+    #[test]
+    fn trailing_slash_stripped_from_flag() {
+        let url = resolve_api_url_with(Some("http://flag:8000/"), no_env, no_config);
+        assert_eq!(url, "http://flag:8000");
+    }
+
+    #[test]
+    fn trailing_slash_stripped_from_env() {
+        let url = resolve_api_url_with(None, env_val("http://env:8000/"), no_config);
+        assert_eq!(url, "http://env:8000");
+    }
+
+    #[test]
+    fn trailing_slash_stripped_from_config() {
+        let url = resolve_api_url_with(None, no_env, config_val("http://config:8000/"));
+        assert_eq!(url, "http://config:8000");
+    }
+
+    #[test]
+    fn config_error_falls_through_to_default() {
+        let url = resolve_api_url_with(None, no_env, || Err("broken".to_string()));
+        assert_eq!(url, DEFAULT_API_URL);
+    }
+
+    #[test]
+    fn api_url_is_known_setting() {
+        assert!(
+            KNOWN_SETTINGS.iter().any(|(k, _)| *k == "api_url"),
+            "api_url must be in KNOWN_SETTINGS"
+        );
+    }
+
+    /// Integration test: `read_config_api_url` actually reads `settings.json` from disk.
+    #[test]
+    fn read_config_api_url_reads_real_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let astra_dir = tmp.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        let settings = astra_dir.join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"api_url":"http://from-disk:9999","default_model":"gpt-4"}"#,
+        )
+        .unwrap();
+
+        let result = read_config_api_url_from(Some(&settings));
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("http://from-disk:9999"),
+            "read_config_api_url should read from disk"
+        );
+    }
+
+    #[test]
+    fn read_config_api_url_returns_none_when_key_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let astra_dir = tmp.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(astra_dir.join("settings.json"), r#"{}"#).unwrap();
+
+        let settings = astra_dir.join("settings.json");
+        let result = read_config_api_url_from(Some(&settings));
+        assert_eq!(result.unwrap(), None);
     }
 }

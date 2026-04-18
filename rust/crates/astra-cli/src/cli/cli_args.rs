@@ -10,9 +10,9 @@ use clap::{Args, Parser, Subcommand};
 #[command(name = "astra")]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
 pub(crate) struct Cli {
-    /// API server base URL
-    #[arg(long, default_value = "http://127.0.0.1:8000")]
-    pub api_url: String,
+    /// API server base URL [env: ASTRA_API_URL] [config: api_url] [default: http://127.0.0.1:8000]
+    #[arg(long)]
+    pub api_url: Option<String>,
     /// Config profile name
     #[arg(long)]
     pub profile: Option<String>,
