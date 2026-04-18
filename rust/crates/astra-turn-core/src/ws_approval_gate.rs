@@ -225,6 +225,8 @@ mod tests {
         assert!(gate.requires_approval("bash"));
         assert!(gate.requires_approval("write_file"));
         assert!(gate.requires_approval("delete_file"));
+        assert!(gate.requires_approval("rollback_file_edits"));
+        assert!(gate.requires_approval("rollback_database_snapshots"));
         assert!(!gate.requires_approval("read_file"));
         assert!(!gate.requires_approval("list_dir"));
         assert!(!gate.requires_approval("grep"));
