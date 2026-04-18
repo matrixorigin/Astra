@@ -565,7 +565,8 @@ impl PlanCommand {
         let trimmed = input.trim();
         // Strip only emphatic/question punctuation used for command-like inputs.
         // Avoid ASCII '.' and ',' because paused-plan parsing runs on all input.
-        let stripped = trimmed.trim_end_matches(['!', '！', '?', '？', '。']);
+        // Also avoid '。' (CJK full stop) — it's declarative like '.' not emphatic.
+        let stripped = trimmed.trim_end_matches(['!', '！', '?', '？']);
         let lower = stripped.to_lowercase();
 
         // Help
@@ -1068,12 +1069,8 @@ mod tests {
         // Chinese punctuation
         assert_eq!(PlanCommand::parse("继续!"), Some(PlanCommand::Resume));
         assert_eq!(PlanCommand::parse("继续！"), Some(PlanCommand::Resume));
-        assert_eq!(
-            PlanCommand::parse("执行。"),
-            Some(PlanCommand::Execute {
-                step_by_step: false
-            })
-        );
+        // CJK full stop (。) is declarative like ASCII '.', so NOT stripped
+        assert_eq!(PlanCommand::parse("执行。"), None);
         // English punctuation
         assert_eq!(PlanCommand::parse("continue!"), Some(PlanCommand::Resume));
         assert_eq!(

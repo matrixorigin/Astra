@@ -915,7 +915,12 @@ pub async fn handle_plan_mode_input(
 
         // Not a command, not a slash — abandon plan and send as chat
         if let Some(ref handle) = state.plan_handle {
-            let _ = handle.send_command(crate::plan_executor::PlanCommand::Cancel);
+            if let Err(e) = handle.send_command(crate::plan_executor::PlanCommand::Cancel) {
+                astra_core::agent_warn!(
+                    "plan",
+                    "failed to send Cancel to executor during abandon: {e}"
+                );
+            }
         }
         state.plan_handle = None;
         state.plan_mode = None;

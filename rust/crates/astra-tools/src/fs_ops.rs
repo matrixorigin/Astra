@@ -165,6 +165,7 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         let mut total_lines = 0usize;
 
         // Count total lines (streaming) and collect head
+        let mut io_error = false;
         loop {
             line_buf.clear();
             match reader.read_line(&mut line_buf) {
@@ -177,7 +178,14 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
                         head_lines.push(trimmed.to_string());
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    io_error = true;
+                    astra_core::agent_warn!(
+                        "fs",
+                        "I/O error reading head lines of large file: {e}"
+                    );
+                    break;
+                }
             }
         }
 
@@ -199,8 +207,14 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
         let mut preview = String::new();
         preview.push_str(&format!(
-            "# Large file preview ({} bytes, {} lines)\n\n",
-            file_size, total_lines
+            "# Large file preview ({} bytes, {} lines){}\n\n",
+            file_size,
+            total_lines,
+            if io_error {
+                " — partial read due to I/O error"
+            } else {
+                ""
+            }
         ));
 
         // Head section
@@ -388,7 +402,18 @@ fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
         }
     }
 
-    let text = String::from_utf8_lossy(&suffix[start..]);
+    // Ensure we start at a valid UTF-8 character boundary. If `start` landed
+    // inside a multi-byte sequence (e.g. a CJK character), scan forward to the
+    // next lead byte (0x00–0x7F or 0xC0–0xFF) so the first decoded line isn't
+    // garbled with a `` replacement. This matters both when start > 0 (common
+    // case: landed mid-character after a newline) and when start == 0 (rare
+    // case: file has fewer lines than n and seek_pos landed mid-character).
+    let mut safe_start = start;
+    while safe_start < suffix.len() && suffix[safe_start] & 0xC0 == 0x80 {
+        safe_start += 1;
+    }
+
+    let text = String::from_utf8_lossy(&suffix[safe_start..]);
     Ok(text.lines().map(|line| line.to_string()).collect())
 }
 
@@ -975,6 +1000,22 @@ mod tests {
 
         let lines = read_last_n_lines(&path, 2).unwrap();
         assert_eq!(lines, vec!["倒数第二行".to_string(), "最终行".to_string()]);
+    }
+
+    #[test]
+    fn read_last_n_lines_few_lines_avoids_mid_utf8_start() {
+        // Edge case: file has fewer lines than n, so start == 0 but seek_pos
+        // may land mid-UTF-8. Verify the safe_start scan produces valid output.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("few-cjk.txt");
+        // Two lines of CJK text — requesting 10 last lines (more than exist).
+        std::fs::write(&path, "第一行内容\n第二行内容").unwrap();
+        let lines = read_last_n_lines(&path, 10).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "第一行内容");
+        assert_eq!(lines[1], "第二行内容");
+        // No `` replacement characters from mid-UTF-8 boundary corruption.
+        assert!(!lines.iter().any(|l| l.contains('\u{FFFD}')));
     }
 
     #[test]
