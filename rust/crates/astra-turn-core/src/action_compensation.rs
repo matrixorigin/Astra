@@ -1356,6 +1356,42 @@ mod tests {
         assert!(explicit_approval_reason("write_file", &json!({"path": "x"})).is_none());
     }
 
+    #[test]
+    fn cloud_approval_required_tools_never_fall_back_to_read_profiles() {
+        fn sample_args(tool_name: &str) -> Value {
+            match tool_name {
+                "bash" | "exec" | "run_command" | "shell" => {
+                    json!({"command": "touch tmp.txt"})
+                }
+                "create_file" | "write_file" => json!({"path": "tmp.txt", "content": "ok"}),
+                "delete_file" => json!({"path": "tmp.txt"}),
+                "edit_file" | "str_replace" => {
+                    json!({"path": "tmp.txt", "old_str": "a", "new_str": "b"})
+                }
+                "git_commit" => json!({"message": "x"}),
+                "git_revert_commit" => json!({"commit_sha": "abc123"}),
+                "git_stash" => json!({"action": "push"}),
+                "github_create_issue" => json!({"owner": "o", "repo": "r", "title": "t"}),
+                "multi_edit" => {
+                    json!({"path": "tmp.txt", "edits": [{"old_str": "a", "new_str": "b"}]})
+                }
+                "rollback_database_snapshots" | "rollback_file_edits" | "rollback_turn_actions" => {
+                    json!({})
+                }
+                other => panic!("add sample args for {other}"),
+            }
+        }
+
+        for &tool_name in crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS {
+            let profile = tool_action_profile(tool_name, &sample_args(tool_name));
+            assert_ne!(
+                profile.category,
+                ActionCategory::Read,
+                "{tool_name} should not resolve to a read-only profile"
+            );
+        }
+    }
+
     // ── Execution outcome classification tests ──
 
     #[test]

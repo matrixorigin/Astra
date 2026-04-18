@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::chat_turn_heuristics::TaskExecutionProfile;
+use crate::cloud_approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS;
 use crate::error_recovery::{self, EscalationLevel, SessionErrorSummary};
 use crate::result_quality::{self, ResultQuality};
 use crate::stall::{self, DivergenceStatus, StallReflection};
@@ -462,17 +463,7 @@ impl TurnGuard {
                 true // second consecutive Critical → force stop
             } else {
                 // First Critical: restrict to read-only tools
-                let write_tools = [
-                    "bash",
-                    "write_file",
-                    "str_replace",
-                    "create_file",
-                    "edit_file",
-                    "exec",
-                    "run_command",
-                    "shell",
-                ];
-                for t in &write_tools {
+                for t in CLOUD_APPROVAL_REQUIRED_TOOLS {
                     avoid_tools.insert(t.to_string());
                 }
                 injections.push(
@@ -933,11 +924,13 @@ mod tests {
             "first Critical should restrict tools, not force_stop (progressive degradation)"
         );
         assert_eq!(v.severity, VerdictSeverity::Critical);
-        // Should restrict write tools
-        assert!(
-            v.avoid_tools.contains(&"bash".to_string()),
-            "first Critical should restrict bash"
-        );
+        // Should restrict every canonical cloud-gated write/execute tool.
+        for tool in CLOUD_APPROVAL_REQUIRED_TOOLS {
+            assert!(
+                v.avoid_tools.contains(&tool.to_string()),
+                "first Critical should restrict {tool}"
+            );
+        }
 
         // Second consecutive Critical → force_stop
         let v2 = guard.evaluate();

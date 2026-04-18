@@ -2796,6 +2796,10 @@ impl StreamRenderState {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
                 format!("$ {}", truncate_line(cmd, path_budget(2)))
             }
+            "powershell" => {
+                let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+                format!("PS> {}", truncate_line(cmd, path_budget(4)))
+            }
             "read_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
                 let start = args.get("start_line").and_then(Value::as_u64);
@@ -2902,9 +2906,91 @@ impl StreamRenderState {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
                 format!("Git blame {}", shorten_path(path, path_budget(10)))
             }
+            "git_file_history" => {
+                let file = args.get("file").and_then(Value::as_str).unwrap_or("");
+                format!("Git history {}", shorten_path(file, path_budget(12)))
+            }
+            "git_log_search" => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Git log search \"{}\"",
+                    truncate_line(query, path_budget(17))
+                )
+            }
+            "git_contributors" => {
+                let path = args.get("path").and_then(Value::as_str);
+                let since = args.get("since").and_then(Value::as_str);
+                match (path, since) {
+                    (Some(path), Some(since)) => format!(
+                        "Git contributors {} since {}",
+                        shorten_path(path, path_budget(23)),
+                        truncate_line(since, 18)
+                    ),
+                    (Some(path), None) => {
+                        format!("Git contributors {}", shorten_path(path, path_budget(17)))
+                    }
+                    (None, Some(since)) => {
+                        format!(
+                            "Git contributors since {}",
+                            truncate_line(since, path_budget(23))
+                        )
+                    }
+                    (None, None) => "Git contributors".to_string(),
+                }
+            }
             "git_commit" => {
                 let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
                 format!("Git commit \"{}\"", truncate_line(msg, path_budget(13)))
+            }
+            "git_revert_commit" => {
+                let sha = args.get("commit_sha").and_then(Value::as_str).unwrap_or("");
+                format!("Git revert {}", truncate_line(sha, path_budget(13)))
+            }
+            "git_stash" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let stash_ref = args.get("stash_ref").and_then(Value::as_str);
+                let index = args.get("index").and_then(Value::as_i64);
+                match (action, stash_ref, index) {
+                    ("", _, _) => "Git stash".to_string(),
+                    (action, Some(stash_ref), _) => format!(
+                        "Git stash {action} {}",
+                        truncate_line(stash_ref, path_budget(19))
+                    ),
+                    (action, None, Some(index)) => format!("Git stash {action} stash@{{{index}}}"),
+                    (action, None, None) => format!("Git stash {action}"),
+                }
+            }
+            "git_checkout_file" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                let git_ref = args.get("ref").and_then(Value::as_str);
+                match git_ref {
+                    Some(git_ref) => format!(
+                        "Git checkout {} -- {}",
+                        truncate_line(git_ref, 16),
+                        shorten_path(path, path_budget(20))
+                    ),
+                    None => format!("Git checkout {}", shorten_path(path, path_budget(13))),
+                }
+            }
+            "git_worktree" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let branch = args.get("branch").and_then(Value::as_str);
+                let path = args.get("path").and_then(Value::as_str);
+                match (branch, path) {
+                    (Some(branch), _) => format!(
+                        "Git worktree {} {}",
+                        truncate_line(action, 16),
+                        truncate_line(branch, path_budget(19))
+                    ),
+                    (None, Some(path)) => format!(
+                        "Git worktree {} {}",
+                        truncate_line(action, 16),
+                        shorten_path(path, path_budget(19))
+                    ),
+                    (None, None) => {
+                        format!("Git worktree {}", truncate_line(action, path_budget(13)))
+                    }
+                }
             }
             "find_definition" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
@@ -2921,8 +3007,8 @@ impl StreamRenderState {
                 )
             }
             "symbol_search" => {
-                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Search symbol {}", truncate_line(symbol, path_budget(15)))
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                format!("Search symbol {}", truncate_line(query, path_budget(15)))
             }
             "symbols" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -2932,6 +3018,113 @@ impl StreamRenderState {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
                 format!("Call graph for {}", truncate_line(symbol, path_budget(16)))
             }
+            "hover_info" => {
+                let file = args.get("file").and_then(Value::as_str).unwrap_or("");
+                let line = args.get("line").and_then(Value::as_u64);
+                let column = args.get("column").and_then(Value::as_u64);
+                match (line, column) {
+                    (Some(line), Some(column)) => {
+                        let suffix_len = format!(":{line}:{column}").chars().count();
+                        let short_file = shorten_path(file, path_budget(14 + suffix_len));
+                        format!("Hover info at {short_file}:{line}:{column}")
+                    }
+                    (Some(line), None) => {
+                        let suffix_len = format!(":{line}").chars().count();
+                        let short_file = shorten_path(file, path_budget(14 + suffix_len));
+                        format!("Hover info at {short_file}:{line}")
+                    }
+                    (None, _) => format!("Hover info at {}", shorten_path(file, path_budget(14))),
+                }
+            }
+            "type_hierarchy" => {
+                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                let direction = args.get("direction").and_then(Value::as_str);
+                match direction {
+                    Some(direction) => format!(
+                        "Type hierarchy for {} ({})",
+                        truncate_line(name, path_budget(23)),
+                        truncate_line(direction, 16)
+                    ),
+                    None => format!(
+                        "Type hierarchy for {}",
+                        truncate_line(name, path_budget(19))
+                    ),
+                }
+            }
+            "rename_symbol" => {
+                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+                let new_name = args.get("new_name").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Rename symbol {} -> {}",
+                    truncate_line(symbol, path_budget(18)),
+                    truncate_line(new_name, 18)
+                )
+            }
+            "dead_code" => {
+                let path = args.get("path").and_then(Value::as_str);
+                let kind = args.get("kind").and_then(Value::as_str);
+                match (path, kind) {
+                    (Some(path), Some(kind)) => format!(
+                        "Find dead code: {} ({})",
+                        shorten_path(path, path_budget(22)),
+                        truncate_line(kind, 16)
+                    ),
+                    (Some(path), None) => {
+                        format!("Find dead code: {}", shorten_path(path, path_budget(16)))
+                    }
+                    (None, Some(kind)) => {
+                        format!("Find dead code: {}", truncate_line(kind, path_budget(16)))
+                    }
+                    (None, None) => "Find dead code".to_string(),
+                }
+            }
+            "extract_members" => {
+                let file = args.get("file").and_then(Value::as_str).unwrap_or("");
+                let line = args.get("line").and_then(Value::as_u64);
+                match line {
+                    Some(line) => {
+                        let suffix_len = format!(":{line}").chars().count();
+                        let short_file = shorten_path(file, path_budget(17 + suffix_len));
+                        format!("Extract members: {short_file}:{line}")
+                    }
+                    None => format!("Extract members: {}", shorten_path(file, path_budget(17))),
+                }
+            }
+            "lsp" => {
+                let operation = args.get("operation").and_then(Value::as_str);
+                let file = args.get("file").and_then(Value::as_str);
+                let line = args.get("line").and_then(Value::as_u64);
+                let column = args.get("column").and_then(Value::as_u64);
+                let symbol = args.get("symbol").and_then(Value::as_str);
+                let query = args.get("query").and_then(Value::as_str);
+                match (operation, file, line, column, symbol, query) {
+                    (Some(operation), Some(file), Some(line), Some(column), _, _) => {
+                        let suffix_len = format!(":{line}:{column}").chars().count();
+                        let prefix_len = 5 + operation.chars().count() + 1;
+                        let short_file = shorten_path(file, path_budget(prefix_len + suffix_len));
+                        format!("LSP: {operation} {short_file}:{line}:{column}")
+                    }
+                    (Some(operation), Some(file), _, _, _, _) => format!(
+                        "LSP: {} {}",
+                        truncate_line(operation, path_budget(5)),
+                        shorten_path(file, path_budget(18))
+                    ),
+                    (Some(operation), _, _, _, Some(symbol), _) => format!(
+                        "LSP: {} {}",
+                        truncate_line(operation, path_budget(5)),
+                        truncate_line(symbol, path_budget(18))
+                    ),
+                    (Some(operation), _, _, _, _, Some(query)) => format!(
+                        "LSP: {} {}",
+                        truncate_line(operation, path_budget(5)),
+                        truncate_line(query, path_budget(18))
+                    ),
+                    (Some(operation), _, _, _, _, _) => {
+                        format!("LSP: {}", truncate_line(operation, path_budget(13)))
+                    }
+                    _ => "LSP".to_string(),
+                }
+            }
             "run_build_test" => {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
                 format!("$ {}", truncate_line(cmd, path_budget(2)))
@@ -2940,16 +3133,469 @@ impl StreamRenderState {
                 let url = args.get("url").and_then(Value::as_str).unwrap_or("");
                 format!("Fetching: {}", truncate_line(url, path_budget(10)))
             }
+            "web_search" => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Searching web: \"{}\"",
+                    truncate_line(query, path_budget(17))
+                )
+            }
             "github_get_pr" => {
-                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
-                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
                 let num = args.get("pr_number").and_then(Value::as_u64).unwrap_or(0);
-                format!("Getting PR: {owner}/{repo}#{num}")
+                format!("Getting PR: {repo_display}#{num}")
             }
             "github_list_prs" => {
-                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
-                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
-                format!("Listing PRs: {owner}/{repo}")
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                format!("Listing PRs: {repo_display}")
+            }
+            "github_get_issue" => {
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                let num = args
+                    .get("issue_number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                format!("Getting issue: {repo_display}#{num}")
+            }
+            "github_list_issues" => {
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                format!("Listing issues: {repo_display}")
+            }
+            "github_repo_stats" => {
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                format!("GitHub stats: {repo_display}")
+            }
+            "github_ci_status" => {
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                format!("GitHub CI: {repo_display}")
+            }
+            "get_agent_info" => {
+                let dimension = args.get("dimension").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Getting agent info: {}",
+                    truncate_line(dimension, path_budget(18))
+                )
+            }
+            "reflect" => {
+                let question = args.get("question").and_then(Value::as_str);
+                let focus = args.get("focus").and_then(Value::as_str);
+                match (question, focus) {
+                    (Some(question), _) => format!(
+                        "Reflecting: \"{}\"",
+                        truncate_line(question, path_budget(13))
+                    ),
+                    (None, Some(focus)) => {
+                        format!("Reflecting: {}", truncate_line(focus, path_budget(13)))
+                    }
+                    (None, None) => "Reflecting".to_string(),
+                }
+            }
+            "context_analysis" => {
+                let mode = args.get("mode").and_then(Value::as_str);
+                let turn = args.get("turn").and_then(Value::as_i64);
+                let turn_a = args.get("turn_a").and_then(Value::as_i64);
+                let turn_b = args.get("turn_b").and_then(Value::as_i64);
+                match (mode, turn, turn_a, turn_b) {
+                    (Some("turn"), Some(turn), _, _) => format!("Context analysis: turn {turn}"),
+                    (Some("compare"), _, Some(turn_a), Some(turn_b)) => {
+                        format!("Context analysis: compare {turn_a} vs {turn_b}")
+                    }
+                    (Some(mode), _, _, _) => {
+                        format!("Context analysis: {}", truncate_line(mode, path_budget(18)))
+                    }
+                    _ => "Context analysis".to_string(),
+                }
+            }
+            "run_chain" => {
+                let name = args.get("name").and_then(Value::as_str);
+                let description = args.get("description").and_then(Value::as_str);
+                match (name, description) {
+                    (Some(name), _) => {
+                        format!("Running chain: {}", truncate_line(name, path_budget(15)))
+                    }
+                    (None, Some(description)) => format!(
+                        "Running chain: {}",
+                        truncate_line(description, path_budget(15))
+                    ),
+                    (None, None) => "Running chain".to_string(),
+                }
+            }
+            "rollback_file_edits" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                let path = args.get("path").and_then(Value::as_str);
+                match (scope, turn_index, path) {
+                    (Some("turn"), Some(turn_index), _) => {
+                        format!("Revert file edits: turn {turn_index}")
+                    }
+                    (Some("file"), _, Some(path)) => format!(
+                        "Revert file edits: {}",
+                        truncate_line(path, path_budget(19))
+                    ),
+                    (Some(scope), _, _) => format!(
+                        "Revert file edits: {}",
+                        truncate_line(scope, path_budget(19))
+                    ),
+                    _ => "Revert file edits".to_string(),
+                }
+            }
+            "rollback_database_snapshots" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                let snapshot_id = args.get("snapshot_id").and_then(Value::as_str);
+                match (scope, turn_index, snapshot_id) {
+                    (Some("turn"), Some(turn_index), _) => {
+                        format!("Revert DB snapshots: turn {turn_index}")
+                    }
+                    (Some("snapshot"), _, Some(snapshot_id)) => format!(
+                        "Revert DB snapshots: {}",
+                        truncate_line(snapshot_id, path_budget(21))
+                    ),
+                    (Some(scope), _, _) => format!(
+                        "Revert DB snapshots: {}",
+                        truncate_line(scope, path_budget(21))
+                    ),
+                    _ => "Revert DB snapshots".to_string(),
+                }
+            }
+            "rollback_turn_actions" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                match (scope, turn_index) {
+                    (Some("turn"), Some(turn_index)) => {
+                        format!("Rollback turn actions: turn {turn_index}")
+                    }
+                    (Some(scope), _) => format!(
+                        "Rollback turn actions: {}",
+                        truncate_line(scope, path_budget(24))
+                    ),
+                    _ => "Rollback turn actions".to_string(),
+                }
+            }
+            "send_message" => {
+                let to = args.get("to").and_then(Value::as_str).unwrap_or("");
+                let summary = args.get("summary").and_then(Value::as_str);
+                let message = args.get("message").and_then(Value::as_str);
+                match (summary, message) {
+                    (Some(summary), _) => format!(
+                        "Send message: {}: {}",
+                        truncate_line(to, path_budget(12)),
+                        truncate_line(summary, path_budget(16))
+                    ),
+                    (None, Some(message)) => format!(
+                        "Send message: {}: {}",
+                        truncate_line(to, path_budget(12)),
+                        truncate_line(message, path_budget(16))
+                    ),
+                    (None, None) => {
+                        format!("Send message: {}", truncate_line(to, path_budget(14)))
+                    }
+                }
+            }
+            "spawn_agent" => {
+                let description = args.get("description").and_then(Value::as_str);
+                let agent_type = args.get("agent_type").and_then(Value::as_str);
+                match (description, agent_type) {
+                    (Some(description), Some(agent_type)) => format!(
+                        "Spawn agent: {} ({})",
+                        truncate_line(description, path_budget(13)),
+                        truncate_line(agent_type, path_budget(8))
+                    ),
+                    (Some(description), None) => format!(
+                        "Spawn agent: {}",
+                        truncate_line(description, path_budget(13))
+                    ),
+                    (None, Some(agent_type)) => {
+                        format!(
+                            "Spawn agent: {}",
+                            truncate_line(agent_type, path_budget(13))
+                        )
+                    }
+                    _ => "Spawn agent".to_string(),
+                }
+            }
+            "diagnose" => {
+                let category = args.get("category").and_then(Value::as_str);
+                let verbose = args.get("verbose").and_then(Value::as_bool);
+                match (category, verbose) {
+                    (Some(category), Some(true)) => format!(
+                        "Diagnose: {} verbose",
+                        truncate_line(category, path_budget(10))
+                    ),
+                    (Some(category), _) => {
+                        format!("Diagnose: {}", truncate_line(category, path_budget(10)))
+                    }
+                    (None, Some(true)) => "Diagnose: verbose".to_string(),
+                    _ => "Diagnose".to_string(),
+                }
+            }
+            "env" => {
+                let operation = args.get("operation").and_then(Value::as_str);
+                let name = args.get("name").and_then(Value::as_str);
+                let pattern = args.get("pattern").and_then(Value::as_str);
+                match (operation, name, pattern) {
+                    (Some(operation), Some(name), _) => format!(
+                        "Env: {} {}",
+                        truncate_line(operation, path_budget(5)),
+                        truncate_line(name, path_budget(14))
+                    ),
+                    (Some("search"), _, Some(pattern)) => {
+                        format!("Env: search {}", truncate_line(pattern, path_budget(12)))
+                    }
+                    (Some(operation), _, _) => {
+                        format!("Env: {}", truncate_line(operation, path_budget(12)))
+                    }
+                    _ => "Env".to_string(),
+                }
+            }
+            "notebook_edit" => {
+                let edit_mode = args.get("edit_mode").and_then(Value::as_str);
+                let notebook_path = args.get("notebook_path").and_then(Value::as_str);
+                match (edit_mode, notebook_path) {
+                    (Some(edit_mode), Some(notebook_path)) => format!(
+                        "Notebook edit: {} {}",
+                        truncate_line(edit_mode, path_budget(7)),
+                        truncate_line(notebook_path, path_budget(17))
+                    ),
+                    (_, Some(notebook_path)) => format!(
+                        "Notebook edit: {}",
+                        truncate_line(notebook_path, path_budget(19))
+                    ),
+                    _ => "Notebook edit".to_string(),
+                }
+            }
+            "config" => {
+                let setting = args.get("setting").and_then(Value::as_str).unwrap_or("");
+                let value = args.get("value").and_then(Value::as_str);
+                match value {
+                    Some(value) => format!(
+                        "Config: {}={}",
+                        truncate_line(setting, path_budget(8)),
+                        truncate_line(value, path_budget(10))
+                    ),
+                    None => format!("Config: {}", truncate_line(setting, path_budget(13))),
+                }
+            }
+            "brief" => {
+                let focus = args.get("focus").and_then(Value::as_str);
+                match focus {
+                    Some(focus) => format!("Brief: {}", truncate_line(focus, path_budget(14))),
+                    None => "Brief".to_string(),
+                }
+            }
+            "share_context" => {
+                let key = args.get("key").and_then(Value::as_str).unwrap_or("");
+                format!("Share context: {}", truncate_line(key, path_budget(16)))
+            }
+            "query_context" => {
+                let key = args.get("key").and_then(Value::as_str);
+                let prefix = args.get("prefix").and_then(Value::as_str);
+                let list_keys = args.get("list_keys").and_then(Value::as_bool);
+                match (key, prefix, list_keys) {
+                    (Some(key), _, _) => {
+                        format!("Query context: {}", truncate_line(key, path_budget(16)))
+                    }
+                    (None, Some(prefix), _) => {
+                        format!("Query context: {}", truncate_line(prefix, path_budget(16)))
+                    }
+                    (None, None, Some(true)) => "Query context: keys".to_string(),
+                    _ => "Query context".to_string(),
+                }
+            }
+            "adjust_config" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                format!("Adjust config: {}", truncate_line(path, path_budget(15)))
+            }
+            "prioritize_tool" => {
+                let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+                format!("Prioritize tool: {}", truncate_line(tool, path_budget(17)))
+            }
+            "deprioritize_tool" => {
+                let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Deprioritize tool: {}",
+                    truncate_line(tool, path_budget(19))
+                )
+            }
+            "set_goal" => {
+                let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+                format!("Set goal: \"{}\"", truncate_line(goal, path_budget(12)))
+            }
+            "compress_context" => {
+                let reason = args.get("reason").and_then(Value::as_str);
+                match reason {
+                    Some(reason) => format!(
+                        "Compress context: {}",
+                        truncate_line(reason, path_budget(18))
+                    ),
+                    None => "Compress context".to_string(),
+                }
+            }
+            "rollback_session_state" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                match (scope, turn_index) {
+                    (Some("turn"), Some(turn_index)) => {
+                        format!("Rollback session state: turn {turn_index}")
+                    }
+                    (Some(scope), _) => {
+                        format!(
+                            "Rollback session state: {}",
+                            truncate_line(scope, path_budget(24))
+                        )
+                    }
+                    _ => "Rollback session state".to_string(),
+                }
+            }
+            "github_create_issue" => {
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                let title = args.get("title").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Creating issue: {} \"{}\"",
+                    repo_display,
+                    truncate_line(title, path_budget(19))
+                )
+            }
+            "ask_user" => {
+                let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Asking user: \"{}\"",
+                    truncate_line(question, path_budget(15))
+                )
+            }
+            "sleep" => {
+                let duration_ms = args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+                let reason = args.get("reason").and_then(Value::as_str);
+                match reason {
+                    Some(reason) => format!(
+                        "Sleeping: {}ms ({})",
+                        duration_ms,
+                        truncate_line(reason, path_budget(18))
+                    ),
+                    None => format!("Sleeping: {duration_ms}ms"),
+                }
+            }
+            "tool_search" => {
+                let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Searching tools: \"{}\"",
+                    truncate_line(query, path_budget(18))
+                )
+            }
+            "task_create" => {
+                let title = args.get("title").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "Creating task: \"{}\"",
+                    truncate_line(title, path_budget(16))
+                )
+            }
+            "task_list" => {
+                let status = args.get("status").and_then(Value::as_str);
+                match status {
+                    Some(status) => {
+                        format!("Listing tasks: {}", truncate_line(status, path_budget(15)))
+                    }
+                    None => "Listing tasks".to_string(),
+                }
+            }
+            "task_get" => {
+                let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+                format!("Getting task: {}", truncate_line(task_id, path_budget(14)))
+            }
+            "task_update" => {
+                let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+                let status = args.get("status").and_then(Value::as_str);
+                match status {
+                    Some(status) => format!(
+                        "Updating task: {} -> {}",
+                        truncate_line(task_id, path_budget(21)),
+                        truncate_line(status, 16)
+                    ),
+                    None => format!("Updating task: {}", truncate_line(task_id, path_budget(15))),
+                }
+            }
+            "task_stop" => {
+                let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
+                format!("Stopping task: {}", truncate_line(task_id, path_budget(15)))
+            }
+            "mo_query" => {
+                let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
+                format!(
+                    "MatrixOne query: \"{}\"",
+                    truncate_line(sql, path_budget(18))
+                )
+            }
+            "mo_snapshot" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let name = args.get("name").and_then(Value::as_str);
+                match name {
+                    Some(name) => format!(
+                        "MatrixOne snapshot: {} {}",
+                        truncate_line(action, 16),
+                        truncate_line(name, path_budget(30))
+                    ),
+                    None => format!(
+                        "MatrixOne snapshot: {}",
+                        truncate_line(action, path_budget(20))
+                    ),
+                }
+            }
+            "mo_branch" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let name = args.get("name").and_then(Value::as_str);
+                match name {
+                    Some(name) => format!(
+                        "MatrixOne branch: {} {}",
+                        truncate_line(action, 16),
+                        truncate_line(name, path_budget(28))
+                    ),
+                    None => format!(
+                        "MatrixOne branch: {}",
+                        truncate_line(action, path_budget(18))
+                    ),
+                }
             }
             // Memory tools with natural verbs
             "memory_retrieve" => {
@@ -2967,8 +3613,26 @@ impl StreamRenderState {
                     truncate_line(query, path_budget(20))
                 )
             }
-            "memory_purge" => "Purging memory".to_string(),
-            "memory_correct" => "Correcting memory".to_string(),
+            "memory_purge" => {
+                let topic = args.get("topic").and_then(Value::as_str);
+                match topic {
+                    Some(topic) => format!(
+                        "Purging memory: \"{}\"",
+                        truncate_line(topic, path_budget(18))
+                    ),
+                    None => "Purging memory".to_string(),
+                }
+            }
+            "memory_correct" => {
+                let memory_id = args.get("memory_id").and_then(Value::as_str);
+                match memory_id {
+                    Some(memory_id) => format!(
+                        "Correcting memory: {}",
+                        truncate_line(memory_id, path_budget(20))
+                    ),
+                    None => "Correcting memory".to_string(),
+                }
+            }
             "memory_profile" => "Checking profile".to_string(),
             // Skill tool — show specific skill name
             "skill" => {
@@ -3061,8 +3725,13 @@ impl StreamRenderState {
                 .get("commit")
                 .or_else(|| args.get("ref"))
                 .or_else(|| args.get("path"))
+                .or_else(|| args.get("file"))
                 .and_then(Value::as_str)
                 .map(|s| truncate_line(s, 20)),
+            "git_log_search" => args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|q| format!("\"{}\"", truncate_line(q, 40))),
             "git_diff" => {
                 let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
                 let path = args.get("path").and_then(Value::as_str);
@@ -3087,20 +3756,211 @@ impl StreamRenderState {
                 .get("message")
                 .and_then(Value::as_str)
                 .map(|m| format!("-m \"{}\"", truncate_line(m, 50))),
-            "git_stash" => args
-                .get("action")
+            "git_revert_commit" => args
+                .get("commit_sha")
                 .and_then(Value::as_str)
-                .map(|a| a.to_string()),
-            "find_definition" | "find_references" | "symbol_search" | "hover_info" => args
+                .map(|sha| truncate_line(sha, 24)),
+            "git_contributors" => {
+                let path = args.get("path").and_then(Value::as_str);
+                let since = args.get("since").and_then(Value::as_str);
+                match (path, since) {
+                    (Some(path), Some(since)) => Some(format!(
+                        "{} since {}",
+                        truncate_line(path, 24),
+                        truncate_line(since, 16)
+                    )),
+                    (Some(path), None) => Some(truncate_line(path, 32)),
+                    (None, Some(since)) => Some(format!("since {}", truncate_line(since, 24))),
+                    (None, None) => None,
+                }
+            }
+            "git_stash" => {
+                let action = args.get("action").and_then(Value::as_str);
+                let stash_ref = args.get("stash_ref").and_then(Value::as_str);
+                let index = args.get("index").and_then(Value::as_i64);
+                match (action, stash_ref, index) {
+                    (Some(action), Some(stash_ref), _) => {
+                        Some(format!("{action} {}", truncate_line(stash_ref, 40)))
+                    }
+                    (Some(action), None, Some(index)) => {
+                        Some(format!("{action} stash@{{{index}}}"))
+                    }
+                    (Some(action), None, None) => Some(action.to_string()),
+                    _ => None,
+                }
+            }
+            "git_checkout_file" => {
+                let path = args.get("path").and_then(Value::as_str);
+                let git_ref = args.get("ref").and_then(Value::as_str);
+                match (path, git_ref) {
+                    (Some(path), Some(git_ref)) => Some(format!(
+                        "{} -- {}",
+                        truncate_line(git_ref, 16),
+                        shorten_path(path, 28)
+                    )),
+                    (Some(path), None) => Some(shorten_path(path, 40)),
+                    _ => None,
+                }
+            }
+            "git_worktree" => {
+                let action = args.get("action").and_then(Value::as_str);
+                let branch = args.get("branch").and_then(Value::as_str);
+                let path = args.get("path").and_then(Value::as_str);
+                match (action, branch, path) {
+                    (Some(action), Some(branch), _) => Some(format!(
+                        "{} {}",
+                        truncate_line(action, 16),
+                        truncate_line(branch, 24)
+                    )),
+                    (Some(action), None, Some(path)) => Some(format!(
+                        "{} {}",
+                        truncate_line(action, 16),
+                        truncate_line(path, 28)
+                    )),
+                    (Some(action), None, None) => Some(action.to_string()),
+                    _ => None,
+                }
+            }
+            "find_definition" | "find_references" => args
                 .get("symbol")
                 .and_then(Value::as_str)
                 .map(|s| truncate_line(s, 40)),
-            "call_graph" | "type_hierarchy" => {
-                let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                let depth = args.get("depth").and_then(Value::as_u64);
-                match depth {
-                    Some(d) => Some(format!("{} (depth {})", truncate_line(symbol, 40), d)),
-                    None => Some(truncate_line(symbol, 50)),
+            "symbol_search" => args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|query| truncate_line(query, 40)),
+            "hover_info" => {
+                let file = args.get("file").and_then(Value::as_str);
+                let line = args.get("line").and_then(Value::as_u64);
+                let column = args.get("column").and_then(Value::as_u64);
+                match (file, line, column) {
+                    (Some(file), Some(line), Some(column)) => Some(format!(
+                        "{}:{line}:{column}",
+                        shorten_path(
+                            file,
+                            40usize.saturating_sub(format!(":{line}:{column}").chars().count())
+                        )
+                    )),
+                    (Some(file), Some(line), None) => Some(format!(
+                        "{}:{line}",
+                        shorten_path(
+                            file,
+                            40usize.saturating_sub(format!(":{line}").chars().count())
+                        )
+                    )),
+                    (Some(file), None, _) => Some(truncate_line(file, 50)),
+                    _ => None,
+                }
+            }
+            "call_graph" => {
+                let symbol = args.get("symbol").and_then(Value::as_str);
+                let path = args.get("path").and_then(Value::as_str);
+                let start = args.get("start_line").and_then(Value::as_u64);
+                let end = args.get("end_line").and_then(Value::as_u64);
+                match (symbol, path, start, end) {
+                    (Some(symbol), _, _, _) => Some(truncate_line(symbol, 40)),
+                    (None, Some(path), Some(start), Some(end)) => Some(format!(
+                        "{}:{start}-{end}",
+                        shorten_path(
+                            path,
+                            40usize.saturating_sub(format!(":{start}-{end}").chars().count())
+                        )
+                    )),
+                    (None, Some(path), Some(start), None) => Some(format!(
+                        "{}:{start}-",
+                        shorten_path(
+                            path,
+                            40usize.saturating_sub(format!(":{start}-").chars().count())
+                        )
+                    )),
+                    (None, Some(path), None, None) => Some(truncate_line(path, 50)),
+                    _ => None,
+                }
+            }
+            "type_hierarchy" => {
+                let name = args.get("name").and_then(Value::as_str);
+                let direction = args.get("direction").and_then(Value::as_str);
+                match (name, direction) {
+                    (Some(name), Some(direction)) => Some(format!(
+                        "{} ({})",
+                        truncate_line(name, 32),
+                        truncate_line(direction, 16)
+                    )),
+                    (Some(name), None) => Some(truncate_line(name, 40)),
+                    _ => None,
+                }
+            }
+            "rename_symbol" => {
+                let symbol = args.get("symbol").and_then(Value::as_str);
+                let new_name = args.get("new_name").and_then(Value::as_str);
+                match (symbol, new_name) {
+                    (Some(symbol), Some(new_name)) => Some(format!(
+                        "{} -> {}",
+                        truncate_line(symbol, 24),
+                        truncate_line(new_name, 24)
+                    )),
+                    (Some(symbol), None) => Some(truncate_line(symbol, 40)),
+                    _ => None,
+                }
+            }
+            "dead_code" => {
+                let path = args.get("path").and_then(Value::as_str);
+                let kind = args.get("kind").and_then(Value::as_str);
+                match (path, kind) {
+                    (Some(path), Some(kind)) => Some(format!(
+                        "{} ({})",
+                        truncate_line(path, 30),
+                        truncate_line(kind, 16)
+                    )),
+                    (Some(path), None) => Some(truncate_line(path, 40)),
+                    (None, Some(kind)) => Some(truncate_line(kind, 24)),
+                    _ => None,
+                }
+            }
+            "extract_members" => {
+                let file = args.get("file").and_then(Value::as_str);
+                let line = args.get("line").and_then(Value::as_u64);
+                match (file, line) {
+                    (Some(file), Some(line)) => Some(format!(
+                        "{}:{line}",
+                        shorten_path(
+                            file,
+                            40usize.saturating_sub(format!(":{line}").chars().count())
+                        )
+                    )),
+                    (Some(file), None) => Some(truncate_line(file, 40)),
+                    _ => None,
+                }
+            }
+            "lsp" => {
+                let operation = args.get("operation").and_then(Value::as_str);
+                let file = args.get("file").and_then(Value::as_str);
+                let line = args.get("line").and_then(Value::as_u64);
+                let column = args.get("column").and_then(Value::as_u64);
+                let symbol = args.get("symbol").and_then(Value::as_str);
+                let query = args.get("query").and_then(Value::as_str);
+                match (operation, file, line, column, symbol, query) {
+                    (Some(operation), Some(file), Some(line), Some(column), _, _) => Some(format!(
+                        "{operation} {}:{line}:{column}",
+                        shorten_path(
+                            file,
+                            40usize
+                                .saturating_sub(operation.chars().count())
+                                .saturating_sub(1)
+                                .saturating_sub(format!(":{line}:{column}").chars().count())
+                        )
+                    )),
+                    (Some(operation), Some(file), _, _, _, _) => {
+                        Some(format!("{operation} {}", truncate_line(file, 32)))
+                    }
+                    (Some(operation), _, _, _, Some(symbol), _) => {
+                        Some(format!("{operation} {}", truncate_line(symbol, 26)))
+                    }
+                    (Some(operation), _, _, _, _, Some(query)) => {
+                        Some(format!("{operation} {}", truncate_line(query, 26)))
+                    }
+                    (Some(operation), _, _, _, _, _) => Some(truncate_line(operation, 40)),
+                    _ => None,
                 }
             }
             "symbols" => args
@@ -3115,32 +3975,311 @@ impl StreamRenderState {
                 .get("url")
                 .and_then(Value::as_str)
                 .map(|u| truncate_line(u, 60)),
+            "web_search" => args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|query| truncate_line(query, 40)),
+            "powershell" => args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|command| truncate_line(command, 60)),
             "github_get_pr" | "github_get_issue" => {
-                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
-                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
                 let number = args
                     .get("number")
                     .or_else(|| args.get("pr_number"))
                     .or_else(|| args.get("issue_number"))
                     .and_then(Value::as_u64);
                 match number {
-                    Some(n) => Some(format!("{owner}/{repo}#{n}")),
-                    None => Some(format!("{owner}/{repo}")),
+                    Some(n) => Some(format!("{repo_display}#{n}")),
+                    None => Some(repo_display),
                 }
             }
             "github_list_prs" | "github_list_issues" | "github_repo_stats" | "github_ci_status" => {
-                let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
-                let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
-                Some(format!("{owner}/{repo}"))
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                Some(match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                })
             }
-            "mo_query" => args
+            "github_create_issue" => {
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = match (owner, repo) {
+                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
+                    (_, Some(repo)) => repo.to_string(),
+                    _ => String::new(),
+                };
+                let title = args.get("title").and_then(Value::as_str);
+                match title {
+                    Some(title) => Some(format!(
+                        "{}: \"{}\"",
+                        repo_display,
+                        truncate_line(title, 28)
+                    )),
+                    None => Some(repo_display),
+                }
+            }
+            "adjust_config" => args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| truncate_line(path, 36)),
+            "prioritize_tool" | "deprioritize_tool" => args
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(|tool| truncate_line(tool, 24)),
+            "set_goal" => args
+                .get("goal")
+                .and_then(Value::as_str)
+                .map(|goal| truncate_line(goal, 40)),
+            "compress_context" => args
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|reason| truncate_line(reason, 40)),
+            "rollback_session_state" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                match (scope, turn_index) {
+                    (Some("turn"), Some(turn_index)) => Some(format!("turn {turn_index}")),
+                    (Some(scope), _) => Some(scope.to_string()),
+                    _ => None,
+                }
+            }
+            "get_agent_info" => args
+                .get("dimension")
+                .and_then(Value::as_str)
+                .map(|dimension| truncate_line(dimension, 24)),
+            "reflect" => args
+                .get("question")
+                .or_else(|| args.get("focus"))
+                .and_then(Value::as_str)
+                .map(|value| truncate_line(value, 40)),
+            "context_analysis" => {
+                let mode = args.get("mode").and_then(Value::as_str);
+                let turn = args.get("turn").and_then(Value::as_i64);
+                let turn_a = args.get("turn_a").and_then(Value::as_i64);
+                let turn_b = args.get("turn_b").and_then(Value::as_i64);
+                match (mode, turn, turn_a, turn_b) {
+                    (Some("turn"), Some(turn), _, _) => Some(format!("turn {turn}")),
+                    (Some("compare"), _, Some(turn_a), Some(turn_b)) => {
+                        Some(format!("compare {turn_a} vs {turn_b}"))
+                    }
+                    (Some(mode), _, _, _) => Some(truncate_line(mode, 24)),
+                    _ => None,
+                }
+            }
+            "run_chain" => args
+                .get("name")
+                .or_else(|| args.get("description"))
+                .and_then(Value::as_str)
+                .map(|value| truncate_line(value, 40)),
+            "rollback_file_edits" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                let path = args.get("path").and_then(Value::as_str);
+                match (scope, turn_index, path) {
+                    (Some("turn"), Some(turn_index), _) => Some(format!("turn {turn_index}")),
+                    (Some("file"), _, Some(path)) => Some(truncate_line(path, 36)),
+                    (Some(scope), _, _) => Some(scope.to_string()),
+                    _ => None,
+                }
+            }
+            "rollback_database_snapshots" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                let snapshot_id = args.get("snapshot_id").and_then(Value::as_str);
+                match (scope, turn_index, snapshot_id) {
+                    (Some("turn"), Some(turn_index), _) => Some(format!("turn {turn_index}")),
+                    (Some("snapshot"), _, Some(snapshot_id)) => {
+                        Some(truncate_line(snapshot_id, 36))
+                    }
+                    (Some(scope), _, _) => Some(scope.to_string()),
+                    _ => None,
+                }
+            }
+            "rollback_turn_actions" => {
+                let scope = args.get("scope").and_then(Value::as_str);
+                let turn_index = args.get("turn_index").and_then(Value::as_i64);
+                match (scope, turn_index) {
+                    (Some("turn"), Some(turn_index)) => Some(format!("turn {turn_index}")),
+                    (Some(scope), _) => Some(scope.to_string()),
+                    _ => None,
+                }
+            }
+            "send_message" => {
+                let to = args.get("to").and_then(Value::as_str);
+                let summary = args.get("summary").and_then(Value::as_str);
+                let message = args.get("message").and_then(Value::as_str);
+                match (to, summary, message) {
+                    (Some(to), Some(summary), _) => Some(format!(
+                        "{}: {}",
+                        truncate_line(to, 18),
+                        truncate_line(summary, 28)
+                    )),
+                    (Some(to), None, Some(message)) => Some(format!(
+                        "{}: {}",
+                        truncate_line(to, 18),
+                        truncate_line(message, 28)
+                    )),
+                    (Some(to), None, None) => Some(truncate_line(to, 40)),
+                    _ => None,
+                }
+            }
+            "spawn_agent" => {
+                let description = args.get("description").and_then(Value::as_str);
+                let agent_type = args.get("agent_type").and_then(Value::as_str);
+                match (description, agent_type) {
+                    (Some(description), Some(agent_type)) => Some(format!(
+                        "{} ({})",
+                        truncate_line(description, 28),
+                        truncate_line(agent_type, 12)
+                    )),
+                    (Some(description), None) => Some(truncate_line(description, 40)),
+                    (None, Some(agent_type)) => Some(truncate_line(agent_type, 24)),
+                    _ => None,
+                }
+            }
+            "diagnose" => {
+                let category = args.get("category").and_then(Value::as_str);
+                let verbose = args.get("verbose").and_then(Value::as_bool);
+                match (category, verbose) {
+                    (Some(category), Some(true)) => Some(format!("{category} verbose")),
+                    (Some(category), _) => Some(category.to_string()),
+                    (None, Some(true)) => Some("verbose".to_string()),
+                    _ => None,
+                }
+            }
+            "env" => {
+                let operation = args.get("operation").and_then(Value::as_str);
+                let name = args.get("name").and_then(Value::as_str);
+                let pattern = args.get("pattern").and_then(Value::as_str);
+                match (operation, name, pattern) {
+                    (Some(operation), Some(name), _) => {
+                        Some(format!("{operation} {}", truncate_line(name, 30)))
+                    }
+                    (Some("search"), _, Some(pattern)) => {
+                        Some(format!("search {}", truncate_line(pattern, 24)))
+                    }
+                    (Some(operation), _, _) => Some(operation.to_string()),
+                    _ => None,
+                }
+            }
+            "notebook_edit" => {
+                let notebook_path = args.get("notebook_path").and_then(Value::as_str);
+                let edit_mode = args.get("edit_mode").and_then(Value::as_str);
+                match (edit_mode, notebook_path) {
+                    (Some(edit_mode), Some(notebook_path)) => Some(format!(
+                        "{} {}",
+                        truncate_line(edit_mode, 12),
+                        truncate_line(notebook_path, 32)
+                    )),
+                    (_, Some(notebook_path)) => Some(truncate_line(notebook_path, 40)),
+                    _ => None,
+                }
+            }
+            "config" => {
+                let setting = args.get("setting").and_then(Value::as_str);
+                let value = args.get("value").and_then(Value::as_str);
+                match (setting, value) {
+                    (Some(setting), Some(value)) => Some(format!(
+                        "{}={}",
+                        truncate_line(setting, 18),
+                        truncate_line(value, 24)
+                    )),
+                    (Some(setting), None) => Some(truncate_line(setting, 40)),
+                    _ => None,
+                }
+            }
+            "brief" => args
+                .get("focus")
+                .and_then(Value::as_str)
+                .map(|focus| truncate_line(focus, 24)),
+            "share_context" => args
+                .get("key")
+                .and_then(Value::as_str)
+                .map(|key| truncate_line(key, 40)),
+            "query_context" => {
+                let key = args.get("key").and_then(Value::as_str);
+                let prefix = args.get("prefix").and_then(Value::as_str);
+                let list_keys = args.get("list_keys").and_then(Value::as_bool);
+                match (key, prefix, list_keys) {
+                    (Some(key), _, _) => Some(truncate_line(key, 40)),
+                    (None, Some(prefix), _) => Some(truncate_line(prefix, 40)),
+                    (None, None, Some(true)) => Some("keys".to_string()),
+                    _ => None,
+                }
+            }
+            "ask_user" => args
+                .get("question")
+                .and_then(Value::as_str)
+                .map(|question| truncate_line(question, 50)),
+            "sleep" => {
+                let duration_ms = args.get("duration_ms").and_then(Value::as_u64);
+                let reason = args.get("reason").and_then(Value::as_str);
+                match (duration_ms, reason) {
+                    (Some(duration_ms), Some(reason)) => {
+                        Some(format!("{}ms ({})", duration_ms, truncate_line(reason, 28)))
+                    }
+                    (Some(duration_ms), None) => Some(format!("{duration_ms}ms")),
+                    (None, Some(reason)) => Some(truncate_line(reason, 40)),
+                    (None, None) => None,
+                }
+            }
+            "tool_search" => args
                 .get("query")
                 .and_then(Value::as_str)
-                .map(|q| truncate_line(q, 60)),
-            "mo_snapshot" | "mo_branch" => args
-                .get("action")
+                .map(|query| format!("\"{}\"", truncate_line(query, 40))),
+            "task_create" => args
+                .get("title")
                 .and_then(Value::as_str)
-                .map(|a| a.to_string()),
+                .map(|title| truncate_line(title, 48)),
+            "task_list" => args
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| truncate_line(status, 24)),
+            "task_get" | "task_stop" => args
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(|task_id| truncate_line(task_id, 36)),
+            "task_update" => {
+                let task_id = args.get("task_id").and_then(Value::as_str);
+                let status = args.get("status").and_then(Value::as_str);
+                match (task_id, status) {
+                    (Some(task_id), Some(status)) => Some(format!(
+                        "{} -> {}",
+                        truncate_line(task_id, 24),
+                        truncate_line(status, 16)
+                    )),
+                    (Some(task_id), None) => Some(truncate_line(task_id, 36)),
+                    _ => None,
+                }
+            }
+            "mo_query" => args
+                .get("sql")
+                .or_else(|| args.get("query"))
+                .and_then(Value::as_str)
+                .map(|q| truncate_line(q, 60)),
+            "mo_snapshot" | "mo_branch" => {
+                let action = args.get("action").and_then(Value::as_str);
+                let name = args.get("name").and_then(Value::as_str);
+                match (action, name) {
+                    (Some(action), Some(name)) => Some(format!(
+                        "{} {}",
+                        truncate_line(action, 16),
+                        truncate_line(name, 28)
+                    )),
+                    (Some(action), None) => Some(action.to_string()),
+                    _ => None,
+                }
+            }
             "memory_retrieve" | "memory_search" => args
                 .get("query")
                 .and_then(Value::as_str)
@@ -3149,6 +4288,14 @@ impl StreamRenderState {
                 .get("content")
                 .and_then(Value::as_str)
                 .map(|c| truncate_line(c, 50)),
+            "memory_purge" => args
+                .get("topic")
+                .and_then(Value::as_str)
+                .map(|topic| truncate_line(topic, 40)),
+            "memory_correct" => args
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .map(|memory_id| truncate_line(memory_id, 40)),
             _ => None,
         }
     }
@@ -3733,6 +4880,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
     let preview = args_preview.unwrap_or("");
     match name {
         "bash" | "shell_exec" | "run_build_test" => format!("$ {preview}"),
+        "powershell" => format!("PS> {preview}"),
         "read_file" | "view_file" => format!("Reading: {preview}"),
         "write_file" => format!("Writing: {preview}"),
         "str_replace" | "multi_edit" => format!("Editing: {preview}"),
@@ -3745,16 +4893,85 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "git_show" => format!("Git show {preview}"),
         "git_diff" => format!("Git diff {preview}"),
         "git_blame" => format!("Git blame {preview}"),
+        "git_file_history" => format!("Git history {preview}"),
+        "git_log_search" => format!("Git log search {preview}"),
+        "git_contributors" => {
+            if preview.is_empty() {
+                "Git contributors".to_string()
+            } else {
+                format!("Git contributors {preview}")
+            }
+        }
         "git_commit" => format!("Git commit {preview}"),
+        "git_revert_commit" => format!("Git revert {preview}"),
+        "git_stash" => format!("Git stash {preview}"),
+        "git_checkout_file" => format!("Git checkout {preview}"),
+        "git_worktree" => format!("Git worktree {preview}"),
         "find_definition" => format!("Find definition of {preview}"),
         "find_references" => format!("Find references to {preview}"),
         "symbol_search" => format!("Search symbol {preview}"),
         "symbols" => format!("Get symbols in {preview}"),
         "call_graph" => format!("Call graph for {preview}"),
+        "hover_info" => format!("Hover info at {preview}"),
+        "type_hierarchy" => format!("Type hierarchy for {preview}"),
+        "rename_symbol" => format!("Rename symbol {preview}"),
+        "dead_code" => format!("Find dead code: {preview}"),
+        "extract_members" => format!("Extract members: {preview}"),
+        "lsp" => format!("LSP: {preview}"),
         "web_fetch" => format!("Fetching: {preview}"),
+        "web_search" => format!("Searching web: \"{preview}\""),
+        "github_get_pr" => format!("Getting PR: {preview}"),
+        "github_list_prs" => format!("Listing PRs: {preview}"),
+        "github_get_issue" => format!("Getting issue: {preview}"),
+        "github_list_issues" => format!("Listing issues: {preview}"),
+        "github_repo_stats" => format!("GitHub stats: {preview}"),
+        "github_ci_status" => format!("GitHub CI: {preview}"),
+        "github_create_issue" => format!("Creating issue: {preview}"),
+        "get_agent_info" => format!("Getting agent info: {preview}"),
+        "reflect" => format!("Reflecting: \"{preview}\""),
+        "context_analysis" => format!("Context analysis: {preview}"),
+        "run_chain" => format!("Running chain: {preview}"),
+        "rollback_file_edits" => format!("Revert file edits: {preview}"),
+        "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
+        "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
+        "send_message" => format!("Send message: {preview}"),
+        "spawn_agent" => format!("Spawn agent: {preview}"),
+        "diagnose" => format!("Diagnose: {preview}"),
+        "env" => format!("Env: {preview}"),
+        "notebook_edit" => format!("Notebook edit: {preview}"),
+        "config" => format!("Config: {preview}"),
+        "brief" => format!("Brief: {preview}"),
+        "share_context" => format!("Share context: {preview}"),
+        "query_context" => format!("Query context: {preview}"),
+        "adjust_config" => format!("Adjust config: {preview}"),
+        "prioritize_tool" => format!("Prioritize tool: {preview}"),
+        "deprioritize_tool" => format!("Deprioritize tool: {preview}"),
+        "set_goal" => format!("Set goal: \"{preview}\""),
+        "compress_context" => format!("Compress context: {preview}"),
+        "rollback_session_state" => format!("Rollback session state: {preview}"),
+        "ask_user" => format!("Asking user: \"{preview}\""),
+        "sleep" => format!("Sleeping: {preview}"),
+        "tool_search" => format!("Searching tools: {preview}"),
+        "task_create" => format!("Creating task: \"{preview}\""),
+        "task_list" => {
+            if preview.is_empty() {
+                "Listing tasks".to_string()
+            } else {
+                format!("Listing tasks: {preview}")
+            }
+        }
+        "task_get" => format!("Getting task: {preview}"),
+        "task_update" => format!("Updating task: {preview}"),
+        "task_stop" => format!("Stopping task: {preview}"),
+        "mo_query" => format!("MatrixOne query: \"{preview}\""),
+        "mo_snapshot" => format!("MatrixOne snapshot: {preview}"),
+        "mo_branch" => format!("MatrixOne branch: {preview}"),
         "memory_retrieve" => format!("Recalling: \"{preview}\""),
         "memory_store" => format!("Storing: \"{preview}\""),
         "memory_search" => format!("Searching memory: \"{preview}\""),
+        "memory_purge" => format!("Purging memory: \"{preview}\""),
+        "memory_correct" => format!("Correcting memory: {preview}"),
+        "memory_profile" => "Checking profile".to_string(),
         "skill" => format!("Running skill: {preview}"),
         other if other.starts_with("mcp_") => {
             let rest = &other[4..];
@@ -4353,6 +5570,648 @@ mod tests {
         let r = StreamRenderState::new();
         let desc = r.format_tool_description("mcp_mytool", &serde_json::json!({}));
         assert_eq!(desc, "MCP mytool");
+    }
+
+    #[test]
+    fn format_git_revert_description() {
+        let r = StreamRenderState::new();
+        let args = serde_json::json!({"commit_sha": "abc123def456"});
+        let desc = r.format_tool_description("git_revert_commit", &args);
+        assert_eq!(desc, "Git revert abc123def456");
+    }
+
+    #[test]
+    fn format_git_stash_description() {
+        let r = StreamRenderState::new();
+        let args = serde_json::json!({"action": "apply", "stash_ref": "stash@{2}"});
+        let desc = r.format_tool_description("git_stash", &args);
+        assert_eq!(desc, "Git stash apply stash@{2}");
+    }
+
+    #[test]
+    fn format_git_helper_descriptions() {
+        let r = StreamRenderState::new();
+        let file_history = r.format_tool_description(
+            "git_file_history",
+            &serde_json::json!({"file": "src/main.rs"}),
+        );
+        let log_search =
+            r.format_tool_description("git_log_search", &serde_json::json!({"query": "auth"}));
+        let contributors = r.format_tool_description(
+            "git_contributors",
+            &serde_json::json!({"path": "src/", "since": "30 days ago"}),
+        );
+
+        assert_eq!(file_history, "Git history src/main.rs");
+        assert_eq!(log_search, "Git log search \"auth\"");
+        assert_eq!(contributors, "Git contributors src/ since 30 days ago");
+    }
+
+    #[test]
+    fn format_git_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("git_revert_commit", Some("abc123")),
+            "Git revert abc123"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("git_stash", Some("push")),
+            "Git stash push"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("git_file_history", Some("src/main.rs")),
+            "Git history src/main.rs"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("git_log_search", Some("\"auth\"")),
+            "Git log search \"auth\""
+        );
+        assert_eq!(
+            format_tool_display_from_preview("git_contributors", Some("src/ since 30 days ago")),
+            "Git contributors src/ since 30 days ago"
+        );
+    }
+
+    #[test]
+    fn format_additional_git_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let checkout = r.format_tool_description(
+            "git_checkout_file",
+            &serde_json::json!({"path": "src/lib.rs", "ref": "HEAD~1"}),
+        );
+        let worktree = r.format_tool_description(
+            "git_worktree",
+            &serde_json::json!({"action": "add", "branch": "feature/ui"}),
+        );
+
+        assert_eq!(checkout, "Git checkout HEAD~1 -- src/lib.rs");
+        assert_eq!(worktree, "Git worktree add feature/ui");
+    }
+
+    #[test]
+    fn format_additional_git_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("git_checkout_file", Some("HEAD~1 -- src/lib.rs")),
+            "Git checkout HEAD~1 -- src/lib.rs"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("git_worktree", Some("add feature/ui")),
+            "Git worktree add feature/ui"
+        );
+    }
+
+    #[test]
+    fn format_git_checkout_preview_shortens_long_path() {
+        let r = StreamRenderState::new();
+        let desc = r.format_tool_description(
+            "git_checkout_file",
+            &serde_json::json!({
+                "path": "/very/long/path/to/deeply/nested/module/with/more/components/and/even/more/components/src/lib.rs",
+                "ref": "HEAD~1"
+            }),
+        );
+        assert!(desc.starts_with("Git checkout HEAD~1 -- .../"));
+        assert!(desc.ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn format_github_descriptions_use_repo_argument() {
+        let r = StreamRenderState::new();
+        let pr = r.format_tool_description(
+            "github_get_pr",
+            &serde_json::json!({"repo": "matrixorigin/astra", "pr_number": 159}),
+        );
+        let issue = r.format_tool_description(
+            "github_create_issue",
+            &serde_json::json!({"repo": "matrixorigin/astra", "title": "Fix renderer drift"}),
+        );
+        let ci = r.format_tool_description(
+            "github_ci_status",
+            &serde_json::json!({"repo": "matrixorigin/astra"}),
+        );
+
+        assert_eq!(pr, "Getting PR: matrixorigin/astra#159");
+        assert_eq!(
+            issue,
+            "Creating issue: matrixorigin/astra \"Fix renderer drift\""
+        );
+        assert_eq!(ci, "GitHub CI: matrixorigin/astra");
+    }
+
+    #[test]
+    fn format_github_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("github_get_issue", Some("matrixorigin/astra#147")),
+            "Getting issue: matrixorigin/astra#147"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("github_list_issues", Some("matrixorigin/astra")),
+            "Listing issues: matrixorigin/astra"
+        );
+        assert_eq!(
+            format_tool_display_from_preview(
+                "github_create_issue",
+                Some("matrixorigin/astra: \"Fix renderer drift\""),
+            ),
+            "Creating issue: matrixorigin/astra: \"Fix renderer drift\""
+        );
+    }
+
+    #[test]
+    fn format_utility_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let ask_user = r.format_tool_description(
+            "ask_user",
+            &serde_json::json!({"question": "Continue with the refactor?"}),
+        );
+        let sleep = r.format_tool_description(
+            "sleep",
+            &serde_json::json!({"duration_ms": 1500, "reason": "waiting for CI"}),
+        );
+        let tool_search =
+            r.format_tool_description("tool_search", &serde_json::json!({"query": "git"}));
+
+        assert_eq!(ask_user, "Asking user: \"Continue with the refactor?\"");
+        assert_eq!(sleep, "Sleeping: 1500ms (waiting for CI)");
+        assert_eq!(tool_search, "Searching tools: \"git\"");
+    }
+
+    #[test]
+    fn format_utility_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("ask_user", Some("Continue with the refactor?")),
+            "Asking user: \"Continue with the refactor?\""
+        );
+        assert_eq!(
+            format_tool_display_from_preview("sleep", Some("1500ms (waiting for CI)")),
+            "Sleeping: 1500ms (waiting for CI)"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("tool_search", Some("\"git\"")),
+            "Searching tools: \"git\""
+        );
+    }
+
+    #[test]
+    fn format_meta_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let send = r.format_tool_description(
+            "send_message",
+            &serde_json::json!({"to": "agent-2", "summary": "Need review"}),
+        );
+        let env = r.format_tool_description(
+            "env",
+            &serde_json::json!({"operation": "get", "name": "PATH"}),
+        );
+        let notebook = r.format_tool_description(
+            "notebook_edit",
+            &serde_json::json!({"edit_mode": "replace", "notebook_path": "analysis.ipynb"}),
+        );
+        let query =
+            r.format_tool_description("query_context", &serde_json::json!({"prefix": "auth/"}));
+
+        assert_eq!(send, "Send message: agent-2: Need review");
+        assert_eq!(env, "Env: get PATH");
+        assert_eq!(notebook, "Notebook edit: replace analysis.ipynb");
+        assert_eq!(query, "Query context: auth/");
+    }
+
+    #[test]
+    fn format_meta_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("send_message", Some("agent-2: Need review")),
+            "Send message: agent-2: Need review"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("env", Some("get PATH")),
+            "Env: get PATH"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("notebook_edit", Some("replace analysis.ipynb")),
+            "Notebook edit: replace analysis.ipynb"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("query_context", Some("auth/")),
+            "Query context: auth/"
+        );
+    }
+
+    #[test]
+    fn format_memory_maintenance_descriptions() {
+        let r = StreamRenderState::new();
+        let purge = r.format_tool_description(
+            "memory_purge",
+            &serde_json::json!({"topic": "renderer drift"}),
+        );
+        let correct = r.format_tool_description(
+            "memory_correct",
+            &serde_json::json!({"memory_id": "mem-123"}),
+        );
+        let profile = r.format_tool_description("memory_profile", &serde_json::json!({}));
+
+        assert_eq!(purge, "Purging memory: \"renderer drift\"");
+        assert_eq!(correct, "Correcting memory: mem-123");
+        assert_eq!(profile, "Checking profile");
+    }
+
+    #[test]
+    fn format_memory_maintenance_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("memory_purge", Some("renderer drift")),
+            "Purging memory: \"renderer drift\""
+        );
+        assert_eq!(
+            format_tool_display_from_preview("memory_correct", Some("mem-123")),
+            "Correcting memory: mem-123"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("memory_profile", None),
+            "Checking profile"
+        );
+    }
+
+    #[test]
+    fn format_web_search_description_and_preview() {
+        let r = StreamRenderState::new();
+        let desc = r.format_tool_description(
+            "web_search",
+            &serde_json::json!({"query": "matrixone latest"}),
+        );
+
+        assert_eq!(desc, "Searching web: \"matrixone latest\"");
+        assert_eq!(
+            format_tool_display_from_preview("web_search", Some("matrixone latest")),
+            "Searching web: \"matrixone latest\""
+        );
+    }
+
+    #[test]
+    fn format_analysis_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let info = r.format_tool_description(
+            "get_agent_info",
+            &serde_json::json!({"dimension": "budget"}),
+        );
+        let reflect = r.format_tool_description(
+            "reflect",
+            &serde_json::json!({"question": "why did the tool fail?"}),
+        );
+        let context = r.format_tool_description(
+            "context_analysis",
+            &serde_json::json!({"mode": "compare", "turn_a": 3, "turn_b": 7}),
+        );
+        let chain =
+            r.format_tool_description("run_chain", &serde_json::json!({"name": "search-and-read"}));
+
+        assert_eq!(info, "Getting agent info: budget");
+        assert_eq!(reflect, "Reflecting: \"why did the tool fail?\"");
+        assert_eq!(context, "Context analysis: compare 3 vs 7");
+        assert_eq!(chain, "Running chain: search-and-read");
+    }
+
+    #[test]
+    fn format_analysis_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("get_agent_info", Some("budget")),
+            "Getting agent info: budget"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("reflect", Some("why did the tool fail?")),
+            "Reflecting: \"why did the tool fail?\""
+        );
+        assert_eq!(
+            format_tool_display_from_preview("context_analysis", Some("compare 3 vs 7")),
+            "Context analysis: compare 3 vs 7"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("run_chain", Some("search-and-read")),
+            "Running chain: search-and-read"
+        );
+    }
+
+    #[test]
+    fn format_session_state_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let powershell = r.format_tool_description(
+            "powershell",
+            &serde_json::json!({"command": "Get-ChildItem"}),
+        );
+        let adjust = r.format_tool_description(
+            "adjust_config",
+            &serde_json::json!({"path": "display.max_output_lines"}),
+        );
+        let rollback = r.format_tool_description(
+            "rollback_session_state",
+            &serde_json::json!({"scope": "turn", "turn_index": 5}),
+        );
+
+        assert_eq!(powershell, "PS> Get-ChildItem");
+        assert_eq!(adjust, "Adjust config: display.max_output_lines");
+        assert_eq!(rollback, "Rollback session state: turn 5");
+    }
+
+    #[test]
+    fn format_rollback_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let file = r.format_tool_description(
+            "rollback_file_edits",
+            &serde_json::json!({"scope": "file", "path": "src/main.rs"}),
+        );
+        let snapshot = r.format_tool_description(
+            "rollback_database_snapshots",
+            &serde_json::json!({"scope": "snapshot", "snapshot_id": "snap_123"}),
+        );
+        let turn = r.format_tool_description(
+            "rollback_turn_actions",
+            &serde_json::json!({"scope": "turn", "turn_index": 7}),
+        );
+
+        assert_eq!(file, "Revert file edits: src/main.rs");
+        assert_eq!(snapshot, "Revert DB snapshots: snap_123");
+        assert_eq!(turn, "Rollback turn actions: turn 7");
+    }
+
+    #[test]
+    fn format_session_state_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("powershell", Some("Get-ChildItem")),
+            "PS> Get-ChildItem"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("adjust_config", Some("display.max_output_lines"),),
+            "Adjust config: display.max_output_lines"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("rollback_session_state", Some("turn 5")),
+            "Rollback session state: turn 5"
+        );
+    }
+
+    #[test]
+    fn format_rollback_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("rollback_file_edits", Some("src/main.rs")),
+            "Revert file edits: src/main.rs"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("rollback_database_snapshots", Some("snap_123")),
+            "Revert DB snapshots: snap_123"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("rollback_turn_actions", Some("turn 7")),
+            "Rollback turn actions: turn 7"
+        );
+    }
+
+    #[test]
+    fn format_task_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let create = r.format_tool_description(
+            "task_create",
+            &serde_json::json!({"title": "Fix renderer drift"}),
+        );
+        let update = r.format_tool_description(
+            "task_update",
+            &serde_json::json!({"task_id": "render-pass", "status": "in_progress"}),
+        );
+        let list = r.format_tool_description("task_list", &serde_json::json!({"status": "active"}));
+
+        assert_eq!(create, "Creating task: \"Fix renderer drift\"");
+        assert_eq!(update, "Updating task: render-pass -> in_progress");
+        assert_eq!(list, "Listing tasks: active");
+    }
+
+    #[test]
+    fn format_task_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("task_create", Some("Fix renderer drift")),
+            "Creating task: \"Fix renderer drift\""
+        );
+        assert_eq!(
+            format_tool_display_from_preview("task_update", Some("render-pass -> in_progress")),
+            "Updating task: render-pass -> in_progress"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("task_list", Some("active")),
+            "Listing tasks: active"
+        );
+    }
+
+    #[test]
+    fn format_mo_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let query = r.format_tool_description(
+            "mo_query",
+            &serde_json::json!({"sql": "select * from users"}),
+        );
+        let snapshot = r.format_tool_description(
+            "mo_snapshot",
+            &serde_json::json!({"action": "create", "name": "pre-migration"}),
+        );
+        let branch = r.format_tool_description(
+            "mo_branch",
+            &serde_json::json!({"action": "create", "name": "exp-a"}),
+        );
+
+        assert_eq!(query, "MatrixOne query: \"select * from users\"");
+        assert_eq!(snapshot, "MatrixOne snapshot: create pre-migration");
+        assert_eq!(branch, "MatrixOne branch: create exp-a");
+    }
+
+    #[test]
+    fn format_mo_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("mo_query", Some("select * from users")),
+            "MatrixOne query: \"select * from users\""
+        );
+        assert_eq!(
+            format_tool_display_from_preview("mo_snapshot", Some("create pre-migration")),
+            "MatrixOne snapshot: create pre-migration"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("mo_branch", Some("create exp-a")),
+            "MatrixOne branch: create exp-a"
+        );
+    }
+
+    #[test]
+    fn format_code_navigation_descriptions() {
+        let r = StreamRenderState::new();
+        let search = r.format_tool_description(
+            "symbol_search",
+            &serde_json::json!({"query": "SessionFacts"}),
+        );
+        let hover = r.format_tool_description(
+            "hover_info",
+            &serde_json::json!({"file": "src/lib.rs", "line": 42, "column": 3}),
+        );
+        let hierarchy = r.format_tool_description(
+            "type_hierarchy",
+            &serde_json::json!({"name": "SessionStore", "direction": "implementations"}),
+        );
+        let lsp = r.format_tool_description(
+            "lsp",
+            &serde_json::json!({"operation": "hover", "file": "src/lib.rs", "line": 42, "column": 3}),
+        );
+
+        assert_eq!(search, "Search symbol SessionFacts");
+        assert_eq!(hover, "Hover info at src/lib.rs:42:3");
+        assert_eq!(
+            hierarchy,
+            "Type hierarchy for SessionStore (implementations)"
+        );
+        assert_eq!(lsp, "LSP: hover src/lib.rs:42:3");
+    }
+
+    #[test]
+    fn format_code_navigation_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("hover_info", Some("src/lib.rs:42:3")),
+            "Hover info at src/lib.rs:42:3"
+        );
+        assert_eq!(
+            format_tool_display_from_preview(
+                "type_hierarchy",
+                Some("SessionStore (implementations)"),
+            ),
+            "Type hierarchy for SessionStore (implementations)"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("symbol_search", Some("SessionFacts")),
+            "Search symbol SessionFacts"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("lsp", Some("hover src/lib.rs:42:3")),
+            "LSP: hover src/lib.rs:42:3"
+        );
+    }
+
+    #[test]
+    fn format_code_navigation_truncates_long_position_paths() {
+        let r = StreamRenderState::new();
+        let hover = r.format_tool_description(
+            "hover_info",
+            &serde_json::json!({
+                "file": "/very/long/path/to/deeply/nested/module/with/more/components/and/even/more/components/src/lib.rs",
+                "line": 42,
+                "column": 3
+            }),
+        );
+        assert!(hover.starts_with("Hover info at .../"));
+        assert!(hover.ends_with(":42:3"));
+    }
+
+    #[test]
+    fn format_code_navigation_keeps_medium_position_paths() {
+        let r = StreamRenderState::new();
+        let hover = r.format_tool_description(
+            "hover_info",
+            &serde_json::json!({
+                "file": "/moderately/long/path/to/nested/module/file.rs",
+                "line": 42,
+                "column": 3
+            }),
+        );
+        assert_eq!(
+            hover,
+            "Hover info at /moderately/long/path/to/nested/module/file.rs:42:3"
+        );
+    }
+
+    #[test]
+    fn format_call_graph_preview_respects_path_budget() {
+        let r = StreamRenderState::new();
+        let preview = r
+            ._format_tool_arg_preview_unused(
+                "call_graph",
+                &serde_json::json!({
+                    "path": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
+                    "start_line": 10,
+                    "end_line": 24
+                }),
+            )
+            .expect("preview");
+        assert!(preview.starts_with(".../"));
+        assert!(preview.ends_with(":10-24"));
+        assert!(preview.chars().count() <= 40);
+    }
+
+    #[test]
+    fn format_location_previews_respect_path_budget() {
+        let r = StreamRenderState::new();
+        let hover = r
+            ._format_tool_arg_preview_unused(
+                "hover_info",
+                &serde_json::json!({
+                    "file": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
+                    "line": 42,
+                    "column": 3
+                }),
+            )
+            .expect("hover preview");
+        let extract = r
+            ._format_tool_arg_preview_unused(
+                "extract_members",
+                &serde_json::json!({
+                    "file": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
+                    "line": 88
+                }),
+            )
+            .expect("extract preview");
+        let lsp = r
+            ._format_tool_arg_preview_unused(
+                "lsp",
+                &serde_json::json!({
+                    "operation": "hover",
+                    "file": "/very/long/path/to/deeply/nested/module/with/more/components/src/lib.rs",
+                    "line": 42,
+                    "column": 3
+                }),
+            )
+            .expect("lsp preview");
+
+        assert!(hover.ends_with(":42:3"));
+        assert!(hover.chars().count() <= 40);
+        assert!(extract.ends_with(":88"));
+        assert!(extract.chars().count() <= 40);
+        assert!(lsp.ends_with(":42:3"));
+        assert!(lsp.chars().count() <= 40);
+    }
+
+    #[test]
+    fn format_remaining_code_tool_descriptions() {
+        let r = StreamRenderState::new();
+        let rename = r.format_tool_description(
+            "rename_symbol",
+            &serde_json::json!({"symbol": "SessionStore", "new_name": "StoreSession"}),
+        );
+        let dead_code = r.format_tool_description(
+            "dead_code",
+            &serde_json::json!({"path": "src/", "kind": "function"}),
+        );
+        let extract_members = r.format_tool_description(
+            "extract_members",
+            &serde_json::json!({"file": "src/lib.rs", "line": 88}),
+        );
+
+        assert_eq!(rename, "Rename symbol SessionStore -> StoreSession");
+        assert_eq!(dead_code, "Find dead code: src/ (function)");
+        assert_eq!(extract_members, "Extract members: src/lib.rs:88");
+    }
+
+    #[test]
+    fn format_remaining_code_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview("rename_symbol", Some("SessionStore -> StoreSession"),),
+            "Rename symbol SessionStore -> StoreSession"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("dead_code", Some("src/ (function)")),
+            "Find dead code: src/ (function)"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("extract_members", Some("src/lib.rs:88")),
+            "Extract members: src/lib.rs:88"
+        );
     }
 
     // ── Skill/MCP output summary tests ──

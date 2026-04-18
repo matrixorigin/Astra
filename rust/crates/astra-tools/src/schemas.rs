@@ -21,6 +21,7 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_blame",
     "git_commit",
     "git_revert_commit",
+    "web_fetch",
     "web_search",
 ];
 
@@ -1925,14 +1926,18 @@ mod tests {
     }
 
     #[test]
-    fn default_executor_tool_schemas_exclude_unsupported_tools() {
+    fn default_executor_tool_schemas_match_supported_surface() {
         let schemas = default_executor_tool_schemas();
         let names = schema_names(&schemas);
-        assert!(names.contains(&"git_revert_commit"));
+        for &name in DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                names.contains(&name),
+                "{name} should have a default executor schema"
+            );
+        }
         assert!(!names.contains(&"tool_search"));
         assert!(!names.contains(&"github_list_prs"));
         assert!(!names.contains(&"symbols"));
-        assert!(!names.contains(&"web_fetch"));
         assert!(!names.contains(&"rollback_file_edits"));
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
