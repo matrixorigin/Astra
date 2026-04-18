@@ -238,10 +238,32 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
     }
 }
 
-/// Per-chunk idle watchdog: no SSE JSON for this long → treat as stalled.
+/// Per-chunk idle watchdog (pre-progress): no SSE JSON for this long → treat as stalled.
+/// Delegate to the canonical public function in sse_stream_host.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
-    // Delegate to the canonical public function in sse_stream_host.
+    #[cfg(test)]
+    if let Some(d) = TEST_STREAM_IDLE_TIMEOUT.with(|c| *c.borrow()) {
+        return d;
+    }
     crate::turn::sse_stream_host::stream_idle_timeout()
+}
+
+/// Per-chunk idle watchdog (post-progress): once at least one SSE chunk has been
+/// received, allow a longer idle window to accommodate thinking/reasoning pauses.
+pub(crate) fn stream_idle_timeout_after_progress() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(d) = TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| *c.borrow()) {
+        return d;
+    }
+    crate::turn::sse_stream_host::stream_idle_timeout_after_progress()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STREAM_IDLE_TIMEOUT: std::cell::RefCell<Option<std::time::Duration>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS: std::cell::RefCell<Option<std::time::Duration>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// TCP connect timeout for LLM API requests.
@@ -334,6 +356,10 @@ pub(crate) async fn call_llm_and_collect(
     // the same partial generation in a second streaming attempt.
     let mut idle_timeout_count = 0u32;
     let max_retries = LLM_MAX_RETRIES;
+    // Read idle timeouts once before the retry loop to avoid env-var races between
+    // parallel tests (and to ensure consistent timeouts across retries).
+    let idle_pre = stream_idle_timeout();
+    let idle_post = stream_idle_timeout_after_progress();
 
     for attempt in 0..=max_retries {
         // Extend retries if TPM exhaustion was detected (account-level limit)
@@ -411,7 +437,16 @@ pub(crate) async fn call_llm_and_collect(
             // Success — record to cooldown tracker
             cooldown.with(model_key, |c| c.record_success());
             let byte_stream = response.bytes_stream();
-            match collect_llm_stream(byte_stream, model_name, started, cancel).await {
+            match collect_llm_stream(
+                byte_stream,
+                model_name,
+                started,
+                cancel,
+                idle_pre,
+                idle_post,
+            )
+            .await
+            {
                 Ok(result) => return Ok(result),
                 Err(StreamCollectError::Cancelled) => {
                     return Err(astra_core::ClassifiedError::new(
@@ -605,6 +640,8 @@ async fn collect_llm_stream(
     model_name: &str,
     started: Instant,
     cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -616,9 +653,8 @@ async fn collect_llm_stream(
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-
-    let idle = stream_idle_timeout();
     loop {
+        let idle = if made_progress { idle_post } else { idle_pre };
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled),
@@ -1042,6 +1078,27 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+    /// Set thread-local stream idle timeouts for the duration of a test.
+    /// Returns a guard that resets them on drop.
+    fn set_test_stream_timeouts(pre_ms: u64, post_ms: Option<u64>) -> impl Drop {
+        TEST_STREAM_IDLE_TIMEOUT.with(|c| {
+            *c.borrow_mut() = Some(std::time::Duration::from_millis(pre_ms));
+        });
+        if let Some(post) = post_ms {
+            TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| {
+                *c.borrow_mut() = Some(std::time::Duration::from_millis(post));
+            });
+        }
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                TEST_STREAM_IDLE_TIMEOUT.with(|c| *c.borrow_mut() = None);
+                TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        Guard
+    }
+
     #[tokio::test]
     async fn sleep_ms_or_llm_cancel_sleeps_when_no_cancel_source() {
         let r = sleep_ms_or_llm_cancel(8, LlmCancel::None).await;
@@ -1407,7 +1464,15 @@ mod tests {
         let err = sample_reqwest_stream_error().await;
         let byte_stream = stream::iter(vec![Err(err)]);
         let started = Instant::now();
-        let res = collect_llm_stream(byte_stream, "test-model", started, LlmCancel::None).await;
+        let res = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            started,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await;
         assert!(
             matches!(res, Err(StreamCollectError::Transport(_))),
             "expected transport error, got: {res:?}"
@@ -1423,9 +1488,16 @@ mod tests {
         let u = json!({"usage":{"prompt_tokens":3,"completion_tokens":4}});
         let body = format!("data: {d1}\n\ndata: {d2}\n\ndata: {u}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-        let res = collect_llm_stream(stream, "gpt-test", Instant::now(), LlmCancel::None)
-            .await
-            .expect("collect");
+        let res = collect_llm_stream(
+            stream,
+            "gpt-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
         assert_eq!(res.full_text, "Hi there");
         assert_eq!(res.reasoning, "R");
         assert_eq!(res.usage.get("prompt").and_then(Value::as_i64), Some(3));
@@ -1445,9 +1517,16 @@ mod tests {
         let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
         let body = format!("data: {d1}\n\ndata: {done}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
-            .await
-            .expect("collect");
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
         assert_eq!(res.full_text, "Hello");
         assert_eq!(res.finish_reason.as_deref(), Some("stop"));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
@@ -1460,9 +1539,16 @@ mod tests {
         let done = json!({"choices":[{"delta":{},"finish_reason":"length"}]});
         let body = format!("data: {d1}\n\ndata: {done}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
-            .await
-            .expect("collect");
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
         assert_eq!(res.finish_reason.as_deref(), Some("length"));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
@@ -1474,9 +1560,16 @@ mod tests {
         let c2 = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\"bar\"}"}}]}}]});
         let body = format!("data: {c1}\n\ndata: {c2}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
-            .await
-            .expect("collect");
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
         assert_eq!(res.tool_calls.len(), 1);
         let args = res.tool_calls[0]["function"]["arguments"]
             .as_str()
@@ -1494,7 +1587,15 @@ mod tests {
         // Stream that never yields any bytes (simulates a hung connection).
         let pending_stream = stream::pending::<Result<Bytes, reqwest::Error>>();
         let started = Instant::now();
-        let res = collect_llm_stream(pending_stream, "test-model", started, LlmCancel::None).await;
+        let res = collect_llm_stream(
+            pending_stream,
+            "test-model",
+            started,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await;
         assert!(
             matches!(
                 res,
@@ -1511,10 +1612,19 @@ mod tests {
     #[tokio::test]
     async fn stream_idle_timeout_after_partial_output_marks_progress() {
         unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "1") };
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS", "1") };
         let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
         let stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n")))])
             .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
-        let res = collect_llm_stream(stream, "test-model", Instant::now(), LlmCancel::None).await;
+        let res = collect_llm_stream(
+            stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await;
         assert!(
             matches!(
                 res,
@@ -1526,6 +1636,7 @@ mod tests {
             "expected idle timeout after partial output, got: {res:?}"
         );
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS") };
     }
 
     #[tokio::test]
@@ -1541,6 +1652,8 @@ mod tests {
                 "test-model",
                 started,
                 LlmCancel::Flag(flag.as_ref()),
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
             )
             .await
         });
@@ -1567,6 +1680,8 @@ mod tests {
                 "test-model",
                 started,
                 LlmCancel::Token(&token_for_stream),
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
             )
             .await
         });
@@ -1595,6 +1710,8 @@ mod tests {
                 "test-model",
                 started,
                 LlmCancel::FlagAndToken(flag.as_ref(), &token_signal),
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
             )
             .await
         });
@@ -1771,9 +1888,16 @@ mod tests {
         v.extend_from_slice(br#""}}]}"#);
         v.extend_from_slice(b"\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(v))]);
-        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
-            .await
-            .expect("collect");
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
         assert_eq!(res.full_text, "a\u{FFFD}");
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
@@ -2053,9 +2177,16 @@ mod tests {
         }]});
         let body = format!("data: {d}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(body))]);
-        let res = collect_llm_stream(stream, "m", Instant::now(), LlmCancel::None)
-            .await
-            .expect("collect");
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
         assert_eq!(res.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(res.tool_calls.len(), 1);
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
@@ -2063,7 +2194,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_falls_back_immediately_after_partial_stream_idle() {
-        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "10") };
+        let _guard = set_test_stream_timeouts(10, Some(10));
         let state = StreamIdleHit {
             stream_hits: Arc::new(AtomicU32::new(0)),
             fallback_hits: Arc::new(AtomicU32::new(0)),
@@ -2096,12 +2227,11 @@ mod tests {
             "partial stream idle should skip the extra streaming retry"
         );
         assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
-        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
     #[tokio::test]
     async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
-        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "10") };
+        let _guard = set_test_stream_timeouts(10, None);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(
@@ -2126,7 +2256,6 @@ mod tests {
         .expect("stream retry succeeds");
         assert_eq!(res.full_text, "after-retry");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
     /// Mock server that returns 400 with context_length_exceeded.

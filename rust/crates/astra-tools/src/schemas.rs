@@ -2012,4 +2012,29 @@ mod tests {
             );
         }
     }
+
+    /// Default CLI/edge executor names must remain promotable to the server allowlist without
+    /// forgetting to add new defaults when expanding server coverage.
+    #[test]
+    fn default_executor_tool_names_are_subset_of_server_allowlist() {
+        let allow: HashSet<&str> = SERVER_EXECUTOR_TOOL_NAMES.iter().copied().collect();
+        for name in DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                allow.contains(name),
+                "`{name}` is in DEFAULT_EXECUTOR_TOOL_NAMES but missing from SERVER_EXECUTOR_TOOL_NAMES"
+            );
+        }
+    }
+
+    #[test]
+    fn default_executor_tool_schemas_are_subset_of_server_executor_schemas() {
+        let server_schemas = server_executor_tool_schemas();
+        let server_names: HashSet<&str> = schema_names(&server_schemas).into_iter().collect();
+        for name in schema_names(&default_executor_tool_schemas()) {
+            assert!(
+                server_names.contains(name),
+                "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
+            );
+        }
+    }
 }

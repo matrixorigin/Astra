@@ -24,15 +24,42 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// Stream idle watchdog default: abort SSE consumption if no chunk arrives within this time.
-pub const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+///
+/// This timeout applies before the first SSE frame is received (the TTFT gap).
+/// Because thinking/reasoning models (o1, o3, DeepSeek-R1, claude with extended
+/// thinking) can spend minutes in the reasoning phase **before** emitting any SSE
+/// chunk, it is impossible to distinguish a genuinely dead connection from a slow
+/// model at this stage. The 5-minute default matches
+/// [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`] and is configurable via
+/// `MO_STREAM_IDLE_TIMEOUT_MS`.
+pub const STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 
-/// Configurable stream idle timeout. Reads `MO_STREAM_IDLE_TIMEOUT_MS` env var,
-/// falling back to [`STREAM_IDLE_TIMEOUT_MS`] (90 s).
+/// Idle timeout after at least one SSE chunk has been received.
+///
+/// Thinking/reasoning models (o1, o3, DeepSeek-R1, claude with extended thinking)
+/// can spend minutes in the reasoning phase where the SSE stream produces no
+/// `text_delta` events. A 5-minute post-progress window avoids false aborts while
+/// still catching genuinely stalled connections.
+pub const STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: u64 = 300_000;
+
+/// Configurable stream idle timeout (pre-progress). Reads `MO_STREAM_IDLE_TIMEOUT_MS`
+/// env var, falling back to [`STREAM_IDLE_TIMEOUT_MS`] (300 s / 5 min).
 pub fn stream_idle_timeout() -> std::time::Duration {
     let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(STREAM_IDLE_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Configurable stream idle timeout (post-progress). Reads
+/// `MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS` env var, falling back to
+/// [`STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS`] (300 s / 5 min).
+pub fn stream_idle_timeout_after_progress() -> std::time::Duration {
+    let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS);
     std::time::Duration::from_millis(ms)
 }
 
@@ -294,10 +321,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
 
     host.on_before_sse_read_loop();
 
-    let idle = idle_timeout;
+    let idle_pre = idle_timeout;
+    let idle_post = stream_idle_timeout_after_progress();
     // Short tick for UI heartbeat (thinking pane elapsed timer refresh).
     let tick = std::time::Duration::from_secs(1);
     loop {
+        // After first progress, use the more generous post-progress timeout
+        // to avoid false aborts during thinking/reasoning model pauses.
+        let idle = if first_sse_frame_seen {
+            idle_post
+        } else {
+            idle_pre
+        };
         // Inner loop: retry with short ticks so on_idle_tick can refresh the UI,
         // but accumulate elapsed time toward the full idle_timeout.
         let chunk_result = 'wait: {
@@ -383,7 +418,15 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         pending.clear();
         let msg = match abort {
             Some(astra_core::ErrorKind::StreamIdle) => {
-                format!("Error: stream idle timeout after {}ms", idle.as_millis())
+                let timeout_used = if first_sse_frame_seen {
+                    idle_post
+                } else {
+                    idle_pre
+                };
+                format!(
+                    "Error: stream idle timeout after {}ms",
+                    timeout_used.as_millis()
+                )
             }
             Some(astra_core::ErrorKind::Cancelled) => "Cancelled by user".to_string(),
             _ => "Unknown abort".to_string(),

@@ -3804,6 +3804,35 @@ esac
         assert!(result.contains("not available"));
     }
 
+    struct AlwaysTimeoutGate;
+
+    #[async_trait]
+    impl astra_tools::ToolApprovalGate for AlwaysTimeoutGate {
+        async fn request_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _args: &Value,
+        ) -> astra_tools::ApprovalDecision {
+            astra_tools::ApprovalDecision::Timeout
+        }
+
+        fn requires_approval(&self, tool_name: &str) -> bool {
+            tool_name == "bash"
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_returns_denied_error_string() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_approval_gate(std::sync::Arc::new(AlwaysTimeoutGate));
+        let out = exec.execute("bash", &json!({"command": "echo hi"})).await;
+        assert!(
+            out.contains("approval request timed out"),
+            "unexpected output: {out}"
+        );
+    }
+
     // ── Bash execution ─────────────────────────────────────────────────
 
     #[tokio::test]
