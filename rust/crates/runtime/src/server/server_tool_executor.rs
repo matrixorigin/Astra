@@ -1207,6 +1207,7 @@ impl ServerToolExecutor {
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
+            "web_fetch" => self.default_executor.execute("web_fetch", args).await,
             "read_file" => self.default_executor.execute("read_file", args).await,
             "write_file" => tool_result_from_output(self.server_write_file(args)),
             "str_replace" => tool_result_from_output(self.server_str_replace(args)),
@@ -1225,6 +1226,11 @@ impl ServerToolExecutor {
             "task_get" => tool_result_from_output(self.task_get(args)),
             "task_update" => tool_result_from_output(self.task_update(args)),
             "task_stop" => tool_result_from_output(self.task_stop(args)),
+            "sleep" => self.default_executor.execute("sleep", args).await,
+            "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
+                &astra_tools::schemas::server_executor_tool_schemas(),
+                args,
+            )),
             // ── MatrixOne operations ────────────────────────────────────
             "mo_query" => self.server_mo_query(args),
             "rollback_database_snapshots" => {
@@ -1241,6 +1247,17 @@ impl ServerToolExecutor {
             "git_status" => self.default_executor.execute("git_status", args).await,
             "git_diff" => self.default_executor.execute("git_diff", args).await,
             "git_log" => self.default_executor.execute("git_log", args).await,
+            "git_file_history" => {
+                self.default_executor
+                    .execute("git_file_history", args)
+                    .await
+            }
+            "git_contributors" => {
+                self.default_executor
+                    .execute("git_contributors", args)
+                    .await
+            }
+            "git_log_search" => self.default_executor.execute("git_log_search", args).await,
             "git_show" => self.default_executor.execute("git_show", args).await,
             "git_blame" => self.default_executor.execute("git_blame", args).await,
             "symbols" => self.default_executor.execute("symbols", args).await,
@@ -1248,6 +1265,30 @@ impl ServerToolExecutor {
             "git_revert_commit" => {
                 self.default_executor
                     .execute("git_revert_commit", args)
+                    .await
+            }
+            // ── GitHub operations ────────────────────────────────────────
+            // Read-only GitHub tools delegate to DefaultToolExecutor.
+            "github_list_prs" => self.default_executor.execute("github_list_prs", args).await,
+            "github_get_pr" => self.default_executor.execute("github_get_pr", args).await,
+            "github_ci_status" => {
+                self.default_executor
+                    .execute("github_ci_status", args)
+                    .await
+            }
+            "github_list_issues" => {
+                self.default_executor
+                    .execute("github_list_issues", args)
+                    .await
+            }
+            "github_get_issue" => {
+                self.default_executor
+                    .execute("github_get_issue", args)
+                    .await
+            }
+            "github_repo_stats" => {
+                self.default_executor
+                    .execute("github_repo_stats", args)
                     .await
             }
             // ── Delegation placeholder ─────────────────────────────────
@@ -1261,8 +1302,11 @@ impl ServerToolExecutor {
                 "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
-                     rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
+                     rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
+                     grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
+                     git_show, git_blame, symbols, git_commit, git_revert_commit, github_list_prs, github_get_pr, \
+                     github_ci_status, github_list_issues, github_get_issue, github_repo_stats, memory_*, web_fetch, \
+                     web_search"
             )),
         };
 
@@ -3607,6 +3651,42 @@ esac
     }
 
     #[tokio::test]
+    async fn web_fetch_is_available_in_server_mode() {
+        let (exec, _dir) = test_executor();
+        let result = exec.execute("web_fetch", &json!({})).await;
+        assert!(result.contains("Missing 'url'"), "{result}");
+        assert!(
+            !result.contains("not available in server-side execution mode"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_is_available_in_server_mode() {
+        let (exec, _dir) = test_executor();
+        let start = std::time::Instant::now();
+        let result = exec.execute("sleep", &json!({"duration_ms": 20})).await;
+        assert!(result.contains("Slept"), "{result}");
+        assert!(start.elapsed().as_millis() >= 15);
+        assert!(!result.contains("not available in server-side execution mode"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_uses_server_surface() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute("tool_search", &json!({"query": "select:memory_store"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result).expect("tool_search json");
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory_store"));
+        assert_eq!(
+            parsed["missing"].as_array().map(Vec::len),
+            Some(0),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
     async fn symbols_extracts_rust_symbols() {
         let (exec, dir) = test_executor();
         std::fs::write(
@@ -3661,6 +3741,56 @@ esac
         // Request 999 — should be capped at 100
         let result = exec.execute("git_log", &json!({"n": 999})).await;
         assert!(result.contains("initial"));
+    }
+
+    #[tokio::test]
+    async fn git_helper_tools_are_available_in_server_mode() {
+        let (exec, dir) = test_executor();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial helper commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let file_history = exec
+            .execute("git_file_history", &json!({"file": "f.txt"}))
+            .await;
+        assert!(file_history.contains("File: f.txt"), "{file_history}");
+
+        let log_search = exec
+            .execute("git_log_search", &json!({"query": "helper"}))
+            .await;
+        assert!(
+            log_search.contains("Search:") || log_search.contains("initial helper commit"),
+            "{log_search}"
+        );
+
+        let contributors = exec.execute("git_contributors", &json!({})).await;
+        assert!(
+            contributors.contains("## Top Contributors"),
+            "{contributors}"
+        );
     }
 
     #[tokio::test]
@@ -3838,6 +3968,28 @@ esac
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_tools_delegate_to_default_executor() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "github_list_prs",
+                &json!({"repo": "matrixorigin/mo-agent-runtime"}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("requires a configured GitHub client")
+        );
+        assert!(
+            !result
+                .output
+                .contains("not available in server-side execution mode")
+        );
     }
 
     // ── Output management ──────────────────────────────────────────────

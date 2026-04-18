@@ -248,10 +248,15 @@ impl DefaultToolExecutor {
             // ── Sleep ────────────────────────────────────────────────
             "sleep" => {
                 let secs = args
-                    .get("seconds")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0)
-                    .clamp(0.0, 30.0);
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .map(|ms| (ms.min(300_000) as f64) / 1000.0)
+                    .or_else(|| {
+                        args.get("seconds")
+                            .and_then(Value::as_f64)
+                            .map(|s| s.clamp(0.0, 300.0))
+                    })
+                    .unwrap_or(1.0);
                 tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
                 ToolResult::text(format!("Slept for {secs:.1}s"))
             }
@@ -705,11 +710,23 @@ mod tests {
         let (_tmp, exec) = test_executor();
         let start = std::time::Instant::now();
         let result = exec
-            .execute("sleep", &serde_json::json!({"seconds": 0.1}))
+            .execute("sleep", &serde_json::json!({"duration_ms": 100}))
             .await;
         assert!(!result.is_error);
         assert!(result.output.contains("Slept"));
         assert!(start.elapsed().as_millis() >= 90);
+    }
+
+    #[tokio::test]
+    async fn dispatch_sleep_accepts_legacy_seconds() {
+        let (_tmp, exec) = test_executor();
+        let start = std::time::Instant::now();
+        let result = exec
+            .execute("sleep", &serde_json::json!({"seconds": 0.05}))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.output.contains("Slept"));
+        assert!(start.elapsed().as_millis() >= 40);
     }
 
     #[tokio::test]
