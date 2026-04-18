@@ -674,6 +674,117 @@ pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
 }
 
 #[derive(Debug)]
+pub struct PreparedMultiEdit {
+    path: PathBuf,
+    path_str: String,
+    new_content: String,
+    edit_count: usize,
+    dry_run: bool,
+}
+
+impl PreparedMultiEdit {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn new_content_bytes(&self) -> &[u8] {
+        self.new_content.as_bytes()
+    }
+
+    pub fn apply(&self) -> ToolResult {
+        if self.dry_run {
+            return ToolResult::text(format!(
+                "Dry run: {} edit(s) would be applied to {}",
+                self.edit_count, self.path_str
+            ));
+        }
+
+        match std::fs::write(&self.path, &self.new_content) {
+            Ok(()) => ToolResult::text(format!(
+                "Successfully applied {} edit(s) to {}",
+                self.edit_count, self.path_str
+            )),
+            Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+        }
+    }
+}
+
+pub fn prepare_multi_edit(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedMultiEdit, ToolResult> {
+    let path_str = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
+    };
+    let edits = match args.get("edits").and_then(|v| v.as_array()) {
+        Some(e) => e,
+        None => return Err(ToolResult::error("Error: Missing 'edits' array".into())),
+    };
+    if edits.is_empty() {
+        return Err(ToolResult::error("Error: 'edits' array is empty".into()));
+    }
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let path = match resolve_path(workspace_root, path_str) {
+        Ok(p) => p,
+        Err(e) => return Err(ToolResult::error(e)),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
+    };
+
+    let mut working = content;
+    for (i, edit) in edits.iter().enumerate() {
+        let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                return Err(ToolResult::error(format!(
+                    "Error: edit[{i}] missing 'old_str'"
+                )));
+            }
+        };
+        let new_str = match edit.get("new_str").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                return Err(ToolResult::error(format!(
+                    "Error: edit[{i}] missing 'new_str'"
+                )));
+            }
+        };
+        if old_str == new_str {
+            return Err(ToolResult::error(format!(
+                "Error: edit[{i}] old_str and new_str are identical"
+            )));
+        }
+        let count = working.matches(old_str).count();
+        if count == 0 {
+            return Err(ToolResult::error(format!(
+                "Error: edit[{i}] old_str not found in {path_str}"
+            )));
+        }
+        if count > 1 {
+            return Err(ToolResult::error(format!(
+                "Error: edit[{i}] old_str found {count} times in {path_str}. Must match exactly once."
+            )));
+        }
+        working = working.replacen(old_str, new_str, 1);
+    }
+
+    Ok(PreparedMultiEdit {
+        path,
+        path_str: path_str.to_string(),
+        new_content: working,
+        edit_count: edits.len(),
+        dry_run,
+    })
+}
+
+#[derive(Debug)]
 pub struct PreparedDeleteFile {
     path: PathBuf,
     path_str: String,
@@ -787,72 +898,9 @@ pub fn list_dir(workspace_root: &Path, args: &Value) -> ToolResult {
 /// Each edit must have `old_str` and `new_str`. All edits are validated
 /// first (no partial application). `old_str` must match exactly once.
 pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
-    let path_str = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return ToolResult::error("Error: Missing 'path' parameter".into()),
-    };
-    let edits = match args.get("edits").and_then(|v| v.as_array()) {
-        Some(e) => e,
-        None => return ToolResult::error("Error: Missing 'edits' array".into()),
-    };
-    if edits.is_empty() {
-        return ToolResult::error("Error: 'edits' array is empty".into());
-    }
-    let dry_run = args
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let path = match resolve_path(workspace_root, path_str) {
-        Ok(p) => p,
-        Err(e) => return ToolResult::error(e),
-    };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
-    };
-
-    // Validate all edits first (atomic: all or nothing)
-    let mut working = content.clone();
-    for (i, edit) in edits.iter().enumerate() {
-        let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return ToolResult::error(format!("Error: edit[{i}] missing 'old_str'")),
-        };
-        let new_str = match edit.get("new_str").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return ToolResult::error(format!("Error: edit[{i}] missing 'new_str'")),
-        };
-        if old_str == new_str {
-            return ToolResult::error(format!(
-                "Error: edit[{i}] old_str and new_str are identical"
-            ));
-        }
-        let count = working.matches(old_str).count();
-        if count == 0 {
-            return ToolResult::error(format!("Error: edit[{i}] old_str not found in {path_str}"));
-        }
-        if count > 1 {
-            return ToolResult::error(format!(
-                "Error: edit[{i}] old_str found {count} times in {path_str}. Must match exactly once."
-            ));
-        }
-        working = working.replacen(old_str, new_str, 1);
-    }
-
-    if dry_run {
-        return ToolResult::text(format!(
-            "Dry run: {} edit(s) would be applied to {path_str}",
-            edits.len()
-        ));
-    }
-
-    match std::fs::write(&path, &working) {
-        Ok(()) => ToolResult::text(format!(
-            "Successfully applied {} edit(s) to {path_str}",
-            edits.len()
-        )),
-        Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+    match prepare_multi_edit(workspace_root, args) {
+        Ok(prepared) => prepared.apply(),
+        Err(error) => error,
     }
 }
 

@@ -29,6 +29,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
     "str_replace",
+    "multi_edit",
     "delete_file",
     "rollback_file_edits",
     "list_dir",
@@ -1968,7 +1969,7 @@ mod tests {
         assert!(!names.contains(&"rollback_turn_actions"));
         assert!(!names.contains(&"powershell"));
         assert!(!names.contains(&"memory_feedback"));
-        assert!(!names.contains(&"multi_edit"));
+        assert!(names.contains(&"multi_edit"));
     }
 
     #[test]
