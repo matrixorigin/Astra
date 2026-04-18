@@ -1,16 +1,16 @@
 use std::{borrow::Cow, fs, path::PathBuf};
 
-use astra_thin_client::paths;
 use astra_thin_client::ThinClient;
+use astra_thin_client::paths;
 use crossterm::style::Stylize;
 use rustyline::{
+    CompletionType, Config, Context, Editor, Helper,
     completion::{Completer, Pair},
     error::ReadlineError,
     highlight::Highlighter,
     hint::Hinter,
     history::FileHistory,
     validate::{ValidationContext, ValidationResult, Validator},
-    CompletionType, Config, Context, Editor, Helper,
 };
 
 use super::credentials::{load_credentials, profile_name, save_credentials};

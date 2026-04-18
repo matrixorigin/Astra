@@ -507,7 +507,9 @@ impl AuthService for DatabaseAuthService {
                 if self
                     .fetch_user_by_username(&pool, &request.username)
                     .await
-                    .map_err(|e| map_auth_sqlx(e, "register.fetch_user_by_username_dup", Some(&pool)))?
+                    .map_err(|e| {
+                        map_auth_sqlx(e, "register.fetch_user_by_username_dup", Some(&pool))
+                    })?
                     .is_some()
                 {
                     return Err(error_response(
@@ -527,7 +529,11 @@ impl AuthService for DatabaseAuthService {
                     ));
                 }
             }
-            return Err(map_auth_sqlx(error, "register.insert_auth_users", Some(&pool)));
+            return Err(map_auth_sqlx(
+                error,
+                "register.insert_auth_users",
+                Some(&pool),
+            ));
         }
 
         query(

@@ -1,7 +1,7 @@
 use std::fs;
 
-use astra_thin_client::paths;
 use astra_thin_client::ThinClient;
+use astra_thin_client::paths;
 use clap::Parser;
 
 mod cli_args;

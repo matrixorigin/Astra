@@ -2461,12 +2461,17 @@ mod tests {
     }
 
     fn test_settings() -> MatrixOneSettings {
+        dotenvy::dotenv().ok();
+        let lookup = |k: &str| std::env::var(k).ok();
         MatrixOneSettings {
-            host: "localhost".to_string(),
-            port: 6001,
-            user: "test".to_string(),
-            password: "test".to_string(),
-            database: "test".to_string(),
+            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
+            port: std::env::var("MATRIXONE_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6001),
+            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".into()),
+            database: astra_core::resolve_matrixone_database_name_or(&lookup, "test_astra_runtime"),
         }
     }
 

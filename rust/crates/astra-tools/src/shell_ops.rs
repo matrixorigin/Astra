@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 use uuid::Uuid;
 
 use astra_sandbox::{CommandRisk, analyze_command_risks};
@@ -1246,7 +1247,14 @@ async fn load_gitignored_search_paths(
     if exit_code == 1 {
         return Ok(std::collections::HashSet::new());
     }
-    if stderr.contains("not a git repository") || stderr.contains("outside repository") {
+    if exit_code == 128
+        || stderr.contains("not a git repository")
+        || stderr.contains("outside repository")
+    {
+        debug!(
+            "git check-ignore returned {exit_code}, assuming no ignore rules: {}",
+            stderr.lines().next().unwrap_or("")
+        );
         return Ok(std::collections::HashSet::new());
     }
 

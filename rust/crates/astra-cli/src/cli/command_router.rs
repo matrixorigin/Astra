@@ -1867,14 +1867,19 @@ fn mcp_get(name: &str) -> Result<(), String> {
 // ═══════════════════════════════════════════════════════ Config ═══════════
 
 /// Path to `~/.astra/settings.json`.
-fn settings_path() -> Result<std::path::PathBuf, String> {
+fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = override_path {
+        return Ok(p.clone());
+    }
     dirs::home_dir()
         .map(|h| h.join(".astra").join("settings.json"))
         .ok_or_else(|| "Cannot determine home directory".to_string())
 }
 
-fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let path = settings_path()?;
+fn read_settings_from(
+    path_override: Option<&std::path::PathBuf>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let path = settings_path(path_override)?;
     if !path.is_file() {
         return Ok(serde_json::Map::new());
     }
@@ -1885,6 +1890,10 @@ fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String>
     val.as_object()
         .cloned()
         .ok_or_else(|| format!("{} is not a JSON object", path.display()))
+}
+
+fn read_settings() -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    read_settings_from(None)
 }
 
 /// Read `default_model` from settings.json, if set.
@@ -1898,7 +1907,14 @@ pub fn read_config_default_model() -> Result<Option<String>, String> {
 
 /// Read `api_url` from settings.json, if set.
 pub fn read_config_api_url() -> Result<Option<String>, String> {
-    let settings = read_settings()?;
+    read_config_api_url_from(None)
+}
+
+/// Read `api_url` from a specific path (for testing) or the default settings path.
+fn read_config_api_url_from(
+    path_override: Option<&std::path::PathBuf>,
+) -> Result<Option<String>, String> {
+    let settings = read_settings_from(path_override)?;
     Ok(settings
         .get("api_url")
         .and_then(|v| v.as_str())
@@ -1936,7 +1952,7 @@ fn resolve_api_url_with(
 }
 
 fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
-    let path = settings_path()?;
+    let path = settings_path(None)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
@@ -1972,7 +1988,7 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
 
 fn config_list() -> Result<(), String> {
     let settings = read_settings()?;
-    let path = settings_path()?;
+    let path = settings_path(None)?;
 
     if settings.is_empty() {
         println!("  {}", "No settings configured.".dim());
@@ -2131,10 +2147,12 @@ mod mcp_cli_tests {
 
         // Verify it's gone
         let config = read_mcp_config(&path).unwrap();
-        assert!(!config["mcpServers"]
-            .as_object()
-            .unwrap()
-            .contains_key("test-server"));
+        assert!(
+            !config["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("test-server")
+        );
     }
 
     #[test]
@@ -2754,11 +2772,9 @@ mod api_url_config_tests {
     /// Integration test: `read_config_api_url` actually reads `settings.json` from disk.
     #[test]
     fn read_config_api_url_reads_real_file() {
-        // Use a temp HOME so we don't clobber the user's real settings.
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
         std::fs::create_dir_all(&astra_dir).unwrap();
-
         let settings = astra_dir.join("settings.json");
         std::fs::write(
             &settings,
@@ -2766,19 +2782,7 @@ mod api_url_config_tests {
         )
         .unwrap();
 
-        // Point HOME to our temp dir so `settings_path()` finds our file.
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: single-threaded test context, HOME is restored before returning
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-
-        let result = read_config_api_url();
-
-        if let Some(prev) = prev_home {
-            unsafe { std::env::set_var("HOME", prev) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-
+        let result = read_config_api_url_from(Some(&settings));
         assert_eq!(
             result.unwrap().as_deref(),
             Some("http://from-disk:9999"),
@@ -2793,18 +2797,8 @@ mod api_url_config_tests {
         std::fs::create_dir_all(&astra_dir).unwrap();
         std::fs::write(astra_dir.join("settings.json"), r#"{}"#).unwrap();
 
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: single-threaded test context, HOME is restored before returning
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-
-        let result = read_config_api_url();
-
-        if let Some(prev) = prev_home {
-            unsafe { std::env::set_var("HOME", prev) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-
+        let settings = astra_dir.join("settings.json");
+        let result = read_config_api_url_from(Some(&settings));
         assert_eq!(result.unwrap(), None);
     }
 }

@@ -219,7 +219,9 @@ pub(super) fn status_hint(status: u16) -> Option<&'static str> {
 /// Message-aware hint: checks error body for known patterns before falling back to status-only hints.
 fn status_hint_for(status: u16, message: &str) -> Option<&'static str> {
     if (status == 500 || status == 503) && message.to_ascii_lowercase().contains("pool timed out") {
-        return Some("Database pool timeout — the API could not obtain a free DB connection in time (other requests may be holding connections or the DB is slow). Retry; on the server enable RUST_LOG=astra_services::auth=warn to log pool_size, pool_idle, and the auth operation name.");
+        return Some(
+            "Database pool timeout — the API could not obtain a free DB connection in time (other requests may be holding connections or the DB is slow). Retry; on the server enable RUST_LOG=astra_services::auth=warn to log pool_size, pool_idle, and the auth operation name.",
+        );
     }
     match status {
         400 => Some("Bad request — check your input"),

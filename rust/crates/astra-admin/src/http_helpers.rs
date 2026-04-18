@@ -1,4 +1,4 @@
-use super::credentials::{load_credentials, profile_name, CredentialsFile, Profile};
+use super::credentials::{CredentialsFile, Profile, load_credentials, profile_name};
 
 pub(crate) fn read_api_error(status: u16, body: &str) -> String {
     format!("request failed ({status}): {}", compact_or_raw(body))

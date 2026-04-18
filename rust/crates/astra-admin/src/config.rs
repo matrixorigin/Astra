@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-fn settings_path() -> Result<PathBuf, String> {
+fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = override_path {
+        return Ok(p.clone());
+    }
     dirs::home_dir()
         .map(|h| h.join(".astra").join("settings.json"))
         .ok_or_else(|| "Cannot determine home directory".to_string())
@@ -8,7 +11,12 @@ fn settings_path() -> Result<PathBuf, String> {
 
 /// Read `api_url` from ~/.astra/settings.json, if set.
 pub(crate) fn read_config_api_url() -> Result<Option<String>, String> {
-    let path = settings_path()?;
+    read_config_api_url_from(None)
+}
+
+/// Read `api_url` from a specific path (for testing) or the default settings path.
+fn read_config_api_url_from(path_override: Option<&PathBuf>) -> Result<Option<String>, String> {
+    let path = settings_path(path_override)?;
     if !path.is_file() {
         return Ok(None);
     }
@@ -127,21 +135,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
         std::fs::create_dir_all(&astra_dir).unwrap();
+        let settings = astra_dir.join("settings.json");
         std::fs::write(
-            astra_dir.join("settings.json"),
+            &settings,
             r#"{"api_url":"http://from-disk:9999","default_model":"gpt-4"}"#,
         )
         .unwrap();
 
-        let prev_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-
-        let result = read_config_api_url();
-        assert_eq!(result.unwrap().as_deref(), Some("http://from-disk:9999"));
-
-        if let Some(prev) = prev_home {
-            unsafe { std::env::set_var("HOME", prev) };
-        }
+        let result = read_config_api_url_from(Some(&settings));
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("http://from-disk:9999"),
+            "read_config_api_url should read from disk"
+        );
     }
 
     #[test]
@@ -149,31 +155,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
         std::fs::create_dir_all(&astra_dir).unwrap();
-        std::fs::write(astra_dir.join("settings.json"), r#"{}"#).unwrap();
+        let settings = astra_dir.join("settings.json");
+        std::fs::write(&settings, r#"{}"#).unwrap();
 
-        let prev_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-
-        let result = read_config_api_url();
+        let result = read_config_api_url_from(Some(&settings));
         assert_eq!(result.unwrap(), None);
-
-        if let Some(prev) = prev_home {
-            unsafe { std::env::set_var("HOME", prev) };
-        }
     }
 
     #[test]
     fn read_config_api_url_returns_none_when_no_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let settings = tmp.path().join("settings.json");
 
-        let result = read_config_api_url();
+        let result = read_config_api_url_from(Some(&settings));
         assert_eq!(result.unwrap(), None);
-
-        if let Some(prev) = prev_home {
-            unsafe { std::env::set_var("HOME", prev) };
-        }
     }
 
     #[test]
@@ -181,16 +176,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let astra_dir = tmp.path().join(".astra");
         std::fs::create_dir_all(&astra_dir).unwrap();
-        std::fs::write(astra_dir.join("settings.json"), "not json").unwrap();
+        let settings = astra_dir.join("settings.json");
+        std::fs::write(&settings, "not json").unwrap();
 
-        let prev_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-
-        let result = read_config_api_url();
+        let result = read_config_api_url_from(Some(&settings));
         assert!(result.is_err());
-
-        if let Some(prev) = prev_home {
-            unsafe { std::env::set_var("HOME", prev) };
-        }
     }
 }
