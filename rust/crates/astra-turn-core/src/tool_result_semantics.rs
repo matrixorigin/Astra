@@ -641,6 +641,12 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
+        // git_commit timeout
+        assert_eq!(
+            classify_tool_error("git_commit", output),
+            ToolErrorSeverity::HardError
+        );
+
         // git_revert_commit timeout
         assert_eq!(
             classify_tool_error("git_revert_commit", output),

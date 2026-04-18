@@ -10,6 +10,7 @@ pub const CLOUD_APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "create_file",
     "edit_file",
     "exec",
+    "git_commit",
     "git_revert_commit",
     "git_stash",
     "github_create_issue",
@@ -377,9 +378,15 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn git_revert_commit_is_write_gated() {
         assert_eq!(
             cloud_gated_tool_kind("git_revert_commit"),
+=======
+    fn git_commit_is_write_gated() {
+        assert_eq!(
+            cloud_gated_tool_kind("git_commit"),
+>>>>>>> fab4bf5d (fix: require cloud approval for git_commit)
             Some(CloudGatedToolKind::Write)
         );
     }
