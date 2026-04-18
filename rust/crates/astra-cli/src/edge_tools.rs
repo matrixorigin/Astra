@@ -436,10 +436,7 @@ impl ToolExecutor {
             cloud_token: None,
             // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
             // memory-resident secrets from lingering after drop.
-            github_token: env::var("GITHUB_TOKEN")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            github_token: astra_tools::github::resolve_github_token(),
             github_client: Client::builder()
                 .timeout(Duration::from_secs(15))
                 .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION")))

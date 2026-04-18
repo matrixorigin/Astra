@@ -1,6 +1,6 @@
 ---
 name: github-ci-check
-description: "Check CI/CD workflow status for a GitHub repository. Analyze failures, diagnose root causes, and provide actionable fix suggestions for failing jobs/steps."
+description: "Check CI/CD workflow status for a GitHub repository. Analyze failures, diagnose root causes, and provide actionable fix suggestions."
 user_invocable: true
 when_to_use: "When the user asks to check CI status, analyze CI failures, debug test failures in GitHub Actions, or says 'check CI', 'ci status', 'why is CI failing'"
 arguments:
@@ -12,9 +12,11 @@ arguments:
     required: false
 allowed_tools:
   - github_ci_status
+  - github_get_pr
   - read_file
   - grep
   - glob
+  - bash
 ---
 # GitHub CI Check
 
@@ -26,59 +28,64 @@ $ARGUMENTS
 
 ---
 
-## Phase 1: Fetch CI Status
+## Phase 1: Resolve Repository
 
-Use `github_ci_status` to get the latest workflow runs. Start with `detail: "detailed"` to get failed jobs and first failed steps.
+1. **If the user provided a full GitHub URL** (e.g., `https://github.com/owner/repo/actions`), parse `owner/repo` directly from the URL. This takes absolute priority.
+2. If `REPO` is provided, use it directly
+3. Otherwise, detect from git remote:
+   ```bash
+   git remote get-url origin 2>/dev/null
+   ```
+   Parse `owner/repo` from the URL. If detection fails, ask the user.
+
+## Phase 2: Fetch CI Status
+
+Use `github_ci_status` with `detail: "detailed"` to get failed jobs and first failed steps.
 
 ```json
 {"repo": "owner/repo", "detail": "detailed", "limit": 3}
 ```
 
-If the result has `resolved_by_search: true`, note which repo was resolved.
+**If the tool returns an error:**
+- "requires a configured GitHub client" → fall back to `bash`:
+  ```bash
+  gh run list --repo owner/repo --limit 3 --json name,conclusion,headBranch,startedAt,updatedAt,event 2>&1
+  ```
+- If `gh` also fails (not installed, not authenticated, no permission), report the error and stop.
 
-## Phase 2: Analyze Failures
+If `resolved_by_search: true` in the result, note which repo was resolved.
+
+## Phase 3: Analyze Failures
 
 For each failed workflow run:
 
-1. **Identify the failing job(s)** — look at `conclusion: "failure"` entries
-2. **Find the first failed step** — this is usually the root cause; later steps may fail as cascading effects
-3. **Categorize the failure**:
-   - **Build failure**: compilation error, missing dependency, syntax error
+1. **Identify the failing job(s)** — `conclusion: "failure"` entries
+2. **Find the first failed step** — usually the root cause; later steps cascade
+3. **Categorize**:
+   - **Build failure**: compilation error, missing dependency
    - **Test failure**: assertion failed, timeout, flaky test
-   - **Lint/format failure**: clippy warning, rustfmt violation, make check
+   - **Lint/format failure**: clippy warning, rustfmt violation
    - **Infrastructure**: rate limit, runner unavailable, network timeout
-   - **Config**: missing secrets, wrong matrix, workflow syntax error
+   - **Config**: missing secrets, workflow syntax error
 
-## Phase 3: Diagnose Root Cause
-
-For each failure category:
+## Phase 4: Diagnose Root Cause
 
 ### Build Failures
-- Extract the compiler error message
-- Identify the failing file and line number
-- Check if it's a type mismatch, missing import, or API change
+- Extract compiler error message, file, and line
 - Suggest the minimal fix
 
 ### Test Failures
-- Identify the failing test name and assertion
-- Check if the test is flaky (fails intermittently)
-- Determine if it's a test bug or a real regression
-- Suggest fix: update assertion, fix test setup, or fix production code
+- Identify failing test name and assertion
+- Determine if flaky or real regression
 
 ### Lint/Format Failures
 - Identify the clippy lint or formatting violation
-- For clippy: suggest the recommended fix (often just following the lint message)
-- For rustfmt: suggest running `cargo fmt`
-- For `make check`: check what the Makefile target does
+- Suggest: `cargo fmt` or follow the lint message
 
 ### Infrastructure Failures
-- Rate limit: suggest retry or reducing parallelism
-- Runner issues: usually transient, suggest re-run
-- Network timeout: check if it's a dependency download issue
+- Usually transient — suggest re-run
 
-## Phase 4: Report
-
-Output a structured report:
+## Phase 5: Report
 
 ```markdown
 ## CI Status: {repo}
@@ -104,13 +111,3 @@ Output a structured report:
 | 🔴 Blocking | Build failure, test regression, security scan fail |
 | 🟡 Fix Soon | Lint warning, flaky test, deprecation notice |
 | 💡 Info | Infrastructure retry, cosmetic CI output |
-
-## Phase 5: Local Verification (Optional)
-
-If the user wants to verify locally before pushing:
-
-- For build failures: `cargo check` or `cargo build`
-- For test failures: `cargo test <test_name>` or `cargo test --package <crate>`
-- For lint: `cargo clippy -- -D warnings`
-- For format: `cargo fmt --check`
-- For make check: `make check`

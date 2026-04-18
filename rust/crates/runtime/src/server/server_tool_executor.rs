@@ -1019,12 +1019,13 @@ impl ServerToolExecutor {
             logger: std::sync::Arc::new(astra_tools::TracingLogger),
             cancel_token: None,
         });
-        // Wire GitHubClient into DefaultToolExecutor if token available
-        let github_token = std::env::var("GITHUB_TOKEN").ok();
-        let default_executor = if let Some(ref token) = github_token {
-            let github = astra_tools::github::GitHubClient::new(
+        // Wire GitHubClient into DefaultToolExecutor if any token is available
+        let github_tokens = astra_tools::github::resolve_github_tokens();
+        let github_token = github_tokens.first().cloned();
+        let default_executor = if !github_tokens.is_empty() {
+            let github = astra_tools::github::GitHubClient::from_tokens(
                 http_client.clone(),
-                Some(token.clone()),
+                github_tokens,
                 Vec::new(),
             );
             default_executor.with_github_client(github)

@@ -174,10 +174,12 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
         cancel_token: None,
     };
 
-    // Build executor with optional GitHub client (from GITHUB_TOKEN env var)
+    // Build executor with optional GitHub client (from GITHUB_TOKEN + gh auth token)
     let mut executor = astra_tools::executor::DefaultToolExecutor::new(ctx);
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let github = astra_tools::github::GitHubClient::new(http_client, Some(token), Vec::new());
+    let tokens = astra_tools::github::resolve_github_tokens();
+    if !tokens.is_empty() {
+        let github =
+            astra_tools::github::GitHubClient::from_tokens(http_client, tokens, Vec::new());
         executor = executor.with_github_client(github);
     }
 

@@ -1,11 +1,11 @@
 ---
 name: review-changes
-description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, or specific commits. Signal-driven analysis routing for efficient deep review."
+description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, specific commits, or GitHub PR URLs. Signal-driven analysis routing for efficient deep review."
 user_invocable: true
-when_to_use: "When the user asks to review code changes, commits, diffs, PRs, or says 'review latest commit'"
+when_to_use: "When the user asks to review code changes, commits, diffs, PRs, GitHub PR URLs (e.g. 'review https://github.com/.../pull/123'), or says 'review latest commit'"
 arguments:
   - name: TARGET
-    description: "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', or 'pr:<number>'. Default: all uncommitted changes."
+    description: "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', 'pr:<number>', or a GitHub PR URL (e.g. 'https://github.com/owner/repo/pull/123'). Default: all uncommitted changes."
     required: false
   - name: FOCUS
     description: "Review focus: 'bugs', 'security', 'logic', 'api', 'tests', or 'all' (default: all)"
@@ -15,9 +15,11 @@ allowed_tools:
   - git_status
   - git_show
   - git_log
+  - github_get_pr
   - read_file
   - grep
   - glob
+  - bash
 ---
 
 # Review Changes
@@ -42,7 +44,17 @@ $ARGUMENTS
 | `staged` | `git_diff(staged: true)` |
 | `branch:<name>` | `git_diff(ref: "main")` |
 | `commit:<sha>` | `git_show(sha)` |
+| `pr:<number>` | See PR workflow below |
+| GitHub PR URL | See PR workflow below |
 | Stat overview | `git_diff(stat_only: true)` first, then per-file |
+
+**PR workflow** (for `pr:<number>` or GitHub PR URL like `https://github.com/owner/repo/pull/123`):
+
+1. Parse `owner/repo` and PR number from the URL (if URL given)
+2. Get the diff via `gh pr diff N --repo owner/repo 2>&1` using `bash`
+   - Always use `bash` + `gh` for PR diffs — it works with the user's `gh auth` credentials regardless of whether `GITHUB_TOKEN` is set
+   - If `gh` fails (not installed, not authenticated, repo not accessible), report the error and stop
+3. Optionally use `github_get_pr` with `detail: "normal"` for PR metadata (title, body, changed files). If it fails (no GITHUB_TOKEN for private repos), skip — the diff is sufficient for review
 
 No changes? Check `git_status`, try `staged: true`. Still nothing? Ask user.
 

@@ -1,22 +1,23 @@
 ---
 name: github-pre-pr
-description: "Pre-PR checklist automation: run make check, make format, cargo clippy, cargo fmt, and verify local tests pass before opening a pull request. Catches issues before CI."
+description: "Pre-PR checklist automation: run project-specific quality checks before opening a pull request. Catches issues before CI."
 user_invocable: true
 when_to_use: "When the user wants to prepare a PR, says 'pre-pr check', 'before opening PR', 'pre-pr', or 'check before push'"
 arguments:
   - name: SCOPE
-    description: "What to check: 'full' (default), 'quick' (build only), or 'test' (build + test only)."
+    description: "What to check: 'full' (default), 'quick' (build + lint only), or 'test' (build + test only)."
     required: false
 allowed_tools:
   - bash
   - git_diff
+  - git_status
   - read_file
   - grep
-  - github_ci_status
+  - glob
 ---
 # Pre-PR Checklist
 
-Run all quality checks locally BEFORE opening a pull request. Catches issues before CI, saving time and avoiding failed PRs.
+Run quality checks locally BEFORE opening a pull request. Adapts to the project's build system.
 
 ## Task
 
@@ -24,100 +25,83 @@ $ARGUMENTS
 
 ---
 
-## Phase 1: Assess Scope
+## Phase 1: Detect Build System
+
+Check what build tools the project uses, in order:
+
+1. **Makefile** — check for `make check`, `make lint`, `make test`, `make format-check`:
+   ```bash
+   grep -E '^(check|lint|test|format|build)[^:]*:' Makefile 2>/dev/null | head -10
+   ```
+2. **package.json** — check for npm/yarn scripts:
+   ```bash
+   cat package.json 2>/dev/null | grep -E '"(test|lint|check|build|format)"' | head -10
+   ```
+3. **Cargo.toml** — Rust project, use cargo commands directly
+4. **go.mod** — Go project
+5. **pyproject.toml / setup.py** — Python project
+
+**Always prefer project-specific targets** (e.g., `make check`) over generic commands (e.g., `cargo clippy`). The Makefile often wraps the right flags.
+
+## Phase 2: Assess Scope
 
 Use `git_diff` with `stat_only: true` to understand what changed. This helps determine which checks are most relevant.
 
-## Phase 2: Run Checks
+## Phase 3: Run Checks
 
-Execute checks in order of speed (fastest first). Stop on first failure and report.
+Execute checks in order of speed (fastest first). **Stop on first failure and report.**
 
-### 2.1 Format Check
+### For projects with Makefile targets:
 
-```bash
-cargo fmt --check
-```
+| Scope | Checks |
+|-------|--------|
+| `full` | `make format-check` → `make lint` → `make build` → `make test-offline` |
+| `quick` | `make format-check` → `make lint` → `make build` |
+| `test` | `make build` → `make test-offline` |
 
-If it fails, run `cargo fmt` to auto-fix, then re-check.
+If a target doesn't exist, skip it and fall through to generic commands.
 
-### 2.2 Lint Check
+### Generic fallback (Rust):
 
-```bash
-cargo clippy --all-targets --all-features -- -D warnings
-```
+| Order | Command |
+|-------|---------|
+| 1 | `cargo fmt --check` |
+| 2 | `cargo clippy --workspace -- -D warnings` |
+| 3 | `cargo check --workspace` |
+| 4 | `cargo test --workspace` |
 
-For project-specific lints, also check:
-```bash
-make check 2>/dev/null || echo "no make check target"
-```
+### Generic fallback (Node.js):
 
-### 2.3 Build Check
+| Order | Command |
+|-------|---------|
+| 1 | `npm run lint` or `npx eslint .` |
+| 2 | `npm run build` |
+| 3 | `npm test` |
 
-```bash
-cargo check --all-targets --all-features
-```
-
-### 2.4 Test Check
-
-Run tests for changed crates only (from git diff):
-```bash
-# Extract changed crate names and run their tests
-cargo test --package <crate_name>
-```
-
-For full test suite (slower):
-```bash
-cargo test --workspace
-```
-
-### 2.5 Integration Tests (if applicable)
-
-```bash
-cargo test --test '*' 2>/dev/null || echo "no integration tests"
-```
-
-## Phase 3: Report
-
-Output a checklist:
+## Phase 4: Report
 
 ```markdown
 ## Pre-PR Checklist
 
 | Check | Status | Notes |
 |-------|--------|-------|
-| cargo fmt | ✅ / ❌ | {details} |
-| cargo clippy | ✅ / ❌ | {details} |
-| cargo check | ✅ / ❌ | {details} |
-| cargo test | ✅ / ❌ | {details} |
-| make check | ✅ / ❌ | {details} |
+| format | ✅ / ❌ | {details} |
+| lint | ✅ / ❌ | {details} |
+| build | ✅ / ❌ | {details} |
+| test | ✅ / ❌ | {details} |
 
 ### Issues to Fix
-
-{list any failures with file:line and error message}
-
-### Recommendations
-
-{suggestions for cleanup before opening PR}
+{list failures with file:line and error message}
 ```
 
-### All Clear
-
 If everything passes:
-```markdown
+```
 ✅ All pre-PR checks passed! Ready to open PR.
 ```
 
-## Phase 4: Auto-Fix (When Possible)
+## Phase 5: Auto-Fix (When Safe)
 
 For fixable issues:
-- **Format**: `cargo fmt` (always safe)
-- **Simple clippy**: if the lint suggests `--fix`, run `cargo clippy --fix --all-targets --allow-dirty`
-- **Trivial build errors**: suggest the fix but don't auto-apply
-
-## Scope Variants
-
-| Scope | Runs |
-|-------|------|
-| `full` | fmt → clippy → check → test → make check |
-| `quick` | fmt → check (fastest path to "will it compile?") |
-| `test` | fmt → check → test (skip clippy) |
+- **Format**: `cargo fmt` / `npx prettier --write .` (always safe)
+- **Simple clippy**: `cargo clippy --fix --allow-dirty` (if lint suggests `--fix`)
+- **Build/test errors**: suggest the fix but don't auto-apply

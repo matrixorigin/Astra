@@ -29,18 +29,46 @@ fn enforce_github_api_url(url: &str) -> Result<(), String> {
 ///
 /// Wraps a reqwest::Client with optional auth token and a list of
 /// preferred repositories (learned from user interactions).
+/// Supports token fallback: if the primary token gets a 401/403,
+/// automatically retries with the next candidate.
 pub struct GitHubClient {
     client: Client,
-    token: Option<String>,
+    tokens: Mutex<Vec<String>>,
     preferred_repos: Mutex<Vec<String>>,
 }
 
 impl GitHubClient {
     pub fn new(client: Client, token: Option<String>, preferred_repos: Vec<String>) -> Self {
+        let tokens = token.into_iter().collect();
         Self {
             client,
-            token,
+            tokens: Mutex::new(tokens),
             preferred_repos: Mutex::new(preferred_repos),
+        }
+    }
+
+    /// Create with multiple candidate tokens (first is tried first, fallback on auth failure).
+    pub fn from_tokens(client: Client, tokens: Vec<String>, preferred_repos: Vec<String>) -> Self {
+        Self {
+            client,
+            tokens: Mutex::new(tokens),
+            preferred_repos: Mutex::new(preferred_repos),
+        }
+    }
+
+    fn current_token(&self) -> Option<String> {
+        self.tokens.lock().ok().and_then(|t| t.first().cloned())
+    }
+
+    /// Drop the current (failed) token. Returns `true` if a fallback token is now active.
+    fn rotate_token(&self) -> bool {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            if !tokens.is_empty() {
+                tokens.remove(0);
+            }
+            !tokens.is_empty()
+        } else {
+            false
         }
     }
 
@@ -73,6 +101,37 @@ impl GitHubClient {
 
 const GITHUB_MISSING_REPO_ERROR: &str = "Error: missing 'repo' — infer repo from current user text or recent conversation; bare names like 'memoria' are allowed";
 
+/// Collect GitHub token candidates: `GITHUB_TOKEN` env var, then `gh auth token` CLI.
+/// Returns all valid tokens found (may be 0, 1, or 2).
+pub fn resolve_github_tokens() -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Ok(val) = std::env::var("GITHUB_TOKEN") {
+        let val = val.trim().to_string();
+        if !val.is_empty() {
+            tokens.push(val);
+        }
+    }
+    if let Some(t) = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })
+        .filter(|t| !tokens.contains(t))
+    {
+        tokens.push(t);
+    }
+    tokens
+}
+
+/// Convenience: resolve the best single token (first candidate).
+pub fn resolve_github_token() -> Option<String> {
+    resolve_github_tokens().into_iter().next()
+}
+
 impl GitHubClient {
     async fn github_request(
         &self,
@@ -81,12 +140,31 @@ impl GitHubClient {
         payload: Option<&Value>,
     ) -> Result<Value, String> {
         enforce_github_api_url(url)?;
+        let result = self.github_request_once(method.clone(), url, payload).await;
+        // On 401/403/404 with a token, try rotating to the next candidate.
+        // GitHub returns 404 (not 403) for private repos with bad auth to prevent info leakage.
+        // Round-robin rotation is non-destructive, so retrying on real 404 is harmless.
+        if let Err(ref e) = result
+            && (e.contains("HTTP 401") || e.contains("HTTP 403") || e.contains("HTTP 404"))
+            && self.rotate_token()
+        {
+            return self.github_request_once(method, url, payload).await;
+        }
+        result
+    }
+
+    async fn github_request_once(
+        &self,
+        method: Method,
+        url: &str,
+        payload: Option<&Value>,
+    ) -> Result<Value, String> {
         let mut request = self
             .client
             .request(method, url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(token) = &self.token {
+        if let Some(token) = &self.current_token() {
             request = request.bearer_auth(token);
         }
         if let Some(payload) = payload {
@@ -114,7 +192,7 @@ impl GitHubClient {
             return Err(github_api_error_message(
                 status,
                 &value,
-                self.token.is_some(),
+                self.current_token().is_some(),
             ));
         }
 
@@ -1056,7 +1134,7 @@ impl GitHubClient {
                 "Error: github_create_issue requires repo in 'owner/repo' form",
             );
         }
-        if self.token.is_none() {
+        if self.current_token().is_none() {
             return github_error_response(
                 "github_create_issue",
                 "issue",
