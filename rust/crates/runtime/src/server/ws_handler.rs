@@ -131,6 +131,15 @@ pub(super) enum WsClientMessage {
         reason: Option<String>,
     },
 
+    /// Respond to an ask_user prompt.
+    #[serde(rename = "user_prompt")]
+    UserPrompt {
+        request_id: String,
+        answer: String,
+        #[serde(default)]
+        was_custom: bool,
+    },
+
     /// Client heartbeat.
     #[serde(rename = "ping")]
     Ping,
@@ -195,6 +204,18 @@ pub(super) enum WsServerMessage {
         request_id: String,
         tool: String,
         args: serde_json::Value,
+    },
+
+    /// ask_user requires a frontend response before the turn can continue.
+    #[serde(rename = "user_prompt_request")]
+    UserPromptRequest {
+        request_id: String,
+        question: String,
+        choices: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
     },
 
     /// Tool execution started on server.
@@ -503,6 +524,20 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 )
                                 .await;
                             }
+                            Ok(WsClientMessage::UserPrompt {
+                                request_id,
+                                answer,
+                                was_custom,
+                            }) => {
+                                handle_user_prompt_response(
+                                    state,
+                                    &conn,
+                                    &request_id,
+                                    answer,
+                                    was_custom,
+                                )
+                                .await;
+                            }
                             Ok(WsClientMessage::Ping) => {
                                 send_msg(socket, &WsServerMessage::Pong).await;
                             }
@@ -791,6 +826,26 @@ async fn handle_tool_approval(
     guard.insert(key, value);
 }
 
+/// Store an ask_user response in the edge callback ledger.
+async fn handle_user_prompt_response(
+    state: &AppState,
+    conn: &WsConnection,
+    request_id: &str,
+    answer: String,
+    was_custom: bool,
+) {
+    use crate::turn::edge_ledger::user_prompt_callback_key;
+
+    let key = user_prompt_callback_key(&conn.user.user_id, request_id);
+    let value = serde_json::json!({
+        "answer": answer,
+        "was_custom": was_custom,
+    });
+    let ledger = state.edge_callback_ledger.clone();
+    let mut guard = ledger.lock().await;
+    guard.insert(key, value);
+}
+
 fn build_bridge_chat_payload(
     session_id: Option<String>,
     content: &str,
@@ -858,6 +913,7 @@ fn build_ws_chat_request(
         forward_headers: std::collections::HashMap::new(),
         max_candidates,
         explain,
+        interactive_client: true,
     }
 }
 
@@ -1135,6 +1191,20 @@ async fn stream_run_over_websocket(
                             Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
                                 handle_tool_approval(state, conn, &request_id, approved, reason).await;
                             }
+                            Ok(WsClientMessage::UserPrompt {
+                                request_id,
+                                answer,
+                                was_custom,
+                            }) => {
+                                handle_user_prompt_response(
+                                    state,
+                                    conn,
+                                    &request_id,
+                                    answer,
+                                    was_custom,
+                                )
+                                .await;
+                            }
                             Ok(WsClientMessage::Ping) => {
                                 send_msg(socket, &WsServerMessage::Pong).await;
                             }
@@ -1211,6 +1281,47 @@ async fn stream_run_over_websocket(
                                 .unwrap_or_default()
                                 .to_string(),
                             args: req.get("args").cloned().unwrap_or_default(),
+                        },
+                    )
+                    .await;
+                }
+
+                for req in state
+                    .run_lifecycle_service
+                    .drain_user_prompt_requests(run_id)
+                    .await
+                {
+                    send_msg(
+                        socket,
+                        &WsServerMessage::UserPromptRequest {
+                            request_id: req
+                                .get("request_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            question: req
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            choices: req
+                                .get("choices")
+                                .and_then(|v| v.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                            default: req
+                                .get("default")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string),
+                            context: req
+                                .get("context")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string),
                         },
                     )
                     .await;
@@ -2100,6 +2211,20 @@ async fn stream_sse_response_as_ws(
                             Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
                                 handle_tool_approval(state, conn, &request_id, approved, reason).await;
                             }
+                            Ok(WsClientMessage::UserPrompt {
+                                request_id,
+                                answer,
+                                was_custom,
+                            }) => {
+                                handle_user_prompt_response(
+                                    state,
+                                    conn,
+                                    &request_id,
+                                    answer,
+                                    was_custom,
+                                )
+                                .await;
+                            }
                             Ok(WsClientMessage::Ping) => {
                                 send_msg(socket, &WsServerMessage::Pong).await;
                             }
@@ -2607,6 +2732,7 @@ mod tests {
         assert_eq!(request.context.as_ref().unwrap()["is_plan_subtask"], true);
         assert_eq!(request.max_candidates, 7);
         assert!(request.explain);
+        assert!(request.interactive_client);
     }
 
     #[test]
@@ -4166,6 +4292,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_user_prompt_response() {
+        let json =
+            r#"{"type":"user_prompt","request_id":"req-3","answer":"custom","was_custom":true}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::UserPrompt {
+                request_id,
+                answer,
+                was_custom,
+            } => {
+                assert_eq!(request_id, "req-3");
+                assert_eq!(answer, "custom");
+                assert!(was_custom);
+            }
+            _ => panic!("expected UserPrompt"),
+        }
+    }
+
+    #[test]
     fn serialize_run_started() {
         let msg = WsServerMessage::RunStarted {
             run_id: "r1".into(),
@@ -4326,6 +4471,22 @@ mod tests {
     }
 
     #[test]
+    fn serialize_user_prompt_request() {
+        let msg = WsServerMessage::UserPromptRequest {
+            request_id: "req-2".into(),
+            question: "Continue?".into(),
+            choices: vec!["yes".into(), "no".into()],
+            default: Some("yes".into()),
+            context: Some("Need confirmation".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"user_prompt_request""#));
+        assert!(json.contains(r#""question":"Continue?""#));
+        assert!(json.contains(r#""choices":["yes","no"]"#));
+        assert!(json.contains(r#""default":"yes""#));
+    }
+
+    #[test]
     fn all_server_message_variants_serialize() {
         let variants: Vec<WsServerMessage> = vec![
             WsServerMessage::AuthOk {
@@ -4357,6 +4518,13 @@ mod tests {
                 tool: "bash".into(),
                 args: serde_json::json!({}),
             },
+            WsServerMessage::UserPromptRequest {
+                request_id: "req-2".into(),
+                question: "Continue?".into(),
+                choices: vec!["yes".into(), "no".into()],
+                default: Some("yes".into()),
+                context: None,
+            },
             WsServerMessage::Error {
                 message: "err".into(),
                 code: "E".into(),
@@ -4385,6 +4553,7 @@ mod tests {
             r#"{"type":"message","content":"hello"}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,
+            r#"{"type":"user_prompt","request_id":"req-2","answer":"yes","was_custom":false}"#,
             r#"{"type":"ping"}"#,
         ];
         for json in &inputs {
@@ -4409,6 +4578,15 @@ mod tests {
 
         // Missing request_id
         let json = r#"{"type":"tool_approval","approved":true}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+    }
+
+    #[test]
+    fn user_prompt_requires_request_id_and_answer() {
+        let json = r#"{"type":"user_prompt","answer":"yes"}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+
+        let json = r#"{"type":"user_prompt","request_id":"req-1"}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
     }
 }

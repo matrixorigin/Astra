@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::{ToolContext, ToolExecutor};
+use astra_tools::{AskUserDecision, AskUserGate, ToolContext, ToolExecutor};
 use async_trait::async_trait;
 
 use crate::tool_sandbox::{
@@ -46,6 +46,14 @@ struct DatabaseSnapshotRollbackEntry {
 struct DatabaseSnapshotRollbackJournal {
     entries: Vec<DatabaseSnapshotRollbackEntry>,
     next_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AskUserRequest {
+    question: String,
+    choices: Vec<String>,
+    default: Option<String>,
+    context: Option<String>,
 }
 
 impl DatabaseSnapshotRollbackJournal {
@@ -957,6 +965,8 @@ pub struct ServerToolExecutor {
     url_cache: Mutex<HashMap<String, (String, Instant)>>,
     /// Optional approval gate for dangerous tool execution.
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
+    /// Optional ask_user gate for interactive client prompts.
+    ask_user_gate: Option<Arc<dyn AskUserGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
     /// Optional resource governor for usage tracking (Phase 5).
@@ -1053,6 +1063,7 @@ impl ServerToolExecutor {
             http_client,
             url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
+            ask_user_gate: None,
             progress_callback: None,
             resource_governor: None,
             edge_connection_pool: None,
@@ -1066,6 +1077,11 @@ impl ServerToolExecutor {
     /// Set the approval gate for interactive tool execution.
     pub fn set_approval_gate(&mut self, gate: Arc<dyn astra_tools::ToolApprovalGate>) {
         self.approval_gate = Some(gate);
+    }
+
+    /// Set the ask_user gate for interactive user prompts.
+    pub fn set_ask_user_gate(&mut self, gate: Arc<dyn AskUserGate>) {
+        self.ask_user_gate = Some(gate);
     }
 
     /// Set the progress callback for streaming tool output.
@@ -1203,6 +1219,7 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
+            "ask_user" => self.server_ask_user(args).await,
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
@@ -1258,10 +1275,10 @@ impl ServerToolExecutor {
             // ── Unknown tool fallback ──────────────────────────────────
             _ => astra_tools::ToolResult::error(format!(
                 "Error: Tool '{name}' is not available in server-side execution mode. \
-                     Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
-                     list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
-                     rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
+                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
+                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
+                      rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
+                      git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search, ask_user"
             )),
         };
 
@@ -1280,6 +1297,48 @@ impl ServerToolExecutor {
         }
 
         result
+    }
+
+    async fn server_ask_user(&self, args: &Value) -> astra_tools::ToolResult {
+        let request = match parse_ask_user_request(args) {
+            Ok(request) => request,
+            Err(error) => return astra_tools::ToolResult::error(error),
+        };
+
+        let Some(gate) = &self.ask_user_gate else {
+            return astra_tools::ToolResult::error(
+                "Error: ask_user requires an interactive client connection".into(),
+            );
+        };
+
+        let request_id = format!("ask-{}-{}", self.session_id, uuid_v4_short());
+        match gate
+            .request_user_input(
+                &request_id,
+                &request.question,
+                &request.choices,
+                request.default.as_deref(),
+                request.context.as_deref(),
+            )
+            .await
+        {
+            AskUserDecision::Answer(response) => {
+                let mut body = json!({
+                    "answer": response.answer,
+                    "question": request.question,
+                });
+                if !request.choices.is_empty() {
+                    body["was_custom"] = Value::Bool(response.was_custom);
+                }
+                astra_tools::ToolResult::text(body.to_string())
+            }
+            AskUserDecision::Timeout => astra_tools::ToolResult::error(
+                "Error: ask_user timed out waiting for user response".into(),
+            ),
+            AskUserDecision::Error(message) => {
+                astra_tools::ToolResult::error(format!("Error: ask_user failed: {message}"))
+            }
+        }
     }
 
     /// Set the current turn index for journal entries.
@@ -2968,6 +3027,42 @@ fn edit_type_label(edit_type: EditType) -> &'static str {
     }
 }
 
+fn parse_ask_user_request(args: &Value) -> Result<AskUserRequest, String> {
+    let question = match args.get("question").and_then(Value::as_str) {
+        Some(question) if !question.trim().is_empty() => question.to_string(),
+        _ => return Err("Error: 'question' is required".into()),
+    };
+
+    let choices: Vec<String> = args
+        .get("choices")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !choices.is_empty() && !(2..=9).contains(&choices.len()) {
+        return Err("Error: choices must contain 2-9 options".into());
+    }
+
+    Ok(AskUserRequest {
+        question,
+        choices,
+        default: args
+            .get("default")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        context: args
+            .get("context")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    })
+}
+
 fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let json_error = parsed
@@ -3020,6 +3115,8 @@ mod tests {
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
 
     use super::*;
+    use astra_tools::{AskUserDecision, AskUserGate, AskUserResponse};
+    use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -3144,7 +3241,96 @@ esac
         (exec, dir, session_id, session)
     }
 
+    #[derive(Clone)]
+    struct StaticAskUserGate {
+        expected_question: &'static str,
+        expected_choices: Vec<&'static str>,
+        decision: AskUserDecision,
+    }
+
+    #[async_trait]
+    impl AskUserGate for StaticAskUserGate {
+        async fn request_user_input(
+            &self,
+            _request_id: &str,
+            question: &str,
+            choices: &[String],
+            _default: Option<&str>,
+            _context: Option<&str>,
+        ) -> AskUserDecision {
+            assert_eq!(question, self.expected_question);
+            assert_eq!(
+                choices,
+                &self
+                    .expected_choices
+                    .iter()
+                    .map(|choice| choice.to_string())
+                    .collect::<Vec<_>>()
+            );
+            self.decision.clone()
+        }
+    }
+
     // ── Path traversal security ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ask_user_returns_structured_response_from_gate() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
+            expected_question: "Which option?",
+            expected_choices: vec!["first", "second"],
+            decision: AskUserDecision::Answer(AskUserResponse {
+                answer: "custom".into(),
+                was_custom: true,
+            }),
+        }));
+
+        let result = exec
+            .execute_with_metadata(
+                "ask_user",
+                &json!({
+                    "question": "Which option?",
+                    "choices": ["first", "second"],
+                    "default": "first"
+                }),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap(),
+            json!({
+                "answer": "custom",
+                "question": "Which option?",
+                "was_custom": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_requires_interactive_gate() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("ask_user", &json!({"question": "Continue?"}))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("interactive client connection"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_rejects_invalid_choice_count() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "ask_user",
+                &json!({"question": "Pick one", "choices": ["only-one"]}),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("choices must contain 2-9 options"));
+    }
 
     #[tokio::test]
     async fn resolve_path_allows_relative_inside_workspace() {

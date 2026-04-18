@@ -461,6 +461,7 @@ mod tests {
             forward_headers: std::collections::HashMap::new(),
             max_candidates: 3,
             explain: true,
+            interactive_client: false,
         });
         let obj = payload.as_object().unwrap();
         assert!(obj.contains_key("messages"));
@@ -499,6 +500,7 @@ mod tests {
             forward_headers: std::collections::HashMap::new(),
             max_candidates: 3,
             explain: true,
+            interactive_client: false,
         });
         let obj = payload.as_object().unwrap();
         assert_eq!(obj["allow_skills"], serde_json::json!(["analyze", "plan"]));

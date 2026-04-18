@@ -56,6 +56,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_commit",
     "git_revert_commit",
     "web_search",
+    "ask_user",
     "memory_retrieve",
     "memory_store",
     "memory_search",

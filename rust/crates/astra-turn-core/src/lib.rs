@@ -171,3 +171,4 @@ pub mod tool_registry_plugin;
 pub mod tool_registry_selection_edge_hints;
 pub mod turn_guard;
 pub mod ws_approval_gate;
+pub mod ws_user_prompt_gate;

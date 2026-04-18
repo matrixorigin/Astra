@@ -695,6 +695,10 @@ pub struct AgenticRunLifecycleService {
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
+    /// Per-run ask_user prompt channel receivers.
+    /// Key: run_id → receiver that the WS handler drains.
+    user_prompt_channels:
+        Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
     /// Per-run progress event channel receivers (Phase F.3).
     /// Key: run_id → receiver that the WS handler drains.
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<ProgressEvent>>>>,
@@ -719,6 +723,7 @@ impl AgenticRunLifecycleService {
             skill_service: None,
             server_skill_resolver_cache: std::sync::OnceLock::new(),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
+            user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
@@ -958,7 +963,8 @@ impl AgenticRunLifecycleService {
         .with_model(request.model.clone())
         .with_edge_tools(edge_tools)
         .with_edge_profile(edge_profile)
-        .with_edge_callback_ledger(self.edge_callback_ledger.clone());
+        .with_edge_callback_ledger(self.edge_callback_ledger.clone())
+        .with_interactive_client(request.interactive_client);
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -1392,6 +1398,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await
                 .insert(run_id.clone(), approval_rx);
 
+            if request.interactive_client {
+                let (user_prompt_tx, user_prompt_rx) = mpsc::unbounded_channel();
+                let user_prompt_gate = super::ws_user_prompt_gate::WebSocketUserPromptGate::new(
+                    user_id.clone(),
+                    self.edge_callback_ledger.clone(),
+                    user_prompt_tx,
+                );
+                executor.set_ask_user_gate(std::sync::Arc::new(user_prompt_gate));
+                self.user_prompt_channels
+                    .lock()
+                    .await
+                    .insert(run_id.clone(), user_prompt_rx);
+            }
+
             // ── Phase F.3: Wire WebSocket progress callback ─────────
             let (progress_tx, progress_rx) = mpsc::unbounded_channel();
             let progress_cb =
@@ -1407,6 +1427,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Clone handles we need inside the spawned task.
         let bg_approval_channels = self.approval_channels.clone();
+        let bg_user_prompt_channels = self.user_prompt_channels.clone();
         let bg_progress_channels = self.progress_channels.clone();
         let runs = self.runs_handle();
         let run_engine = self.run_engine.clone();
@@ -1423,6 +1444,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Clean up channels for this run.
             bg_approval_channels.lock().await.remove(&bg_run_id);
+            bg_user_prompt_channels.lock().await.remove(&bg_run_id);
             bg_progress_channels.lock().await.remove(&bg_run_id);
             let terminal_events = terminal_events_for_persistence(&events);
 
@@ -1737,6 +1759,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
     async fn drain_approval_requests(&self, run_id: &str) -> Vec<serde_json::Value> {
         let mut channels = self.approval_channels.lock().await;
+        let Some(rx) = channels.get_mut(run_id) else {
+            return vec![];
+        };
+        let mut requests = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            requests.push(req);
+        }
+        requests
+    }
+
+    async fn drain_user_prompt_requests(&self, run_id: &str) -> Vec<serde_json::Value> {
+        let mut channels = self.user_prompt_channels.lock().await;
         let Some(rx) = channels.get_mut(run_id) else {
             return vec![];
         };
@@ -2461,6 +2495,7 @@ mod tests {
             forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
+            interactive_client: false,
         }
     }
 
@@ -3078,6 +3113,7 @@ mod tests {
             forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
+            interactive_client: false,
         };
         let tools = AgenticRunLifecycleService::extract_edge_tools(&req);
         assert_eq!(tools.len(), 1);
@@ -3108,6 +3144,7 @@ mod tests {
             forward_headers: HashMap::new(),
             max_candidates: 5,
             explain: false,
+            interactive_client: false,
         };
         let profile = AgenticRunLifecycleService::extract_edge_profile(&req);
         assert_eq!(profile["cwd"], "/tmp");
