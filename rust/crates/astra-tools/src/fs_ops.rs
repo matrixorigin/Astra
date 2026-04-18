@@ -147,8 +147,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     // For large files without explicit range, provide a helpful preview instead of error.
     // This auto-pagination helps the agent understand file structure without manual range specification.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
-        // Use streaming approach for large files to avoid allocating ~10MB
-        // for preview. Read only head lines + seek to tail.
+        // Read head lines + count total via fast byte scan.
+        // Phase 1: collect head lines (allocates Strings only for the first N lines).
+        // Phase 2: scan the rest of the file in raw chunks counting '\n' bytes —
+        // no per-line String allocation, no UTF-8 validation, ~10-100x faster than
+        // read_line for the counting-only portion.
         const HEAD_LINES: usize = 50;
         const TAIL_LINES: usize = 20;
 
@@ -158,13 +161,12 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         };
         let file_size = metadata.len();
 
-        // Read head lines
         let mut reader = BufReader::new(file);
         let mut head_lines = Vec::with_capacity(HEAD_LINES);
         let mut line_buf = String::new();
         let mut total_lines = 0usize;
 
-        // Count total lines (streaming) and collect head
+        // Phase 1: collect head lines only
         let mut io_error = false;
         loop {
             line_buf.clear();
@@ -176,6 +178,8 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
                         // Remove trailing newline for consistent formatting
                         let trimmed = line_buf.trim_end_matches(['\n', '\r']);
                         head_lines.push(trimmed.to_string());
+                    } else {
+                        break; // Got enough head lines — stop allocating Strings
                     }
                 }
                 Err(e) => {
@@ -185,6 +189,27 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
                         "I/O error reading head lines of large file: {e}"
                     );
                     break;
+                }
+            }
+        }
+
+        // Phase 2: count remaining lines via raw byte scan (no String allocation)
+        if !io_error {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total_lines += chunk[..n].iter().filter(|&&b| b == b'\n').count();
+                    }
+                    Err(e) => {
+                        io_error = true;
+                        astra_core::agent_warn!(
+                            "fs",
+                            "I/O error counting lines in large file: {e}"
+                        );
+                        break;
+                    }
                 }
             }
         }
