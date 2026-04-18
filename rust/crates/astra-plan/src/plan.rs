@@ -1069,10 +1069,20 @@ mod tests {
         // Chinese punctuation
         assert_eq!(PlanCommand::parse("继续!"), Some(PlanCommand::Resume));
         assert_eq!(PlanCommand::parse("继续！"), Some(PlanCommand::Resume));
-        assert_eq!(PlanCommand::parse("执行。"), Some(PlanCommand::Execute { step_by_step: false }));
+        assert_eq!(
+            PlanCommand::parse("执行。"),
+            Some(PlanCommand::Execute {
+                step_by_step: false
+            })
+        );
         // English punctuation
         assert_eq!(PlanCommand::parse("continue!"), Some(PlanCommand::Resume));
-        assert_eq!(PlanCommand::parse("go!"), Some(PlanCommand::Execute { step_by_step: false }));
+        assert_eq!(
+            PlanCommand::parse("go!"),
+            Some(PlanCommand::Execute {
+                step_by_step: false
+            })
+        );
         assert_eq!(PlanCommand::parse("status?"), Some(PlanCommand::Status));
         // Multiple punctuation
         assert_eq!(PlanCommand::parse("继续!!"), Some(PlanCommand::Resume));
