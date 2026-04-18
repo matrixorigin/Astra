@@ -189,6 +189,7 @@ pub struct EdgeToolRoundDelivery {
 pub struct ApprovalAuditContext {
     pub user_id: String,
     pub session_id: String,
+    pub turn: u32,
     pub agent_id: Option<String>,
     pub parent_event_id: Option<String>,
     pub parent_event_ids: Vec<String>,
@@ -220,6 +221,7 @@ fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
 
 fn append_approval_required_journal_event(
     session_id: &str,
+    turn: u32,
     request_id: &str,
     tool_name: &str,
     approval_kind: ApprovalKind,
@@ -229,6 +231,7 @@ fn append_approval_required_journal_event(
     writer
         .append(&JournalEvent::approval_required(
             Some(session_id),
+            Some(turn),
             request_id,
             tool_name,
             approval_kind_str(approval_kind),
@@ -239,6 +242,7 @@ fn append_approval_required_journal_event(
 
 fn append_approval_timeout_journal_event(
     session_id: &str,
+    turn: u32,
     request_id: &str,
     tool_name: &str,
     approval_kind: ApprovalKind,
@@ -247,6 +251,7 @@ fn append_approval_timeout_journal_event(
     writer
         .append(&JournalEvent::approval_timeout(
             Some(session_id),
+            Some(turn),
             request_id,
             tool_name,
             approval_kind_str(approval_kind),
@@ -303,6 +308,7 @@ pub async fn record_approval_required_audit(
 ) -> Result<(), String> {
     append_approval_required_journal_event(
         &context.session_id,
+        context.turn,
         request_id,
         tool_name,
         approval_kind,
@@ -440,6 +446,7 @@ pub async fn wait_approval_ledger_for_tool(
             CloudApprovalResult::Timeout => {
                 if let Err(error) = append_approval_timeout_journal_event(
                     &context.session_id,
+                    context.turn,
                     id,
                     tool_name,
                     approval_kind,

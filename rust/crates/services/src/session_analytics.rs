@@ -365,6 +365,7 @@ mod tests {
         let events = vec![
             JournalEvent::approval_required(
                 Some("s1"),
+                None,
                 "req-1",
                 "write_file",
                 "standard",
@@ -372,13 +373,14 @@ mod tests {
             ),
             JournalEvent::approval_decision(
                 Some("s1"),
+                None,
                 "req-1",
                 Some("write_file"),
                 Some("standard"),
                 "allow",
                 None,
             ),
-            JournalEvent::approval_timeout(Some("s1"), "req-2", "bash", "explicit"),
+            JournalEvent::approval_timeout(Some("s1"), None, "req-2", "bash", "explicit"),
         ];
         let stats = compute_session_stats("s1", &events);
         assert_eq!(stats.approval_required_count, 1);

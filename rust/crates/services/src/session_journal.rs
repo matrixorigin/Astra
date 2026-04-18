@@ -533,6 +533,17 @@ pub struct ApprovalJournalDecision {
     pub approval_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalJournalRequest {
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_kind: Option<String>,
+}
+
 fn normalize_optional_str(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -878,6 +889,36 @@ pub fn find_latest_approval_decision(
             request_id: found_request_id,
             decision,
             reason: approval_metadata_str(metadata, "reason"),
+            tool_name: approval_metadata_str(metadata, "tool_name"),
+            approval_kind: approval_metadata_str(metadata, "approval_kind"),
+        }));
+    }
+    Ok(None)
+}
+
+pub fn find_latest_approval_required(
+    session_id: &str,
+    request_id: &str,
+) -> std::io::Result<Option<ApprovalJournalRequest>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let events = read_journal(session_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != JournalEventType::ApprovalRequired {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        let Some(found_request_id) = approval_metadata_str(metadata, "request_id") else {
+            continue;
+        };
+        if found_request_id != request_id {
+            continue;
+        }
+        return Ok(Some(ApprovalJournalRequest {
+            request_id: found_request_id,
+            turn: event.turn,
             tool_name: approval_metadata_str(metadata, "tool_name"),
             approval_kind: approval_metadata_str(metadata, "approval_kind"),
         }));
@@ -1709,12 +1750,14 @@ impl JournalEvent {
 
     pub fn approval_required(
         session_id: Option<&str>,
+        turn: Option<u32>,
         request_id: &str,
         tool_name: &str,
         approval_kind: &str,
         detail: Option<&str>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::ApprovalRequired, session_id);
+        evt.turn = turn;
         evt.user_input = Some(truncate(
             &format!("approval_required {tool_name} {request_id}"),
             200,
@@ -1732,6 +1775,7 @@ impl JournalEvent {
 
     pub fn approval_decision(
         session_id: Option<&str>,
+        turn: Option<u32>,
         request_id: &str,
         tool_name: Option<&str>,
         approval_kind: Option<&str>,
@@ -1739,6 +1783,7 @@ impl JournalEvent {
         reason: Option<&str>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::ApprovalDecision, session_id);
+        evt.turn = turn;
         let summary_tool = tool_name.filter(|s| !s.is_empty()).unwrap_or("unknown");
         evt.user_input = Some(truncate(
             &format!("approval_decision {summary_tool} {request_id} {decision}"),
@@ -1758,11 +1803,13 @@ impl JournalEvent {
 
     pub fn approval_timeout(
         session_id: Option<&str>,
+        turn: Option<u32>,
         request_id: &str,
         tool_name: &str,
         approval_kind: &str,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::ApprovalTimeout, session_id);
+        evt.turn = turn;
         evt.error = Some(truncate(
             &format!("approval timeout for {tool_name} ({request_id})"),
             200,
@@ -2887,6 +2934,7 @@ mod approval_tests {
         writer
             .append(&JournalEvent::approval_decision(
                 Some("sess-approval"),
+                Some(7),
                 "req-1",
                 Some("write_file"),
                 Some("standard"),
@@ -2897,6 +2945,7 @@ mod approval_tests {
         writer
             .append(&JournalEvent::approval_decision(
                 Some("sess-approval"),
+                Some(9),
                 "req-2",
                 Some("bash"),
                 Some("explicit"),
@@ -2924,6 +2973,7 @@ mod approval_tests {
         writer
             .append(&JournalEvent::approval_required(
                 Some("sess-approval"),
+                Some(4),
                 "req-1",
                 "write_file",
                 "standard",
@@ -2933,6 +2983,32 @@ mod approval_tests {
 
         let found = find_latest_approval_decision("sess-approval", "req-1").unwrap();
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn find_latest_approval_required_reads_matching_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-approval").unwrap();
+
+        writer
+            .append(&JournalEvent::approval_required(
+                Some("sess-approval"),
+                Some(11),
+                "req-11",
+                "bash",
+                "explicit",
+                Some("cargo test"),
+            ))
+            .unwrap();
+
+        let found = find_latest_approval_required("sess-approval", "req-11")
+            .unwrap()
+            .expect("approval request");
+        assert_eq!(found.request_id, "req-11");
+        assert_eq!(found.turn, Some(11));
+        assert_eq!(found.tool_name.as_deref(), Some("bash"));
+        assert_eq!(found.approval_kind.as_deref(), Some("explicit"));
     }
 
     #[test]

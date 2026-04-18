@@ -7,7 +7,9 @@
 
 use super::*;
 
-use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
+use astra_services::session_journal::{
+    JournalEvent, JournalWriter, find_latest_approval_required, validate_session_id,
+};
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
@@ -101,6 +103,10 @@ pub(super) async fn post_approval_respond_handler(
             astra_thin_client::ApprovalKind::Standard => "standard",
             astra_thin_client::ApprovalKind::Explicit => "explicit",
         });
+        let approval_turn = find_latest_approval_required(session_id, &body.request_id)
+            .ok()
+            .flatten()
+            .and_then(|request| request.turn);
         let writer = JournalWriter::new(session_id).map_err(|error| {
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -110,6 +116,7 @@ pub(super) async fn post_approval_respond_handler(
         writer
             .append(&JournalEvent::approval_decision(
                 Some(session_id),
+                approval_turn,
                 &body.request_id,
                 body.tool_name.as_deref(),
                 approval_kind,

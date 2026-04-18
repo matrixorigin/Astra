@@ -2591,6 +2591,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     let approval_audit_context = ApprovalAuditContext {
                         user_id: user_id.clone(),
                         session_id: session_id.clone(),
+                        turn: turn_count_from_messages(&messages).max(1) as u32,
                         agent_id: agent_id.clone(),
                         parent_event_id: Some(user_query_event_id.clone()),
                         parent_event_ids: vec![user_query_event_id.clone()],

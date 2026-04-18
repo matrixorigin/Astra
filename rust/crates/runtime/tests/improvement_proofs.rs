@@ -6916,6 +6916,13 @@ mod turnguard_step_integration_proofs {
             has_cache_warning,
             "3+ cache hits should trigger duplication warning"
         );
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|msg| msg.contains("start_line/end_line") && msg.contains("outline=true")),
+            "read_file duplication should include targeted alternatives"
+        );
         assert!(verdict.severity >= VerdictSeverity::Warning);
     }
 
