@@ -50,6 +50,9 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_status",
     "git_diff",
     "git_log",
+    "git_file_history",
+    "git_contributors",
+    "git_log_search",
     "git_show",
     "git_blame",
     "symbols",
@@ -1938,6 +1941,9 @@ mod tests {
         assert!(names.contains(&"task_stop"));
         assert!(names.contains(&"mo_query"));
         assert!(names.contains(&"rollback_database_snapshots"));
+        assert!(names.contains(&"git_file_history"));
+        assert!(names.contains(&"git_contributors"));
+        assert!(names.contains(&"git_log_search"));
         assert!(names.contains(&"memory_retrieve"));
         assert!(names.contains(&"symbols"));
         assert!(names.contains(&"memory_store"));

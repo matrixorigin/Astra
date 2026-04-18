@@ -1240,6 +1240,17 @@ impl ServerToolExecutor {
             "git_status" => self.default_executor.execute("git_status", args).await,
             "git_diff" => self.default_executor.execute("git_diff", args).await,
             "git_log" => self.default_executor.execute("git_log", args).await,
+            "git_file_history" => {
+                self.default_executor
+                    .execute("git_file_history", args)
+                    .await
+            }
+            "git_contributors" => {
+                self.default_executor
+                    .execute("git_contributors", args)
+                    .await
+            }
+            "git_log_search" => self.default_executor.execute("git_log_search", args).await,
             "git_show" => self.default_executor.execute("git_show", args).await,
             "git_blame" => self.default_executor.execute("git_blame", args).await,
             "symbols" => self.default_executor.execute("symbols", args).await,
@@ -1261,7 +1272,8 @@ impl ServerToolExecutor {
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
+                     git_diff, git_log, git_file_history, git_contributors, git_log_search, git_show, git_blame, \
+                     symbols, git_commit, git_revert_commit, memory_*, web_search"
             )),
         };
 
@@ -3660,6 +3672,56 @@ esac
         // Request 999 — should be capped at 100
         let result = exec.execute("git_log", &json!({"n": 999})).await;
         assert!(result.contains("initial"));
+    }
+
+    #[tokio::test]
+    async fn git_helper_tools_are_available_in_server_mode() {
+        let (exec, dir) = test_executor();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial helper commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let file_history = exec
+            .execute("git_file_history", &json!({"file": "f.txt"}))
+            .await;
+        assert!(file_history.contains("File: f.txt"), "{file_history}");
+
+        let log_search = exec
+            .execute("git_log_search", &json!({"query": "helper"}))
+            .await;
+        assert!(
+            log_search.contains("Search:") || log_search.contains("initial helper commit"),
+            "{log_search}"
+        );
+
+        let contributors = exec.execute("git_contributors", &json!({})).await;
+        assert!(
+            contributors.contains("## Top Contributors"),
+            "{contributors}"
+        );
     }
 
     #[tokio::test]
