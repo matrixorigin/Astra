@@ -576,8 +576,13 @@ impl EventIngestionWorker {
         // Additionally, record last_event_sync_at to help diagnose future issues.
         let mut session_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
+        let mut session_users: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
         for event in events {
             *session_counts.entry(&event.session_id).or_default() += 1;
+            session_users
+                .entry(&event.session_id)
+                .or_insert(event.user_id.as_str());
         }
 
         // Log if duplicates were detected (useful for debugging)
@@ -593,15 +598,19 @@ impl EventIngestionWorker {
         // Always reconcile from actual row count to prevent drift from concurrent flushes.
         // This is more expensive than increment but guarantees accuracy.
         for session_id in session_counts.keys() {
-            sqlx::query(
-                "UPDATE agent_sessions SET \
-                 event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ?), \
-                 updated_at = NOW() \
-                 WHERE session_id = ?",
+            let user_id = session_users
+                .get(session_id)
+                .copied()
+                .ok_or_else(|| format!("missing user_id for session {session_id}"))?;
+            let event_count = crate::storage::load_agent_event_count(&mut *tx, session_id)
+                .await
+                .map_err(|e| format!("event_count load for {session_id}: {e}"))?;
+            crate::storage::upsert_agent_session_event_count(
+                &mut *tx,
+                session_id,
+                user_id,
+                event_count,
             )
-            .bind(*session_id)
-            .bind(*session_id)
-            .execute(&mut *tx)
             .await
             .map_err(|e| format!("event_count reconcile for {session_id}: {e}"))?;
         }
@@ -1387,8 +1396,16 @@ mod tests {
             "insert_batch must check rows_affected to detect INSERT IGNORE skips"
         );
         assert!(
-            source.contains("SELECT COUNT(*) FROM agent_events WHERE session_id"),
-            "insert_batch must reconcile event_count from actual row count on duplicate detection"
+            source.contains("load_agent_event_count"),
+            "insert_batch must load actual persisted agent_event counts before reconciling event_count"
+        );
+        assert!(
+            source.contains("upsert_agent_session_event_count"),
+            "insert_batch must reuse the shared agent_sessions upsert helper before reconciling event_count"
+        );
+        assert!(
+            source.contains("rows_affected()"),
+            "insert_batch must still preserve duplicate-detection logic while reconciling via the shared helper"
         );
     }
 

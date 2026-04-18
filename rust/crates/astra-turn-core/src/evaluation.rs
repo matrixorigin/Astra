@@ -25,7 +25,7 @@ pub enum EvalSignal {
     StallDetected,
     /// Budget pressure exceeded 0.8 (agent struggling to fit in budget).
     HighBudgetPressure,
-    /// Same tool called 3+ times — possible retry loop.
+    /// Same tool/target called 3+ times — possible retry loop.
     RepeatToolCall(String),
     /// TurnGuard issued a warning or higher verdict.
     VerdictWarning,
@@ -52,6 +52,7 @@ pub struct TurnEvaluation {
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
     pub name: String,
+    pub repeat_key: String,
     pub ok: bool,
     pub ms: u64,
     pub error: Option<String>,
@@ -130,13 +131,17 @@ pub fn evaluate_turn(
     }
 
     // ─── Repeat tool detection (retry loops) ────────────────────────────
-    let mut call_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut call_counts: std::collections::HashMap<&str, (&str, usize)> =
+        std::collections::HashMap::new();
     for tc in tool_calls {
-        *call_counts.entry(tc.name.as_str()).or_default() += 1;
+        let entry = call_counts
+            .entry(tc.repeat_key.as_str())
+            .or_insert((tc.name.as_str(), 0));
+        entry.1 += 1;
     }
-    for (name, count) in &call_counts {
+    for (name, count) in call_counts.values() {
         if *count >= 3 {
-            signals.push(EvalSignal::RepeatToolCall(name.to_string()));
+            signals.push(EvalSignal::RepeatToolCall((*name).to_string()));
             quality -= 0.15;
         }
     }
@@ -190,6 +195,13 @@ pub fn evaluate_tool_call_records(
         .filter(|record| !record.is_synthetic_placeholder())
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
+            repeat_key: record
+                .args_preview
+                .as_deref()
+                .map(str::trim)
+                .filter(|preview| !preview.is_empty())
+                .map(|preview| format!("{}::{preview}", record.name))
+                .unwrap_or_else(|| record.name.clone()),
             ok: record.ok,
             ms: record.ms,
             error: record.error.clone(),
@@ -292,6 +304,7 @@ mod tests {
     fn ok_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
+            repeat_key: name.to_string(),
             ok: true,
             ms: 100,
             error: None,
@@ -302,6 +315,7 @@ mod tests {
     fn err_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
+            repeat_key: name.to_string(),
             ok: false,
             ms: 50,
             error: Some("tool error".to_string()),
@@ -312,6 +326,7 @@ mod tests {
     fn empty_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
+            repeat_key: name.to_string(),
             ok: true,
             ms: 100,
             error: None,
@@ -627,6 +642,72 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, EvalSignal::RepeatToolCall(_))),
             "no RepeatToolCall signal should be emitted for synthetic placeholders, got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn repeat_tool_call_distinguishes_distinct_args_preview() {
+        use astra_services::session_journal::ToolCallRecord;
+
+        let record = |name: &str, args_preview: &str| ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ms: 20,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(120),
+            args_preview: Some(args_preview.to_string()),
+            result_preview: Some("ok".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+        };
+
+        let distinct_greps = vec![
+            record("grep", "/catch_tool_execution_panic/ in ."),
+            record("grep", "/CLOUD_APPROVAL_REQUIRED_TOOLS/ in ."),
+            record(
+                "grep",
+                "/struct ToolExecutionOutcome/ in rust/crates/astra-cli/src",
+            ),
+            record("grep", "/struct ToolExecutionOutcome/ in ."),
+        ];
+        let eval = evaluate_tool_call_records(
+            "review latest commit",
+            &["grep".to_string()],
+            &distinct_greps,
+            0,
+            false,
+            0.1,
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "grep")),
+            "distinct grep queries should not be treated as a retry loop: {:?}",
+            eval.signals
+        );
+
+        let repeated_git_show = vec![
+            record("git_show", "6f2f96e"),
+            record("git_show", "6f2f96e"),
+            record("git_show", "6f2f96e"),
+        ];
+        let eval = evaluate_tool_call_records(
+            "review latest commit",
+            &["git_show".to_string()],
+            &repeated_git_show,
+            0,
+            false,
+            0.1,
+        );
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
+            "identical git_show targets should still surface as repeat loops: {:?}",
             eval.signals
         );
     }

@@ -3,7 +3,7 @@ use crate::auth::session::SessionRecord;
 use astra_core::{ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error};
 use axum::{Json, http::StatusCode};
 use fs2::FileExt;
-use sqlx::{MySql, QueryBuilder, Row, query};
+use sqlx::{Executor, MySql, QueryBuilder, Row, query};
 use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
@@ -92,6 +92,47 @@ pub fn normalized_parent_event_ids(
     }
 
     out
+}
+
+pub async fn load_agent_event_count<'e, E>(
+    executor: E,
+    session_id: &str,
+) -> Result<i64, sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    let row = query("SELECT COUNT(*) AS event_count FROM agent_events WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(row.try_get::<i64, _>("event_count").unwrap_or(0))
+}
+
+pub async fn upsert_agent_session_event_count<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+    event_count: i64,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    query(
+        "INSERT INTO agent_sessions \
+         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at) \
+         VALUES (?, ?, 'active', ?, NOW(), NOW(), NOW()) \
+         ON DUPLICATE KEY UPDATE \
+         event_count = ?, \
+         updated_at = NOW(), \
+         last_active_at = NOW()",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(event_count)
+    .bind(event_count)
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 pub async fn insert_agent_event_edges<'e, E>(

@@ -44,6 +44,7 @@ $ARGUMENTS
 | `staged` | `git_diff(staged: true)` |
 | `branch:<name>` | `git_diff(ref: "main")` |
 | `commit:<sha>` | `git_show(sha)` |
+| `latest commit` / `review latest commit` | `git_log()` once to resolve the SHA, then `git_show(resolved_sha)` once |
 | `pr:<number>` | See PR workflow below |
 | GitHub PR URL | See PR workflow below |
 | Stat overview | `git_diff(stat_only: true)` first, then per-file |
@@ -58,7 +59,14 @@ $ARGUMENTS
 
 No changes? Check `git_status`, try `staged: true`. Still nothing? Ask user.
 
-### 1.2 Strategy Router
+### 1.2 Reuse gathered evidence
+
+- For `latest commit`, resolve the SHA once and reuse that same commit diff for the rest of the review.
+- **Do not call `git_show` on the same commit more than once** unless you truly need a different object than the full diff you already fetched.
+- When searching changed symbols, prefer one decisive `grep` over a scoped `grep` followed by the same repo-wide `grep`.
+- Once the diff already identified the file to inspect, prefer `read_file` for local context instead of re-reading the whole commit diff.
+
+### 1.3 Strategy Router
 
 After reading the diff, route based on **signals** in the diff:
 

@@ -41,7 +41,7 @@ fn runtime_promotion_record_from_row(
 }
 
 /// `SUBSTRING(..., 1, N)` caps for `agent_events.content` to avoid full LONGTEXT reads.
-/// JSON columns (`metadata`, `token_usage`) are left intact so parsing stays valid.
+/// JSON columns are cast to `CHAR` at the SQL edge so MatrixOne returns parseable text.
 mod agent_events_content_cap {
     pub const TURN_LIST_PREVIEW: u32 = 200;
     pub const TURN_DETAIL_CHILD: u32 = 65_536;
@@ -1048,7 +1048,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let turn_sql = format!(
             "SELECT event_id, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-             token_usage, llm_model_used, metadata, created_at \
+             CAST(token_usage AS CHAR) AS token_usage, llm_model_used, \
+             CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
              ORDER BY created_at ASC \
@@ -1140,7 +1141,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // This avoids fetching the full event content for every turn in the session.
         let offset = turn.saturating_sub(1);
         let row = query(
-            "SELECT event_id, content, token_usage, llm_model_used, metadata, created_at \
+            "SELECT event_id, content, CAST(token_usage AS CHAR) AS token_usage, \
+             llm_model_used, CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
              ORDER BY created_at ASC \
@@ -1181,7 +1183,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let child_sql = format!(
             "SELECT event_id, event_type, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-             metadata, created_at \
+             CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND parent_event_id = ? \
              ORDER BY created_at ASC",
@@ -1364,7 +1366,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let list_err_sql = format!(
             "SELECT event_id, event_type, \
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-             metadata, created_at \
+             CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? \
                AND event_type IN ('turn_error', 'stall_detected', 'error', 'turn_guard_verdict', 'tool_error') \

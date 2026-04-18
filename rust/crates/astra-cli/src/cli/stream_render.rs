@@ -29,7 +29,7 @@ use std::time::Instant;
 // CLI formatting utilities
 use super::cli_formatting::{
     colorize_diff_summary, extract_cli_diff_block, format_byte_size, format_duration_suffix,
-    shorten_path, truncate_line,
+    github_repo_display, shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -3147,32 +3147,20 @@ impl StreamRenderState {
             "github_get_pr" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 let num = args.get("pr_number").and_then(Value::as_u64).unwrap_or(0);
                 format!("Getting PR: {repo_display}#{num}")
             }
             "github_list_prs" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 format!("Listing PRs: {repo_display}")
             }
             "github_get_issue" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 let num = args
                     .get("issue_number")
                     .and_then(Value::as_u64)
@@ -3182,31 +3170,19 @@ impl StreamRenderState {
             "github_list_issues" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 format!("Listing issues: {repo_display}")
             }
             "github_repo_stats" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 format!("GitHub stats: {repo_display}")
             }
             "github_ci_status" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 format!("GitHub CI: {repo_display}")
             }
             "get_agent_info" => {
@@ -3490,11 +3466,7 @@ impl StreamRenderState {
             "github_create_issue" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 let title = args.get("title").and_then(Value::as_str).unwrap_or("");
                 format!(
                     "Creating issue: {} \"{}\"",
@@ -3990,11 +3962,7 @@ impl StreamRenderState {
             "github_get_pr" | "github_get_issue" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 let number = args
                     .get("number")
                     .or_else(|| args.get("pr_number"))
@@ -4008,20 +3976,12 @@ impl StreamRenderState {
             "github_list_prs" | "github_list_issues" | "github_repo_stats" | "github_ci_status" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                Some(match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                })
+                Some(github_repo_display(owner, repo).unwrap_or_default())
             }
             "github_create_issue" => {
                 let owner = args.get("owner").and_then(Value::as_str);
                 let repo = args.get("repo").and_then(Value::as_str);
-                let repo_display = match (owner, repo) {
-                    (Some(owner), Some(repo)) if !repo.contains('/') => format!("{owner}/{repo}"),
-                    (_, Some(repo)) => repo.to_string(),
-                    _ => String::new(),
-                };
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
                 let title = args.get("title").and_then(Value::as_str);
                 match title {
                     Some(title) => Some(format!(
@@ -4903,7 +4863,7 @@ where
                 ),
                 tool_result_fields: None,
             },
-            0,
+            t0.elapsed().as_millis() as u64,
         ),
     }
 }
@@ -6261,10 +6221,11 @@ mod tests {
     #[tokio::test]
     async fn catch_tool_execution_panic_reports_error_output() {
         let (outcome, duration_ms) = catch_tool_execution_panic(async {
+            std::thread::sleep(std::time::Duration::from_millis(10));
             panic!("boom");
         })
         .await;
-        assert_eq!(duration_ms, 0);
+        assert!(duration_ms >= 10);
         assert!(outcome.output.contains("Tool execution panicked: boom"));
         assert!(outcome.tool_result_fields.is_none());
     }

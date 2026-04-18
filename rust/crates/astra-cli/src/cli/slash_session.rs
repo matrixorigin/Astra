@@ -4408,6 +4408,117 @@ fn combine_resume_guidance(
     }
 }
 
+fn build_step_resume_guidance(
+    interruption: Option<&serde_json::Value>,
+    compaction_state: Option<&serde_json::Value>,
+) -> Option<String> {
+    let compaction_ctx =
+        compaction_state.map(
+            |cs| astra_runtime::turn::interruption::CompactionResumeContext {
+                compaction_attempts: cs
+                    .get("attempt_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                total_tokens_freed: cs
+                    .get("cumulative_tokens_freed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                last_was_insufficient: cs
+                    .get("last_was_insufficient")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            },
+        );
+    interruption.and_then(|irj| {
+        astra_runtime::turn::interruption::build_resume_guidance_with_context(
+            irj,
+            compaction_ctx.as_ref(),
+        )
+    })
+}
+
+fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut last_user = String::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        match role {
+            "user" => last_user = content.to_string(),
+            "assistant" if !last_user.is_empty() => {
+                pairs.push((last_user.clone(), content.to_string()));
+                last_user.clear();
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+fn apply_heavy_state_fallback(
+    state: &mut ReplState,
+    blocked_tools: &[String],
+    recent_tools: &[String],
+    messages: &[serde_json::Value],
+    approval_overrides: Option<&serde_json::Value>,
+) {
+    for tool in blocked_tools {
+        if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
+            state
+                .tool_health_entries
+                .push(astra_runtime::pipeline::persistence::ToolHealthEntry {
+                    name: tool.clone(),
+                    total_calls: 3,
+                    total_failures: 3,
+                    failure_rate: 1.0,
+                    last_updated_epoch: 0,
+                });
+        }
+    }
+    if let Some(ao_json) = approval_overrides {
+        state.perm_manager.merge_restored_overrides(ao_json);
+    }
+    if state.recent_tools.is_empty() {
+        state.recent_tools = recent_tools.to_vec();
+    }
+    if state.history.is_empty() {
+        let pairs = history_pairs_from_messages(messages);
+        if !pairs.is_empty() {
+            state.history = pairs;
+        }
+    }
+}
+
+fn apply_heavy_checkpoint_fallback(
+    state: &mut ReplState,
+    heavy: &astra_runtime::pipeline::step_protocol::HeavyCheckpoint,
+) {
+    apply_heavy_state_fallback(
+        state,
+        &heavy.blocked_tools,
+        &heavy.recent_tools,
+        &heavy.messages,
+        heavy.approval_overrides.as_ref(),
+    );
+}
+
+fn apply_restored_cloud_heavy_state(state: &mut ReplState, restored: &RestoredSession) {
+    apply_heavy_state_fallback(
+        state,
+        &restored.blocked_tools,
+        &restored.recent_tools,
+        &restored.conversation_messages,
+        restored.approval_overrides.as_ref(),
+    );
+}
+
+fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
+    let history = repl_runtime::restore_history_from_journal(session_id);
+    if !history.is_empty() || state.history.is_empty() {
+        state.history = history;
+    }
+}
+
 async fn apply_restored_session(
     profile: Option<&str>,
     state: &mut ReplState,
@@ -4427,7 +4538,7 @@ async fn apply_restored_session(
     state.turn = restored.turn_count;
     state.total_prompt_tokens = restored.total_tokens_in;
     state.total_completion_tokens = restored.total_tokens_out;
-    state.recent_tools = restored.recent_tools;
+    state.recent_tools = restored.recent_tools.clone();
 
     apply_restored_workspace_state(state, &restored.session_id);
 
@@ -4451,28 +4562,10 @@ async fn apply_restored_session(
         if state.recent_tools.is_empty() {
             state.recent_tools = step_restored.recent_tools;
         }
-        let step_guidance = step_restored.interruption.as_ref().and_then(|irj| {
-            let compaction_ctx = step_restored.compaction_state.as_ref().map(|cs| {
-                astra_runtime::turn::interruption::CompactionResumeContext {
-                    compaction_attempts: cs
-                        .get("attempt_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32,
-                    total_tokens_freed: cs
-                        .get("cumulative_tokens_freed")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    last_was_insufficient: cs
-                        .get("last_was_insufficient")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                }
-            });
-            astra_runtime::turn::interruption::build_resume_guidance_with_context(
-                irj,
-                compaction_ctx.as_ref(),
-            )
-        });
+        let step_guidance = build_step_resume_guidance(
+            step_restored.interruption.as_ref(),
+            step_restored.compaction_state.as_ref(),
+        );
         state.resume_guidance = combine_resume_guidance(
             step_guidance,
             build_session_memory_resume_guidance(&restored.session_id),
@@ -4484,13 +4577,29 @@ async fn apply_restored_session(
     } else if let Ok(Some(heavy)) =
         astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(&restored.session_id)
     {
-        if state.recent_tools.is_empty() {
-            state.recent_tools = heavy.recent_tools;
-        }
+        apply_heavy_checkpoint_fallback(state, &heavy);
         state.resume_guidance = combine_resume_guidance(
-            None,
+            build_step_resume_guidance(
+                heavy.interruption.as_ref(),
+                heavy.compaction_state.as_ref(),
+            ),
             build_session_memory_resume_guidance(&restored.session_id),
         );
+    } else if !restored.conversation_messages.is_empty()
+        || !restored.blocked_tools.is_empty()
+        || restored.approval_overrides.is_some()
+        || restored.interruption.is_some()
+        || restored.compaction_state.is_some()
+    {
+        apply_restored_cloud_heavy_state(state, &restored);
+        state.resume_guidance = combine_resume_guidance(
+            build_step_resume_guidance(
+                restored.interruption.as_ref(),
+                restored.compaction_state.as_ref(),
+            ),
+            build_session_memory_resume_guidance(&restored.session_id),
+        );
+        eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
     } else if let Some(ref mc) = state.matrix_runtime {
         let pool = mc.shared_pool().get();
         match astra_services::session_restore::pull_step_checkpoint_from_cloud(
@@ -4500,59 +4609,31 @@ async fn apply_restored_session(
         .await
         {
             Ok(Some(state_json)) => {
-                match serde_json::from_str::<astra_runtime::pipeline::step_protocol::StepCheckpoint>(
+                match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
                     &state_json,
                 ) {
-                    Ok(astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) => {
-                        for tool in &heavy.blocked_tools {
-                            if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
-                                state.tool_health_entries.push(
-                                    astra_runtime::pipeline::persistence::ToolHealthEntry {
-                                        name: tool.clone(),
-                                        total_calls: 3,
-                                        total_failures: 3,
-                                        failure_rate: 1.0,
-                                        last_updated_epoch: 0,
-                                    },
-                                );
-                            }
-                        }
-                        if state.recent_tools.is_empty() {
-                            state.recent_tools = heavy.recent_tools;
-                        }
-                        if state.history.is_empty() && !heavy.messages.is_empty() {
-                            let mut pairs = Vec::new();
-                            let mut last_user = String::new();
-                            for msg in &heavy.messages {
-                                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                                let content =
-                                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                                match role {
-                                    "user" => last_user = content.to_string(),
-                                    "assistant" if !last_user.is_empty() => {
-                                        pairs.push((last_user.clone(), content.to_string()));
-                                        last_user.clear();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if !pairs.is_empty() {
-                                state.history = pairs;
-                            }
-                        }
+                    Some(heavy) => {
+                        apply_heavy_state_fallback(
+                            state,
+                            &heavy.blocked_tools,
+                            &heavy.recent_tools,
+                            &heavy.messages,
+                            heavy.approval_overrides.as_ref(),
+                        );
                         state.resume_guidance = combine_resume_guidance(
-                            None,
+                            build_step_resume_guidance(
+                                heavy.interruption.as_ref(),
+                                heavy.compaction_state.as_ref(),
+                            ),
                             build_session_memory_resume_guidance(&restored.session_id),
                         );
                         eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
                     }
-                    Ok(_) => {}
-                    Err(e) => {
+                    None => {
                         eprintln!(
                             "  {} Cloud checkpoint corrupted, skipping",
                             theme::icon_warn()
                         );
-                        eprintln!("{}", format!("     ({e})").dim());
                     }
                 }
             }
@@ -4591,7 +4672,7 @@ async fn apply_restored_session(
         state.learning_snapshot = Some(learning_json.clone());
     }
 
-    state.history = repl_runtime::restore_history_from_journal(&restored.session_id);
+    restore_journal_history_if_available(state, &restored.session_id);
 
     if let Ok(events) = session_journal::read_journal(&restored.session_id) {
         state.last_turn_event = events
@@ -5249,6 +5330,85 @@ mod resume_tests {
             },
         );
         crate::cli_utils::save_credentials(&creds).unwrap();
+    }
+
+    #[test]
+    fn apply_heavy_checkpoint_fallback_restores_history_and_approval_overrides() {
+        use astra_runtime::turn::approval_fingerprint::{
+            ApprovalFingerprint, FingerprintedOverrides,
+        };
+
+        let mut state = ReplState::default();
+        let mut overrides = FingerprintedOverrides::default();
+        overrides.insert(
+            ApprovalFingerprint::shell("bash", "git commit -m 'wip'", false),
+            true,
+        );
+        let approval_json = overrides.to_json().expect("non-empty overrides");
+
+        let mut heavy = match astra_runtime::pipeline::step_protocol::StepCheckpoint::heavy(
+            "step-1".into(),
+            "task-1".into(),
+            "agent-1".into(),
+            Default::default(),
+        ) {
+            astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(heavy) => *heavy,
+            _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
+        };
+        heavy.messages = vec![
+            serde_json::json!({"role": "user", "content": "continue"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        heavy.recent_tools = vec!["rg".into()];
+        heavy.blocked_tools = vec!["bash".into()];
+        heavy.approval_overrides = Some(approval_json.clone());
+
+        apply_heavy_checkpoint_fallback(&mut state, &heavy);
+
+        assert_eq!(
+            state.history,
+            vec![("continue".to_string(), "done".to_string())]
+        );
+        assert_eq!(state.recent_tools, vec!["rg".to_string()]);
+        assert!(
+            state
+                .tool_health_entries
+                .iter()
+                .any(|entry| entry.name == "bash")
+        );
+        let exported = state
+            .perm_manager
+            .export_session_overrides()
+            .expect("restored approval overrides");
+        assert_eq!(serde_json::to_value(exported).unwrap(), approval_json);
+    }
+
+    #[test]
+    fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let mut state = ReplState::default();
+        state.history = vec![("from-cloud".to_string(), "still-here".to_string())];
+
+        restore_journal_history_if_available(&mut state, "missing-session");
+
+        assert_eq!(
+            state.history,
+            vec![("from-cloud".to_string(), "still-here".to_string())]
+        );
+    }
+
+    #[test]
+    fn restore_journal_history_if_available_prefers_local_history_when_present() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-history-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 1);
+
+        let mut state = ReplState::default();
+        state.history = vec![("from-cloud".to_string(), "old".to_string())];
+
+        restore_journal_history_if_available(&mut state, &session_id);
+
+        assert_eq!(state.history, vec![("continue".into(), "restored".into())]);
     }
 
     #[tokio::test]

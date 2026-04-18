@@ -7,6 +7,8 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 use std::borrow::Cow;
 
+pub use astra_text_utils::str_preview::{github_repo_display, shorten_path};
+
 /// Unified diff for CLI summaries: `str_replace` / `multi_edit` sentinels, or `write_file` JSON field.
 pub fn extract_cli_diff_block(output: &str) -> Option<Cow<'_, str>> {
     let start_marker = "<<<ASTRA_UNIFIED_DIFF>>>";
@@ -132,32 +134,6 @@ pub fn truncate_line(s: &str, max_chars: usize) -> String {
         let truncated: String = line.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{truncated}…")
     }
-}
-
-/// Shorten a path by keeping the filename and truncating dir prefix with "...".
-pub fn shorten_path(path: &str, max_chars: usize) -> String {
-    if path.chars().count() <= max_chars {
-        return path.to_string();
-    }
-    // Keep the filename (last component)
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.is_empty() {
-        return truncate_line(path, max_chars);
-    }
-    let filename = parts.last().unwrap_or(&"");
-    if filename.chars().count() >= max_chars.saturating_sub(4) {
-        // Filename itself is too long, just truncate
-        return truncate_line(filename, max_chars);
-    }
-    // Try to keep one parent dir
-    if parts.len() >= 2 {
-        let parent = parts[parts.len() - 2];
-        let short = format!(".../{parent}/{filename}");
-        if short.chars().count() <= max_chars {
-            return short;
-        }
-    }
-    format!(".../{filename}")
 }
 
 /// Simple syntax highlighting for code preview.

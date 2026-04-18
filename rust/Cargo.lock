@@ -144,6 +144,7 @@ dependencies = [
  "astra-core",
  "astra-runtime",
  "astra-services",
+ "astra-text-utils",
  "astra-thin-client",
  "astra-tools",
  "async-trait",

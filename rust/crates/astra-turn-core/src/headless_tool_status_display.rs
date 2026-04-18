@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value};
 
-use astra_text_utils::str_preview::truncate_str;
+use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_str};
 
 #[derive(Debug, Clone, Copy)]
 enum ToolCat {
@@ -16,32 +16,6 @@ enum ToolCat {
     Memory,
     Utility,
     Other,
-}
-
-fn shorten_path(path: &str, max_chars: usize) -> String {
-    if path.chars().count() <= max_chars {
-        return path.to_string();
-    }
-
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.is_empty() {
-        return truncate_str(path, max_chars);
-    }
-
-    let filename = parts.last().copied().unwrap_or("");
-    if filename.chars().count() >= max_chars.saturating_sub(4) {
-        return truncate_str(filename, max_chars);
-    }
-
-    if parts.len() >= 2 {
-        let parent = parts[parts.len() - 2];
-        let short = format!(".../{parent}/{filename}");
-        if short.chars().count() <= max_chars {
-            return short;
-        }
-    }
-
-    format!(".../{filename}")
 }
 
 fn format_path_location(
@@ -119,11 +93,7 @@ fn categorize(name: &str) -> ToolCat {
 fn fmt_github_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
     let owner = obj.get("owner").and_then(|v| v.as_str());
     let repo = obj.get("repo").and_then(|v| v.as_str());
-    let repo_display = match (owner, repo) {
-        (Some(owner), Some(repo)) if !repo.contains('/') => Some(format!("{owner}/{repo}")),
-        (_, Some(repo)) => Some(repo.to_string()),
-        _ => None,
-    };
+    let repo_display = github_repo_display(owner, repo);
     let number = obj
         .get("number")
         .or_else(|| obj.get("pr_number"))

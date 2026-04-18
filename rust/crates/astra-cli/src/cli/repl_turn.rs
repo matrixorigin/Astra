@@ -1031,7 +1031,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                     let user_id_owned = user_id.to_string();
                     let cp_clone = cp.clone();
                     let cp_number = cp.number;
-                    tokio::spawn(async move {
+                    mc.spawn_session_sync_task(async move {
                         if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
                             &pool,
                             &sid_owned,
@@ -1091,7 +1091,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                         )
                     }
                 };
-                tokio::spawn(async move {
+                mc.spawn_session_sync_task(async move {
                     if let Err(e) = astra_services::session_restore::push_step_checkpoint_to_cloud(
                         &pool,
                         &sid_owned,
@@ -1121,14 +1121,21 @@ fn commit_turn_journal_workspace_and_sidecars(
                 let sid_owned = sid.to_string();
                 let user_id_owned = user_id.to_string();
                 let trace_signal = trace_signal.clone();
-                tokio::spawn(async move {
-                    let _ = astra_services::session_restore::push_context_trace_signal_to_cloud(
-                        &pool,
-                        &sid_owned,
-                        &user_id_owned,
-                        &trace_signal,
-                    )
-                    .await;
+                mc.spawn_session_sync_task(async move {
+                    if let Err(e) =
+                        astra_services::session_restore::push_context_trace_signal_to_cloud(
+                            &pool,
+                            &sid_owned,
+                            &user_id_owned,
+                            &trace_signal,
+                        )
+                        .await
+                    {
+                        astra_core::agent_warn!(
+                            "context_trace_sync",
+                            "failed to push context trace signal to cloud for session {sid_owned}: {e}"
+                        );
+                    }
                 });
             }
 
@@ -1141,20 +1148,40 @@ fn commit_turn_journal_workspace_and_sidecars(
             {
                 let pool = mc.shared_pool().get().clone();
                 let sid_owned = sid.to_string();
+                let user_id = state
+                    .ingestion_user_id
+                    .as_deref()
+                    .unwrap_or("anonymous")
+                    .to_string();
                 let plan_json = ws.executing_plan_json.clone();
                 let goal = ws.plan_goal.clone();
                 let config = ws.plan_config_json.clone();
                 let rounds = ws.plan_execution_rounds;
-                tokio::spawn(async move {
-                    let _ = astra_services::session_restore::push_session_state_to_cloud(
+                let git_branch = ws.git_branch.clone();
+                let model = if ws.model.is_empty() {
+                    None
+                } else {
+                    Some(ws.model.clone())
+                };
+                mc.spawn_session_sync_task(async move {
+                    if let Err(e) = astra_services::session_restore::push_session_state_to_cloud(
                         &pool,
                         &sid_owned,
+                        &user_id,
                         plan_json.as_deref(),
                         goal.as_deref(),
                         config.as_deref(),
                         rounds,
+                        git_branch.as_deref(),
+                        model.as_deref(),
                     )
-                    .await;
+                    .await
+                    {
+                        astra_core::agent_warn!(
+                            "session_state_sync",
+                            "failed to push session state to cloud for session {sid_owned}: {e}"
+                        );
+                    }
                 });
             }
 
@@ -2150,7 +2177,7 @@ fn spawn_manual_checkpoint_cloud_uploads(
     let pool = mc.shared_pool().get().clone();
     let sid_owned = sid.to_string();
     let cp_clone = session_cp.clone();
-    tokio::spawn(async move {
+    mc.spawn_session_sync_task(async move {
         if let Err(e) = astra_services::session_restore::push_checkpoint_to_cloud(
             &pool, &sid_owned, &user_id, &cp_clone,
         )
@@ -2166,7 +2193,7 @@ fn spawn_manual_checkpoint_cloud_uploads(
     let state_json = serde_json::to_string(step_cp).unwrap_or_default();
     let tools_json =
         serde_json::to_string(&state.recent_tools).unwrap_or_else(|_| "[]".to_string());
-    tokio::spawn(async move {
+    mc.spawn_session_sync_task(async move {
         if let Err(e) = astra_services::session_restore::push_step_checkpoint_to_cloud(
             &pool2,
             &sid_step,

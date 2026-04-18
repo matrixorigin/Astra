@@ -9,6 +9,7 @@ use astra_core::{
 };
 
 use crate::pagination::clamp_api_list_pagination;
+use crate::storage::{load_agent_event_count, upsert_agent_session_event_count};
 
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 
@@ -308,18 +309,14 @@ impl EventService for DatabaseEventService {
 
         // BUG FIX (Session 7875e355 diagnostic): Use COUNT(*) reconcile instead of
         // increment to prevent drift from concurrent requests or duplicate detection.
-        // This matches the fix in event_ingestion.rs flush_batch().
-        query(
-            "UPDATE agent_sessions SET \
-             event_count = (SELECT COUNT(*) FROM agent_events WHERE session_id = ?), \
-             updated_at = NOW() \
-             WHERE session_id = ?",
-        )
-        .bind(&session_id)
-        .bind(&session_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal_error)?;
+        // MatrixOne rejects the earlier subquery-in-upsert form, so count first and
+        // then upsert with bound values.
+        let event_count = load_agent_event_count(&mut *tx, &session_id)
+            .await
+            .map_err(internal_error)?;
+        upsert_agent_session_event_count(&mut *tx, &session_id, &user_id, event_count)
+            .await
+            .map_err(internal_error)?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ?",
@@ -844,6 +841,19 @@ mod tests {
         let resp = EventListResponse::from(record);
         assert_eq!(resp.events.len(), 1);
         assert_eq!(resp.total, 42);
+    }
+
+    #[test]
+    fn create_event_upserts_agent_session_count() {
+        let source = include_str!("events.rs");
+        assert!(
+            source.contains("load_agent_event_count"),
+            "create event flow should count actual persisted agent_events before reconciling event_count"
+        );
+        assert!(
+            source.contains("upsert_agent_session_event_count"),
+            "create event flow should reuse the shared agent_sessions upsert helper when reconciling event_count"
+        );
     }
 
     // --- query deserialization defaults ---

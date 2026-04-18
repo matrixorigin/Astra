@@ -116,15 +116,15 @@ pub(crate) fn sync_log_retain_limit(status: &str) -> Option<usize> {
 /// Exposed for checkpoint sync to reuse the same pruning policy.
 pub(crate) fn build_sync_log_prune_query() -> &'static str {
     "DELETE FROM session_sync_log \
-     WHERE user_id = ? AND status = ? \
+     WHERE user_id = ? AND status = ? AND sync_type = ? \
        AND sync_id NOT IN ( \
-           SELECT sync_id FROM ( \
-               SELECT sync_id FROM session_sync_log \
-               WHERE user_id = ? AND status = ? \
-               ORDER BY created_at DESC \
-               LIMIT ? \
-           ) AS keepers \
-       )"
+            SELECT sync_id FROM ( \
+                SELECT sync_id FROM session_sync_log \
+                WHERE user_id = ? AND status = ? AND sync_type = ? \
+                ORDER BY created_at DESC \
+                LIMIT ? \
+            ) AS keepers \
+        )"
 }
 
 // ─── Sync Types ─────────────────────────────────────────────────────────────
@@ -543,16 +543,19 @@ impl MatrixOneSyncService {
         if inserted.is_ok()
             && let Some(retain) = sync_log_retain_limit(status)
         {
-            self.prune_sync_logs(user_id, status, retain).await;
+            self.prune_sync_logs(user_id, sync_type, status, retain)
+                .await;
         }
     }
 
-    async fn prune_sync_logs(&self, user_id: &str, status: &str, retain: usize) {
+    async fn prune_sync_logs(&self, user_id: &str, sync_type: &str, status: &str, retain: usize) {
         let _ = sqlx::query(build_sync_log_prune_query())
             .bind(user_id)
             .bind(status)
+            .bind(sync_type)
             .bind(user_id)
             .bind(status)
+            .bind(sync_type)
             .bind(retain as i64)
             .execute(&self.pool)
             .await;
@@ -1529,11 +1532,11 @@ mod tests {
     }
 
     #[test]
-    fn prune_query_keeps_latest_rows_for_user_and_status() {
+    fn prune_query_keeps_latest_rows_for_user_status_and_sync_type() {
         let query = build_sync_log_prune_query();
 
         assert!(query.contains("DELETE FROM session_sync_log"));
-        assert!(query.contains("WHERE user_id = ? AND status = ?"));
+        assert!(query.contains("WHERE user_id = ? AND status = ? AND sync_type = ?"));
         assert!(query.contains("SELECT sync_id FROM session_sync_log"));
         assert!(query.contains("ORDER BY created_at DESC"));
         assert!(query.contains("LIMIT ?"));

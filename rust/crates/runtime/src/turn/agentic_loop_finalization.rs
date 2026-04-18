@@ -51,10 +51,13 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     }
     if collector.has_data() {
         // Defer journal write to turn-commit path to prevent ghost assemblies.
-        // Store the trace data so the caller can emit `context_assembly_recorded`
-        // only when the turn actually commits (not on aborts/retries).
-        state.telemetry.pending_context_assembly_trace =
-            Some((session_turn, trace.to_json_value()));
+        // Store only the first trace for this outer turn so the journal records
+        // the initial context assembly, not a later internal iteration after
+        // tool-call messages have already been appended.
+        if state.telemetry.pending_context_assembly_trace.is_none() {
+            state.telemetry.pending_context_assembly_trace =
+                Some((session_turn, trace.to_json_value()));
+        }
     }
     persist_latest_context_trace_signal(state).await;
 }
@@ -686,6 +689,59 @@ mod tests {
             .expect("pending_context_assembly_trace should be set");
         assert_eq!(*turn_num, 3);
         assert_eq!(trace_json["turn_id"], "turn-3");
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_trace_preserves_first_pending_trace_within_outer_turn() {
+        let mut state = make_state();
+        state.max_turns = 40;
+        state.remaining_turns = 39; // outer turn 1
+        state.current_session_id = Some("s1".to_string());
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(12_000);
+
+        let first = crate::turn::turn_trace_collector::TurnTraceCollector::new(
+            "turn-0".to_string(),
+            "s1".to_string(),
+        );
+        first.set_history_retained(&[]);
+        first.record_token_budget_estimate(5_000, 0, 0, 2_000, 100, 7_100, 100_000, 0.071);
+        state.telemetry.turn_trace_collector = Some(first);
+        finalize_turn_trace(&mut state).await;
+
+        let first_pending = state
+            .telemetry
+            .pending_context_assembly_trace
+            .clone()
+            .expect("first pending trace should be set");
+        assert_eq!(first_pending.0, 1);
+        assert_eq!(first_pending.1["history"]["total_turns_available"], 0);
+        assert_eq!(
+            first_pending.1["history"]["turns_retained"]
+                .as_array()
+                .expect("turns_retained should be an array")
+                .len(),
+            0
+        );
+
+        let second = crate::turn::turn_trace_collector::TurnTraceCollector::new(
+            "turn-1".to_string(),
+            "s1".to_string(),
+        );
+        second.set_history_retained(&[crate::turn::context_assembly_trace::TurnRetention {
+            turn_index: 0,
+            role: "assistant".to_string(),
+            tokens: 123,
+            has_tool_calls: true,
+        }]);
+        second.record_token_budget_estimate(5_000, 123, 0, 2_000, 100, 7_223, 100_000, 0.07223);
+        state.telemetry.turn_trace_collector = Some(second);
+        finalize_turn_trace(&mut state).await;
+
+        assert_eq!(
+            state.telemetry.pending_context_assembly_trace,
+            Some(first_pending)
+        );
     }
 
     #[tokio::test]

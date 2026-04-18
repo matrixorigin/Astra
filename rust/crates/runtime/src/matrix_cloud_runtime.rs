@@ -3,9 +3,11 @@
 //! [`AppState`] and by the CLI [`ReplState`] as a single `Arc` attachment.
 
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinSet;
 
 use astra_core::{MatrixOneSettings, SharedPool, resolve_database_name};
 use astra_services::{
@@ -51,6 +53,10 @@ pub struct MatrixCloudRuntime {
     ingestion_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Notify-based shutdown signal — works even when cloned senders are still alive.
     ingestion_shutdown: astra_services::event_ingestion::IngestionShutdownHandle,
+    /// Session/cloud sync tasks spawned from the CLI (checkpoint, session-state,
+    /// context-trace pushes). Awaited on graceful shutdown so short sessions do not
+    /// silently lose the final cloud sidecars.
+    session_sync_tasks: Mutex<JoinSet<()>>,
     /// Live ingestion stats (events_received, events_flushed, errors).
     ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
     sync_orchestrator: TokioMutex<SyncOrchestrator>,
@@ -135,6 +141,7 @@ impl MatrixCloudRuntime {
             ingestion: Mutex::new(Some(sender)),
             ingestion_handle: Mutex::new(Some(ingestion_jh)),
             ingestion_shutdown,
+            session_sync_tasks: Mutex::new(JoinSet::new()),
             ingestion_stats,
             sync_orchestrator: TokioMutex::new(orch),
             preference_store,
@@ -204,6 +211,26 @@ impl MatrixCloudRuntime {
         self.ingestion.lock().ok()?.as_ref().cloned()
     }
 
+    /// Spawn a session/cloud sync sidecar task and track it for graceful shutdown.
+    pub fn spawn_session_sync_task<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if let Ok(mut tasks) = self.session_sync_tasks.lock() {
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(error) = result {
+                    astra_core::agent_warn!(
+                        "session_sync",
+                        "session sync task join failed: {error}"
+                    );
+                }
+            }
+            tasks.spawn(task);
+        } else {
+            tokio::spawn(task);
+        }
+    }
+
     /// Expand a journal event and enqueue for async DB flush (no-op if ingestion shut down).
     pub fn enqueue_journal_events(&self, user_id: &str, event: &JournalEvent) {
         let Ok(guard) = self.ingestion.lock() else {
@@ -218,8 +245,7 @@ impl MatrixCloudRuntime {
     }
 
     /// Flush and stop the ingestion worker, then **wait** for the background
-    /// worker to drain its buffer and exit. Use this on graceful exit paths
-    /// to ensure short sessions don't lose their final events.
+    /// worker plus tracked session/cloud sync tasks to drain before process exit.
     pub async fn shutdown_ingestion_and_wait(&self) {
         // Signal the worker to exit via Notify — works even when cloned senders
         // are still alive (the channel-close approach fails in that case).
@@ -240,6 +266,35 @@ impl MatrixCloudRuntime {
                     astra_core::agent_warn!(
                         "ingestion",
                         "worker flush timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}, some events may be lost"
+                    );
+                }
+            }
+        }
+
+        let mut session_sync_tasks = self
+            .session_sync_tasks
+            .lock()
+            .ok()
+            .map(|mut tasks| std::mem::take(&mut *tasks))
+            .unwrap_or_default();
+        if !session_sync_tasks.is_empty() {
+            match tokio::time::timeout(INGESTION_SHUTDOWN_TIMEOUT, async {
+                while let Some(result) = session_sync_tasks.join_next().await {
+                    if let Err(error) = result {
+                        astra_core::agent_warn!(
+                            "session_sync",
+                            "session sync task join failed: {error}"
+                        );
+                    }
+                }
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(_) => {
+                    astra_core::agent_warn!(
+                        "session_sync",
+                        "session sync drain timed out after {INGESTION_SHUTDOWN_TIMEOUT:?}, some sync sidecars may be lost"
                     );
                 }
             }
@@ -336,5 +391,35 @@ mod tests {
         assert!(domains.contains(&SyncDomain::Templates));
         assert!(domains.contains(&SyncDomain::Preferences));
         assert!(domains.contains(&SyncDomain::Tasks));
+    }
+
+    #[test]
+    fn matrix_runtime_tracks_session_sync_tasks() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("session_sync_tasks: Mutex<JoinSet<()>>"),
+            "MatrixCloudRuntime should keep a tracked JoinSet for session sync sidecars"
+        );
+        assert!(
+            source.contains("pub fn spawn_session_sync_task"),
+            "MatrixCloudRuntime should expose a helper for tracked session sync spawns"
+        );
+        assert!(
+            source.contains("tasks.try_join_next()"),
+            "spawn_session_sync_task should opportunistically reap completed sync tasks"
+        );
+    }
+
+    #[test]
+    fn shutdown_waits_for_session_sync_tasks() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("std::mem::take(&mut *tasks)"),
+            "shutdown_ingestion_and_wait should drain tracked session sync tasks"
+        );
+        assert!(
+            source.contains("session_sync_tasks.join_next().await"),
+            "shutdown_ingestion_and_wait should await tracked session sync tasks before exit"
+        );
     }
 }
