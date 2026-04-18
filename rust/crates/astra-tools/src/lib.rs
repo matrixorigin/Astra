@@ -356,6 +356,7 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "str_replace",
     "delete_file",
     "git_commit",
+    "git_stash",
 ];
 
 // ─── Output management utilities ────────────────────────────────────────────
@@ -776,6 +777,7 @@ mod tests {
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"write_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_stash"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"grep"));
     }
