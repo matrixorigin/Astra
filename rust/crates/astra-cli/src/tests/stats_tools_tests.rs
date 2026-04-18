@@ -186,6 +186,8 @@ fn tools_reads_tool_calls_from_journal() {
             args_preview: Some("npm test".into()),
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         },
         session_journal::ToolCallRecord {
             name: "bash".into(),
@@ -197,6 +199,8 @@ fn tools_reads_tool_calls_from_journal() {
             args_preview: Some("cargo build".into()),
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         },
         session_journal::ToolCallRecord {
             name: "grep".into(),
@@ -208,6 +212,8 @@ fn tools_reads_tool_calls_from_journal() {
             args_preview: Some("/error/ in src/".into()),
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         },
     ]);
     writer.append(&event).unwrap();

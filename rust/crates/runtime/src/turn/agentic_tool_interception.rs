@@ -46,6 +46,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             args_preview: Some(result.tool_call_id.clone()),
             result_preview: Some(result.result.chars().take(500).collect::<String>()),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         });
     }
 
@@ -55,7 +57,22 @@ pub(crate) async fn prepare_intercepted_tool_round(
     // evaluation/analytics via ToolCallRecord::is_synthetic_placeholder().
     // The stall detector does NOT treat synthetic placeholders as real
     // attempts either, matching the existing skipped/deferred behavior.
+
+    // Build id→name lookup so we can preserve the original tool name.
+    let tool_name_by_id: HashMap<&str, &str> = tool_calls
+        .iter()
+        .filter_map(|tc| {
+            let id = tc.get("id").and_then(Value::as_str)?;
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)?;
+            Some((id, name))
+        })
+        .collect();
+
     for id in &surgically_removed_ids {
+        let original_name = tool_name_by_id.get(id.as_str()).map(|s| s.to_string());
         state.stall.tool_call_records.push(ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
@@ -66,6 +83,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             args_preview: Some(id.clone()),
             result_preview: Some("(removed from context — skill covered this work)".to_string()),
             file_path: None,
+            surgically_removed: Some(true),
+            original_tool_name: original_name,
         });
     }
 

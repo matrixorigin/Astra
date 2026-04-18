@@ -2479,6 +2479,8 @@ mod exit_code_tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
@@ -2497,6 +2499,8 @@ mod exit_code_tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             });
         sr.verdict_events.push(VerdictEvent {
             turn: 1,
@@ -2530,6 +2534,8 @@ mod exit_code_tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             });
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -2542,6 +2548,8 @@ mod exit_code_tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }

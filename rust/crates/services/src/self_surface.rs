@@ -2323,6 +2323,8 @@ mod tests {
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 }]),
                 budget_used: Some(8300),
                 budget_pressure: Some(0.83),

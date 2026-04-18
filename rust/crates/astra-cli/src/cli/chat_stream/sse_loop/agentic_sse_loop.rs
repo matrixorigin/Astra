@@ -330,6 +330,8 @@ mod tests {
             args_preview: None,
             result_preview: result_preview.map(str::to_string),
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 

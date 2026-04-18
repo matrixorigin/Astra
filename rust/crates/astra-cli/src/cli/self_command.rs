@@ -1835,6 +1835,8 @@ mod tests {
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 }]),
                 budget_used: Some(7000),
                 budget_pressure: Some(0.7),
@@ -1987,6 +1989,8 @@ mod tests {
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -1998,6 +2002,8 @@ mod tests {
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 },
             ]);
             if !bash_ok {
@@ -2136,6 +2142,8 @@ mod tests {
                         args_preview: None,
                         result_preview: None,
                         file_path: None,
+                        surgically_removed: None,
+                        original_tool_name: None,
                     },
                     ToolCallRecord {
                         name: "rg".to_string(),
@@ -2147,6 +2155,8 @@ mod tests {
                         args_preview: None,
                         result_preview: None,
                         file_path: None,
+                        surgically_removed: None,
+                        original_tool_name: None,
                     },
                 ]),
                 budget_used: Some(9100),
@@ -2424,6 +2434,8 @@ mod tests {
                     args_preview: None,
                     result_preview: None,
                     file_path: None,
+                    surgically_removed: None,
+                    original_tool_name: None,
                 }]),
                 budget_used: Some(9100),
                 budget_pressure: Some(0.91),

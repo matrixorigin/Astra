@@ -402,6 +402,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -413,6 +415,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
             crate::session_journal::ToolCallRecord {
                 name: "write_file".into(),
@@ -424,6 +428,8 @@ mod tests {
                 args_preview: None,
                 result_preview: None,
                 file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
             },
         ]);
         let stats = compute_session_stats("s1", &[turn]);
@@ -507,6 +513,8 @@ mod tests {
             args_preview: None,
             result_preview: None,
             file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
         }
     }
 
