@@ -54,6 +54,12 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_blame",
     "git_commit",
     "git_revert_commit",
+    "github_list_prs",
+    "github_get_pr",
+    "github_ci_status",
+    "github_list_issues",
+    "github_get_issue",
+    "github_repo_stats",
     "web_search",
     "memory_retrieve",
     "memory_store",
@@ -1912,6 +1918,7 @@ mod tests {
         let schemas = default_executor_tool_schemas();
         let names = schema_names(&schemas);
         assert!(names.contains(&"git_revert_commit"));
+        assert!(!names.contains(&"github_list_prs"));
         assert!(!names.contains(&"rollback_file_edits"));
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
@@ -1937,6 +1944,8 @@ mod tests {
         assert!(names.contains(&"mo_query"));
         assert!(names.contains(&"rollback_database_snapshots"));
         assert!(names.contains(&"memory_retrieve"));
+        assert!(names.contains(&"github_list_prs"));
+        assert!(names.contains(&"github_ci_status"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"git_revert_commit"));
         assert!(!names.contains(&"rollback_turn_actions"));

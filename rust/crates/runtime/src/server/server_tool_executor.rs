@@ -1248,6 +1248,30 @@ impl ServerToolExecutor {
                     .execute("git_revert_commit", args)
                     .await
             }
+            // ── GitHub operations ────────────────────────────────────────
+            // Read-only GitHub tools delegate to DefaultToolExecutor.
+            "github_list_prs" => self.default_executor.execute("github_list_prs", args).await,
+            "github_get_pr" => self.default_executor.execute("github_get_pr", args).await,
+            "github_ci_status" => {
+                self.default_executor
+                    .execute("github_ci_status", args)
+                    .await
+            }
+            "github_list_issues" => {
+                self.default_executor
+                    .execute("github_list_issues", args)
+                    .await
+            }
+            "github_get_issue" => {
+                self.default_executor
+                    .execute("github_get_issue", args)
+                    .await
+            }
+            "github_repo_stats" => {
+                self.default_executor
+                    .execute("github_repo_stats", args)
+                    .await
+            }
             // ── Delegation placeholder ─────────────────────────────────
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
@@ -1260,7 +1284,9 @@ impl ServerToolExecutor {
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, git_commit, git_revert_commit, memory_*, web_search"
+                     git_diff, git_log, git_show, git_blame, git_commit, git_revert_commit, github_list_prs, \
+                     github_get_pr, github_ci_status, github_list_issues, github_get_issue, github_repo_stats, \
+                     memory_*, web_search"
             )),
         };
 
@@ -3823,6 +3849,28 @@ esac
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_tools_delegate_to_default_executor() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "github_list_prs",
+                &json!({"repo": "matrixorigin/mo-agent-runtime"}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("requires a configured GitHub client")
+        );
+        assert!(
+            !result
+                .output
+                .contains("not available in server-side execution mode")
+        );
     }
 
     // ── Output management ──────────────────────────────────────────────
