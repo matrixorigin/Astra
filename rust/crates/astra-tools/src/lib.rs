@@ -817,6 +817,7 @@ mod tests {
         assert!(names.contains(&"glob".into()));
         assert!(names.contains(&"memory_store".into()));
         assert!(names.contains(&"memory_search".into()));
+        assert!(names.contains(&"memory_retrieve".into()));
         assert!(names.contains(&"memory_profile".into()));
     }
 

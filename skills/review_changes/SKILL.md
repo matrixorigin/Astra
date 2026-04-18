@@ -1,6 +1,6 @@
 ---
 name: review-changes
-description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, or specific commits in the astra codebase. Combines git diff with code intelligence (symbol extraction, call analysis, import resolution) for deep structural review."
+description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, or specific commits. Signal-driven analysis routing for efficient deep review."
 user_invocable: true
 when_to_use: "When the user asks to review code changes, commits, diffs, PRs, or says 'review latest commit'"
 arguments:
@@ -19,22 +19,12 @@ allowed_tools:
   - grep
   - glob
 ---
+
 # Review Changes
 
-Context-aware code review combining git diffs with astra's code intelligence system.
-Goes beyond line-by-line diff review — understands symbol relationships, import changes,
-trait implementations, and call graph impact.
+Signal-driven code review. Goes beyond line-by-line diff — dynamically selects analysis depth based on what actually changed.
 
-**Signal-to-noise philosophy**: Only surface issues that genuinely matter — bugs, security
-vulnerabilities, logic errors, API breakage, missing tests. Never comment on style,
-formatting, or trivial matters.
-
-**Efficiency rules:**
-- Use `read_file` with line ranges instead of reading entire files
-- Make **parallel** tool calls when reading multiple independent files
-- Never read the same file twice — gather all needed ranges in one pass
-- Use `git_diff` with `stat_only: true` FIRST to plan which files to deep-dive
-- Use `git_diff` with `path: "file.rs"` for targeted per-file diffs instead of full repo diff
+**Only surface issues that matter**: bugs, security, logic errors, API breakage, missing tests. Never comment on style/formatting.
 
 ## Task
 
@@ -42,283 +32,142 @@ $ARGUMENTS
 
 ---
 
-## Phase 1: Gather the Diff
+## Phase 1: Gather + Route
 
 ### 1.1 Resolve TARGET
 
-**⚠ CRITICAL: Use the built-in `git_diff`, `git_status`, `git_show`, `git_log` tools — NOT `bash` with raw git commands.** The built-in tools have automatic output truncation that prevents context explosion.
-
 | TARGET | Tool call |
 |--------|-----------|
-| Default (uncommitted) | `git_diff` (no args) |
-| `staged` | `git_diff` with `staged: true` |
-| `unstaged` | `git_diff` (default is worktree vs HEAD) |
-| `branch:<name>` | `git_diff` with `ref: "main"` (or the base branch) |
-| `commit:<sha>` | `git_show` with the SHA |
-| Stat overview | `git_diff` with `stat_only: true` |
-| Filter by path | `git_diff` with `path: "rust/crates/..."` |
+| Default (uncommitted) | `git_diff()` |
+| `staged` | `git_diff(staged: true)` |
+| `branch:<name>` | `git_diff(ref: "main")` |
+| `commit:<sha>` | `git_show(sha)` |
+| Stat overview | `git_diff(stat_only: true)` first, then per-file |
 
-**When `git_diff` returns "No changes":**
-1. Check `git_status` — are there staged changes? Try `git_diff` with `staged: true`
-2. If still nothing, **ask the user** what they want reviewed. Do NOT automatically expand to branch diff against main — that can be hundreds of files.
+No changes? Check `git_status`, try `staged: true`. Still nothing? Ask user.
 
-### 1.2 Assess Scope Before Deep Dive
+### 1.2 Strategy Router
 
-**⚠ CRITICAL workflow — always follow this exact sequence:**
+After reading the diff, route based on **signals** in the diff:
 
-1. **First call**: `git_diff` with `stat_only: true` to get the file list and line counts
-2. **Then**: For each interesting file, call `git_show` or `git_diff` with `path: "specific/file.rs"` to get per-file diffs
-3. **Never**: Request the full diff of all files at once — this wastes context
+**FOCUS override** (skip signal scan):
+| FOCUS | Phases |
+|-------|--------|
+| `bugs` | 1 → 3.1 → 6 |
+| `security` | 1 → 3.1 → 3.2 → 6 |
+| `logic` | 1 → 3.1 → 3.3 → 6 |
+| `api` | 1 → 2 → 3.1 → 4 → 6 |
+| `tests` | 1 → 3.3 → 6 |
 
-Scope guidelines based on the stat output:
-- **Trivial** (<50 lines, 1-2 files): Quick inline review
-- **Medium** (50-300 lines, 3-10 files): Per-file review with cross-file analysis
-- **Large** (>300 lines, >10 files): Review only the most critical files (core logic, public API, largest hunks)
+**Signal-based routing** (FOCUS unset):
+| Signal | Trigger |
+|--------|---------|
+| `unsafe`, `Command::new`, SQL interp, `unwrap()` non-test | → 3.2 |
+| `pub fn/struct/enum/trait` signature change | → 2 + 4 |
+| Tool schema/register, `JournalEvent`, `SubtaskStage`, `SERVER_EXECUTOR_TOOL_NAMES` | → 5 |
+| `impl Foo for Bar`, `#[async_trait]` | → 4.1 |
+| Error type/variant change, `thiserror` | → 4.2 |
+| Config struct, `Cargo.toml` | → 4.3 |
+| Pure docs/comments/config (no code logic) | → skip 2, 3, 4 |
 
-For large diffs, **do not** read every file. Focus on:
-- Core logic changes (skip config, docs, generated files)
-- Public API changes
-- Files with the most line changes
+Output: `📋 Strategy: 1 → 3.1 → 5.1 → 6 | Skipped: 2, 3.2, 3.3, 4`
 
----
+**Common patterns:**
+| Profile | Phases | Tool calls |
+|---------|--------|------------|
+| Trivial (<50 lines, no signals) | 1 → 3.1* → 6 | 2-3 |
+| Schema/config addition | 1 → 3.1* → 5.1 → 6 | 3-4 |
+| Bug fix with logic | 1 → 3.1 → 3.3 → 6 | 4-6 |
+| API change | 1 → 2 → 3.1 → 4 → 6 | 6-10 |
+| Security-relevant | 1 → 3.1 → 3.2 → 5 → 6 | 6-10 |
+| Large refactor (>300 lines) | 1 → 2 → 3 → 4 → 5 → 6 | 10-15 |
 
-## Phase 2: Structural Analysis
+*\*3.1 trivial = light scan only (5-10 diff lines for obvious bugs). Skip full checklist.*
 
-### 2.1 Symbol-Level Impact Assessment
-
-For each changed file, use astra's code intelligence to extract symbols:
-
-**What astra's code_intel.rs provides** (9 languages supported):
-- `extract_symbols()`: All functions, methods, types, traits, constants
-- `extract_calls()`: Function call sites with argument counts
-- `extract_imports()`: Import statements with resolved paths
-- `find_rust_impls()`: Trait implementations (Rust-specific)
-- `extract_members()`: Struct/class member fields and types
-
-**Analysis steps:**
-
-1. **Extract symbols from changed hunks only** — what functions/types were modified?
-2. **Check if changed symbols are public API** — `pub fn`, `export`, etc.
-3. **Find callers of changed symbols** — grep for function names across codebase
-4. **Check if signature changed** — parameter types, return type, generics
-
-Use the built-in `grep` tool for caller analysis:
-```json
-{"pattern": "function_name(", "path": "rust/crates/", "glob": "*.rs"}
-```
-
-### 2.2 Import/Dependency Changes
-
-From the diff output, check import changes (`use`, `import`, `from`, `require`):
-- Was a dependency added? Check `Cargo.toml` / `package.json` changes
-- Was a module restructured? Check if old import paths still work
-- Any circular dependency introduced?
-
-### 2.3 Type/API Surface Changes
-
-From the diff, identify public API changes (`pub fn`, `pub struct`, `pub enum`, `pub trait`, `export`):
-- **Breaking change?** Removed parameter, changed type, removed variant
-- **Semver impact?** Major (breaking), minor (additive), patch (internal)
-- **Migration needed?** Find all callers that need updating
+**Rules:** Always run 1 + 3.1 + 6. Re-route if Phase 3 reveals new signals. When in doubt, include.
 
 ---
 
-## Phase 3: Deep Review (Per-File)
+## Phase 2: Structural Analysis *(conditional)*
 
-For each file with core logic changes (skip trivial formatting):
+1. Extract changed symbols — are they `pub`?
+2. Find callers via `grep`
+3. Signature changes? Assess semver impact (breaking vs additive)
+4. Import changes? Old paths still valid?
 
-### 3.0 Read Context Efficiently
+---
 
-**⚠ CRITICAL: NEVER read an entire large file.** Use line ranges from the diff hunk headers:
+## Phase 3: Deep Review *(3.1 always; 3.2/3.3 conditional)*
 
-1. Parse the `@@ -45,7 +45,9 @@` markers from the diff output
-2. Call `read_file` with `start_line` / `end_line` for ~30 lines around each hunk
-3. For files >200 lines, use `outline: true` first to understand structure, then read specific ranges
-4. If the diff touches multiple scattered hunks, make **parallel** `read_file` calls for each range
+### 3.0 Context (only if diff is ambiguous)
 
-Example: if the diff shows `@@ -120,8 +120,12 @@`, call:
-```json
-{"path": "src/foo.rs", "start_line": 105, "end_line": 140}
-```
-
-**Merge commits:** `git_show` on a merge commit shows the combined first-parent diff.
-If the output looks incomplete (e.g., no code hunks, only file renames), use
-`git_diff` with `ref: "<first-parent-sha>"` to get the real code diff instead.
+You already read the diff in Phase 1 — don't re-read it. Only `read_file` surrounding context when the diff alone is unclear. For files >200 lines, `outline: true` first.
 
 ### 3.1 Bug Detection
 
-Check the diff hunks for:
+Trivial: light scan for obvious bugs.
+Medium/Large: full scan — logic errors, concurrency issues, error handling gaps.
 
-**Logic errors:**
-- Off-by-one: loop bounds, array indexing, range expressions
-- Null/None handling: unwrap() without check, missing Option handling
-- Type coercion: lossy casts (as u32, parseInt without validation)
-- Boundary conditions: empty collections, zero values, overflow
+### 3.2 Security *(conditional)*
 
-**Concurrency issues (Rust-specific):**
-- Arc/Mutex usage: deadlock potential, lock ordering
-- async/await: missing .await, holding lock across await point
-- Channel usage: unbounded channels, dropped receivers
+Command injection, path traversal, credential exposure, SQL injection, `unsafe` without safety comments.
 
-**Error handling:**
-- `unwrap()` or `expect()` on fallible operations in non-test code
-- Swallowed errors: `let _ = result;` or `if let Ok(x) = ...`
-- Error type changes: new error variant without handling in callers
+### 3.3 Test Coverage *(conditional)*
 
-### 3.2 Security Review
-
-Check for:
-- **Command injection**: User input passed to `Command::new()` or bash
-- **Path traversal**: User-controlled paths without sanitization
-- **Credential exposure**: Hardcoded tokens, API keys, passwords
-- **SQL injection**: String interpolation in SQL queries (relevant for MatrixOne)
-- **Unsafe code**: New `unsafe` blocks without safety comments
-
-### 3.3 Test Coverage
-
-For each changed function:
-1. Does a test exist? Use `grep` to search for the function name in test files
-2. Does the test cover the new/changed behavior?
-3. Are edge cases tested?
-
-Flag:
-- 🔴 Public API change with no test update
-- 🟡 New code path with no test
-- 🟢 Test exists and covers the change
+For changed code paths: test exists? Covers new behavior? Edge cases?
 
 ---
 
-## Phase 4: Cross-File Consistency
+## Phase 4: Cross-File Consistency *(conditional)*
 
-### 4.1 Interface Contracts
-
-If a trait/interface was modified:
-- Do all implementations conform to the new contract?
-- Are default implementations updated?
-- Are mock implementations in tests updated?
-
-### 4.2 Error Propagation
-
-If error types changed:
-- Are all `?` operators still valid?
-- Do error conversions (From/Into) still compile?
-- Are error messages helpful?
-
-### 4.3 Configuration Consistency
-
-If config structures changed:
-- Are default values sensible?
-- Are config files (TOML/YAML/JSON) updated to match?
-- Is backward compatibility maintained? (old config files still load)
-
-### 4.4 Documentation Consistency
-
-If public API changed:
-- Are doc comments updated?
-- Are README/docs files updated?
-- Are examples still correct?
+| # | Signal | Check |
+|---|--------|-------|
+| 4.1 | Trait modified | All impls conform? Defaults/mocks updated? |
+| 4.2 | Error type changed | `?`/`From`/`Into` still valid? |
+| 4.3 | Config struct changed | Defaults sensible? Backward compatible? |
+| 4.4 | Public API changed | Docs/examples updated? |
 
 ---
 
-## Phase 5: Astra-Specific Checks
+## Phase 5: Astra-Specific *(conditional, sub-phases independent)*
 
-### 5.1 Tool Registration
-
-If a new tool was added or tool schema changed:
-- Is it registered in `edge_tools.rs` tool list?
-- Is it in the appropriate tool category for selection?
-- Is it marked `parallel_safe` if read-only? (see `plan_executor.rs`)
-- Does the tool schema match the implementation?
-
-### 5.2 Journal Event Changes
-
-If `JournalEvent` or `JournalEventType` was modified:
-- Is backward compatibility maintained for existing `.jsonl` files?
-- Are new fields optional (with defaults)?
-- Is cloud event ingestion updated?
-
-### 5.3 State Machine Changes
-
-If `SubtaskStage` or plan execution flow changed:
-- Are all state transitions valid?
-- Are new states handled in display code?
-- Are serialization/deserialization updated?
-
-### 5.4 Cloud Sync Impact
-
-If cloud-synced data structures changed:
-- Are SQL schema migrations needed?
-- Is the sync adapter updated?
-- Are older cloud records still readable?
+| # | Signal | Check |
+|---|--------|-------|
+| 5.1 | Tool schema/register | Registered in edge_tools? Category correct? `parallel_safe` if read-only? Schema matches impl? |
+| 5.2 | JournalEvent changed | .jsonl backward compat? New fields optional? Cloud ingestion updated? |
+| 5.3 | SubtaskStage changed | State transitions valid? Display handles new states? |
+| 5.4 | Cloud-synced struct | SQL migration needed? Sync adapter updated? |
 
 ---
 
-## Phase 6: Review Report
+## Phase 6: Report
 
-**⚠ CRITICAL: Do NOT start writing the review report until ALL analysis in Phases 1-5 is
-complete. While you are still making tool calls to gather information, output NOTHING as text.
-The review report below must be your FINAL text output — no tool calls after it.**
-
-**⚠ Gather ALL information BEFORE writing.** If you realize mid-review you need more data,
-make the tool calls SILENTLY (no text output) before starting the review report. Any text you
-produce between tool calls will be discarded and wastes tokens.
+**⚠ Write the report ONLY after all analysis is complete. While making tool calls, output NOTHING.**
 
 ---
 
-## Code Review: {target_description}
+## Code Review: {target}
 
 **Scope:** {n} files, +{added}/-{removed} lines
 
 ### 🔴 Critical ({n})
-
-{issue with file:line and explanation}
+{issues with file:line and why}
 
 ### 🟡 Important ({n})
-
-{issue with file:line and explanation}
+{issues with file:line and why}
 
 ### 💡 Suggestions ({n})
-
-{non-blocking improvements}
+{non-blocking improvements with benefit}
 
 ### ✅ Looks Good
-
-{aspects of the change that are well done}
+{what's well done}
 
 ### 📊 Impact Assessment
-
 | Aspect | Status |
 |--------|--------|
-| Public API changes | {n} ({breaking/additive/internal}) |
+| Public API | {n} ({breaking/additive/internal}) |
 | Test coverage | {adequate/needs-work/missing} |
-| Cross-file impact | {files affected by changes} |
+| Cross-file impact | {files affected} |
 | Semver | {major/minor/patch} |
 
-### Issue Severity Guide
-
-| Severity | Criteria | Action |
-|----------|----------|--------|
-| 🔴 Critical | Bugs, security issues, data loss, API breakage | Must fix before merge |
-| 🟡 Important | Missing tests, error handling gaps, logic concerns | Should fix |
-| 💡 Suggestion | Performance, readability, alternative approaches | Nice to have |
-| ✅ Looks Good | Acknowledge well-written code, good patterns | Positive feedback |
-
-**Rules:**
-- Never mention formatting, whitespace, or style (rustfmt handles that)
-- Never suggest renaming unless the name is actively misleading
-- Every issue must include the specific file and line number
-- Every critical/important issue must explain **why** it's a problem
-- Suggestions must explain the **benefit** of the change
-
----
-
-## Reference: Key Source Files
-
-| Component | File |
-|-----------|------|
-| Code intelligence | `rust/crates/astra-cli/src/edge_tools/code_intel.rs` |
-| Git tools | `rust/crates/astra-cli/src/edge_tools/git_gix.rs` |
-| Edge tools registry | `rust/crates/astra-cli/src/edge_tools.rs` |
-| Tool parallel safety | `rust/crates/astra-cli/src/cli/plan_executor.rs` (parallel_safe) |
-| Session journal schema | `rust/crates/services/src/session_journal.rs` |
-| Durable task states | `rust/crates/services/src/durable_task.rs` |
+**Rules:** No style/formatting comments. Every issue needs file:line. Every 🔴🟡 must explain **why**. Every 💡 must explain **benefit**.
