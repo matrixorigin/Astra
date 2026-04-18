@@ -1206,6 +1206,7 @@ impl ServerToolExecutor {
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
+            "web_fetch" => self.default_executor.execute("web_fetch", args).await,
             "read_file" => self.default_executor.execute("read_file", args).await,
             "write_file" => tool_result_from_output(self.server_write_file(args)),
             "str_replace" => tool_result_from_output(self.server_str_replace(args)),
@@ -1261,7 +1262,7 @@ impl ServerToolExecutor {
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
+                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_fetch, web_search"
             )),
         };
 
@@ -3496,6 +3497,17 @@ esac
         let (exec, _dir) = test_executor();
         let result = exec.execute("nonexistent_tool", &json!({})).await;
         assert!(result.contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_is_available_in_server_mode() {
+        let (exec, _dir) = test_executor();
+        let result = exec.execute("web_fetch", &json!({})).await;
+        assert!(result.contains("Missing 'url'"), "{result}");
+        assert!(
+            !result.contains("not available in server-side execution mode"),
+            "{result}"
+        );
     }
 
     // ── Bash execution ─────────────────────────────────────────────────

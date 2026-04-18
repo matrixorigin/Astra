@@ -55,6 +55,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "symbols",
     "git_commit",
     "git_revert_commit",
+    "web_fetch",
     "web_search",
     "memory_retrieve",
     "memory_store",
@@ -1915,6 +1916,7 @@ mod tests {
         assert!(names.contains(&"git_revert_commit"));
         assert!(!names.contains(&"symbols"));
         assert!(!names.contains(&"rollback_file_edits"));
+        assert!(!names.contains(&"web_fetch"));
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
         assert!(!names.contains(&"multi_edit"));
@@ -1940,6 +1942,7 @@ mod tests {
         assert!(names.contains(&"rollback_database_snapshots"));
         assert!(names.contains(&"memory_retrieve"));
         assert!(names.contains(&"symbols"));
+        assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"git_revert_commit"));
         assert!(!names.contains(&"rollback_turn_actions"));
