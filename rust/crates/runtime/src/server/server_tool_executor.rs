@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::{ToolContext, ToolExecutor};
+use astra_tools::{AskUserDecision, AskUserGate, ToolContext, ToolExecutor};
 use async_trait::async_trait;
 
 use crate::tool_sandbox::{
@@ -46,6 +46,14 @@ struct DatabaseSnapshotRollbackEntry {
 struct DatabaseSnapshotRollbackJournal {
     entries: Vec<DatabaseSnapshotRollbackEntry>,
     next_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AskUserRequest {
+    question: String,
+    choices: Vec<String>,
+    default: Option<String>,
+    context: Option<String>,
 }
 
 impl DatabaseSnapshotRollbackJournal {
@@ -957,6 +965,8 @@ pub struct ServerToolExecutor {
     url_cache: Mutex<HashMap<String, (String, Instant)>>,
     /// Optional approval gate for dangerous tool execution.
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
+    /// Optional ask_user gate for interactive client prompts.
+    ask_user_gate: Option<Arc<dyn AskUserGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
     /// Optional resource governor for usage tracking (Phase 5).
@@ -1054,6 +1064,7 @@ impl ServerToolExecutor {
             http_client,
             url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
+            ask_user_gate: None,
             progress_callback: None,
             resource_governor: None,
             edge_connection_pool: None,
@@ -1067,6 +1078,11 @@ impl ServerToolExecutor {
     /// Set the approval gate for interactive tool execution.
     pub fn set_approval_gate(&mut self, gate: Arc<dyn astra_tools::ToolApprovalGate>) {
         self.approval_gate = Some(gate);
+    }
+
+    /// Set the ask_user gate for interactive user prompts.
+    pub fn set_ask_user_gate(&mut self, gate: Arc<dyn AskUserGate>) {
+        self.ask_user_gate = Some(gate);
     }
 
     /// Set the progress callback for streaming tool output.
@@ -1204,6 +1220,7 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
+            "ask_user" => self.server_ask_user(args).await,
             // ── File operations ─────────────────────────────────────────
             // Write operations use server-specific journal recording.
             // Read-only operations delegate to DefaultToolExecutor.
@@ -1211,6 +1228,7 @@ impl ServerToolExecutor {
             "read_file" => self.default_executor.execute("read_file", args).await,
             "write_file" => tool_result_from_output(self.server_write_file(args)),
             "str_replace" => tool_result_from_output(self.server_str_replace(args)),
+            "multi_edit" => tool_result_from_output(self.server_multi_edit(args)),
             "delete_file" => tool_result_from_output(self.server_delete_file(args)),
             "rollback_file_edits" => tool_result_from_output(self.rollback_file_edits(args)),
             "list_dir" => self.default_executor.execute("list_dir", args).await,
@@ -1262,13 +1280,14 @@ impl ServerToolExecutor {
             "git_blame" => self.default_executor.execute("git_blame", args).await,
             "symbols" => self.default_executor.execute("symbols", args).await,
             "git_commit" => self.default_executor.execute("git_commit", args).await,
+            "git_stash" => self.default_executor.execute("git_stash", args).await,
             "git_revert_commit" => {
                 self.default_executor
                     .execute("git_revert_commit", args)
                     .await
             }
             // ── GitHub operations ────────────────────────────────────────
-            // Read-only GitHub tools delegate to DefaultToolExecutor.
+            // GitHub tools delegate to DefaultToolExecutor.
             "github_list_prs" => self.default_executor.execute("github_list_prs", args).await,
             "github_get_pr" => self.default_executor.execute("github_get_pr", args).await,
             "github_ci_status" => {
@@ -1291,6 +1310,11 @@ impl ServerToolExecutor {
                     .execute("github_repo_stats", args)
                     .await
             }
+            "github_create_issue" => {
+                self.default_executor
+                    .execute("github_create_issue", args)
+                    .await
+            }
             // ── Delegation placeholder ─────────────────────────────────
             "delegate" => astra_tools::ToolResult::text(
                 "Delegation request acknowledged. The delegation engine will execute \
@@ -1301,12 +1325,12 @@ impl ServerToolExecutor {
             _ => astra_tools::ToolResult::error(format!(
                 "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
-                     list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
+                     multi_edit, list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
                      rollback_session_state, task_*, sleep, tool_search, mo_query, rollback_database_snapshots, \
                      grep, glob, git_status, git_diff, git_log, git_file_history, git_contributors, git_log_search, \
-                     git_show, git_blame, symbols, git_commit, git_revert_commit, github_list_prs, github_get_pr, \
-                     github_ci_status, github_list_issues, github_get_issue, github_repo_stats, memory_*, web_fetch, \
-                     web_search"
+                     git_show, git_blame, symbols, git_commit, git_stash, git_revert_commit, github_list_prs, github_get_pr, \
+                     github_ci_status, github_list_issues, github_get_issue, github_repo_stats, github_create_issue, memory_*, web_fetch, \
+                     web_search, ask_user"
             )),
         };
 
@@ -1325,6 +1349,48 @@ impl ServerToolExecutor {
         }
 
         result
+    }
+
+    async fn server_ask_user(&self, args: &Value) -> astra_tools::ToolResult {
+        let request = match parse_ask_user_request(args) {
+            Ok(request) => request,
+            Err(error) => return astra_tools::ToolResult::error(error),
+        };
+
+        let Some(gate) = &self.ask_user_gate else {
+            return astra_tools::ToolResult::error(
+                "Error: ask_user requires an interactive client connection".into(),
+            );
+        };
+
+        let request_id = format!("ask-{}-{}", self.session_id, uuid_v4_short());
+        match gate
+            .request_user_input(
+                &request_id,
+                &request.question,
+                &request.choices,
+                request.default.as_deref(),
+                request.context.as_deref(),
+            )
+            .await
+        {
+            AskUserDecision::Answer(response) => {
+                let mut body = json!({
+                    "answer": response.answer,
+                    "question": request.question,
+                });
+                if !request.choices.is_empty() {
+                    body["was_custom"] = Value::Bool(response.was_custom);
+                }
+                astra_tools::ToolResult::text(body.to_string())
+            }
+            AskUserDecision::Timeout => astra_tools::ToolResult::error(
+                "Error: ask_user timed out waiting for user response".into(),
+            ),
+            AskUserDecision::Error(message) => {
+                astra_tools::ToolResult::error(format!("Error: ask_user failed: {message}"))
+            }
+        }
     }
 
     /// Set the current turn index for journal entries.
@@ -2684,6 +2750,39 @@ impl ServerToolExecutor {
         result.output
     }
 
+    fn server_multi_edit(&self, args: &Value) -> String {
+        let prepared = match astra_tools::fs_ops::prepare_multi_edit(&self.workspace_root, args) {
+            Ok(prepared) => prepared,
+            Err(error) => return error.output,
+        };
+
+        if !args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
+            journal.record_before_patch(prepared.path(), "server-multi-edit", turn_idx);
+        }
+
+        let result = prepared.apply();
+        if !result.is_error
+            && !args
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            journal.record_after(
+                prepared.path(),
+                "server-multi-edit",
+                prepared.new_content_bytes(),
+            );
+        }
+        result.output
+    }
+
     fn server_delete_file(&self, args: &Value) -> String {
         let prepared = match astra_tools::fs_ops::prepare_delete_file(&self.workspace_root, args) {
             Ok(prepared) => prepared,
@@ -3013,6 +3112,42 @@ fn edit_type_label(edit_type: EditType) -> &'static str {
     }
 }
 
+fn parse_ask_user_request(args: &Value) -> Result<AskUserRequest, String> {
+    let question = match args.get("question").and_then(Value::as_str) {
+        Some(question) if !question.trim().is_empty() => question.to_string(),
+        _ => return Err("Error: 'question' is required".into()),
+    };
+
+    let choices: Vec<String> = args
+        .get("choices")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !choices.is_empty() && !(2..=9).contains(&choices.len()) {
+        return Err("Error: choices must contain 2-9 options".into());
+    }
+
+    Ok(AskUserRequest {
+        question,
+        choices,
+        default: args
+            .get("default")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        context: args
+            .get("context")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    })
+}
+
 fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let json_error = parsed
@@ -3065,6 +3200,8 @@ mod tests {
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
 
     use super::*;
+    use astra_tools::{AskUserDecision, AskUserGate, AskUserResponse};
+    use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -3189,7 +3326,96 @@ esac
         (exec, dir, session_id, session)
     }
 
+    #[derive(Clone)]
+    struct StaticAskUserGate {
+        expected_question: &'static str,
+        expected_choices: Vec<&'static str>,
+        decision: AskUserDecision,
+    }
+
+    #[async_trait]
+    impl AskUserGate for StaticAskUserGate {
+        async fn request_user_input(
+            &self,
+            _request_id: &str,
+            question: &str,
+            choices: &[String],
+            _default: Option<&str>,
+            _context: Option<&str>,
+        ) -> AskUserDecision {
+            assert_eq!(question, self.expected_question);
+            assert_eq!(
+                choices,
+                &self
+                    .expected_choices
+                    .iter()
+                    .map(|choice| choice.to_string())
+                    .collect::<Vec<_>>()
+            );
+            self.decision.clone()
+        }
+    }
+
     // ── Path traversal security ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ask_user_returns_structured_response_from_gate() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
+            expected_question: "Which option?",
+            expected_choices: vec!["first", "second"],
+            decision: AskUserDecision::Answer(AskUserResponse {
+                answer: "custom".into(),
+                was_custom: true,
+            }),
+        }));
+
+        let result = exec
+            .execute_with_metadata(
+                "ask_user",
+                &json!({
+                    "question": "Which option?",
+                    "choices": ["first", "second"],
+                    "default": "first"
+                }),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap(),
+            json!({
+                "answer": "custom",
+                "question": "Which option?",
+                "was_custom": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_requires_interactive_gate() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("ask_user", &json!({"question": "Continue?"}))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("interactive client connection"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_rejects_invalid_choice_count() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "ask_user",
+                &json!({"question": "Pick one", "choices": ["only-one"]}),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("choices must contain 2-9 options"));
+    }
 
     #[tokio::test]
     async fn resolve_path_allows_relative_inside_workspace() {
@@ -3482,6 +3708,41 @@ esac
     }
 
     #[tokio::test]
+    async fn rollback_file_edits_current_turn_reverts_server_multi_edit() {
+        let (exec, dir) = test_executor();
+        exec.set_turn_index(8);
+        let target = dir.path().join("edit.txt");
+        std::fs::write(&target, "aaa bbb ccc").unwrap();
+
+        let edited = exec
+            .execute(
+                "multi_edit",
+                &json!({
+                    "path": "edit.txt",
+                    "edits": [
+                        {"old_str": "aaa", "new_str": "AAA"},
+                        {"old_str": "ccc", "new_str": "CCC"}
+                    ]
+                }),
+            )
+            .await;
+        assert!(edited.contains("Successfully applied"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC");
+
+        let rollback = exec
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
+            .await;
+        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(
+            rollback_json["success"].as_bool(),
+            Some(true),
+            "got: {rollback}"
+        );
+        assert_eq!(rollback_json["turn_index"].as_u64(), Some(8));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "aaa bbb ccc");
+    }
+
+    #[tokio::test]
     async fn rollback_file_edits_file_scope_restores_deleted_file() {
         let (exec, dir) = test_executor();
         let target = dir.path().join("gone.txt");
@@ -3643,17 +3904,11 @@ esac
     #[tokio::test]
     async fn grep_finds_pattern_in_files() {
         let (exec, dir) = test_executor();
-        // The grep tool runs git check-ignore; must have a git repo.
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
             .expect("git init failed");
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .expect("git add failed");
         std::fs::write(dir.path().join("test.rs"), "fn main() {}\nfn helper() {}").unwrap();
         let result = exec.execute("grep", &json!({"pattern": "fn main"})).await;
         assert!(result.contains("fn main"), "actual output: {result}");
@@ -3662,17 +3917,11 @@ esac
     #[tokio::test]
     async fn grep_no_matches_returns_message() {
         let (exec, dir) = test_executor();
-        // The grep tool runs git check-ignore; must have a git repo.
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
             .expect("git init failed");
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .expect("git add failed");
         std::fs::write(dir.path().join("empty.rs"), "nothing here").unwrap();
         let result = exec
             .execute("grep", &json!({"pattern": "ZZZZNOTFOUND"}))
@@ -3692,6 +3941,32 @@ esac
             !result.contains("not available in server-side execution mode"),
             "{result}"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_edit_is_available_in_server_mode() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("edit.txt"), "foo bar baz").unwrap();
+
+        let result = exec
+            .execute(
+                "multi_edit",
+                &json!({
+                    "path": "edit.txt",
+                    "edits": [
+                        {"old_str": "foo", "new_str": "FOO"},
+                        {"old_str": "baz", "new_str": "BAZ"}
+                    ]
+                }),
+            )
+            .await;
+
+        assert!(result.contains("Successfully applied"), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
+            "FOO bar BAZ"
+        );
+        assert!(!result.contains("not available in server-side execution mode"));
     }
 
     #[tokio::test]
@@ -3823,6 +4098,34 @@ esac
         assert!(
             contributors.contains("## Top Contributors"),
             "{contributors}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_stash_is_available_in_server_mode() {
+        let (exec, dir) = test_executor();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let stash_list = exec.execute("git_stash", &json!({"action": "list"})).await;
+        assert!(
+            stash_list.contains("No stashes found")
+                || stash_list.contains("stash@")
+                || stash_list.is_empty(),
+            "{stash_list}"
         );
     }
 
@@ -4013,8 +4316,6 @@ esac
             )
             .await;
         // Verify github tools delegate to default executor (not rejected as server-mode-only).
-        // If a GitHub token is configured, the call succeeds; otherwise it returns an error.
-        // The key assertion is: never "not available in server-side execution mode".
         if result.is_error {
             assert!(
                 result
