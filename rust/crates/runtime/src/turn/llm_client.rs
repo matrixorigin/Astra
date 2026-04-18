@@ -326,10 +326,12 @@ pub(crate) async fn call_llm_and_collect(
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
     let mut tpm_exhaustion_detected = false;
-    // Track consecutive idle timeouts for the retry-before-fallback logic.
+    // Track idle timeouts for the retry-before-fallback logic.
     // This counter is NOT reset inside the retry loop: the first idle timeout across
-    // all retries (rate-limit, network, etc.) triggers one streaming retry, and the
-    // second idle timeout falls back to non-stream mode.
+    // all retries (rate-limit, network, etc.) only gets a streaming retry if the
+    // stream never produced any useful output. Once a stream has emitted partial
+    // content/tool calls and then stalls, fall back immediately instead of redoing
+    // the same partial generation in a second streaming attempt.
     let mut idle_timeout_count = 0u32;
     let max_retries = LLM_MAX_RETRIES;
 
@@ -422,7 +424,10 @@ pub(crate) async fn call_llm_and_collect(
                     last_kind = astra_core::ErrorKind::StreamTransport;
                     continue;
                 }
-                Err(StreamCollectError::IdleTimeout { elapsed_ms }) => {
+                Err(StreamCollectError::IdleTimeout {
+                    elapsed_ms,
+                    made_progress,
+                }) => {
                     if cancel.is_triggered() {
                         return Err(astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::Cancelled,
@@ -443,9 +448,11 @@ pub(crate) async fn call_llm_and_collect(
 
                     idle_timeout_count += 1;
 
-                    // On first idle timeout, retry streaming before falling back to non-stream.
-                    // Some transient stalls recover on retry.
-                    if idle_timeout_count == 1 {
+                    // Only retry streaming if the connection stalled before any
+                    // meaningful output arrived. Once partial content/tool calls
+                    // have streamed, a second streaming attempt tends to replay
+                    // the same partial work and wastes another idle window.
+                    if idle_timeout_count == 1 && !made_progress {
                         astra_core::agent_warn!(
                             "llm",
                             "stream idle timeout after {}ms — retrying streaming once before fallback",
@@ -456,15 +463,16 @@ pub(crate) async fn call_llm_and_collect(
                         continue; // retry streaming
                     }
 
-                    // Second idle timeout — fall back to non-stream request.
+                    // Mid-stream stall, or second idle timeout — fall back to a non-stream request.
                     // Cap the fallback timeout at min(fallback_timeout, remaining budget).
                     let remaining = total_budget.saturating_sub(elapsed);
                     let fb_timeout = llm_fallback_timeout().min(remaining);
                     astra_core::agent_warn!(
                         "llm",
-                        "stream idle timeout #{} after {}ms — attempting non-stream fallback (timeout {}s)",
+                        "stream idle timeout #{} after {}ms (made_progress={}) — attempting non-stream fallback (timeout {}s)",
                         idle_timeout_count,
                         elapsed_ms,
+                        made_progress,
                         fb_timeout.as_secs()
                     );
                     return call_llm_nonstream_fallback(
@@ -604,6 +612,7 @@ async fn collect_llm_stream(
     let mut usage = Map::new();
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
+    let mut made_progress = false;
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
@@ -618,6 +627,7 @@ async fn collect_llm_stream(
                 Err(_elapsed) => {
                     return Err(StreamCollectError::IdleTimeout {
                         elapsed_ms: idle.as_millis() as u64,
+                        made_progress,
                     });
                 }
             },
@@ -643,6 +653,7 @@ async fn collect_llm_stream(
                     usage_map.insert("total".to_string(), Value::from(p + c));
                 }
                 usage = usage_map;
+                made_progress = true;
             }
         }
 
@@ -657,6 +668,7 @@ async fn collect_llm_stream(
             .and_then(Value::as_str)
         {
             finish_reason = Some(fr.to_string());
+            made_progress = true;
         }
 
         let Some(delta) = choices
@@ -678,6 +690,7 @@ async fn collect_llm_stream(
                 )));
             }
             full_text.push_str(content);
+            made_progress = true;
         }
 
         // Reasoning
@@ -691,6 +704,7 @@ async fn collect_llm_stream(
                 )));
             }
             reasoning.push_str(r);
+            made_progress = true;
         }
 
         // Tool calls (streaming accumulation)
@@ -717,6 +731,7 @@ async fn collect_llm_stream(
                     && !id.is_empty()
                 {
                     entry.insert("id".to_string(), Value::String(id.to_string()));
+                    made_progress = true;
                 }
                 if let Some(func) = tc.get("function").and_then(Value::as_object) {
                     let f = entry
@@ -729,6 +744,7 @@ async fn collect_llm_stream(
                         && is_valid_tool_name(name)
                     {
                         f.insert("name".to_string(), Value::String(name.to_string()));
+                        made_progress = true;
                     } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
                         astra_core::agent_warn!(
                             "llm",
@@ -747,6 +763,7 @@ async fn collect_llm_stream(
                             .or_insert_with(|| Value::String(String::new()));
                         if let Value::String(s) = existing {
                             s.push_str(args);
+                            made_progress = true;
                         }
                     }
                 }
@@ -791,6 +808,7 @@ async fn collect_llm_stream(
 enum StreamCollectError {
     IdleTimeout {
         elapsed_ms: u64,
+        made_progress: bool,
     },
     /// Byte stream error from the HTTP client (e.g. reset, TLS failure).
     Transport(String),
@@ -1478,8 +1496,34 @@ mod tests {
         let started = Instant::now();
         let res = collect_llm_stream(pending_stream, "test-model", started, LlmCancel::None).await;
         assert!(
-            matches!(res, Err(StreamCollectError::IdleTimeout { .. })),
+            matches!(
+                res,
+                Err(StreamCollectError::IdleTimeout {
+                    made_progress: false,
+                    ..
+                })
+            ),
             "expected idle timeout, got: {res:?}"
+        );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_after_partial_output_marks_progress() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "1") };
+        let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
+        let stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n")))])
+            .chain(stream::pending::<Result<Bytes, reqwest::Error>>());
+        let res = collect_llm_stream(stream, "test-model", Instant::now(), LlmCancel::None).await;
+        assert!(
+            matches!(
+                res,
+                Err(StreamCollectError::IdleTimeout {
+                    made_progress: true,
+                    ..
+                })
+            ),
+            "expected idle timeout after partial output, got: {res:?}"
         );
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
@@ -1568,6 +1612,12 @@ mod tests {
     #[derive(Clone)]
     struct Hit(Arc<AtomicU32>);
 
+    #[derive(Clone)]
+    struct StreamIdleHit {
+        stream_hits: Arc<AtomicU32>,
+        fallback_hits: Arc<AtomicU32>,
+    }
+
     async fn spawn_local_http_server(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1652,6 +1702,64 @@ mod tests {
             .status(500)
             .body(Body::from("server error"))
             .unwrap()
+    }
+
+    async fn mock_stream_idle_after_partial_then_fallback(
+        State(state): State<StreamIdleHit>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if is_stream {
+            state.stream_hits.fetch_add(1, Ordering::SeqCst);
+            let partial = json!({"choices":[{"delta":{"content":"partial"}}]});
+            let body_stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+                format!("data: {partial}\n\n"),
+            ))])
+            .chain(stream::pending::<Result<Bytes, std::io::Error>>());
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(body_stream))
+                .unwrap()
+        } else {
+            state.fallback_hits.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(200)
+                .body(Body::from(
+                    r#"{"choices":[{"message":{"content":"from-fallback"}}]}"#,
+                ))
+                .unwrap()
+        }
+    }
+
+    async fn mock_stream_idle_before_any_output_then_retry(
+        State(Hit(c)): State<Hit>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        let n = c.fetch_add(1, Ordering::SeqCst);
+        let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if is_stream && n == 0 {
+            let body_stream = stream::pending::<Result<Bytes, std::io::Error>>();
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(body_stream))
+                .unwrap()
+        } else if is_stream {
+            let payload = json!({"choices":[{"delta":{"content":"after-retry"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {payload}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        } else {
+            Response::builder()
+                .status(500)
+                .body(Body::from("unexpected non-stream fallback"))
+                .unwrap()
+        }
     }
 
     #[tokio::test]
@@ -1950,6 +2058,74 @@ mod tests {
             .expect("collect");
         assert_eq!(res.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(res.tool_calls.len(), 1);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_falls_back_immediately_after_partial_stream_idle() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "10") };
+        let state = StreamIdleHit {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(mock_stream_idle_after_partial_then_fallback),
+            )
+            .with_state(state.clone());
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("fallback succeeds");
+        assert_eq!(res.full_text, "from-fallback");
+        assert_eq!(
+            state.stream_hits.load(Ordering::SeqCst),
+            1,
+            "partial stream idle should skip the extra streaming retry"
+        );
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "10") };
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(mock_stream_idle_before_any_output_then_retry),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("stream retry succeeds");
+        assert_eq!(res.full_text, "after-retry");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
