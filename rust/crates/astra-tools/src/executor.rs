@@ -492,15 +492,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_read_file_large_file_returns_error() {
+    async fn dispatch_read_file_large_file_returns_preview() {
         let (tmp, exec) = test_executor();
         std::fs::write(tmp.path().join("big.txt"), "abcdefghij".repeat(9_000)).unwrap();
         let result = exec
             .execute("read_file", &serde_json::json!({"path": "big.txt"}))
             .await;
-        assert!(result.is_error);
-        assert!(result.output.contains("file is too large"));
-        assert!(result.output.contains("outline=true"));
+        // After auto-pagination, large files return a preview (not an error)
+        assert!(!result.is_error);
+        assert!(
+            result.output.contains("Large file preview") || result.output.contains("First lines")
+        );
     }
 
     #[tokio::test]

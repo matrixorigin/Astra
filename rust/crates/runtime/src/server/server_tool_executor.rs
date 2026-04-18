@@ -3244,12 +3244,17 @@ esac
     }
 
     #[tokio::test]
-    async fn read_file_large_full_read_requires_range_or_outline() {
+    async fn read_file_large_returns_preview() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("big.txt"), "abcdefghij".repeat(9_000)).unwrap();
         let result = exec.execute("read_file", &json!({"path": "big.txt"})).await;
-        assert!(result.contains("file is too large"), "got: {result}");
-        assert!(result.contains("outline=true"), "got: {result}");
+        // After auto-pagination change, large files return a preview (head + tail)
+        // instead of an error
+        assert!(
+            result.contains("Large file preview") || result.contains("First lines"),
+            "expected preview for large file, got: {}",
+            &result[..result.len().min(200)]
+        );
     }
 
     #[tokio::test]

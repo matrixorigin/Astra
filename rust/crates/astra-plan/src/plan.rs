@@ -563,7 +563,11 @@ impl PlanCommand {
     /// natural-language plan edit or goal description).
     pub fn parse(input: &str) -> Option<PlanCommand> {
         let trimmed = input.trim();
-        let lower = trimmed.to_lowercase();
+        // Strip trailing punctuation (!, !, ?，。etc.) for fuzzy matching
+        let stripped = trimmed.trim_end_matches(|c: char| {
+            matches!(c, '!' | '！' | '?' | '？' | '。' | '，' | ',' | '.')
+        });
+        let lower = stripped.to_lowercase();
 
         // Help
         if matches!(lower.as_str(), "help" | "?" | "帮助" | "commands") {
@@ -1058,6 +1062,22 @@ mod tests {
                 anchor: "setup".to_string()
             })
         );
+    }
+
+    #[test]
+    fn plan_command_parse_strips_trailing_punctuation() {
+        // Chinese punctuation
+        assert_eq!(PlanCommand::parse("继续!"), Some(PlanCommand::Resume));
+        assert_eq!(PlanCommand::parse("继续！"), Some(PlanCommand::Resume));
+        assert_eq!(PlanCommand::parse("执行。"), Some(PlanCommand::Execute { step_by_step: false }));
+        // English punctuation
+        assert_eq!(PlanCommand::parse("continue!"), Some(PlanCommand::Resume));
+        assert_eq!(PlanCommand::parse("go!"), Some(PlanCommand::Execute { step_by_step: false }));
+        assert_eq!(PlanCommand::parse("status?"), Some(PlanCommand::Status));
+        // Multiple punctuation
+        assert_eq!(PlanCommand::parse("继续!!"), Some(PlanCommand::Resume));
+        // No punctuation still works
+        assert_eq!(PlanCommand::parse("继续"), Some(PlanCommand::Resume));
     }
 
     #[test]

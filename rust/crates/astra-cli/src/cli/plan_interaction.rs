@@ -878,11 +878,35 @@ pub async fn handle_plan_mode_input(
 
     // ── Natural-language plan editing via LLM ───────────────────────────
     if plan_execution_ui_active(state) {
+        // When plan is paused (handle exists but monitor exited), non-command
+        // input should abandon the plan per the documented behavior:
+        // "Any other message — abandons the plan and sends it as a normal chat turn"
+        //
+        // Check if this is a /command (which should be allowed) or a correct/note
+        // (which is handled by PlanCommand). If neither, abandon the plan and
+        // return Err to signal the caller should send as chat.
+        if !input.starts_with('/') {
+            // Attempt to cancel the executor
+            if let Some(ref handle) = state.plan_handle {
+                let _ = handle.send_command(crate::plan_executor::PlanCommand::Cancel);
+            }
+            state.plan_handle = None;
+            state.plan_mode = None;
+            state.plan_resume_pending = false;
+            state.executing_plan = None;
+            eprintln!(
+                "  {} Plan abandoned. Sending as normal chat...",
+                theme::icon_warn()
+            );
+            // Return error to signal caller should handle as chat
+            return Err(format!("__SEND_AS_CHAT__:{}", input));
+        }
+        // /commands are allowed during pause — let them fall through to slash handling
         eprintln!(
-            "  {} Plan run is active; LLM edits are paused. Try {}, {}, or {}.",
+            "  {} Plan run is paused. Try {}, {}, {}, or any message to abandon.",
             theme::icon_warn(),
+            "continue".cyan(),
             "status".cyan(),
-            "show".cyan(),
             "exit".cyan()
         );
         return Ok(());

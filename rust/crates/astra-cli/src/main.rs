@@ -493,7 +493,7 @@ async fn run_chat_repl(
                         }
                     } else if state.plan_mode.is_some() {
                         // Plan mode: handle input as plan editing
-                        if let Err(e) = handle_plan_mode_input(
+                        match handle_plan_mode_input(
                             line.clone(),
                             current_token.as_deref(),
                             &mut state,
@@ -501,8 +501,26 @@ async fn run_chat_repl(
                         )
                         .await
                         {
-                            state.plan_resume_pending = false;
-                            return Err(e);
+                            Ok(()) => {}
+                            Err(e) if e.starts_with("__SEND_AS_CHAT__:") => {
+                                // Plan was abandoned; send the message as normal chat
+                                let msg = e.strip_prefix("__SEND_AS_CHAT__:").unwrap_or(&line);
+                                handle_chat_input(
+                                    msg.to_string(),
+                                    current_token.as_deref(),
+                                    &mut state,
+                                    ReplTurnContext {
+                                        api,
+                                        profile,
+                                        selector: &*selector,
+                                    },
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                state.plan_resume_pending = false;
+                                return Err(e);
+                            }
                         }
 
                         // If plan execution was just triggered, start the executor (blocking).
