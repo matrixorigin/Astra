@@ -60,14 +60,10 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
 }
 
 fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
-    let outer_turn = (state.max_turns - state.remaining_turns) as u32;
-    state
-        .telemetry
-        .observability_session
-        .as_ref()
-        .and_then(|s| s.read().ok().map(|g| g.turn_number))
-        .filter(|turn| *turn > 0)
-        .unwrap_or(outer_turn)
+    // Journal turn numbers should match the user-visible outer turn count.
+    // The observability session tracks its own internal counter, which can
+    // include sub-rounds and drift away from the REPL/session journal turn IDs.
+    (state.max_turns - state.remaining_turns).max(1) as u32
 }
 
 async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
@@ -559,6 +555,7 @@ mod tests {
         let hub = crate::observability_integration::ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         state.telemetry.observability_session = Some(session.clone());
+        state.remaining_turns = 9; // first outer turn after prepare_turn_iteration()
         state.max_turn_input_tokens = 100_000;
         state.last_measured_prompt_tokens = Some(25_000);
 
@@ -575,7 +572,7 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.context_traces.len(), 1);
         let trace = &guard.context_traces[0];
-        assert_eq!(trace.turn_id, "turn-0");
+        assert_eq!(trace.turn_id, "turn-1");
         assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
         assert_eq!(trace.token_budget.history_tokens, 5_000);
         assert_eq!(trace.token_budget.total_used, 22_200);
@@ -598,6 +595,7 @@ mod tests {
         state.telemetry.observability_session = Some(session.clone());
         state.max_turn_input_tokens = 100_000;
 
+        state.remaining_turns = 9; // outer turn 1
         session.write().unwrap().turn_number = 1;
         state.last_measured_prompt_tokens = Some(20_000);
         state.telemetry.turn_trace_collector =
@@ -607,6 +605,7 @@ mod tests {
             ));
         finalize_turn_trace(&mut state).await;
 
+        state.remaining_turns = 8; // outer turn 2
         session.write().unwrap().turn_number = 2;
         state.last_measured_prompt_tokens = Some(30_000);
         state.telemetry.turn_trace_collector =
@@ -627,6 +626,8 @@ mod tests {
     #[tokio::test]
     async fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
         let mut state = make_state();
+        state.max_turns = 40;
+        state.remaining_turns = 37; // outer turn 3
         let hub = crate::observability_integration::ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         session.write().unwrap().turn_number = 3;
@@ -648,6 +649,36 @@ mod tests {
         drop(session_guard);
 
         // Journal write is now deferred — verify the pending trace instead.
+        let (turn_num, trace_json) = state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .expect("pending_context_assembly_trace should be set");
+        assert_eq!(*turn_num, 3);
+        assert_eq!(trace_json["turn_id"], "turn-3");
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_trace_uses_outer_turn_when_internal_counter_drifts() {
+        let mut state = make_state();
+        state.max_turns = 40;
+        state.remaining_turns = 37; // outer turn 3
+
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        session.write().unwrap().turn_number = 31;
+        state.current_session_id = Some("s1".to_string());
+        state.telemetry.observability_session = Some(session);
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(42_000);
+
+        finalize_turn_trace(&mut state).await;
+
         let (turn_num, trace_json) = state
             .telemetry
             .pending_context_assembly_trace

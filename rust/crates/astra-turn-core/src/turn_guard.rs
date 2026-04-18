@@ -394,6 +394,22 @@ impl TurnGuard {
                  Reuse the earlier results instead of calling again.",
                 tool_list.join(", ")
             ));
+            for (tool_name, _) in &cache_wasteful {
+                match *tool_name {
+                    "read_file" => injections.push(
+                        "For repeated read_file cache hits, reuse the earlier file output. \
+                         If you need a different slice, switch to start_line/end_line, \
+                         outline=true, grep, or glob instead of rereading the same file."
+                            .to_string(),
+                    ),
+                    "git_diff" => injections.push(
+                        "For repeated git_diff cache hits, reuse the earlier diff until the \
+                         worktree changes, or narrow the diff to a specific path or commit."
+                            .to_string(),
+                    ),
+                    _ => {}
+                }
+            }
             severity = severity.max(VerdictSeverity::Warning);
         }
 
