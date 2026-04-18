@@ -43,6 +43,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "task_get",
     "task_update",
     "task_stop",
+    "tool_search",
     "mo_query",
     "rollback_database_snapshots",
     "grep",
@@ -1936,6 +1937,7 @@ mod tests {
         assert!(names.contains(&"task_get"));
         assert!(names.contains(&"task_update"));
         assert!(names.contains(&"task_stop"));
+        assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"mo_query"));
         assert!(names.contains(&"rollback_database_snapshots"));
         assert!(names.contains(&"memory_retrieve"));

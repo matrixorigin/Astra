@@ -1224,6 +1224,10 @@ impl ServerToolExecutor {
             "task_get" => tool_result_from_output(self.task_get(args)),
             "task_update" => tool_result_from_output(self.task_update(args)),
             "task_stop" => tool_result_from_output(self.task_stop(args)),
+            "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
+                &astra_tools::schemas::server_executor_tool_schemas(),
+                args,
+            )),
             // ── MatrixOne operations ────────────────────────────────────
             "mo_query" => self.server_mo_query(args),
             "rollback_database_snapshots" => {
@@ -1260,8 +1264,9 @@ impl ServerToolExecutor {
                 "Error: Tool '{name}' is not available in server-side execution mode. \
                      Available: bash, read_file, write_file, str_replace, delete_file, rollback_file_edits, \
                      list_dir, adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, \
-                     rollback_session_state, task_*, mo_query, rollback_database_snapshots, grep, glob, git_status, \
-                     git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, memory_*, web_search"
+                     rollback_session_state, task_*, tool_search, mo_query, rollback_database_snapshots, grep, glob, \
+                     git_status, git_diff, git_log, git_show, git_blame, symbols, git_commit, git_revert_commit, \
+                     memory_*, web_search"
             )),
         };
 
@@ -3603,6 +3608,21 @@ esac
             .execute("grep", &json!({"pattern": "ZZZZNOTFOUND"}))
             .await;
         assert!(result.contains("No matches found"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_uses_server_surface() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute("tool_search", &json!({"query": "select:memory_store"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result).expect("tool_search json");
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory_store"));
+        assert_eq!(
+            parsed["missing"].as_array().map(Vec::len),
+            Some(0),
+            "{result}"
+        );
     }
 
     #[tokio::test]
