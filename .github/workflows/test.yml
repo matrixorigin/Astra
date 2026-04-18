@@ -26,7 +26,7 @@ jobs:
         with:
           workspaces: rust
           shared-key: ci-test
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Compile all test binaries (default + bridge-e2e-hooks) without running
       - name: Compile test binaries
         run: |
@@ -93,6 +93,17 @@ jobs:
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-runtime
           --profile ci --test trusted_moi_auth_integration
+      - name: Comment contract failure on PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Regression Gate\n\n❌ Contract tests failed — see [shard-b logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`
+            });
 
   shard-c:
     name: "Test: turn-core + services"
