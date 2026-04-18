@@ -194,11 +194,20 @@ pub trait AgenticLoopHost: Send {
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
 
 /// Request-scoped capability constraints supplied by the external caller.
+///
+/// Tool and skill access are controlled separately:
+/// - `allowed_tools` applies to non-skill tools.
+/// - `allowed_skills` applies to skill visibility/execution via the
+///   `skill` / `discover_skills` tool schemas.
 #[derive(Clone, Debug, Default)]
 pub struct RequestConstraints {
-    /// When set, only this subset of tools may execute for the request.
+    /// When set, only this subset of non-skill tools may execute for the request.
+    ///
+    /// This does not restrict the `skill` or `discover_skills` tool schemas;
+    /// skill access is controlled by `allowed_skills`.
     pub allowed_tools: Option<HashSet<String>>,
-    /// When set, only this subset of skills may be visible/executable.
+    /// When set, only this subset of skills may be visible/executable via
+    /// the `skill` / `discover_skills` tool schemas.
     pub allowed_skills: Option<HashSet<String>>,
 }
 

@@ -39,6 +39,37 @@ use super::run_engine::RunEngine;
 use crate::messaging::router::AgentMailboxRouter;
 use crate::prompts::team_prompts;
 
+fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
+    let normalized = entry.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        Err(format!(
+            "context[{key}] must not contain empty or whitespace-only strings"
+        ))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn parse_request_allowlist_from_context(
+    context: &mut HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<HashSet<String>>, String> {
+    let Some(value) = context.remove(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("context[{key}] must be an array of strings"))?;
+    let mut normalized = HashSet::with_capacity(values.len());
+    for entry in values {
+        let raw = entry
+            .as_str()
+            .ok_or_else(|| format!("context[{key}] must contain only strings"))?;
+        normalized.insert(normalize_context_allowlist_entry(raw, key)?);
+    }
+    Ok(Some(normalized))
+}
+
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
 /// Configuration for a sub-run spawned by delegation.
@@ -1448,30 +1479,14 @@ impl DelegationEngine {
             .context
             .remove(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
         let request_constraints = RequestConstraints::new(
-            request
-                .context
-                .remove(
-                    crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
-                )
-                .and_then(|value| value.as_array().cloned())
-                .map(|values| {
-                    values
-                        .into_iter()
-                        .filter_map(|value| value.as_str().map(|s| s.to_string()))
-                        .collect::<HashSet<_>>()
-                }),
-            request
-                .context
-                .remove(
-                    crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
-                )
-                .and_then(|value| value.as_array().cloned())
-                .map(|values| {
-                    values
-                        .into_iter()
-                        .filter_map(|value| value.as_str().map(|s| s.to_string()))
-                        .collect::<HashSet<_>>()
-                }),
+            parse_request_allowlist_from_context(
+                &mut request.context,
+                crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
+            )?,
+            parse_request_allowlist_from_context(
+                &mut request.context,
+                crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
+            )?,
         );
 
         // Validate first
@@ -4124,6 +4139,52 @@ mod tests {
             result.agent_results[0].output.as_deref(),
             Some("auth_present=false;context_key_present=false")
         );
+    }
+
+    #[test]
+    fn parse_request_allowlist_from_context_normalizes_and_dedupes() {
+        let key = crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let mut context = HashMap::from([(
+            key.to_string(),
+            serde_json::json!([" Bash ", "bash", "READ_FILE"]),
+        )]);
+
+        let parsed = parse_request_allowlist_from_context(&mut context, key)
+            .expect("allowlist should parse")
+            .expect("allowlist should be present");
+
+        let expected = HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        assert_eq!(parsed, expected);
+        assert!(
+            !context.contains_key(key),
+            "key should be removed from context"
+        );
+    }
+
+    #[test]
+    fn parse_request_allowlist_from_context_rejects_non_array_value() {
+        let key = crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let mut context = HashMap::from([(key.to_string(), serde_json::json!("bash"))]);
+
+        let err = parse_request_allowlist_from_context(&mut context, key)
+            .expect_err("non-array allowlist should fail");
+        assert!(err.contains("must be an array of strings"));
+    }
+
+    #[test]
+    fn parse_request_allowlist_from_context_rejects_non_string_or_empty_entries() {
+        let key = crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let mut non_string_context =
+            HashMap::from([(key.to_string(), serde_json::json!(["bash", 42]))]);
+        let err = parse_request_allowlist_from_context(&mut non_string_context, key)
+            .expect_err("non-string entry should fail");
+        assert!(err.contains("must contain only strings"));
+
+        let mut empty_context =
+            HashMap::from([(key.to_string(), serde_json::json!(["bash", "   "]))]);
+        let err = parse_request_allowlist_from_context(&mut empty_context, key)
+            .expect_err("empty entry should fail");
+        assert!(err.contains("must not contain empty or whitespace-only strings"));
     }
 
     #[tokio::test]
