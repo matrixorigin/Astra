@@ -13,6 +13,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use sqlx::{MySql, Row, query};
+use tracing::warn;
 use uuid::Uuid;
 
 mod admin;
@@ -405,6 +406,39 @@ fn normalize_jwt_secret_for_trusted_mode(secret: &str) -> String {
     }
 }
 
+/// Map SQLx failures to HTTP errors; PoolTimedOut → 503 (retryable), others → 500.
+fn map_auth_sqlx(
+    err: sqlx::Error,
+    operation: &'static str,
+    pool: Option<&sqlx::Pool<MySql>>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    if matches!(&err, sqlx::Error::PoolTimedOut) {
+        match pool {
+            Some(p) => {
+                warn!(
+                    target: "astra_services::auth",
+                    operation,
+                    pool_size = p.size(),
+                    pool_idle = p.num_idle(),
+                    "auth database pool acquire timed out"
+                );
+            }
+            None => {
+                warn!(
+                    target: "astra_services::auth",
+                    operation,
+                    "auth database pool acquire timed out (no pool handle for size/idle)"
+                );
+            }
+        }
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pool timed out while waiting for an open connection",
+        );
+    }
+    internal_error(err)
+}
+
 #[async_trait]
 impl AuthService for DatabaseAuthService {
     async fn register(
@@ -412,14 +446,17 @@ impl AuthService for DatabaseAuthService {
         request: AuthRegisterRequestData,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
         validate_register_request(&request)?;
-        let pool = self.get_pool().await.map_err(internal_error)?;
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
         self.ensure_default_roles(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(|e| map_auth_sqlx(e, "register.ensure_default_roles", Some(&pool)))?;
         if self
             .fetch_user_by_username(&pool, &request.username)
             .await
-            .map_err(internal_error)?
+            .map_err(|e| map_auth_sqlx(e, "register.fetch_user_by_username", Some(&pool)))?
             .is_some()
         {
             return Err(error_response(
@@ -430,7 +467,7 @@ impl AuthService for DatabaseAuthService {
         if self
             .fetch_user_by_email(&pool, &request.email)
             .await
-            .map_err(internal_error)?
+            .map_err(|e| map_auth_sqlx(e, "register.fetch_user_by_email", Some(&pool)))?
             .is_some()
         {
             return Err(error_response(
@@ -448,7 +485,10 @@ impl AuthService for DatabaseAuthService {
         let user_id = Uuid::new_v4().to_string();
         let display_name = request.display_name.clone();
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "register.begin_tx", Some(&pool)))?;
         let insert_result = query(
             "INSERT INTO auth_users (user_id, username, email, password_hash, display_name, is_active) \
              VALUES (?, ?, ?, ?, ?, 1)",
@@ -467,7 +507,7 @@ impl AuthService for DatabaseAuthService {
                 if self
                     .fetch_user_by_username(&pool, &request.username)
                     .await
-                    .map_err(internal_error)?
+                    .map_err(|e| map_auth_sqlx(e, "register.fetch_user_by_username_dup", Some(&pool)))?
                     .is_some()
                 {
                     return Err(error_response(
@@ -478,7 +518,7 @@ impl AuthService for DatabaseAuthService {
                 if self
                     .fetch_user_by_email(&pool, &request.email)
                     .await
-                    .map_err(internal_error)?
+                    .map_err(|e| map_auth_sqlx(e, "register.fetch_user_by_email_dup", Some(&pool)))?
                     .is_some()
                 {
                     return Err(error_response(
@@ -487,7 +527,7 @@ impl AuthService for DatabaseAuthService {
                     ));
                 }
             }
-            return Err(internal_error(error));
+            return Err(map_auth_sqlx(error, "register.insert_auth_users", Some(&pool)));
         }
 
         query(
@@ -500,13 +540,11 @@ impl AuthService for DatabaseAuthService {
         .bind(&user_id)
         .execute(&mut *tx)
         .await
-        .map_err(|error| {
-            let message = error.to_string();
-            (message, internal_error(error))
-        })
-        .map_err(|(_, error)| error)?;
+        .map_err(|e| map_auth_sqlx(e, "register.assign_initial_roles", Some(&pool)))?;
 
-        tx.commit().await.map_err(internal_error)?;
+        tx.commit()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "register.commit_tx", Some(&pool)))?;
 
         Ok(AuthUserRecord {
             user_id,
@@ -520,11 +558,14 @@ impl AuthService for DatabaseAuthService {
         &self,
         request: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
         let user = self
             .fetch_user_by_username(&pool, &request.username)
             .await
-            .map_err(internal_error)?
+            .map_err(|e| map_auth_sqlx(e, "login.fetch_user_by_username", Some(&pool)))?
             .ok_or_else(|| {
                 error_response(StatusCode::UNAUTHORIZED, "Invalid username or password")
             })?;
@@ -551,12 +592,15 @@ impl AuthService for DatabaseAuthService {
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "login.begin_tx", Some(&pool)))?;
         query("UPDATE auth_users SET last_login_at = NOW() WHERE user_id = ?")
             .bind(&user.user_id)
             .execute(&mut *tx)
             .await
-            .map_err(internal_error)?;
+            .map_err(|e| map_auth_sqlx(e, "login.update_last_login_at", Some(&pool)))?;
         query(
             "INSERT INTO auth_refresh_tokens (token_id, user_id, token_hash, expires_at, is_revoked) \
              VALUES (?, ?, ?, ?, 0)",
@@ -567,8 +611,10 @@ impl AuthService for DatabaseAuthService {
         .bind(expires_at)
         .execute(&mut *tx)
         .await
-        .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
+        .map_err(|e| map_auth_sqlx(e, "login.insert_refresh_token", Some(&pool)))?;
+        tx.commit()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "login.commit_tx", Some(&pool)))?;
 
         Ok(AuthTokenRecord {
             access_token,
@@ -595,12 +641,15 @@ impl AuthService for DatabaseAuthService {
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
 
-        let pool = self.get_pool().await.map_err(internal_error)?;
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
         let refresh_token_hash = sha256_hex(&request.refresh_token);
         let stored = self
             .fetch_refresh_token(&pool, &refresh_token_hash)
             .await
-            .map_err(internal_error)?
+            .map_err(|e| map_auth_sqlx(e, "refresh.fetch_refresh_token", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Token expired or revoked"))?;
 
         if stored.1 < Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string() {
@@ -613,7 +662,7 @@ impl AuthService for DatabaseAuthService {
         let user = self
             .fetch_user_by_id_or_username(&pool, &user_id, None)
             .await
-            .map_err(internal_error)?
+            .map_err(|e| map_auth_sqlx(e, "refresh.fetch_user_by_id", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
 
         let access_token = self
@@ -627,12 +676,15 @@ impl AuthService for DatabaseAuthService {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "refresh.begin_tx", Some(&pool)))?;
         query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ?")
             .bind(&refresh_token_hash)
             .execute(&mut *tx)
             .await
-            .map_err(internal_error)?;
+            .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
         query(
             "INSERT INTO auth_refresh_tokens (token_id, user_id, token_hash, expires_at, is_revoked) \
              VALUES (?, ?, ?, ?, 0)",
@@ -643,8 +695,10 @@ impl AuthService for DatabaseAuthService {
         .bind(expires_at)
         .execute(&mut *tx)
         .await
-        .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
+        .map_err(|e| map_auth_sqlx(e, "refresh.insert_new_refresh_token", Some(&pool)))?;
+        tx.commit()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "refresh.commit_tx", Some(&pool)))?;
 
         Ok(AuthTokenRecord {
             access_token,
@@ -665,14 +719,17 @@ impl AuthService for DatabaseAuthService {
                 .ok()
                 .and_then(|c| c.sub);
 
-        let pool = self.get_pool().await.map_err(internal_error)?;
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
 
         // Revoke the specific token by hash first (handles even expired tokens gracefully)
         query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ?")
             .bind(sha256_hex(&request.refresh_token))
             .execute(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(|e| map_auth_sqlx(e, "logout.revoke_submitted_token", Some(&pool)))?;
 
         // Also revoke ALL active sessions for this user
         if let Some(uid) = user_id {
@@ -682,7 +739,7 @@ impl AuthService for DatabaseAuthService {
             .bind(uid)
             .execute(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(|e| map_auth_sqlx(e, "logout.revoke_all_user_tokens", Some(&pool)))?;
         }
 
         Ok(())
@@ -706,11 +763,14 @@ impl AuthService for DatabaseAuthService {
             .sub
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let pool = self.get_pool().await.map_err(internal_error)?;
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
         let user = self
             .fetch_user_by_id_or_username(&pool, &user_id, claims.username.as_deref())
             .await
-            .map_err(internal_error)?
+            .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
 
         Ok(AuthUserRecord {

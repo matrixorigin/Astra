@@ -58,10 +58,10 @@ pub async fn build_server_state(
     .with_model_service({
         let encryptor =
             Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
-        Arc::new(DatabaseModelService::new(
-            settings.matrixone.clone(),
-            encryptor,
-        ))
+        Arc::new(
+            DatabaseModelService::new(settings.matrixone.clone(), encryptor)
+                .with_pool(shared_pool.clone()),
+        )
     })
     .with_job_service(Arc::new(InMemoryJobService::new()))
     .with_trigger_service(Arc::new(
@@ -147,10 +147,10 @@ pub async fn build_server_state(
         DatabaseTurnSessionActivityWriter::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
-    .with_admin_authorizer(Arc::new(DatabaseAdminAuthorizer::new(
-        settings.matrixone.clone(),
-        settings.jwt,
-    )))
+    .with_admin_authorizer(Arc::new(
+        DatabaseAdminAuthorizer::new(settings.matrixone.clone(), settings.jwt)
+            .with_pool(shared_pool.clone()),
+    ))
     .with_admin_initializer(Arc::new(
         DatabaseAdminInitializer::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
@@ -169,9 +169,10 @@ pub async fn build_server_state(
         DatabaseAdminFeedbackStatsReader::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
-    .with_admin_user_role_manager(Arc::new(DatabaseAdminUserRoleManager::new(
-        settings.matrixone.clone(),
-    )))
+    .with_admin_user_role_manager(Arc::new(
+        DatabaseAdminUserRoleManager::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone()),
+    ))
     .with_turn_learning_writer(learning_stack.writer.clone())
     .with_task_service(Arc::new(MatrixOneTaskService::from_shared(&shared_pool)))
     .with_edge_registry_service(Arc::new(DatabaseEdgeRegistryService::from_shared(

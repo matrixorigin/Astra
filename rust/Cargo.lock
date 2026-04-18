@@ -133,6 +133,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "tempfile",
  "tokio",
 ]
 
@@ -440,6 +441,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

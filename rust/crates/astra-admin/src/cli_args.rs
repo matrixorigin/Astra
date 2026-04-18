@@ -4,8 +4,9 @@ use clap::{Args, Parser, Subcommand};
 #[command(name = "astra-admin")]
 #[command(about = "Admin CLI — run `astra-admin` for interactive mode")]
 pub(crate) struct Cli {
-    #[arg(long, default_value = "http://127.0.0.1:8000")]
-    pub api_url: String,
+    /// API server base URL (flag > env > config > default) [env: ASTRA_API_URL]
+    #[arg(long)]
+    pub api_url: Option<String>,
     #[arg(long)]
     pub profile: Option<String>,
     #[command(subcommand)]
@@ -271,12 +272,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["astra-admin", "--api-url", "http://localhost:9000", "init"])
                 .unwrap();
-        assert_eq!(cli.api_url, "http://localhost:9000");
+        assert_eq!(cli.api_url.as_deref(), Some("http://localhost:9000"));
     }
 
     #[test]
     fn default_api_url() {
         let cli = Cli::try_parse_from(["astra-admin", "init"]).unwrap();
-        assert_eq!(cli.api_url, "http://127.0.0.1:8000");
+        assert_eq!(cli.api_url, None);
     }
 }

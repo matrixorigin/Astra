@@ -1,16 +1,18 @@
 use std::fs;
 
-use astra_thin_client::ThinClient;
 use astra_thin_client::paths;
+use astra_thin_client::ThinClient;
 use clap::Parser;
 
 mod cli_args;
+mod config;
 mod credentials;
 mod http_helpers;
 mod input;
 mod interactive;
 
 use cli_args::*;
+use config::resolve_api_url;
 use credentials::*;
 use http_helpers::*;
 use input::*;
@@ -19,7 +21,8 @@ use interactive::run_interactive;
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
-    let base = cli.api_url.trim_end_matches('/').to_string();
+    // Resolve API URL: --api-url flag > ASTRA_API_URL env > config file > default
+    let base = resolve_api_url(cli.api_url.as_deref());
     let api = ThinClient::new(&base, None).map_err(|e| e.to_string())?;
     let command = cli.command.unwrap_or(Command::Interactive);
 

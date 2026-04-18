@@ -314,13 +314,13 @@ fn cli_serve_custom_port() {
 #[test]
 fn cli_api_url_default() {
     let cli = Cli::try_parse_from(["astra"]).unwrap();
-    assert_eq!(cli.api_url, "http://127.0.0.1:8000");
+    assert_eq!(cli.api_url, None);
 }
 
 #[test]
 fn cli_api_url_custom() {
     let cli = Cli::try_parse_from(["astra", "--api-url", "http://remote:9000"]).unwrap();
-    assert_eq!(cli.api_url, "http://remote:9000");
+    assert_eq!(cli.api_url.as_deref(), Some("http://remote:9000"));
 }
 
 #[test]
