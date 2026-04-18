@@ -15,11 +15,14 @@ use astra_runtime::turn::tool_result_semantics::{
 };
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use crossterm::style::Stylize;
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use serde_json::{Map, Value};
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -2307,10 +2310,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             ui_indices.push(tool_idx);
         }
 
-        // ── Phase 2: Concurrent execution (no `tokio::spawn` + raw executor pointers) ──
+        // ── Phase 2: Concurrent execution (join_all + panic isolation) ──
         // `ToolExecutor::execute_with_metadata` takes `&self` and is `Sync`; we run all
         // tool futures concurrently on the current runtime via `join_all` so the shared
         // `&ToolExecutor` stays sound without `unsafe impl Send` around raw pointers.
+        // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
+        // a tool failure instead of aborting the whole batch/turn.
         let executor: &crate::edge_tools::ToolExecutor = &*self.executor;
         let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
             conc_reqs
@@ -2319,9 +2324,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
                     async move {
-                        let t0 = Instant::now();
-                        let output = executor.execute_with_metadata(&tool, &args).await;
-                        (output, t0.elapsed().as_millis() as u64)
+                        catch_tool_execution_panic(executor.execute_with_metadata(&tool, &args))
+                            .await
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -4874,6 +4878,36 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
     description.to_string()
 }
 
+fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+async fn catch_tool_execution_panic<F>(future: F) -> (crate::edge_tools::ToolExecutionOutcome, u64)
+where
+    F: Future<Output = crate::edge_tools::ToolExecutionOutcome>,
+{
+    let t0 = Instant::now();
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(output) => (output, t0.elapsed().as_millis() as u64),
+        Err(payload) => (
+            crate::edge_tools::ToolExecutionOutcome {
+                output: format!(
+                    "Tool execution panicked: {}",
+                    panic_payload_summary(payload.as_ref())
+                ),
+                tool_result_fields: None,
+            },
+            0,
+        ),
+    }
+}
+
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
 /// Mirrors `format_tool_description_with_output` but works without full args JSON.
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
@@ -6212,6 +6246,17 @@ mod tests {
             format_tool_display_from_preview("extract_members", Some("src/lib.rs:88")),
             "Extract members: src/lib.rs:88"
         );
+    }
+
+    #[tokio::test]
+    async fn catch_tool_execution_panic_reports_error_output() {
+        let (outcome, duration_ms) = catch_tool_execution_panic(async {
+            panic!("boom");
+        })
+        .await;
+        assert_eq!(duration_ms, 0);
+        assert!(outcome.output.contains("Tool execution panicked: boom"));
+        assert!(outcome.tool_result_fields.is_none());
     }
 
     // ── Skill/MCP output summary tests ──
