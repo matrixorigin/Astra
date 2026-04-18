@@ -12,6 +12,8 @@ use crate::code_intel;
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
+/// Hard ceiling: files above this size are never read into memory for preview.
+const READ_FILE_HARD_LIMIT: usize = 10 * 1024 * 1024;
 const IMAGE_READ_SIZE_LIMIT: u64 = 1_500_000;
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 const BINARY_EXTS: &[&str] = &[
@@ -134,6 +136,14 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     // For large files without explicit range, provide a helpful preview instead of error.
     // This auto-pagination helps the agent understand file structure without manual range specification.
     if !has_range && !outline && metadata.len() as usize > READ_FILE_SIZE_LIMIT {
+        // Hard ceiling: refuse to load extremely large files into memory.
+        if metadata.len() as usize > READ_FILE_HARD_LIMIT {
+            return ToolResult::error(format!(
+                "Error: file is too large ({} bytes). Use start_line/end_line to read a specific range, or outline=true.",
+                metadata.len()
+            ));
+        }
+
         // Read the file anyway for preview
         let content = match read_to_string_lossy(&path) {
             Ok(content) => content,
@@ -193,13 +203,18 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
         // Try to add outline for code files
         let outline_str = render_outline(&path, &content, total_lines);
-        if !outline_str.contains("(no outline available)") {
+        if !outline_str.contains("(no definitions found") {
             preview.push_str(&outline_str);
         }
 
         preview.push_str(
             "\n**Tip**: Use `start_line`/`end_line` to read specific sections, or `outline=true` for definitions only."
         );
+
+        let limit = per_tool_output_limit("read_file");
+        if preview.len() > limit {
+            preview = truncate_output(preview, limit);
+        }
 
         return ToolResult::text(preview);
     }
@@ -783,6 +798,19 @@ mod tests {
             "got: {}",
             result.output
         );
+    }
+
+    #[test]
+    fn read_file_rejects_extremely_large_files() {
+        let tmp = TempDir::new().unwrap();
+        let big_path = tmp.path().join("huge.txt");
+        // Create a file just over the 10MB hard limit using sparse write.
+        let f = std::fs::File::create(&big_path).unwrap();
+        f.set_len((10 * 1024 * 1024 + 1) as u64).unwrap();
+
+        let result = read_file(tmp.path(), &serde_json::json!({"path": "huge.txt"}));
+        assert!(result.is_error, "expected error, got: {}", result.output);
+        assert!(result.output.contains("too large"), "got: {}", result.output);
     }
 
     #[test]
