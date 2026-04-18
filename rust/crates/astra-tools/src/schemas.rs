@@ -21,6 +21,7 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "git_blame",
     "git_commit",
     "git_revert_commit",
+    "web_fetch",
     "web_search",
 ];
 
@@ -1930,14 +1931,18 @@ mod tests {
     }
 
     #[test]
-    fn default_executor_tool_schemas_exclude_unsupported_tools() {
+    fn default_executor_tool_schemas_match_supported_surface() {
         let schemas = default_executor_tool_schemas();
         let names = schema_names(&schemas);
-        assert!(names.contains(&"git_revert_commit"));
+        for &name in DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                names.contains(&name),
+                "{name} should have a default executor schema"
+            );
+        }
         assert!(!names.contains(&"tool_search"));
         assert!(!names.contains(&"github_list_prs"));
         assert!(!names.contains(&"symbols"));
-        assert!(!names.contains(&"web_fetch"));
         assert!(!names.contains(&"rollback_file_edits"));
         assert!(!names.contains(&"memory_store"));
         assert!(!names.contains(&"powershell"));
@@ -2014,6 +2019,31 @@ mod tests {
             assert!(
                 allow.contains(name),
                 "schema defines `{name}` but it is missing from SERVER_EXECUTOR_TOOL_NAMES"
+            );
+        }
+    }
+
+    /// Default CLI/edge executor names must remain promotable to the server allowlist without
+    /// forgetting to add new defaults when expanding server coverage.
+    #[test]
+    fn default_executor_tool_names_are_subset_of_server_allowlist() {
+        let allow: HashSet<&str> = SERVER_EXECUTOR_TOOL_NAMES.iter().copied().collect();
+        for name in DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                allow.contains(name),
+                "`{name}` is in DEFAULT_EXECUTOR_TOOL_NAMES but missing from SERVER_EXECUTOR_TOOL_NAMES"
+            );
+        }
+    }
+
+    #[test]
+    fn default_executor_tool_schemas_are_subset_of_server_executor_schemas() {
+        let server_schemas = server_executor_tool_schemas();
+        let server_names: HashSet<&str> = schema_names(&server_schemas).into_iter().collect();
+        for name in schema_names(&default_executor_tool_schemas()) {
+            assert!(
+                server_names.contains(name),
+                "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
             );
         }
     }

@@ -108,7 +108,7 @@ const TOOL_GROUPS: &[&[&str]] = &[
     // File reading tools
     &["read_file", "grep", "glob", "list_dir"],
     // File writing tools
-    &["write_file", "str_replace"],
+    &["write_file", "str_replace", "multi_edit"],
     // Memory tools
     &[
         "memory_store",
@@ -613,6 +613,13 @@ mod tests {
     fn suggest_memory_alternatives() {
         let alts = suggest_alternatives("memory_store", &[]);
         assert!(alts.contains(&"memory_search".to_string()));
+    }
+
+    #[test]
+    fn suggest_multi_edit_alternatives() {
+        let alts = suggest_alternatives("multi_edit", &[]);
+        assert!(alts.contains(&"write_file".to_string()));
+        assert!(alts.contains(&"str_replace".to_string()));
     }
 
     // ── Recovery message ──

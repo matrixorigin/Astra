@@ -433,6 +433,10 @@ mod tests {
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
         assert_eq!(pl["query"], "rust patterns");
+        assert!(
+            pl.get("min_confidence").is_none(),
+            "min_confidence should only be sent when explicitly provided"
+        );
 
         // search
         let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
@@ -483,6 +487,17 @@ mod tests {
         let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("user_id").is_none());
+        assert!(
+            pl.get("min_confidence").is_none(),
+            "min_confidence omitted when not provided"
+        );
+    }
+
+    #[test]
+    fn build_direct_request_retrieve_respects_explicit_min_confidence() {
+        let args = json!({"query": "q", "min_confidence": 0.7});
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        assert_eq!(pl["min_confidence"], json!(0.7));
     }
 
     // ── Session isolation: retrieve forwards filter_session & include_cross_session ──

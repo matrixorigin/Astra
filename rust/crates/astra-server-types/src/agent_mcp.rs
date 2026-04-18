@@ -63,7 +63,7 @@ impl McpProjectConfig {
 
         if yaml_path.exists()
             && let Ok(content) = std::fs::read_to_string(&yaml_path)
-            && let Ok(config) = serde_yml::from_str(&content)
+            && let Ok(config) = serde_yaml_ng::from_str(&content)
         {
             return config;
         }

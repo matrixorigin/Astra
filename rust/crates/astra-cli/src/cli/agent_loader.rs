@@ -186,7 +186,7 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
             mcp_servers: None,
         }
     } else {
-        serde_yml::from_str(fm_str).map_err(|e| format!("YAML parse error: {e}"))?
+        serde_yaml_ng::from_str(fm_str).map_err(|e| format!("YAML parse error: {e}"))?
     };
 
     let file_stem = path

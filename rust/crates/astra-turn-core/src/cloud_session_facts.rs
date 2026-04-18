@@ -31,7 +31,7 @@ pub struct SessionFacts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: String,
-    /// "read", "write", or "create"
+    /// "read", "write", or "create"; "write" covers all non-create mutations, including deletes.
     pub last_action: String,
     pub turn: u32,
 }
@@ -228,8 +228,11 @@ fn parse_path_from_json_preview(preview: &str) -> Option<String> {
 
 fn action_for_tool(tool_name: &str) -> String {
     match tool_name {
-        "write_to_file" | "create_file" => "write".to_string(),
-        "str_replace" | "str_replace_editor" => "write".to_string(),
+        "create_file" => "create".to_string(),
+        "write_to_file" | "write_file" => "write".to_string(),
+        "edit_file" | "str_replace" | "str_replace_editor" | "multi_edit" | "delete_file" => {
+            "write".to_string()
+        }
         "insert_content" | "append_to_file" => "write".to_string(),
         _ => "read".to_string(),
     }
@@ -297,6 +300,27 @@ mod tests {
         assert_eq!(facts.active_files[0].last_action, "read");
         assert_eq!(facts.active_files[1].path, "src/lib.rs");
         assert_eq!(facts.active_files[1].last_action, "write");
+    }
+
+    #[test]
+    fn update_tracks_create_and_recent_file_mutation_actions() {
+        let mut facts = SessionFacts::default();
+        let event = make_event(
+            1,
+            vec![
+                make_tc("create_file", true, Some("new.rs"), None),
+                make_tc("write_file", true, Some("existing.rs"), None),
+                make_tc("multi_edit", true, Some("batch.rs"), None),
+                make_tc("delete_file", true, Some("gone.rs"), None),
+            ],
+        );
+        facts.update_from_journal_event(&event);
+
+        assert_eq!(facts.active_files.len(), 4);
+        assert_eq!(facts.active_files[0].last_action, "create");
+        assert_eq!(facts.active_files[1].last_action, "write");
+        assert_eq!(facts.active_files[2].last_action, "write");
+        assert_eq!(facts.active_files[3].last_action, "write");
     }
 
     #[test]

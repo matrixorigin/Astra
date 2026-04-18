@@ -4,7 +4,7 @@
 ///
 /// | Behavior | Implementation |
 /// |------------------------|------|
-/// | Long-lived stream “stall” / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (90s default, `MO_STREAM_IDLE_TIMEOUT_MS`) |
+/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default, `MO_STREAM_IDLE_TIMEOUT_MS`) |
 /// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm_client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm_client::wait_until_cancelled_or_pending) in the bridge stream |
@@ -55,7 +55,11 @@ use futures_util::{StreamExt, stream};
 /// Maximum number of read-only tools to execute concurrently.
 /// Prevents resource exhaustion from parallel tool execution.
 const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 10;
+use astra_tools::executor::DefaultToolExecutor;
+use astra_tools::{SandboxConfig, SandboxMode, ToolContext, ToolExecutor, TracingLogger};
 use serde_json::{Map, Value, json};
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -76,10 +80,10 @@ use crate::{
     },
     turn::cloud_tool_delivery::{
         ApprovalAuditContext, cloud_tool_requires_approval_for_delivery,
-        record_approval_required_audit, sse_maps_through_tool_request,
-        tool_approval_detail_for_delivery, tool_approval_kind_for_delivery,
-        tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
-        wait_tool_result_ledger_for_tool,
+        local_tool_execution_delivery, record_approval_required_audit,
+        sse_maps_through_tool_request, tool_approval_detail_for_delivery,
+        tool_approval_kind_for_delivery, tool_path_hint_for_delivery,
+        wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
     },
     turn::edge_ledger::{
         assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
@@ -94,7 +98,8 @@ use crate::{
     },
     turn::stall::cli_agentic_tool_round_budget_abort_msg,
     turn::stream_events::build_approval_required_event,
-    turn::tool_call_shape::tool_call_name,
+    turn::tool_argument_hints::normalize_llm_function_arguments,
+    turn::tool_call_shape::{tool_call_arguments_value, tool_call_name},
     turn::tool_schema_prune::prune_tool_schemas,
     turn::turn_guard::TurnGuard,
 };
@@ -1098,7 +1103,8 @@ async fn call_llm_stream(
             let base_url_for_fallback = base_url.to_string();
             let provider_for_fallback = provider.to_string();
             let max_out_for_fallback = max_output_tokens;
-            let idle_dur = crate::turn::llm_client::stream_idle_timeout();
+            let idle_pre = crate::turn::llm_client::stream_idle_timeout();
+            let idle_post = crate::turn::llm_client::stream_idle_timeout_after_progress();
 
             let out = stream! {
                 let cc = client_cancel.clone();
@@ -1107,11 +1113,13 @@ async fn call_llm_stream(
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
+                let mut made_progress = false;
 
                 let sse = crate::turn::llm_client::parse_openai_sse_json_stream(byte_stream);
                 tokio::pin!(sse);
 
                 loop {
+                    let idle = if made_progress { idle_post } else { idle_pre };
                     tokio::select! {
                         biased;
                         _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
@@ -1124,15 +1132,16 @@ async fn call_llm_stream(
                             reasoning.clear();
                             break;
                         }
-                        tick = tokio::time::timeout(idle_dur, sse.next()) => {
+                        tick = tokio::time::timeout(idle, sse.next()) => {
                             let next = tick;
                             let chunk = match next {
                                 Ok(c) => c,
                                 Err(_) => {
                                     astra_core::agent_warn!(
                                         "llm",
-                                        "in-process stream idle after {}ms — attempting non-stream fallback",
-                                        idle_dur.as_millis()
+                                        "in-process stream idle after {}ms (made_progress={}) — attempting non-stream fallback",
+                                        idle.as_millis(),
+                                        made_progress
                                     );
                                     tool_calls_map.clear();
                                     full_text.clear();
@@ -1219,6 +1228,7 @@ async fn call_llm_stream(
                             };
                             // Some providers attach usage to a chunk that also contains choices,
                             // so parse usage first on every chunk.
+                            made_progress = true;
                             if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
                                 let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
                                 let completion = u.get("completion_tokens").and_then(Value::as_i64);
@@ -2574,6 +2584,14 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     &loop_reasoning,
                     !reasoning.is_empty() || history_has_reasoning(&llm_messages),
                 ));
+                // Tool delivery matrix for this generator (legacy `/chat/turn`):
+                // - Approval-gated + empty `edge_tools`: fast-fail via `local_tool_execution_delivery`
+                //   (no edge client for §5.5 POST /approval/respond or /tools/result).
+                // - Approval-gated + non-empty `edge_tools`: sequential §5.5 ledger
+                //   (audit + approval_required → wait approval → tool_request → wait result).
+                // - Read-only batch: empty `edge_tools` → `DefaultToolExecutor` + cwd; else concurrent
+                //   `wait_tool_result_ledger_for_tool` after broadcasting all `tool_request` maps.
+                // (`cloud_tool_requires_approval_for_delivery` / bash read-only rules live in astra-turn-core.)
                 // ── Tool delivery: approval tools sequential, read-only concurrent ──
                 let mut read_only_tcs: Vec<Value> = Vec::new();
                 for tc in loop_tool_calls.iter() {
@@ -2582,7 +2600,33 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         read_only_tcs.push(tc.clone());
                         continue;
                     }
-                    // Sequential: approval → wait → request → wait
+                    if edge_tools.is_empty() {
+                        // No edge tool schemas: §5.5 approval/result round-trip has no edge client
+                        // to POST /approval/respond or /tools/result — fail fast instead of ledger timeout.
+                        let tool_name = tc_map
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let tail = local_tool_execution_delivery(
+                            tc,
+                            &format!(
+                                "approval-required tool `{tool_name}` cannot execute: no edge agent connected"
+                            ),
+                            true,
+                        );
+                        for m in tail.sse_maps {
+                            yield render_sse_map(&m);
+                        }
+                        record_turn_guard_tool_results(
+                            &mut bridge_turn_guard,
+                            &tail.persist_tool_results,
+                        );
+                        merged_tool_results.extend(tail.persist_tool_results);
+                        llm_messages.extend(tail.tool_messages);
+                        continue;
+                    }
+                    // Sequential: approval → wait → request → wait (§5.5 ledger + edge agent).
                     let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
                     let tool_name = tc_map
                         .get("function")
@@ -2625,39 +2669,39 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         path.as_deref(),
                         detail.as_deref(),
                     ));
-                        let approval = match await_with_client_disconnect(
-                            cc.as_deref(),
-                            wait_approval_ledger_for_tool(
-                                &edge_callback_ledger,
-                                &user_id,
-                                tc,
-                                ledger_wait,
-                                Some(&approval_audit_context),
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(approval) => approval,
-                            Err(event) => {
-                                yield render_sse_map(&event);
-                                return;
-                            }
-                        };
-                        match approval {
-                            Ok(()) => {}
-                            Err(part) => {
-                                record_turn_guard_tool_results(
-                                    &mut bridge_turn_guard,
-                                    &part.persist_tool_results,
-                                );
-                                for m in part.sse_maps {
-                                    yield render_sse_map(&m);
-                                }
-                                merged_tool_results.extend(part.persist_tool_results);
-                                llm_messages.extend(part.tool_messages);
-                                continue;
-                            }
+                    let approval = match await_with_client_disconnect(
+                        cc.as_deref(),
+                        wait_approval_ledger_for_tool(
+                            &edge_callback_ledger,
+                            &user_id,
+                            tc,
+                            ledger_wait,
+                            Some(&approval_audit_context),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(approval) => approval,
+                        Err(event) => {
+                            yield render_sse_map(&event);
+                            return;
                         }
+                    };
+                    match approval {
+                        Ok(()) => {}
+                        Err(part) => {
+                            record_turn_guard_tool_results(
+                                &mut bridge_turn_guard,
+                                &part.persist_tool_results,
+                            );
+                            for m in part.sse_maps {
+                                yield render_sse_map(&m);
+                            }
+                            merged_tool_results.extend(part.persist_tool_results);
+                            llm_messages.extend(part.tool_messages);
+                            continue;
+                        }
+                    }
                     for m in sse_maps_through_tool_request(tc) {
                         yield render_sse_map(&m);
                     }
@@ -2681,7 +2725,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     for m in tail.sse_maps {
                         yield render_sse_map(&m);
                     }
-                    record_turn_guard_tool_results(&mut bridge_turn_guard, &tail.persist_tool_results);
+                    record_turn_guard_tool_results(
+                        &mut bridge_turn_guard,
+                        &tail.persist_tool_results,
+                    );
                     merged_tool_results.extend(tail.persist_tool_results);
                     llm_messages.extend(tail.tool_messages);
                 }
@@ -2693,41 +2740,132 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             yield render_sse_map(&m);
                         }
                     }
-                    // Use buffer_unordered to limit concurrent tool executions.
-                    // This prevents resource exhaustion when many tools are called.
-                    let tool_stream = stream::iter(read_only_tcs.into_iter().map(|tc| {
-                        let ledger = edge_callback_ledger.clone();
-                        let uid = user_id.clone();
-                        async move {
-                            wait_tool_result_ledger_for_tool(
-                                &ledger, &uid, &tc, ledger_wait,
-                            ).await
-                        }
-                    })).buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
-                    tokio::pin!(tool_stream);
-                    loop {
-                        let next_tail = match await_with_client_disconnect(
-                            cc.as_deref(),
-                            tool_stream.next(),
-                        )
-                        .await
-                        {
-                            Ok(next_tail) => next_tail,
-                            Err(event) => {
-                                yield render_sse_map(&event);
-                                return;
-                            }
+                    if edge_tools.is_empty() {
+                        // No edge agent: execute read-only tools locally (requires cwd workspace).
+                        let cwd_str = edge_profile
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty());
+                        let Some(cwd_str) = cwd_str else {
+                            yield render_sse_map(&build_stream_error_event(
+                                "edge_tools is empty but edge_profile.cwd is missing; cannot execute read-only tools on the server",
+                                "LOCAL_TOOL_NO_WORKSPACE",
+                                false,
+                            ));
+                            return;
                         };
-                        let Some(tail) = next_tail else { break };
-                        for m in tail.sse_maps {
-                            yield render_sse_map(&m);
+                        let root = PathBuf::from(cwd_str);
+                        if !root.is_dir() {
+                            yield render_sse_map(&build_stream_error_event(
+                                &format!(
+                                    "edge_profile.cwd is not a directory: {}",
+                                    root.display()
+                                ),
+                                "LOCAL_TOOL_NO_WORKSPACE",
+                                false,
+                            ));
+                            return;
                         }
-                        record_turn_guard_tool_results(
-                            &mut bridge_turn_guard,
-                            &tail.persist_tool_results,
-                        );
-                        merged_tool_results.extend(tail.persist_tool_results);
-                        llm_messages.extend(tail.tool_messages);
+                        // SandboxConfig for server-side read-only tool execution:
+                        // The primary protection is the SERVER_EXECUTOR_TOOL_NAMES allowlist,
+                        // which only includes read-only tools. SandboxMode::ReadOnly and
+                        // network_allowed=false serve as a future enforcement layer; currently
+                        // individual tools do not check sandbox mode at dispatch time.
+                        // 30s command timeout (vs 120s strict default) — server should be more
+                        // conservative, failing fast on stalled commands.
+                        let sandbox = SandboxConfig {
+                            project_root: root.clone(),
+                            allowed_paths: vec![PathBuf::from("/tmp")],
+                            mode: SandboxMode::ReadOnly,
+                            max_output_bytes: 200_000,
+                            command_timeout: Duration::from_secs(30),
+                            network_allowed: false,
+                        };
+                        let ctx = ToolContext {
+                            project_root: root.clone(),
+                            workspace_root: root,
+                            user_id: user_id.clone(),
+                            session_id: session_id.clone(),
+                            sandbox,
+                            http_client: None,
+                            logger: Arc::new(TracingLogger),
+                            cancel_token: None,
+                        };
+                        let executor = Arc::new(DefaultToolExecutor::new(ctx));
+                        let local_ro = read_only_tcs;
+                        let local_futs = stream::iter(local_ro.into_iter().map(|tc| {
+                            let exec = executor.clone();
+                            async move {
+                                let Some(name) = tool_call_name(&tc) else {
+                                    tracing::warn!(
+                                        tool_call = %tc,
+                                        "skipping local tool call with missing name"
+                                    );
+                                    return None;
+                                };
+                                let args =
+                                    normalize_llm_function_arguments(&tool_call_arguments_value(&tc));
+                                let result = exec.execute(name, &args).await;
+                                Some(local_tool_execution_delivery(
+                                    &tc,
+                                    &result.output,
+                                    result.is_error,
+                                ))
+                            }
+                        }))
+                        .buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
+                        tokio::pin!(local_futs);
+                        while let Some(tail) = local_futs.next().await.flatten() {
+                            for m in tail.sse_maps {
+                                yield render_sse_map(&m);
+                            }
+                            record_turn_guard_tool_results(
+                                &mut bridge_turn_guard,
+                                &tail.persist_tool_results,
+                            );
+                            merged_tool_results.extend(tail.persist_tool_results);
+                            llm_messages.extend(tail.tool_messages);
+                        }
+                    } else {
+                        // Use buffer_unordered to limit concurrent tool executions.
+                        // This prevents resource exhaustion when many tools are called.
+                        let ro = read_only_tcs.clone();
+                        let tool_stream = stream::iter(ro.into_iter().map(|tc| {
+                            let ledger = edge_callback_ledger.clone();
+                            let uid = user_id.clone();
+                            async move {
+                                wait_tool_result_ledger_for_tool(
+                                    &ledger, &uid, &tc, ledger_wait,
+                                )
+                                .await
+                            }
+                        }))
+                        .buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
+                        tokio::pin!(tool_stream);
+                        loop {
+                            let next_tail = match await_with_client_disconnect(
+                                cc.as_deref(),
+                                tool_stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(next_tail) => next_tail,
+                                Err(event) => {
+                                    yield render_sse_map(&event);
+                                    return;
+                                }
+                            };
+                            let Some(tail) = next_tail else { break };
+                            for m in tail.sse_maps {
+                                yield render_sse_map(&m);
+                            }
+                            record_turn_guard_tool_results(
+                                &mut bridge_turn_guard,
+                                &tail.persist_tool_results,
+                            );
+                            merged_tool_results.extend(tail.persist_tool_results);
+                            llm_messages.extend(tail.tool_messages);
+                        }
                     }
                 }
 

@@ -23,6 +23,7 @@ use astra_runtime::{
     turn::edge_ledger::{LEDGER_MAX_ENTRIES, MSG_TOOL_LEDGER_TIMEOUT},
 };
 use astra_services::session_journal::{JournalDirGuard, find_latest_approval_decision};
+use astra_turn_core::cloud_tool_delivery::MSG_APPROVAL_LEDGER_TIMEOUT;
 use async_trait::async_trait;
 use axum::{
     Router,
@@ -31,6 +32,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use tempfile::tempdir;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 
@@ -739,12 +741,22 @@ async fn approval_denied_skips_tool_execution() {
     let events = parse_sse_events(&full);
     let approval_event = events
         .iter()
-        .find(|e| e["type"] == "approval_required" && e.to_string().contains("tc-deny-1"))
+        .find(|e| {
+            e.get("type").and_then(Value::as_str) == Some("approval_required")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-deny-1")
+        })
         .expect("approval_required event for denied bash");
     assert_eq!(approval_event["approval_kind"], "explicit");
+    assert_eq!(
+        approval_event.get("tool").and_then(Value::as_str),
+        Some("bash")
+    );
     let tool_requests: Vec<_> = events
         .iter()
-        .filter(|e| e["type"] == "tool_request" && e.to_string().contains("tc-deny-1"))
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_request")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-deny-1")
+        })
         .collect();
     assert!(
         tool_requests.is_empty(),
@@ -955,6 +967,140 @@ async fn tool_result_timeout_when_edge_never_responds() {
         all_events
             .iter()
             .map(|e| format!("{}:{}", e.event_type, &e.content[..e.content.len().min(80)]))
+            .collect::<Vec<_>>()
+    );
+
+    let evs = parse_sse_events(&full);
+    let req_ev = evs
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_request")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-timeout-1")
+        })
+        .expect("structured tool_request for tc-timeout-1");
+    assert_eq!(
+        req_ev.get("tool").and_then(Value::as_str),
+        Some("read_file")
+    );
+    let ends: Vec<_> = evs
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                && e.get("call_id").and_then(Value::as_str) == Some("tc-timeout-1")
+        })
+        .collect();
+    assert!(
+        !ends.is_empty(),
+        "expected tool_call_end for tc-timeout-1: {evs:?}"
+    );
+    let end_s = ends[0]
+        .get("result")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    assert!(
+        end_s.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "tool_call_end should carry ledger timeout text: {end_s}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 5b: Approval ledger timeout — edge never POST /approval/respond
+//
+// Run separately: MO_TURN_TIMEOUT_S=3 cargo test ... -- approval_timeout --ignored
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore = "requires MO_TURN_TIMEOUT_S=3 to avoid long ledger wait; run: MO_TURN_TIMEOUT_S=3 cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test edge_cloud_round_trip_e2e --features bridge-e2e-hooks -- approval_timeout_when_edge_never_posts_approval --ignored --nocapture"]
+async fn approval_timeout_when_edge_never_posts_approval() {
+    init_env();
+    let capture = Capture::default();
+    let app = build_app_with_capture(capture.clone());
+
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "write out.txt" }],
+        "edge_tools": [tool_schema("write_file")],
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-appr-to-1", "write_file", json!({"path": "out.txt", "content": "x"}))] },
+            { "full_text": "Stopped after approval wait." }
+        ]
+    });
+
+    // Never POST /approval/respond — approval wait uses turn timeout (see MO_TURN_TIMEOUT_S).
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let full = String::from_utf8_lossy(&raw);
+    let events = parse_sse_events(&full);
+
+    let appr: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("approval_required")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-appr-to-1")
+        })
+        .collect();
+    assert_eq!(
+        appr.len(),
+        1,
+        "expected exactly one approval_required for tc-appr-to-1: {events:?}"
+    );
+
+    let wf_requests: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_request")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-appr-to-1")
+        })
+        .collect();
+    assert!(
+        wf_requests.is_empty(),
+        "approval timeout must not emit tool_request for write_file: {wf_requests:?}"
+    );
+
+    let ends: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                && e.get("call_id").and_then(Value::as_str) == Some("tc-appr-to-1")
+        })
+        .collect();
+    assert!(
+        !ends.is_empty(),
+        "expected tool_call_end for tc-appr-to-1: {events:?}"
+    );
+    let end_s = ends[0]
+        .get("result")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    assert!(
+        end_s.contains(MSG_APPROVAL_LEDGER_TIMEOUT),
+        "tool_call_end should carry approval timeout text: {end_s}"
+    );
+
+    assert!(
+        full.contains("Stopped after approval wait"),
+        "second mock round should stream: {full}"
+    );
+
+    wait_persist().await;
+    let plans = capture.plans.lock().await;
+    let all_events: Vec<_> = plans.iter().flat_map(|p| &p.events).collect();
+    let timeout_rows: Vec<_> = all_events
+        .iter()
+        .filter(|e| {
+            e.event_type == "tool_result"
+                && e.content
+                    .contains("timed out waiting for edge POST /approval/respond")
+        })
+        .collect();
+    assert!(
+        !timeout_rows.is_empty(),
+        "expected persisted tool_result for approval timeout: {:?}",
+        all_events
+            .iter()
+            .filter(|e| e.event_type == "tool_result")
+            .map(|e| &e.content[..e.content.len().min(120)])
             .collect::<Vec<_>>()
     );
 }
@@ -1352,28 +1498,59 @@ async fn mixed_approval_and_readonly_in_same_round() {
 
     // Verify ordering: approval_required for write_file comes before its tool_request
     let events = parse_sse_events(&full);
+    let wf_approvals: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("approval_required")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-mix-wf")
+        })
+        .collect();
+    assert_eq!(
+        wf_approvals.len(),
+        1,
+        "expected exactly one approval_required for tc-mix-wf; got {} matching events in {} parsed events",
+        wf_approvals.len(),
+        events.len()
+    );
     let appr_idx = events
         .iter()
-        .position(|e| e["type"] == "approval_required" && e.to_string().contains("tc-mix-wf"));
+        .position(|e| {
+            e.get("type").and_then(Value::as_str) == Some("approval_required")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-mix-wf")
+        })
+        .expect("approval_required for tc-mix-wf must be present");
     let wf_req_idx = events
         .iter()
-        .position(|e| e["type"] == "tool_request" && e.to_string().contains("tc-mix-wf"));
-    if let (Some(a), Some(r)) = (appr_idx, wf_req_idx) {
-        assert!(
-            a < r,
-            "approval_required must precede tool_request for write_file"
-        );
-    }
+        .position(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_request")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-mix-wf")
+        })
+        .expect("tool_request for tc-mix-wf must be present");
+    assert!(
+        appr_idx < wf_req_idx,
+        "approval_required must precede tool_request for write_file (indices {appr_idx} vs {wf_req_idx})"
+    );
 
     // read_file and grep should NOT have approval_required events
     let rf_approvals: Vec<_> = events
         .iter()
-        .filter(|e| e["type"] == "approval_required" && e.to_string().contains("tc-mix-rf"))
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("approval_required")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-mix-rf")
+        })
         .collect();
     assert!(
         rf_approvals.is_empty(),
         "read_file should not need approval"
     );
+    let gr_approvals: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("approval_required")
+                && e.get("request_id").and_then(Value::as_str) == Some("tc-mix-gr")
+        })
+        .collect();
+    assert!(gr_approvals.is_empty(), "grep should not need approval");
 
     assert!(
         full.contains("Config updated and verified"),
@@ -1395,6 +1572,102 @@ async fn mixed_approval_and_readonly_in_same_round() {
     assert!(
         result_count >= 3,
         "expected ≥3 persisted tool_results, got {result_count}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 11b: empty edge_tools — read-only tool runs on server (no POST /tools/result)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn empty_edge_tools_read_file_executes_on_server_without_tools_result() {
+    init_env();
+    let app = build_app_with_capture(Capture::default());
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.txt"), b"server-local").unwrap();
+    let cwd = dir.path().to_string_lossy();
+
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "read hello" }],
+        "edge_tools": [],
+        "edge_profile": { "cwd": cwd.as_ref() },
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-srv-rf", "read_file", json!({"path": "hello.txt"}))] },
+            { "full_text": "round two ok" }
+        ]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let full = String::from_utf8_lossy(&raw);
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "should not ledger-timeout without edge: {full}"
+    );
+    assert!(
+        full.contains("server-local"),
+        "expected read_file body in SSE stream: {full}"
+    );
+    assert!(
+        full.contains("round two ok"),
+        "expected second mock LLM round: {full}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test 11c: empty edge_tools — approval-required tool fast-fails (no ledger hang)
+// (write_file always needs approval; read-only bash like `echo hi` would execute locally.)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn empty_edge_tools_approval_required_fast_fails() {
+    init_env();
+    let app = build_app_with_capture(Capture::default());
+    let dir = tempdir().unwrap();
+    let cwd = dir.path().to_string_lossy();
+
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "write config" }],
+        "edge_tools": [],
+        "edge_profile": { "cwd": cwd.as_ref() },
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-srv-wf", "write_file", json!({"path": "out.txt", "content": "x"}))] },
+            { "full_text": "round two ok" }
+        ]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let full = String::from_utf8_lossy(&raw);
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "should not ledger-timeout for approval tool without edge: {full}"
+    );
+    let events = parse_sse_events(&full);
+    let wf_ends: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                && e.get("call_id").and_then(Value::as_str) == Some("tc-srv-wf")
+        })
+        .collect();
+    assert!(
+        !wf_ends.is_empty(),
+        "expected tool_call_end for tc-srv-wf, parsed events: {events:?}"
+    );
+    let end_msg = wf_ends[0]
+        .get("result")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    assert!(
+        end_msg.contains("no edge agent connected"),
+        "tool_call_end result should include fast-fail message: {end_msg}"
+    );
+    assert!(
+        full.contains("round two ok"),
+        "expected second mock LLM round: {full}"
     );
 }
 
