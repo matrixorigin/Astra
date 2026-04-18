@@ -357,7 +357,12 @@ fn resolve_git_dir(root: &Path) -> Option<std::path::PathBuf> {
         && let Ok(content) = std::fs::read_to_string(&git_path)
         && let Some(gd) = content.trim().strip_prefix("gitdir: ")
     {
-        let path = std::path::PathBuf::from(gd);
+        let raw_path = std::path::PathBuf::from(gd);
+        let path = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            git_path.parent().unwrap_or(root).join(raw_path)
+        };
         if path.exists() && path.join("HEAD").exists() {
             return Some(path);
         }
@@ -4489,14 +4494,38 @@ Done!"#;
 
     #[test]
     fn analyze_project_detects_git_branch() {
-        // This test runs in a git repo
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .expect("should find repo root");
-        let ctx = analyze_project(root);
-        assert!(ctx.git_branch.is_some(), "should detect git branch");
+        let dir = tempfile::TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature/test\n").unwrap();
+        std::fs::write(git_dir.join("index"), "").unwrap();
+
+        let ctx = analyze_project(dir.path());
+        assert_eq!(ctx.git_branch.as_deref(), Some("feature/test"));
+        assert!(
+            ctx.has_uncommitted_changes,
+            "index presence marks repo state"
+        );
+    }
+
+    #[test]
+    fn analyze_project_detects_git_branch_from_relative_worktree_gitfile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let actual_git_dir = dir.path().join(".git-worktrees").join("feature-test");
+        std::fs::create_dir_all(&actual_git_dir).unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: .git-worktrees/feature-test\n",
+        )
+        .unwrap();
+        std::fs::write(
+            actual_git_dir.join("HEAD"),
+            "ref: refs/heads/worktree/feature-test\n",
+        )
+        .unwrap();
+
+        let ctx = analyze_project(dir.path());
+        assert_eq!(ctx.git_branch.as_deref(), Some("worktree/feature-test"));
     }
 
     #[test]
