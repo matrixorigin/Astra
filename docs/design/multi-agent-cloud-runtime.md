@@ -115,7 +115,7 @@ rust/crates/
 │   ├── tool_selector.rs     # LearnedContext, TfIdf/LLM/FallbackSelector
 │   ├── tool_registry/       # 8 modules: registry, scoring, report, meta
 │   ├── turn/                # 38 modules: bridge, stall detection, error recovery, health
-│   │   ├── bridge_inprocess.rs  # In-process ChatTurnBridge; calls services for active LLM resolution
+│   │   ├── bridge_inprocess.rs  # InProcessChatTurnBridge; single-call LLM proxy for /chat/turn
 │   │   ├── tool_health.rs       # Session-scoped error budgets, deprioritization
 │   │   └── stall.rs             # TurnGuard, intent drift detection
 │   └── pipeline/            # 18 modules: cognitive engine
@@ -1966,7 +1966,7 @@ astra Orchestrator
 | `/chat/turn` SSE JSON dispatch | `runtime/src/turn/chat_turn_sse_dispatch.rs` | `ChatTurnSseAccum`, `ChatTurnEdgePending`, `ChatTurnSseFramer`, `dispatch_chat_turn_sse_event_block`, `parse_chat_turn_sse_utf8_body` | runtime ✅ |
 | Chat turn heuristics | `runtime/src/turn/chat_turn_heuristics.rs` | Factual-query guard, `openai_factual_tool_retry_user_message`, session-not-found, repo extraction from memory text | runtime ✅ |
 | Headless tool assembly | `runtime/src/turn/headless_tool_assembly.rs` | `CACHEABLE_TOOLS`, edge row → `tool_call` output match, `openai_assistant_with_tool_calls_message`, `openai_tool_roundtrip_values` | runtime ✅ |
-| Bridge (HTTP) | `runtime/src/turn/bridge/mod.rs` | HttpChatTurnBridge, forwards to external service | runtime ✅ |
+| Bridge (in-process) | `runtime/src/bridge/mod.rs` + `turn/bridge_inprocess.rs` | InProcessChatTurnBridge, single-call LLM proxy | runtime ✅ |
 | Chat stream | `rust/crates/astra-cli/src/cli/chat_stream/` (`sse_loop/mod.rs`, `agentic_sse_loop.rs`, `agentic_loop_turn.rs`) | Multi-turn loop orchestration + CLI rendering; imports runtime headless helpers | ⚠️ Core loop should move to runtime |
 | Plan decompose | `runtime/src/plan_decompose.rs` | Long-horizon planning, subtask generation | runtime ✅ |
 | Entity graph | `runtime/src/pipeline/entity.rs` | EntityKnowledge, decayed_confidence | runtime ✅ |
