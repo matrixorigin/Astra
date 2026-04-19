@@ -962,7 +962,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
         "CREATE TABLE IF NOT EXISTS runtime_llm_trusted_domains (
             domain_id     VARCHAR(36) PRIMARY KEY,
             domain_host   VARCHAR(255) NOT NULL,
-            domain_port   INT,
+            domain_port   INT NOT NULL DEFAULT 0,
             is_enabled    SMALLINT NOT NULL DEFAULT 1,
             description   VARCHAR(255),
             created_by    VARCHAR(36),

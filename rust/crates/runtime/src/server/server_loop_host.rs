@@ -51,6 +51,21 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
     COOLDOWN.get_or_init(PerModelCooldown::new)
 }
 
+fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(llm_connect_timeout())
+            .timeout(llm_fallback_timeout())
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
     match (&state.cancellation.flag, &state.cancellation.token) {
         (Some(f), Some(t)) => LlmCancel::FlagAndToken(f.as_ref(), t.as_ref()),
@@ -90,12 +105,7 @@ impl crate::turn::cloud::summary::SummaryLlmClient for RequestAwareSummaryClient
         &self,
         messages: &[Value],
     ) -> Result<crate::turn::cloud::summary::SummaryResponse, String> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(llm_connect_timeout())
-            .timeout(llm_fallback_timeout())
-            .build()
-            .map_err(|error| error.to_string())?;
+        let client = request_aware_summary_http_client()?;
 
         match call_llm_nonstream_fallback_with_request_overrides(
             &client,

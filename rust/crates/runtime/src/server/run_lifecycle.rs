@@ -177,17 +177,17 @@ fn normalize_trusted_llm_domain_host(raw: &str) -> Result<String, String> {
 
 fn trusted_llm_domain_from_db_values(
     host_raw: &str,
-    port_raw: Option<i64>,
+    port_raw: i64,
 ) -> Result<TrustedLlmDomain, String> {
     let host = normalize_trusted_llm_domain_host(host_raw)?;
     let port = match port_raw {
-        Some(port) if !(1..=65_535).contains(&port) => {
+        0 => None,
+        port if !(1..=65_535).contains(&port) => {
             return Err(format!(
                 "trusted domain host '{host_raw}' has invalid port value {port}"
             ));
         }
-        Some(port) => Some(port as u16),
-        None => None,
+        port => Some(port as u16),
     };
     Ok(TrustedLlmDomain { host, port })
 }
@@ -1052,7 +1052,7 @@ impl AgenticRunLifecycleService {
             })?
         };
         let rows = sqlx::query(
-            "SELECT domain_host, domain_port \
+            "SELECT domain_host, IFNULL(domain_port, 0) AS domain_port \
              FROM runtime_llm_trusted_domains \
              WHERE is_enabled = 1",
         )
@@ -1077,7 +1077,7 @@ impl AgenticRunLifecycleService {
                     ),
                 )
             })?;
-            let port: Option<i64> = row.try_get("domain_port").map_err(|error| {
+            let port: i64 = row.try_get("domain_port").map_err(|error| {
                 error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!(
@@ -1107,7 +1107,7 @@ impl AgenticRunLifecycleService {
         }
         if trusted_domains.is_empty() {
             return Err(error_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE} has no enabled trusted domains"
                 ),
@@ -3408,18 +3408,21 @@ mod tests {
 
     #[test]
     fn trusted_llm_domain_from_db_values_accepts_valid_host_and_port() {
-        let parsed = super::trusted_llm_domain_from_db_values("catalog", Some(8081))
+        let parsed = super::trusted_llm_domain_from_db_values("catalog", 8081)
             .expect("host+port should parse");
         assert_eq!(parsed.host, "catalog");
         assert_eq!(parsed.port, Some(8081));
+        let wildcard = super::trusted_llm_domain_from_db_values("catalog", 0)
+            .expect("sentinel port should represent wildcard");
+        assert_eq!(wildcard.port, None);
     }
 
     #[test]
     fn trusted_llm_domain_from_db_values_rejects_invalid_host_or_port() {
-        let host_err = super::trusted_llm_domain_from_db_values("http://catalog:8081", Some(8081))
+        let host_err = super::trusted_llm_domain_from_db_values("http://catalog:8081", 8081)
             .expect_err("host should not include scheme");
         assert!(host_err.contains("host"));
-        let port_err = super::trusted_llm_domain_from_db_values("catalog", Some(70000))
+        let port_err = super::trusted_llm_domain_from_db_values("catalog", 70000)
             .expect_err("port out of range should fail");
         assert!(port_err.contains("port"));
     }

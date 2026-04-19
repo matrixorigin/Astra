@@ -134,26 +134,30 @@ impl DatabaseLlmTrustedDomainService {
         Ok(host.to_ascii_lowercase())
     }
 
-    fn map_row(row: &sqlx::mysql::MySqlRow) -> Result<LlmTrustedDomainRecord, sqlx::Error> {
-        let domain_port_raw: Option<i64> = row.try_get("domain_port")?;
-        let domain_port = if let Some(raw) = domain_port_raw {
-            if (1..=65_535).contains(&raw) {
-                Some(raw as u16)
-            } else {
-                None
+    fn map_row(
+        row: &sqlx::mysql::MySqlRow,
+    ) -> Result<LlmTrustedDomainRecord, (StatusCode, Json<ErrorResponse>)> {
+        let domain_id: String = row.try_get("domain_id").map_err(internal_error)?;
+        let domain_host: String = row.try_get("domain_host").map_err(internal_error)?;
+        let domain_port_raw: i64 = row.try_get("domain_port").map_err(internal_error)?;
+        let domain_port = match domain_port_raw {
+            0 => None,
+            raw if (1..=65_535).contains(&raw) => Some(raw as u16),
+            raw => {
+                return Err(internal_error(format!(
+                    "trusted domain '{domain_id}' has invalid domain_port value {raw}"
+                )));
             }
-        } else {
-            None
         };
-        let is_enabled: i16 = row.try_get("is_enabled")?;
+        let is_enabled: i16 = row.try_get("is_enabled").map_err(internal_error)?;
         Ok(LlmTrustedDomainRecord {
-            domain_id: row.try_get("domain_id")?,
-            domain_host: row.try_get("domain_host")?,
+            domain_id,
+            domain_host,
             domain_port,
             is_enabled: is_enabled == 1,
-            description: row.try_get("description")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
+            description: row.try_get("description").map_err(internal_error)?,
+            created_at: row.try_get("created_at").map_err(internal_error)?,
+            updated_at: row.try_get("updated_at").map_err(internal_error)?,
         })
     }
 
@@ -163,7 +167,7 @@ impl DatabaseLlmTrustedDomainService {
         domain_id: &str,
     ) -> Result<LlmTrustedDomainRecord, (StatusCode, Json<ErrorResponse>)> {
         let row = query(
-            "SELECT domain_id, domain_host, domain_port, is_enabled, description, \
+            "SELECT domain_id, domain_host, IFNULL(domain_port, 0) AS domain_port, is_enabled, description, \
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at, \
                     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS updated_at \
              FROM runtime_llm_trusted_domains \
@@ -179,7 +183,7 @@ impl DatabaseLlmTrustedDomainService {
                 format!("trusted domain '{domain_id}' not found"),
             )
         })?;
-        Self::map_row(&row).map_err(internal_error)
+        Self::map_row(&row)
     }
 }
 
@@ -190,7 +194,7 @@ impl LlmTrustedDomainService for DatabaseLlmTrustedDomainService {
     ) -> Result<Vec<LlmTrustedDomainRecord>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let rows = query(
-            "SELECT domain_id, domain_host, domain_port, is_enabled, description, \
+            "SELECT domain_id, domain_host, IFNULL(domain_port, 0) AS domain_port, is_enabled, description, \
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at, \
                     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS updated_at \
              FROM runtime_llm_trusted_domains \
@@ -202,7 +206,6 @@ impl LlmTrustedDomainService for DatabaseLlmTrustedDomainService {
         rows.iter()
             .map(Self::map_row)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(internal_error)
     }
 
     async fn upsert_trusted_domain(
@@ -218,7 +221,9 @@ impl LlmTrustedDomainService for DatabaseLlmTrustedDomainService {
                 "domain_port must be between 1 and 65535 when provided",
             ));
         }
-        let domain_port = request.domain_port.map(i64::from);
+        // Persist absent port as sentinel `0` so `(domain_host, domain_port)` uniqueness
+        // also applies to host-only records.
+        let domain_port = i64::from(request.domain_port.unwrap_or(0));
         let description = request
             .description
             .map(|value| value.trim().to_string())
@@ -232,7 +237,7 @@ impl LlmTrustedDomainService for DatabaseLlmTrustedDomainService {
         let existing = query(
             "SELECT domain_id \
              FROM runtime_llm_trusted_domains \
-             WHERE domain_host = ? AND domain_port <=> ? \
+             WHERE domain_host = ? AND IFNULL(domain_port, 0) = ? \
              LIMIT 1",
         )
         .bind(&domain_host)
