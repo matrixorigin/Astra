@@ -1,3 +1,4 @@
+#![cfg(feature = "bridge-e2e-hooks")]
 //! Comprehensive bridge E2E tests — persistence, multi-turn, errors, cancellation.
 //!
 //! These tests complement `edge_cloud_round_trip_e2e.rs` by focusing on:
@@ -967,4 +968,425 @@ async fn core_persist_records_correct_metadata() {
         assert_eq!(lr.user_id, USER_ID);
         assert_eq!(lr.agent_id.as_deref(), Some("meta-agent-123"));
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Single tool round — full round-trip: tool_calls → tool_results → text
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn single_tool_round_full_roundtrip() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: User query → LLM returns one tool call.
+    let turn1 = json!({
+        "agent_id": "roundtrip-agent",
+        "messages": [{ "role": "user", "content": "Read the config file" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-rt1", "read_file", json!({"path": "config.toml"}))],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 15 }
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+
+    // Verify SSE: session_info first, turn_complete last with has_tool_calls=true.
+    assert_eq!(
+        ev1.first()
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str),
+        Some("session_info"),
+        "turn 1 must start with session_info"
+    );
+    let tc1 = events_of_type(&ev1, "turn_complete");
+    assert_eq!(tc1.len(), 1);
+    assert_eq!(
+        tc1[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // Extract session_id from session_info for turn 2.
+    let session_id = ev1[0].get("session_id").and_then(Value::as_str).unwrap();
+
+    // Turn 2: CLI sends tool_results → LLM returns final text.
+    let turn2 = json!({
+        "agent_id": "roundtrip-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "Read the config file" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-rt1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"config.toml\"}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-rt1", "content": "port = 8080\nhost = localhost" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-rt1", "content": "port = 8080\nhost = localhost" }],
+        "test_llm_rounds": [{
+            "full_text": "The config has port 8080 and host localhost.",
+            "usage": { "prompt_tokens": 200, "completion_tokens": 25 }
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+
+    // Turn 2 SSE: text_delta events present, turn_complete with no tool calls.
+    let deltas = events_of_type(&ev2, "text_delta");
+    assert!(!deltas.is_empty(), "turn 2 should have text_delta events");
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(tc2.len(), 1);
+    assert_eq!(
+        tc2[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Verify persistence: 2 core persist calls.
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 2, "two core persist calls (one per turn)");
+
+    // Turn 1: user_query persisted, llm_response persisted.
+    assert!(
+        core[0].user_query_event.is_some(),
+        "turn 1 persists user_query"
+    );
+    assert!(
+        core[0].llm_response_event.is_some(),
+        "turn 1 persists llm_response"
+    );
+
+    // Turn 2 (continuation): user_query NOT re-persisted, llm_response persisted.
+    assert!(
+        core[1].user_query_event.is_none(),
+        "continuation must NOT re-persist user_query"
+    );
+    assert!(
+        core[1].llm_response_event.is_some(),
+        "turn 2 persists llm_response"
+    );
+    assert!(
+        core[1]
+            .llm_response_event
+            .as_ref()
+            .unwrap()
+            .content
+            .contains("port 8080"),
+        "turn 2 llm_response should contain final text"
+    );
+
+    // Verify all event_ids are unique across both turns.
+    let mut all_ids: Vec<String> = Vec::new();
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            all_ids.push(uq.event_id.clone());
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            all_ids.push(lr.event_id.clone());
+        }
+    }
+    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique.len(),
+        "all event_ids unique: {:?}",
+        all_ids
+    );
+
+    // Verify tool events persisted for turn 1.
+    let tools = cap.tool_plans.lock().await;
+    let total_tool: usize = tools.iter().map(|p| p.events.len()).sum();
+    assert!(
+        total_tool >= 1,
+        "turn 1 tool call should be persisted, got {total_tool}"
+    );
+
+    // Verify activity writer called for both turns.
+    let acts = cap.activity_plans.lock().await;
+    assert!(
+        acts.len() >= 2,
+        "activity writer should be called for both turns, got {}",
+        acts.len()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Error recovery — LLM failure on continuation still produces clean SSE
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn error_on_continuation_emits_clean_error_event() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: normal tool call.
+    let turn1 = json!({
+        "agent_id": "err-recovery-agent",
+        "messages": [{ "role": "user", "content": "check files" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-er1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0].get("session_id").and_then(Value::as_str).unwrap();
+
+    // Turn 2: continuation with EMPTY test_llm_rounds — simulates LLM failure.
+    // The e2e mock has no round[0], so bridge falls through to real LLM call which
+    // fails (no real LLM configured) → error SSE event.
+    let turn2 = json!({
+        "agent_id": "err-recovery-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "check files" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-er1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-er1", "content": "file data" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-er1", "content": "file data" }],
+        "test_llm_rounds": []
+    });
+
+    let (st2, raw2) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK, "SSE stream still returns 200");
+    let ev2 = parse_sse_events(&raw2);
+
+    // Should still have session_info.
+    let si2 = events_of_type(&ev2, "session_info");
+    assert!(!si2.is_empty(), "continuation should have session_info");
+
+    // Should have error or turn_complete (the bridge handles the missing round gracefully).
+    let has_error = !events_of_type(&ev2, "error").is_empty();
+    let has_tc = !events_of_type(&ev2, "turn_complete").is_empty();
+    assert!(
+        has_error || has_tc,
+        "continuation with no LLM rounds should produce error or turn_complete"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Turn 1 should have persisted normally despite turn 2 failure.
+    let core = cap.core_plans.lock().await;
+    assert!(
+        !core.is_empty(),
+        "turn 1 core persist should have succeeded"
+    );
+    let turn1_plan = &core[0];
+    assert!(
+        turn1_plan.user_query_event.is_some(),
+        "turn 1 user_query should be persisted even if turn 2 fails"
+    );
+    assert!(
+        turn1_plan.llm_response_event.is_some(),
+        "turn 1 llm_response should be persisted even if turn 2 fails"
+    );
+
+    // Verify no corrupted event_ids — all should be valid UUIDs.
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            assert!(
+                uuid::Uuid::parse_str(&uq.event_id).is_ok(),
+                "event_id must be valid UUID: {}",
+                uq.event_id
+            );
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            assert!(
+                uuid::Uuid::parse_str(&lr.event_id).is_ok(),
+                "event_id must be valid UUID: {}",
+                lr.event_id
+            );
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Many sequential tool rounds — no state corruption across 5 turns
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn many_sequential_tool_rounds_no_state_corruption() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: initial user query → tool call.
+    let turn1 = json!({
+        "agent_id": "multi-round-agent",
+        "messages": [{ "role": "user", "content": "refactor everything" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("write_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-mr1", "read_file", json!({"path": "src/main.rs"}))]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0]
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // Build message history incrementally for turns 2-5.
+    let mut messages = vec![
+        json!({"role": "user", "content": "refactor everything"}),
+        json!({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "tc-mr1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}}
+        ]}),
+        json!({"role": "tool", "tool_call_id": "tc-mr1", "content": "fn main() {}"}),
+    ];
+
+    // Turns 2-4: each returns a different tool call.
+    let tool_rounds = [
+        (
+            "tc-mr2",
+            "write_file",
+            json!({"path": "src/main.rs", "content": "fn main() { println!(\"hi\"); }"}),
+        ),
+        ("tc-mr3", "read_file", json!({"path": "src/lib.rs"})),
+        (
+            "tc-mr4",
+            "write_file",
+            json!({"path": "src/lib.rs", "content": "pub fn greet() {}"}),
+        ),
+    ];
+
+    for (tc_id, tool_name, args) in &tool_rounds {
+        let payload = json!({
+            "agent_id": "multi-round-agent",
+            "session_id": &session_id,
+            "messages": messages.clone(),
+            "edge_tools": [tool_schema("read_file"), tool_schema("write_file")],
+            "tool_results": [{ "tool_call_id": messages.iter().rev()
+                .find_map(|m| m.get("tool_call_id").and_then(Value::as_str))
+                .unwrap_or("tc-mr1"), "content": "ok" }],
+            "test_llm_rounds": [{
+                "tool_calls": [tool_call(tc_id, tool_name, args.clone())]
+            }]
+        });
+
+        let (st, raw) = chat_turn(&app, payload).await;
+        assert_eq!(st, StatusCode::OK);
+        let evts = parse_sse_events(&raw);
+        let tc = events_of_type(&evts, "turn_complete");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(
+            tc[0].get("has_tool_calls").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // Extend message history with assistant tool_call + tool result.
+        messages.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"id": tc_id, "type": "function", "function": {"name": tool_name, "arguments": serde_json::to_string(args).unwrap()}}
+        ]}));
+        messages.push(json!({"role": "tool", "tool_call_id": tc_id, "content": "ok"}));
+    }
+
+    // Turn 5 (final): return text completion.
+    let turn5 = json!({
+        "agent_id": "multi-round-agent",
+        "session_id": &session_id,
+        "messages": messages,
+        "edge_tools": [tool_schema("read_file"), tool_schema("write_file")],
+        "tool_results": [{ "tool_call_id": "tc-mr4", "content": "ok" }],
+        "test_llm_rounds": [{
+            "full_text": "Refactoring complete. Updated main.rs and lib.rs.",
+            "usage": { "prompt_tokens": 500, "completion_tokens": 30 }
+        }]
+    });
+
+    let (st5, raw5) = chat_turn(&app, turn5).await;
+    assert_eq!(st5, StatusCode::OK);
+    let ev5 = parse_sse_events(&raw5);
+    let tc5 = events_of_type(&ev5, "turn_complete");
+    assert_eq!(tc5.len(), 1);
+    assert_eq!(
+        tc5[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify persistence across all 5 turns.
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        5,
+        "5 core persist calls (one per HTTP request), got {}",
+        core.len()
+    );
+
+    // Only turn 1 should have user_query_event; turns 2-5 are continuations.
+    assert!(core[0].user_query_event.is_some(), "turn 1 has user_query");
+    for (i, plan) in core.iter().enumerate().skip(1) {
+        assert!(
+            plan.user_query_event.is_none(),
+            "turn {} (continuation) must NOT re-persist user_query",
+            i + 1
+        );
+    }
+
+    // All 5 turns should have llm_response_event.
+    for (i, plan) in core.iter().enumerate() {
+        assert!(
+            plan.llm_response_event.is_some(),
+            "turn {} should persist llm_response",
+            i + 1
+        );
+    }
+
+    // All event_ids must be globally unique across all 5 turns.
+    let mut all_ids: Vec<String> = Vec::new();
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            all_ids.push(uq.event_id.clone());
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            all_ids.push(lr.event_id.clone());
+        }
+    }
+    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique.len(),
+        "all event_ids must be unique across 5 turns: {:?}",
+        all_ids
+    );
+    // Should have 6 IDs total: 1 user_query + 5 llm_responses.
+    assert_eq!(all_ids.len(), 6, "1 user_query + 5 llm_response IDs");
+
+    // All event_ids should be valid UUIDs.
+    for id in &all_ids {
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "invalid UUID: {id}");
+    }
+
+    // Verify tool events persisted (at least 4 tool call records from turns 1-4).
+    let tools = cap.tool_plans.lock().await;
+    let total_tool: usize = tools.iter().map(|p| p.events.len()).sum();
+    assert!(
+        total_tool >= 4,
+        "at least 4 tool events should be persisted, got {total_tool}"
+    );
+
+    // Verify activity writer called for all 5 turns.
+    let acts = cap.activity_plans.lock().await;
+    assert!(
+        acts.len() >= 5,
+        "activity writer should be called for all 5 turns, got {}",
+        acts.len()
+    );
 }
