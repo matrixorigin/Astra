@@ -57,7 +57,6 @@ use crate::{
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
     build_explain_event, build_stream_error_event, prompts,
     turn::edge_ledger::ensure_tool_call_ids,
-    turn::llm_client::{LlmCancel, sleep_ms_or_llm_cancel},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
     turn::sse_blocks::SseBlankLineUtf8Buf,
     turn::tool_call_shape::tool_call_name,
@@ -65,10 +64,6 @@ use crate::{
 };
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
-
-fn turn_timeout_s() -> f64 {
-    astra_core::RuntimeLimits::global().turn_timeout_s
-}
 
 fn count_inprocess_persisted_events(
     core_event_count: usize,
@@ -240,21 +235,11 @@ use super::bridge_observability::{
     build_legacy_context_trace_signal, persist_legacy_bridge_trace_and_quality,
 };
 
-/// Returns `true` if `name` looks like a valid tool function name.
-///
-/// LLM providers sometimes return malformed tool calls when the model leaks XML-style
-/// thinking tags (e.g., `<reflect>`) into tool call blocks. We reject names that:
-/// - are empty
-/// - contain `<` or `>` (XML artifact)
-/// - contain whitespace
-fn is_valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('<')
-        && !name.contains('>')
-        && !name.chars().any(char::is_whitespace)
-}
+// ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
+use super::bridge_llm_stream::call_llm_stream;
+use super::bridge_llm_stream::rate_limit_cooldown;
+use crate::bridge::rate_limit_cooldown::RateLimitAction;
 
-/// Maps one parsed JSON event from the in-process LLM SSE stream to bytes forwarded to the HTTP client.
 #[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
     cancel: Option<&CancellationToken>,
@@ -345,42 +330,6 @@ fn record_turn_guard_tool_results(
     }
 }
 
-fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Option<Value> {
-    let function = tool_call.get("function").and_then(Value::as_object)?;
-    let tool = function
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| is_valid_tool_name(name))?
-        .to_string();
-    let arguments = function
-        .get("arguments")
-        .and_then(Value::as_str)
-        .filter(|args| !args.is_empty())
-        .map(std::string::ToString::to_string);
-    let call_id = tool_call
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| {
-            let id = Uuid::now_v7().to_string();
-            tool_call.insert("id".to_string(), Value::String(id.clone()));
-            id
-        });
-
-    let mut event = json!({
-        "type": "tool_call_start",
-        "tool": tool,
-        "call_id": call_id,
-    });
-    if let Some(arguments) = arguments
-        && let Some(obj) = event.as_object_mut()
-    {
-        obj.insert("arguments".to_string(), Value::String(arguments));
-    }
-    Some(event)
-}
-
 fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[Value]) -> Value {
     let mut event = crate::turn::complete::build_turn_complete_event(
         !tool_calls.is_empty(),
@@ -403,479 +352,11 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
     Value::Object(event)
 }
 
-/// Maximum retries for transient LLM errors (429, 5xx, network).
-const LLM_MAX_RETRIES: u32 = 3;
-/// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
-const LLM_RETRY_BASE_MS: u64 = 1000;
-
-// ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
-use crate::bridge::rate_limit_cooldown::{
-    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
-    parse_retry_after_ms,
-};
-use std::sync::OnceLock;
-
-/// Per-model rate-limit cooldown tracker.
-fn rate_limit_cooldown() -> &'static PerModelCooldown {
-    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(PerModelCooldown::new)
-}
-
 // ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
 pub use super::prompt_cache::PromptCacheConfig;
 pub(crate) use super::prompt_cache::{
     add_message_cache_breakpoint, annotate_tool_schemas_for_caching, build_system_message,
 };
-
-fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
-    match cc.as_ref() {
-        Some(t) => LlmCancel::Token(t.as_ref()),
-        None => LlmCancel::None,
-    }
-}
-
-/// Call LLM streaming API, yield SSE bytes.
-/// Emits: text_delta, reasoning_delta, reasoning_done, tool_call_start, usage SSE events,
-/// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
-///
-/// **Stream resilience (same as [`super::llm_client::call_llm_and_collect`])**:
-/// per-chunk idle watchdog on parsed SSE; if the provider stops sending, partial state is
-/// discarded and a **single non-stream** `/chat/completions` request attempts recovery.
-///
-/// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
-/// with exponential backoff.
-///
-/// **Note**: Caller must check rate-limit cooldown state and handle fallback model
-/// resolution BEFORE calling this function. This function only handles retries for
-/// transient errors within a single model.
-#[allow(clippy::too_many_arguments)]
-async fn call_llm_stream(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
-    client_cancel: Option<Arc<CancellationToken>>,
-) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
-    let cooldown = rate_limit_cooldown();
-    let model_key = model_name;
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(crate::turn::llm_client::llm_connect_timeout())
-        .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let messages = crate::turn::llm_client::consolidate_system_messages(messages);
-
-    let mut body = json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
-
-    // Set max output tokens to prevent generation cutoff.
-    // Use provider-appropriate field name.
-    if let Some(max_out) = max_output_tokens {
-        if provider == "anthropic" || model_name.contains("claude") {
-            body["max_tokens"] = json!(max_out);
-        } else {
-            // OpenAI, DeepSeek, Qwen, etc. use max_completion_tokens (newer)
-            // or max_tokens (legacy). Prefer max_completion_tokens.
-            body["max_completion_tokens"] = json!(max_out);
-        }
-    }
-
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = Value::String("auto".to_string());
-    }
-
-    let url = crate::turn::llm_client::llm_completions_url_for_provider(base_url, provider);
-
-    // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
-    let mut last_err = String::new();
-    for attempt in 0..=LLM_MAX_RETRIES {
-        if attempt > 0 {
-            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
-            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mut req = client.post(&url).header("content-type", "application/json");
-
-        if provider == "anthropic" {
-            req = req
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req = req.header("authorization", format!("Bearer {api_key}"));
-        }
-
-        let response = match req.json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = format!("LLM request failed: {e}");
-                // Network errors are always retryable
-                continue;
-            }
-        };
-
-        let status = response.status().as_u16();
-        if response.status().is_success() {
-            // Success — record to cooldown tracker and return the stream
-            cooldown.with(model_key, |c| c.record_success());
-            let byte_stream = response.bytes_stream();
-            let model_name = model_name.to_string();
-
-            let client_for_fallback = client.clone();
-            let messages_for_fallback: Vec<Value> = messages.to_vec();
-            let tools_for_fallback: Vec<Value> = tools.to_vec();
-            let api_key_for_fallback = api_key.to_string();
-            let base_url_for_fallback = base_url.to_string();
-            let provider_for_fallback = provider.to_string();
-            let max_out_for_fallback = max_output_tokens;
-            let idle_pre = crate::turn::llm_client::stream_idle_timeout();
-            let idle_post = crate::turn::llm_client::stream_idle_timeout_after_progress();
-
-            let out = stream! {
-                let cc = client_cancel.clone();
-                let mut full_text = String::new();
-                let mut reasoning = String::new();
-                let mut in_think_block = false;
-                let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
-                    std::collections::HashMap::new();
-                let mut usage = Map::new();
-                let mut made_progress = false;
-
-                let sse = crate::turn::llm_client::parse_openai_sse_json_stream(byte_stream);
-                tokio::pin!(sse);
-
-                loop {
-                    let idle = if made_progress { idle_post } else { idle_pre };
-                    tokio::select! {
-                        biased;
-                        _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "in-process LLM SSE cancelled (client disconnect)"
-                            );
-                            tool_calls_map.clear();
-                            full_text.clear();
-                            reasoning.clear();
-                            break;
-                        }
-                        tick = tokio::time::timeout(idle, sse.next()) => {
-                            let next = tick;
-                            let chunk = match next {
-                                Ok(c) => c,
-                                Err(_) => {
-                                    astra_core::agent_warn!(
-                                        "llm",
-                                        "in-process stream idle after {}ms (made_progress={}) — attempting non-stream fallback",
-                                        idle.as_millis(),
-                                        made_progress
-                                    );
-                                    tool_calls_map.clear();
-                                    full_text.clear();
-                                    reasoning.clear();
-                                    let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
-                                    match crate::turn::llm_client::call_llm_nonstream_fallback(
-                                        &client_for_fallback,
-                                        &messages_for_fallback,
-                                        &tools_for_fallback,
-                                        &model_name,
-                                        &api_key_for_fallback,
-                                        &base_url_for_fallback,
-                                        &provider_for_fallback,
-                                        max_out_for_fallback,
-                                        fb_timeout,
-                                    )
-                                    .await
-                                    {
-                                        Ok(mut result) => {
-                                            ensure_tool_call_ids(&mut result.tool_calls);
-                                            full_text = result.full_text.clone();
-                                            reasoning = result.reasoning.clone();
-                                            usage = result.usage.clone();
-                                            tool_calls_map.clear();
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if let Value::Object(m) = tc {
-                                                    tool_calls_map.insert(i, m.clone());
-                                                }
-                                            }
-                                            if !result.full_text.is_empty()
-                                                && result.tool_calls.is_empty()
-                                            {
-                                                yield render_sse(&json!({"type":"text_delta","content": result.full_text}));
-                                            }
-                                            if !result.reasoning.is_empty() {
-                                                yield render_sse(&json!({"type":"reasoning_delta","content": result.reasoning}));
-                                            }
-                                            for tc in &result.tool_calls {
-                                                if let Some(obj) = tc.as_object() {
-                                                    let mut tc = obj.clone();
-                                                    if let Some(event) = tool_call_start_event(&mut tc) {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            }
-                                            let prompt = result.usage.get("prompt").and_then(Value::as_i64);
-                                            let completion = result.usage.get("completion").and_then(Value::as_i64);
-                                            if prompt.is_some() || completion.is_some() {
-                                                let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
-                                                let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
-                                                yield render_sse(&json!({
-                                                    "type": "usage",
-                                                    "prompt_tokens": prompt,
-                                                    "completion_tokens": completion,
-                                                    "cache_read_tokens": cache_read,
-                                                    "cache_creation_tokens": cache_creation,
-                                                }));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            yield render_sse(&json!({"type":"error","message": format!("stream stalled; non-stream recovery failed: {e}")}));
-                                            tool_calls_map.clear();
-                                            full_text.clear();
-                                            reasoning.clear();
-                                        }
-                                    }
-                                    break;
-                                }
-                            };
-                            let Some(item) = chunk else { break };
-                            let chunk = match item {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    astra_core::agent_warn!(
-                                        "llm",
-                                        "in-process stream transport error: {e}"
-                                    );
-                                    yield render_sse(&json!({"type":"error","message": format!("LLM stream transport error: {e}")}));
-                                    tool_calls_map.clear();
-                                    full_text.clear();
-                                    reasoning.clear();
-                                    break;
-                                }
-                            };
-                            // Some providers attach usage to a chunk that also contains choices,
-                            // so parse usage first on every chunk.
-                            made_progress = true;
-                            if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-                                let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
-                                let completion = u.get("completion_tokens").and_then(Value::as_i64);
-                                if prompt.is_some() || completion.is_some() {
-                                    let mut usage_map = Map::new();
-                                    if let Some(value) = prompt {
-                                        usage_map.insert("prompt".to_string(), Value::from(value));
-                                    }
-                                    if let Some(value) = completion {
-                                        usage_map.insert("completion".to_string(), Value::from(value));
-                                    }
-                                    if let (Some(p), Some(c)) = (prompt, completion) {
-                                        usage_map.insert("total".to_string(), Value::from(p + c));
-                                    }
-                                    usage = usage_map;
-                                    // OpenAI: prompt_tokens_details.cached_tokens
-                                    // Anthropic (via proxy): cache_read_input_tokens / cache_creation_input_tokens
-                                    let cache_read = u.get("prompt_tokens_details")
-                                        .and_then(|d| d.get("cached_tokens"))
-                                        .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64));
-                                    let cache_creation = u.get("prompt_tokens_details")
-                                        .and_then(|d| d.get("cache_creation_input_tokens"))
-                                        .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64));
-                                    yield render_sse(&json!({
-                                        "type": "usage",
-                                        "prompt_tokens": prompt,
-                                        "completion_tokens": completion,
-                                        "cache_read_tokens": cache_read,
-                                        "cache_creation_tokens": cache_creation,
-                                    }));
-                                }
-                            }
-
-                            let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-                                continue;
-                            };
-
-                            let Some(delta) = choices.first()
-                                .and_then(|c| c.get("delta"))
-                                .and_then(Value::as_object)
-                            else { continue };
-
-                            // Text content — split out <think>...</think> blocks into reasoning_delta.
-                            // Models like MiniMax embed thinking in content with <think> tags.
-                            if let Some(content) = delta.get("content").and_then(Value::as_str)
-                                && !content.is_empty() {
-                                    for (chunk, is_think) in crate::turn::llm_client::split_think_chunks(content, &mut in_think_block) {
-                                        if is_think {
-                                            reasoning.push_str(&chunk);
-                                            yield render_sse(&json!({"type": "reasoning_delta", "content": chunk}));
-                                        } else {
-                                            full_text.push_str(&chunk);
-                                            yield render_sse(&json!({"type": "text_delta", "content": chunk}));
-                                        }
-                                    }
-                                }
-
-                            // Reasoning (DeepSeek / o1 style)
-                            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
-                                && !r.is_empty() {
-                                    reasoning.push_str(r);
-                                    yield render_sse(&json!({"type": "reasoning_delta", "content": r}));
-                                }
-
-                            // Tool calls (streaming accumulation)
-                            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                                for tc in tcs {
-                                    let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                    let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                                        Map::from_iter([
-                                            ("id".to_string(), Value::String(String::new())),
-                                            ("type".to_string(), Value::String("function".to_string())),
-                                            ("function".to_string(), json!({"name": "", "arguments": ""})),
-                                        ])
-                                    });
-                                    if let Some(id) = tc.get("id").and_then(Value::as_str)
-                                        && !id.is_empty() {
-                                            entry.insert("id".to_string(), Value::String(id.to_string()));
-                                        }
-                                        if let Some(func) = tc.get("function").and_then(Value::as_object) {
-                                            let f = entry
-                                                .entry("function".to_string())
-                                                .or_insert_with(|| json!({}));
-                                            let Some(f) = f.as_object_mut() else { continue; };
-                                            if let Some(args) = func.get("arguments").and_then(Value::as_str) {
-                                                let existing = f
-                                                    .entry("arguments".to_string())
-                                                    .or_insert_with(|| Value::String(String::new()));
-                                                if let Value::String(s) = existing {
-                                                    s.push_str(args);
-                                                }
-                                            }
-                                            if let Some(name) = func.get("name").and_then(Value::as_str)
-                                            && is_valid_tool_name(name) {
-                                                let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
-                                                f.insert("name".to_string(), Value::String(name.to_string()));
-                                                if is_new {
-                                                    if let Some(event) = tool_call_start_event(entry) {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
-                                                astra_core::agent_warn!(
-                                                    "llm",
-                                                    "dropped malformed tool_call with invalid name: {bad_name:?}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                        }
-                    }
-                }
-
-                // Emit final summary as a special internal event (not forwarded to client)
-                let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
-                sorted_tcs.sort_by_key(|(idx, _)| *idx);
-                let mut tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
-
-                // Degraded tool-call fallback: recover <invoke> or <tool_call> blocks.
-                if tool_calls.is_empty() {
-                    if let Some(parsed) = crate::turn::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
-                        astra_core::agent_warn!(
-                            "llm",
-                            "recovered {} tool call(s) from degraded text in content (inprocess)",
-                            parsed.len()
-                        );
-                        full_text = crate::turn::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
-                        tool_calls = parsed;
-                    }
-                }
-
-                yield render_sse(&json!({
-                    "type": "_inprocess_summary",
-                    "full_text": full_text,
-                    "reasoning": reasoning,
-                    "tool_calls": tool_calls,
-                    "usage": usage,
-                    "model_used": model_name,
-                }));
-            };
-
-            return Ok(out);
-        }
-
-        // Non-success: check if retryable (429 rate limit, 5xx server error)
-        let headers = response.headers();
-        let retry_after_ms = headers
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after_ms);
-
-        let text = response.text().await.unwrap_or_default();
-        last_err = format!("LLM error {status}: {text}");
-
-        // Record rate-limit errors to cooldown tracker
-        if is_rate_limit_status(status) {
-            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
-            astra_core::agent_warn!(
-                "llm",
-                "rate limit (429) on {}: action={:?}",
-                model_key,
-                action,
-            );
-
-            // If cooldown says to wait, honor it
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            continue; // Retryable
-        }
-
-        if is_overload_status(status) {
-            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
-            astra_core::agent_warn!(
-                "llm",
-                "server overload ({status}) on {}: action={:?}",
-                model_key,
-                action,
-            );
-
-            // If cooldown says to wait, honor it
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            continue; // Retryable
-        }
-
-        // Other 5xx errors are retryable but don't affect cooldown state
-        if status >= 500 {
-            continue;
-        }
-
-        // 4xx (except 429) is not retryable — fail immediately.
-        // Context-window errors are detected by content at the call site
-        // (bridge_inprocess line ~2271), not here.
-        return Err(last_err);
-    }
-
-    // All retries exhausted
-    Err(format!("{last_err} (after {} retries)", LLM_MAX_RETRIES))
-}
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {
@@ -1562,6 +1043,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let mut resolved_model = model_name.clone();
             let mut cloud_loop_turns: i64 = 0;
             let mut llm_steps: Vec<Value> = Vec::new();
+            // Approximate turn number from user message count in history.
+            let bridge_turn: u32 = messages.iter()
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .count() as u32;
 
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
@@ -1705,6 +1190,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         Some(max_output_tokens),
                         has_fallback,
                         cc.clone(),
+                        &crate::turn::llm_client::LlmTraceCtx {
+                            session_id: session_id.clone(),
+                            turn: bridge_turn,
+                            round: round_ix as u32,
+                            ..Default::default()
+                        },
                     )
                     .await
                     {
@@ -1794,6 +1285,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 Some(max_output_tokens / 2), // reduce output budget too
                                 has_fallback,
                                 cc.clone(),
+                                &crate::turn::llm_client::LlmTraceCtx {
+                                    session_id: session_id.clone(),
+                                    turn: bridge_turn,
+                                    round: round_ix as u32,
+                                    ..Default::default()
+                                },
                             )
                             .await
                             {
@@ -1948,9 +1445,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         yield done;
                     }
                 }
+                let round_ms = loop_started.elapsed().as_millis();
+                let tok_in = usage.get("prompt").and_then(Value::as_i64).unwrap_or(0);
+                let tok_out = usage.get("completion").and_then(Value::as_i64).unwrap_or(0);
+                astra_core::agent_info!(
+                    "llm",
+                    "⏱ LLM round done: total={}ms tok_in={} tok_out={} tools={} model={} sid={} r={}",
+                    round_ms,
+                    tok_in,
+                    tok_out,
+                    loop_tool_calls.len(),
+                    if resolved_model.is_empty() { &model_name } else { &resolved_model },
+                    session_id,
+                    round_ix,
+                );
                 llm_steps.push(json!({
                     "step": "llm",
-                    "duration_ms": loop_started.elapsed().as_millis() as i64,
+                    "duration_ms": round_ms as i64,
                     "in": usage.get("prompt").and_then(Value::as_i64),
                     "out": usage.get("completion").and_then(Value::as_i64),
                     "tool_calls": loop_tool_calls.len(),
@@ -3044,36 +2555,6 @@ mod tests {
             messages[1]["content"].is_string(),
             "messages should not be modified when not anthropic"
         );
-    }
-
-    // ── is_valid_tool_name ───────────────────────────────────────────────────
-
-    #[test]
-    fn is_valid_tool_name_rejects_xml_artifacts() {
-        // Malformed names from LLM leaking XML thinking tags
-        assert!(!is_valid_tool_name("reflect>"));
-        assert!(!is_valid_tool_name("<reflect"));
-        assert!(!is_valid_tool_name("<think>"));
-        assert!(!is_valid_tool_name("</think>"));
-        assert!(!is_valid_tool_name("foo<bar"));
-        assert!(!is_valid_tool_name("foo>bar"));
-    }
-
-    #[test]
-    fn is_valid_tool_name_rejects_empty_and_whitespace() {
-        assert!(!is_valid_tool_name(""));
-        assert!(!is_valid_tool_name("tool name"));
-        assert!(!is_valid_tool_name("tool\tname"));
-        assert!(!is_valid_tool_name("tool\nname"));
-    }
-
-    #[test]
-    fn is_valid_tool_name_accepts_valid_names() {
-        assert!(is_valid_tool_name("bash"));
-        assert!(is_valid_tool_name("str_replace"));
-        assert!(is_valid_tool_name("read_file"));
-        assert!(is_valid_tool_name("list_dir"));
-        assert!(is_valid_tool_name("github-mcp-server-search_code"));
     }
 
     #[test]
@@ -4264,42 +3745,6 @@ mod tests {
             result.get("message").and_then(Value::as_str),
             Some("Request cancelled (client disconnected)")
         );
-    }
-
-    #[test]
-    fn tool_call_start_event_preserves_protocol_fields() {
-        let mut tool_call = Map::from_iter([
-            ("id".to_string(), Value::String("call-1".to_string())),
-            (
-                "function".to_string(),
-                json!({"name": "bash", "arguments": "{\"command\":\"ls\"}"}),
-            ),
-        ]);
-        let event = tool_call_start_event(&mut tool_call).unwrap();
-        assert_eq!(
-            event,
-            json!({
-                "type": "tool_call_start",
-                "tool": "bash",
-                "call_id": "call-1",
-                "arguments": "{\"command\":\"ls\"}",
-            })
-        );
-    }
-
-    #[test]
-    fn tool_call_start_event_fills_missing_call_id() {
-        let mut tool_call = Map::from_iter([(
-            "function".to_string(),
-            json!({"name": "bash", "arguments": "{}"}),
-        )]);
-        let event = tool_call_start_event(&mut tool_call).unwrap();
-        let call_id = event
-            .get("call_id")
-            .and_then(Value::as_str)
-            .expect("call_id");
-        assert!(!call_id.is_empty());
-        assert_eq!(tool_call.get("id").and_then(Value::as_str), Some(call_id));
     }
 
     #[test]

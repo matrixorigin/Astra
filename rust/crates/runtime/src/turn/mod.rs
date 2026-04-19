@@ -25,6 +25,7 @@ pub mod boost_domain_hints;
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod bridge_e2e_hooks;
 pub mod bridge_inprocess;
+pub mod bridge_llm_stream;
 pub mod bridge_observability;
 pub mod bridge_sse_helpers;
 pub mod cache;
