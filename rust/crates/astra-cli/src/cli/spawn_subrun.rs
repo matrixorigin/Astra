@@ -286,6 +286,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            turn_event_buffer: None,
         };
 
         // Inherit skills from parent: pre-populate discovered skills

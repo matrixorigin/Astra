@@ -1854,6 +1854,7 @@ mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            turn_event_buffer: None,
         }
     }
 

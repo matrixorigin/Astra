@@ -834,6 +834,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
+        let obs_turn_start = state.turn_event_buffer.as_ref().map(|b| b.turn_start_instant());
+        let obs_llm_round = state.turn_event_buffer.as_ref().map(|b| b.current_round()).unwrap_or(0);
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -863,9 +865,37 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
             server_tool_executor: state.server_tool_executor.as_deref(),
+            turn_start: obs_turn_start,
+            llm_round: obs_llm_round,
         })
         .await;
     }
+
+    // Record LLM round in the turn event buffer and advance the round counter.
+    if let Some(ref mut buf) = state.turn_event_buffer {
+        let tool_names: Vec<String> = turn_result
+            .accum
+            .tool_calls
+            .iter()
+            .filter_map(|tc| {
+                tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            ttft_ms: turn_result.ttft_ms,
+            duration_ms: prep.turn_start_time.elapsed().as_millis() as u64,
+            prompt_tokens: turn_result.accum.prompt_tokens,
+            completion_tokens: turn_result.accum.completion_tokens,
+            cache_read_tokens: turn_result.accum.cache_read_tokens,
+            tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
+            tool_call_names: tool_names,
+            finish_reason: None,
+        });
+    }
+
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
         state.server_tool_executor.as_deref(),

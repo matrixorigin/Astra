@@ -958,6 +958,11 @@ impl TurnEventBuffer {
         self.turn_start.elapsed().as_millis() as u64
     }
 
+    /// The instant when this turn started (for passing to sub-contexts).
+    pub fn turn_start_instant(&self) -> std::time::Instant {
+        self.turn_start
+    }
+
     /// Current LLM round index (0-based).
     pub fn current_round(&self) -> u32 {
         self.round

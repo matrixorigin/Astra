@@ -130,6 +130,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 args_preview,
                 file_path,
             ));
+        // Fill observability fields on the just-pushed record.
+        if let Some(rec) = self.ctx.tool_call_records.last_mut() {
+            if let Some(start) = self.ctx.turn_start {
+                rec.start_offset_ms =
+                    Some((start.elapsed().as_millis() as u64).saturating_sub(executed_ms));
+            }
+            rec.round = Some(self.ctx.llm_round);
+        }
         self.ctx.step_recorder.complete_tool_with_result(
             &execution.name,
             is_err,

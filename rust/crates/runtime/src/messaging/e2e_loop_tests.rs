@@ -210,6 +210,7 @@ mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            turn_event_buffer: None,
         }
     }
 
@@ -656,6 +657,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -725,6 +728,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -823,6 +828,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -941,6 +948,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -1048,6 +1057,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -1140,6 +1151,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -1259,6 +1272,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -1378,6 +1393,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 
@@ -1455,6 +1472,8 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             server_tool_executor: None,
+            turn_start: None,
+            llm_round: 0,
         })
         .await;
 

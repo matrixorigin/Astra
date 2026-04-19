@@ -62,6 +62,11 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub pre_resolved_results: &'a [(String, String)],
     /// Optional server-side tool executor for web agent sessions.
     pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
+    // ── Observability (Phase 1) ──
+    /// Turn start instant for computing start_offset_ms on tool records.
+    pub turn_start: Option<std::time::Instant>,
+    /// Current LLM round index (0-based) within this turn.
+    pub llm_round: u32,
 }
 
 struct HeadlessPreparedRound<'a> {
@@ -169,6 +174,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         progress_emitter,
         pre_resolved_results,
         server_tool_executor,
+        turn_start,
+        llm_round,
     } = ctx;
     let HeadlessPreparedRound {
         effective_permission_timeout,
@@ -219,6 +226,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             progress_emitter,
             effective_permission_timeout,
             server_tool_executor,
+            turn_start,
+            llm_round,
         },
         consumed_edge,
     );

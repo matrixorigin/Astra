@@ -665,6 +665,11 @@ pub struct AgenticLoopState {
     pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
     /// Last diagnosis computed after tool selection (for telemetry and fallback).
     pub last_confidence_diagnosis: Option<super::confidence_contract::ConfidenceDiagnosis>,
+
+    // ── Turn observability (Phase 1) ──
+    /// In-memory collector for fine-grained turn events (llm_round, tool timing).
+    /// Created at turn start, flushed at turn end or on interruption.
+    pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1109,6 +1114,7 @@ pub(crate) mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            turn_event_buffer: None,
         }
     }
 
