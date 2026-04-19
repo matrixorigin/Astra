@@ -164,18 +164,25 @@ pub(super) async fn chat_stream_handler(
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
 
-    // Bridge E2E hooks: when test secret is present, route through bridge so
-    // `test_llm_rounds` mock works without a real LLM.
+    // Bridge E2E hooks: when test secret is present and NO test_llm_rounds in
+    // context, route through bridge. When test_llm_rounds IS present, fall
+    // through to stream_chat() which wires mock rounds into the host.
     #[cfg(feature = "bridge-e2e-hooks")]
-    if crate::turn::bridge_e2e_hooks::authorized(&headers) {
-        let payload = chat_stream_bridge_fallback_payload(&chat_data);
-        let body = match serde_json::to_vec(&payload).map(Bytes::from) {
-            Ok(body) => body,
-            Err(e) => {
-                return sse_error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-            }
-        };
-        return dispatch_chat_turn_bridge(&state, &user, &headers, body).await;
+    {
+        let has_test_rounds = chat_data
+            .context
+            .as_ref()
+            .map_or(false, |c| c.contains_key("test_llm_rounds"));
+        if crate::turn::bridge_e2e_hooks::authorized(&headers) && !has_test_rounds {
+            let payload = chat_stream_bridge_fallback_payload(&chat_data);
+            let body = match serde_json::to_vec(&payload).map(Bytes::from) {
+                Ok(body) => body,
+                Err(e) => {
+                    return sse_error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                }
+            };
+            return dispatch_chat_turn_bridge(&state, &user, &headers, body).await;
+        }
     }
 
     match state

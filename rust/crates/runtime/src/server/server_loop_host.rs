@@ -229,6 +229,12 @@ pub struct ServerAgenticLoopHost {
     // ── Agent progress ──
     /// Optional receiver for agent progress events (multi-agent tree updates).
     progress_rx: Option<tokio::sync::broadcast::Receiver<crate::orchestration::AgentProgressEvent>>,
+
+    // ── Test hooks ──
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds: std::collections::VecDeque<Value>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds_wired: bool,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -247,6 +253,10 @@ pub struct ServerAgenticLoopHostBuilder {
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
     interactive_client: bool,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds: Vec<Value>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds_wired: bool,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -271,6 +281,10 @@ impl ServerAgenticLoopHostBuilder {
             progress_broadcaster: None,
             interactive_client: false,
             event_tx: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds: Vec::new(),
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds_wired: false,
         }
     }
 
@@ -333,6 +347,13 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
+        self.test_llm_rounds_wired = true;
+        self.test_llm_rounds = rounds;
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
@@ -373,6 +394,10 @@ impl ServerAgenticLoopHostBuilder {
             emitted_events: Vec::new(),
             event_tx: self.event_tx,
             progress_rx,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds_wired: self.test_llm_rounds_wired,
         }
     }
 }
@@ -434,6 +459,76 @@ impl ServerAgenticLoopHost {
     /// this sender as they are emitted, enabling streaming to the client.
     pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) {
         self.event_tx = Some(tx);
+    }
+
+    /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).
+    ///
+    /// Parses the round JSON (same shape as bridge e2e hooks), emits SSE events,
+    /// and returns a `HostTurnResult` as if a real LLM responded.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    async fn execute_mock_turn(
+        &mut self,
+        state: &mut AgenticLoopState,
+        round: &Value,
+        turn_started: Instant,
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        let (full_text, reasoning, tool_calls, usage) =
+            crate::turn::bridge_e2e_hooks::parse_llm_round(round);
+
+        // Emit SSE events matching real flow.
+        if !reasoning.is_empty() {
+            self.push_reasoning_events(&reasoning);
+        }
+        if !full_text.is_empty() {
+            self.emit_event(json!({ "type": "text_delta", "content": &full_text }));
+        }
+        for tc in &tool_calls {
+            self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
+        }
+        let prompt = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(10);
+        let completion = usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(5);
+        self.emit_event(json!({
+            "type": "usage",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+        }));
+
+        // Edge tool delivery via ledger (when streaming to web client).
+        let edge_tool_round =
+            if !self.server_side_tools && self.event_tx.is_some() && !tool_calls.is_empty() {
+                self.deliver_edge_tools_via_ledger(&tool_calls).await
+            } else {
+                Vec::new()
+            };
+
+        let accum = ChatTurnSseAccum {
+            full_text: full_text.clone(),
+            reasoning_content: reasoning,
+            tool_calls: tool_calls.clone(),
+            has_tool_calls: !tool_calls.is_empty(),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            has_usage: true,
+            ..Default::default()
+        };
+
+        state.final_text = full_text;
+        state.total_prompt += prompt;
+        state.total_completion += completion;
+        state.has_any_usage = true;
+
+        Ok(HostTurnResult {
+            accum,
+            ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
+            edge_tool_round,
+            error_kind: None,
+        })
     }
 
     /// Deliver edge tool calls via the ledger protocol.
@@ -1031,6 +1126,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
+
+        // ── Test hook: mock LLM rounds ──────────────────────────────────
+        #[cfg(feature = "bridge-e2e-hooks")]
+        {
+            if let Some(round) = self.test_llm_rounds.pop_front() {
+                return self.execute_mock_turn(state, &round, turn_started).await;
+            }
+            if self.test_llm_rounds_wired {
+                // All mock rounds consumed — return a no-op text result so the
+                // agentic loop terminates cleanly (no real LLM fallback).
+                self.emit_event(
+                    json!({ "type": "text_delta", "content": "[mock rounds exhausted]" }),
+                );
+                state.final_text = "[mock rounds exhausted]".to_string();
+                return Ok(HostTurnResult {
+                    accum: ChatTurnSseAccum {
+                        full_text: "[mock rounds exhausted]".to_string(),
+                        ..Default::default()
+                    },
+                    ttft_ms: Some(0),
+                    edge_tool_round: Vec::new(),
+                    error_kind: None,
+                });
+            }
+        }
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
         // Skill-level model override takes precedence over the host-level one.

@@ -1192,6 +1192,17 @@ impl AgenticRunLifecycleService {
                 builder = builder.with_progress_broadcaster(Arc::clone(broadcaster));
             }
         }
+        // Wire test LLM rounds from request context (E2E test hook).
+        #[cfg(feature = "bridge-e2e-hooks")]
+        if let Some(rounds) = request
+            .context
+            .as_ref()
+            .and_then(|c| c.get("test_llm_rounds"))
+            .and_then(Value::as_array)
+            .cloned()
+        {
+            builder = builder.with_test_llm_rounds(rounds);
+        }
         builder.build()
     }
 
