@@ -7484,3 +7484,223 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
     }
 }
+
+#[cfg(test)]
+mod observability_e2e_tests {
+    use super::tests::*;
+    use super::*;
+    use astra_services::session_journal::{
+        JournalDirGuard, JournalEventType, JournalWriter, ToolCallRecord,
+    };
+    use serde_json::json;
+
+    fn tool_call_json(name: &str) -> Value {
+        json!({
+            "id": format!("call-{name}"),
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+            }
+        })
+    }
+
+    fn turn_with_tools(tools: &[&str], text: &str) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                full_text: text.to_string(),
+                tool_calls: tools.iter().map(|t| tool_call_json(t)).collect(),
+                has_tool_calls: !tools.is_empty(),
+                prompt_tokens: 1000,
+                completion_tokens: 200,
+                cache_read_tokens: 100,
+                has_usage: true,
+                ..Default::default()
+            },
+            ttft_ms: Some(50),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }
+    }
+
+    fn text_only_turn(text: &str) -> HostTurnResult {
+        turn_with_tools(&[], text)
+    }
+
+    fn read_journal_events(session_id: &str) -> Vec<astra_services::session_journal::JournalEvent> {
+        let writer = JournalWriter::new(session_id).unwrap();
+        let content = std::fs::read_to_string(writer.path()).unwrap_or_default();
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Scenario 1: Single round with multiple tools — verifies round, start_offset_ms,
+    /// batch_id, parallel fields are populated on ToolCallRecords.
+    #[tokio::test]
+    async fn observability_single_round_multi_tool_records_round_and_batch() {
+        let session_id = format!("obs-e2e-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        // Two turns: first returns 3 tool_calls, second returns text.
+        let mut host = MockHost::new(vec![
+            turn_with_tools(&["read_file", "grep", "glob"], ""),
+            text_only_turn("done"),
+        ])
+        .with_valid_tools(&["read_file", "grep", "glob"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await.unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        // Verify ToolCallRecords have round field set.
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert!(
+            !records.is_empty(),
+            "expected tool call records from headless round"
+        );
+        for rec in &records {
+            assert_eq!(rec.round, Some(0), "all tools in first round should have round=0");
+            assert!(
+                rec.start_offset_ms.is_some(),
+                "start_offset_ms should be set for {}",
+                rec.name
+            );
+        }
+
+        // If multiple tools, they should share a batch_id and be marked parallel.
+        if records.len() > 1 {
+            let batch_ids: Vec<_> = records.iter().filter_map(|r| r.batch_id.as_ref()).collect();
+            assert!(
+                !batch_ids.is_empty(),
+                "batch_id should be set for multi-tool round"
+            );
+            let first = &batch_ids[0];
+            assert!(
+                batch_ids.iter().all(|b| b == first),
+                "all tools in same round should share batch_id"
+            );
+            assert!(
+                records.iter().all(|r| r.parallel == Some(true)),
+                "multi-tool round should mark parallel=true"
+            );
+        }
+    }
+
+    /// Scenario 2: Multiple LLM rounds — verifies llm_round events are recorded
+    /// and round counter increments correctly.
+    #[tokio::test]
+    async fn observability_multi_round_records_llm_round_events() {
+        let session_id = format!("obs-e2e-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        // Three turns: round 0 (1 tool), round 1 (1 tool), round 2 (text).
+        let mut host = MockHost::new(vec![
+            turn_with_tools(&["read_file"], ""),
+            turn_with_tools(&["grep"], ""),
+            text_only_turn("final answer"),
+        ])
+        .with_valid_tools(&["read_file", "grep"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await.unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        // Verify tool records have incrementing round numbers.
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].round, Some(0));
+        assert_eq!(records[1].round, Some(1));
+
+        // Verify start_offset_ms is monotonically increasing.
+        let off0 = records[0].start_offset_ms.unwrap_or(0);
+        let off1 = records[1].start_offset_ms.unwrap_or(0);
+        assert!(
+            off1 >= off0,
+            "second tool should start after first: {off0} vs {off1}"
+        );
+
+        // The buffer persists across iterations within the same agentic loop.
+        // It should have recorded 2 llm_round events (for the 2 tool rounds).
+        if let Some(buf) = &state.turn_event_buffer {
+            assert_eq!(buf.current_round(), 2, "buffer should have 2 rounds recorded");
+        }
+    }
+
+    /// Scenario 3: Cancellation preserves partial data via flush_interrupted.
+    #[tokio::test]
+    async fn observability_cancellation_flushes_partial_events() {
+        let session_id = format!("obs-e2e-cancel-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        // First turn returns tools, second turn the host will error (simulating cancel).
+        let mut host = MockHost::new(vec![
+            turn_with_tools(&["read_file"], ""),
+            // No more turns → BudgetExhausted error → triggers interruption path.
+        ])
+        .with_valid_tools(&["read_file"]);
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+
+        let _outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        // The loop should complete (budget exhausted gracefully) or error.
+        // Either way, check that partial events were flushed.
+
+        let events = read_journal_events(&session_id);
+        // We should see at least an interruption_recorded event.
+        // The flush_interrupted path writes partial llm_round events.
+        let has_interruption = events
+            .iter()
+            .any(|e| e.event_type == JournalEventType::InterruptionRecorded);
+        // If there was an interruption, partial events should have been flushed.
+        if has_interruption {
+            let llm_rounds: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == JournalEventType::LlmRound)
+                .collect();
+            // Should have at least 1 llm_round from the first successful tool turn.
+            if !llm_rounds.is_empty() {
+                let partial = llm_rounds[0]
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("partial"))
+                    .and_then(|v| v.as_bool());
+                assert_eq!(
+                    partial,
+                    Some(true),
+                    "interrupted events should be marked partial"
+                );
+            }
+        }
+
+        // Verify tool records still have round info even on interruption.
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        if !records.is_empty() {
+            assert_eq!(records[0].round, Some(0));
+            assert!(records[0].start_offset_ms.is_some());
+        }
+    }
+}

@@ -5353,3 +5353,209 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod turn_event_buffer_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn begin_turn_initializes_round_zero() {
+        let buf = TurnEventBuffer::begin_turn(Some("sess-1"), 3);
+        assert_eq!(buf.current_round(), 0);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn record_llm_round_advances_round_counter() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 1);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(100),
+            duration_ms: 500,
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            tool_calls_returned: 2,
+            tool_call_names: vec!["read_file".into(), "grep".into()],
+            finish_reason: Some("tool_calls".into()),
+        });
+        assert_eq!(buf.current_round(), 1);
+        assert_eq!(buf.len(), 1);
+
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 300,
+            prompt_tokens: 2000,
+            completion_tokens: 100,
+            cache_read_tokens: 500,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["write_file".into()],
+            finish_reason: None,
+        });
+        assert_eq!(buf.current_round(), 2);
+        assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn recorded_llm_round_event_has_correct_fields() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 5);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(42),
+            duration_ms: 800,
+            prompt_tokens: 3000,
+            completion_tokens: 400,
+            cache_read_tokens: 1000,
+            tool_calls_returned: 3,
+            tool_call_names: vec!["a".into(), "b".into(), "c".into()],
+            finish_reason: Some("tool_calls".into()),
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.event_type, JournalEventType::LlmRound);
+        assert_eq!(ev.turn, Some(5));
+        assert_eq!(ev.round, Some(0));
+        assert_eq!(ev.ttft_ms, Some(42));
+        assert_eq!(ev.tokens_in, Some(3000));
+        assert_eq!(ev.tokens_out, Some(400));
+        assert_eq!(ev.cache_read_tokens, Some(1000));
+        assert_eq!(ev.tool_calls_returned, Some(3));
+        let meta = ev.metadata.as_ref().unwrap();
+        assert_eq!(meta["tool_call_names"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn next_batch_id_includes_round() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
+        assert_eq!(buf.next_batch_id(), "b-0-0");
+        assert_eq!(buf.next_batch_id(), "b-0-1");
+        // Advance round
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: None,
+        });
+        assert_eq!(buf.next_batch_id(), "b-1-0");
+    }
+
+    #[test]
+    fn flush_writes_events_to_journal() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-flush").unwrap();
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-flush"), 1);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 100,
+            prompt_tokens: 500,
+            completion_tokens: 50,
+            cache_read_tokens: 0,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["bash".into()],
+            finish_reason: None,
+        });
+        buf.record(JournalEvent::base_public(
+            JournalEventType::Turn,
+            Some("sess-flush"),
+        ));
+        assert_eq!(buf.len(), 2);
+
+        buf.flush(&writer).unwrap();
+        assert!(buf.is_empty());
+
+        // Verify written to disk
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let ev0: JournalEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev0.event_type, JournalEventType::LlmRound);
+        let ev1: JournalEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(ev1.event_type, JournalEventType::Turn);
+    }
+
+    #[test]
+    fn flush_interrupted_marks_events_partial() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-interrupted").unwrap();
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-interrupted"), 1);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(50),
+            duration_ms: 200,
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            cache_read_tokens: 0,
+            tool_calls_returned: 2,
+            tool_call_names: vec!["read_file".into(), "grep".into()],
+            finish_reason: None,
+        });
+
+        buf.flush_interrupted(&writer).unwrap();
+        assert!(buf.is_empty());
+
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let ev: JournalEvent = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(ev.event_type, JournalEventType::LlmRound);
+        let partial = ev
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("partial"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(partial, Some(true));
+    }
+
+    #[test]
+    fn flush_empty_buffer_is_noop() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-empty").unwrap();
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-empty"), 1);
+        buf.flush(&writer).unwrap();
+        // File should not exist (no events written)
+        assert!(!writer.path().exists());
+    }
+
+    #[test]
+    fn drain_returns_events_and_clears_buffer() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
+        buf.record(JournalEvent::base_public(
+            JournalEventType::Turn,
+            Some("s"),
+        ));
+        buf.record(JournalEvent::base_public(
+            JournalEventType::Turn,
+            Some("s"),
+        ));
+        assert_eq!(buf.len(), 2);
+        let drained = buf.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn append_bulk_writes_multiple_events_atomically() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-bulk").unwrap();
+
+        let events = vec![
+            JournalEvent::session_start(Some("sess-bulk"), Some("gpt-4")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("sess-bulk")),
+            JournalEvent::session_end(Some("sess-bulk"), 1),
+        ];
+        writer.append_bulk(&events).unwrap();
+
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+    }
+}

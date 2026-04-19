@@ -338,13 +338,15 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     let turn_start_time = Instant::now();
 
-    // Initialize turn event buffer for fine-grained observability.
-    state.turn_event_buffer = Some(
-        astra_services::session_journal::TurnEventBuffer::begin_turn(
-            state.current_session_id.as_deref(),
-            (state.max_turns - state.remaining_turns) as u32,
-        ),
-    );
+    // Initialize turn event buffer for fine-grained observability (once per turn).
+    if state.turn_event_buffer.is_none() {
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(
+                state.current_session_id.as_deref(),
+                (state.max_turns - state.remaining_turns) as u32,
+            ),
+        );
+    }
 
     if let (Some(hub), Some(session)) = (
         &state.telemetry.observability_hub,

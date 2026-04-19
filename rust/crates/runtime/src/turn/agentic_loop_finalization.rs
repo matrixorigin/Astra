@@ -366,9 +366,31 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     let result = run_agentic_loop_impl(host, state).await;
 
+    // On error, best-effort flush turn observability events.
+    if result.is_err() {
+        if let Some(sid) = state.current_session_id.as_deref() {
+            if let Some(buf) = state.turn_event_buffer.as_mut() {
+                if !buf.is_empty() {
+                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                        let _ = buf.flush_interrupted(&writer);
+                    }
+                }
+            }
+        }
+    }
+
     // Emit structured interruption to journal if one was recorded.
     if let Some(ref interruption) = state.interruption {
         if let Some(ref sid) = state.current_session_id {
+            // Best-effort flush of turn observability events on interruption.
+            if let Some(buf) = state.turn_event_buffer.as_mut() {
+                if !buf.is_empty() {
+                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                        let _ = buf.flush_interrupted(&writer);
+                    }
+                }
+            }
+
             let turn_num = (state.max_turns - state.remaining_turns) as u32;
             let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
                 Some(sid.as_str()),

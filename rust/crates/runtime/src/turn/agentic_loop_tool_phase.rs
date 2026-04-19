@@ -872,6 +872,30 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     // Record LLM round in the turn event buffer and advance the round counter.
+    // Also post-process new ToolCallRecords to set batch_id and parallel flags.
+    let new_records_start = evo_records_before;
+    let new_records = &mut state.stall.tool_call_records[new_records_start..];
+    if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
+        let batch_id = state
+            .turn_event_buffer
+            .as_mut()
+            .map(|b| b.next_batch_id());
+        let has_parallel = new_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .count()
+            > 1;
+        for rec in new_records.iter_mut() {
+            if rec.is_synthetic_placeholder() {
+                continue;
+            }
+            rec.batch_id = batch_id.clone();
+            if has_parallel {
+                rec.parallel = Some(true);
+            }
+        }
+    }
+
     if let Some(ref mut buf) = state.turn_event_buffer {
         let tool_names: Vec<String> = turn_result
             .accum
