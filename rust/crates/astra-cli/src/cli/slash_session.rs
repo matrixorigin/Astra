@@ -4455,6 +4455,20 @@ fn history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, S
     pairs
 }
 
+/// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
+/// cloud preference seeding in `cloud_sync.rs`).
+fn blocked_tool_health_entry(
+    name: String,
+) -> astra_runtime::pipeline::persistence::ToolHealthEntry {
+    astra_runtime::pipeline::persistence::ToolHealthEntry {
+        name,
+        total_calls: 0,
+        total_failures: 0,
+        failure_rate: 0.0,
+        last_updated_epoch: 0,
+    }
+}
+
 fn apply_heavy_state_fallback(
     state: &mut ReplState,
     blocked_tools: &[String],
@@ -4466,13 +4480,7 @@ fn apply_heavy_state_fallback(
         if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
             state
                 .tool_health_entries
-                .push(astra_runtime::pipeline::persistence::ToolHealthEntry {
-                    name: tool.clone(),
-                    total_calls: 0,
-                    total_failures: 0,
-                    failure_rate: 0.0,
-                    last_updated_epoch: 0,
-                });
+                .push(blocked_tool_health_entry(tool.clone()));
         }
     }
     if let Some(ao_json) = approval_overrides {
@@ -4553,15 +4561,9 @@ async fn apply_restored_session(
         let summary = astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
         for tool in &step_restored.blocked_tools {
             if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
-                state.tool_health_entries.push(
-                    astra_runtime::pipeline::persistence::ToolHealthEntry {
-                        name: tool.clone(),
-                        total_calls: 3,
-                        total_failures: 3,
-                        failure_rate: 1.0,
-                        last_updated_epoch: 0,
-                    },
-                );
+                state
+                    .tool_health_entries
+                    .push(blocked_tool_health_entry(tool.clone()));
             }
         }
         if state.recent_tools.is_empty() {
