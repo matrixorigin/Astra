@@ -96,6 +96,10 @@ pub struct Aggregates {
     pub avg_tokens_in: f64,
     pub avg_tokens_out: f64,
     pub avg_duration_ms: f64,
+    /// Average LLM rounds per turn (how many LLM→tool cycles).
+    pub avg_llm_rounds: f64,
+    /// Average tool calls per LLM round.
+    pub avg_tool_calls_per_round: f64,
 }
 
 #[derive(Serialize)]
@@ -138,6 +142,15 @@ pub struct TurnRow {
     pub user_input_preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_pressure: Option<f64>,
+    /// LLM rounds in this turn (LLM→tool cycles).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_rounds: Option<u32>,
+    /// Total LLM time excluding tool execution (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_llm_ms: Option<u64>,
+    /// Total tool execution time (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tool_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +305,9 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     tool_calls_fail: fail_c,
                     user_input_preview,
                     budget_pressure: ev.budget_pressure,
+                    llm_rounds: ev.llm_rounds,
+                    total_llm_ms: ev.total_llm_ms,
+                    total_tool_ms: ev.total_tool_ms,
                 };
                 turns_out.push(row);
             }
@@ -377,6 +393,23 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             avg_tokens_in,
             avg_tokens_out,
             avg_duration_ms,
+            avg_llm_rounds: if turn_count > 0 {
+                turns_out
+                    .iter()
+                    .filter_map(|t| t.llm_rounds)
+                    .sum::<u32>() as f64
+                    / turns_out.iter().filter(|t| t.llm_rounds.is_some()).count().max(1) as f64
+            } else {
+                0.0
+            },
+            avg_tool_calls_per_round: {
+                let total_rounds: u32 = turns_out.iter().filter_map(|t| t.llm_rounds).sum();
+                if total_rounds > 0 {
+                    total_tool_calls as f64 / total_rounds as f64
+                } else {
+                    0.0
+                }
+            },
         },
         turns: turns_out,
         compaction_events,
@@ -424,6 +457,12 @@ pub fn print_text(d: &JournalDigest) {
         "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
         a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
     );
+    if a.avg_llm_rounds > 0.0 {
+        println!(
+            "  llm_rounds={:.1} tool_calls_per_round={:.1}",
+            a.avg_llm_rounds, a.avg_tool_calls_per_round
+        );
+    }
     if !d.turns.is_empty() {
         println!("\n  {}", "Turns".bold().cyan());
         println!(

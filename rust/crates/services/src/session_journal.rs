@@ -5559,3 +5559,122 @@ mod turn_event_buffer_tests {
         assert_eq!(lines.len(), 3);
     }
 }
+
+#[cfg(test)]
+mod observability_serde_tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_record_new_fields_serialize_only_when_set() {
+        let rec = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            ms: 50,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        // New fields should be omitted when None.
+        assert!(!json.contains("start_offset_ms"));
+        assert!(!json.contains("batch_id"));
+        assert!(!json.contains("parallel"));
+        assert!(!json.contains("\"round\""));
+    }
+
+    #[test]
+    fn tool_call_record_new_fields_round_trip() {
+        let rec = ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            ms: 10,
+            start_offset_ms: Some(5000),
+            batch_id: Some("b-0-0".into()),
+            parallel: Some(true),
+            round: Some(2),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"start_offset_ms\":5000"));
+        assert!(json.contains("\"batch_id\":\"b-0-0\""));
+        assert!(json.contains("\"parallel\":true"));
+        assert!(json.contains("\"round\":2"));
+
+        let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.start_offset_ms, Some(5000));
+        assert_eq!(deser.batch_id.as_deref(), Some("b-0-0"));
+        assert_eq!(deser.parallel, Some(true));
+        assert_eq!(deser.round, Some(2));
+    }
+
+    #[test]
+    fn tool_call_record_backward_compat_old_json_missing_new_fields() {
+        // Old journal entries won't have the new fields — they must deserialize to None.
+        let old_json = r#"{"name":"bash","ok":true,"ms":100}"#;
+        let rec: ToolCallRecord = serde_json::from_str(old_json).unwrap();
+        assert_eq!(rec.name, "bash");
+        assert!(rec.ok);
+        assert_eq!(rec.ms, 100);
+        assert_eq!(rec.start_offset_ms, None);
+        assert_eq!(rec.batch_id, None);
+        assert_eq!(rec.parallel, None);
+        assert_eq!(rec.round, None);
+    }
+
+    #[test]
+    fn journal_event_new_fields_serialize_only_when_set() {
+        let ev = JournalEvent::base_public(JournalEventType::Turn, Some("s1"));
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("\"round\""));
+        assert!(!json.contains("tool_calls_returned"));
+        assert!(!json.contains("offset_ms"));
+        assert!(!json.contains("llm_rounds"));
+        assert!(!json.contains("total_llm_ms"));
+        assert!(!json.contains("total_tool_ms"));
+    }
+
+    #[test]
+    fn journal_event_llm_round_type_round_trip() {
+        let mut ev = JournalEvent::base_public(JournalEventType::LlmRound, Some("s1"));
+        ev.round = Some(3);
+        ev.tool_calls_returned = Some(5);
+        ev.offset_ms = Some(12000);
+        ev.tokens_in = Some(8000);
+        ev.tokens_out = Some(400);
+
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"llm_round\""));
+        assert!(json.contains("\"round\":3"));
+        assert!(json.contains("\"tool_calls_returned\":5"));
+
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.event_type, JournalEventType::LlmRound);
+        assert_eq!(deser.round, Some(3));
+        assert_eq!(deser.tool_calls_returned, Some(5));
+        assert_eq!(deser.offset_ms, Some(12000));
+    }
+
+    #[test]
+    fn journal_event_backward_compat_old_turn_missing_new_fields() {
+        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500}"#;
+        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert_eq!(ev.event_type, JournalEventType::Turn);
+        assert_eq!(ev.round, None);
+        assert_eq!(ev.tool_calls_returned, None);
+        assert_eq!(ev.llm_rounds, None);
+        assert_eq!(ev.total_llm_ms, None);
+        assert_eq!(ev.total_tool_ms, None);
+    }
+
+    #[test]
+    fn journal_event_turn_with_observability_summary() {
+        let mut ev = JournalEvent::turn(Some("s1"), 1, Some("gpt-4"), "hi", "hello", 3, 1000, 200, 5000);
+        ev.llm_rounds = Some(2);
+        ev.total_llm_ms = Some(4500);
+        ev.total_tool_ms = Some(500);
+
+        let json = serde_json::to_string(&ev).unwrap();
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.llm_rounds, Some(2));
+        assert_eq!(deser.total_llm_ms, Some(4500));
+        assert_eq!(deser.total_tool_ms, Some(500));
+    }
+}
