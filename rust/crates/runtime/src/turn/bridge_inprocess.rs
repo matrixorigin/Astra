@@ -144,6 +144,7 @@ fn preview_chars(value: &str, limit: usize) -> String {
 fn build_bridge_tool_call_records(
     tool_calls: &[Value],
     tool_results: &[Value],
+    round_info: &HashMap<String, (u32, usize)>, // request_id → (round, tools_in_round)
 ) -> Vec<ToolCallRecord> {
     let mut call_metadata: HashMap<String, (String, Option<String>, Option<u32>)> = HashMap::new();
     for tool_call in tool_calls {
@@ -219,6 +220,12 @@ fn build_bridge_tool_call_records(
                 .ok()
                 .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
         });
+        // Observability: assign round/batch_id/parallel from round_info.
+        let (round, batch_id, parallel) = match round_info.get(&request_id) {
+            Some(&(r, count)) if count > 1 => (Some(r), Some(format!("bridge-r{r}")), Some(true)),
+            Some(&(r, _)) => (Some(r), None, None),
+            None => (None, None, None),
+        };
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -236,6 +243,9 @@ fn build_bridge_tool_call_records(
             file_path,
             surgically_removed: None,
             original_tool_name: None,
+            round,
+            batch_id,
+            parallel,
             ..Default::default()
         });
     }
@@ -244,6 +254,11 @@ fn build_bridge_tool_call_records(
         if seen_request_ids.contains(&request_id) {
             continue;
         }
+        let (round, batch_id, parallel) = match round_info.get(&request_id) {
+            Some(&(r, count)) if count > 1 => (Some(r), Some(format!("bridge-r{r}")), Some(true)),
+            Some(&(r, _)) => (Some(r), None, None),
+            None => (None, None, None),
+        };
         records.push(ToolCallRecord {
             name: tool_name,
             ok: false,
@@ -258,6 +273,9 @@ fn build_bridge_tool_call_records(
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            round,
+            batch_id,
+            parallel,
             ..Default::default()
         });
     }
@@ -2592,11 +2610,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     turn_guard: &mut bridge_turn_guard,
                 });
 
+                let round_start = all_round_tool_calls.len();
                 all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
-                round_boundaries.push((
-                    all_round_tool_calls.len() - loop_tool_calls.len(),
-                    loop_tool_calls.len(),
-                ));
+                round_boundaries.push((round_start, loop_tool_calls.len()));
 
                 llm_messages.push(assistant_message_with_tool_calls_and_reasoning(
                     &loop_tool_calls,
@@ -3143,51 +3159,20 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 );
             }
 
-            let mut tool_call_records =
-                build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results);
-            // Post-process: assign round and batch_id/parallel from round_boundaries.
-            {
-                // Build tool_call_id → round mapping from boundaries.
-                let mut id_to_round: HashMap<String, u32> = HashMap::new();
-                let mut id_to_count: HashMap<String, usize> = HashMap::new();
+            // Build request_id → (round, tools_in_round) for observability.
+            let round_info: HashMap<String, (u32, usize)> = {
+                let mut m = HashMap::new();
                 for (round_idx, (start, count)) in round_boundaries.iter().enumerate() {
                     for tc in &all_round_tool_calls[*start..*start + *count] {
                         if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                            id_to_round.insert(id.to_string(), round_idx as u32);
-                            id_to_count.insert(id.to_string(), *count);
+                            m.insert(id.to_string(), (round_idx as u32, *count));
                         }
                     }
                 }
-                // Match records to tool_calls by name+position order.
-                // Records are built from tool_results which carry request_id matching tool_call id.
-                for rec in &mut tool_call_records {
-                    // Try to find the round for this record by matching against merged_tool_results.
-                    // The record's args_preview was built from the tool_call's arguments.
-                    // Simplest: iterate tool_calls and match by name order.
-                    for tc in all_round_tool_calls.iter() {
-                        let tc_name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let tc_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                        if tc_name == rec.name {
-                            if let Some(&round) = id_to_round.get(tc_id) {
-                                rec.round = Some(round);
-                                if let Some(&count) = id_to_count.get(tc_id) {
-                                    if count > 1 {
-                                        rec.batch_id =
-                                            Some(format!("bridge-r{round}"));
-                                        rec.parallel = Some(true);
-                                    }
-                                }
-                            }
-                            // Remove matched to avoid double-matching same-name tools.
-                            break;
-                        }
-                    }
-                }
-            }
+                m
+            };
+            let tool_call_records =
+                build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results, &round_info);
             let verdict_warning = bridge_verdict_events.iter().any(|event| {
                 event.severity.eq_ignore_ascii_case("warning")
                     || event.severity.eq_ignore_ascii_case("critical")

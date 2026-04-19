@@ -2326,7 +2326,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
-                ..Default::default()
+                    ..Default::default()
                 }]),
                 budget_used: Some(8300),
                 budget_pressure: Some(0.83),

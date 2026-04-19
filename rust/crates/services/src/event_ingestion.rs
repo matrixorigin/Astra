@@ -1139,7 +1139,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
             crate::session_journal::ToolCallRecord {
                 name: "read_file".into(),
@@ -1153,7 +1153,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
         ]);
 
@@ -1211,7 +1211,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
-        ..Default::default()
+            ..Default::default()
         }]);
 
         let events = IngestionEvent::expand_journal_event(&journal, "u1");
@@ -1238,7 +1238,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
-        ..Default::default()
+            ..Default::default()
         }]);
 
         let a = IngestionEvent::expand_journal_event(&journal, "u1");

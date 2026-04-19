@@ -834,8 +834,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
-        let obs_turn_start = state.turn_event_buffer.as_ref().map(|b| b.turn_start_instant());
-        let obs_llm_round = state.turn_event_buffer.as_ref().map(|b| b.current_round()).unwrap_or(0);
+        let obs_turn_start = state
+            .turn_event_buffer
+            .as_ref()
+            .map(|b| b.turn_start_instant());
+        let obs_llm_round = state
+            .turn_event_buffer
+            .as_ref()
+            .map(|b| b.current_round())
+            .unwrap_or(0);
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -876,10 +883,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let new_records_start = evo_records_before;
     let new_records = &mut state.stall.tool_call_records[new_records_start..];
     if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
-        let batch_id = state
-            .turn_event_buffer
-            .as_mut()
-            .map(|b| b.next_batch_id());
+        let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
         let has_parallel = new_records
             .iter()
             .filter(|r| !r.is_synthetic_placeholder())

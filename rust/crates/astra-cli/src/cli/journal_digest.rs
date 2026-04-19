@@ -394,11 +394,12 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             avg_tokens_out,
             avg_duration_ms,
             avg_llm_rounds: if turn_count > 0 {
-                turns_out
-                    .iter()
-                    .filter_map(|t| t.llm_rounds)
-                    .sum::<u32>() as f64
-                    / turns_out.iter().filter(|t| t.llm_rounds.is_some()).count().max(1) as f64
+                turns_out.iter().filter_map(|t| t.llm_rounds).sum::<u32>() as f64
+                    / turns_out
+                        .iter()
+                        .filter(|t| t.llm_rounds.is_some())
+                        .count()
+                        .max(1) as f64
             } else {
                 0.0
             },

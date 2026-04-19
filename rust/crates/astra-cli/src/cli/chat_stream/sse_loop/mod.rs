@@ -585,7 +585,7 @@ pub(crate) async fn stream_chat_sse(
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
-            turn_event_buffer: None,
+        turn_event_buffer: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
@@ -679,10 +679,7 @@ pub(crate) async fn stream_chat_sse(
             .as_mut()
             .map(|b| b.drain())
             .unwrap_or_default(),
-        llm_rounds: state
-            .turn_event_buffer
-            .as_ref()
-            .map(|b| b.current_round()),
+        llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
     }))
 }
 

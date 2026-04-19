@@ -1031,9 +1031,7 @@ impl TurnEventBuffer {
             return Ok(());
         }
         for event in &mut self.events {
-            let meta = event
-                .metadata
-                .get_or_insert_with(|| serde_json::json!({}));
+            let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
@@ -4225,7 +4223,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
-        ..Default::default()
+            ..Default::default()
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -5527,14 +5525,8 @@ mod turn_event_buffer_tests {
     #[test]
     fn drain_returns_events_and_clears_buffer() {
         let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
-        buf.record(JournalEvent::base_public(
-            JournalEventType::Turn,
-            Some("s"),
-        ));
-        buf.record(JournalEvent::base_public(
-            JournalEventType::Turn,
-            Some("s"),
-        ));
+        buf.record(JournalEvent::base_public(JournalEventType::Turn, Some("s")));
+        buf.record(JournalEvent::base_public(JournalEventType::Turn, Some("s")));
         assert_eq!(buf.len(), 2);
         let drained = buf.drain();
         assert_eq!(drained.len(), 2);
@@ -5666,7 +5658,17 @@ mod observability_serde_tests {
 
     #[test]
     fn journal_event_turn_with_observability_summary() {
-        let mut ev = JournalEvent::turn(Some("s1"), 1, Some("gpt-4"), "hi", "hello", 3, 1000, 200, 5000);
+        let mut ev = JournalEvent::turn(
+            Some("s1"),
+            1,
+            Some("gpt-4"),
+            "hi",
+            "hello",
+            3,
+            1000,
+            200,
+            5000,
+        );
         ev.llm_rounds = Some(2);
         ev.total_llm_ms = Some(4500);
         ev.total_tool_ms = Some(500);

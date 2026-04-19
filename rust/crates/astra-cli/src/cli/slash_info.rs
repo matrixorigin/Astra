@@ -1023,10 +1023,7 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
             };
 
             // Show round and parallel info when available.
-            let round_tag = tc
-                .round
-                .map(|r| format!(" R{r}"))
-                .unwrap_or_default();
+            let round_tag = tc.round.map(|r| format!(" R{r}")).unwrap_or_default();
             let par_tag = if tc.parallel == Some(true) {
                 " ∥"
             } else {

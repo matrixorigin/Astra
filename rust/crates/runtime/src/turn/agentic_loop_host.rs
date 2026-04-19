@@ -5908,7 +5908,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -5922,7 +5922,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
         ];
 
@@ -6067,7 +6067,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6081,7 +6081,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6095,7 +6095,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
         ];
 
@@ -6656,7 +6656,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
-                ..Default::default()
+                    ..Default::default()
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -6670,7 +6670,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
-                ..Default::default()
+                    ..Default::default()
                 },
             ]);
             if !bash_ok {
@@ -6728,7 +6728,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
-                ..Default::default()
+                    ..Default::default()
                 }]),
                 budget_used: None,
                 budget_pressure: None,
@@ -6752,12 +6752,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 selector_confidence: None,
                 routing_domain_hint: None,
                 entity_learn_skipped_no_domain: false,
-            round: None,
-            tool_calls_returned: None,
-            offset_ms: None,
-            llm_rounds: None,
-            total_llm_ms: None,
-            total_tool_ms: None,
+                round: None,
+                tool_calls_returned: None,
+                offset_ms: None,
+                llm_rounds: None,
+                total_llm_ms: None,
+                total_tool_ms: None,
             })
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")
@@ -6823,7 +6823,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6837,7 +6837,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -6851,7 +6851,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
-            ..Default::default()
+                ..Default::default()
             },
         ];
         state.recent_tactical_actions = vec![
@@ -7553,7 +7553,9 @@ mod observability_e2e_tests {
         ])
         .with_valid_tools(&["read_file", "grep", "glob"]);
 
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await.unwrap();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
         assert!(matches!(outcome, AgenticLoopOutcome::Completed));
 
         // Verify ToolCallRecords have round field set.
@@ -7568,7 +7570,11 @@ mod observability_e2e_tests {
             "expected tool call records from headless round"
         );
         for rec in &records {
-            assert_eq!(rec.round, Some(0), "all tools in first round should have round=0");
+            assert_eq!(
+                rec.round,
+                Some(0),
+                "all tools in first round should have round=0"
+            );
             assert!(
                 rec.start_offset_ms.is_some(),
                 "start_offset_ms should be set for {}",
@@ -7613,7 +7619,9 @@ mod observability_e2e_tests {
         ])
         .with_valid_tools(&["read_file", "grep"]);
 
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await.unwrap();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
         assert!(matches!(outcome, AgenticLoopOutcome::Completed));
 
         // Verify tool records have incrementing round numbers.
@@ -7638,7 +7646,11 @@ mod observability_e2e_tests {
         // The buffer persists across iterations within the same agentic loop.
         // It should have recorded 2 llm_round events (for the 2 tool rounds).
         if let Some(buf) = &state.turn_event_buffer {
-            assert_eq!(buf.current_round(), 2, "buffer should have 2 rounds recorded");
+            assert_eq!(
+                buf.current_round(),
+                2,
+                "buffer should have 2 rounds recorded"
+            );
         }
     }
 

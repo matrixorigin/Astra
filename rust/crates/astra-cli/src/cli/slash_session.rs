@@ -4112,7 +4112,7 @@ mod export_tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
-        ..Default::default()
+            ..Default::default()
         }];
         let block = format_tool_calls_md(&calls);
         assert!(block.contains("<details>"));

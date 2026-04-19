@@ -755,7 +755,7 @@ fn e2e_unicode_in_tool_records_survives_journal_roundtrip() {
             file_path: Some("/tmp/科技风格/index.html".into()),
             surgically_removed: None,
             original_tool_name: None,
-        ..Default::default()
+            ..Default::default()
         },
         surgical_removal("read_file"),
     ];
