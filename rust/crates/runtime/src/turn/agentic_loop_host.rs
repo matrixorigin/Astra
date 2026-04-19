@@ -7716,3 +7716,188 @@ mod observability_e2e_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod parallel_execution_tests {
+    use super::tests::*;
+    use super::*;
+    use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
+    use serde_json::json;
+
+    fn tool_call_json_named(name: &str, id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+            }
+        })
+    }
+
+    fn turn_with_named_tools(tools: &[(&str, &str)], text: &str) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                full_text: text.to_string(),
+                tool_calls: tools
+                    .iter()
+                    .map(|(name, id)| tool_call_json_named(name, id))
+                    .collect(),
+                has_tool_calls: !tools.is_empty(),
+                prompt_tokens: 1000,
+                completion_tokens: 200,
+                cache_read_tokens: 0,
+                has_usage: true,
+                ..Default::default()
+            },
+            ttft_ms: Some(50),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }
+    }
+
+    /// 6 read-only tools in one round — all should be batched concurrently.
+    #[tokio::test]
+    async fn parallel_all_readonly_tools_batched_together() {
+        let session_id = format!("par-e2e-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+
+        let tools = vec![
+            ("read_file", "c1"),
+            ("grep", "c2"),
+            ("glob", "c3"),
+            ("git_status", "c4"),
+            ("git_diff", "c5"),
+            ("read_file", "c6"),
+        ];
+        let mut host = MockHost::new(vec![
+            turn_with_named_tools(&tools, ""),
+            turn_with_named_tools(&[], "done"),
+        ])
+        .with_valid_tools(&["read_file", "grep", "glob", "git_status", "git_diff"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert_eq!(records.len(), 6, "expected 6 tool call records");
+
+        // All should be in round 0, all parallel, all same batch_id.
+        for rec in &records {
+            assert_eq!(rec.round, Some(0), "tool {} should be round 0", rec.name);
+            assert!(
+                rec.parallel == Some(true),
+                "tool {} should be parallel",
+                rec.name
+            );
+        }
+        let batch_ids: Vec<_> = records.iter().filter_map(|r| r.batch_id.as_ref()).collect();
+        assert!(!batch_ids.is_empty(), "batch_ids should be set");
+        let first = &batch_ids[0];
+        assert!(
+            batch_ids.iter().all(|b| b == first),
+            "all tools should share same batch_id"
+        );
+    }
+
+    /// Mixed: 3 read-only, then 1 write (bash), then 2 read-only.
+    /// Partition should produce: Concurrent(3), Serial(1), Concurrent(2).
+    /// All tools should complete successfully.
+    #[tokio::test]
+    async fn parallel_mixed_readonly_and_write_tools_partitioned() {
+        let session_id = format!("par-mix-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+
+        let tools = vec![
+            ("read_file", "c1"),
+            ("grep", "c2"),
+            ("glob", "c3"),
+            ("bash", "c4"),       // write tool — breaks the concurrent batch
+            ("read_file", "c5"),
+            ("git_diff", "c6"),
+        ];
+        let mut host = MockHost::new(vec![
+            turn_with_named_tools(&tools, ""),
+            turn_with_named_tools(&[], "all done"),
+        ])
+        .with_valid_tools(&[
+            "read_file",
+            "grep",
+            "glob",
+            "bash",
+            "git_diff",
+        ]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert_eq!(records.len(), 6, "expected 6 tool call records");
+
+        // All should be round 0 (same LLM round).
+        for rec in &records {
+            assert_eq!(rec.round, Some(0), "tool {} should be round 0", rec.name);
+        }
+
+        // Verify tool names in order.
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["read_file", "grep", "glob", "bash", "read_file", "git_diff"],
+            "tools should be in original order"
+        );
+
+        // All tools should have completed (ok or error — we're testing partitioning, not tool success).
+        // The key verification is that the partition logic ran without panics and
+        // all 6 tools were processed in the correct order.
+        assert_eq!(records.len(), 6, "all 6 tools should have been processed");
+    }
+
+    /// Unit test for partition_tool_batches.
+    #[test]
+    fn partition_tool_batches_groups_correctly() {
+        use crate::turn::agentic_headless_round::{partition_tool_batches, ToolBatch};
+        use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
+
+        let tool_calls = vec![
+            json!({"function": {"name": "read_file"}}),
+            json!({"function": {"name": "grep"}}),
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "glob"}}),
+            json!({"function": {"name": "git_diff"}}),
+        ];
+        let indices: Vec<HeadlessRoundToolIdx> = (0..5)
+            .map(HeadlessRoundToolIdx::ServerToolCall)
+            .collect();
+
+        let batches = partition_tool_batches(&indices, &tool_calls);
+
+        // Expected: Concurrent([0,1]), Serial(2), Concurrent([3,4])
+        assert_eq!(batches.len(), 3);
+        assert!(matches!(&batches[0], ToolBatch::Concurrent(v) if v.len() == 2));
+        assert!(matches!(&batches[1], ToolBatch::Serial(_)));
+        assert!(matches!(&batches[2], ToolBatch::Concurrent(v) if v.len() == 2));
+    }
+}

@@ -17,6 +17,38 @@ use crate::turn::tool_result_semantics::is_tool_error;
 /// when no edge agent matched the tool call.
 const EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
 
+/// Pure execution: server-side tool execution + hydration.
+/// No &mut pipeline needed — only shared refs.
+pub(crate) async fn execute_tool_pure(
+    execution: &mut super::HeadlessResolvedExecution,
+    server_tool_executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    api: &ThinClient,
+    token: &str,
+    current_session_id: Option<&String>,
+    turn_index: usize,
+) {
+    if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
+        if let Some(executor) = server_tool_executor {
+            executor.set_turn_index(turn_index.min(u32::MAX as usize) as u32);
+            let result = executor
+                .execute_with_metadata(&execution.name, &execution.args)
+                .await;
+            execution.tool_result_fields = result.metadata;
+            execution.result_str = result.output;
+        }
+    }
+
+    execution.result_str = hydrate_reflect_placeholder_if_needed(
+        api,
+        token,
+        current_session_id,
+        &execution.name,
+        &execution.args,
+        std::mem::take(&mut execution.result_str),
+    )
+    .await;
+}
+
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) async fn execute_execution(
         &mut self,
@@ -27,29 +59,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             idem_key,
         } = permitted;
 
-        // ── Server-side tool execution fallback ────────────────────────
-        // When no edge agent is connected (web-only mode), the edge tool
-        // round is empty and `resolve_headless_tool_execution` returns the
-        // edge protocol error.  If a server tool executor is available,
-        // execute the tool directly on the server instead.
-        if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
-            if let Some(executor) = self.ctx.server_tool_executor {
-                executor.set_turn_index(self.ctx.turn_index.min(u32::MAX as usize) as u32);
-                let result = executor
-                    .execute_with_metadata(&execution.name, &execution.args)
-                    .await;
-                execution.tool_result_fields = result.metadata;
-                execution.result_str = result.output;
-            }
-        }
-
-        execution.result_str = hydrate_reflect_placeholder_if_needed(
+        execute_tool_pure(
+            &mut execution,
+            self.ctx.server_tool_executor,
             self.ctx.api,
             self.ctx.token,
             self.ctx.current_session_id,
-            &execution.name,
-            &execution.args,
-            execution.result_str,
+            self.ctx.turn_index,
         )
         .await;
 
