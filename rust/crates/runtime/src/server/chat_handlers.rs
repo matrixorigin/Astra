@@ -183,17 +183,25 @@ pub(super) async fn chat_stream_handler(
         .stream_chat(user.user_id.clone(), chat_data.clone())
         .await
     {
-        Ok(stream) => {
-            let mut events = vec![serde_json::json!({
-                "type": "session_info",
-                "session_id": stream.session_id,
-                "run_id": stream.run_id,
-            })];
-            events.extend(transform_stream_run_events_for_client(
-                &stream.run_id,
-                stream.events,
-            ));
-            sse_json_response(events)
+        Ok(mut stream) => {
+            if let Some(event_rx) = stream.event_rx.take() {
+                // Incremental SSE streaming: convert channel into SSE body.
+                let session_id = stream.session_id.clone();
+                let run_id = stream.run_id.clone();
+                sse_streaming_response(session_id, run_id, event_rx)
+            } else {
+                // Batch fallback (test stubs, etc.)
+                let mut events = vec![serde_json::json!({
+                    "type": "session_info",
+                    "session_id": stream.session_id,
+                    "run_id": stream.run_id,
+                })];
+                events.extend(transform_stream_run_events_for_client(
+                    &stream.run_id,
+                    stream.events,
+                ));
+                sse_json_response(events)
+            }
         }
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
@@ -1060,6 +1068,7 @@ mod chat_stream_bridge_fallback_tests {
                         "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2}
                     }),
                 ],
+                event_rx: None,
             })
         }
 

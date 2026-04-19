@@ -972,20 +972,6 @@ impl AgenticRunLifecycleService {
         }
     }
 
-    async fn persist_terminal_events_if_configured(&self, run_id: &str, events: &[Value]) {
-        let Some(engine) = &self.run_engine else {
-            return;
-        };
-        for event in terminal_events_for_persistence(events) {
-            astra_core::log_persist!(
-                engine.append_event(run_id, event).await,
-                "run_lifecycle",
-                run_id,
-                "append_terminal_event"
-            );
-        }
-    }
-
     fn finalize_run_events(
         loop_outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
         mut events: Vec<Value>,
@@ -1823,7 +1809,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         })
     }
 
-    /// Stream chat (synchronous mode): runs the full agentic loop, returns all events.
+    /// Stream chat (incremental SSE mode): spawns the agentic loop in a
+    /// background task and returns an event channel for incremental streaming.
+    /// Post-loop cleanup (persistence, learning state) runs inside the task.
     async fn stream_chat(
         &self,
         user_id: String,
@@ -1848,9 +1836,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             None
         };
 
-        // If no edge tools are provided, return a minimal "no tools" response.
-        // The client (CLI thin-client) is expected to provide edge_tools in context.
+        // Create the incremental SSE channel.
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        host.set_event_tx(event_tx.clone());
         let mut state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
@@ -1873,73 +1863,126 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         )
         .await;
 
-        let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        // Fire SessionEnd hooks (best-effort).
-        crate::skills::hooks::fire_session_end(
-            &state.skills.session_event_hooks,
-            state.current_session_id.as_deref().unwrap_or(""),
-        )
-        .await;
-        persist_runtime_promotion_events(
-            &self.matrixone,
-            self.shared_pool.as_ref(),
-            &user_id,
-            &session_id,
-            &run_id,
-            &state.telemetry.promotion_events,
-        )
-        .await;
-
-        // Persist cross-session learning state.
-        let active_canary = match state.evolution_service.as_ref() {
-            Some(evolution_service) => evolution_service.export_active_canary().await,
-            None => None,
-        };
-        learning_stack.save_with_active_canary(active_canary);
-
-        let (mut final_events, final_status, error_msg) =
-            Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
-        flush_turn_observability(&mut state, &session_id, false);
-        persist_turn_evaluation_journal(&session_id, "server_runtime", &state);
-        let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
-        all_events.append(&mut final_events);
-
-        if let Some(run) = self.runs.write().await.get_mut(&run_id) {
-            run.events = all_events.clone();
-            run.status = final_status.clone();
+        // Wire ServerToolExecutor when no edge agent is connected (web-agent mode).
+        if let Some(workspace) = server_workspace {
+            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let mut executor = super::server_tool_executor::ServerToolExecutor::new(
+                workspace,
+                user_id.clone(),
+                session_id.clone(),
+                memoria_base,
+                None,
+            )
+            .with_cancel_token(state.cancellation.token.clone());
+            if let Some(pool) = &self.edge_connection_pool {
+                executor.set_edge_connection_pool(pool.clone());
+            }
+            if let Some(observability_session) = state.telemetry.observability_session.clone() {
+                executor.set_observability_session(observability_session);
+            }
+            state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
-        if let Some(engine) = &self.run_engine {
-            astra_core::log_persist!(
-                engine
-                    .persist_status(&run_id, final_status.as_str(), None, error_msg.as_deref())
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "status"
-            );
-            astra_core::log_persist!(
-                engine
-                    .persist_usage(
-                        &run_id,
-                        state.total_prompt,
-                        state.total_completion,
-                        state.total_tool_calls,
-                    )
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "usage"
-            );
-        }
-        self.persist_terminal_events_if_configured(&run_id, &all_events[1..])
+        // Clone handles for the background task.
+        let runs = self.runs_handle();
+        let run_engine = self.run_engine.clone();
+        let bg_run_id = run_id.clone();
+        let bg_user_id = user_id.clone();
+        let bg_session_id = session_id.clone();
+        let bg_matrixone = self.matrixone.clone();
+        let bg_shared_pool = self.shared_pool.clone();
+
+        // Spawn the agentic loop in a background task. Events are pushed
+        // through event_tx incrementally; the HTTP handler streams them.
+        tokio::spawn(async move {
+            let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+            // Fire SessionEnd hooks (best-effort).
+            crate::skills::hooks::fire_session_end(
+                &state.skills.session_event_hooks,
+                state.current_session_id.as_deref().unwrap_or(""),
+            )
             .await;
+            persist_runtime_promotion_events(
+                &bg_matrixone,
+                bg_shared_pool.as_ref(),
+                &bg_user_id,
+                &bg_session_id,
+                &bg_run_id,
+                &state.telemetry.promotion_events,
+            )
+            .await;
+
+            // Persist cross-session learning state.
+            let active_canary = match state.evolution_service.as_ref() {
+                Some(evolution_service) => evolution_service.export_active_canary().await,
+                None => None,
+            };
+            learning_stack.save_with_active_canary(active_canary);
+
+            let (mut final_events, final_status, error_msg) =
+                Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+            flush_turn_observability(&mut state, &bg_session_id, false);
+            persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
+            let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
+            all_events.append(&mut final_events);
+
+            if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                run.events = all_events.clone();
+                run.status = final_status.clone();
+            }
+
+            if let Some(engine) = &run_engine {
+                astra_core::log_persist!(
+                    engine
+                        .persist_status(
+                            &bg_run_id,
+                            final_status.as_str(),
+                            None,
+                            error_msg.as_deref()
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "status"
+                );
+                astra_core::log_persist!(
+                    engine
+                        .persist_usage(
+                            &bg_run_id,
+                            state.total_prompt,
+                            state.total_completion,
+                            state.total_tool_calls,
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "usage"
+                );
+            }
+
+            // Persist terminal events to durable store.
+            let terminal_events = terminal_events_for_persistence(&all_events);
+            if let Some(engine) = &run_engine {
+                for event in terminal_events {
+                    astra_core::log_persist!(
+                        engine.append_event(&bg_run_id, event).await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "append_terminal_event"
+                    );
+                }
+            }
+
+            // Drop event_tx — signals end-of-stream to the HTTP handler.
+            drop(event_tx);
+        });
 
         Ok(ChatStreamRecord {
             session_id,
             run_id,
-            events: all_events,
+            events: Vec::new(),
+            event_rx: Some(event_rx),
         })
     }
 

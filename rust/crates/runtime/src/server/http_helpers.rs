@@ -37,6 +37,38 @@ pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>)
     })])
 }
 
+pub(super) fn sse_streaming_response(
+    session_id: String,
+    run_id: String,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) -> Response {
+    // Build an async stream that yields SSE frames from the channel.
+    let stream = async_stream::stream! {
+        // First frame: session info.
+        let session_info = serde_json::json!({
+            "type": "session_info",
+            "session_id": session_id,
+            "run_id": run_id,
+        });
+        yield Ok::<_, std::convert::Infallible>(format!(
+            "data: {}\n\n",
+            serde_json::to_string(&session_info).unwrap_or_default()
+        ));
+
+        // Stream events as they arrive from the background loop.
+        while let Some(event) = event_rx.recv().await {
+            let line = match serde_json::to_string(&event) {
+                Ok(json) => format!("data: {json}\n\n"),
+                Err(_) => "data: {\"type\":\"error\",\"message\":\"serialization failed\"}\n\n".to_string(),
+            };
+            yield Ok::<_, std::convert::Infallible>(line);
+        }
+    };
+
+    let body = Body::from_stream(stream);
+    bridge::sse_stream_response(StatusCode::OK, body)
+}
+
 pub(super) fn status_to_sse_error_code(status: StatusCode) -> &'static str {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "AUTH_ERROR",

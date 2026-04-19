@@ -211,16 +211,20 @@ pub struct ServerAgenticLoopHost {
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
 
-    // ── Tool execution (used by RunLifecycleService wiring) ──
-    #[allow(dead_code)] // needed once RunLifecycleService uses ledger-based tool execution
+    // ── Tool execution ──
+    #[allow(dead_code)] // used in Step 3: wire edge tool delivery via ledger
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in Step 3
     user_id: String,
     session_id: String,
 
     // ── Output collection ──
     /// SSE events emitted during the turn, streamed to the client.
     emitted_events: Vec<Value>,
+    /// When set, SSE events are also pushed through this channel for
+    /// incremental streaming (web agent mode). The HTTP handler reads
+    /// from the corresponding receiver to stream SSE to the client.
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 
     // ── Agent progress ──
     /// Optional receiver for agent progress events (multi-agent tree updates).
@@ -242,6 +246,7 @@ pub struct ServerAgenticLoopHostBuilder {
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
     interactive_client: bool,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -265,6 +270,7 @@ impl ServerAgenticLoopHostBuilder {
             session_id,
             progress_broadcaster: None,
             interactive_client: false,
+            event_tx: None,
         }
     }
 
@@ -322,6 +328,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_event_tx(mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
@@ -360,6 +371,7 @@ impl ServerAgenticLoopHostBuilder {
             user_id: self.user_id,
             session_id: self.session_id,
             emitted_events: Vec::new(),
+            event_tx: self.event_tx,
             progress_rx,
         }
     }
@@ -374,15 +386,23 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn push_reasoning_events(emitted_events: &mut Vec<Value>, reasoning: &str) {
+    /// Push an SSE event to both the internal buffer and the streaming channel.
+    fn emit_event(&mut self, event: Value) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event.clone());
+        }
+        self.emitted_events.push(event);
+    }
+
+    fn push_reasoning_events(&mut self, reasoning: &str) {
         if reasoning.is_empty() {
             return;
         }
-        emitted_events.push(json!({
+        self.emit_event(json!({
             "type": "reasoning_delta",
             "content": reasoning,
         }));
-        emitted_events.push(json!({
+        self.emit_event(json!({
             "type": "reasoning_done",
         }));
     }
@@ -391,12 +411,16 @@ impl ServerAgenticLoopHost {
     /// Also drains any pending agent progress events into the result.
     pub fn take_emitted_events(&mut self) -> Vec<Value> {
         // Drain pending progress events from the broadcast receiver
+        let mut progress_events = Vec::new();
         if let Some(ref mut rx) = self.progress_rx {
             while let Ok(evt) = rx.try_recv() {
                 if let Some(sse_val) = progress_event_to_sse(&evt) {
-                    self.emitted_events.push(sse_val);
+                    progress_events.push(sse_val);
                 }
             }
+        }
+        for evt in progress_events {
+            self.emit_event(evt);
         }
         std::mem::take(&mut self.emitted_events)
     }
@@ -404,6 +428,12 @@ impl ServerAgenticLoopHost {
     /// Returns `true` when no CLI edge agent is connected (tools are server-side).
     pub fn edge_tools_empty(&self) -> bool {
         self.server_side_tools
+    }
+
+    /// Attach an incremental SSE channel. Events will be pushed through
+    /// this sender as they are emitted, enabling streaming to the client.
+    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) {
+        self.event_tx = Some(tx);
     }
 
     /// Build the system prompt from edge context and the tool schemas visible
@@ -1083,14 +1113,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 4. Emit SSE events for client ───────────────────────────────
         if !result.full_text.is_empty() {
-            self.emitted_events.push(json!({
+            self.emit_event(json!({
                 "type": "text_delta",
                 "content": result.full_text,
             }));
         }
-        Self::push_reasoning_events(&mut self.emitted_events, &result.reasoning);
+        self.push_reasoning_events(&result.reasoning);
         if !result.usage.is_empty() {
-            self.emitted_events.push(json!({
+            self.emit_event(json!({
                 "type": "usage",
                 "prompt_tokens": result.usage.get("prompt"),
                 "completion_tokens": result.usage.get("completion"),
@@ -1215,7 +1245,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
-        self.emitted_events.push(json!({
+        self.emit_event(json!({
             "type": "headless_line",
             "content": line,
         }));
@@ -1631,20 +1661,32 @@ mod tests {
 
     #[test]
     fn push_reasoning_events_emits_done_marker() {
-        let mut emitted = Vec::new();
-        ServerAgenticLoopHost::push_reasoning_events(&mut emitted, "thinking...");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        host.push_reasoning_events("thinking...");
 
-        assert_eq!(emitted.len(), 2);
-        assert_eq!(emitted[0]["type"], "reasoning_delta");
-        assert_eq!(emitted[0]["content"], "thinking...");
-        assert_eq!(emitted[1]["type"], "reasoning_done");
+        assert_eq!(host.emitted_events.len(), 2);
+        assert_eq!(host.emitted_events[0]["type"], "reasoning_delta");
+        assert_eq!(host.emitted_events[0]["content"], "thinking...");
+        assert_eq!(host.emitted_events[1]["type"], "reasoning_done");
     }
 
     #[test]
     fn push_reasoning_events_skips_empty_reasoning() {
-        let mut emitted = Vec::new();
-        ServerAgenticLoopHost::push_reasoning_events(&mut emitted, "");
-        assert!(emitted.is_empty());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        host.push_reasoning_events("");
+        assert!(host.emitted_events.is_empty());
     }
 
     #[test]

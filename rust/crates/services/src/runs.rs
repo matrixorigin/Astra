@@ -210,11 +210,15 @@ pub struct ChatRunRecord {
     pub explain: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct ChatStreamRecord {
     pub session_id: String,
     pub run_id: String,
+    /// Batch events (populated after loop completes for persistence).
     pub events: Vec<serde_json::Value>,
+    /// When present, SSE events are streamed incrementally through this
+    /// channel. The HTTP handler converts this into a streaming response.
+    pub event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
