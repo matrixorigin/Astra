@@ -684,8 +684,9 @@ pub fn plan_response_parse_error_preview(
 
 /// Parse LLM response into a TaskPlan.
 pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
-    // Try to extract JSON from the response (may be wrapped in markdown)
-    let json_str = extract_json(response);
+    // Try to extract JSON from the response (may be wrapped in markdown),
+    // applying repair strategies for common LLM errors (trailing commas, comments).
+    let json_str = extract_json_robust(response);
 
     // First, try to parse as generic JSON to provide better error messages
     let parsed_value: serde_json::Value = match serde_json::from_str(&json_str) {
@@ -850,6 +851,137 @@ fn extract_json(response: &str) -> String {
     }
 
     response.to_string()
+}
+
+/// Strip trailing commas before `}` or `]` — a common LLM JSON error.
+fn fix_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == ',' {
+            // Look ahead past whitespace for } or ]
+            let mut j = i + 1;
+            while j < len && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < len && (chars[j] == '}' || chars[j] == ']') {
+                // Skip the trailing comma
+                i += 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Strip single-line `// …` comments — another common LLM JSON error.
+fn strip_json_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape_next = false;
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if escape_next {
+            out.push(chars[i]);
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+        if chars[i] == '\\' && in_string {
+            out.push(chars[i]);
+            escape_next = true;
+            i += 1;
+            continue;
+        }
+        if chars[i] == '"' {
+            in_string = !in_string;
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if !in_string && i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+            // Skip to end of line
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Strip LLM thinking/reasoning tags: `<think>…</think>`, `<thinking>…</thinking>`, etc.
+///
+/// Many models wrap their reasoning in XML-like tags before the actual JSON output.
+/// This must run before JSON extraction to avoid matching `{` inside thinking content.
+fn strip_thinking_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    for tag in &["think", "thinking", "reflect", "inner_monologue"] {
+        loop {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            if let Some(start) = result.find(&open) {
+                if let Some(rel_end) = result[start + open.len()..].find(&close) {
+                    let end_pos = start + open.len() + rel_end + close.len();
+                    result = format!("{}{}", &result[..start], &result[end_pos..]);
+                    continue;
+                }
+                // Unclosed tag — strip from open tag to end
+                result = result[..start].to_string();
+            }
+            break;
+        }
+    }
+    result
+}
+
+/// Robust JSON extraction: tries multiple repair strategies.
+///
+/// 1. Strip LLM thinking tags (`<think>…</think>` etc.)
+/// 2. Direct `extract_json` (handles markdown fences, raw objects)
+/// 3. Fix trailing commas
+/// 4. Strip `//` comments
+/// 5. Both fixes combined
+///
+/// Returns the first variant that parses as valid JSON, or the original
+/// extracted string if none succeed (caller handles the parse error).
+pub fn extract_json_robust(response: &str) -> String {
+    // Strip thinking/reasoning tags before extraction
+    let cleaned = strip_thinking_tags(response);
+    let extracted = extract_json(&cleaned);
+
+    // Fast path: already valid
+    if serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
+        return extracted;
+    }
+
+    // Try trailing comma fix
+    let fixed_commas = fix_trailing_commas(&extracted);
+    if serde_json::from_str::<serde_json::Value>(&fixed_commas).is_ok() {
+        return fixed_commas;
+    }
+
+    // Try comment stripping
+    let stripped = strip_json_comments(&extracted);
+    if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
+        return stripped;
+    }
+
+    // Try both
+    let both = fix_trailing_commas(&stripped);
+    if serde_json::from_str::<serde_json::Value>(&both).is_ok() {
+        return both;
+    }
+
+    extracted
 }
 
 /// Format a TaskPlan for display.
@@ -7013,6 +7145,149 @@ Done!"#;
     #[test]
     fn extract_json_empty_string() {
         assert_eq!(extract_json(""), "");
+    }
+
+    // ── Robust JSON extraction tests ────────────────────────────────────
+
+    #[test]
+    fn extract_json_robust_fixes_trailing_commas() {
+        let input = r#"{"subtasks": [{"id": "t1", "title": "A",}]}"#;
+        let result = extract_json_robust(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+    }
+
+    #[test]
+    fn extract_json_robust_strips_comments() {
+        let input = r#"{
+  "subtasks": [
+    {"id": "t1", "title": "A"} // first task
+  ]
+}"#;
+        let result = extract_json_robust(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+    }
+
+    #[test]
+    fn extract_json_robust_fixes_both() {
+        let input = r#"{
+  "subtasks": [
+    {"id": "t1", "title": "A",}, // trailing comma + comment
+  ]
+}"#;
+        let result = extract_json_robust(input);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&result).is_ok(),
+            "should fix both trailing commas and comments: {result}"
+        );
+    }
+
+    #[test]
+    fn extract_json_robust_preserves_valid_json() {
+        let input = r#"{"subtasks": [{"id": "t1", "title": "A"}]}"#;
+        assert_eq!(extract_json_robust(input), input);
+    }
+
+    #[test]
+    fn extract_json_robust_strips_thinking_tags() {
+        let input = "<think>Let me analyze this goal. I need to create phases for {\"something\": true}.</think>\n{\"phases\": [{\"id\": \"p1\", \"title\": \"A\", \"description\": \"B\", \"estimated_subtasks\": 1}], \"total_effort\": \"small\"}";
+        let result = extract_json_robust(input);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&result).is_ok(),
+            "should parse after stripping thinking tags: {result}"
+        );
+        assert!(result.contains("phases"));
+    }
+
+    #[test]
+    fn extract_json_robust_strips_thinking_with_markdown() {
+        let input = "<thinking>reasoning here</thinking>\n```json\n{\"subtasks\": [{\"id\": \"t1\", \"title\": \"A\"}]}\n```";
+        let result = extract_json_robust(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+        assert!(result.contains("subtasks"));
+    }
+
+    #[test]
+    fn strip_thinking_tags_removes_all_variants() {
+        let input = "<think>a</think>X<thinking>b</thinking>Y<reflect>c</reflect>Z";
+        assert_eq!(strip_thinking_tags(input), "XYZ");
+    }
+
+    #[test]
+    fn strip_thinking_tags_multiple_same_tag() {
+        let input = "<think>first</think>MIDDLE<think>second</think>END";
+        assert_eq!(strip_thinking_tags(input), "MIDDLEEND");
+    }
+
+    #[test]
+    fn strip_thinking_tags_nested_braces_in_thinking() {
+        let input = "<think>I see {\"key\": \"val\"} in the code</think>\n{\"phases\": []}";
+        let result = strip_thinking_tags(input);
+        assert_eq!(result, "\n{\"phases\": []}");
+    }
+
+    #[test]
+    fn strip_thinking_tags_handles_unclosed() {
+        let input = "before<think>reasoning without close";
+        assert_eq!(strip_thinking_tags(input), "before");
+    }
+
+    #[test]
+    fn strip_thinking_tags_no_tags() {
+        let input = "just plain text";
+        assert_eq!(strip_thinking_tags(input), input);
+    }
+
+    #[test]
+    fn extract_json_robust_handles_markdown_fence_with_errors() {
+        let input = "```json\n{\"subtasks\": [{\"id\": \"t1\", \"title\": \"A\",}]}\n```";
+        let result = extract_json_robust(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&result).is_ok());
+    }
+
+    #[test]
+    fn fix_trailing_commas_nested() {
+        let input = r#"{"a": [1, 2, 3,], "b": {"c": "d",}}"#;
+        let fixed = fix_trailing_commas(input);
+        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok());
+    }
+
+    #[test]
+    fn strip_json_comments_preserves_urls() {
+        // "//" inside strings should not be stripped
+        let input = r#"{"url": "https://example.com"}"#;
+        let stripped = strip_json_comments(input);
+        assert_eq!(stripped, input);
+    }
+
+    #[test]
+    fn parse_plan_response_with_trailing_comma() {
+        let response = r#"```json
+{
+  "subtasks": [
+    {"id": "setup", "title": "Setup project",},
+    {"id": "impl", "title": "Implement feature",},
+  ]
+}
+```"#;
+        let plan = parse_plan_response(response);
+        assert!(
+            plan.is_ok(),
+            "should handle trailing commas: {:?}",
+            plan.err()
+        );
+        assert_eq!(plan.unwrap().subtasks.len(), 2);
+    }
+
+    #[test]
+    fn parse_plan_response_with_comments() {
+        let response = r#"{
+  "subtasks": [
+    {"id": "t1", "title": "First task"} // the main task
+  ]
+  // notes omitted
+}"#;
+        let plan = parse_plan_response(response);
+        assert!(plan.is_ok(), "should handle comments: {:?}", plan.err());
     }
 
     // ═══════════════════════ parse_execution_confirmation Tests ════════════════════════

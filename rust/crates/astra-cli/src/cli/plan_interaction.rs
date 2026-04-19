@@ -5,12 +5,154 @@
 //! natural-language plan editing via LLM.
 
 use super::*;
-use crate::sse_utils::collect_sse_with_preview;
+use crate::sse_utils::collect_sse_cancellable;
 use astra_runtime::plan;
 use astra_runtime::plan::PlanCommand;
 use astra_runtime::plan::progress_bar_segments;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
+
+/// Default timeouts for plan LLM calls.
+const PLAN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PLAN_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const PLAN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Outcome of a cancellable plan LLM call.
+enum PlanLlmOutcome {
+    /// LLM returned text successfully.
+    Ok {
+        text: String,
+        session_id: Option<String>,
+    },
+    /// User pressed Ctrl-C during generation.
+    Cancelled,
+    /// HTTP or SSE error.
+    Error(String),
+}
+
+/// If the LLM response contains a session_id and we don't have one yet, initialize it.
+fn maybe_init_session_from_plan(state: &mut ReplState, outcome: &PlanLlmOutcome) {
+    if let PlanLlmOutcome::Ok {
+        session_id: Some(sid),
+        ..
+    } = outcome
+    {
+        if state.session_id.is_none() {
+            super::repl_turn::initialize_journal_pub(state, sid);
+            state.session_id = Some(sid.clone());
+        }
+    }
+}
+
+/// Send a plan LLM request with Ctrl-C cancellation and timeouts.
+///
+/// Wraps `post_chat_turn_timeout` + `collect_sse_cancellable` in a
+/// `tokio::select!` that listens for `ctrl_c()`. On interrupt the
+/// cancellation token is fired, the SSE stream is drained, and
+/// `PlanLlmOutcome::Cancelled` is returned.
+async fn plan_llm_call(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    payload: &serde_json::Value,
+) -> PlanLlmOutcome {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_for_signal = cancel.clone();
+
+    // Race the full request+stream against Ctrl-C.
+    // Once ctrl_c fires we cancel the token; the inner select in
+    // collect_sse_cancellable will observe it and break out.
+    let result = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            cancel_for_signal.cancel();
+            // Give the stream a moment to drain cleanly
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return PlanLlmOutcome::Cancelled;
+        }
+        r = async {
+            let resp = match api.post_chat_turn_timeout(token, payload, PLAN_REQUEST_TIMEOUT).await {
+                Ok(r) => r,
+                Err(e) => return PlanLlmOutcome::Error(e.to_string()),
+            };
+            if !resp.status().is_success() {
+                return PlanLlmOutcome::Error(format!("HTTP {}", resp.status()));
+            }
+            let sse_result = collect_sse_cancellable(
+                resp,
+                &cancel,
+                PLAN_STREAM_TIMEOUT,
+                PLAN_IDLE_TIMEOUT,
+                |_| {},
+            ).await;
+            if sse_result.is_cancelled() {
+                return PlanLlmOutcome::Cancelled;
+            }
+            if let Some(err) = sse_result.completion_error() {
+                return PlanLlmOutcome::Error(err);
+            }
+            PlanLlmOutcome::Ok { text: sse_result.text, session_id: sse_result.session_id }
+        } => r,
+    };
+    result
+}
+
+/// Generate a plan from a goal, with automatic retry on JSON parse failure.
+///
+/// On first attempt, sends the decomposition prompt. If the LLM returns text
+/// that fails JSON parsing, sends a correction prompt and retries once.
+async fn plan_generate_with_retry(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    goal: &str,
+    context: &plan::ProjectContext,
+    session_id: Option<&str>,
+) -> PlanLlmOutcome {
+    use astra_runtime::plan::decomposition_prompt;
+
+    let prompt = decomposition_prompt(goal, context);
+    let payload = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "session_id": session_id,
+    });
+
+    let result = plan_llm_call(api, token, &payload).await;
+    let text = match &result {
+        PlanLlmOutcome::Ok { text: t, .. } => t,
+        _ => return result,
+    };
+
+    // Check if it parses — if yes, return immediately
+    if plan::parse_plan_response(text).is_ok()
+        || plan::detect_clarification_questions(text).is_some()
+    {
+        return result;
+    }
+
+    // Parse failed — retry with correction prompt
+    eprintln!(
+        "  {} JSON parse failed, retrying with correction…",
+        theme::icon_warn()
+    );
+
+    let retry_prompt = format!(
+        "Your previous response was not valid JSON. Please output ONLY a JSON object \
+         with this exact structure:\n\
+         {{\"subtasks\": [{{\"id\": \"...\", \"title\": \"...\", \"description\": \"...\", \
+         \"depends_on\": [], \"effort\": \"small|medium|large\", \"files\": [\"...\"]}}]}}\n\n\
+         No markdown, no explanation, no code fences. Just the raw JSON.\n\n\
+         Original goal: {goal}"
+    );
+    let retry_payload = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": retry_prompt},
+        ],
+        "session_id": session_id,
+    });
+
+    plan_llm_call(api, token, &retry_payload).await
+}
 
 /// Result from [`handle_plan_mode_input`].
 ///
@@ -144,6 +286,141 @@ pub(super) fn eprint_plan_json_parse_failed(full_text: &str, _err: &str) {
 }
 
 /// Print available plan mode commands (compact, for after plan generation).
+/// Styled plan display with crossterm colors — replaces markdown streaming for plan confirmation.
+fn eprint_styled_plan(plan: &astra_runtime::plan::TaskPlan, goal: &str) {
+    use astra_runtime::plan::TaskStatus;
+
+    eprintln!("  {} {}", "Plan:".bold(), goal.cyan());
+    if let Some(ref notes) = plan.notes {
+        eprintln!("  {}", notes.as_str().dim());
+    }
+    eprintln!();
+
+    for (i, st) in plan.subtasks.iter().enumerate() {
+        let (icon, icon_style) = match st.status {
+            TaskStatus::Completed => ("✓", "green"),
+            TaskStatus::InProgress => ("▶", "cyan"),
+            TaskStatus::Failed => ("✗", "red"),
+            TaskStatus::Paused => ("⏸", "yellow"),
+            _ => ("○", "dim"),
+        };
+        let icon_str = match icon_style {
+            "green" => icon.green().to_string(),
+            "cyan" => icon.cyan().to_string(),
+            "red" => icon.red().to_string(),
+            "yellow" => icon.yellow().to_string(),
+            _ => icon.dim().to_string(),
+        };
+
+        let effort = match st.effort.as_deref() {
+            Some("small") => " S".green().to_string(),
+            Some("medium") => " M".yellow().to_string(),
+            Some("large") => " L".red().to_string(),
+            _ => String::new(),
+        };
+
+        eprintln!(
+            "  {} {} {}{}  {}",
+            format!("{:>2}.", i + 1).dim(),
+            icon_str,
+            st.id.as_str().bold(),
+            effort,
+            st.title.as_str().dim()
+        );
+
+        if let Some(ref desc) = st.description {
+            let short: String = desc.chars().take(80).collect();
+            let suffix = if desc.len() > 80 { "…" } else { "" };
+            eprintln!("      {}{}", short.dim(), suffix.dim());
+        }
+
+        if !st.files.is_empty() {
+            let files: Vec<_> = st
+                .files
+                .iter()
+                .take(4)
+                .map(|f| f.as_str().dim().to_string())
+                .collect();
+            let suffix = if st.files.len() > 4 {
+                format!(" +{}", st.files.len() - 4)
+            } else {
+                String::new()
+            };
+            eprintln!("      {} {}{}", "📁".dim(), files.join(", "), suffix.dim());
+        }
+
+        if !st.depends_on.is_empty() {
+            eprintln!(
+                "      {} {}",
+                "↳".dim(),
+                format!("after {}", st.depends_on.join(", ")).dim()
+            );
+        }
+    }
+
+    // Summary line
+    let done = plan.items_done();
+    let total = plan.subtasks.len();
+    let pct = plan.progress_pct();
+    eprintln!();
+    eprintln!(
+        "  {} {}/{} ({}%)",
+        format_progress_bar(pct, 15),
+        format!("{done}").cyan(),
+        format!("{total}").dim(),
+        pct
+    );
+}
+
+/// Styled outline display with crossterm colors.
+fn eprint_styled_outline(outline: &astra_runtime::plan::outline::PlanOutline, goal: &str) {
+    let effort_styled = match outline.total_effort.as_str() {
+        "small" => "small".green().to_string(),
+        "medium" => "medium".yellow().to_string(),
+        "large" => "large".red().to_string(),
+        other => other.to_string(),
+    };
+
+    eprintln!("  {} {}", "Plan:".bold(), goal.cyan());
+    eprintln!(
+        "  {} {}  ·  {} phase{}",
+        "Effort:".bold(),
+        effort_styled,
+        format!("{}", outline.phases.len()).cyan(),
+        if outline.phases.len() == 1 { "" } else { "s" }
+    );
+    eprintln!();
+
+    for (i, phase) in outline.phases.iter().enumerate() {
+        eprintln!(
+            "  {} {} — {}",
+            format!("{}.", i + 1).bold().cyan(),
+            phase.title.as_str().bold(),
+            phase.description.as_str().dim()
+        );
+        let mut detail = format!(
+            "     ~{} subtask{}",
+            format!("{}", phase.estimated_subtasks).cyan(),
+            if phase.estimated_subtasks == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        if !phase.key_files.is_empty() {
+            let files: Vec<_> = phase
+                .key_files
+                .iter()
+                .take(3)
+                .map(|f| f.as_str().dim().to_string())
+                .collect();
+            detail.push_str(&format!("  ·  {}", files.join(", ")));
+        }
+        eprintln!("{detail}");
+    }
+    eprintln!();
+}
+
 pub(super) fn eprint_plan_commands_help() {
     eprintln!(
         "  {} {} to run  {} {} to modify  {} {} to leave",
@@ -339,7 +616,7 @@ fn format_progress_bar(pct: u32, width: usize) -> String {
 /// Print the full plan mode banner (shown on entry and on `help` command).
 pub(super) fn eprint_plan_mode_banner(goal: &str) {
     eprintln!();
-    eprint!("{}", "Plan mode".yellow().bold());
+    eprint!("{}", "📋 Plan mode".yellow().bold());
     if !goal.is_empty() {
         let display_goal: String = goal.chars().take(60).collect();
         let suffix = if goal.len() > 60 { "…" } else { "" };
@@ -348,11 +625,7 @@ pub(super) fn eprint_plan_mode_banner(goal: &str) {
     eprintln!();
     eprintln!(
         "{}",
-        "  go  execute · step  step-by-step · pause · resume · exit · show · status".dim()
-    );
-    eprintln!(
-        "{}",
-        "  correct <…> · rewind <…> · diff · rollback · timeline · metrics · history · list".dim()
+        "  Type a goal to start · go to execute · show to view · exit to leave".dim()
     );
     eprintln!();
 }
@@ -689,71 +962,60 @@ pub async fn handle_plan_mode_input(
         });
 
         eprintln!();
-        let resp = api.post_chat_turn(tok, &payload).await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let sse_result = collect_sse_with_preview(r).await;
-                if let Some(err) = sse_result.completion_error() {
-                    eprintln!("  {} {}", theme::icon_err(), err.red());
-                    return Ok(PlanInputResult::Handled);
-                }
-                let full_text = sse_result.text;
-
-                match parse_plan_response(&full_text) {
-                    Ok(plan) => {
-                        plan_state.set_plan(plan);
-                        let _ = plan_state.save_to_file(&PlanModeState::state_path());
-
-                        journal_plan_event(
-                            &mut state.journal,
-                            session_journal::JournalEventType::PlanEdit,
-                            "Plan regenerated after clarifications",
-                            None,
-                        );
-
-                        let subtask_count = plan_state.plan.subtasks.len();
-                        eprint_plan_commands_help();
-
-                        // Offer interactive confirmation if terminal supports it
-                        if let Some(choice) = prompt_plan_confirmation(subtask_count) {
-                            match choice {
-                                PlanConfirmChoice::ExecuteAll => {
-                                    return Box::pin(handle_plan_mode_input(
-                                        "go".into(),
-                                        token,
-                                        state,
-                                        api,
-                                    ))
-                                    .await;
-                                }
-                                PlanConfirmChoice::StepByStep => {
-                                    return Box::pin(handle_plan_mode_input(
-                                        "step".into(),
-                                        token,
-                                        state,
-                                        api,
-                                    ))
-                                    .await;
-                                }
-                                PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprint_plan_json_parse_failed(&full_text, &e.to_string());
-                    }
-                }
+        let full_text = match plan_llm_call(api, tok, &payload).await {
+            PlanLlmOutcome::Ok { text, .. } => text,
+            PlanLlmOutcome::Cancelled => {
+                eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+                return Ok(PlanInputResult::Handled);
             }
-            Ok(r) => {
-                eprintln!(
-                    "  {} LLM call failed ({})",
-                    theme::icon_err(),
-                    r.status().to_string().red()
+            PlanLlmOutcome::Error(e) => {
+                eprintln!("  {} {}", theme::icon_err(), e.red());
+                return Ok(PlanInputResult::Handled);
+            }
+        };
+
+        match parse_plan_response(&full_text) {
+            Ok(plan) => {
+                plan_state.set_plan(plan);
+                let _ = plan_state.save_to_file(&PlanModeState::state_path());
+
+                journal_plan_event(
+                    &mut state.journal,
+                    session_journal::JournalEventType::PlanEdit,
+                    "Plan regenerated after clarifications",
+                    None,
                 );
+
+                let subtask_count = plan_state.plan.subtasks.len();
+                eprint_plan_commands_help();
+
+                // Offer interactive confirmation if terminal supports it
+                if let Some(choice) = prompt_plan_confirmation(subtask_count) {
+                    match choice {
+                        PlanConfirmChoice::ExecuteAll => {
+                            return Box::pin(handle_plan_mode_input(
+                                "go".into(),
+                                token,
+                                state,
+                                api,
+                            ))
+                            .await;
+                        }
+                        PlanConfirmChoice::StepByStep => {
+                            return Box::pin(handle_plan_mode_input(
+                                "step".into(),
+                                token,
+                                state,
+                                api,
+                            ))
+                            .await;
+                        }
+                        PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
+                    }
+                }
             }
             Err(e) => {
-                cli_utils::eprint_request_error(&e);
+                eprint_plan_json_parse_failed(&full_text, &e.to_string());
             }
         }
 
@@ -936,6 +1198,7 @@ pub async fn handle_plan_mode_input(
     let Some(plan_state) = state.plan_mode.as_mut() else {
         return Ok(PlanInputResult::Handled);
     };
+
     let prompt = plan_state.plan_mode_prompt(&input);
     plan_state.add_turn(&input, "");
 
@@ -961,123 +1224,103 @@ pub async fn handle_plan_mode_input(
     });
 
     eprintln!();
-    let resp = api.post_chat_turn(tok, &payload).await;
+    let llm_text = match plan_llm_call(api, tok, &payload).await {
+        PlanLlmOutcome::Ok { text, .. } => text,
+        PlanLlmOutcome::Cancelled => {
+            eprintln!("  {} Plan edit cancelled.", theme::icon_warn());
+            return Ok(PlanInputResult::Handled);
+        }
+        PlanLlmOutcome::Error(e) => {
+            eprintln!("  {} {}", theme::icon_err(), e.red());
+            return Ok(PlanInputResult::Handled);
+        }
+    };
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let sse_result = collect_sse_with_preview(r).await;
-            if let Some(err) = sse_result.completion_error() {
-                eprintln!("  {} {}", theme::icon_err(), err.red());
-                return Ok(PlanInputResult::Handled);
-            }
+    if llm_text.is_empty() {
+        eprintln!("  {} No response from server", theme::icon_warn());
+    }
 
-            if sse_result.text.is_empty() {
-                if sse_result.event_count == 0 {
+    if !llm_text.is_empty() {
+        let Some(plan_state) = state.plan_mode.as_mut() else {
+            return Ok(PlanInputResult::Handled);
+        };
+        match try_replace_plan_from_llm_json(&llm_text, plan_state) {
+            Ok(true) => {
+                plan_state.modified = true;
+                let _ = plan_state.save_to_file(&PlanModeState::state_path());
+
+                journal_plan_event(
+                    &mut state.journal,
+                    session_journal::JournalEventType::PlanEdit,
+                    &format!(
+                        "Plan edited: {}",
+                        input.chars().take(80).collect::<String>()
+                    ),
+                    Some(serde_json::json!({
+                        "instruction": input.chars().take(200).collect::<String>(),
+                        "subtask_count": plan_state.plan.subtasks.len(),
+                    })),
+                );
+
+                // Auto-prompt execution if there are new pending subtasks
+                let pending_count = plan_state
+                    .plan
+                    .subtasks
+                    .iter()
+                    .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Pending)
+                    .count();
+                if pending_count > 0 {
+                    eprintln!();
                     eprintln!(
-                        "  {} No SSE events received from server",
-                        theme::icon_warn()
+                        "  {} {} new subtask{} added.",
+                        theme::icon_ok(),
+                        format!("{pending_count}").cyan(),
+                        if pending_count == 1 { "" } else { "s" }
                     );
-                } else {
-                    eprintln!(
-                        "  {} {} events (types: {}) but no text",
-                        theme::icon_warn(),
-                        sse_result.event_count,
-                        sse_result.event_types.join(", ")
-                    );
-                }
-            }
-
-            if !sse_result.text.is_empty() {
-                let Some(plan_state) = state.plan_mode.as_mut() else {
-                    return Ok(PlanInputResult::Handled);
-                };
-                match try_replace_plan_from_llm_json(&sse_result.text, plan_state) {
-                    Ok(true) => {
-                        plan_state.modified = true;
-                        let _ = plan_state.save_to_file(&PlanModeState::state_path());
-
-                        journal_plan_event(
-                            &mut state.journal,
-                            session_journal::JournalEventType::PlanEdit,
-                            &format!(
-                                "Plan edited: {}",
-                                input.chars().take(80).collect::<String>()
-                            ),
-                            Some(serde_json::json!({
-                                "instruction": input.chars().take(200).collect::<String>(),
-                                "subtask_count": plan_state.plan.subtasks.len(),
-                            })),
-                        );
-
-                        // Auto-prompt execution if there are new pending subtasks
-                        let pending_count = plan_state
-                            .plan
-                            .subtasks
-                            .iter()
-                            .filter(|s| {
-                                s.status == astra_services::task_orchestrator::TaskStatus::Pending
-                            })
-                            .count();
-                        if pending_count > 0 {
-                            eprintln!();
-                            eprintln!(
-                                "  {} {} new subtask{} added.",
-                                theme::icon_ok(),
-                                format!("{pending_count}").cyan(),
-                                if pending_count == 1 { "" } else { "s" }
-                            );
-                            if let Some(choice) = prompt_plan_confirmation(pending_count) {
-                                match choice {
-                                    PlanConfirmChoice::ExecuteAll => {
-                                        return Box::pin(handle_plan_mode_input(
-                                            "go".into(),
-                                            token,
-                                            state,
-                                            api,
-                                        ))
-                                        .await;
-                                    }
-                                    PlanConfirmChoice::StepByStep => {
-                                        return Box::pin(handle_plan_mode_input(
-                                            "step".into(),
-                                            token,
-                                            state,
-                                            api,
-                                        ))
-                                        .await;
-                                    }
-                                    PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
-                                }
+                    if let Some(choice) = prompt_plan_confirmation(pending_count) {
+                        match choice {
+                            PlanConfirmChoice::ExecuteAll => {
+                                return Box::pin(handle_plan_mode_input(
+                                    "go".into(),
+                                    token,
+                                    state,
+                                    api,
+                                ))
+                                .await;
                             }
+                            PlanConfirmChoice::StepByStep => {
+                                return Box::pin(handle_plan_mode_input(
+                                    "step".into(),
+                                    token,
+                                    state,
+                                    api,
+                                ))
+                                .await;
+                            }
+                            PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
                         }
                     }
-                    Ok(false) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "  {} Model reply is not valid plan JSON: {}",
-                            theme::icon_warn(),
-                            e
-                        );
-                        eprintln!(
-                            "  {} Plan unchanged. Try {} for the current plan.",
-                            "⋯".dim(),
-                            "show".cyan()
-                        );
-                    }
                 }
             }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "  {} Model reply is not valid plan JSON: {}",
+                    theme::icon_warn(),
+                    e
+                );
+                eprintln!(
+                    "  {} Plan unchanged. Try {} for the current plan.",
+                    "⋯".dim(),
+                    "show".cyan()
+                );
+            }
+        }
+    }
 
-            if let Some(plan_state) = state.plan_mode.as_mut() {
-                if let Some(last) = plan_state.history.last_mut() {
-                    last.1 = sse_result.text.chars().take(500).collect();
-                }
-            }
-        }
-        Ok(r) => {
-            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
-        }
-        Err(e) => {
-            cli_utils::eprint_request_error(&e);
+    if let Some(plan_state) = state.plan_mode.as_mut() {
+        if let Some(last) = plan_state.history.last_mut() {
+            last.1 = llm_text.chars().take(500).collect();
         }
     }
 
@@ -1676,16 +1919,20 @@ async fn handle_plan_command(
 }
 
 /// Handle initial goal submission — scan project and generate plan via LLM.
+///
+/// Uses a two-stage flow:
+/// 1. Generate outline (2-4 phases) — fast, gives user a chance to review
+/// 2. User confirms → expand each phase into subtasks
+///
+/// Falls back to direct full-plan generation if outline parsing fails.
 async fn handle_goal_submission(
     goal: String,
     token: Option<&str>,
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<PlanInputResult, String> {
-    use plan::{
-        PendingClarifications, PlanModeState, decomposition_prompt, detect_clarification_questions,
-        format_project_context, parse_plan_response,
-    };
+    use astra_runtime::plan::outline;
+    use plan::{detect_clarification_questions, format_project_context, parse_plan_response};
 
     let Some(tok) = token else {
         eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
@@ -1722,110 +1969,526 @@ async fn handle_goal_submission(
         state.verbose_mode,
     )
     .await;
-    let prompt = decomposition_prompt(&goal, &plan_state.context);
-    let payload = serde_json::json!({
-        "messages": [{"role": "user", "content": prompt}],
+
+    // ── Stage 1: Generate outline ───────────────────────────────────────
+    eprintln!();
+    let outline_prompt = outline::outline_prompt(&goal, &plan_state.context);
+    let outline_payload = serde_json::json!({
+        "messages": [{"role": "user", "content": outline_prompt}],
         "session_id": state.session_id.clone(),
     });
 
-    eprintln!();
-    let resp = api.post_chat_turn(tok, &payload).await;
+    let outline_result = plan_llm_call(api, tok, &outline_payload).await;
+    maybe_init_session_from_plan(state, &outline_result);
+    let outline_text = match outline_result {
+        PlanLlmOutcome::Ok { text, .. } => text,
+        PlanLlmOutcome::Cancelled => {
+            eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+            return Ok(PlanInputResult::Handled);
+        }
+        PlanLlmOutcome::Error(e) => {
+            eprintln!("  {} {}", theme::icon_err(), e.red());
+            return Ok(PlanInputResult::Handled);
+        }
+    };
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let sse_result = collect_sse_with_preview(r).await;
-            if let Some(err) = sse_result.completion_error() {
-                eprintln!("  {} {}", theme::icon_err(), err.red());
+    if outline_text.trim().is_empty() {
+        // LLM returned only thinking content, no text_delta — skip to full plan
+        if state.verbose_mode {
+            eprintln!("  {} Outline response empty, trying full plan…", "⋯".dim());
+        }
+    } else {
+        // Try to parse as outline; fall back to full plan generation on failure
+        let parsed_outline = outline::parse_outline_response(&outline_text);
+
+        if state.verbose_mode {
+            if let Err(ref e) = parsed_outline {
+                eprintln!("  {} Outline parse error: {}", "⋯".dim(), e.as_str().dim());
+                let preview: String = outline_text.chars().take(200).collect();
+                eprintln!("  {} Response preview: {}", "⋯".dim(), preview.dim());
+            }
+        }
+
+        match parsed_outline {
+            Ok(ref ol) if !ol.questions.is_empty() => {
+                return handle_outline_clarifications(
+                    ol.questions.clone(),
+                    &goal,
+                    token,
+                    state,
+                    api,
+                )
+                .await;
+            }
+            Ok(ref ol) if !ol.phases.is_empty() => {
+                eprintln!();
+                eprint_styled_outline(ol, &goal);
+
+                match prompt_outline_confirmation(ol.phases.len()) {
+                    OutlineChoice::Confirm => {
+                        return expand_outline_to_plan(ol, &goal, tok, state, api).await;
+                    }
+                    OutlineChoice::SkipToFull => {
+                        eprintln!("  {} Generating full plan directly…", "⏭".cyan());
+                    }
+                    OutlineChoice::Edit => {
+                        match inquire::Text::new("  Describe changes:")
+                            .with_help_message("Esc to cancel")
+                            .prompt()
+                        {
+                            Ok(edit) if !edit.trim().is_empty() => {
+                                return Box::pin(handle_plan_mode_input(edit, token, state, api))
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                        return Ok(PlanInputResult::Handled);
+                    }
+                    OutlineChoice::Cancel => {
+                        return Ok(PlanInputResult::Handled);
+                    }
+                }
+            }
+            _ => {
+                // Outline parse failed — try as full plan or clarification directly
+                if let Some(questions) = detect_clarification_questions(&outline_text) {
+                    return handle_outline_clarifications(questions, &goal, token, state, api)
+                        .await;
+                }
+                if let Ok(plan) = parse_plan_response(&outline_text) {
+                    return accept_generated_plan(plan, token, state, api).await;
+                }
+                if state.verbose_mode {
+                    eprintln!("  {} Outline parse failed, trying full plan…", "⋯".dim());
+                }
+            }
+        }
+    }
+
+    // ── Fallback: direct full-plan generation ───────────────────────────
+    let Some(plan_ctx) = state.plan_mode.as_ref().map(|ps| ps.context.clone()) else {
+        return Ok(PlanInputResult::Handled);
+    };
+    let full_text =
+        match plan_generate_with_retry(api, tok, &goal, &plan_ctx, state.session_id.as_deref())
+            .await
+        {
+            PlanLlmOutcome::Ok { text, .. } => text,
+            PlanLlmOutcome::Cancelled => {
+                eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
                 return Ok(PlanInputResult::Handled);
             }
-            let full_text = sse_result.text;
+            PlanLlmOutcome::Error(e) => {
+                eprintln!("  {} {}", theme::icon_err(), e.red());
+                return Ok(PlanInputResult::Handled);
+            }
+        };
 
-            if let Some(questions) = detect_clarification_questions(&full_text) {
-                eprintln!();
-                eprintln!(
-                    "  {} {}",
-                    "▸".cyan(),
-                    format!(
-                        "{} question{} before planning:",
-                        questions.len(),
-                        if questions.len() == 1 { "" } else { "s" }
-                    )
-                    .bold()
-                    .cyan()
-                );
-                eprintln!();
+    if let Some(questions) = detect_clarification_questions(&full_text) {
+        return handle_outline_clarifications(questions, &goal, token, state, api).await;
+    }
 
-                let Some(plan_state) = state.plan_mode.as_mut() else {
+    match parse_plan_response(&full_text) {
+        Ok(plan) => accept_generated_plan(plan, token, state, api).await,
+        Err(e) => {
+            eprint_plan_json_parse_failed(&full_text, &e.to_string());
+            Ok(PlanInputResult::Handled)
+        }
+    }
+}
+
+/// User's choice after seeing the outline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutlineChoice {
+    Confirm,
+    SkipToFull,
+    Edit,
+    Cancel,
+}
+
+/// Interactive outline confirmation using `inquire::Select`.
+fn prompt_outline_confirmation(phase_count: usize) -> OutlineChoice {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return OutlineChoice::Confirm;
+    }
+
+    let options = vec![
+        format!("✓  Looks good, expand all {phase_count} phases"),
+        "⏭  Skip outline, generate full plan directly".to_string(),
+        "✏  Edit (describe changes)".to_string(),
+        "✕  Cancel".to_string(),
+    ];
+
+    eprintln!();
+    match inquire::Select::new("Plan outline:", options)
+        .with_render_config(plan_select_theme())
+        .without_help_message()
+        .prompt()
+    {
+        Ok(c) if c.starts_with('✓') => OutlineChoice::Confirm,
+        Ok(c) if c.starts_with('⏭') => OutlineChoice::SkipToFull,
+        Ok(c) if c.starts_with('✏') => OutlineChoice::Edit,
+        _ => OutlineChoice::Cancel,
+    }
+}
+
+/// Handle clarification questions with interactive `inquire::Select`.
+async fn handle_outline_clarifications(
+    questions: Vec<plan::ClarificationQuestion>,
+    goal: &str,
+    token: Option<&str>,
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+) -> Result<PlanInputResult, String> {
+    use plan::{PendingClarifications, PlanModeState};
+    use std::io::IsTerminal;
+
+    eprintln!();
+    eprintln!(
+        "  {} {}",
+        "▸".cyan(),
+        format!(
+            "{} question{} before planning:",
+            questions.len(),
+            if questions.len() == 1 { "" } else { "s" }
+        )
+        .bold()
+        .cyan()
+    );
+    eprintln!();
+
+    // Try interactive inquire selection if terminal supports it
+    if std::io::stdin().is_terminal() {
+        let mut answers = Vec::new();
+        for q in &questions {
+            match ask_clarification_interactive(q) {
+                Some(answer) => answers.push(answer),
+                None => {
+                    // User cancelled — fall back to text-based flow
+                    break;
+                }
+            }
+        }
+
+        if answers.len() == questions.len() {
+            // All answered — regenerate plan with answers
+            let answers_text = questions
+                .iter()
+                .zip(&answers)
+                .map(|(q, a)| format!("Q: {}\nA: {}", q.question, a))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
+            let goal_with_context =
+                format!("{goal}\n\n## Clarifications from user:\n{answers_text}");
+
+            let Some(tok) = token else {
+                return Ok(PlanInputResult::Handled);
+            };
+
+            let Some(clarify_ctx) = state.plan_mode.as_ref().map(|ps| ps.context.clone()) else {
+                return Ok(PlanInputResult::Handled);
+            };
+            let full_text = match plan_generate_with_retry(
+                api,
+                tok,
+                &goal_with_context,
+                &clarify_ctx,
+                state.session_id.as_deref(),
+            )
+            .await
+            {
+                PlanLlmOutcome::Ok { text, .. } => text,
+                PlanLlmOutcome::Cancelled => {
+                    eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
                     return Ok(PlanInputResult::Handled);
-                };
-                let pending = PendingClarifications {
-                    questions: questions.clone(),
-                    answers: Vec::new(),
-                };
-                plan_state.pending_clarifications = Some(pending);
+                }
+                PlanLlmOutcome::Error(e) => {
+                    eprintln!("  {} {}", theme::icon_err(), e.red());
+                    return Ok(PlanInputResult::Handled);
+                }
+            };
 
-                eprint_clarification_question(&questions[0]);
-                let _ = plan_state.save_to_file(&PlanModeState::state_path());
-            } else {
-                match parse_plan_response(&full_text) {
-                    Ok(plan) => {
-                        let Some(plan_state) = state.plan_mode.as_mut() else {
-                            return Ok(PlanInputResult::Handled);
-                        };
-                        plan_state.set_plan(plan);
-                        let _ = plan_state.save_to_file(&PlanModeState::state_path());
+            match plan::parse_plan_response(&full_text) {
+                Ok(plan) => return accept_generated_plan(plan, token, state, api).await,
+                Err(e) => {
+                    eprint_plan_json_parse_failed(&full_text, &e.to_string());
+                    return Ok(PlanInputResult::Handled);
+                }
+            }
+        }
+    }
 
-                        journal_plan_event(
-                            &mut state.journal,
-                            session_journal::JournalEventType::PlanLifecycle,
-                            &format!(
-                                "Plan generated: {} subtasks",
-                                plan_state.plan.subtasks.len()
-                            ),
-                            Some(serde_json::json!({
-                                "subtask_count": plan_state.plan.subtasks.len(),
-                            })),
-                        );
+    // Fall back to text-based clarification (existing flow)
+    let Some(plan_state) = state.plan_mode.as_mut() else {
+        return Ok(PlanInputResult::Handled);
+    };
+    let pending = PendingClarifications {
+        questions: questions.clone(),
+        answers: Vec::new(),
+    };
+    plan_state.pending_clarifications = Some(pending);
+    eprint_clarification_question(&questions[0]);
+    let _ = plan_state.save_to_file(&PlanModeState::state_path());
+    Ok(PlanInputResult::Handled)
+}
 
-                        let subtask_count = plan_state.plan.subtasks.len();
-                        eprint_plan_commands_help();
+/// Ask a single clarification question using `inquire::Select`.
+///
+/// Returns the selected answer text, or `None` if the user pressed Esc.
+fn ask_clarification_interactive(q: &plan::ClarificationQuestion) -> Option<String> {
+    let icon = match q.category {
+        plan::ClarificationCategory::Scope => "📦",
+        plan::ClarificationCategory::Approach => "🛤️ ",
+        plan::ClarificationCategory::Behavior => "⚙️ ",
+        plan::ClarificationCategory::Technical => "🔧",
+        plan::ClarificationCategory::Confirmation => "❓",
+    };
 
-                        // Offer interactive confirmation if terminal supports it
-                        if let Some(choice) = prompt_plan_confirmation(subtask_count) {
-                            match choice {
-                                PlanConfirmChoice::ExecuteAll => {
-                                    return Box::pin(handle_plan_mode_input(
-                                        "go".into(),
-                                        token,
-                                        state,
-                                        api,
-                                    ))
-                                    .await;
-                                }
-                                PlanConfirmChoice::StepByStep => {
-                                    return Box::pin(handle_plan_mode_input(
-                                        "step".into(),
-                                        token,
-                                        state,
-                                        api,
-                                    ))
-                                    .await;
-                                }
-                                PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
-                            }
+    let mut options = q.options.clone();
+    options.push("Other (type your answer)".into());
+
+    let prompt_text = format!("{icon} {}", q.question);
+    let starting = q.default.unwrap_or(0);
+
+    match inquire::Select::new(&prompt_text, options.clone())
+        .with_render_config(plan_select_theme())
+        .with_starting_cursor(starting)
+        .without_help_message()
+        .prompt()
+    {
+        Ok(choice) if choice.starts_with("Other") => {
+            match inquire::Text::new("  Your answer:").prompt() {
+                Ok(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+                _ => None,
+            }
+        }
+        Ok(choice) => Some(choice),
+        Err(_) => None,
+    }
+}
+
+/// Expand an outline into a full plan by generating subtasks for each phase.
+async fn expand_outline_to_plan(
+    ol: &astra_runtime::plan::outline::PlanOutline,
+    goal: &str,
+    tok: &str,
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+) -> Result<PlanInputResult, String> {
+    use astra_runtime::plan::outline;
+    use plan::parse_plan_response;
+
+    let Some(plan_ctx) = state.plan_mode.as_ref().map(|ps| ps.context.clone()) else {
+        return Ok(PlanInputResult::Handled);
+    };
+    let mut all_subtasks = Vec::new();
+    let mut completed_phases = Vec::new();
+
+    for (i, phase) in ol.phases.iter().enumerate() {
+        eprintln!(
+            "  {} Expanding phase {}/{}: {}",
+            "⋯".cyan(),
+            i + 1,
+            ol.phases.len(),
+            phase.title.as_str().bold()
+        );
+
+        let detail_prompt =
+            outline::phase_detail_prompt(goal, ol, phase, &completed_phases, &plan_ctx);
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": detail_prompt}],
+            "session_id": state.session_id.clone(),
+        });
+
+        let text = match plan_llm_call(api, tok, &payload).await {
+            PlanLlmOutcome::Ok { text: t, .. } => t,
+            PlanLlmOutcome::Cancelled => {
+                eprintln!("  {} Cancelled during phase expansion.", theme::icon_warn());
+                // Use whatever subtasks we have so far
+                if !all_subtasks.is_empty() {
+                    eprintln!(
+                        "  {} Using {} subtasks from completed phases.",
+                        theme::icon_ok(),
+                        all_subtasks.len()
+                    );
+                    break;
+                }
+                return Ok(PlanInputResult::Handled);
+            }
+            PlanLlmOutcome::Error(e) => {
+                eprintln!(
+                    "  {} Phase {} failed: {}",
+                    theme::icon_warn(),
+                    phase.id,
+                    e.yellow()
+                );
+                continue;
+            }
+        };
+
+        match parse_plan_response(&text) {
+            Ok(phase_plan) => {
+                let count = phase_plan.subtasks.len();
+                all_subtasks.extend(phase_plan.subtasks);
+                completed_phases.push(phase.id.clone());
+                eprintln!(
+                    "  {} {} — {} subtask{}",
+                    theme::icon_ok(),
+                    phase.title,
+                    count,
+                    if count == 1 { "" } else { "s" }
+                );
+            }
+            Err(_) => {
+                // Retry once with a stricter prompt
+                let retry_prompt = format!(
+                    "Output ONLY a JSON object: {{\"subtasks\": [...]}}. \
+                     No markdown, no explanation. Expand phase \"{}\" — {}",
+                    phase.id, phase.title
+                );
+                let retry_payload = serde_json::json!({
+                    "messages": [
+                        {"role": "user", "content": detail_prompt},
+                        {"role": "assistant", "content": text},
+                        {"role": "user", "content": retry_prompt},
+                    ],
+                    "session_id": state.session_id.clone(),
+                });
+                match plan_llm_call(api, tok, &retry_payload).await {
+                    PlanLlmOutcome::Ok {
+                        text: retry_text, ..
+                    } => match parse_plan_response(&retry_text) {
+                        Ok(phase_plan) => {
+                            let count = phase_plan.subtasks.len();
+                            all_subtasks.extend(phase_plan.subtasks);
+                            completed_phases.push(phase.id.clone());
+                            eprintln!(
+                                "  {} {} — {} subtask{} (retry)",
+                                theme::icon_ok(),
+                                phase.title,
+                                count,
+                                if count == 1 { "" } else { "s" }
+                            );
                         }
-                    }
-                    Err(e) => {
-                        eprint_plan_json_parse_failed(&full_text, &e.to_string());
+                        Err(e2) => {
+                            eprintln!(
+                                "  {} Phase {} failed: {}",
+                                theme::icon_warn(),
+                                phase.id,
+                                e2.yellow()
+                            );
+                        }
+                    },
+                    PlanLlmOutcome::Cancelled => break,
+                    PlanLlmOutcome::Error(e) => {
+                        eprintln!(
+                            "  {} Phase {} retry failed: {}",
+                            theme::icon_warn(),
+                            phase.id,
+                            e.yellow()
+                        );
                     }
                 }
             }
         }
-        Ok(r) => {
-            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
-        }
-        Err(e) => {
-            cli_utils::eprint_request_error(&e);
+    }
+
+    if all_subtasks.is_empty() {
+        eprintln!(
+            "  {} No subtasks generated. Try rephrasing your goal.",
+            theme::icon_err()
+        );
+        return Ok(PlanInputResult::Handled);
+    }
+
+    let plan = astra_services::task_orchestrator::TaskPlan {
+        subtasks: all_subtasks,
+        notes: Some(format!("Generated from {}-phase outline", ol.phases.len())),
+    };
+
+    accept_generated_plan(plan, Some(tok), state, api).await
+}
+
+/// Accept a generated plan: store it, journal it, record a session turn, and prompt for execution.
+async fn accept_generated_plan(
+    plan: astra_services::task_orchestrator::TaskPlan,
+    token: Option<&str>,
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+) -> Result<PlanInputResult, String> {
+    use plan::PlanModeState;
+
+    let Some(plan_state) = state.plan_mode.as_mut() else {
+        return Ok(PlanInputResult::Handled);
+    };
+    plan_state.set_plan(plan);
+    let _ = plan_state.save_to_file(&PlanModeState::state_path());
+
+    let subtask_count = plan_state.plan.subtasks.len();
+    let goal = plan_state.goal.clone();
+
+    journal_plan_event(
+        &mut state.journal,
+        session_journal::JournalEventType::PlanLifecycle,
+        &format!("Plan generated: {subtask_count} subtasks"),
+        Some(serde_json::json!({
+            "subtask_count": subtask_count,
+        })),
+    );
+
+    // Record a session turn so /session shows the plan generation
+    if let Some(ref journal) = state.journal {
+        let plan_summary: Vec<String> = plan_state
+            .plan
+            .subtasks
+            .iter()
+            .map(|s| format!("- [{}] {}", s.id, s.title))
+            .collect();
+        let assistant_content = format!(
+            "Plan generated ({subtask_count} subtasks):\n{}",
+            plan_summary.join("\n")
+        );
+        let turn_event = session_journal::JournalEvent::turn(
+            state.session_id.as_deref(),
+            state.turn,
+            state.model.as_deref(),
+            &goal,
+            &assistant_content,
+            0, // tool_count
+            0, // tokens_in (not tracked for plan generation)
+            0, // tokens_out
+            0, // duration_ms
+        );
+        let _ = journal.append(&turn_event);
+    }
+    state.turn += 1;
+
+    // Show the generated plan before asking what to do
+    eprintln!();
+    eprint_styled_plan(&plan_state.plan, &goal);
+
+    if let Some(choice) = prompt_plan_confirmation(subtask_count) {
+        match choice {
+            PlanConfirmChoice::ExecuteAll => {
+                return Box::pin(handle_plan_mode_input("go".into(), token, state, api)).await;
+            }
+            PlanConfirmChoice::StepByStep => {
+                return Box::pin(handle_plan_mode_input("step".into(), token, state, api)).await;
+            }
+            PlanConfirmChoice::Edit => {
+                match inquire::Text::new("  Describe changes:")
+                    .with_help_message("Esc to cancel")
+                    .prompt()
+                {
+                    Ok(edit) if !edit.trim().is_empty() => {
+                        return Box::pin(handle_plan_mode_input(edit, token, state, api)).await;
+                    }
+                    _ => {}
+                }
+            }
+            PlanConfirmChoice::Cancel => {}
         }
     }
 

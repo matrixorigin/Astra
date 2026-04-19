@@ -2,6 +2,7 @@
 
 pub mod decompose;
 pub mod metrics;
+pub mod outline;
 pub mod performance;
 pub mod plan;
 

@@ -7,6 +7,8 @@
 use crate::theme;
 use futures_util::StreamExt;
 use std::io::IsTerminal;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum SSE buffer size (1 MB). If a malformed stream sends data without
 /// `\n\n` delimiters, we truncate the buffer to prevent unbounded memory growth.
@@ -22,6 +24,10 @@ pub struct SseTextResult {
     pub stream_error: Option<String>,
     /// True when we had to truncate an oversized malformed SSE buffer.
     pub truncated: bool,
+    /// Session ID from `session_info` event (if present).
+    pub session_id: Option<String>,
+    /// True when the stream was interrupted by a cancellation token.
+    pub cancelled: bool,
 }
 
 impl SseTextResult {
@@ -31,6 +37,11 @@ impl SseTextResult {
                 format!("SSE buffer exceeded {MAX_SSE_BUFFER} bytes before a complete event")
             })
         })
+    }
+
+    /// True when the stream was interrupted by a cancellation token.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -44,6 +55,8 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
         event_types: Vec::new(),
         stream_error: None,
         truncated: false,
+        session_id: None,
+        cancelled: false,
     };
     let mut buffer = String::new();
     let mut stream = resp.bytes_stream();
@@ -158,6 +171,8 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
         event_types: Vec::new(),
         stream_error: None,
         truncated: false,
+        session_id: None,
+        cancelled: false,
     };
     let mut buffer = String::new();
     let mut stream = resp.bytes_stream();
@@ -282,6 +297,8 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
         event_types: Vec::new(),
         stream_error: None,
         truncated: false,
+        session_id: None,
+        cancelled: false,
     };
     let mut buffer = String::new();
     let mut stream = resp.bytes_stream();
@@ -364,6 +381,168 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
     }
 
     // Show summary, then clear the preview
+    let summary = pane.summary_line();
+    pane.clear();
+    if !summary.is_empty() {
+        eprintln!("{}", summary);
+    }
+
+    result
+}
+
+/// Cancellable SSE collection with timeout, preview pane, and progress callback.
+///
+/// Like [`collect_sse_with_preview`] but supports:
+/// - **Cancellation** via [`CancellationToken`] (wired to Ctrl-C by caller)
+/// - **Stream timeout** — total wall-clock limit for the entire SSE stream
+/// - **Idle timeout** — max gap between consecutive SSE data frames
+/// - **Progress callback** — called on each `text_delta` chunk
+///
+/// Used by plan generation where the user must be able to interrupt long LLM calls.
+pub async fn collect_sse_cancellable(
+    resp: reqwest::Response,
+    cancel: &CancellationToken,
+    stream_timeout: Duration,
+    idle_timeout: Duration,
+    mut on_chunk: impl FnMut(&str),
+) -> SseTextResult {
+    use super::effects::{ThinkingPreviewPane, thinking_viewport_rows};
+
+    let tw = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    let rows = thinking_viewport_rows();
+    let mut pane = ThinkingPreviewPane::new(rows, tw);
+
+    let mut result = SseTextResult {
+        text: String::new(),
+        event_count: 0,
+        event_types: Vec::new(),
+        stream_error: None,
+        truncated: false,
+        session_id: None,
+        cancelled: false,
+    };
+    let mut buffer = String::new();
+    let mut stream = resp.bytes_stream();
+    let deadline = tokio::time::Instant::now() + stream_timeout;
+    let mut last_data = tokio::time::Instant::now();
+
+    loop {
+        let idle_deadline = last_data + idle_timeout;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                result.stream_error = Some("Plan generation cancelled".into());
+                result.cancelled = true;
+                break;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                result.stream_error = Some(format!(
+                    "Stream timeout after {}s",
+                    stream_timeout.as_secs()
+                ));
+                break;
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                result.stream_error = Some(format!(
+                    "No data received for {}s",
+                    idle_timeout.as_secs()
+                ));
+                break;
+            }
+            chunk = stream.next() => {
+                match chunk {
+                    Some(Ok(bytes)) => {
+                        last_data = tokio::time::Instant::now();
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                        if buffer.len() > MAX_SSE_BUFFER {
+                            result.truncated = true;
+                            buffer.clear();
+                            break;
+                        }
+
+                        while let Some(event_end) = buffer.find("\n\n") {
+                            let event_str = buffer[..event_end].to_string();
+                            buffer = buffer[event_end + 2..].to_string();
+
+                            for line in event_str.lines() {
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    result.event_count += 1;
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                                        let event_type = json
+                                            .get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown");
+
+                                        if !result.event_types.contains(&event_type.to_string()) {
+                                            result.event_types.push(event_type.to_string());
+                                        }
+
+                                        match event_type {
+                                            "text_delta" => {
+                                                if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                                                    result.text.push_str(content);
+                                                    pane.push_chunk(content);
+                                                    on_chunk(content);
+                                                }
+                                            }
+                                            "session_info" => {
+                                                if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                                                    result.session_id = Some(sid.to_string());
+                                                }
+                                            }
+                                            "error" => {
+                                                if let Some(msg) = json
+                                                    .get("message")
+                                                    .or_else(|| json.get("error"))
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        result.stream_error = Some(format!("SSE stream read failed: {e}"));
+                        break;
+                    }
+                    None => break, // stream ended normally
+                }
+            }
+        }
+    }
+
+    // Drain remaining buffer
+    for line in buffer.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            result.event_count += 1;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                match json.get("type").and_then(|v| v.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
+                            result.text.push_str(content);
+                            pane.push_chunk(content);
+                            on_chunk(content);
+                        }
+                    }
+                    Some("session_info") => {
+                        if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+                            result.session_id = Some(sid.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let summary = pane.summary_line();
     pane.clear();
     if !summary.is_empty() {
@@ -506,5 +685,147 @@ mod tests {
             collected.completion_error(),
             "terminal failure state must match collect_sse_text"
         );
+    }
+
+    // ── collect_sse_cancellable tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn cancellable_collects_text_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"text_delta\",\"content\":\"hel\"}\n\n",
+            "data: {\"type\":\"text_delta\",\"content\":\"lo\"}\n\n",
+        );
+        let cancel = CancellationToken::new();
+        let r = collect_sse_cancellable(
+            sse_response(body),
+            &cancel,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            |_| {},
+        )
+        .await;
+        assert_eq!(r.text, "hello");
+        assert!(!r.is_cancelled());
+        assert!(r.completion_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellable_respects_cancellation_token() {
+        // Stream that never ends — cancellation must break out
+        let body = reqwest::Body::wrap_stream(futures_util::stream::unfold(0u32, |i| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let chunk = format!("data: {{\"type\":\"text_delta\",\"content\":\"chunk{i}\"}}\n\n");
+            Some((Ok::<_, std::io::Error>(chunk.into_bytes()), i + 1))
+        }));
+        let resp = reqwest::Response::from(
+            Response::builder()
+                .status(200)
+                .body(body)
+                .expect("test response"),
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel_clone.cancel();
+        });
+
+        let r = collect_sse_cancellable(
+            resp,
+            &cancel,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            |_| {},
+        )
+        .await;
+        assert!(r.is_cancelled(), "should be cancelled");
+        assert!(
+            !r.text.is_empty(),
+            "should have collected some chunks before cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellable_idle_timeout_fires() {
+        // Stream that sends one chunk then stalls
+        let body =
+            reqwest::Body::wrap_stream(futures_util::stream::unfold(false, |sent| async move {
+                if sent {
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    None
+                } else {
+                    let chunk = "data: {\"type\":\"text_delta\",\"content\":\"x\"}\n\n";
+                    Some((Ok::<_, std::io::Error>(chunk.as_bytes().to_vec()), true))
+                }
+            }));
+        let resp = reqwest::Response::from(
+            Response::builder()
+                .status(200)
+                .body(body)
+                .expect("test response"),
+        );
+
+        let cancel = CancellationToken::new();
+        let r = collect_sse_cancellable(
+            resp,
+            &cancel,
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            |_| {},
+        )
+        .await;
+        assert_eq!(r.text, "x");
+        assert!(
+            r.completion_error()
+                .is_some_and(|e| e.contains("No data received")),
+            "should report idle timeout, got: {:?}",
+            r.completion_error()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellable_calls_on_chunk() {
+        let body = concat!(
+            "data: {\"type\":\"text_delta\",\"content\":\"a\"}\n\n",
+            "data: {\"type\":\"text_delta\",\"content\":\"b\"}\n\n",
+        );
+        let cancel = CancellationToken::new();
+        let mut chunks = Vec::new();
+        let r = collect_sse_cancellable(
+            sse_response(body),
+            &cancel,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            |c| chunks.push(c.to_string()),
+        )
+        .await;
+        assert_eq!(r.text, "ab");
+        assert_eq!(chunks, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn is_cancelled_returns_false_for_other_errors() {
+        let r = collect_sse_text(sse_error_response(), false).await;
+        assert!(!r.is_cancelled());
+        assert!(!r.cancelled);
+    }
+
+    #[test]
+    fn is_cancelled_uses_bool_not_string() {
+        let mut r = SseTextResult {
+            text: String::new(),
+            event_count: 0,
+            event_types: vec![],
+            stream_error: Some("Plan generation cancelled".into()),
+            truncated: false,
+            session_id: None,
+            cancelled: false,
+        };
+        // Even with "cancelled" in the error string, is_cancelled is false
+        // because the bool field is what matters
+        assert!(!r.is_cancelled());
+        r.cancelled = true;
+        assert!(r.is_cancelled());
     }
 }
