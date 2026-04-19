@@ -1390,3 +1390,407 @@ async fn many_sequential_tool_rounds_no_state_corruption() {
         acts.len()
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Reasoning content — persisted in llm_response + reasoning_done SSE emitted
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn reasoning_content_persisted_and_sse_emitted() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "reasoning-agent",
+        "messages": [{ "role": "user", "content": "explain quicksort" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "Quicksort is a divide-and-conquer algorithm.",
+            "reasoning": "The user wants an explanation of quicksort. I should explain the algorithm step by step.",
+            "usage": { "prompt_tokens": 50, "completion_tokens": 30 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // reasoning_done SSE event should be emitted when reasoning is non-empty.
+    let rd = events_of_type(&events, "reasoning_done");
+    assert_eq!(rd.len(), 1, "should have exactly one reasoning_done event");
+
+    // text_delta should contain the actual answer.
+    let deltas = events_of_type(&events, "text_delta");
+    assert!(!deltas.is_empty(), "should have text_delta events");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Verify reasoning is persisted in llm_response.
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1);
+    let lr = core[0].llm_response_event.as_ref().unwrap();
+    assert!(
+        lr.reasoning_content.is_some(),
+        "reasoning_content should be persisted"
+    );
+    assert!(
+        lr.reasoning_content.as_ref().unwrap().contains("quicksort"),
+        "reasoning_content should contain the reasoning text"
+    );
+    assert!(
+        lr.content.contains("divide-and-conquer"),
+        "llm response content should contain the actual answer"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Reasoning with tool calls — reasoning persisted, tool calls returned
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn reasoning_with_tool_calls_persists_reasoning() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "reason-tool-agent",
+        "messages": [{ "role": "user", "content": "read the config" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "reasoning": "I need to read the config file to answer the user's question.",
+            "tool_calls": [tool_call("tc-rt1", "read_file", json!({"path": "config.toml"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // reasoning_done should be emitted even when tool calls are present.
+    let rd = events_of_type(&events, "reasoning_done");
+    assert_eq!(
+        rd.len(),
+        1,
+        "reasoning_done should be emitted with tool calls"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Note: reasoning_content on llm_response may be None when has_tool_calls is true
+    // (bridge line ~1558: reasoning_content is None when reasoning is empty AND has_tool_calls).
+    // But here reasoning IS non-empty, so it should be persisted.
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1);
+    let lr = core[0].llm_response_event.as_ref().unwrap();
+    assert!(
+        lr.reasoning_content.is_some(),
+        "reasoning_content should be persisted even with tool calls when reasoning is non-empty"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Usage/token tracking — usage from mock rounds persisted in llm_response
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn usage_token_tracking_persisted_in_llm_response() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "usage-agent",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "Hi there!",
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 7,
+                "total_tokens": 49,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 5
+            }
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1);
+    let lr = core[0].llm_response_event.as_ref().unwrap();
+
+    // token_usage should be persisted.
+    assert!(lr.token_usage.is_some(), "token_usage should be persisted");
+    let usage = lr.token_usage.as_ref().unwrap();
+    assert_eq!(
+        usage.get("prompt_tokens").and_then(Value::as_i64),
+        Some(42),
+        "prompt_tokens should be 42"
+    );
+    assert_eq!(
+        usage.get("completion_tokens").and_then(Value::as_i64),
+        Some(7),
+        "completion_tokens should be 7"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Usage tracking across multi-turn — each turn has independent usage
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn usage_tracking_across_multi_turn_independent() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: tool call with usage.
+    let turn1 = json!({
+        "agent_id": "usage-mt-agent",
+        "messages": [{ "role": "user", "content": "read files" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-u1", "read_file", json!({"path": "a.txt"}))],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 20 }
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0].get("session_id").and_then(Value::as_str).unwrap();
+
+    // Turn 2: completion with different usage.
+    let turn2 = json!({
+        "agent_id": "usage-mt-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "read files" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-u1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-u1", "content": "file contents here" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-u1", "content": "file contents here" }],
+        "test_llm_rounds": [{
+            "full_text": "Here is what I found.",
+            "usage": { "prompt_tokens": 250, "completion_tokens": 15 }
+        }]
+    });
+
+    let (st2, _) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 2, "two core persist calls");
+
+    // Turn 1 usage.
+    let lr1 = core[0].llm_response_event.as_ref().unwrap();
+    assert!(lr1.token_usage.is_some());
+    assert_eq!(
+        lr1.token_usage
+            .as_ref()
+            .unwrap()
+            .get("prompt_tokens")
+            .and_then(Value::as_i64),
+        Some(100)
+    );
+
+    // Turn 2 usage — should be different (independent per call).
+    let lr2 = core[1].llm_response_event.as_ref().unwrap();
+    assert!(lr2.token_usage.is_some());
+    assert_eq!(
+        lr2.token_usage
+            .as_ref()
+            .unwrap()
+            .get("prompt_tokens")
+            .and_then(Value::as_i64),
+        Some(250)
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Concurrent requests — multiple sessions don't interfere
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn concurrent_requests_no_cross_session_interference() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Launch 5 concurrent requests with different agent_ids to distinguish them.
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let app_clone = app.clone();
+        let payload = json!({
+            "agent_id": format!("concurrent-agent-{i}"),
+            "messages": [{ "role": "user", "content": format!("concurrent request {i}") }],
+            "edge_tools": [tool_schema("read_file")],
+            "test_llm_rounds": [{
+                "full_text": format!("Response for concurrent request {i}"),
+                "usage": { "prompt_tokens": 10 + i, "completion_tokens": 5 + i }
+            }]
+        });
+        handles.push(tokio::spawn(
+            async move { chat_turn(&app_clone, payload).await },
+        ));
+    }
+
+    // Await all.
+    let results: Vec<_> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
+
+    // All should succeed.
+    for (i, (st, raw)) in results.iter().enumerate() {
+        assert_eq!(*st, StatusCode::OK, "request {i} should succeed");
+        let events = parse_sse_events(raw);
+        let si = events_of_type(&events, "session_info");
+        assert!(!si.is_empty(), "request {i} should have session_info");
+        let tc = events_of_type(&events, "turn_complete");
+        assert_eq!(tc.len(), 1, "request {i} should have turn_complete");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify 5 independent core persist calls.
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        5,
+        "5 concurrent requests = 5 core persist calls"
+    );
+
+    // All event_ids must be unique across all 5 requests.
+    let mut all_ids: Vec<String> = Vec::new();
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            all_ids.push(uq.event_id.clone());
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            all_ids.push(lr.event_id.clone());
+        }
+    }
+    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique.len(),
+        "all event_ids unique across concurrent requests"
+    );
+    // Each request produces 1 user_query + 1 llm_response = 10 total.
+    assert_eq!(all_ids.len(), 10, "5 requests × 2 events = 10 IDs");
+
+    // Verify all agent_ids are present (no cross-contamination).
+    let agent_ids: std::collections::HashSet<_> = core
+        .iter()
+        .filter_map(|p| p.user_query_event.as_ref())
+        .filter_map(|uq| uq.agent_id.as_deref())
+        .collect();
+    for i in 0..5 {
+        assert!(
+            agent_ids.contains(format!("concurrent-agent-{i}").as_str()),
+            "agent concurrent-agent-{i} should be present"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Large payload — many tools and long messages handled correctly
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn large_payload_many_tools_and_long_messages() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Build a payload with 20 tool schemas and a long user message.
+    let tools: Vec<Value> = (0..20).map(|i| tool_schema(&format!("tool_{i}"))).collect();
+
+    // Long message (~10KB).
+    let long_content = "x".repeat(10_000);
+
+    // LLM returns 10 tool calls in one response.
+    let tool_calls: Vec<Value> = (0..10)
+        .map(|i| {
+            tool_call(
+                &format!("tc-lg-{i}"),
+                &format!("tool_{i}"),
+                json!({"data": format!("arg-{i}")}),
+            )
+        })
+        .collect();
+
+    let payload = json!({
+        "agent_id": "large-payload-agent",
+        "messages": [{ "role": "user", "content": long_content }],
+        "edge_tools": tools,
+        "test_llm_rounds": [{
+            "tool_calls": tool_calls,
+            "usage": { "prompt_tokens": 5000, "completion_tokens": 200 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Should have session_info and turn_complete.
+    let si = events_of_type(&events, "session_info");
+    assert!(!si.is_empty(), "should have session_info");
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Verify core persistence.
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1);
+    let uq = core[0].user_query_event.as_ref().unwrap();
+    assert!(
+        uq.content.len() >= 10_000,
+        "user_query content should contain the long message"
+    );
+
+    // Verify tool events: at least 10 tool call records.
+    let tools_persisted = cap.tool_plans.lock().await;
+    let total: usize = tools_persisted.iter().map(|p| p.events.len()).sum();
+    assert!(
+        total >= 10,
+        "should persist at least 10 tool events, got {total}"
+    );
+
+    // Verify usage persisted.
+    let lr = core[0].llm_response_event.as_ref().unwrap();
+    assert!(lr.token_usage.is_some());
+    assert_eq!(
+        lr.token_usage
+            .as_ref()
+            .unwrap()
+            .get("prompt_tokens")
+            .and_then(Value::as_i64),
+        Some(5000)
+    );
+}
