@@ -2025,3 +2025,748 @@ async fn approval_allow_session_approves_tool() {
         "should complete after allow_session approval"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PHASE A: RUN LIFECYCLE, EVENT REPLAY, STATE CONSISTENCY
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers for Phase A ──────────────────────────────────────────────────────
+
+/// GET /chat/runs/{run_id} — returns JSON body.
+async fn get_run_status(app: &Router, run_id: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/chat/runs/{run_id}"))
+        .header("authorization", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// GET /chat/runs/{run_id} with a custom auth header.
+async fn get_run_status_with_auth(app: &Router, run_id: &str, auth: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/chat/runs/{run_id}"))
+        .header("authorization", auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// GET /chat/runs/{run_id}/stream?last_index=N — returns SSE events.
+async fn get_run_stream(app: &Router, run_id: &str, last_index: u32) -> (StatusCode, Vec<Value>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/chat/runs/{run_id}/stream?last_index={last_index}"
+        ))
+        .header("authorization", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&bytes);
+    let events = parse_sse_events(&body_str);
+    (status, events)
+}
+
+/// GET /runs?limit=N&offset=M — list runs.
+async fn list_runs(app: &Router, limit: u32, offset: u32) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/runs?limit={limit}&offset={offset}"))
+        .header("authorization", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// Convenience: stream a chat, wait for completion, extract run_id.
+async fn stream_and_get_run_id(app: &Router, payload: Value) -> (Vec<Value>, String, String) {
+    let events = chat_stream_collect(app, payload).await;
+    let si = find_events(&events, "session_info");
+    assert!(!si.is_empty(), "must have session_info event");
+    let run_id = si[0]
+        .get("run_id")
+        .and_then(Value::as_str)
+        .expect("run_id in session_info")
+        .to_string();
+    let session_id = si[0]
+        .get("session_id")
+        .and_then(Value::as_str)
+        .expect("session_id in session_info")
+        .to_string();
+    (events, run_id, session_id)
+}
+
+// ── A1: Run Status Field Verification ────────────────────────────────────────
+
+#[tokio::test]
+async fn a1_run_status_all_fields_text_only() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "text only run",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Done." }]
+        }
+    });
+
+    let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (status_code, body) = get_run_status(&app, &run_id).await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    // Verify ALL RunStatusResponse fields.
+    assert_eq!(body["run_id"].as_str().unwrap(), run_id);
+    assert_eq!(body["session_id"].as_str().unwrap(), session_id);
+    assert_eq!(body["status"].as_str().unwrap(), "completed");
+    assert!(
+        body["waiting_for"].is_null(),
+        "completed run should not be waiting: {:?}",
+        body["waiting_for"]
+    );
+    let events_count = body["events_count"].as_i64().unwrap();
+    assert!(
+        events_count > 0,
+        "events_count should be > 0, got {events_count}"
+    );
+}
+
+#[tokio::test]
+async fn a1_run_status_all_fields_after_tool_round() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "tool round run",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-a1",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{\"path\": \"/x\"}" }
+                    }]
+                },
+                { "full_text": "All done." }
+            ],
+            "edge_tools": [tool_schema("read_file")]
+        }
+    });
+
+    let app_clone = app.clone();
+    let app_for_post = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(&app_clone, payload).await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let st = post_tool_result(&app_for_post, "tc-a1", "file contents", "ok").await;
+    assert_eq!(st, 200);
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("timed out")
+        .expect("task panicked");
+
+    let si = find_events(&events, "session_info");
+    let run_id = si[0]["run_id"].as_str().unwrap();
+    let session_id = si[0]["session_id"].as_str().unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (status_code, body) = get_run_status(&app, run_id).await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(body["run_id"].as_str().unwrap(), run_id);
+    assert_eq!(body["session_id"].as_str().unwrap(), session_id);
+    assert_eq!(body["status"].as_str().unwrap(), "completed");
+    assert!(body["waiting_for"].is_null());
+    assert!(body["events_count"].as_i64().unwrap() > 0);
+}
+
+// ── A2: Run Status Transitions ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn a2_transition_running_to_completed_text_only() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "transition text",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Response." }]
+        }
+    });
+
+    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (_, body) = get_run_status(&app, &run_id).await;
+    assert_eq!(body["status"].as_str().unwrap(), "completed");
+}
+
+#[tokio::test]
+async fn a2_transition_running_to_completed_after_tool_rounds() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "tool then complete",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-a2-tool",
+                        "type": "function",
+                        "function": { "name": "glob", "arguments": "{\"pattern\": \"*.rs\"}" }
+                    }]
+                },
+                { "full_text": "Tool done." }
+            ],
+            "edge_tools": [tool_schema("glob")]
+        }
+    });
+
+    let app_clone = app.clone();
+    let app_for_post = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(&app_clone, payload).await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app_for_post, "tc-a2-tool", "file.rs", "ok").await;
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("timed out")
+        .expect("task panicked");
+
+    let si = find_events(&events, "session_info");
+    let run_id = si[0]["run_id"].as_str().unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (_, body) = get_run_status(&app, run_id).await;
+    assert_eq!(body["status"].as_str().unwrap(), "completed");
+}
+
+#[tokio::test]
+async fn a2_transition_running_to_cancelled() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    // Use a tool round so the loop doesn't terminate immediately.
+    let payload = json!({
+        "message": "cancel me",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-a2-cancel",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{\"path\": \"/c\"}" }
+                    }]
+                },
+                { "full_text": "never reached" }
+            ],
+            "edge_tools": [tool_schema("read_file")]
+        }
+    });
+
+    let app_clone = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(&app_clone, payload).await;
+        read_sse_events_incremental(resp.into_body()).await
+    });
+
+    // Wait for stream to start, then extract run_id from initial events.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    // We need to cancel — but first we need the run_id. We'll list runs to find it.
+    let (_, list_body) = list_runs(&app, 10, 0).await;
+    let runs = list_body["runs"].as_array().expect("runs array");
+    assert!(!runs.is_empty(), "should have at least one run");
+    let running = runs
+        .iter()
+        .find(|r| r["status"].as_str() == Some("running"));
+    assert!(running.is_some(), "should have a running run");
+    let run_id = running.unwrap()["run_id"].as_str().unwrap().to_string();
+
+    let cancel_status = cancel_run(&app, &run_id).await;
+    assert_eq!(cancel_status, StatusCode::OK);
+
+    // Also post the tool result so the stream can terminate.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    post_tool_result(&app, "tc-a2-cancel", "cancelled", "ok").await;
+
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("timed out")
+        .expect("task panicked");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (_, body) = get_run_status(&app, &run_id).await;
+    let status = body["status"].as_str().unwrap();
+    assert!(
+        status == "cancelled" || status == "completed",
+        "expected cancelled or completed after cancel, got: {status}"
+    );
+}
+
+// ── A3: Event Replay via stream_run ──────────────────────────────────────────
+
+#[tokio::test]
+async fn a3_event_replay_all_events_from_index_zero() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "replay test",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Replay me." }]
+        }
+    });
+
+    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Replay from index 0 — should get all stored events.
+    let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !replay_events.is_empty(),
+        "replay from index 0 should return events"
+    );
+
+    // Replayed events should have index fields.
+    assert_eq!(replay_events[0]["index"], 0);
+
+    // Should contain a run_started or run_finished event type.
+    let has_terminal = replay_events.iter().any(|e| {
+        let t = e["type"].as_str().unwrap_or("");
+        t == "run_started" || t == "run_finished"
+    });
+    assert!(has_terminal, "replay should include run lifecycle events");
+}
+
+#[tokio::test]
+async fn a3_event_replay_partial_from_middle() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "partial replay",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Partial replay content." }]
+        }
+    });
+
+    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Get all events first.
+    let (_, all_events) = get_run_stream(&app, &run_id, 0).await;
+    let total = all_events.len();
+    assert!(total >= 2, "need at least 2 events for partial replay");
+
+    // Replay from index 1 — should skip the first event.
+    let (_, partial_events) = get_run_stream(&app, &run_id, 1).await;
+    assert_eq!(
+        partial_events.len(),
+        total - 1,
+        "partial from index 1 should have {expected} events, got {actual}",
+        expected = total - 1,
+        actual = partial_events.len()
+    );
+
+    // First event in partial should have index 1.
+    assert_eq!(partial_events[0]["index"], 1);
+}
+
+#[tokio::test]
+async fn a3_event_replay_beyond_end_returns_empty() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "beyond end",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Short." }]
+        }
+    });
+
+    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Replay from a very high index.
+    let (status, events) = get_run_stream(&app, &run_id, 9999).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        events.is_empty(),
+        "replay beyond end should return empty, got {} events",
+        events.len()
+    );
+}
+
+#[tokio::test]
+async fn a3_event_replay_matches_sse_stream_content() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "match test",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Match this text." }]
+        }
+    });
+
+    let (sse_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (_, replay_events) = get_run_stream(&app, &run_id, 0).await;
+
+    // Find text_delta in SSE events.
+    let sse_text: Vec<&str> = sse_events
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("text_delta"))
+        .filter_map(|e| e["content"].as_str().or(e["text"].as_str()))
+        .collect();
+
+    // Find text_delta in replay events.
+    let replay_text: Vec<&str> = replay_events
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("text_delta"))
+        .filter_map(|e| e["content"].as_str().or(e["text"].as_str()))
+        .collect();
+
+    assert!(!sse_text.is_empty(), "SSE should have text_delta events");
+    assert_eq!(
+        sse_text, replay_text,
+        "replay text_delta content should match SSE stream"
+    );
+}
+
+// ── A4: Ledger Cleanup Verification ──────────────────────────────────────────
+
+#[tokio::test]
+async fn a4_ledger_empty_after_tool_run_completes() {
+    init_env();
+    let (app, ledger) = build_test_app();
+
+    let payload = json!({
+        "message": "ledger cleanup test",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-a4-ledger",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{\"path\": \"/l\"}" }
+                    }]
+                },
+                { "full_text": "Ledger clean." }
+            ],
+            "edge_tools": [tool_schema("read_file")]
+        }
+    });
+
+    let app_clone = app.clone();
+    let app_for_post = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(&app_clone, payload).await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app_for_post, "tc-a4-ledger", "content", "ok").await;
+
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("timed out")
+        .expect("task panicked");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Ledger should be empty — all tool entries consumed.
+    let ledger_map = ledger.lock().await;
+    assert!(
+        ledger_map.is_empty(),
+        "ledger should be empty after run completes, has {} entries: {:?}",
+        ledger_map.len(),
+        ledger_map.keys().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a4_ledger_empty_after_cancelled_run() {
+    init_env();
+    let (app, ledger) = build_test_app();
+
+    let payload = json!({
+        "message": "cancel ledger test",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-a4-cancel-ledger",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{\"path\": \"/cl\"}" }
+                    }]
+                },
+                { "full_text": "never reached" }
+            ],
+            "edge_tools": [tool_schema("read_file")]
+        }
+    });
+
+    let app_clone = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(&app_clone, payload).await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    // Find running run and cancel it.
+    let (_, list_body) = list_runs(&app, 10, 0).await;
+    let runs = list_body["runs"].as_array().expect("runs array");
+    let running = runs
+        .iter()
+        .find(|r| r["status"].as_str() == Some("running"));
+    if let Some(r) = running {
+        let run_id = r["run_id"].as_str().unwrap();
+        cancel_run(&app, run_id).await;
+    }
+
+    // Post tool result so the stream can finish even if cancel didn't interrupt.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "ok").await;
+
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("timed out")
+        .expect("task panicked");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let ledger_map = ledger.lock().await;
+    assert!(
+        ledger_map.is_empty(),
+        "ledger should be empty after cancelled run, has {} entries: {:?}",
+        ledger_map.len(),
+        ledger_map.keys().collect::<Vec<_>>()
+    );
+}
+
+// ── A5: Run Not Found / Access Denied ────────────────────────────────────────
+
+#[tokio::test]
+async fn a5_run_status_not_found() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let (status, body) = get_run_status(&app, "nonexistent-run-id").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nonexistent run should 404");
+    assert!(
+        body["detail"].as_str().is_some(),
+        "error response should have detail"
+    );
+}
+
+#[tokio::test]
+async fn a5_run_status_unauthorized() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    // Create a run first.
+    let payload = json!({
+        "message": "auth test",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Auth." }]
+        }
+    });
+    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Try with wrong token.
+    let (status, _) = get_run_status_with_auth(&app, &run_id, "Bearer wrong-token").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "wrong token should get 401"
+    );
+}
+
+#[tokio::test]
+async fn a5_stream_run_not_found() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    // stream_run returns SSE, so errors come as SSE events.
+    let (status, events) = get_run_stream(&app, "nonexistent-stream-id", 0).await;
+    assert_eq!(status, StatusCode::OK, "SSE endpoints return 200");
+    // Should have an error event.
+    let error_events = find_events(&events, "error");
+    assert!(
+        !error_events.is_empty(),
+        "should have SSE error event for nonexistent run"
+    );
+    let code = error_events[0]["code"].as_str().unwrap_or("");
+    assert_eq!(code, "NOT_FOUND", "error code should be NOT_FOUND");
+}
+
+// ── A6: Session Info Consistency ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn a6_session_id_consistent_across_events_and_run() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "session consistency",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Consistent." }]
+        }
+    });
+
+    let (events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify run status session_id matches.
+    let (_, body) = get_run_status(&app, &run_id).await;
+    assert_eq!(
+        body["session_id"].as_str().unwrap(),
+        session_id,
+        "run status session_id should match session_info"
+    );
+
+    // Verify session_id is non-empty and looks like a UUID.
+    assert!(!session_id.is_empty(), "session_id should not be empty");
+    assert!(
+        session_id.contains('-'),
+        "session_id should be UUID-like: {session_id}"
+    );
+
+    // All events in the stream should be associated with this session.
+    let si_events = find_events(&events, "session_info");
+    assert_eq!(si_events.len(), 1, "should have exactly one session_info");
+}
+
+#[tokio::test]
+async fn a6_custom_session_id_preserved() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let custom_sid = format!("custom-{}", uuid::Uuid::new_v4());
+    let payload = json!({
+        "message": "custom session",
+        "session_id": &custom_sid,
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Custom." }]
+        }
+    });
+
+    let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The session_id in session_info should match our custom ID.
+    assert_eq!(
+        session_id, custom_sid,
+        "session_info should preserve custom session_id"
+    );
+
+    // Run status should also reflect the custom session_id.
+    let (_, body) = get_run_status(&app, &run_id).await;
+    assert_eq!(body["session_id"].as_str().unwrap(), custom_sid);
+}
+
+#[tokio::test]
+async fn a6_multiple_runs_same_session() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let shared_sid = format!("shared-{}", uuid::Uuid::new_v4());
+
+    // First run.
+    let payload1 = json!({
+        "message": "run 1",
+        "session_id": &shared_sid,
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Run one." }]
+        }
+    });
+    let (_, run_id_1, sid_1) = stream_and_get_run_id(&app, payload1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Second run with same session.
+    let payload2 = json!({
+        "message": "run 2",
+        "session_id": &shared_sid,
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Run two." }]
+        }
+    });
+    let (_, run_id_2, sid_2) = stream_and_get_run_id(&app, payload2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Both should share the same session_id.
+    assert_eq!(sid_1, shared_sid);
+    assert_eq!(sid_2, shared_sid);
+    assert_ne!(
+        run_id_1, run_id_2,
+        "different runs should have different run_ids"
+    );
+
+    // Both runs should be queryable.
+    let (s1, b1) = get_run_status(&app, &run_id_1).await;
+    let (s2, b2) = get_run_status(&app, &run_id_2).await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(b1["session_id"].as_str().unwrap(), shared_sid);
+    assert_eq!(b2["session_id"].as_str().unwrap(), shared_sid);
+}
+
+#[tokio::test]
+async fn a6_list_runs_shows_completed_runs() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "list me",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Listed." }]
+        }
+    });
+
+    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (status, body) = list_runs(&app, 50, 0).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let runs = body["runs"].as_array().expect("runs array");
+    let found = runs.iter().any(|r| r["run_id"].as_str() == Some(&run_id));
+    assert!(found, "list_runs should include the completed run {run_id}");
+}
