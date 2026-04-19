@@ -33,7 +33,6 @@
 ///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     sync::Arc,
     time::Instant,
 };
@@ -50,16 +49,9 @@ use axum::body::Body;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 
-/// Maximum number of read-only tools to execute concurrently.
-/// Prevents resource exhaustion from parallel tool execution.
-const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 10;
-use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::{SandboxConfig, SandboxMode, ToolContext, ToolExecutor, TracingLogger};
 use serde_json::{Map, Value, json};
-use std::path::PathBuf;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -70,25 +62,8 @@ use crate::{
     TurnCorePersistPlan, TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter,
     TurnReflectionStateStore, TurnSessionActivityWriter, TurnToolEventPersistPlan,
     TurnToolEventRecord, TurnToolEventWriter, build_explain_event, build_stream_error_event,
-    pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder},
     prompts,
-    turn::agentic_post_tool_policy::{
-        AgenticPostToolPolicyOutcome, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
-    },
-    turn::agentic_stall_preflight::{
-        CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
-    },
-    turn::cloud_tool_delivery::{
-        ApprovalAuditContext, cloud_tool_requires_approval_for_delivery,
-        local_tool_execution_delivery, record_approval_required_audit,
-        sse_maps_through_tool_request, tool_approval_detail_for_delivery,
-        tool_approval_kind_for_delivery, tool_path_hint_for_delivery,
-        wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
-    },
-    turn::edge_ledger::{
-        assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
-        history_has_reasoning,
-    },
+    turn::edge_ledger::ensure_tool_call_ids,
     turn::llm_client::{LlmCancel, sleep_ms_or_llm_cancel},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
     turn::sse_blocks::SseBlankLineUtf8Buf,
@@ -96,12 +71,8 @@ use crate::{
         drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
         validated_json_events_from_sse_block,
     },
-    turn::stall::cli_agentic_tool_round_budget_abort_msg,
-    turn::stream_events::build_approval_required_event,
-    turn::tool_argument_hints::normalize_llm_function_arguments,
-    turn::tool_call_shape::{tool_call_arguments_value, tool_call_name},
+    turn::tool_call_shape::tool_call_name,
     turn::tool_schema_prune::prune_tool_schemas,
-    turn::turn_guard::TurnGuard,
 };
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
@@ -502,12 +473,13 @@ fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
     (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
 }
 
+#[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
     cancel: Option<&CancellationToken>,
     future: F,
 ) -> Result<T, Map<String, Value>>
 where
-    F: Future<Output = T>,
+    F: std::future::Future<Output = T>,
 {
     tokio::select! {
         biased;
@@ -571,7 +543,11 @@ fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<Stri
         .collect()
 }
 
-fn record_turn_guard_tool_results(turn_guard: &mut TurnGuard, persist_tool_results: &[Value]) {
+#[cfg(test)]
+fn record_turn_guard_tool_results(
+    turn_guard: &mut crate::turn::turn_guard::TurnGuard,
+    persist_tool_results: &[Value],
+) {
     for tool_result in persist_tool_results {
         let Some(tool_result) = tool_result.as_object() else {
             continue;
@@ -1594,7 +1570,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
         let turn_learning_writer = self.turn_learning_writer.clone();
-        let edge_callback_ledger = self.edge_callback_ledger.clone();
+        let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_for_stream: Option<Vec<Value>> =
@@ -2135,7 +2111,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             super::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
-            let mut merged_tool_results: Vec<Value> = tool_results.clone();
+            let merged_tool_results: Vec<Value> = tool_results.clone();
 
             let mut full_text = String::new();
             let mut all_round_tool_calls: Vec<Value> = Vec::new();
@@ -2150,9 +2126,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
-            let ledger_wait = std::time::Duration::from_secs_f64(turn_timeout_s().max(1.0));
             let max_rounds = crate::turn::routing::max_tool_rounds();
-            let round_limit: i64 = if use_e2e_llm {
+            let _round_limit: i64 = if use_e2e_llm {
                 bridge_e2e
                     .as_ref()
                     .map(|r| (r.len() as i64).clamp(1, max_rounds))
@@ -2162,41 +2137,19 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             };
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut bridge_ptl_streak: u32 = 0;
+            let bridge_ptl_streak: u32 = 0;
             let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
-            let mut bridge_turn_sigs = Vec::new();
-            let mut bridge_turn_tool_names = Vec::new();
-            let mut bridge_stall_events = Vec::new();
-            let mut bridge_intent_tool_turns = Vec::new();
-            let mut bridge_verdict_events = Vec::new();
-            let mut bridge_turn_guard = TurnGuard::new();
-            let mut bridge_restricted_tools = HashSet::new();
-            let mut bridge_remaining_turns = round_limit as usize;
-            let mut bridge_step_recorder = StepRecorder::new(&session_id, "legacy-bridge-loop");
-            let mut bridge_last_heavy_checkpoint: Option<StepCheckpoint> = None;
-            let user_message_for_guard = latest_user_message_text(&messages)
-                .unwrap_or("")
-                .to_string();
 
-            for round_ix in 0i64..round_limit {
+
+            // Single LLM call per HTTP request (no multi-round tool loop).
+            let round_ix = 0i64;
+            {
                 cloud_loop_turns += 1;
 
-                if bridge_remaining_turns == 0 {
-                    yield render_sse_map(&build_stream_error_event(
-                        &format!(
-                            "{} (round limit: {})",
-                            cli_agentic_tool_round_budget_abort_msg(round_limit as usize),
-                            round_limit
-                        ),
-                        "TURN_BUDGET_EXHAUSTED",
-                        false,
-                    ));
-                    return;
-                }
-                bridge_remaining_turns = bridge_remaining_turns.saturating_sub(1);
+                // Budget check removed: single LLM call per HTTP request.
 
                 let round_edge_tools =
-                    filter_round_edge_tools(&edge_tools, &bridge_restricted_tools);
+                    filter_round_edge_tools(&edge_tools, &HashSet::new());
                 let round_tools_fingerprint_str =
                     serde_json::to_string(&round_edge_tools).unwrap_or_default();
 
@@ -2318,7 +2271,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         Ok(s) => s,
                         Err(e) if crate::turn::llm_client::is_context_window_error(&e.to_lowercase()) => {
                             // Context-window error: force aggressive compaction and retry once
-                            bridge_ptl_streak = bridge_ptl_streak.saturating_add(1);
+                            let _ = bridge_ptl_streak.saturating_add(1);
                             astra_core::agent_warn!(
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
@@ -2568,7 +2521,6 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)));
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
-                    bridge_ptl_streak = 0;
                 }
 
                 // ── Cache break detection ──
@@ -2596,345 +2548,16 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     }
                 }
 
-                if loop_tool_calls.is_empty() {
-                    break;
-                }
-
-                ensure_tool_call_ids(&mut loop_tool_calls);
-                apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
-                    turn_index: round_ix as u32,
-                    tool_calls_for_guard: &loop_tool_calls,
-                    turn_sigs: &mut bridge_turn_sigs,
-                    turn_tool_names: &mut bridge_turn_tool_names,
-                    stall_events: &mut bridge_stall_events,
-                    turn_guard: &mut bridge_turn_guard,
-                });
-
-                let round_start = all_round_tool_calls.len();
-                all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
-                round_boundaries.push((round_start, loop_tool_calls.len()));
-
-                llm_messages.push(assistant_message_with_tool_calls_and_reasoning(
-                    &loop_tool_calls,
-                    &loop_reasoning,
-                    !reasoning.is_empty() || history_has_reasoning(&llm_messages),
-                ));
-                // Tool delivery matrix for this generator (legacy `/chat/turn`):
-                // - Approval-gated + empty `edge_tools`: fast-fail via `local_tool_execution_delivery`
-                //   (no edge client for §5.5 POST /approval/respond or /tools/result).
-                // - Approval-gated + non-empty `edge_tools`: sequential §5.5 ledger
-                //   (audit + approval_required → wait approval → tool_request → wait result).
-                // - Read-only batch: empty `edge_tools` → `DefaultToolExecutor` + cwd; else concurrent
-                //   `wait_tool_result_ledger_for_tool` after broadcasting all `tool_request` maps.
-                // (`cloud_tool_requires_approval_for_delivery` / bash read-only rules live in astra-turn-core.)
-                // ── Tool delivery: approval tools sequential, read-only concurrent ──
-                let mut read_only_tcs: Vec<Value> = Vec::new();
-                for tc in loop_tool_calls.iter() {
-                    let Some(tc_map) = tc.as_object() else { continue };
-                    if !cloud_tool_requires_approval_for_delivery(tc) {
-                        read_only_tcs.push(tc.clone());
-                        continue;
-                    }
-                    if edge_tools.is_empty() {
-                        // No edge tool schemas: §5.5 approval/result round-trip has no edge client
-                        // to POST /approval/respond or /tools/result — fail fast instead of ledger timeout.
-                        let tool_name = tc_map
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let tail = local_tool_execution_delivery(
-                            tc,
-                            &format!(
-                                "approval-required tool `{tool_name}` cannot execute: no edge agent connected"
-                            ),
-                            true,
-                        );
-                        for m in tail.sse_maps {
-                            yield render_sse_map(&m);
-                        }
-                        record_turn_guard_tool_results(
-                            &mut bridge_turn_guard,
-                            &tail.persist_tool_results,
-                        );
-                        merged_tool_results.extend(tail.persist_tool_results);
-                        llm_messages.extend(tail.tool_messages);
-                        continue;
-                    }
-                    // Sequential: approval → wait → request → wait (§5.5 ledger + edge agent).
-                    let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
-                    let tool_name = tc_map
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let path = tool_path_hint_for_delivery(tc);
-                    let detail = tool_approval_detail_for_delivery(tc);
-                    let approval_kind = tool_approval_kind_for_delivery(tc);
-                    let approval_audit_context = ApprovalAuditContext {
-                        user_id: user_id.clone(),
-                        session_id: session_id.clone(),
-                        turn: turn_count_from_messages(&messages).max(1) as u32,
-                        agent_id: agent_id.clone(),
-                        parent_event_id: Some(user_query_event_id.clone()),
-                        parent_event_ids: vec![user_query_event_id.clone()],
-                        causal_chain_id: turn_chain_id.clone(),
-                        auxiliary_event_writer: turn_auxiliary_event_writer.clone(),
-                    };
-                    if let Err(error) = record_approval_required_audit(
-                        &approval_audit_context,
-                        id,
-                        tool_name,
-                        approval_kind,
-                        detail.as_deref(),
-                    )
-                    .await
-                    {
-                        astra_core::agent_error!(
-                            "approval",
-                            "approval required audit persist failed for {}: {}",
-                            id,
-                            error
-                        );
-                    }
-                    yield render_sse_map(&build_approval_required_event(
-                        id,
-                        tool_name,
-                        approval_kind,
-                        path.as_deref(),
-                        detail.as_deref(),
-                    ));
-                    let approval = match await_with_client_disconnect(
-                        cc.as_deref(),
-                        wait_approval_ledger_for_tool(
-                            &edge_callback_ledger,
-                            &user_id,
-                            tc,
-                            ledger_wait,
-                            Some(&approval_audit_context),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(approval) => approval,
-                        Err(event) => {
-                            yield render_sse_map(&event);
-                            return;
-                        }
-                    };
-                    match approval {
-                        Ok(()) => {}
-                        Err(part) => {
-                            record_turn_guard_tool_results(
-                                &mut bridge_turn_guard,
-                                &part.persist_tool_results,
-                            );
-                            for m in part.sse_maps {
-                                yield render_sse_map(&m);
-                            }
-                            merged_tool_results.extend(part.persist_tool_results);
-                            llm_messages.extend(part.tool_messages);
-                            continue;
-                        }
-                    }
-                    for m in sse_maps_through_tool_request(tc) {
-                        yield render_sse_map(&m);
-                    }
-                    let tail = match await_with_client_disconnect(
-                        cc.as_deref(),
-                        wait_tool_result_ledger_for_tool(
-                            &edge_callback_ledger,
-                            &user_id,
-                            tc,
-                            ledger_wait,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(tail) => tail,
-                        Err(event) => {
-                            yield render_sse_map(&event);
-                            return;
-                        }
-                    };
-                    for m in tail.sse_maps {
-                        yield render_sse_map(&m);
-                    }
-                    record_turn_guard_tool_results(
-                        &mut bridge_turn_guard,
-                        &tail.persist_tool_results,
-                    );
-                    merged_tool_results.extend(tail.persist_tool_results);
-                    llm_messages.extend(tail.tool_messages);
-                }
-                // Read-only: yield all tool_request SSEs first so edge can
-                // start executing in parallel, then join_all on ledger waits.
-                if !read_only_tcs.is_empty() {
-                    for tc in &read_only_tcs {
-                        for m in sse_maps_through_tool_request(tc) {
-                            yield render_sse_map(&m);
-                        }
-                    }
-                    if edge_tools.is_empty() {
-                        // No edge agent: execute read-only tools locally (requires cwd workspace).
-                        let cwd_str = edge_profile
-                            .get("cwd")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty());
-                        let Some(cwd_str) = cwd_str else {
-                            yield render_sse_map(&build_stream_error_event(
-                                "edge_tools is empty but edge_profile.cwd is missing; cannot execute read-only tools on the server",
-                                "LOCAL_TOOL_NO_WORKSPACE",
-                                false,
-                            ));
-                            return;
-                        };
-                        let root = PathBuf::from(cwd_str);
-                        if !root.is_dir() {
-                            yield render_sse_map(&build_stream_error_event(
-                                &format!(
-                                    "edge_profile.cwd is not a directory: {}",
-                                    root.display()
-                                ),
-                                "LOCAL_TOOL_NO_WORKSPACE",
-                                false,
-                            ));
-                            return;
-                        }
-                        // SandboxConfig for server-side read-only tool execution:
-                        // The primary protection is the SERVER_EXECUTOR_TOOL_NAMES allowlist,
-                        // which only includes read-only tools. SandboxMode::ReadOnly and
-                        // network_allowed=false serve as a future enforcement layer; currently
-                        // individual tools do not check sandbox mode at dispatch time.
-                        // 30s command timeout (vs 120s strict default) — server should be more
-                        // conservative, failing fast on stalled commands.
-                        let sandbox = SandboxConfig {
-                            project_root: root.clone(),
-                            allowed_paths: vec![PathBuf::from("/tmp")],
-                            mode: SandboxMode::ReadOnly,
-                            max_output_bytes: 200_000,
-                            command_timeout: Duration::from_secs(30),
-                            network_allowed: false,
-                        };
-                        let ctx = ToolContext {
-                            project_root: root.clone(),
-                            workspace_root: root,
-                            user_id: user_id.clone(),
-                            session_id: session_id.clone(),
-                            sandbox,
-                            http_client: None,
-                            logger: Arc::new(TracingLogger),
-                            cancel_token: None,
-                        };
-                        let executor = Arc::new(DefaultToolExecutor::new(ctx));
-                        let local_ro = read_only_tcs;
-                        let local_futs = stream::iter(local_ro.into_iter().map(|tc| {
-                            let exec = executor.clone();
-                            async move {
-                                let Some(name) = tool_call_name(&tc) else {
-                                    tracing::warn!(
-                                        tool_call = %tc,
-                                        "skipping local tool call with missing name"
-                                    );
-                                    return None;
-                                };
-                                let args =
-                                    normalize_llm_function_arguments(&tool_call_arguments_value(&tc));
-                                let result = exec.execute(name, &args).await;
-                                Some(local_tool_execution_delivery(
-                                    &tc,
-                                    &result.output,
-                                    result.is_error,
-                                ))
-                            }
-                        }))
-                        .buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
-                        tokio::pin!(local_futs);
-                        while let Some(tail) = local_futs.next().await.flatten() {
-                            for m in tail.sse_maps {
-                                yield render_sse_map(&m);
-                            }
-                            record_turn_guard_tool_results(
-                                &mut bridge_turn_guard,
-                                &tail.persist_tool_results,
-                            );
-                            merged_tool_results.extend(tail.persist_tool_results);
-                            llm_messages.extend(tail.tool_messages);
-                        }
-                    } else {
-                        // Use buffer_unordered to limit concurrent tool executions.
-                        // This prevents resource exhaustion when many tools are called.
-                        let ro = read_only_tcs.clone();
-                        let tool_stream = stream::iter(ro.into_iter().map(|tc| {
-                            let ledger = edge_callback_ledger.clone();
-                            let uid = user_id.clone();
-                            async move {
-                                wait_tool_result_ledger_for_tool(
-                                    &ledger, &uid, &tc, ledger_wait,
-                                )
-                                .await
-                            }
-                        }))
-                        .buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
-                        tokio::pin!(tool_stream);
-                        loop {
-                            let next_tail = match await_with_client_disconnect(
-                                cc.as_deref(),
-                                tool_stream.next(),
-                            )
-                            .await
-                            {
-                                Ok(next_tail) => next_tail,
-                                Err(event) => {
-                                    yield render_sse_map(&event);
-                                    return;
-                                }
-                            };
-                            let Some(tail) = next_tail else { break };
-                            for m in tail.sse_maps {
-                                yield render_sse_map(&m);
-                            }
-                            record_turn_guard_tool_results(
-                                &mut bridge_turn_guard,
-                                &tail.persist_tool_results,
-                            );
-                            merged_tool_results.extend(tail.persist_tool_results);
-                            llm_messages.extend(tail.tool_messages);
-                        }
-                    }
-                }
-
-                let recent_tools_for_policy = tool_names_from_tool_calls(&all_round_tool_calls);
-                match apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
-                    turn_index: round_ix as u32,
-                    message: &user_message_for_guard,
-                    tool_calls_for_guard: &loop_tool_calls,
-                    intent_tool_turns: &mut bridge_intent_tool_turns,
-                    messages: &mut llm_messages,
-                    stall_events: &mut bridge_stall_events,
-                    turn_guard: &mut bridge_turn_guard,
-                    verdict_events: &mut bridge_verdict_events,
-                    restricted_tools: &mut bridge_restricted_tools,
-                    remaining_turns: &mut bridge_remaining_turns,
-                    step_recorder: &mut bridge_step_recorder,
-                    current_session_id: None,
-                    max_turns: round_limit as usize,
-                    loop_turn: round_ix as usize,
-                    recent_tools: &recent_tools_for_policy,
-                    last_heavy_checkpoint: &mut bridge_last_heavy_checkpoint,
-                }) {
-                    AgenticPostToolPolicyOutcome::ProceedEndTurn
-                    | AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {}
-                    AgenticPostToolPolicyOutcome::Abort(message) => {
-                        yield render_sse_map(&build_stream_error_event(
-                            &message,
-                            "TURN_GUARD_ABORT",
-                            false,
-                        ));
-                        return;
-                    }
+                if !loop_tool_calls.is_empty() {
+                    // Accumulate tool calls for turn_complete event.
+                    // Tool execution and continuation happen on the CLI side.
+                    ensure_tool_call_ids(&mut loop_tool_calls);
+                    let round_start = all_round_tool_calls.len();
+                    all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
+                    round_boundaries.push((round_start, loop_tool_calls.len()));
                 }
             }
+
 
             let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
 
@@ -2945,21 +2568,28 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let llm_content = full_text.trim().to_string();
             let should_persist_llm = !llm_content.is_empty() || has_tool_calls;
 
-            let user_query_event = user_content.as_ref().map(|content| TurnCoreEventRecord {
-                event_id: user_query_event_id.clone(),
-                user_id: user_id.clone(),
-                session_id: session_id.clone(),
-                agent_id: agent_id.clone(),
-                event_type: "user_query".to_string(),
-                content: content.clone(),
-                parent_event_id: None,
-                parent_event_ids: Vec::new(),
-                causal_chain_id: turn_chain_id.clone(),
-                llm_model_used: None,
-                token_usage: None,
-                llm_params: None,
-                reasoning_content: None,
-            });
+            // P2 fix: on continuation calls (CLI sent tool_results), the user query
+            // was already persisted on the first bridge call. Skip to avoid duplicate event_id.
+            let is_continuation = !tool_results.is_empty();
+            let user_query_event = if is_continuation {
+                None
+            } else {
+                user_content.as_ref().map(|content| TurnCoreEventRecord {
+                    event_id: user_query_event_id.clone(),
+                    user_id: user_id.clone(),
+                    session_id: session_id.clone(),
+                    agent_id: agent_id.clone(),
+                    event_type: "user_query".to_string(),
+                    content: content.clone(),
+                    parent_event_id: None,
+                    parent_event_ids: Vec::new(),
+                    causal_chain_id: turn_chain_id.clone(),
+                    llm_model_used: None,
+                    token_usage: None,
+                    llm_params: None,
+                    reasoning_content: None,
+                })
+            };
 
             let llm_response_event = should_persist_llm.then(|| TurnCoreEventRecord {
                 event_id: Uuid::now_v7().to_string(),
@@ -3173,10 +2803,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             };
             let tool_call_records =
                 build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results, &round_info);
-            let verdict_warning = bridge_verdict_events.iter().any(|event| {
-                event.severity.eq_ignore_ascii_case("warning")
-                    || event.severity.eq_ignore_ascii_case("critical")
-            });
+            let verdict_warning = false; // No multi-round verdicts in single-call mode.
             let recent_tools_for_quality = tool_names_from_tool_calls(&all_round_tool_calls);
             let budget_pressure = last_measured_prompt.map_or(0.0, |measured| {
                 if budget.model_limit > 0 {
@@ -3185,12 +2812,15 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     0.0
                 }
             });
+            let user_message_for_eval = latest_user_message_text(&messages)
+                .unwrap_or("")
+                .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
                 crate::pipeline::evaluation::evaluate_tool_call_records(
-                    &user_message_for_guard,
+                    &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
-                    bridge_stall_events.len(),
+                    0, // No stall events in single-call mode.
                     verdict_warning,
                     budget_pressure,
                 )
@@ -3566,6 +3196,7 @@ pub mod bridge_inprocess_test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::turn_guard::TurnGuard;
 
     #[test]
     fn extract_entity_tokens_from_mixed_language() {

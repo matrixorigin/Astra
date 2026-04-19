@@ -7827,7 +7827,7 @@ mod parallel_execution_tests {
             ("read_file", "c1"),
             ("grep", "c2"),
             ("glob", "c3"),
-            ("bash", "c4"),       // write tool — breaks the concurrent batch
+            ("bash", "c4"), // write tool — breaks the concurrent batch
             ("read_file", "c5"),
             ("git_diff", "c6"),
         ];
@@ -7835,13 +7835,7 @@ mod parallel_execution_tests {
             turn_with_named_tools(&tools, ""),
             turn_with_named_tools(&[], "all done"),
         ])
-        .with_valid_tools(&[
-            "read_file",
-            "grep",
-            "glob",
-            "bash",
-            "git_diff",
-        ]);
+        .with_valid_tools(&["read_file", "grep", "glob", "bash", "git_diff"]);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -7878,7 +7872,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic_headless_round::{partition_tool_batches, ToolBatch};
+        use crate::turn::agentic_headless_round::{ToolBatch, partition_tool_batches};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![
@@ -7888,9 +7882,8 @@ mod parallel_execution_tests {
             json!({"function": {"name": "glob"}}),
             json!({"function": {"name": "git_diff"}}),
         ];
-        let indices: Vec<HeadlessRoundToolIdx> = (0..5)
-            .map(HeadlessRoundToolIdx::ServerToolCall)
-            .collect();
+        let indices: Vec<HeadlessRoundToolIdx> =
+            (0..5).map(HeadlessRoundToolIdx::ServerToolCall).collect();
 
         let batches = partition_tool_batches(&indices, &tool_calls);
 

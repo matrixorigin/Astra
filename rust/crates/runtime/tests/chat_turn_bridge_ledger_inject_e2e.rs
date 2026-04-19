@@ -1,5 +1,5 @@
-//! Full path: `POST /chat/turn` (mock LLM via `test_llm_rounds`) → SSE `tool_request` →
-//! `POST /tools/result` → shared ledger → bridge consumes and persists tool result.
+//! Verify that `POST /chat/turn` with mock LLM returns tool_calls in `turn_complete`
+//! without executing tools server-side (single-call proxy: CLI drives the agentic loop).
 //!
 //! Requires crate feature `bridge-e2e-hooks` and env `ASTRA_BRIDGE_TEST_SECRET` (set below).
 
@@ -12,12 +12,12 @@ use astra_runtime::{
     MatrixOneSettings, ServiceInfo, SessionActivityRecord, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
-    turn::bridge_inprocess::InProcessChatTurnBridge, turn::edge_ledger::MSG_TOOL_LEDGER_TIMEOUT,
+    turn::bridge_inprocess::InProcessChatTurnBridge,
 };
 use async_trait::async_trait;
 use axum::{
     Router,
-    body::{self, Body},
+    body::Body,
     http::{HeaderMap, Request, StatusCode},
 };
 use futures_util::StreamExt;
@@ -36,8 +36,6 @@ fn ensure_bridge_test_secret_env() {
         }
     });
 }
-
-const E2E_TOOL_OUTPUT: &str = "e2e-ledger-injected-tool-body-7f3a";
 
 #[derive(Clone)]
 struct StubHealth;
@@ -228,27 +226,6 @@ fn ledger_inject_app(capture: ToolPersistCapture) -> Router {
     build_app(state)
 }
 
-async fn post_json(app: &Router, path: &str, payload: serde_json::Value) -> (StatusCode, String) {
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("authorization", "Bearer ledger-e2e-token")
-                .header("content-type", "application/json")
-                .body(Body::from(payload.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
-        .await
-        .unwrap();
-    (status, String::from_utf8_lossy(&bytes).into_owned())
-}
-
 #[tokio::test]
 async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round() {
     ensure_bridge_test_secret_env();
@@ -268,6 +245,9 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
         }
     });
 
+    // Mock LLM returns tool call on round 1.
+    // With single-call proxy, only round 1 is used — bridge does NOT execute
+    // the tool or proceed to round 2.  The tool_calls appear in turn_complete.
     let payload = json!({
         "agent_id": "ledger-e2e-agent",
         "messages": [{ "role": "user", "content": "read README" }],
@@ -300,60 +280,31 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut stream = response.into_body().into_data_stream();
-    let mut posted = false;
     let mut acc = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("sse chunk");
         acc.extend_from_slice(&chunk);
-        let s = String::from_utf8_lossy(&acc);
-        if !posted && s.contains("\"type\":\"tool_request\"") && s.contains("call-ledger-e2e-1") {
-            let (st, body) = post_json(
-                &app,
-                "/tools/result",
-                json!({
-                    "request_id": "call-ledger-e2e-1",
-                    "status": "ok",
-                    "output": E2E_TOOL_OUTPUT
-                }),
-            )
-            .await;
-            assert_eq!(st, StatusCode::OK);
-            assert!(body.contains("\"ok\":true"), "tools/result body: {body}");
-            posted = true;
-        }
     }
-
-    assert!(posted, "expected tool_request in SSE before stream end");
 
     let full = String::from_utf8_lossy(&acc);
+
+    // Single-call proxy: bridge must NOT emit tool_request events.
+    // Tool execution is handled by the CLI.
     assert!(
-        full.contains("\"type\":\"tool_request\""),
-        "missing tool_request: {full}"
-    );
-    assert!(
-        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
-        "ledger timed out: {full}"
-    );
-    assert!(
-        full.contains("round-2-after-ledger"),
-        "second mock round should stream as text_delta: {full}"
+        !full.contains("\"type\":\"tool_request\""),
+        "bridge should not emit tool_request in single-call mode: {full}"
     );
 
-    // Tool events are persisted in a spawned task on the bridge path.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let plans = capture.plans.lock().await;
-    let mut saw_injected = false;
-    for plan in plans.iter() {
-        for ev in &plan.events {
-            if ev.event_type == "tool_result" && ev.content.contains(E2E_TOOL_OUTPUT) {
-                saw_injected = true;
-            }
-        }
-    }
+    // Bridge must NOT run second mock round (round-2-after-ledger).
     assert!(
-        saw_injected,
-        "expected tool_result persist to contain POST /tools/result output"
+        !full.contains("round-2-after-ledger"),
+        "bridge should not run second LLM round in single-call mode: {full}"
+    );
+
+    // turn_complete must indicate tool calls are present.
+    assert!(
+        full.contains("\"has_tool_calls\":true"),
+        "turn_complete should indicate tool calls: {full}"
     );
 }

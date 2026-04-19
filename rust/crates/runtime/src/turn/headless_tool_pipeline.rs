@@ -229,10 +229,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     /// Execute a batch of read-only tools concurrently.
     /// Returns false if the round should be aborted.
-    pub(crate) async fn run_batch_concurrent(
-        &mut self,
-        items: &[HeadlessRoundToolIdx],
-    ) -> bool {
+    pub(crate) async fn run_batch_concurrent(&mut self, items: &[HeadlessRoundToolIdx]) -> bool {
         use super::headless_tool_pipeline::execute::execute_tool_pure;
 
         // Phase 1: validate + permit serially (fast, needs &mut self).
@@ -268,14 +265,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         let futs: Vec<_> = executions
             .iter_mut()
-            .map(|(exec, _)| execute_tool_pure(exec, server_executor, api, token, session_id, turn_index))
+            .map(|(exec, _)| {
+                execute_tool_pure(exec, server_executor, api, token, session_id, turn_index)
+            })
             .collect();
         futures_util::future::join_all(futs).await;
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for (execution, idem_key) in executions {
-            let is_err =
-                crate::turn::tool_result_semantics::is_tool_error(&execution.result_str);
+            let is_err = crate::turn::tool_result_semantics::is_tool_error(&execution.result_str);
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
