@@ -1,4 +1,4 @@
-/// In-process ChatTurnBridge — calls LLM directly without an external bridge service.
+/// In-process chat turn bridge — calls LLM directly without an external bridge service.
 ///
 /// # Key behaviors
 ///
@@ -27,7 +27,7 @@
 ///
 /// # Architecture (legacy)
 ///
-///   Rust API (dispatch_chat_turn_bridge) injects context into headers:
+///   Rust API (`forward()` on [`InProcessChatTurnBridge`]) injects context into headers:
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
 ///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and
 ///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
@@ -51,9 +51,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    ChatTurnBridge, FernetTokenEncryptor, MatrixOneSettings, SessionActivityUpdatePlan,
-    TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan,
-    TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
+    FernetTokenEncryptor, MatrixOneSettings, SessionActivityUpdatePlan, TurnAuxiliaryEventWriter,
+    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnHookDbWriter,
+    TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
     build_explain_event, build_stream_error_event, prompts,
     turn::edge_ledger::ensure_tool_call_ids,
@@ -420,9 +420,9 @@ fn inprocess_session_info_event(session_id: &str, run_id: &str) -> Value {
     })
 }
 
-#[async_trait::async_trait]
-impl ChatTurnBridge for InProcessChatTurnBridge {
-    async fn forward(
+impl InProcessChatTurnBridge {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward(
         &self,
         headers: &HeaderMap,
         body: Bytes,

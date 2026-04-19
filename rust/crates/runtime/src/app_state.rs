@@ -75,7 +75,8 @@ pub struct AppState {
     pub(crate) admin_audit_reader: Arc<dyn AdminAuditReader>,
     pub(crate) admin_feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
     pub(crate) admin_user_role_manager: Arc<dyn AdminUserRoleManager>,
-    pub(crate) chat_turn_bridge: Arc<dyn ChatTurnBridge>,
+    pub(crate) chat_turn_bridge:
+        Option<Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>>,
     pub(crate) chat_turn_bridge_secret: String,
     pub(crate) chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
     /// Pipeline learning writer — shared across all turns, auto-updates
@@ -175,7 +176,7 @@ impl AppState {
             admin_audit_reader: Arc::new(auth::UnconfiguredAdminAuditReader),
             admin_feedback_stats_reader: Arc::new(auth::UnconfiguredAdminFeedbackStatsReader),
             admin_user_role_manager: Arc::new(auth::UnconfiguredAdminUserRoleManager),
-            chat_turn_bridge: Arc::new(UnavailableChatTurnBridge),
+            chat_turn_bridge: None,
             chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
             chat_turn_bridge_cache,
             turn_learning_writer: None,
@@ -524,8 +525,11 @@ impl AppState {
         self
     }
 
-    pub fn with_chat_turn_bridge(mut self, chat_turn_bridge: Arc<dyn ChatTurnBridge>) -> Self {
-        self.chat_turn_bridge = chat_turn_bridge;
+    pub fn with_chat_turn_bridge(
+        mut self,
+        chat_turn_bridge: Arc<crate::turn::bridge_inprocess::InProcessChatTurnBridge>,
+    ) -> Self {
+        self.chat_turn_bridge = Some(chat_turn_bridge);
         self
     }
 
@@ -534,42 +538,6 @@ impl AppState {
         chat_turn_bridge_secret: impl Into<String>,
     ) -> Self {
         self.chat_turn_bridge_secret = chat_turn_bridge_secret.into();
-        self
-    }
-
-    pub fn with_chat_turn_bridge_url(mut self, chat_turn_bridge_url: impl Into<String>) -> Self {
-        let mut bridge = HttpChatTurnBridge::new(
-            chat_turn_bridge_url.into(),
-            self.chat_turn_bridge_cache.clone(),
-        );
-        if let Some(ref pool) = self.shared_pool {
-            bridge = bridge.with_persisted_replay_window_store(Arc::new(
-                crate::bridge::DatabaseBridgeReplayWindowStore::new(pool.clone()),
-            ));
-        }
-        if let Some(ref writer) = self.turn_learning_writer {
-            bridge = bridge.with_learning_writer(writer.clone());
-        }
-        self.chat_turn_bridge = Arc::new(bridge);
-        self
-    }
-
-    pub fn with_chat_turn_bridge_url_optional(
-        mut self,
-        chat_turn_bridge_url: Option<String>,
-    ) -> Self {
-        if let Some(url) = chat_turn_bridge_url {
-            let mut bridge = HttpChatTurnBridge::new(url, self.chat_turn_bridge_cache.clone());
-            if let Some(ref pool) = self.shared_pool {
-                bridge = bridge.with_persisted_replay_window_store(Arc::new(
-                    crate::bridge::DatabaseBridgeReplayWindowStore::new(pool.clone()),
-                ));
-            }
-            if let Some(ref writer) = self.turn_learning_writer {
-                bridge = bridge.with_learning_writer(writer.clone());
-            }
-            self.chat_turn_bridge = Arc::new(bridge);
-        }
         self
     }
 
@@ -779,39 +747,6 @@ mod tests {
 
         let writer = make_test_learning_writer();
         let state = state.with_turn_learning_writer(writer);
-        assert!(state.turn_learning_writer.is_some());
-    }
-
-    #[test]
-    fn bridge_url_builder_propagates_learning_writer() {
-        let writer = make_test_learning_writer();
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_turn_learning_writer(writer)
-            .with_chat_turn_bridge_url("http://localhost:9999");
-
-        // The learning writer should be propagated to the bridge.
-        // We can't inspect HttpChatTurnBridge fields directly, but we verify
-        // that AppState retains the writer.
-        assert!(state.turn_learning_writer.is_some());
-    }
-
-    #[test]
-    fn bridge_url_optional_builder_propagates_learning_writer() {
-        let writer = make_test_learning_writer();
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_turn_learning_writer(writer)
-            .with_chat_turn_bridge_url_optional(Some("http://localhost:9999".to_string()));
-
-        assert!(state.turn_learning_writer.is_some());
-    }
-
-    #[test]
-    fn bridge_url_optional_none_keeps_default_bridge() {
-        let writer = make_test_learning_writer();
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_turn_learning_writer(writer)
-            .with_chat_turn_bridge_url_optional(None);
-
         assert!(state.turn_learning_writer.is_some());
     }
 

@@ -1692,8 +1692,22 @@ async fn handle_chat_message_via_bridge(
     let client_cancel = Arc::new(CancellationToken::new());
 
     // Call bridge
-    let response = state
-        .chat_turn_bridge
+    let bridge = match state.chat_turn_bridge.as_ref() {
+        Some(b) => b,
+        None => {
+            send_msg(
+                socket,
+                &ws_error_from_status(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "chat turn bridge disabled. Configure the runtime with an in-process bridge."
+                        .to_string(),
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    let response = bridge
         .forward(
             &bridge_headers,
             prepared.body,
@@ -2151,7 +2165,7 @@ fn ws_json_events_from_sse_block(block: &str) -> Result<Vec<Value>, String> {
 ///
 /// The bridge returns `text/event-stream` format: `data: {json}\n\n`.
 /// Streams the HTTP body so client disconnect stops in-process LLM work promptly
-/// (via [`CancellationToken`] passed into [`crate::bridge::ChatTurnBridge::forward`]).
+/// (via [`CancellationToken`] passed into [`crate::turn::bridge_inprocess::InProcessChatTurnBridge::forward`]).
 async fn stream_sse_response_as_ws(
     socket: &mut WebSocket,
     state: &AppState,

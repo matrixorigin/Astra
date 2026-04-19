@@ -18,29 +18,16 @@
 
 // ── Crate-level imports used by internal modules ─────────────────────────────
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use async_stream::stream;
 use async_trait::async_trait;
-use axum::{
-    body::{Body, Bytes},
-    http::{HeaderMap, StatusCode},
-    response::Response,
-};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE};
-use futures_util::StreamExt;
+use axum::{body::Body, http::StatusCode, response::Response};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::{mysql::MySqlPoolOptions, query};
 use uuid::Uuid;
 
 use crate::bridge::{
-    HttpChatTurnBridge, InMemoryTurnReflectionStateStore, NoopTurnObserverWorker,
-    NoopTurnReflectionLessonWriter, UnavailableChatTurnBridge,
+    InMemoryTurnReflectionStateStore, NoopTurnObserverWorker, NoopTurnReflectionLessonWriter,
 };
 
 // ── Internal modules: HTTP handlers (crate-visible only) ─────────────────────
@@ -217,7 +204,7 @@ pub use app_state::{
 // ── Re-exports: bridge ───────────────────────────────────────────────────────
 
 pub use bridge::{
-    ChatTurnBridge, CooldownReason, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
+    CooldownReason, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
     RateLimitAction, RateLimitCooldown, RateLimitMetrics, RateLimitState,
     side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT},
 };

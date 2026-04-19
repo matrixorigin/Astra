@@ -187,28 +187,21 @@ pub async fn build_server_state(
         Arc::clone(&lease_hold_cache),
     )));
 
-    // Wire chat turn bridge: prefer explicit URL override, fall back to in-process Rust impl.
-    // Note: with_chat_turn_bridge_url auto-wires the learning writer from AppState.
-    let state = if let Some(url) = settings.chat_turn_bridge_url {
-        state
-            .with_chat_turn_bridge_url(url)
-            .with_chat_turn_bridge_secret(settings.chat_turn_bridge_secret)
-    } else {
-        let encryptor =
-            Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
-        let edge_ledger = state.edge_callback_ledger.clone();
-        state
-            .with_chat_turn_bridge(Arc::new(
-                turn::bridge_inprocess::InProcessChatTurnBridge::new(
-                    settings.matrixone.clone(),
-                    encryptor,
-                )
-                .with_pool(shared_pool.clone())
-                .with_learning_writer(learning_stack.writer.clone())
-                .with_edge_callback_ledger(edge_ledger),
-            ))
-            .with_chat_turn_bridge_secret(settings.chat_turn_bridge_secret)
-    };
+    // Wire in-process chat turn bridge.
+    let encryptor =
+        Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
+    let edge_ledger = state.edge_callback_ledger.clone();
+    let state = state
+        .with_chat_turn_bridge(Arc::new(
+            turn::bridge_inprocess::InProcessChatTurnBridge::new(
+                settings.matrixone.clone(),
+                encryptor,
+            )
+            .with_pool(shared_pool.clone())
+            .with_learning_writer(learning_stack.writer.clone())
+            .with_edge_callback_ledger(edge_ledger),
+        ))
+        .with_chat_turn_bridge_secret(settings.chat_turn_bridge_secret);
     let state = state.with_memoria_config(settings.memoria_base_url, settings.memoria_master_key);
 
     // Wire run lifecycle service: uses ServerAgenticLoopHost for agentic loops.

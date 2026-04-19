@@ -350,8 +350,16 @@ pub(super) async fn dispatch_chat_turn_bridge(
 
     let client_disconnect = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
 
-    match state
-        .chat_turn_bridge
+    let bridge = match state.chat_turn_bridge.as_ref() {
+        Some(b) => b,
+        None => {
+            return sse_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "chat turn bridge disabled. Configure the runtime with an in-process bridge.",
+            );
+        }
+    };
+    match bridge
         .forward(
             &bridge_headers,
             prepared.body,
@@ -803,22 +811,16 @@ mod chat_stream_bridge_fallback_tests {
     use async_trait::async_trait;
     use axum::{
         Json,
-        body::{self, Body, Bytes},
+        body::{self, Body},
         http::{HeaderMap, Request, StatusCode},
-        response::Response,
     };
-    use serde_json::Value;
-    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
 
     use crate::{
         AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData,
-        AuthService, AuthTokenRecord, AuthUserRecord, ChatTurnBridge, ErrorResponse, HealthChecker,
-        ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
-        SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
-        TurnAuxiliaryEventWriter, TurnCoreEventWriter, TurnHookDbWriter, TurnObserverWorker,
-        TurnReflectionLessonWriter, TurnReflectionStateStore, TurnSessionActivityWriter,
-        TurnToolEventWriter, build_app,
+        AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
+        SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+        SessionRecord, SessionService, SessionUpdateRequestData, build_app,
     };
 
     #[derive(Clone)]
@@ -975,16 +977,6 @@ mod chat_stream_bridge_fallback_tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct Capture {
-        body: Arc<Mutex<Option<Value>>>,
-    }
-
-    #[derive(Clone)]
-    struct StubChatTurnBridge {
-        capture: Capture,
-    }
-
     #[derive(Clone)]
     struct StubOtherNotImplementedLifecycle;
 
@@ -1118,48 +1110,13 @@ mod chat_stream_bridge_fallback_tests {
         }
     }
 
-    #[async_trait]
-    impl ChatTurnBridge for StubChatTurnBridge {
-        async fn forward(
-            &self,
-            _headers: &HeaderMap,
-            body: Bytes,
-            _turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
-            _turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
-            _turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
-            _turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-            _turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
-            _turn_observer_worker: Arc<dyn TurnObserverWorker>,
-            _turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
-            _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
-            _client_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
-        ) -> Result<Response, (StatusCode, String)> {
-            *self.capture.body.lock().await =
-                Some(serde_json::from_slice(&body).expect("request body should be valid json"));
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream")
-                .body(Body::from(
-                    "data: {\"type\":\"session_info\",\"session_id\":\"s1\",\"run_id\":\"r1\"}\n\n\
-                     data: {\"type\":\"text_delta\",\"content\":\"hello\"}\n\n\
-                     data: {\"type\":\"text_done\",\"full_text\":\"hello\"}\n\n\
-                     data: [DONE]\n\n",
-                ))
-                .expect("response should build"))
-        }
-    }
-
     #[tokio::test]
-    async fn chat_stream_falls_back_to_chat_turn_bridge_when_lifecycle_unconfigured() {
-        let capture = Capture::default();
+    async fn chat_stream_falls_back_to_bridge_disabled_when_lifecycle_unconfigured_and_no_bridge() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(StubAuthService))
                 .with_session_service(Arc::new(StubSessionService))
-                .with_chat_turn_bridge_secret("test-secret")
-                .with_chat_turn_bridge(Arc::new(StubChatTurnBridge {
-                    capture: capture.clone(),
-                })),
+                .with_chat_turn_bridge_secret("test-secret"),
         );
 
         let resp = app
@@ -1170,7 +1127,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"message":"hi","session_id":"s1","model":"demo-model","context":{"topic":"runtime"},"skill_search":{"dynamic_surface":false,"min_catalog_size":12,"surface_cap":20},"max_candidates":3,"explain":true}"#,
+                        r#"{"message":"hi","session_id":"s1","model":"demo-model"}"#,
                     ))
                     .expect("request should build"),
             )
@@ -1182,25 +1139,8 @@ mod chat_stream_bridge_fallback_tests {
             .await
             .expect("body should be readable");
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"text_delta\""));
-        assert!(text.contains("\"content\":\"hello\""));
-
-        let forwarded = capture
-            .body
-            .lock()
-            .await
-            .clone()
-            .expect("bridge should receive payload");
-        assert_eq!(forwarded["session_id"], "s1");
-        assert_eq!(forwarded["model"], "demo-model");
-        assert_eq!(forwarded["context"]["topic"], "runtime");
-        assert_eq!(forwarded["skill_search"]["dynamic_surface"], false);
-        assert_eq!(forwarded["skill_search"]["min_catalog_size"], 12);
-        assert_eq!(forwarded["skill_search"]["surface_cap"], 20);
-        assert_eq!(forwarded["max_candidates"], 3);
-        assert_eq!(forwarded["explain"], true);
-        assert_eq!(forwarded["messages"][0]["role"], "user");
-        assert_eq!(forwarded["messages"][0]["content"], "hi");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("chat turn bridge disabled"));
     }
 
     #[tokio::test]
@@ -1242,16 +1182,11 @@ mod chat_stream_bridge_fallback_tests {
 
     #[tokio::test]
     async fn chat_stream_does_not_fall_back_for_other_not_implemented_errors() {
-        let capture = Capture::default();
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(StubAuthService))
                 .with_session_service(Arc::new(StubSessionService))
-                .with_run_lifecycle_service(Arc::new(StubOtherNotImplementedLifecycle))
-                .with_chat_turn_bridge_secret("test-secret")
-                .with_chat_turn_bridge(Arc::new(StubChatTurnBridge {
-                    capture: capture.clone(),
-                })),
+                .with_run_lifecycle_service(Arc::new(StubOtherNotImplementedLifecycle)),
         );
 
         let resp = app
@@ -1276,7 +1211,6 @@ mod chat_stream_bridge_fallback_tests {
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"error\""));
         assert!(!text.contains("\"type\":\"text_delta\""));
-        assert!(capture.body.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -1305,8 +1239,6 @@ mod chat_stream_bridge_fallback_tests {
             .await
             .expect("body should be readable");
         let text = String::from_utf8(bytes.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"session_info\""));
-        assert!(text.contains("\"session_id\":\"s-created\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("chat turn bridge disabled"));
     }
