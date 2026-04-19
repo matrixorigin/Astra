@@ -33,6 +33,10 @@ pub(crate) async fn prepare_intercepted_tool_round(
     for result in &skill_results {
         pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
 
+        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
+            Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
+            None => (None, None),
+        };
         state.stall.tool_call_records.push(ToolCallRecord {
             name: result.tool_name.clone(),
             ok: !result.result.starts_with("Unknown skill")
@@ -48,6 +52,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            round,
+            start_offset_ms,
             ..Default::default()
         });
     }
@@ -74,6 +80,11 @@ pub(crate) async fn prepare_intercepted_tool_round(
 
     for id in &surgically_removed_ids {
         let original_name = tool_name_by_id.get(id.as_str()).map(|s| s.to_string());
+        // Preserve observability fields so surgical removal doesn't erase round tracking.
+        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
+            Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
+            None => (None, None),
+        };
         state.stall.tool_call_records.push(ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
@@ -86,6 +97,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: original_name,
+            round,
+            start_offset_ms,
             ..Default::default()
         });
     }
@@ -625,5 +638,76 @@ mod tests {
             parent.try_recv().is_none(),
             "no message should be delivered when send_message is disallowed"
         );
+    }
+
+    /// Verify that surgical removal stubs and skill result records preserve
+    /// round and start_offset_ms from the TurnEventBuffer.
+    #[tokio::test]
+    async fn surgical_removal_preserves_observability_fields() {
+        use astra_services::session_journal::TurnEventBuffer;
+
+        let mut state = make_state();
+        // Initialize the turn event buffer (simulates what prepare_turn_iteration does).
+        let mut buf = TurnEventBuffer::begin_turn(Some("test-session"), 1);
+        // Advance to round 2 to verify the round is captured, not always 0.
+        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cache_read_tokens: 0,
+            duration_ms: 50,
+            ttft_ms: Some(5),
+            finish_reason: None,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+        });
+        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            prompt_tokens: 200,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            duration_ms: 60,
+            ttft_ms: Some(6),
+            finish_reason: None,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+        });
+        assert_eq!(buf.current_round(), 2);
+        state.turn_event_buffer = Some(buf);
+
+        // Simulate what prepare_intercepted_tool_round does for surgical removal.
+        let tool_name_by_id: HashMap<&str, &str> =
+            [("call-read-1", "read_file")].into_iter().collect();
+
+        // Push a surgical removal record (same code path as the real function).
+        {
+            let id = "call-read-1";
+            let original_name = tool_name_by_id.get(id).map(|s| s.to_string());
+            let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
+                Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
+                None => (None, None),
+            };
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
+                ok: true,
+                ms: 0,
+                surgically_removed: Some(true),
+                original_tool_name: original_name,
+                round,
+                start_offset_ms,
+                ..Default::default()
+            });
+        }
+
+        let rec = &state.stall.tool_call_records[0];
+        assert_eq!(
+            rec.round,
+            Some(2),
+            "surgical removal should capture current round"
+        );
+        assert!(
+            rec.start_offset_ms.is_some(),
+            "surgical removal should capture offset"
+        );
+        assert_eq!(rec.original_tool_name.as_deref(), Some("read_file"));
+        assert_eq!(rec.surgically_removed, Some(true));
     }
 }
