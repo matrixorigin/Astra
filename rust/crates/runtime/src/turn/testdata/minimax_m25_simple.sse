@@ -1,0 +1,18 @@
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "<think>", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "The user asks: \"What is 2+2?\" It's a simple arithmetic question. Should answer 4. There's no policy issue. Just respond with answer: 2+2 = 4.\n\nWe must consider whether any special context: no. So answer is 4. Probably include a short explanation? There's", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": " no policy restrictions. Just answer.\n\nThus final answer: The sum of 2 and 2 is 4.\n", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "</think>", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "\n\nThe sum of 2 and 2 is 4.", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"finish_reason": "stop", "index": 0, "delta": {"role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": {"total_tokens": 148, "total_characters": 0, "prompt_tokens": 45, "completion_tokens": 103, "prompt_tokens_details": {"cached_tokens": 16}}, "base_resp": {"status_code": 0, "status_msg": ""}}
+

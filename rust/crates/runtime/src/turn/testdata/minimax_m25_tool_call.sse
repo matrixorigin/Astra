@@ -1,0 +1,22 @@
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "<think>", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "The user is asking me to list files in the /tmp directory. I need to run a shell command to do this. I'll use the `ls` command with the `-la` flags to show all files including hidden ones with detailed", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": " information.\n", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "</think>", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "\n\n\n", "role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"id": "call_function_7d8nzyix424r_1", "type": "function", "function": {"name": "bash", "arguments": ""}, "index": 0}]}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"function": {"arguments": "{\"command\": \"ls -la /tmp\"}"}, "index": 0}]}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"finish_reason": "tool_calls", "index": 0, "delta": {"role": "assistant"}}], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [], "created": 0, "model": "MiniMax-M2.5", "object": "chat.completion.chunk", "usage": {"total_tokens": 265, "total_characters": 0, "prompt_tokens": 187, "completion_tokens": 78, "prompt_tokens_details": {"cached_tokens": 48}}, "base_resp": {"status_code": 0, "status_msg": ""}}
+

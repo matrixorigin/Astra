@@ -4,10 +4,22 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
     format!("request failed ({status}): {}", compact_or_raw(body))
 }
 
+fn append_model_not_found_hint(status: u16, body: &str, message: &mut String) {
+    if status == 404 && body.contains("Model") && body.contains("not found") {
+        message.push_str(
+            "\n  hint: `model_name` must match the server row exactly (case-sensitive). \
+             MiniMax IDs look like `MiniMax-M2.5` / `MiniMax-M2.7` (note the `M` before the version). \
+             Run: astra-admin model list",
+        );
+    }
+}
+
 pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
     match e {
         astra_thin_client::ThinClientError::Api { status, body } => {
-            read_api_error(status.as_u16(), &body)
+            let mut out = read_api_error(status.as_u16(), &body);
+            append_model_not_found_hint(status.as_u16(), &body, &mut out);
+            out
         }
         other => other.to_string(),
     }
@@ -68,6 +80,18 @@ mod tests {
         let err = read_api_error(403, "{\"detail\":\"denied\"}");
         assert!(err.contains("403"), "got: {err}");
         assert!(err.contains("denied"), "got: {err}");
+    }
+
+    #[test]
+    fn append_model_not_found_hint_for_typo_body() {
+        let body = r#"{"detail":"Model 'MiniMax-2.5' not found"}"#;
+        let mut out = read_api_error(404, body);
+        super::append_model_not_found_hint(404, body, &mut out);
+        assert!(
+            out.contains("MiniMax-M2.5"),
+            "hint should mention correct id pattern: {out}"
+        );
+        assert!(out.contains("model list"), "{out}");
     }
 
     #[test]

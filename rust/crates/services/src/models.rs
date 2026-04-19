@@ -67,6 +67,7 @@ pub struct ModelCreateRequestData {
 pub struct ModelUpdateRequestData {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub provider: Option<String>,
     pub description: Option<String>,
     pub context_window: Option<i32>,
     pub max_completion_tokens: Option<i32>,
@@ -123,62 +124,10 @@ pub struct ResolvedActiveLlmModel {
     pub fallback_model: Option<String>,
 }
 
-/// Resolve the active LLM model from the database for in-process / server-side callers.
-///
-/// If `preferred` is `Some(name)`, selects that model when `is_active = 1`; otherwise uses
-/// the lexicographically first active model. When `pool` is `None`, opens an ephemeral
-/// single-connection pool from `matrixone`.
-///
-/// Also extracts `fallback_model` from the `quirks` JSON column (cloud-managed config).
-pub async fn resolve_active_llm_model(
-    matrixone: &MatrixOneSettings,
+fn build_resolved_active_llm_from_row(
+    row: &sqlx::mysql::MySqlRow,
     encryptor: &FernetTokenEncryptor,
-    preferred: Option<&str>,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<ResolvedActiveLlmModel, String> {
-    let ephemeral;
-    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
-        Some(p) => p,
-        None => {
-            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(&matrixone.database_url())
-                .await
-                .map_err(|e| format!("DB connect: {e}"))?;
-            &ephemeral
-        }
-    };
-
-    let row = if let Some(name) = preferred {
-        sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider, \
-                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
-             FROM infra_llm_models WHERE model_name = ? AND is_active = 1 LIMIT 1",
-        )
-        .bind(name)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB query: {e}"))?
-    } else {
-        None
-    };
-
-    let row = if row.is_none() {
-        sqlx::query(
-            "SELECT model_name, api_key_encrypted, base_url, provider, \
-                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
-             FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB query fallback: {e}"))?
-    } else {
-        row
-    };
-
-    let row = row
-        .ok_or_else(|| "No active LLM model configured. Run: astra-admin model add".to_string())?;
-
     let model_name: String = row.try_get("model_name").map_err(|e| e.to_string())?;
     let encrypted: String = row
         .try_get("api_key_encrypted")
@@ -215,6 +164,79 @@ pub async fn resolve_active_llm_model(
         provider,
         fallback_model,
     })
+}
+
+/// Resolve the active LLM model from the database for in-process / server-side callers.
+///
+/// When `preferred` is `Some(name)`, the row **must** exist and be active — otherwise this
+/// returns an error (no silent fallback to another model). When `preferred` is `None`, uses
+/// the lexicographically first active model. When `pool` is `None`, opens an ephemeral
+/// single-connection pool from `matrixone`.
+///
+/// Also extracts `fallback_model` from the `quirks` JSON column (cloud-managed config).
+pub async fn resolve_active_llm_model(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    preferred: Option<&str>,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<ResolvedActiveLlmModel, String> {
+    let ephemeral;
+    let pool: &sqlx::Pool<sqlx::MySql> = match pool {
+        Some(p) => p,
+        None => {
+            ephemeral = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&matrixone.database_url())
+                .await
+                .map_err(|e| format!("DB connect: {e}"))?;
+            &ephemeral
+        }
+    };
+
+    let pref = preferred.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(name) = pref {
+        let row = sqlx::query(
+            "SELECT model_name, api_key_encrypted, base_url, provider, \
+                    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json, is_active \
+             FROM infra_llm_models WHERE model_name = ? LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("DB query: {e}"))?;
+
+        let row = row.ok_or_else(|| {
+            format!(
+                "Model '{name}' is not configured on this server (no infra_llm_models row). \
+                 Omit the model override or choose a configured active model."
+            )
+        })?;
+
+        let is_active_int: i16 = row.try_get("is_active").unwrap_or(0);
+        if is_active_int == 0 {
+            return Err(format!(
+                "Model '{name}' is inactive (connectivity failed or disabled). \
+                 Run `astra-admin model check {name}` or pick an active model; the server will not substitute another model."
+            ));
+        }
+
+        return build_resolved_active_llm_from_row(&row, encryptor);
+    }
+
+    let row = sqlx::query(
+        "SELECT model_name, api_key_encrypted, base_url, provider, \
+                IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json \
+         FROM infra_llm_models WHERE is_active = 1 ORDER BY model_name LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("DB query fallback: {e}"))?;
+
+    let row = row
+        .ok_or_else(|| "No active LLM model configured. Run: astra-admin model add".to_string())?;
+
+    build_resolved_active_llm_from_row(&row, encryptor)
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -516,7 +538,7 @@ impl ModelService for DatabaseModelService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let existing =
-            query("SELECT model_id, base_url FROM infra_llm_models WHERE model_name = ?")
+            query("SELECT model_id, base_url, provider FROM infra_llm_models WHERE model_name = ?")
                 .bind(&model_name)
                 .fetch_optional(&pool)
                 .await
@@ -528,6 +550,13 @@ impl ModelService for DatabaseModelService {
             )
         })?;
         let _model_id: String = existing.try_get("model_id").map_err(internal_error)?;
+        let stored_provider: String = existing
+            .try_get("provider")
+            .unwrap_or_else(|_| {
+                tracing::warn!(model = %model_name, "provider column NULL or missing, defaulting to openai");
+                "openai".to_string()
+            });
+        let effective_provider = request.provider.as_deref().unwrap_or(&stored_provider);
 
         let mut conn_result: Option<String> = None;
 
@@ -537,7 +566,13 @@ impl ModelService for DatabaseModelService {
                 .base_url
                 .clone()
                 .or_else(|| existing.try_get("base_url").ok());
-            let check = validate_connectivity("", &model_name, api_key, base_url.as_deref()).await;
+            let check = validate_connectivity(
+                effective_provider,
+                &model_name,
+                api_key,
+                base_url.as_deref(),
+            )
+            .await;
 
             query("UPDATE infra_llm_models SET api_key_encrypted = ?, updated_at = NOW() WHERE model_name = ?")
                 .bind(&encrypted)
@@ -573,6 +608,7 @@ impl ModelService for DatabaseModelService {
                 }
             };
         }
+        update_field!(provider, "provider");
         update_field!(base_url, "base_url");
         update_field!(description, "description");
         update_field!(context_window, "context_window");
@@ -693,6 +729,26 @@ pub fn resolve_provider_base_url(provider: &str) -> Option<String> {
     }
 }
 
+/// Full URL for a minimal Anthropic Messages API probe (`POST`, JSON body).
+///
+/// - Official Anthropic: `https://api.anthropic.com` → `.../v1/messages`.
+/// - Custom roots (e.g. MiniMax China `https://api.minimaxi.com/anthropic`): append `/v1/messages`.
+/// - If the base already ends with `/v1` (some clients), append `/messages` only.
+fn anthropic_messages_probe_url(base_url: Option<&str>) -> String {
+    const DEFAULT: &str = "https://api.anthropic.com";
+    let base = base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT)
+        .trim_end_matches('/')
+        .to_string();
+    if base.ends_with("/v1") {
+        format!("{}/messages", base)
+    } else {
+        format!("{}/v1/messages", base)
+    }
+}
+
 pub async fn validate_connectivity(
     provider: &str,
     model_name: &str,
@@ -711,9 +767,10 @@ pub async fn validate_connectivity(
         Err(e) => return Some(format!("Client error: {}", e)),
     };
 
-    let result = if provider == "anthropic" && base_url.is_none() {
-        client
-            .post("https://api.anthropic.com/v1/messages")
+    let result = if provider == "anthropic" {
+        let probe = anthropic_messages_probe_url(base_url);
+        let send_result = client
+            .post(&probe)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -723,13 +780,27 @@ pub async fn validate_connectivity(
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .send()
-            .await
+            .await;
+        (send_result, probe)
     } else {
-        let url = base_url
-            .unwrap_or("https://api.openai.com/v1")
-            .trim_end_matches('/');
-        client
-            .post(format!("{}/chat/completions", url))
+        let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
+        let url = match base_trim {
+            Some(b) => b.trim_end_matches('/').to_string(),
+            None if provider == "openai" => "https://api.openai.com/v1".to_string(),
+            // Deliberately refuse to guess for unknown providers with no base_url —
+            // the admin must specify base_url for any non-OpenAI provider.
+            // This aligns with the runtime's guarantee that base_url is always set
+            // from the DB row before calling llm_completions_url_for_provider.
+            None => {
+                return Some(format!(
+                    "No base_url for provider '{provider}'. \
+                         Set base_url (e.g. DashScope/Moonshot compatible-mode /v1 root).",
+                ));
+            }
+        };
+        let probe = format!("{}/chat/completions", url);
+        let send_result = client
+            .post(&probe)
             .header("authorization", format!("Bearer {}", api_key))
             .header("content-type", "application/json")
             .json(&serde_json::json!({
@@ -738,12 +809,13 @@ pub async fn validate_connectivity(
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .send()
-            .await
+            .await;
+        (send_result, probe)
     };
 
     match result {
-        Ok(resp) if resp.status().as_u16() < 400 => None,
-        Ok(resp) => {
+        (Ok(resp), _) if resp.status().as_u16() < 400 => None,
+        (Ok(resp), _) => {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
             let detail = serde_json::from_str::<serde_json::Value>(&text)
@@ -757,7 +829,16 @@ pub async fn validate_connectivity(
                 .unwrap_or_else(|| text.chars().take(200).collect());
             Some(format!("HTTP {}: {}", status, detail))
         }
-        Err(e) => Some(format!("Connection failed: {}", e)),
+        (Err(e), probe) => {
+            let mut msg = format!("Connection failed for {probe}: {e}");
+            if provider != "anthropic" {
+                msg.push_str(
+                    " — host unreachable (firewall/DNS/TLS) or region blocks; \
+                     point base_url at an API gateway you can reach, or fix outbound HTTPS/proxy.",
+                );
+            }
+            Some(msg)
+        }
     }
 }
 
@@ -835,6 +916,7 @@ fn default_text_vec() -> Vec<String> {
 pub struct ModelUpdateRequest {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub provider: Option<String>,
     pub description: Option<String>,
     pub context_window: Option<i32>,
     pub max_completion_tokens: Option<i32>,
@@ -1102,6 +1184,52 @@ mod tests {
         assert!(resp.architecture.is_none());
     }
 
+    /// CLI and other clients must read `is_active` from GET /models — not `active`.
+    #[test]
+    fn anthropic_probe_url_minimax_china_style_base() {
+        assert_eq!(
+            super::anthropic_messages_probe_url(Some("https://api.minimaxi.com/anthropic")),
+            "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn anthropic_probe_url_official_default() {
+        assert_eq!(
+            super::anthropic_messages_probe_url(None),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn anthropic_probe_url_when_base_already_has_v1_suffix() {
+        assert_eq!(
+            super::anthropic_messages_probe_url(Some("https://api.anthropic.com/v1")),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn model_list_item_response_json_uses_is_active_snake_case() {
+        let item = ModelListItem {
+            model_id: "m3".into(),
+            name: "probe".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: false,
+            context_window: 128000,
+            max_completion_tokens: None,
+            architecture: None,
+        };
+        let resp = ModelListItemResponse::from(item);
+        let v = serde_json::to_value(&resp).expect("serialize ModelListItemResponse");
+        assert_eq!(v.get("is_active"), Some(&serde_json::Value::Bool(false)));
+        assert!(
+            v.get("active").is_none(),
+            "legacy key `active` must not be emitted; clients should use is_active"
+        );
+    }
+
     // -- PricingData edge cases used in cost calculation --
 
     #[test]
@@ -1124,5 +1252,21 @@ mod tests {
         )
         .unwrap();
         assert!(p.prompt > 100.0);
+    }
+
+    #[tokio::test]
+    async fn validate_connectivity_mock_provider_skips_network() {
+        let result = super::validate_connectivity("mock", "any-model", "key", None).await;
+        assert!(
+            result.is_none(),
+            "mock provider should short-circuit to success"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_connectivity_unknown_provider_no_base_url_errors() {
+        let result = super::validate_connectivity("dashscope", "qwen-plus", "key", None).await;
+        let msg = result.expect("should return an error");
+        assert!(msg.contains("No base_url"), "got: {msg}");
     }
 }

@@ -1,0 +1,10 @@
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": "<think>\nThe user", "role": "assistant", "name": "MiniMax AI", "audio_content": ""}}], "created": 0, "model": "MiniMax-M2.7", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": " asks \"What is 2+2?\" Simple arithmetic. The answer is 4.\n\nI", "role": "assistant", "name": "MiniMax AI", "audio_content": ""}}], "created": 0, "model": "MiniMax-M2.7", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"index": 0, "delta": {"content": " should respond concisely: \"2 + 2 = 4.\"\n\nGiven the user likely expects a direct answer.\n\nCheck for any policy issues: none.\n\nI'll respond.", "role": "assistant", "name": "MiniMax AI", "audio_content": ""}}], "created": 0, "model": "MiniMax-M2.7", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [{"finish_reason": "stop", "index": 0, "delta": {"content": "\n</think>\n\n\\(2 + 2 = 4\\)", "role": "assistant", "name": "MiniMax AI", "audio_content": ""}}], "created": 0, "model": "MiniMax-M2.7", "object": "chat.completion.chunk", "usage": null, "input_sensitive": false, "output_sensitive": false, "input_sensitive_type": 0, "output_sensitive_type": 0, "output_sensitive_int": 0}
+
+data: {"id": "test-id-redacted", "choices": [], "created": 0, "model": "MiniMax-M2.7", "object": "chat.completion.chunk", "usage": {"total_tokens": 116, "total_characters": 0, "prompt_tokens": 48, "completion_tokens": 68, "completion_tokens_details": {"reasoning_tokens": 58}}, "base_resp": {"status_code": 0, "status_msg": ""}}
+

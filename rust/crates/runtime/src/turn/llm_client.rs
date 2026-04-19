@@ -293,12 +293,187 @@ fn llm_total_budget() -> std::time::Duration {
     std::time::Duration::from_secs(s)
 }
 
-fn llm_completions_url(base_url: &str, override_url: Option<&str>) -> String {
+fn llm_completions_url(base_url: &str, override_url: Option<&str>, provider: &str) -> String {
     override_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| format!("{}/chat/completions", base_url.trim_end_matches('/')))
+        .unwrap_or_else(|| llm_completions_url_for_provider(base_url, provider))
+}
+
+/// Build the default completions URL for a given provider (no override).
+///
+/// Anthropic uses `/v1/messages`, all others use `/chat/completions`.
+pub(crate) fn llm_completions_url_for_provider(base_url: &str, provider: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if provider == "anthropic" {
+        // Match anthropic_messages_probe_url logic in services/models.rs
+        if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        }
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
+/// Merge all system-role messages into a single leading system message.
+///
+/// Some providers (e.g. MiniMax) reject conversations where system messages
+/// appear after the first position. This function collects every system
+/// message, concatenates their content with `\n\n`, and places the result
+/// as the first message. All non-system messages keep their original order.
+pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut rest: Vec<Value> = Vec::new();
+
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            }
+        } else {
+            rest.push(msg.clone());
+        }
+    }
+
+    let mut out = Vec::with_capacity(1 + rest.len());
+    if !system_parts.is_empty() {
+        out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
+    }
+    out.extend(rest);
+
+    // Sanitize assistant messages: fix tool_calls with empty function names.
+    // Some providers (e.g. MiniMax) reject messages containing tool_calls
+    // where the function name is empty (can happen when skill interception
+    // captures a call before the streaming name chunk arrives).
+    //
+    // Build a lookup from tool_call_id → tool name from tool-result messages
+    // so we can recover the correct name when possible.
+    let tool_name_by_id: HashMap<String, String> = out
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .filter_map(|m| {
+            let id = m.get("tool_call_id").and_then(Value::as_str)?.to_string();
+            let name = m.get("name").and_then(Value::as_str)?.to_string();
+            Some((id, name))
+        })
+        .collect();
+
+    for msg in &mut out {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for tc in tcs.iter_mut() {
+            let call_id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(func) = tc.get_mut("function") {
+                let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    let recovered = tool_name_by_id
+                        .get(&call_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("_unknown");
+                    if let Some(f) = func.as_object_mut() {
+                        f.insert("name".to_string(), Value::String(recovered.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Split a streaming content chunk into (text, is_reasoning) segments,
+/// tracking whether we're inside a `<think>` block across chunks.
+///
+/// Returns a vec of (chunk_str, is_reasoning) pairs. Callers should route
+/// is_reasoning=true chunks to `reasoning_delta` and false to `text_delta`.
+pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let len = content.len();
+
+    while pos < len {
+        if *in_think {
+            if let Some(end) = content[pos..].find("</think>") {
+                let abs_end = pos + end;
+                if abs_end > pos {
+                    out.push((content[pos..abs_end].to_string(), true));
+                }
+                *in_think = false;
+                pos = abs_end + "</think>".len();
+            } else {
+                out.push((content[pos..].to_string(), true));
+                pos = len;
+            }
+        } else {
+            if let Some(start) = content[pos..].find("<think>") {
+                let abs_start = pos + start;
+                if abs_start > pos {
+                    out.push((content[pos..abs_start].to_string(), false));
+                }
+                *in_think = true;
+                pos = abs_start + "<think>".len();
+            } else {
+                out.push((content[pos..].to_string(), false));
+                pos = len;
+            }
+        }
+    }
+    out
+}
+
+/// Extract `<think>...</think>` blocks from text, returning (reasoning, cleaned_text).
+///
+/// Some models (e.g. MiniMax) embed reasoning in content using `<think>` tags
+/// instead of a separate `reasoning_content` streaming field. This extracts
+/// all `<think>` blocks into reasoning and returns the remaining text.
+fn extract_think_tags(text: &str) -> Option<(String, String)> {
+    if !text.contains("<think>") {
+        return None;
+    }
+    let mut reasoning = String::new();
+    let mut cleaned = String::new();
+    let mut pos = 0;
+    while let Some(start) = text[pos..].find("<think>") {
+        let abs_start = pos + start;
+        cleaned.push_str(&text[pos..abs_start]);
+        if let Some(end) = text[abs_start..].find("</think>") {
+            let abs_end = abs_start + end + "</think>".len();
+            let inner = &text[abs_start + "<think>".len()..abs_start + end];
+            if !reasoning.is_empty() {
+                reasoning.push('\n');
+            }
+            reasoning.push_str(inner.trim());
+            pos = abs_end;
+        } else {
+            // Unclosed <think> — treat rest as reasoning
+            let inner = &text[abs_start + "<think>".len()..];
+            if !reasoning.is_empty() {
+                reasoning.push('\n');
+            }
+            reasoning.push_str(inner.trim());
+            pos = text.len();
+        }
+    }
+    cleaned.push_str(&text[pos..]);
+    let cleaned = cleaned.trim().to_string();
+    if reasoning.is_empty() {
+        None
+    } else {
+        Some((reasoning, cleaned))
+    }
 }
 
 fn apply_llm_header_overrides(
@@ -403,6 +578,11 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     let total_budget = llm_total_budget();
     let client = global_llm_client();
 
+    // Consolidate system messages: merge all system-role messages into the first
+    // one, converting extras to a single leading system message. Some providers
+    // (e.g. MiniMax) reject system messages after the first position.
+    let messages = consolidate_system_messages(messages);
+
     let mut body = json!({
         "model": model_name,
         "messages": messages,
@@ -423,7 +603,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         body["tool_choice"] = Value::String("auto".to_string());
     }
 
-    let url = llm_completions_url(base_url, completions_url_override);
+    let url = llm_completions_url(base_url, completions_url_override, provider);
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
@@ -597,7 +777,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                     );
                     return call_llm_nonstream_fallback_with_request_overrides(
                         client,
-                        messages,
+                        &messages,
                         tools,
                         model_name,
                         api_key,
@@ -916,6 +1096,16 @@ async fn collect_llm_stream(
         }
     }
 
+    // Extract <think>...</think> blocks from content into reasoning.
+    // Models like MiniMax embed thinking in content with <think> tags
+    // instead of using a separate reasoning_content field.
+    if reasoning.is_empty() {
+        if let Some((extracted_reasoning, cleaned_text)) = extract_think_tags(&full_text) {
+            reasoning = extracted_reasoning;
+            full_text = cleaned_text;
+        }
+    }
+
     Ok(LlmCallResult {
         full_text,
         reasoning,
@@ -1010,6 +1200,9 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     request_timeout: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let started = Instant::now();
+
+    let messages = consolidate_system_messages(messages);
+
     let mut body = json!({
         "model": model_name,
         "messages": messages,
@@ -1027,7 +1220,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         body["tool_choice"] = Value::String("auto".to_string());
     }
 
-    let url = llm_completions_url(base_url, completions_url_override);
+    let url = llm_completions_url(base_url, completions_url_override, provider);
     let mut req = client.post(&url).header("content-type", "application/json");
     if provider == "anthropic" {
         if !has_llm_auth_override(provider, header_overrides) {
@@ -1140,6 +1333,13 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
             );
             full_text = super::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
+        }
+    }
+
+    if reasoning.is_empty() {
+        if let Some((extracted_reasoning, cleaned_text)) = extract_think_tags(&full_text) {
+            reasoning = extracted_reasoning;
+            full_text = cleaned_text;
         }
     }
 
@@ -2551,5 +2751,432 @@ mod tests {
         .expect_err("should fail with auth");
         assert_eq!(err.kind, astra_core::ErrorKind::Auth);
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[test]
+    fn completions_url_openai_default() {
+        assert_eq!(
+            llm_completions_url("https://api.openai.com/v1", None, "openai"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completions_url_openai_trailing_slash() {
+        assert_eq!(
+            llm_completions_url("https://api.openai.com/v1/", None, "openai"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completions_url_anthropic_without_v1() {
+        assert_eq!(
+            llm_completions_url("https://api.minimaxi.com/anthropic", None, "anthropic"),
+            "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn completions_url_anthropic_with_v1() {
+        assert_eq!(
+            llm_completions_url("https://api.anthropic.com/v1", None, "anthropic"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn completions_url_override_takes_precedence() {
+        assert_eq!(
+            llm_completions_url(
+                "https://api.openai.com/v1",
+                Some("https://custom.proxy/llm"),
+                "openai"
+            ),
+            "https://custom.proxy/llm"
+        );
+    }
+
+    #[test]
+    fn consolidate_system_messages_merges_multiple() {
+        let msgs = vec![
+            json!({"role": "system", "content": "A"}),
+            json!({"role": "system", "content": "B"}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "system", "content": "C"}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "A\n\nB\n\nC");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "hi");
+    }
+
+    #[test]
+    fn consolidate_system_messages_single_system_unchanged() {
+        let msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["content"], "sys");
+    }
+
+    #[test]
+    fn consolidate_system_messages_no_system() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+    }
+
+    #[test]
+    fn consolidate_fixes_empty_tool_call_name() {
+        let msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "name": "skill", "content": "result"}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        // assistant tool_call name should be recovered from tool result
+        let tc_name = out[1]["tool_calls"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tc_name, "skill");
+    }
+
+    #[test]
+    fn consolidate_fixes_empty_tool_call_name_unknown_fallback() {
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "", "arguments": "{}"}}]
+        })];
+        let out = consolidate_system_messages(&msgs);
+        let tc_name = out[0]["tool_calls"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tc_name, "_unknown");
+    }
+
+    #[test]
+    fn for_provider_openai() {
+        assert_eq!(
+            llm_completions_url_for_provider("https://api.openai.com/v1", "openai"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn for_provider_anthropic_without_v1() {
+        assert_eq!(
+            llm_completions_url_for_provider("https://api.minimaxi.com/anthropic", "anthropic"),
+            "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn for_provider_anthropic_with_v1() {
+        assert_eq!(
+            llm_completions_url_for_provider("https://api.anthropic.com/v1", "anthropic"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    // ── Golden cases: real provider SSE fixtures ──────────────────────────────
+    //
+    // Fixtures captured from live APIs and stored in testdata/. Each test
+    // feeds the raw SSE bytes through collect_llm_stream and asserts on the
+    // parsed LlmCallResult, providing regression coverage for:
+    //   - <think> tag extraction (MiniMax M2.5/M2.7)
+    //   - reasoning_content field (Qwen3.6-plus, Kimi-k2.5)
+    //   - tool_call streaming accumulation (MiniMax M2.5, Qwen-plus)
+    //   - full_text / reasoning split correctness
+
+    fn load_fixture(name: &str) -> Bytes {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/turn/testdata")
+            .join(name);
+        Bytes::from(std::fs::read(path).expect("fixture file missing"))
+    }
+
+    async fn parse_fixture(name: &str) -> LlmCallResult {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let bytes = load_fixture(name);
+        let stream = stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
+        let result = collect_llm_stream(
+            stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect("collect");
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+        result
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn golden_minimax_m25_simple_think_extracted() {
+        // MiniMax M2.5: <think> in delta.content → reasoning extracted, full_text clean
+        let res = parse_fixture("minimax_m25_simple.sse").await;
+        assert!(
+            !res.reasoning.is_empty(),
+            "reasoning should be extracted from <think> tags"
+        );
+        assert!(
+            !res.full_text.contains("<think>"),
+            "full_text must not contain <think>"
+        );
+        assert!(
+            !res.full_text.contains("</think>"),
+            "full_text must not contain </think>"
+        );
+        assert!(
+            !res.full_text.is_empty(),
+            "full_text should have the answer"
+        );
+        assert!(res.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn golden_minimax_m27_simple_think_extracted() {
+        // MiniMax M2.7: same <think> pattern, verify reasoning/text split
+        let res = parse_fixture("minimax_m27_simple.sse").await;
+        assert!(
+            !res.reasoning.is_empty(),
+            "reasoning should be extracted from <think> tags"
+        );
+        assert!(
+            !res.full_text.contains("<think>"),
+            "full_text must not contain <think>"
+        );
+        assert!(
+            !res.full_text.contains("</think>"),
+            "full_text must not contain </think>"
+        );
+        assert!(
+            !res.full_text.is_empty(),
+            "full_text should have the answer"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn golden_qwen36plus_reasoning_content_field() {
+        // Qwen3.6-plus: reasoning via delta.reasoning_content (not <think> tags)
+        let res = parse_fixture("qwen36plus_simple.sse").await;
+        assert!(
+            !res.reasoning.is_empty(),
+            "reasoning_content field should be captured"
+        );
+        assert!(
+            !res.full_text.is_empty(),
+            "full_text should have the answer"
+        );
+        assert!(res.full_text.contains('4'), "answer to 2+2 should be 4");
+        assert!(
+            !res.full_text.contains("<think>"),
+            "no think tags in qwen output"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn golden_kimi_k25_reasoning_content_field() {
+        // Kimi-k2.5: reasoning via delta.reasoning_content
+        let res = parse_fixture("kimi_k25_simple.sse").await;
+        assert!(
+            !res.reasoning.is_empty(),
+            "reasoning_content field should be captured"
+        );
+        assert!(
+            !res.full_text.is_empty(),
+            "full_text should have the answer"
+        );
+        assert!(res.full_text.contains('4'), "answer to 2+2 should be 4");
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn golden_minimax_m25_tool_call_with_think() {
+        // MiniMax M2.5 tool call: <think> in content + tool_calls in delta
+        let res = parse_fixture("minimax_m25_tool_call.sse").await;
+        assert!(!res.tool_calls.is_empty(), "should have tool calls");
+        let tc = &res.tool_calls[0];
+        let name = tc["function"]["name"].as_str().unwrap_or("");
+        assert_eq!(name, "bash", "tool name should be bash");
+        let args = tc["function"]["arguments"].as_str().unwrap_or("");
+        assert!(
+            args.contains("command"),
+            "args must contain 'command' key, got: {args:?}"
+        );
+        // think content should be in reasoning, not full_text
+        assert!(
+            !res.full_text.contains("<think>"),
+            "full_text must not contain <think>"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn golden_qwen_plus_tool_call_no_reasoning() {
+        // Qwen-plus: pure tool call, no reasoning
+        let res = parse_fixture("qwen_plus_tool_call.sse").await;
+        assert!(!res.tool_calls.is_empty(), "should have tool calls");
+        let tc = &res.tool_calls[0];
+        let name = tc["function"]["name"].as_str().unwrap_or("");
+        assert!(!name.is_empty(), "tool name must not be empty");
+        assert!(
+            res.reasoning.is_empty(),
+            "qwen-plus tool call should have no reasoning"
+        );
+    }
+
+    // ── split_think_chunks (real MiniMax M2.7 streaming patterns) ────────────
+
+    #[test]
+    fn split_think_chunks_think_in_first_chunk() {
+        // MiniMax M2.7 real: first chunk starts with <think>
+        let mut in_think = false;
+        let chunks = split_think_chunks("<think>\nThe user says \"hi\".", &mut in_think);
+        assert!(in_think, "should be inside think block");
+        assert_eq!(chunks, vec![("\nThe user says \"hi\".".to_string(), true)]);
+    }
+
+    #[test]
+    fn split_think_chunks_think_closes_mid_chunk() {
+        // MiniMax M2.7 real: last chunk closes </think> and has reply
+        let mut in_think = true;
+        let chunks = split_think_chunks(
+            " Use friendly tone.\n</think>\n\nHello! How can I help you today?",
+            &mut in_think,
+        );
+        assert!(!in_think, "should be outside think block after close");
+        assert_eq!(
+            chunks,
+            vec![
+                (" Use friendly tone.\n".to_string(), true),
+                ("\n\nHello! How can I help you today?".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_think_chunks_no_think_tags() {
+        // Normal model response without thinking
+        let mut in_think = false;
+        let chunks = split_think_chunks("Hello! How can I help?", &mut in_think);
+        assert!(!in_think);
+        assert_eq!(chunks, vec![("Hello! How can I help?".to_string(), false)]);
+    }
+
+    #[test]
+    fn split_think_chunks_full_think_in_one_chunk() {
+        // Entire think block in a single chunk (non-streaming scenario)
+        let mut in_think = false;
+        let chunks = split_think_chunks("<think>reasoning here</think>\n\nAnswer.", &mut in_think);
+        assert!(!in_think);
+        assert_eq!(
+            chunks,
+            vec![
+                ("reasoning here".to_string(), true),
+                ("\n\nAnswer.".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_think_chunks_state_persists_across_calls() {
+        // Simulate MiniMax M2.7 multi-chunk stream
+        let mut in_think = false;
+        // chunk 1: opens think
+        let c1 = split_think_chunks("<think>\nThe user says \"hi\".", &mut in_think);
+        assert!(in_think);
+        assert!(c1[0].1);
+        // chunk 2: still inside think
+        let c2 = split_think_chunks(" Should be concise.", &mut in_think);
+        assert!(in_think);
+        assert_eq!(c2, vec![(" Should be concise.".to_string(), true)]);
+        // chunk 3: closes think and has reply
+        let c3 = split_think_chunks("</think>\n\nHello!", &mut in_think);
+        assert!(!in_think);
+        assert_eq!(c3, vec![("\n\nHello!".to_string(), false),]);
+    }
+
+    #[test]
+    fn split_think_chunks_multi_phase_reasoning() {
+        // Some models emit multiple <think> phases in one stream.
+        // Verify in_think correctly toggles false→true→false→true→false.
+        let mut in_think = false;
+        // Phase 1
+        let c1 = split_think_chunks("<think>phase one</think>text one", &mut in_think);
+        assert!(!in_think);
+        assert_eq!(
+            c1,
+            vec![
+                ("phase one".to_string(), true),
+                ("text one".to_string(), false),
+            ]
+        );
+        // Phase 2 — in_think was false, starts a new think block
+        let c2 = split_think_chunks("<think>phase two</think>text two", &mut in_think);
+        assert!(!in_think);
+        assert_eq!(
+            c2,
+            vec![
+                ("phase two".to_string(), true),
+                ("text two".to_string(), false),
+            ]
+        );
+        // Phase 3 — split across chunks
+        let c3a = split_think_chunks("<think>phase three start", &mut in_think);
+        assert!(in_think);
+        assert_eq!(c3a, vec![("phase three start".to_string(), true)]);
+        let c3b = split_think_chunks(" phase three end</think>final", &mut in_think);
+        assert!(!in_think);
+        assert_eq!(
+            c3b,
+            vec![
+                (" phase three end".to_string(), true),
+                ("final".to_string(), false),
+            ]
+        );
+    }
+
+    // ── extract_think_tags (post-collection cleanup) ──────────────────────────
+
+    #[test]
+    fn extract_think_tags_minimax_real_pattern() {
+        // Real MiniMax M2.7 full_text after stream collection
+        let text = "<think>\nThe user says \"hi\". Should be concise.\n</think>\n\nHello! How can I help you today?";
+        let (reasoning, cleaned) = extract_think_tags(text).unwrap();
+        assert_eq!(reasoning, "The user says \"hi\". Should be concise.");
+        assert_eq!(cleaned, "Hello! How can I help you today?");
+    }
+
+    #[test]
+    fn extract_think_tags_no_think_returns_none() {
+        assert!(extract_think_tags("Hello! How can I help?").is_none());
+    }
+
+    #[test]
+    fn extract_think_tags_skips_when_reasoning_already_set() {
+        // extract_think_tags is only called when reasoning.is_empty(),
+        // so this just verifies the function itself works correctly
+        let text = "<think>step 1</think>answer";
+        let (r, c) = extract_think_tags(text).unwrap();
+        assert_eq!(r, "step 1");
+        assert_eq!(c, "answer");
     }
 }

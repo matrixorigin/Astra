@@ -18,6 +18,32 @@ use http_helpers::*;
 use input::*;
 use interactive::run_interactive;
 
+/// Parse `POST /models` or `PUT /models/{name}` JSON and print `is_active` / `connectivity`.
+fn print_model_load_server_result(body: &str, model_name: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        println!("  (non-JSON response, len {} bytes)", body.len());
+        return;
+    };
+    let active = value
+        .get("is_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true); // fail-open: treat missing/invalid as active so user proceeds
+    println!("  is_active: {active}");
+    if let Some(c) = value
+        .get("connectivity")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  connectivity: {c}");
+    } else if !active {
+        println!("  connectivity: (not in response; run: astra-admin model check {model_name})");
+    }
+    if !active {
+        eprintln!(
+            "  warning: model is inactive — server probe failed or was skipped; fix YAML then `astra-admin model load <file> --update-existing`, or `astra-admin model check {model_name}`"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
@@ -295,11 +321,41 @@ async fn main() -> Result<(), String> {
                     .post_bearer_path_json_text(&token, paths::MODELS, &payload)
                     .await
                 {
-                    Ok(_) => println!("loaded model: {model_name}"),
+                    Ok(body) => {
+                        println!("loaded model: {model_name}");
+                        print_model_load_server_result(&body, model_name);
+                    }
                     Err(astra_thin_client::ThinClientError::Api { body, .. })
                         if body.contains("already exists") =>
                     {
-                        println!("skipped (already exists): {model_name}");
+                        if args.update_existing {
+                            if api_key.is_empty() {
+                                eprintln!(
+                                    "skipped (already exists): {model_name} — need non-empty api_key in YAML to use --update-existing"
+                                );
+                            } else {
+                                let mut upd =
+                                    serde_json::json!({ "api_key": api_key, "provider": provider });
+                                if let Some(ref u) = base_url {
+                                    upd["base_url"] = serde_json::json!(u);
+                                }
+                                let body = api
+                                    .put_bearer_path_json_text(
+                                        &token,
+                                        &paths::model(model_name),
+                                        &upd,
+                                    )
+                                    .await
+                                    .map_err(map_thin_err)?;
+                                println!("re-synced existing model: {model_name}");
+                                print_model_load_server_result(&body, model_name);
+                            }
+                        } else {
+                            println!(
+                                "skipped (already exists): {model_name} — use `astra-admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
+                                args.path
+                            );
+                        }
                     }
                     Err(e) => return Err(map_thin_err(e)),
                 }

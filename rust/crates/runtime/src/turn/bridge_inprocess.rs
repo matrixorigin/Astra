@@ -1034,6 +1034,8 @@ async fn call_llm_stream(
         .build()
         .map_err(|e| e.to_string())?;
 
+    let messages = crate::turn::llm_client::consolidate_system_messages(messages);
+
     let mut body = json!({
         "model": model_name,
         "messages": messages,
@@ -1058,7 +1060,7 @@ async fn call_llm_stream(
         body["tool_choice"] = Value::String("auto".to_string());
     }
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let url = crate::turn::llm_client::llm_completions_url_for_provider(base_url, provider);
 
     // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
     let mut last_err = String::new();
@@ -1110,6 +1112,7 @@ async fn call_llm_stream(
                 let cc = client_cancel.clone();
                 let mut full_text = String::new();
                 let mut reasoning = String::new();
+                let mut in_think_block = false;
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
@@ -1273,11 +1276,19 @@ async fn call_llm_stream(
                                 .and_then(Value::as_object)
                             else { continue };
 
-                            // Text content
+                            // Text content — split out <think>...</think> blocks into reasoning_delta.
+                            // Models like MiniMax embed thinking in content with <think> tags.
                             if let Some(content) = delta.get("content").and_then(Value::as_str)
                                 && !content.is_empty() {
-                                    full_text.push_str(content);
-                                    yield render_sse(&json!({"type": "text_delta", "content": content}));
+                                    for (chunk, is_think) in crate::turn::llm_client::split_think_chunks(content, &mut in_think_block) {
+                                        if is_think {
+                                            reasoning.push_str(&chunk);
+                                            yield render_sse(&json!({"type": "reasoning_delta", "content": chunk}));
+                                        } else {
+                                            full_text.push_str(&chunk);
+                                            yield render_sse(&json!({"type": "text_delta", "content": chunk}));
+                                        }
+                                    }
                                 }
 
                             // Reasoning (DeepSeek / o1 style)

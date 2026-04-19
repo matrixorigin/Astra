@@ -2,6 +2,46 @@
 
 use super::*;
 
+/// GET `/models` returns `ModelListItemResponse` with field `is_active` (snake_case).
+/// Accept legacy `active` if present; if neither is a bool, treat as active for unknown servers.
+fn model_list_entry_is_active(entry: &serde_json::Value) -> bool {
+    if let Some(v) = entry.get("is_active") {
+        if let Some(b) = v.as_bool() {
+            return b;
+        }
+        // Some gateways / hand-written JSON use 0/1 instead of booleans.
+        if let Some(n) = v.as_i64() {
+            return n != 0;
+        }
+        if let Some(n) = v.as_u64() {
+            return n != 0;
+        }
+    }
+    if let Some(b) = entry.get("active").and_then(|v| v.as_bool()) {
+        return b;
+    }
+    if let Some(n) = entry.get("active").and_then(|v| v.as_i64()) {
+        return n != 0;
+    }
+    true
+}
+
+fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
+    entry
+        .get("name")
+        .or_else(|| entry.get("model_name"))
+        .and_then(|v| v.as_str())
+}
+
+fn find_model_list_entry<'a>(
+    models: &'a [serde_json::Value],
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    models
+        .iter()
+        .find(|m| model_list_entry_name(m).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+}
+
 /// Returns `true` when the REPL should exit.
 pub(super) async fn handle_slash_command(
     line: &str,
@@ -75,12 +115,8 @@ pub(super) async fn handle_slash_command(
                 let items: Vec<(String, String)> = models
                     .iter()
                     .filter_map(|m| {
-                        let name = m
-                            .get("name")
-                            .or_else(|| m.get("model_name"))
-                            .and_then(|v| v.as_str())?;
-                        let active = m.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-                        if !active {
+                        let name = model_list_entry_name(m)?;
+                        if !model_list_entry_is_active(m) {
                             return None;
                         }
                         let desc = m
@@ -127,16 +163,30 @@ pub(super) async fn handle_slash_command(
                             .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
                             .unwrap_or_default();
 
+                        if let Some(entry) = find_model_list_entry(&models, arg) {
+                            if !model_list_entry_is_active(entry) {
+                                eprintln!(
+                                    "{}",
+                                    format!(
+                                        "  Model '{}' is registered but inactive (server will not use it). \
+                                         Activate it in the admin UI or fix connectivity, then retry.",
+                                        arg
+                                    )
+                                    .yellow()
+                                );
+                                return Ok(false);
+                            }
+                        }
+
                         let available: Vec<String> = models
                             .iter()
                             .filter_map(|m| {
-                                let name = m
-                                    .get("name")
-                                    .or_else(|| m.get("model_name"))
-                                    .and_then(|v| v.as_str())?;
-                                let active =
-                                    m.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-                                if active { Some(name.to_string()) } else { None }
+                                let name = model_list_entry_name(m)?;
+                                if model_list_entry_is_active(m) {
+                                    Some(name.to_string())
+                                } else {
+                                    None
+                                }
                             })
                             .collect();
 
@@ -150,6 +200,16 @@ pub(super) async fn handle_slash_command(
                                 arg,
                                 &refs,
                                 Some("/model to see available models"),
+                            );
+                            return Ok(false);
+                        }
+
+                        if !model_exists && available.is_empty() && !models.is_empty() {
+                            eprintln!(
+                                "{}",
+                                "  No active models returned by the server. \
+                                 Add or activate a model (admin), or run a connectivity check."
+                                    .yellow()
                             );
                             return Ok(false);
                         }
@@ -453,4 +513,39 @@ pub(super) async fn handle_slash_command(
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod model_list_json_tests {
+    use super::*;
+
+    #[test]
+    fn respects_is_active_false() {
+        let v = serde_json::json!({"name": "m", "is_active": false});
+        assert!(!model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn respects_legacy_active_false() {
+        let v = serde_json::json!({"name": "m", "active": false});
+        assert!(!model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn is_active_wins_over_active_when_both_present() {
+        let v = serde_json::json!({"name": "m", "is_active": false, "active": true});
+        assert!(!model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn missing_flags_defaults_true_for_unknown_servers() {
+        let v = serde_json::json!({"name": "m"});
+        assert!(model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn is_active_numeric_zero_means_inactive() {
+        let v = serde_json::json!({"name": "m", "is_active": 0});
+        assert!(!model_list_entry_is_active(&v));
+    }
 }

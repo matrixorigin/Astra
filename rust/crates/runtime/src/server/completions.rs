@@ -104,9 +104,9 @@ pub(super) async fn completions_handler(
         body["max_completion_tokens"] = serde_json::json!(request.max_tokens);
     }
 
-    let url = format!(
-        "{}/chat/completions",
-        resolved.base_url.trim_end_matches('/')
+    let url = crate::turn::llm_client::llm_completions_url_for_provider(
+        &resolved.base_url,
+        &resolved.provider,
     );
 
     let client = reqwest::Client::builder()

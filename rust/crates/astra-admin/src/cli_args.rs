@@ -83,6 +83,9 @@ pub(crate) enum ModelCmd {
     Add(ModelAddArgs),
     Show(ModelShowArgs),
     Delete(ModelDeleteArgs),
+    /// Probe upstream LLM connectivity; on success sets `is_active=true`, on failure `false` (HTTP `POST /models/{name}/check`).
+    /// This is the supported way to "try activate" from credentials already stored on the server.
+    #[command(alias = "probe", visible_alias = "verify")]
     Check(ModelShowArgs),
     Load(ModelLoadArgs),
     /// Update model fields (api-key, base-url, quirks, active status).
@@ -108,6 +111,7 @@ pub(crate) struct ModelUpdateArgs {
     pub api_key: Option<String>,
     #[arg(long)]
     pub base_url: Option<String>,
+    /// Set stored `is_active` without re-probing. Prefer `model check` to activate only when connectivity succeeds.
     #[arg(long)]
     pub active: Option<bool>,
     /// JSON string for quirks, e.g. '{"fallback_model":"gpt-4o-mini"}'
@@ -128,6 +132,11 @@ pub(crate) struct ModelDeleteArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ModelLoadArgs {
     pub path: String,
+    /// When the server already has this model name, `POST /models` is skipped. With this flag,
+    /// push `api_key` and optional `base_url` from the YAML via `PUT /models/{name}` so the
+    /// server re-runs connectivity and refreshes `is_active`.
+    #[arg(long)]
+    pub update_existing: bool,
 }
 
 #[derive(Args, Debug)]

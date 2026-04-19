@@ -81,6 +81,7 @@ pub async fn update_model_handler(
             ModelUpdateRequestData {
                 api_key: request.api_key,
                 base_url: request.base_url,
+                provider: request.provider,
                 description: request.description,
                 context_window: request.context_window,
                 max_completion_tokens: request.max_completion_tokens,
