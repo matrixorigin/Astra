@@ -28,15 +28,15 @@ use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
     TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
-use crate::turn::bridge_inprocess::{
-    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
-    build_system_message,
-};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
     sleep_ms_or_llm_cancel,
+};
+use crate::turn::prompt_cache::{
+    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    build_system_message,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
 use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
