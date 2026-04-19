@@ -329,6 +329,39 @@ async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, String) {
     (st, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+async fn chat_turn_wrong_secret(app: &Router, payload: Value) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", "wrong-secret-value")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let st = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (st, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn chat_turn_no_secret(app: &Router, payload: Value) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let st = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (st, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn parse_sse_events(raw: &str) -> Vec<Value> {
     raw.lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -2127,5 +2160,679 @@ async fn session_activity_event_count_for_continuation_turn() {
         plan.event_count_increment, 3,
         "continuation turn: event_count_increment should be 3, got {}",
         plan.event_count_increment
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 1: Edge Cases
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test: Missing agent_id in payload → persisted records have agent_id = None
+#[tokio::test]
+async fn edge_missing_agent_id_persists_as_none() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "messages": [{ "role": "user", "content": "no agent id here" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "Response without agent_id." }]
+    });
+
+    let (st, _raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "should have core persist call");
+    let plan = &core[0];
+    if let Some(uq) = &plan.user_query_event {
+        assert!(
+            uq.agent_id.is_none(),
+            "agent_id should be None when not provided, got {:?}",
+            uq.agent_id
+        );
+    }
+    if let Some(lr) = &plan.llm_response_event {
+        assert!(
+            lr.agent_id.is_none(),
+            "agent_id should be None when not provided, got {:?}",
+            lr.agent_id
+        );
+    }
+}
+
+// Test: Unicode content preserved through SSE and persistence
+#[tokio::test]
+async fn edge_unicode_content_preserved_in_persist_and_sse() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let user_msg = "你好世界 🌍 日本語テスト";
+    let llm_text = "回答：こんにちは！🎉 Réponse";
+
+    let payload = json!({
+        "agent_id": "unicode-agent",
+        "messages": [{ "role": "user", "content": user_msg }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": llm_text }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // SSE text_delta should contain the Unicode LLM output.
+    let delta_text: String = events_of_type(&events, "text_delta")
+        .iter()
+        .filter_map(|e| e.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(
+        delta_text.contains("回答：こんにちは！🎉 Réponse"),
+        "SSE text_delta should contain Unicode LLM text, got: {delta_text}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty());
+    let plan = &core[0];
+
+    // User query content preserved.
+    let uq = plan.user_query_event.as_ref().unwrap();
+    assert!(
+        uq.content.contains("你好世界 🌍 日本語テスト"),
+        "persisted user_query should contain Unicode, got: {}",
+        uq.content
+    );
+
+    // LLM response content preserved.
+    let lr = plan.llm_response_event.as_ref().unwrap();
+    assert!(
+        lr.content.contains("回答：こんにちは！🎉 Réponse"),
+        "persisted llm_response should contain Unicode, got: {}",
+        lr.content
+    );
+}
+
+// Test: Empty tool_results array treated as fresh turn (not continuation)
+#[tokio::test]
+async fn edge_empty_tool_results_array_is_fresh_turn() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "empty-tr-agent",
+        "messages": [{ "role": "user", "content": "fresh turn with empty tool_results" }],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [],
+        "test_llm_rounds": [{ "full_text": "This is a fresh turn." }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "should have core persist");
+    let plan = &core[0];
+    assert!(
+        plan.user_query_event.is_some(),
+        "empty tool_results should be treated as fresh turn — user_query must be persisted"
+    );
+}
+
+// Test: Tool result with error content flows through to persistence
+#[tokio::test]
+async fn edge_tool_result_error_content_flows_through() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: tool call.
+    let turn1 = json!({
+        "agent_id": "tool-err-agent",
+        "messages": [{ "role": "user", "content": "read bad file" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-terr", "read_file", json!({"path": "/nonexistent"}))]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0].get("session_id").and_then(Value::as_str).unwrap();
+
+    // Turn 2: continuation with error content in tool_results.
+    let turn2 = json!({
+        "agent_id": "tool-err-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "read bad file" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-terr", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"/nonexistent\"}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-terr", "content": "ERROR: file not found: /nonexistent" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-terr", "content": "ERROR: file not found: /nonexistent" }],
+        "test_llm_rounds": [{
+            "full_text": "The file was not found."
+        }]
+    });
+
+    let (st2, _) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Verify tool events persisted across both turns.
+    let tools = cap.tool_plans.lock().await;
+    let total_events: usize = tools.iter().map(|p| p.events.len()).sum();
+    assert!(
+        total_events >= 1,
+        "tool events should be persisted, got {total_events}"
+    );
+
+    // Verify final llm_response is persisted.
+    let core = cap.core_plans.lock().await;
+    assert!(core.len() >= 2, "both turns should persist core events");
+    let lr = core.last().unwrap().llm_response_event.as_ref().unwrap();
+    assert!(
+        lr.content.contains("not found"),
+        "final llm_response should contain text about the error"
+    );
+}
+
+// Test: Empty full_text with no tool_calls → llm_response NOT persisted
+#[tokio::test]
+async fn edge_empty_full_text_no_tool_calls_skips_llm_persist() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "empty-text-agent",
+        "messages": [{ "role": "user", "content": "trigger empty response" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "" }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    // A core persist call should still happen (user_query is non-empty).
+    assert!(!core.is_empty(), "should have core persist call");
+    let plan = &core[0];
+    // should_persist_llm = false when llm_content.trim() is empty and no tool_calls.
+    assert!(
+        plan.llm_response_event.is_none(),
+        "empty full_text with no tool_calls should NOT persist llm_response_event"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 2: Multi-turn Patterns
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test: Alternating text → tool → text pattern across 3 turns
+#[tokio::test]
+async fn multi_turn_text_tool_text_alternating_pattern() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: text-only response.
+    let turn1 = json!({
+        "agent_id": "alt-agent",
+        "messages": [{ "role": "user", "content": "start the process" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{ "full_text": "I'll start by reading files." }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0].get("session_id").and_then(Value::as_str).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    {
+        let core = cap.core_plans.lock().await;
+        assert_eq!(core.len(), 1, "after turn 1: 1 core persist");
+    }
+
+    // Turn 2: tool call (no full_text).
+    let turn2 = json!({
+        "agent_id": "alt-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "now read the file" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-alt1", "read_file", json!({"path": "data.txt"}))]
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(
+        tc2[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    {
+        let core = cap.core_plans.lock().await;
+        assert_eq!(core.len(), 2, "after turn 2: 2 core persists");
+    }
+
+    // Turn 3: continuation with tool_results → text response.
+    let turn3 = json!({
+        "agent_id": "alt-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "now read the file" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-alt1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"data.txt\"}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-alt1", "content": "file contents here" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-alt1", "content": "file contents here" }],
+        "test_llm_rounds": [{ "full_text": "The file contains data." }]
+    });
+
+    let (st3, raw3) = chat_turn(&app, turn3).await;
+    assert_eq!(st3, StatusCode::OK);
+    let ev3 = parse_sse_events(&raw3);
+    let tc3 = events_of_type(&ev3, "turn_complete");
+    assert_eq!(
+        tc3[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    {
+        let core = cap.core_plans.lock().await;
+        assert_eq!(core.len(), 3, "after turn 3: 3 core persists (cumulative)");
+    }
+}
+
+// Test: 10 sequential text-only turns, all events captured with unique IDs
+#[tokio::test]
+async fn ten_sequential_turns_all_events_captured() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    for i in 0..10 {
+        let payload = json!({
+            "agent_id": "ten-turn-agent",
+            "messages": [{ "role": "user", "content": format!("question {i}") }],
+            "edge_tools": [],
+            "test_llm_rounds": [{ "full_text": format!("answer {i}") }]
+        });
+
+        let (st, _) = chat_turn(&app, payload).await;
+        assert_eq!(st, StatusCode::OK, "turn {i} should succeed");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        10,
+        "10 sequential turns = 10 core persist plans, got {}",
+        core.len()
+    );
+
+    let acts = cap.activity_plans.lock().await;
+    assert_eq!(
+        acts.len(),
+        10,
+        "10 turns = 10 activity plans, got {}",
+        acts.len()
+    );
+
+    // All event_ids must be unique.
+    let mut all_ids: Vec<String> = Vec::new();
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            all_ids.push(uq.event_id.clone());
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            all_ids.push(lr.event_id.clone());
+        }
+    }
+    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique.len(),
+        "all event_ids across 10 turns must be unique"
+    );
+    // Each turn: 1 user_query + 1 llm_response = 20 total.
+    assert_eq!(all_ids.len(), 20, "10 turns × 2 events = 20 IDs");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 3: Concurrency
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test: 20 parallel sessions each with a tool call — no panics, all captured
+#[tokio::test]
+async fn stress_20_parallel_sessions_with_tool_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let app_clone = app.clone();
+        let payload = json!({
+            "agent_id": format!("stress-agent-{i}"),
+            "messages": [{ "role": "user", "content": format!("stress request {i}") }],
+            "edge_tools": [tool_schema("read_file")],
+            "test_llm_rounds": [{
+                "tool_calls": [tool_call(
+                    &format!("tc-stress-{i}"),
+                    "read_file",
+                    json!({"path": format!("file_{i}.txt")})
+                )]
+            }]
+        });
+        handles.push(tokio::spawn(
+            async move { chat_turn(&app_clone, payload).await },
+        ));
+    }
+
+    let results: Vec<_> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
+
+    for (i, (st, _)) in results.iter().enumerate() {
+        assert_eq!(*st, StatusCode::OK, "parallel request {i} should succeed");
+    }
+
+    // Allow more time for 20 async persist operations to settle.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        20,
+        "20 parallel requests = 20 core persist plans, got {}",
+        core.len()
+    );
+}
+
+// Test: 5 rapid sequential requests — all succeed, all persisted
+#[tokio::test]
+async fn stress_rapid_sequential_same_session() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    for i in 0..5 {
+        let payload = json!({
+            "agent_id": "rapid-agent",
+            "messages": [{ "role": "user", "content": format!("rapid request {i}") }],
+            "edge_tools": [],
+            "test_llm_rounds": [{ "full_text": format!("rapid response {i}") }]
+        });
+
+        let (st, _) = chat_turn(&app, payload).await;
+        assert_eq!(st, StatusCode::OK, "rapid request {i} should succeed");
+        // No sleep between requests — fire as fast as possible.
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        5,
+        "5 rapid sequential requests = 5 core persist plans, got {}",
+        core.len()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 4: SSE Ordering
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test: Text-only turn produces exact SSE event sequence
+#[tokio::test]
+async fn sse_full_sequence_text_only_turn() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "sse-seq-text-agent",
+        "messages": [{ "role": "user", "content": "tell me something" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "Here is something." }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+
+    // context_meta is only emitted in the real LLM path, not the e2e mock path.
+    assert_eq!(
+        types,
+        vec!["session_info", "text_delta", "turn_complete"],
+        "text-only turn SSE sequence should be: session_info → text_delta → turn_complete, got: {types:?}"
+    );
+}
+
+// Test: Tool-call turn produces exact SSE event sequence (no text_delta)
+#[tokio::test]
+async fn sse_full_sequence_tool_call_turn() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "sse-seq-tool-agent",
+        "messages": [{ "role": "user", "content": "do something with tools" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-sseq", "read_file", json!({"path": "x.txt"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+
+    // context_meta is only emitted in the real LLM path, not the e2e mock path.
+    assert_eq!(
+        types,
+        vec!["session_info", "turn_complete"],
+        "tool-call turn SSE sequence should be: session_info → turn_complete, got: {types:?}"
+    );
+
+    // Explicitly verify no text_delta.
+    let deltas = events_of_type(&events, "text_delta");
+    assert!(
+        deltas.is_empty(),
+        "tool-call turn should NOT have text_delta events"
+    );
+}
+
+// Test: context_meta is NOT emitted in e2e mock path (only in real LLM path)
+// This documents current behavior — context_meta requires real prompt assembly.
+#[tokio::test]
+async fn sse_context_meta_not_emitted_in_mock_path() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "ctx-meta-agent",
+        "messages": [{ "role": "user", "content": "anything" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "ok" }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let cm = events_of_type(&events, "context_meta");
+    assert!(
+        cm.is_empty(),
+        "context_meta should NOT be emitted in e2e mock path (emitted only in real LLM path)"
+    );
+}
+
+// Test: reasoning_done appears before turn_complete in SSE sequence
+#[tokio::test]
+async fn sse_reasoning_done_before_turn_complete() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "sse-reason-agent",
+        "messages": [{ "role": "user", "content": "think about this" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "Here is my answer.",
+            "reasoning": "thinking..."
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+
+    let reasoning_pos = types
+        .iter()
+        .position(|t| *t == "reasoning_done")
+        .expect("should have reasoning_done event");
+    let turn_complete_pos = types
+        .iter()
+        .position(|t| *t == "turn_complete")
+        .expect("should have turn_complete event");
+
+    assert!(
+        reasoning_pos < turn_complete_pos,
+        "reasoning_done (pos {reasoning_pos}) must appear before turn_complete (pos {turn_complete_pos}), sequence: {types:?}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 5: Security
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test: Wrong secret header → mock path not used, mock content not in response
+#[tokio::test]
+async fn security_wrong_secret_rejects_mock_path() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "sec-wrong-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "MOCK_CONTENT_SHOULD_NOT_APPEAR"
+        }]
+    });
+
+    let (st, raw) = chat_turn_wrong_secret(&app, payload).await;
+    // The SSE stream should still return 200 but the content should NOT
+    // contain the mock text (real LLM unavailable → error event).
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Verify mock content is NOT in any text_delta.
+    let delta_text: String = events_of_type(&events, "text_delta")
+        .iter()
+        .filter_map(|e| e.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !delta_text.contains("MOCK_CONTENT_SHOULD_NOT_APPEAR"),
+        "wrong secret should NOT allow mock content through"
+    );
+
+    // Should likely have an error event (real LLM unavailable in test).
+    let has_error = !events_of_type(&events, "error").is_empty();
+    let has_tc = !events_of_type(&events, "turn_complete").is_empty();
+    assert!(
+        has_error || has_tc,
+        "wrong secret should produce error or turn_complete (not mock content)"
+    );
+}
+
+// Test: Missing secret header → mock path not used, mock content not in response
+#[tokio::test]
+async fn security_missing_secret_header_rejects_mock_path() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "sec-nosecret-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "MOCK_CONTENT_SHOULD_NOT_APPEAR"
+        }]
+    });
+
+    let (st, raw) = chat_turn_no_secret(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Verify mock content is NOT in any text_delta.
+    let delta_text: String = events_of_type(&events, "text_delta")
+        .iter()
+        .filter_map(|e| e.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !delta_text.contains("MOCK_CONTENT_SHOULD_NOT_APPEAR"),
+        "missing secret header should NOT allow mock content through"
+    );
+
+    // Should likely have an error event (real LLM unavailable in test).
+    let has_error = !events_of_type(&events, "error").is_empty();
+    let has_tc = !events_of_type(&events, "turn_complete").is_empty();
+    assert!(
+        has_error || has_tc,
+        "missing secret should produce error or turn_complete (not mock content)"
     );
 }
