@@ -188,6 +188,7 @@ fn tools_reads_tool_calls_from_journal() {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         },
         session_journal::ToolCallRecord {
             name: "bash".into(),
@@ -201,6 +202,7 @@ fn tools_reads_tool_calls_from_journal() {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         },
         session_journal::ToolCallRecord {
             name: "grep".into(),
@@ -214,6 +216,7 @@ fn tools_reads_tool_calls_from_journal() {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         },
     ]);
     writer.append(&event).unwrap();

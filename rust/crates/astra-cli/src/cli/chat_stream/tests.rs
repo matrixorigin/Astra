@@ -20,6 +20,7 @@ fn tool_call_record_covers_early_exit_paths() {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     };
     assert!(dup.ok);
     assert_eq!(dup.ms, 0);
@@ -37,6 +38,7 @@ fn tool_call_record_covers_early_exit_paths() {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     };
     assert!(cached.ok);
 
@@ -53,6 +55,7 @@ fn tool_call_record_covers_early_exit_paths() {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     };
     assert!(!unknown.ok);
     assert!(unknown.error.as_ref().unwrap().starts_with("unknown_tool:"));
@@ -70,6 +73,7 @@ fn tool_call_record_covers_early_exit_paths() {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     };
     assert!(!denied.ok);
 
@@ -99,6 +103,7 @@ fn tool_call_record_json_roundtrip() {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&original).unwrap();
     let restored: ToolCallRecord = serde_json::from_str(&json).unwrap();

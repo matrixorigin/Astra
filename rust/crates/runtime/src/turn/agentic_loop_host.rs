@@ -3967,6 +3967,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -5901,6 +5902,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -5914,6 +5916,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ];
 
@@ -6058,6 +6061,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6071,6 +6075,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6084,6 +6089,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ];
 
@@ -6644,6 +6650,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -6657,6 +6664,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 },
             ]);
             if !bash_ok {
@@ -6714,6 +6722,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 }]),
                 budget_used: None,
                 budget_pressure: None,
@@ -6737,6 +6746,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 selector_confidence: None,
                 routing_domain_hint: None,
                 entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
             })
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")
@@ -6802,6 +6817,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6815,6 +6831,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -6828,6 +6845,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ];
         state.recent_tactical_actions = vec![

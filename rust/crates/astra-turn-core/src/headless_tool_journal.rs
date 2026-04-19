@@ -19,6 +19,7 @@ pub fn journal_record_duplicate_within_turn(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -40,6 +41,7 @@ pub fn journal_record_cross_turn_cache_hit(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -57,6 +59,7 @@ pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCa
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -79,6 +82,7 @@ pub fn journal_record_blocked_tool(
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -121,6 +125,7 @@ pub fn journal_record_executed_tool_call(
         file_path,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 

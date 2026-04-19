@@ -1340,6 +1340,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -1353,6 +1354,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -1366,6 +1368,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ];
 

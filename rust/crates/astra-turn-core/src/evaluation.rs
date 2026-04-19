@@ -347,6 +347,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -545,6 +546,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
 
         // 1 real successful tool + 3 synthetic placeholders (skipped,
@@ -619,6 +621,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: Some(true),
                 original_tool_name: Some("read_file".to_string()),
+                ..Default::default()
             })
             .chain(std::iter::once(ToolCallRecord {
                 name: "git_show".to_string(),
@@ -632,6 +635,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             }))
             .collect();
 
@@ -662,6 +666,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
 
         let distinct_greps = vec![
@@ -730,6 +735,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let surgical = || ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
@@ -743,6 +749,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("glob".to_string()),
+            ..Default::default()
         };
         let records = vec![real(), surgical(), real(), surgical(), real()];
 
@@ -791,6 +798,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("bash".to_string()),
+            ..Default::default()
         };
         assert!(flagged.is_synthetic_placeholder());
 
@@ -807,6 +815,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         assert!(legacy.is_synthetic_placeholder());
 
@@ -823,6 +832,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         assert!(!normal.is_synthetic_placeholder());
     }

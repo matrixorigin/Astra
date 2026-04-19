@@ -2946,6 +2946,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         });
 
         let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);

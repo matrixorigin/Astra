@@ -837,6 +837,12 @@ mod tests {
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
         }
     }
 
@@ -1133,6 +1139,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             crate::session_journal::ToolCallRecord {
                 name: "read_file".into(),
@@ -1146,6 +1153,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ]);
 
@@ -1203,6 +1211,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         }]);
 
         let events = IngestionEvent::expand_journal_event(&journal, "u1");
@@ -1229,6 +1238,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         }]);
 
         let a = IngestionEvent::expand_journal_event(&journal, "u1");

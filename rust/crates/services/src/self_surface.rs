@@ -2138,6 +2138,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::ConfidenceDiagnosisRecorded => "confidence_diagnosis_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
+        JournalEventType::LlmRound => "llm_round",
     }
     .to_string()
 }
@@ -2325,6 +2326,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 }]),
                 budget_used: Some(8300),
                 budget_pressure: Some(0.83),
@@ -2348,6 +2350,12 @@ mod tests {
                 selector_confidence: Some(0.7),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
+                round: None,
+                tool_calls_returned: None,
+                offset_ms: None,
+                llm_rounds: None,
+                total_llm_ms: None,
+                total_tool_ms: None,
             })
             .unwrap();
 

@@ -48,6 +48,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         });
     }
 
@@ -85,6 +86,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: original_name,
+            ..Default::default()
         });
     }
 

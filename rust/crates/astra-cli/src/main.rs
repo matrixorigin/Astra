@@ -2818,6 +2818,7 @@ total_tokens_out: 500
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -2831,6 +2832,7 @@ total_tokens_out: 500
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -2844,6 +2846,7 @@ total_tokens_out: 500
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ]);
         writer.append(&event).unwrap();

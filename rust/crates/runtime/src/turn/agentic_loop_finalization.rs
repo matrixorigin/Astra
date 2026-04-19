@@ -764,6 +764,7 @@ mod tests {
                 file_path: Some("src/main.rs".to_string()),
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "str_replace".to_string(),
@@ -777,6 +778,7 @@ mod tests {
                 file_path: Some("src/lib.rs".to_string()),
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             },
         ];
         state.total_prompt = 5000;
@@ -823,6 +825,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         }];
         state.total_prompt = 15000;
 

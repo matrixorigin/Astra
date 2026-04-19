@@ -182,6 +182,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             });
         }
         if !quiet {

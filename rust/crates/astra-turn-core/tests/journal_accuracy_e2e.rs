@@ -30,6 +30,7 @@ fn real_tool(name: &str, ok: bool, ms: u64) -> ToolCallRecord {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -46,6 +47,7 @@ fn surgical_removal(original_name: &str) -> ToolCallRecord {
         file_path: None,
         surgically_removed: Some(true),
         original_tool_name: Some(original_name.to_string()),
+        ..Default::default()
     }
 }
 
@@ -63,6 +65,7 @@ fn legacy_surgical_removal() -> ToolCallRecord {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -79,6 +82,7 @@ fn skipped_tool(name: &str) -> ToolCallRecord {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -95,6 +99,7 @@ fn deferred_tool(name: &str) -> ToolCallRecord {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 
@@ -750,6 +755,7 @@ fn e2e_unicode_in_tool_records_survives_journal_roundtrip() {
             file_path: Some("/tmp/科技风格/index.html".into()),
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         },
         surgical_removal("read_file"),
     ];

@@ -97,6 +97,7 @@ fn make_tc(name: &str, ok: bool, file_path: Option<&str>) -> ToolCallRecord {
         file_path: file_path.map(String::from),
         surgically_removed: None,
         original_tool_name: None,
+        ..Default::default()
     }
 }
 

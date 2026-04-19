@@ -272,6 +272,7 @@ mod tests {
             file_path: file_path.map(|s| s.to_string()),
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 

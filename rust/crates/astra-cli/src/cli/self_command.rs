@@ -943,6 +943,12 @@ pub(crate) fn persist_manual_compression(
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+        round: None,
+        tool_calls_returned: None,
+        offset_ms: None,
+        llm_rounds: None,
+        total_llm_ms: None,
+        total_tool_ms: None,
         })
         .map_err(|e| e.to_string())
 }
@@ -1007,6 +1013,12 @@ fn append_config_change_event(
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+        round: None,
+        tool_calls_returned: None,
+        offset_ms: None,
+        llm_rounds: None,
+        total_llm_ms: None,
+        total_tool_ms: None,
         })
         .map_err(|e| e.to_string())
 }
@@ -1715,6 +1727,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::ConfidenceDiagnosisRecorded => "confidence_diagnosis_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
+        JournalEventType::LlmRound => "llm_round",
     }
     .to_string()
 }
@@ -1837,6 +1850,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 }]),
                 budget_used: Some(7000),
                 budget_pressure: Some(0.7),
@@ -1860,6 +1874,12 @@ mod tests {
                 selector_confidence: Some(0.8),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
             })
             .unwrap();
 
@@ -1991,6 +2011,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -2004,6 +2025,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 },
             ]);
             if !bash_ok {
@@ -2055,6 +2077,12 @@ mod tests {
                 selector_confidence: None,
                 routing_domain_hint: None,
                 entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
             })
             .unwrap();
         writer
@@ -2108,6 +2136,12 @@ mod tests {
                 selector_confidence: None,
                 routing_domain_hint: None,
                 entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
             })
             .unwrap();
         writer
@@ -2144,6 +2178,7 @@ mod tests {
                         file_path: None,
                         surgically_removed: None,
                         original_tool_name: None,
+                    ..Default::default()
                     },
                     ToolCallRecord {
                         name: "rg".to_string(),
@@ -2157,6 +2192,7 @@ mod tests {
                         file_path: None,
                         surgically_removed: None,
                         original_tool_name: None,
+                    ..Default::default()
                     },
                 ]),
                 budget_used: Some(9100),
@@ -2181,6 +2217,12 @@ mod tests {
                 selector_confidence: Some(0.8),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
             })
             .unwrap();
         writer
@@ -2436,6 +2478,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                ..Default::default()
                 }]),
                 budget_used: Some(9100),
                 budget_pressure: Some(0.91),
@@ -2459,6 +2502,12 @@ mod tests {
                 selector_confidence: Some(0.6),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
             })
             .unwrap();
 

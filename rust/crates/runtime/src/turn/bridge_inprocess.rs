@@ -236,6 +236,7 @@ fn build_bridge_tool_call_records(
             file_path,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         });
     }
 
@@ -257,6 +258,7 @@ fn build_bridge_tool_call_records(
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         });
     }
 

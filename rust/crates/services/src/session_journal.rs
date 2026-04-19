@@ -461,7 +461,7 @@ pub struct SelectionTrace {
 }
 
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// Tool name.
     pub name: String,
@@ -498,6 +498,20 @@ pub struct ToolCallRecord {
     /// Only set when `surgically_removed == Some(true)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_tool_name: Option<String>,
+    // ── Observability fields (Phase 1) ───────────────────────────────────
+    /// Offset from turn start when this tool began executing (milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_offset_ms: Option<u64>,
+    /// Batch ID shared by tools executed in parallel within the same round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    /// Whether this tool was executed in parallel with others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<bool>,
+    /// LLM round index within the turn (0-based). Identifies which LLM→tool
+    /// cycle this call belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
@@ -697,6 +711,25 @@ pub struct JournalEvent {
     /// True when the turn succeeded with tool calls but routing had no domain — entity graph learn was skipped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub entity_learn_skipped_no_domain: bool,
+    // ── Observability fields (Phase 1) ───────────────────────────────────
+    /// LLM round index within a turn (0-based, for llm_round events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// Number of tool_calls returned by LLM in this round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_returned: Option<u32>,
+    /// Offset from turn start in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_ms: Option<u64>,
+    /// Total LLM rounds in this turn (set on turn_completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_rounds: Option<u32>,
+    /// Total LLM time in this turn excluding tool execution (set on turn_completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_llm_ms: Option<u64>,
+    /// Total tool execution time in this turn (set on turn_completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tool_ms: Option<u64>,
 }
 
 /// Event type discriminator.
@@ -786,6 +819,8 @@ pub enum JournalEventType {
     ConfidenceDiagnosisRecorded,
     /// Compaction retry completed — records tier, tokens freed, and per-layer breakdown.
     CompactionRetry,
+    /// One LLM→tools round within a turn (observability Phase 1).
+    LlmRound,
 }
 
 /// Writer that appends events to a session journal file.
@@ -836,6 +871,176 @@ impl JournalWriter {
     /// Get the path to this journal file.
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Batch-append multiple events in a single write + fsync.
+    pub fn append_bulk(&self, events: &[JournalEvent]) -> std::io::Result<()> {
+        self.append_bulk_inner(events, true)
+    }
+
+    /// Batch-append multiple events without fsync (best-effort, for interrupted turns).
+    pub fn append_bulk_no_sync(&self, events: &[JournalEvent]) -> std::io::Result<()> {
+        self.append_bulk_inner(events, false)
+    }
+
+    fn append_bulk_inner(&self, events: &[JournalEvent], sync: bool) -> std::io::Result<()> {
+        use std::io::Write;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut buf = String::new();
+        for event in events {
+            let line = serde_json::to_string(event)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        file.write_all(buf.as_bytes())?;
+        if sync {
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+// ─── Turn Event Buffer ───────────────────────────────────────────────────────
+
+/// Data for one LLM→tools round within a turn.
+pub struct LlmRoundRecord {
+    pub ttft_ms: Option<u64>,
+    pub duration_ms: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub tool_calls_returned: u32,
+    pub tool_call_names: Vec<String>,
+    pub finish_reason: Option<String>,
+}
+
+/// In-memory collector for fine-grained turn events.
+///
+/// Events are accumulated during a turn and flushed to the journal in a single
+/// IO operation when the turn completes. On interruption, `flush_interrupted`
+/// writes partial data without fsync.
+pub struct TurnEventBuffer {
+    events: Vec<JournalEvent>,
+    turn_start: std::time::Instant,
+    session_id: Option<String>,
+    turn: u32,
+    round: u32,
+    batch_counter: u32,
+}
+
+impl TurnEventBuffer {
+    /// Start collecting events for a new turn.
+    pub fn begin_turn(session_id: Option<&str>, turn: u32) -> Self {
+        Self {
+            events: Vec::new(),
+            turn_start: std::time::Instant::now(),
+            session_id: session_id.map(ToString::to_string),
+            turn,
+            round: 0,
+            batch_counter: 0,
+        }
+    }
+
+    /// Elapsed milliseconds since turn start.
+    pub fn offset_ms(&self) -> u64 {
+        self.turn_start.elapsed().as_millis() as u64
+    }
+
+    /// Current LLM round index (0-based).
+    pub fn current_round(&self) -> u32 {
+        self.round
+    }
+
+    /// Generate a batch ID for a group of parallel tool executions.
+    pub fn next_batch_id(&mut self) -> String {
+        let id = format!("b-{}-{}", self.round, self.batch_counter);
+        self.batch_counter += 1;
+        id
+    }
+
+    /// Record an LLM round completion (one LLM→tools cycle).
+    pub fn record_llm_round(&mut self, r: LlmRoundRecord) {
+        let mut evt = JournalEvent::base(JournalEventType::LlmRound, self.session_id.as_deref());
+        evt.turn = Some(self.turn);
+        evt.round = Some(self.round);
+        evt.offset_ms = Some(self.offset_ms().saturating_sub(r.duration_ms));
+        evt.ttft_ms = r.ttft_ms;
+        evt.duration_ms = Some(r.duration_ms);
+        evt.tokens_in = Some(r.prompt_tokens);
+        evt.tokens_out = Some(r.completion_tokens);
+        if r.cache_read_tokens > 0 {
+            evt.cache_read_tokens = Some(r.cache_read_tokens);
+        }
+        evt.tool_calls_returned = Some(r.tool_calls_returned);
+        if !r.tool_call_names.is_empty() {
+            evt.metadata = Some(serde_json::json!({
+                "tool_call_names": r.tool_call_names,
+                "finish_reason": r.finish_reason,
+            }));
+        }
+        self.events.push(evt);
+        self.round += 1;
+        self.batch_counter = 0;
+    }
+
+    /// Record a single event (generic).
+    pub fn record(&mut self, event: JournalEvent) {
+        self.events.push(event);
+    }
+
+    /// Number of events collected so far.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether no events have been collected.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Flush all collected events to the journal (one IO, with fsync).
+    pub fn flush(&mut self, writer: &JournalWriter) -> std::io::Result<()> {
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        writer.append_bulk(&self.events)?;
+        self.events.clear();
+        Ok(())
+    }
+
+    /// Best-effort flush on interruption: no fsync, marks events as partial.
+    pub fn flush_interrupted(&mut self, writer: &JournalWriter) -> std::io::Result<()> {
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        for event in &mut self.events {
+            let meta = event
+                .metadata
+                .get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("partial".into(), serde_json::json!(true));
+            }
+        }
+        writer.append_bulk_no_sync(&self.events)?;
+        self.events.clear();
+        Ok(())
+    }
+
+    /// Drain collected events (for callers that persist elsewhere, e.g. DB).
+    pub fn drain(&mut self) -> Vec<JournalEvent> {
+        std::mem::take(&mut self.events)
     }
 }
 
@@ -1715,6 +1920,12 @@ impl JournalEvent {
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
         }
     }
 
@@ -3278,6 +3489,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -3867,6 +4079,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -3892,6 +4105,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -3918,6 +4132,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let deferred = ToolCallRecord {
             name: "bash".into(),
@@ -3934,6 +4149,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let dedup = ToolCallRecord {
             name: "skill".into(),
@@ -3950,6 +4166,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let actual_failure = ToolCallRecord {
             name: "skill".into(),
@@ -3963,6 +4180,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
 
         assert!(skipped.is_synthetic_placeholder());
@@ -4002,6 +4220,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+        ..Default::default()
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -4053,6 +4272,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -4076,6 +4296,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -4096,6 +4317,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -5067,6 +5289,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("read_file".to_string()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"surgically_removed\":true"));
@@ -5117,6 +5340,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("read_file".to_string()),
+            ..Default::default()
         };
         assert!(
             rec.is_synthetic_placeholder(),

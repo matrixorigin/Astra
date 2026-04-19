@@ -104,6 +104,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+            ..Default::default()
             }]),
             budget_used: Some(8500),
             budget_pressure: Some(0.85),
@@ -127,6 +128,12 @@ async fn execute_reflect_uses_local_surface_with_session() {
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+        round: None,
+        tool_calls_returned: None,
+        offset_ms: None,
+        llm_rounds: None,
+        total_llm_ms: None,
+        total_tool_ms: None,
         })
         .unwrap();
 
