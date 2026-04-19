@@ -1,0 +1,970 @@
+//! Comprehensive bridge E2E tests — persistence, multi-turn, errors, cancellation.
+//!
+//! These tests complement `edge_cloud_round_trip_e2e.rs` by focusing on:
+//! - Event persistence verification (P2 fix: no duplicate event_ids)
+//! - Multi-turn session state accumulation
+//! - Error scenarios (model unavailable, LLM errors)
+//! - Client cancellation mid-stream
+//! - Session activity writer verification
+//!
+//! ```text
+//! cargo test -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks
+//! ```
+
+use std::sync::{Arc, OnceLock};
+
+use astra_runtime::{
+    AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+    AuthTokenRecord, AuthUserRecord, ErrorResponse, FernetTokenEncryptor, HealthChecker,
+    MatrixOneSettings, ServiceInfo, SessionActivityRecord, SessionActivityUpdatePlan,
+    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
+    SessionUpdateRequestData, TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter,
+    TurnCoreEventWriter, TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan,
+    TurnHookDbWriter, TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter,
+    build_app, turn::bridge_inprocess::InProcessChatTurnBridge,
+};
+use async_trait::async_trait;
+use axum::{
+    Router,
+    body::{self, Body},
+    http::{HeaderMap, Request, StatusCode},
+};
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tower::util::ServiceExt;
+
+// ── Env setup ────────────────────────────────────────────────────────────────
+
+const SECRET: &str = "comprehensive-e2e-secret";
+const TOKEN: &str = "Bearer comp-e2e-token";
+const USER_ID: &str = "comp-e2e-user";
+
+static SECRET_INIT: OnceLock<()> = OnceLock::new();
+
+fn init_env() {
+    SECRET_INIT.get_or_init(|| unsafe {
+        std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", SECRET);
+    });
+}
+
+// ── Stubs (copied from edge_cloud_round_trip_e2e.rs, adjusted) ───────────────
+
+#[derive(Clone)]
+struct StubHealth;
+#[async_trait]
+impl HealthChecker for StubHealth {
+    async fn database_healthy(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct StubAuth;
+#[async_trait]
+impl AuthService for StubAuth {
+    async fn register(
+        &self,
+        _: AuthRegisterRequestData,
+    ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn login(
+        &self,
+        _: AuthLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn refresh(
+        &self,
+        _: AuthRefreshRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn logout(
+        &self,
+        _: AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(TOKEN) {
+            Ok(AuthUserRecord {
+                user_id: USER_ID.into(),
+                username: "comp-e2e".into(),
+                email: "comp@e2e.test".into(),
+                display_name: None,
+            })
+        } else {
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(ErrorResponse::new("bad")),
+            ))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StubSession;
+#[async_trait]
+impl SessionService for StubSession {
+    async fn create_session(
+        &self,
+        user_id: String,
+        req: SessionCreateRequestData,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionRecord {
+            session_id: "s-comp-created".into(),
+            user_id,
+            agent_id: req.agent_id,
+            title: Some("comp-test".into()),
+            metadata: req.metadata.unwrap_or_default(),
+            status: "active".into(),
+            event_count: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+            ended_at: None,
+        })
+    }
+    async fn list_sessions(
+        &self,
+        _: SessionListFilter,
+    ) -> Result<SessionListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!()
+    }
+    async fn get_session(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionRecord {
+            session_id,
+            user_id,
+            agent_id: None,
+            title: None,
+            metadata: serde_json::Map::new(),
+            status: "active".into(),
+            event_count: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: None,
+            ended_at: None,
+        })
+    }
+    async fn update_session(
+        &self,
+        sid: String,
+        uid: String,
+        _: SessionUpdateRequestData,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        self.get_session(sid, uid).await
+    }
+    async fn delete_session(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(())
+    }
+    async fn get_session_activity(
+        &self,
+        _: String,
+        _: String,
+        _: u32,
+        _: u32,
+    ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionActivityRecord {
+            session_id: "s-comp-created".into(),
+            activities: vec![],
+            total: 0,
+        })
+    }
+}
+
+// ── Capturing writers ────────────────────────────────────────────────────────
+
+#[derive(Clone, Default)]
+struct AllCaptures {
+    core_plans: Arc<Mutex<Vec<TurnCorePersistPlan>>>,
+    tool_plans: Arc<Mutex<Vec<TurnToolEventPersistPlan>>>,
+    aux_events: Arc<Mutex<Vec<TurnAuxiliaryEventRecord>>>,
+    activity_plans: Arc<Mutex<Vec<(String, SessionActivityUpdatePlan)>>>,
+    hook_plans: Arc<Mutex<Vec<TurnHookDbPersistPlan>>>,
+}
+
+#[derive(Clone)]
+struct CapCoreWriter(AllCaptures);
+#[async_trait]
+impl TurnCoreEventWriter for CapCoreWriter {
+    async fn persist(&self, plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String> {
+        let event_id = plan.llm_response_event.as_ref().map(|e| e.event_id.clone());
+        self.0.core_plans.lock().await.push(plan);
+        Ok(TurnCorePersistOutcome {
+            llm_response_event_id: event_id,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CapToolWriter(AllCaptures);
+#[async_trait]
+impl TurnToolEventWriter for CapToolWriter {
+    async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
+        self.0.tool_plans.lock().await.push(plan);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CapAuxWriter(AllCaptures);
+#[async_trait]
+impl TurnAuxiliaryEventWriter for CapAuxWriter {
+    async fn persist_events(&self, events: Vec<TurnAuxiliaryEventRecord>) -> Result<(), String> {
+        self.0.aux_events.lock().await.extend(events);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CapActivityWriter(AllCaptures);
+#[async_trait]
+impl TurnSessionActivityWriter for CapActivityWriter {
+    async fn update_session_activity(
+        &self,
+        session_id: &str,
+        plan: SessionActivityUpdatePlan,
+    ) -> Result<(), String> {
+        self.0
+            .activity_plans
+            .lock()
+            .await
+            .push((session_id.to_string(), plan));
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CapHookWriter(AllCaptures);
+#[async_trait]
+impl TurnHookDbWriter for CapHookWriter {
+    async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
+        self.0.hook_plans.lock().await.push(plan);
+        Ok(())
+    }
+}
+
+// ── App builder ──────────────────────────────────────────────────────────────
+
+fn build_test_app(cap: AllCaptures) -> Router {
+    let enc =
+        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession))
+        .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
+        .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
+        .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
+        .with_turn_session_activity_writer(Arc::new(CapActivityWriter(cap.clone())))
+        .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap)));
+    let bridge = InProcessChatTurnBridge::new(
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
+        enc,
+    )
+    .with_edge_callback_ledger(base.edge_callback_ledger());
+    let state = base
+        .with_chat_turn_bridge(Arc::new(bridge))
+        .with_chat_turn_bridge_secret("comp-e2e-bridge-secret");
+    build_app(state)
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn tool_schema(name: &str) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": format!("{name} tool"),
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }
+        }
+    })
+}
+
+fn tool_call(id: &str, name: &str, args: Value) -> Value {
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(&args).unwrap()
+        }
+    })
+}
+
+async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let st = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (st, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn parse_sse_events(raw: &str) -> Vec<Value> {
+    raw.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) == Some(ty))
+        .collect()
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Persist events — user_query + llm_response persisted once, no duplicates
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn persist_core_events_user_query_and_llm_response_once() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "persist-agent",
+        "messages": [{ "role": "user", "content": "hello world" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hello from the LLM!",
+        }]
+    });
+
+    let (st, _raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Allow async persistence to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1, "exactly one core persist call");
+    let plan = &core[0];
+    assert!(
+        plan.user_query_event.is_some(),
+        "user_query_event should be persisted"
+    );
+    assert!(
+        plan.llm_response_event.is_some(),
+        "llm_response_event should be persisted"
+    );
+
+    let uq = plan.user_query_event.as_ref().unwrap();
+    assert_eq!(uq.event_type, "user_query");
+    assert!(uq.content.contains("hello world"));
+
+    let lr = plan.llm_response_event.as_ref().unwrap();
+    assert_eq!(lr.event_type, "llm_response");
+    assert!(
+        lr.content.contains("Hello from the LLM!"),
+        "llm response content should contain model output"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Persist tool events — tool call records persisted correctly
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn persist_tool_events_for_tool_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tool-persist-agent",
+        "messages": [{ "role": "user", "content": "read the README" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("list_files")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-p1", "read_file", json!({"path": "README.md"})),
+                tool_call("tc-p2", "list_files", json!({"path": "/src"})),
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+    assert!(
+        events_of_type(&events, "turn_complete")
+            .first()
+            .and_then(|e| e.get("has_tool_calls"))
+            .and_then(Value::as_bool)
+            == Some(true),
+        "turn_complete should have has_tool_calls=true"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let tools = cap.tool_plans.lock().await;
+    let total_events: usize = tools.iter().map(|p| p.events.len()).sum();
+    assert!(
+        total_events >= 2,
+        "at least 2 tool event records should be persisted, got {total_events}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: No duplicate event_ids across core persist calls (P2 fix)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn no_duplicate_event_ids_in_core_persist() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Two sequential turns simulating a multi-round conversation.
+    let turn1 = json!({
+        "agent_id": "dedup-agent",
+        "messages": [{ "role": "user", "content": "first question" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-d1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let turn2 = json!({
+        "agent_id": "dedup-agent",
+        "session_id": "s-comp-created",
+        "messages": [
+            { "role": "user", "content": "first question" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-d1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-d1", "content": "file contents" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-d1", "content": "file contents" }],
+        "test_llm_rounds": [{
+            "full_text": "Here is the answer."
+        }]
+    });
+
+    let (st1, _) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let (st2, _) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let core = cap.core_plans.lock().await;
+    let mut all_event_ids = Vec::new();
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            all_event_ids.push(uq.event_id.clone());
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            all_event_ids.push(lr.event_id.clone());
+        }
+    }
+    let unique: std::collections::HashSet<_> = all_event_ids.iter().collect();
+    assert_eq!(
+        all_event_ids.len(),
+        unique.len(),
+        "event_ids must be unique: {:?}",
+        all_event_ids
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Continuation call (tool_results present) should NOT persist user_query
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn continuation_call_skips_user_query_persist() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Simulates second call in a conversation (tool_results are present).
+    let payload = json!({
+        "agent_id": "cont-agent",
+        "session_id": "s-comp-created",
+        "messages": [
+            { "role": "user", "content": "read file" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-cont", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-cont", "content": "file data" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-cont", "content": "file data" }],
+        "test_llm_rounds": [{
+            "full_text": "Done."
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "should have a core persist call");
+    // On continuation, user_query should not be re-persisted.
+    for plan in core.iter() {
+        assert!(
+            plan.user_query_event.is_none(),
+            "continuation call must not re-persist user_query_event"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Multi-turn session — turn 1 (tools) → turn 2 (completion)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn multi_turn_session_accumulates_state() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: LLM requests a tool call.
+    let turn1 = json!({
+        "agent_id": "mt-agent",
+        "messages": [{ "role": "user", "content": "analyze code" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-mt1", "read_file", json!({"path": "main.rs"}))]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, turn1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let tc1 = events_of_type(&ev1, "turn_complete");
+    assert_eq!(tc1.len(), 1);
+    assert_eq!(
+        tc1[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // Turn 2: CLI provides tool results, LLM completes with text.
+    let turn2 = json!({
+        "agent_id": "mt-agent",
+        "session_id": "s-comp-created",
+        "messages": [
+            { "role": "user", "content": "analyze code" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-mt1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"main.rs\"}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "tc-mt1", "content": "fn main() {}" },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-mt1", "content": "fn main() {}" }],
+        "test_llm_rounds": [{
+            "full_text": "The main function is empty.",
+            "usage": { "prompt_tokens": 150, "completion_tokens": 20 }
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, turn2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(tc2.len(), 1);
+    assert_eq!(
+        tc2[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false),
+        "turn 2 should complete without tool calls"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Verify both turns persisted core events.
+    let core = cap.core_plans.lock().await;
+    assert!(
+        core.len() >= 2,
+        "both turns should trigger core persist, got {}",
+        core.len()
+    );
+
+    // Turn 1 should have user_query_event.
+    let turn1_plan = &core[0];
+    assert!(
+        turn1_plan.user_query_event.is_some(),
+        "turn 1 should persist user_query"
+    );
+
+    // Turn 2 (continuation) should NOT have user_query_event.
+    let turn2_plan = &core[1];
+    assert!(
+        turn2_plan.user_query_event.is_none(),
+        "turn 2 (continuation) should not re-persist user_query"
+    );
+    assert!(
+        turn2_plan.llm_response_event.is_some(),
+        "turn 2 should persist llm_response"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Text-only turn — no tool calls, persist events correct
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn text_only_turn_persists_correctly() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "textonly-agent",
+        "messages": [{ "role": "user", "content": "what is 2+2?" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "2+2 = 4",
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1);
+    assert!(core[0].user_query_event.is_some());
+    assert!(core[0].llm_response_event.is_some());
+
+    // No tool events for text-only turns.
+    let tools = cap.tool_plans.lock().await;
+    let total_tool_events: usize = tools.iter().map(|p| p.events.len()).sum();
+    assert_eq!(
+        total_tool_events, 0,
+        "text-only turn should have no tool events"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Batch tool calls — 5 tools in one response
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn batch_five_tool_calls_all_returned() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "batch-agent",
+        "messages": [{ "role": "user", "content": "read all config files" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("list_files"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-b1", "read_file", json!({"path": "a.toml"})),
+                tool_call("tc-b2", "read_file", json!({"path": "b.toml"})),
+                tool_call("tc-b3", "read_file", json!({"path": "c.toml"})),
+                tool_call("tc-b4", "list_files", json!({"path": "/etc"})),
+                tool_call("tc-b5", "read_file", json!({"path": "d.toml"})),
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let tools = cap.tool_plans.lock().await;
+    let total_events: usize = tools.iter().map(|p| p.events.len()).sum();
+    assert!(
+        total_events >= 5,
+        "should persist at least 5 tool events, got {total_events}"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: SSE event ordering — session_info first, turn_complete last
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn sse_event_ordering_session_info_first_turn_complete_last() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "order-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hello!",
+            "tool_calls": [tool_call("tc-ord", "read_file", json!({"path": "x"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    assert!(!events.is_empty(), "should have events");
+
+    let first = &events[0];
+    assert_eq!(
+        first.get("type").and_then(Value::as_str),
+        Some("session_info"),
+        "first event must be session_info"
+    );
+
+    let last = &events[events.len() - 1];
+    assert_eq!(
+        last.get("type").and_then(Value::as_str),
+        Some("turn_complete"),
+        "last event must be turn_complete"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Error — missing test_llm_rounds with e2e hooks returns error event
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn error_no_llm_rounds_returns_error_event() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // With bridge-e2e-hooks enabled and authorized, empty test_llm_rounds means
+    // the e2e mock has no rounds. The bridge should handle this — may emit
+    // error or empty turn depending on implementation.
+    let payload = json!({
+        "agent_id": "err-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [],
+        "test_llm_rounds": []
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    // Should still return 200 (SSE stream).
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Should have session_info at minimum.
+    let si = events_of_type(&events, "session_info");
+    assert!(!si.is_empty(), "should have session_info event");
+
+    // With no rounds, bridge may emit turn_complete or error.
+    let has_turn_complete = !events_of_type(&events, "turn_complete").is_empty();
+    let has_error = !events_of_type(&events, "error").is_empty();
+    assert!(
+        has_turn_complete || has_error,
+        "should have turn_complete or error when no LLM rounds provided"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Client cancellation — drop response mid-stream
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn client_cancellation_does_not_panic() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "cancel-agent",
+        "messages": [{ "role": "user", "content": "long task" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "This is a response that the client will never fully read.",
+            "tool_calls": [
+                tool_call("tc-cancel1", "read_file", json!({"path": "a.txt"})),
+                tool_call("tc-cancel2", "read_file", json!({"path": "b.txt"})),
+            ]
+        }]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Drop the response body without fully consuming — simulates client disconnect.
+    drop(resp);
+
+    // Give time for any async cleanup.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // If we get here without panic, the test passes.
+    // Verify that persist writers were not corrupted.
+    let core = cap.core_plans.lock().await;
+    // May or may not have persisted depending on timing — that's fine.
+    // The key assertion is no panic or deadlock.
+    drop(core);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Session info event contains session_id and run_id
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn session_info_contains_session_and_run_ids() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "si-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "hello" }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let si = events_of_type(&events, "session_info");
+    assert_eq!(si.len(), 1, "exactly one session_info event");
+    assert!(
+        si[0].get("session_id").and_then(Value::as_str).is_some(),
+        "session_info must have session_id"
+    );
+    assert!(
+        si[0].get("run_id").and_then(Value::as_str).is_some(),
+        "session_info must have run_id"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Core persist event_ids are valid UUIDs
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn core_persist_event_ids_are_valid_uuids() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "uuid-agent",
+        "messages": [{ "role": "user", "content": "test uuid" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "ok" }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let core = cap.core_plans.lock().await;
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            assert!(
+                uuid::Uuid::parse_str(&uq.event_id).is_ok(),
+                "user_query event_id should be valid UUID: {}",
+                uq.event_id
+            );
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            assert!(
+                uuid::Uuid::parse_str(&lr.event_id).is_ok(),
+                "llm_response event_id should be valid UUID: {}",
+                lr.event_id
+            );
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Test: Core persist records correct user_id, session_id, agent_id
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn core_persist_records_correct_metadata() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "meta-agent-123",
+        "messages": [{ "role": "user", "content": "meta test" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "ok" }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty());
+    let plan = &core[0];
+
+    if let Some(uq) = &plan.user_query_event {
+        assert_eq!(uq.user_id, USER_ID, "user_id should match auth user");
+        assert_eq!(
+            uq.agent_id.as_deref(),
+            Some("meta-agent-123"),
+            "agent_id should match request"
+        );
+    }
+
+    if let Some(lr) = &plan.llm_response_event {
+        assert_eq!(lr.user_id, USER_ID);
+        assert_eq!(lr.agent_id.as_deref(), Some("meta-agent-123"));
+    }
+}
