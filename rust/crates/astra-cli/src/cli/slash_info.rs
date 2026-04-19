@@ -767,13 +767,16 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         eprintln!("  {} {}", theme::icon_err(), err.as_str().red());
     }
 
-    // Calculate tool time
-    let tool_time_ms: u64 = ev
-        .tool_calls
-        .as_ref()
-        .map(|calls| calls.iter().map(|tc| tc.ms).sum())
-        .unwrap_or(0);
-    let llm_time_ms = ev.duration_ms.unwrap_or(0).saturating_sub(tool_time_ms);
+    // Calculate tool time — prefer new observability fields, fall back to sum(tc.ms).
+    let tool_time_ms: u64 = ev.total_tool_ms.unwrap_or_else(|| {
+        ev.tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().map(|tc| tc.ms).sum())
+            .unwrap_or(0)
+    });
+    let llm_time_ms = ev
+        .total_llm_ms
+        .unwrap_or_else(|| ev.duration_ms.unwrap_or(0).saturating_sub(tool_time_ms));
 
     // Summary line
     if let Some(ms) = ev.duration_ms {
@@ -819,6 +822,14 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         && !skills.is_empty()
     {
         eprintln!("  {} {}", "Skills:".cyan(), skills.join(", ").cyan());
+    }
+    if let Some(rounds) = ev.llm_rounds {
+        eprintln!(
+            "  {} {} {}",
+            "LLM rounds:".cyan(),
+            rounds,
+            "(LLM→tool cycles within this turn)".dim()
+        );
     }
     eprintln!();
 
@@ -977,8 +988,9 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
         llm_time_ms.to_string().yellow()
     );
 
-    // Tool calls
+    // Tool calls — use start_offset_ms for real timeline when available.
     if let Some(ref calls) = ev.tool_calls {
+        let has_real_offsets = calls.iter().any(|tc| tc.start_offset_ms.is_some());
         for (i, tc) in calls.iter().enumerate() {
             let is_last = i == calls.len() - 1;
             let branch = if is_last { "└─" } else { "├─" };
@@ -1002,13 +1014,34 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 &tc.name,
                 tc.args_preview.as_deref(),
             );
+
+            // Use real start_offset_ms when available; fall back to accumulated offset.
+            let tool_offset = if has_real_offsets {
+                tc.start_offset_ms.unwrap_or(offset)
+            } else {
+                offset
+            };
+
+            // Show round and parallel info when available.
+            let round_tag = tc
+                .round
+                .map(|r| format!(" R{r}"))
+                .unwrap_or_default();
+            let par_tag = if tc.parallel == Some(true) {
+                " ∥"
+            } else {
+                ""
+            };
+
             eprintln!(
-                "    {} {} {} {}{}",
-                format!("[{:>5}ms]", offset).dim(),
+                "    {} {} {} {}{}{}{}",
+                format!("[{:>5}ms]", tool_offset).dim(),
                 branch.dim(),
                 status,
                 display.cyan(),
-                io_info.dim()
+                io_info.dim(),
+                round_tag.dim(),
+                par_tag.dim(),
             );
 
             if let Some(ref err) = tc.error {
@@ -1021,11 +1054,16 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                     err_preview.red()
                 );
             }
-            offset += tc.ms;
+            let end_offset = if has_real_offsets {
+                tool_offset + tc.ms
+            } else {
+                offset += tc.ms;
+                offset
+            };
             let sub_branch = if is_last { "   " } else { "│  " };
             eprintln!(
                 "    {}    {} complete ({}ms)",
-                format!("[{:>5}ms]", offset).dim(),
+                format!("[{:>5}ms]", end_offset).dim(),
                 sub_branch.dim(),
                 tc.ms.to_string().dim()
             );

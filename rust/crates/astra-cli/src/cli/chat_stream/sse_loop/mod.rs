@@ -674,6 +674,15 @@ pub(crate) async fn stream_chat_sse(
         routing_domain_hint: None,
         entity_learn_skipped_no_domain: false,
         pending_context_assembly_trace: state.telemetry.pending_context_assembly_trace,
+        turn_observability_events: state
+            .turn_event_buffer
+            .as_mut()
+            .map(|b| b.drain())
+            .unwrap_or_default(),
+        llm_rounds: state
+            .turn_event_buffer
+            .as_ref()
+            .map(|b| b.current_round()),
     }))
 }
 

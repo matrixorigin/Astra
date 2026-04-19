@@ -926,7 +926,14 @@ fn commit_turn_journal_workspace_and_sidecars(
     turn_start: Instant,
 ) {
     if let Some(journal) = state.journal.as_ref() {
-        let turn_event = session_journal::JournalEvent::turn(
+        // Flush turn observability events (llm_round, tool timing) before the turn summary.
+        if !result.turn_observability_events.is_empty() {
+            if let Err(e) = journal.append_bulk(&result.turn_observability_events) {
+                astra_core::agent_warn!("journal", "failed to write observability events: {e}");
+            }
+        }
+
+        let mut turn_event = session_journal::JournalEvent::turn(
             state.session_id.as_deref(),
             state.turn,
             state.model.as_deref(),
@@ -958,6 +965,19 @@ fn commit_turn_journal_workspace_and_sidecars(
         )
         .with_memoria_time(result.memoria_ms)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
+
+        // Add turn observability summary.
+        turn_event.llm_rounds = result.llm_rounds;
+        let tool_ms: u64 = result
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .map(|r| r.ms)
+            .sum();
+        turn_event.total_tool_ms = Some(tool_ms);
+        if let Some(dur) = turn_event.duration_ms {
+            turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
+        }
 
         // Store for /turn command
         state.last_turn_event = Some(turn_event.clone());
@@ -3392,6 +3412,8 @@ mod tests {
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
         }
     }
 

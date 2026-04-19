@@ -117,6 +117,10 @@ pub(crate) struct StreamResult {
     pub(crate) entity_learn_skipped_no_domain: bool,
     /// Deferred context assembly trace: journal event is only written on turn commit.
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
+    /// Collected turn observability events (llm_round, tool timing) for batch flush.
+    pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
+    /// Aggregated LLM round count for this turn.
+    pub(crate) llm_rounds: Option<u32>,
 }
 
 impl StreamResult {
