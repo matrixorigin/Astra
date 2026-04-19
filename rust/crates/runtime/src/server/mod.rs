@@ -37,6 +37,7 @@ pub(crate) mod header_utils;
 mod http_helpers;
 mod http_types;
 mod learning_handlers;
+mod llm_trusted_domains_handlers;
 mod meta_handlers;
 mod platform_handlers;
 mod reflect_handlers;

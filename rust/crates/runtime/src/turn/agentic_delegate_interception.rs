@@ -87,6 +87,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             "orchestrator",
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
+            state.hooks.llm_token_service.as_ref(),
             &state.skills.request_constraints,
             &state.skills.search,
             adaptive_delegation_context.as_ref(),
@@ -615,6 +616,7 @@ pub(crate) async fn partition_and_execute_delegations(
     source_agent_id: &str,
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
+    llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
     request_constraints: &RequestConstraints,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
@@ -666,6 +668,7 @@ pub(crate) async fn partition_and_execute_delegations(
                             source_agent_id,
                             None,
                             forward_headers.clone(),
+                            llm_token_service.cloned(),
                         )
                         .await
                     {
@@ -1506,6 +1509,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            None,
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
@@ -1542,6 +1546,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            None,
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,
@@ -1569,6 +1574,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            None,
             &RequestConstraints::default(),
             &astra_core::SkillSearchSettings::default(),
             None,

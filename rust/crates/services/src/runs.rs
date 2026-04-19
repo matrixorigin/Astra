@@ -1,6 +1,7 @@
 use astra_core::{ErrorResponse, error_response, error_response_coded};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
+use serde::{Deserialize, Serialize};
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 
@@ -107,12 +108,45 @@ pub trait RunLifecycleService: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmTokenServiceConfig {
+    pub url: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmTokenServiceRequest {
+    pub url: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl From<LlmTokenServiceRequest> for LlmTokenServiceConfig {
+    fn from(value: LlmTokenServiceRequest) -> Self {
+        Self {
+            url: value.url,
+            timeout_ms: value.timeout_ms,
+        }
+    }
+}
+
+impl From<LlmTokenServiceConfig> for LlmTokenServiceRequest {
+    fn from(value: LlmTokenServiceConfig) -> Self {
+        Self {
+            url: value.url,
+            timeout_ms: value.timeout_ms,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     pub model: Option<String>,
+    pub llm_token_service: Option<LlmTokenServiceConfig>,
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
@@ -152,6 +186,7 @@ impl std::fmt::Debug for ChatRequestData {
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
+            .field("llm_token_service", &self.llm_token_service)
             .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_tools", &self.allow_tools)
@@ -881,6 +916,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             agent_id: None,
             model: None,
+            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
@@ -910,6 +946,7 @@ mod tests {
                     session_id: None,
                     agent_id: None,
                     model: None,
+                    llm_token_service: None,
                     skill_search: None,
                     allow_skills: None,
                     allow_tools: None,

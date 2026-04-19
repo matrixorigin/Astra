@@ -49,6 +49,8 @@ pub struct AppState {
     pub(crate) streaming_service: Arc<dyn StreamingService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
+    pub(crate) llm_trusted_domain_service:
+        Arc<dyn astra_services::llm_trusted_domains::LlmTrustedDomainService>,
     pub(crate) evaluation_service: Arc<dyn EvaluationService>,
     pub(crate) introspection_service: Arc<dyn IntrospectionService>,
     pub(crate) reflect_service: Arc<dyn ReflectService>,
@@ -136,6 +138,9 @@ impl AppState {
             streaming_service: Arc::new(UnconfiguredStreamingService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
+            llm_trusted_domain_service: Arc::new(
+                astra_services::llm_trusted_domains::UnconfiguredLlmTrustedDomainService,
+            ),
             evaluation_service: Arc::new(UnconfiguredEvaluationService),
             introspection_service: Arc::new(UnconfiguredIntrospectionService),
             reflect_service: Arc::new(UnconfiguredReflectService),
@@ -332,6 +337,14 @@ impl AppState {
         skill_config_service: Arc<dyn SkillConfigService>,
     ) -> Self {
         self.skill_config_service = skill_config_service;
+        self
+    }
+
+    pub fn with_llm_trusted_domain_service(
+        mut self,
+        service: Arc<dyn astra_services::llm_trusted_domains::LlmTrustedDomainService>,
+    ) -> Self {
+        self.llm_trusted_domain_service = service;
         self
     }
 

@@ -85,6 +85,10 @@ fn chat_stream_bridge_fallback_payload(
         "session_id": chat_data.session_id.as_deref(),
         "agent_id": chat_data.agent_id.as_deref(),
         "model": chat_data.model.as_deref(),
+        "llm_token_service": chat_data
+            .llm_token_service
+            .as_ref()
+            .map(|config| serde_json::json!(config)),
         "skill_search": chat_data.skill_search.as_ref(),
         "allow_skills": allow_skills,
         "allow_tools": allow_tools,
@@ -450,6 +454,10 @@ mod tests {
             session_id: Some("s1".to_string()),
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
+            llm_token_service: Some(astra_services::LlmTokenServiceConfig {
+                url: "http://catalog:8081/api/v1/llm-token".to_string(),
+                timeout_ms: Some(2500),
+            }),
             skill_search: Some(SkillSearchSettings {
                 dynamic_surface: false,
                 min_catalog_size: 12,
@@ -471,6 +479,11 @@ mod tests {
         assert_eq!(obj["skill_search"]["dynamic_surface"], false);
         assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
         assert_eq!(obj["skill_search"]["surface_cap"], 20);
+        assert_eq!(
+            obj["llm_token_service"]["url"],
+            "http://catalog:8081/api/v1/llm-token"
+        );
+        assert_eq!(obj["llm_token_service"]["timeout_ms"], 2500);
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
         let messages = obj["messages"].as_array().unwrap();
@@ -485,6 +498,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
+            llm_token_service: None,
             skill_search: None,
             allow_skills: Some(vec![
                 " plan ".to_string(),

@@ -63,6 +63,8 @@ pub struct ChatRequest {
     pub agent_id: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
+    pub llm_token_service: Option<astra_services::LlmTokenServiceRequest>,
+    #[serde(default)]
     pub skill_search: Option<astra_core::SkillSearchSettings>,
     #[serde(default)]
     pub allow_skills: Option<Vec<String>>,
@@ -871,6 +873,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         session_id: request.session_id,
         agent_id: request.agent_id,
         model: request.model,
+        llm_token_service: request.llm_token_service.map(Into::into),
         skill_search: request.skill_search,
         allow_skills: request.allow_skills,
         allow_tools: request.allow_tools,

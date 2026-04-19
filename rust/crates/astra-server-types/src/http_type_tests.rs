@@ -54,6 +54,7 @@ fn chat_request_defaults_applied() {
     assert!(req.session_id.is_none());
     assert!(req.agent_id.is_none());
     assert!(req.model.is_none());
+    assert!(req.llm_token_service.is_none());
     assert!(req.context.is_none());
 }
 
@@ -127,6 +128,10 @@ fn chat_request_all_fields() {
         "session_id": "s1",
         "agent_id": "a1",
         "model": "gpt-4",
+        "llm_token_service": {
+            "url": "http://catalog:8081/api/v1/llm-token",
+            "timeout_ms": 2500
+        },
         "context": {"key": "value"},
         "max_candidates": 10,
         "explain": true
@@ -136,6 +141,14 @@ fn chat_request_all_fields() {
     assert_eq!(req.session_id.as_deref(), Some("s1"));
     assert_eq!(req.agent_id.as_deref(), Some("a1"));
     assert_eq!(req.model.as_deref(), Some("gpt-4"));
+    assert_eq!(
+        req.llm_token_service.as_ref().map(|v| v.url.as_str()),
+        Some("http://catalog:8081/api/v1/llm-token")
+    );
+    assert_eq!(
+        req.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
+        Some(2500)
+    );
     assert_eq!(req.max_candidates, 10);
     assert!(req.explain);
     let ctx = req.context.unwrap();
@@ -878,6 +891,10 @@ fn chat_request_into_data_maps_all_fields() {
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
         model: Some("gpt-4".into()),
+        llm_token_service: Some(astra_services::LlmTokenServiceRequest {
+            url: "http://catalog:8081/api/v1/llm-token".into(),
+            timeout_ms: Some(2500),
+        }),
         skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
         allow_tools: None,
@@ -892,6 +909,14 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(data.session_id.as_deref(), Some("s1"));
     assert_eq!(data.agent_id.as_deref(), Some("a1"));
     assert_eq!(data.model.as_deref(), Some("gpt-4"));
+    assert_eq!(
+        data.llm_token_service.as_ref().map(|v| v.url.as_str()),
+        Some("http://catalog:8081/api/v1/llm-token")
+    );
+    assert_eq!(
+        data.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
+        Some(2500)
+    );
     assert_eq!(
         data.skill_search,
         Some(astra_core::SkillSearchSettings::default())
@@ -909,6 +934,7 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.session_id.is_none());
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
+    assert!(data.llm_token_service.is_none());
     assert!(data.context.is_none());
     assert_eq!(data.max_candidates, 5);
     assert!(!data.explain);
@@ -921,6 +947,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         session_id: None,
         agent_id: None,
         model: None,
+        llm_token_service: None,
         skill_search: None,
         allow_skills: None,
         allow_tools: None,

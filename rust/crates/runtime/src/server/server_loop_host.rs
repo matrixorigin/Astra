@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -34,12 +34,15 @@ use crate::turn::bridge_inprocess::{
 };
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
-    LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, sleep_ms_or_llm_cancel,
+    LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
+    call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
+    sleep_ms_or_llm_cancel,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
 use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
+use astra_services::LlmTokenServiceConfig;
 
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 /// Per-model rate-limit cooldown tracker (shared with llm_client).
@@ -55,6 +58,117 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
         (None, Some(t)) => LlmCancel::Token(t.as_ref()),
         (None, None) => LlmCancel::None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTurnLlmConfig {
+    model_name: String,
+    api_key: String,
+    base_url: String,
+    provider: String,
+    fallback_model: Option<String>,
+    header_overrides: HashMap<String, String>,
+    completions_url_override: Option<String>,
+    request_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+struct RequestAwareSummaryClient {
+    model_name: String,
+    api_key: String,
+    base_url: String,
+    provider: String,
+    max_output_tokens: usize,
+    header_overrides: HashMap<String, String>,
+    completions_url_override: Option<String>,
+    request_timeout: Option<Duration>,
+}
+
+#[async_trait]
+impl crate::turn::cloud::summary::SummaryLlmClient for RequestAwareSummaryClient {
+    async fn summarize(
+        &self,
+        messages: &[Value],
+    ) -> Result<crate::turn::cloud::summary::SummaryResponse, String> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(llm_connect_timeout())
+            .timeout(llm_fallback_timeout())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        match call_llm_nonstream_fallback_with_request_overrides(
+            &client,
+            messages,
+            &[],
+            &self.model_name,
+            &self.api_key,
+            &self.base_url,
+            &self.provider,
+            Some(self.max_output_tokens),
+            llm_fallback_timeout(),
+            (!self.header_overrides.is_empty()).then_some(&self.header_overrides),
+            self.completions_url_override.as_deref(),
+            self.request_timeout,
+        )
+        .await
+        {
+            Ok(result) => Ok(crate::turn::cloud::summary::SummaryResponse {
+                text: result.full_text,
+                is_ptl_error: false,
+            }),
+            Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
+                Ok(crate::turn::cloud::summary::SummaryResponse {
+                    text: String::new(),
+                    is_ptl_error: true,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+fn normalize_request_model(preferred_model: Option<&str>) -> Option<String> {
+    preferred_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+}
+
+async fn resolve_llm_model_for_turn(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    preferred_model: Option<&str>,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+    llm_token_service: Option<&LlmTokenServiceConfig>,
+    forward_headers: &HashMap<String, String>,
+) -> Result<ResolvedTurnLlmConfig, String> {
+    if let Some(config) = llm_token_service {
+        return Ok(ResolvedTurnLlmConfig {
+            model_name: normalize_request_model(preferred_model)
+                .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            api_key: String::new(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            provider: "openai".to_string(),
+            fallback_model: None,
+            header_overrides: forward_headers.clone(),
+            completions_url_override: Some(config.url.clone()),
+            request_timeout: config.timeout_ms.map(Duration::from_millis),
+        });
+    }
+    let resolved =
+        astra_services::resolve_active_llm_model(matrixone, encryptor, preferred_model, pool)
+            .await?;
+    Ok(ResolvedTurnLlmConfig {
+        model_name: resolved.model_name,
+        api_key: resolved.api_key,
+        base_url: resolved.base_url,
+        provider: resolved.provider,
+        fallback_model: resolved.fallback_model,
+        header_overrides: HashMap::new(),
+        completions_url_override: None,
+        request_timeout: None,
+    })
 }
 
 /// Server-side host for the runtime agentic loop.
@@ -75,6 +189,7 @@ pub struct ServerAgenticLoopHost {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
+    llm_token_service: Option<LlmTokenServiceConfig>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -108,6 +223,7 @@ pub struct ServerAgenticLoopHostBuilder {
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
     model_override: Option<String>,
+    llm_token_service: Option<LlmTokenServiceConfig>,
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     selection_confidence: f64,
@@ -130,6 +246,7 @@ impl ServerAgenticLoopHostBuilder {
             encryptor,
             shared_pool: None,
             model_override: None,
+            llm_token_service: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             selection_confidence: 1.0,
@@ -148,6 +265,14 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_model(mut self, model: Option<String>) -> Self {
         self.model_override = model;
+        self
+    }
+
+    pub fn with_llm_token_service(
+        mut self,
+        llm_token_service: Option<LlmTokenServiceConfig>,
+    ) -> Self {
+        self.llm_token_service = llm_token_service;
         self
     }
 
@@ -214,6 +339,7 @@ impl ServerAgenticLoopHostBuilder {
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
             model_override: self.model_override,
+            llm_token_service: self.llm_token_service,
             edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
@@ -554,6 +680,9 @@ impl ServerAgenticLoopHost {
         api_key: &str,
         base_url: &str,
         provider: &str,
+        header_overrides: &HashMap<String, String>,
+        completions_url_override: Option<&str>,
+        request_timeout: Option<Duration>,
         cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
         let mut llm_messages = system_messages;
@@ -609,15 +738,16 @@ impl ServerAgenticLoopHost {
 
         // Build summary client for LLM-based compaction (uses same model as main LLM)
         let compact_config = crate::prompts::CompactConfig::from_env();
-        let summary_client = crate::turn::cloud::summary::HttpSummaryClient::new(
-            crate::turn::cloud::summary::LlmConnParams {
-                model_name: model_name.to_string(),
-                api_key: api_key.to_string(),
-                base_url: base_url.to_string(),
-                provider: provider.to_string(),
-                max_output_tokens: compact_config.summary_token_budget,
-            },
-        );
+        let summary_client = RequestAwareSummaryClient {
+            model_name: model_name.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.to_string(),
+            provider: provider.to_string(),
+            max_output_tokens: compact_config.summary_token_budget,
+            header_overrides: header_overrides.clone(),
+            completions_url_override: completions_url_override.map(String::from),
+            request_timeout,
+        };
 
         let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
             &micro_compacted_messages,
@@ -731,34 +861,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .as_deref()
             .or(self.model_override.as_deref());
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) =
-            match astra_services::resolve_active_llm_model(
-                &self.matrixone,
-                self.encryptor.as_ref(),
-                effective_model_override,
-                pool_ref,
-            )
-            .await
-            {
-                Ok(m) => (
-                    m.model_name,
-                    m.api_key,
-                    m.base_url,
-                    m.provider,
-                    m.fallback_model,
-                ),
-                Err(e) => {
-                    return Err(astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::Unknown,
-                        format!("Model resolution failed: {e}"),
-                    ));
-                }
-            };
-        let has_fallback = fallback_model_name.is_some();
+        let mut llm_cfg = match resolve_llm_model_for_turn(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            effective_model_override,
+            pool_ref,
+            self.llm_token_service.as_ref(),
+            &state.hooks.forward_headers,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Unknown,
+                    format!("Model resolution failed: {e}"),
+                ));
+            }
+        };
+        let has_fallback = llm_cfg.fallback_model.is_some();
 
         // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
         let cooldown = rate_limit_cooldown();
-        match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
+        match cooldown.with(&llm_cfg.model_name, |c| c.check_request(has_fallback)) {
             RateLimitAction::Proceed => {}
             RateLimitAction::WaitAndRetry { delay_ms } => {
                 astra_core::agent_info!(
@@ -768,7 +893,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
             }
             RateLimitAction::UseFallback { reason } => {
-                if let Some(ref fb_name) = fallback_model_name {
+                if let Some(ref fb_name) = llm_cfg.fallback_model {
                     astra_core::agent_info!(
                         "llm",
                         "rate-limit cooldown: switching to fallback model '{}' ({})",
@@ -776,20 +901,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         reason.as_str()
                     );
                     // Resolve fallback model credentials
-                    match astra_services::resolve_active_llm_model(
+                    match resolve_llm_model_for_turn(
                         &self.matrixone,
                         self.encryptor.as_ref(),
                         Some(fb_name.as_str()),
                         pool_ref,
+                        self.llm_token_service.as_ref(),
+                        &state.hooks.forward_headers,
                     )
                     .await
                     {
-                        Ok(fb) => {
-                            model_name = fb.model_name;
-                            api_key = fb.api_key;
-                            base_url = fb.base_url;
-                            provider = fb.provider;
-                        }
+                        Ok(fb) => llm_cfg = fb,
                         Err(e) => {
                             astra_core::agent_warn!(
                                 "llm",
@@ -843,7 +965,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
-        let cache_cfg = PromptCacheConfig::latch(&provider, &model_name);
+        let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
 
         let (system_messages, system_prompt_plain) =
             self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
@@ -853,16 +975,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 system_messages,
                 state,
                 &visible_tools,
-                &model_name,
-                &api_key,
-                &base_url,
-                &provider,
+                &llm_cfg.model_name,
+                &llm_cfg.api_key,
+                &llm_cfg.base_url,
+                &llm_cfg.provider,
+                &llm_cfg.header_overrides,
+                llm_cfg.completions_url_override.as_deref(),
+                llm_cfg.request_timeout,
                 &cache_cfg,
             )
             .await;
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
-        let budget = crate::prompts::budget_for_model(Some(&model_name));
+        let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
         let tool_schema_tokens: usize = visible_tools
@@ -894,16 +1019,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // with a higher max_output_tokens (up to 4× the initial budget).
         let mut effective_max_output = max_output_tokens;
         let result = loop {
-            let r = call_llm_and_collect(
+            let r = call_llm_and_collect_with_request_overrides(
                 &llm_messages,
                 &final_tools,
-                &model_name,
-                &api_key,
-                &base_url,
-                &provider,
+                &llm_cfg.model_name,
+                &llm_cfg.api_key,
+                &llm_cfg.base_url,
+                &llm_cfg.provider,
                 Some(effective_max_output),
                 has_fallback,
                 llm_cancel,
+                (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
+                llm_cfg.completions_url_override.as_deref(),
+                llm_cfg.request_timeout,
             )
             .await;
 
@@ -988,45 +1116,39 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .as_deref()
             .or(self.model_override.as_deref());
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) =
-            match astra_services::resolve_active_llm_model(
-                &self.matrixone,
-                self.encryptor.as_ref(),
-                effective_model_override,
-                pool_ref,
-            )
-            .await
-            {
-                Ok(m) => (
-                    m.model_name,
-                    m.api_key,
-                    m.base_url,
-                    m.provider,
-                    m.fallback_model,
-                ),
-                Err(e) => return Err(format!("Model resolution failed: {e}").into()),
-            };
-        let has_fallback = fallback_model_name.is_some();
+        let mut llm_cfg = match resolve_llm_model_for_turn(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            effective_model_override,
+            pool_ref,
+            self.llm_token_service.as_ref(),
+            &state.hooks.forward_headers,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return Err(format!("Model resolution failed: {e}").into()),
+        };
+        let has_fallback = llm_cfg.fallback_model.is_some();
 
-        match rate_limit_cooldown().with(&model_name, |c| c.check_request(has_fallback)) {
+        match rate_limit_cooldown().with(&llm_cfg.model_name, |c| c.check_request(has_fallback)) {
             RateLimitAction::Proceed => {}
             RateLimitAction::WaitAndRetry { delay_ms } => {
                 sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
             }
             RateLimitAction::UseFallback { .. } => {
-                if let Some(ref fb_name) = fallback_model_name
-                    && let Ok(fb) = astra_services::resolve_active_llm_model(
+                if let Some(ref fb_name) = llm_cfg.fallback_model
+                    && let Ok(fb) = resolve_llm_model_for_turn(
                         &self.matrixone,
                         self.encryptor.as_ref(),
                         Some(fb_name.as_str()),
                         pool_ref,
+                        self.llm_token_service.as_ref(),
+                        &state.hooks.forward_headers,
                     )
                     .await
                 {
-                    model_name = fb.model_name;
-                    api_key = fb.api_key;
-                    base_url = fb.base_url;
-                    provider = fb.provider;
+                    llm_cfg = fb;
                 }
             }
             RateLimitAction::Reject {
@@ -1048,16 +1170,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             json!({"role": "system", "content": request.system_prompt}),
             json!({"role": "user", "content": request.user_prompt}),
         ];
-        let result = call_llm_and_collect(
+        let result = call_llm_and_collect_with_request_overrides(
             &reflection_messages,
             &[],
-            &model_name,
-            &api_key,
-            &base_url,
-            &provider,
+            &llm_cfg.model_name,
+            &llm_cfg.api_key,
+            &llm_cfg.base_url,
+            &llm_cfg.provider,
             request.max_output_tokens,
             has_fallback,
             llm_cancel_for_state(state),
+            (!llm_cfg.header_overrides.is_empty()).then_some(&llm_cfg.header_overrides),
+            llm_cfg.completions_url_override.as_deref(),
+            llm_cfg.request_timeout,
         )
         .await?;
         let accum = Self::result_to_accum(&result);
@@ -1228,6 +1353,7 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
+    use crate::turn::cloud::summary::SummaryLlmClient;
     use crate::turn::sse_stream_host::EdgeToolExecResult;
 
     fn mock_matrixone() -> MatrixOneSettings {
@@ -1550,6 +1676,9 @@ mod tests {
                 "sk-test",
                 "https://api.test.com",
                 "openai",
+                &HashMap::new(),
+                None,
+                None,
                 &PromptCacheConfig::latch("openai", "gpt-4"),
             )
             .await;
@@ -2042,6 +2171,158 @@ mod tests {
         assert!(!super::llm_cancel_for_state(&s).is_triggered());
         token.cancel();
         assert!(super::llm_cancel_for_state(&s).is_triggered());
+    }
+
+    #[tokio::test]
+    async fn llm_token_service_uses_gateway_url_and_forwarded_headers() {
+        let mut forward_headers = HashMap::new();
+        forward_headers.insert("authorization".to_string(), "Bearer moi-token".to_string());
+        forward_headers.insert("x-workspace-id".to_string(), "ws-001".to_string());
+        forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
+
+        let resolved = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            Some("gpt-5-mini"),
+            None,
+            Some(&LlmTokenServiceConfig {
+                url: "http://catalog:8081/api/v1/chat/completions".to_string(),
+                timeout_ms: Some(2000),
+            }),
+            &forward_headers,
+        )
+        .await
+        .expect("resolve via llm token service gateway");
+
+        assert_eq!(resolved.model_name, "gpt-5-mini");
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+        assert_eq!(
+            resolved.completions_url_override.as_deref(),
+            Some("http://catalog:8081/api/v1/chat/completions")
+        );
+        assert_eq!(
+            resolved
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer moi-token")
+        );
+        assert_eq!(
+            resolved
+                .header_overrides
+                .get("x-workspace-id")
+                .map(String::as_str),
+            Some("ws-001")
+        );
+        assert_eq!(resolved.request_timeout, Some(Duration::from_millis(2000)));
+    }
+
+    #[tokio::test]
+    async fn llm_token_service_without_model_uses_default_model_name() {
+        let resolved = resolve_llm_model_for_turn(
+            &mock_matrixone(),
+            mock_encryptor().as_ref(),
+            None,
+            None,
+            Some(&LlmTokenServiceConfig {
+                url: "http://catalog:8081/api/v1/chat/completions".to_string(),
+                timeout_ms: None,
+            }),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resolve via llm token service gateway");
+        assert_eq!(resolved.model_name, "gpt-4o-mini");
+        assert!(resolved.request_timeout.is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_client_uses_gateway_override_and_forwarded_headers() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+
+        #[derive(Default)]
+        struct RequestCapture {
+            authorization: tokio::sync::Mutex<Option<String>>,
+            workspace_id: tokio::sync::Mutex<Option<String>>,
+            path: tokio::sync::Mutex<Option<String>>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<RequestCapture>>,
+            headers: axum::http::HeaderMap,
+            request: axum::extract::Request,
+        ) -> axum::Json<Value> {
+            *capture.path.lock().await = Some(request.uri().path().to_string());
+            *capture.authorization.lock().await = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(String::from);
+            *capture.workspace_id.lock().await = headers
+                .get("x-workspace-id")
+                .and_then(|value| value.to_str().ok())
+                .map(String::from);
+            axum::Json(json!({
+                "choices": [
+                    {
+                        "message": { "content": "gateway summary" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let capture = Arc::new(RequestCapture::default());
+        let app = Router::new()
+            .route("/gateway/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut forwarded = HashMap::new();
+        forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
+        forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
+        let client = RequestAwareSummaryClient {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+            header_overrides: forwarded,
+            completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
+            request_timeout: Some(Duration::from_secs(2)),
+        };
+
+        let response = client
+            .summarize(&[
+                json!({"role": "system", "content": "summarize"}),
+                json!({"role": "user", "content": "payload"}),
+            ])
+            .await
+            .expect("summary should succeed");
+        assert_eq!(response.text, "gateway summary");
+        assert!(!response.is_ptl_error);
+
+        assert_eq!(
+            capture.authorization.lock().await.as_deref(),
+            Some("Bearer moi-token")
+        );
+        assert_eq!(capture.workspace_id.lock().await.as_deref(), Some("ws-001"));
+        assert_eq!(
+            capture.path.lock().await.as_deref(),
+            Some("/gateway/chat/completions")
+        );
+
+        server.abort();
     }
 
     // ── progress_event_to_sse tests ──

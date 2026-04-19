@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+use astra_services::LlmTokenServiceConfig;
 use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
     DelegationRequest, DelegationResult, aggregate_results,
@@ -90,6 +91,8 @@ pub struct SubRunConfig {
     pub context: HashMap<String, serde_json::Value>,
     /// Trusted forwarded headers propagated out-of-band for child remote skills.
     pub forward_headers: HashMap<String, String>,
+    /// Optional request-scoped LLM token service for child loop model resolution.
+    pub llm_token_service: Option<LlmTokenServiceConfig>,
     /// Request-scoped capability constraints inherited from the parent runtime request.
     pub request_constraints: RequestConstraints,
     /// Current nested agent/sub-run depth for the child loop.
@@ -115,6 +118,7 @@ impl std::fmt::Debug for SubRunConfig {
             .field("user_id", &self.user_id)
             .field("previous_output", &self.previous_output)
             .field("forward_headers", &!self.forward_headers.is_empty())
+            .field("llm_token_service", &self.llm_token_service.is_some())
             .field("request_constraints", &self.request_constraints)
             .field("recursion_depth", &self.recursion_depth)
             .field("pause_flag", &self.pause_flag.is_some())
@@ -1464,8 +1468,14 @@ impl DelegationEngine {
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
-        self.execute_with_forward_headers(request, source_agent_id, cancel_token, HashMap::new())
-            .await
+        self.execute_with_forward_headers(
+            request,
+            source_agent_id,
+            cancel_token,
+            HashMap::new(),
+            None,
+        )
+        .await
     }
 
     pub async fn execute_with_forward_headers(
@@ -1474,6 +1484,7 @@ impl DelegationEngine {
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
         forward_headers: HashMap<String, String>,
+        llm_token_service: Option<LlmTokenServiceConfig>,
     ) -> Result<DelegationResult, String> {
         request
             .context
@@ -1582,6 +1593,7 @@ impl DelegationEngine {
                     agent_ids,
                     aggregation,
                     &forward_headers,
+                    llm_token_service.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -1599,6 +1611,7 @@ impl DelegationEngine {
                     &agent_ids,
                     false,
                     &forward_headers,
+                    llm_token_service.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -1616,6 +1629,7 @@ impl DelegationEngine {
                     agent_ids,
                     *stop_on_success,
                     &forward_headers,
+                    llm_token_service.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -1636,6 +1650,7 @@ impl DelegationEngine {
                     reviewer_id,
                     *max_rounds,
                     &forward_headers,
+                    llm_token_service.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -1657,6 +1672,7 @@ impl DelegationEngine {
                     *max_turns,
                     aggregation,
                     &forward_headers,
+                    llm_token_service.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
@@ -1726,6 +1742,7 @@ impl DelegationEngine {
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
+        llm_token_service: Option<&LlmTokenServiceConfig>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -1854,6 +1871,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
@@ -2119,6 +2137,7 @@ impl DelegationEngine {
                                 previous_output: None,
                                 context: ctx,
                                 forward_headers: forward_headers.clone(),
+                                llm_token_service: llm_token_service.cloned(),
                                 request_constraints: request_constraints.clone(),
                                 recursion_depth: child_recursion_depth,
                                 pause_flag: None,
@@ -2150,6 +2169,7 @@ impl DelegationEngine {
         agent_ids: &[String],
         stop_on_success: bool,
         forward_headers: &HashMap<String, String>,
+        llm_token_service: Option<&LlmTokenServiceConfig>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -2285,6 +2305,7 @@ impl DelegationEngine {
                 previous_output: previous_output.clone(),
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
@@ -2391,6 +2412,7 @@ impl DelegationEngine {
                         previous_output: prev.clone(),
                         context: ctx.clone(),
                         forward_headers: forward_headers.clone(),
+                        llm_token_service: llm_token_service.cloned(),
                         request_constraints: request_constraints.clone(),
                         recursion_depth: child_recursion_depth,
                         pause_flag: None,
@@ -2429,6 +2451,7 @@ impl DelegationEngine {
         reviewer_id: &str,
         max_rounds: u32,
         forward_headers: &HashMap<String, String>,
+        llm_token_service: Option<&LlmTokenServiceConfig>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -2571,6 +2594,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(prod_pause.clone()),
@@ -2671,6 +2695,7 @@ impl DelegationEngine {
                         previous_output: prev.clone(),
                         context: ctx.clone(),
                         forward_headers: forward_headers.clone(),
+                        llm_token_service: llm_token_service.cloned(),
                         request_constraints: request_constraints.clone(),
                         recursion_depth: child_recursion_depth,
                         pause_flag: None,
@@ -2773,6 +2798,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(rev_pause),
@@ -2867,6 +2893,7 @@ impl DelegationEngine {
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
+        llm_token_service: Option<&LlmTokenServiceConfig>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
@@ -3004,6 +3031,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: fork_context,
                 forward_headers: forward_headers.clone(),
+                llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
@@ -4074,12 +4102,80 @@ mod tests {
                     "authorization".to_string(),
                     "Bearer trusted-token".to_string(),
                 )]),
+                None,
             )
             .await
             .unwrap();
         assert_eq!(
             result.agent_results[0].output.as_deref(),
             Some("auth_present=true;context_key_present=false")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_forward_headers_passes_llm_token_service_sideband() {
+        struct LlmTokenServiceCheckExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for LlmTokenServiceCheckExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                let encoded = config
+                    .llm_token_service
+                    .as_ref()
+                    .map(|service| format!("{}|{}", service.url, service.timeout_ms.unwrap_or(0)))
+                    .unwrap_or_else(|| "none".to_string());
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(encoded),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg,
+            engine,
+            tracker,
+            Arc::new(LlmTokenServiceCheckExecutor),
+        );
+
+        let req = DelegationRequest {
+            delegation_id: "llm-token-test".into(),
+            parent_run_id: "p".into(),
+            task: "check llm token service".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de
+            .execute_with_forward_headers(
+                req,
+                "orch",
+                None,
+                HashMap::new(),
+                Some(LlmTokenServiceConfig {
+                    url: "http://catalog:8081/api/v1/chat/completions".to_string(),
+                    timeout_ms: Some(2500),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.agent_results[0].output.as_deref(),
+            Some("http://catalog:8081/api/v1/chat/completions|2500")
         );
     }
 
@@ -4276,6 +4372,7 @@ mod tests {
             previous_output: None,
             context: HashMap::new(),
             forward_headers: HashMap::new(),
+            llm_token_service: None,
             request_constraints: Default::default(),
             recursion_depth: 1,
             pause_flag: None,

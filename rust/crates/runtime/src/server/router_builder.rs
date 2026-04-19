@@ -177,6 +177,15 @@ pub(super) fn build_router(state: AppState) -> Router {
             post(admin_handlers::admin_cleanup_handler),
         )
         .route(
+            "/admin/llm/trusted-domains",
+            get(llm_trusted_domains_handlers::list_llm_trusted_domains_handler)
+                .put(llm_trusted_domains_handlers::upsert_llm_trusted_domain_handler),
+        )
+        .route(
+            "/admin/llm/trusted-domains/{domain_id}",
+            delete(llm_trusted_domains_handlers::delete_llm_trusted_domain_handler),
+        )
+        .route(
             "/api/v1/learning/health",
             get(learning_handlers::learning_health_handler),
         )

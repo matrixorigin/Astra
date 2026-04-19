@@ -959,6 +959,24 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS runtime_llm_trusted_domains (
+            domain_id     VARCHAR(36) PRIMARY KEY,
+            domain_host   VARCHAR(255) NOT NULL,
+            domain_port   INT,
+            is_enabled    SMALLINT NOT NULL DEFAULT 1,
+            description   VARCHAR(255),
+            created_by    VARCHAR(36),
+            updated_by    VARCHAR(36),
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            UNIQUE INDEX idx_rld_host_port (domain_host, domain_port),
+            INDEX idx_rld_enabled (is_enabled)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS skill_resource_bindings (
             binding_id    VARCHAR(36) PRIMARY KEY,
             user_id       VARCHAR(36) NOT NULL,

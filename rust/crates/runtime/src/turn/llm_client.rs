@@ -293,6 +293,54 @@ fn llm_total_budget() -> std::time::Duration {
     std::time::Duration::from_secs(s)
 }
 
+fn llm_completions_url(base_url: &str, override_url: Option<&str>) -> String {
+    override_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{}/chat/completions", base_url.trim_end_matches('/')))
+}
+
+fn apply_llm_header_overrides(
+    mut req: reqwest::RequestBuilder,
+    header_overrides: Option<&HashMap<String, String>>,
+) -> reqwest::RequestBuilder {
+    let Some(header_overrides) = header_overrides else {
+        return req;
+    };
+    for (name, value) in header_overrides {
+        if name.starts_with("__astra_") {
+            continue;
+        }
+        let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        req = req.header(header_name, header_value);
+    }
+    req
+}
+
+fn has_llm_auth_override(
+    provider: &str,
+    header_overrides: Option<&HashMap<String, String>>,
+) -> bool {
+    let Some(header_overrides) = header_overrides else {
+        return false;
+    };
+    if provider == "anthropic" {
+        header_overrides
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-api-key"))
+    } else {
+        header_overrides
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+    }
+}
+
 /// Call the LLM streaming API, collect the full response, and return a structured result.
 ///
 /// Unlike `call_llm_stream` (which returns raw SSE bytes), this function
@@ -315,6 +363,38 @@ pub(crate) async fn call_llm_and_collect(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     cancel: LlmCancel<'_>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_request_overrides(
+        messages,
+        tools,
+        model_name,
+        api_key,
+        base_url,
+        provider,
+        max_output_tokens,
+        has_fallback,
+        cancel,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_llm_and_collect_with_request_overrides(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    has_fallback: bool,
+    cancel: LlmCancel<'_>,
+    header_overrides: Option<&HashMap<String, String>>,
+    completions_url_override: Option<&str>,
+    request_timeout: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
@@ -343,7 +423,7 @@ pub(crate) async fn call_llm_and_collect(
         body["tool_choice"] = Value::String("auto".to_string());
     }
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let url = llm_completions_url(base_url, completions_url_override);
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
@@ -416,11 +496,16 @@ pub(crate) async fn call_llm_and_collect(
 
         let mut req = client.post(&url).header("content-type", "application/json");
         if provider == "anthropic" {
-            req = req
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
+            if !has_llm_auth_override(provider, header_overrides) {
+                req = req.header("x-api-key", api_key);
+            }
+            req = req.header("anthropic-version", "2023-06-01");
+        } else if !has_llm_auth_override(provider, header_overrides) {
             req = req.header("authorization", format!("Bearer {api_key}"));
+        }
+        req = apply_llm_header_overrides(req, header_overrides);
+        if let Some(timeout) = request_timeout {
+            req = req.timeout(timeout);
         }
 
         let response = match req.json(&body).send().await {
@@ -510,7 +595,7 @@ pub(crate) async fn call_llm_and_collect(
                         made_progress,
                         fb_timeout.as_secs()
                     );
-                    return call_llm_nonstream_fallback(
+                    return call_llm_nonstream_fallback_with_request_overrides(
                         client,
                         messages,
                         tools,
@@ -520,6 +605,9 @@ pub(crate) async fn call_llm_and_collect(
                         provider,
                         max_output_tokens,
                         fb_timeout,
+                        header_overrides,
+                        completions_url_override,
+                        request_timeout,
                     )
                     .await;
                 }
@@ -889,6 +977,38 @@ pub(crate) async fn call_llm_nonstream_fallback(
     max_output_tokens: Option<usize>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_nonstream_fallback_with_request_overrides(
+        client,
+        messages,
+        tools,
+        model_name,
+        api_key,
+        base_url,
+        provider,
+        max_output_tokens,
+        timeout,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
+    client: &reqwest::Client,
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    api_key: &str,
+    base_url: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    timeout: std::time::Duration,
+    header_overrides: Option<&HashMap<String, String>>,
+    completions_url_override: Option<&str>,
+    request_timeout: Option<std::time::Duration>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let started = Instant::now();
     let mut body = json!({
         "model": model_name,
@@ -907,26 +1027,36 @@ pub(crate) async fn call_llm_nonstream_fallback(
         body["tool_choice"] = Value::String("auto".to_string());
     }
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let url = llm_completions_url(base_url, completions_url_override);
     let mut req = client.post(&url).header("content-type", "application/json");
     if provider == "anthropic" {
-        req = req
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
-    } else {
+        if !has_llm_auth_override(provider, header_overrides) {
+            req = req.header("x-api-key", api_key);
+        }
+        req = req.header("anthropic-version", "2023-06-01");
+    } else if !has_llm_auth_override(provider, header_overrides) {
         req = req.header("authorization", format!("Bearer {api_key}"));
     }
+    req = apply_llm_header_overrides(req, header_overrides);
 
     // Apply per-request timeout (overrides the client-level default).
-    let resp = req.timeout(timeout).json(&body).send().await.map_err(|e| {
-        astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::Network,
-            format!(
-                "LLM fallback request failed (timeout {}s): {e}",
-                timeout.as_secs()
-            ),
-        )
-    })?;
+    let effective_timeout = request_timeout
+        .map(|value| value.min(timeout))
+        .unwrap_or(timeout);
+    let resp = req
+        .timeout(effective_timeout)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Network,
+                format!(
+                    "LLM fallback request failed (timeout {}s): {e}",
+                    effective_timeout.as_secs()
+                ),
+            )
+        })?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -1070,6 +1200,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::extract::State;
+    use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::post;
     use futures_util::StreamExt;
@@ -1077,6 +1208,7 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// Set thread-local stream idle timeouts for the duration of a test.
@@ -1262,6 +1394,76 @@ mod tests {
             err.message.contains("timeout") || err.message.contains("Timeout"),
             "error should mention timeout: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn call_llm_with_request_overrides_uses_direct_gateway_url_and_headers() {
+        #[derive(Clone, Default)]
+        struct Capture {
+            auth: Option<String>,
+            workspace: Option<String>,
+            model: Option<String>,
+        }
+
+        async fn gateway_handler(
+            State(capture): State<Arc<Mutex<Capture>>>,
+            headers: HeaderMap,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            *capture.lock().expect("capture lock") = Capture {
+                auth: headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from),
+                workspace: headers
+                    .get("x-workspace-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(String::from),
+                model: body.get("model").and_then(Value::as_str).map(String::from),
+            };
+            let payload = json!({"choices":[{"delta":{"content":"from-gateway"}}]});
+            let body = format!("data: {}\n\ndata: [DONE]\n\n", payload);
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("gateway response")
+        }
+
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let app = Router::new()
+            .route("/gateway", post(gateway_handler))
+            .with_state(capture.clone());
+        let base = spawn_local_http_server(app).await;
+        let gateway_url = format!("{base}/gateway");
+
+        let mut overrides = HashMap::new();
+        overrides.insert("authorization".to_string(), "Bearer moi-token".to_string());
+        overrides.insert("x-workspace-id".to_string(), "ws-001".to_string());
+        overrides.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
+
+        let result = call_llm_and_collect_with_request_overrides(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "gpt-5-mini",
+            "",
+            "https://api.openai.com/v1",
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            Some(&overrides),
+            Some(&gateway_url),
+            None,
+        )
+        .await
+        .expect("gateway llm call");
+
+        assert_eq!(result.full_text, "from-gateway");
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(seen.auth.as_deref(), Some("Bearer moi-token"));
+        assert_eq!(seen.workspace.as_deref(), Some("ws-001"));
+        assert_eq!(seen.model.as_deref(), Some("gpt-5-mini"));
     }
 
     #[test]

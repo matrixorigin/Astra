@@ -22,7 +22,7 @@ use super::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use astra_core::{ErrorResponse, SharedPool, error_response};
+use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
 use astra_services::EdgeContext;
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
@@ -30,6 +30,7 @@ use astra_services::runs::{
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
+use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
@@ -56,6 +57,7 @@ use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
+const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
@@ -136,6 +138,113 @@ fn normalize_request_allowlist(
         normalized.insert(normalize_allowlist_entry(entry, field)?);
     }
     Ok(Some(normalized))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct TrustedLlmDomain {
+    host: String,
+    port: Option<u16>,
+}
+
+fn normalize_trusted_llm_domain_host(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("trusted domain host must not be empty".to_string());
+    }
+    if trimmed.contains("://") {
+        return Err(format!(
+            "trusted domain host '{trimmed}' must not include URL scheme"
+        ));
+    }
+    let parsed = reqwest::Url::parse(&format!("http://{trimmed}"))
+        .map_err(|error| format!("invalid trusted domain host '{trimmed}': {error}"))?;
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.port().is_some()
+    {
+        return Err(format!("trusted domain host '{trimmed}' must be host only"));
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(format!(
+            "trusted domain host '{trimmed}' must include a host"
+        ));
+    };
+    Ok(host.to_ascii_lowercase())
+}
+
+fn trusted_llm_domain_from_db_values(
+    host_raw: &str,
+    port_raw: Option<i64>,
+) -> Result<TrustedLlmDomain, String> {
+    let host = normalize_trusted_llm_domain_host(host_raw)?;
+    let port = match port_raw {
+        Some(port) if !(1..=65_535).contains(&port) => {
+            return Err(format!(
+                "trusted domain host '{host_raw}' has invalid port value {port}"
+            ));
+        }
+        Some(port) => Some(port as u16),
+        None => None,
+    };
+    Ok(TrustedLlmDomain { host, port })
+}
+
+fn llm_token_service_domain_is_trusted(
+    url: &reqwest::Url,
+    trusted_domains: &[TrustedLlmDomain],
+) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let normalized_host = host.to_ascii_lowercase();
+    let resolved_port = url.port_or_known_default();
+    trusted_domains.iter().any(|trusted| {
+        if trusted.host != normalized_host {
+            return false;
+        }
+        match trusted.port {
+            Some(port) => resolved_port == Some(port),
+            None => true,
+        }
+    })
+}
+
+fn validate_llm_token_service_config(
+    config: Option<&astra_services::LlmTokenServiceConfig>,
+    trusted_domains: &[TrustedLlmDomain],
+) -> Result<(), String> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let raw_url = config.url.trim();
+    if raw_url.is_empty() {
+        return Err("llm_token_service.url must not be empty".to_string());
+    }
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|error| format!("llm_token_service.url must be a valid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("llm_token_service.url must use http or https scheme".to_string());
+    }
+    if parsed.host_str().is_none() {
+        return Err("llm_token_service.url must include a host".to_string());
+    }
+    if config.timeout_ms == Some(0) {
+        return Err("llm_token_service.timeout_ms must be greater than 0".to_string());
+    }
+    if trusted_domains.is_empty() {
+        return Err(format!(
+            "llm_token_service.url is not allowed without trusted domains configured in table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}"
+        ));
+    }
+    if !llm_token_service_domain_is_trusted(&parsed, trusted_domains) {
+        return Err(format!(
+            "llm_token_service.url host must match trusted domains configured in table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}"
+        ));
+    }
+    Ok(())
 }
 
 fn skill_tool_names(skill: &crate::turn::skill_tool::SkillToolInfo) -> Vec<String> {
@@ -261,6 +370,7 @@ fn build_server_skill_executor(
     encryptor: &Arc<FernetTokenEncryptor>,
     shared_pool: Option<&SharedPool>,
     model_override: Option<&str>,
+    llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
     forward_headers: &HashMap<String, String>,
@@ -279,6 +389,7 @@ fn build_server_skill_executor(
     )
     .with_pool(shared_pool.cloned())
     .with_default_model(model_override.map(String::from))
+    .with_llm_token_service(llm_token_service.cloned())
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
     .with_forward_headers(forward_headers.clone())
@@ -927,10 +1038,93 @@ impl AgenticRunLifecycleService {
         (events, final_status, error_msg)
     }
 
-    fn validate_request_constraints(
+    async fn load_trusted_llm_token_service_domains(
+        &self,
+    ) -> Result<Vec<TrustedLlmDomain>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = if let Some(pool) = &self.shared_pool {
+            pool.get().clone()
+        } else {
+            connect_matrixone(&self.matrixone).await.map_err(|error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to connect database for trusted domains query: {error}"),
+                )
+            })?
+        };
+        let rows = sqlx::query(
+            "SELECT domain_host, domain_port \
+             FROM runtime_llm_trusted_domains \
+             WHERE is_enabled = 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "failed to query trusted domains from table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}: {error}"
+                ),
+            )
+        })?;
+        let mut trusted_domains = Vec::new();
+        let mut seen = HashSet::new();
+        for row in rows {
+            let host: String = row.try_get("domain_host").map_err(|error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to decode domain_host from table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}: {error}"
+                    ),
+                )
+            })?;
+            let port: Option<i64> = row.try_get("domain_port").map_err(|error| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to decode domain_port from table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}: {error}"
+                    ),
+                )
+            })?;
+            let domain = trusted_llm_domain_from_db_values(&host, port).map_err(|detail| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "invalid trusted domain row in table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE}: {detail}"
+                    ),
+                )
+            })?;
+            let key = format!(
+                "{}:{}",
+                domain.host,
+                domain
+                    .port
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            );
+            if seen.insert(key) {
+                trusted_domains.push(domain);
+            }
+        }
+        if trusted_domains.is_empty() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "table {LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE} has no enabled trusted domains"
+                ),
+            ));
+        }
+        Ok(trusted_domains)
+    }
+
+    async fn validate_request_constraints(
         &self,
         request: &ChatRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if request.llm_token_service.is_some() {
+            let trusted_domains = self.load_trusted_llm_token_service_domains().await?;
+            validate_llm_token_service_config(request.llm_token_service.as_ref(), &trusted_domains)
+                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        }
         normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         let (_, resolver) = build_server_skill_resolver(
@@ -961,6 +1155,7 @@ impl AgenticRunLifecycleService {
             session_id.to_string(),
         )
         .with_model(request.model.clone())
+        .with_llm_token_service(request.llm_token_service.clone())
         .with_edge_tools(edge_tools)
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
@@ -1052,6 +1247,7 @@ impl AgenticRunLifecycleService {
             &self.encryptor,
             self.shared_pool.as_ref(),
             request.model.as_deref(),
+            request.llm_token_service.as_ref(),
             &edge_tools,
             &edge_profile,
             &request.forward_headers,
@@ -1112,6 +1308,7 @@ impl AgenticRunLifecycleService {
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
                 forward_headers: request.forward_headers.clone(),
+                llm_token_service: request.llm_token_service.clone(),
                 ..Default::default()
             },
             cancellation: Default::default(),
@@ -1304,7 +1501,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.validate_request_constraints(&request)?;
+        self.validate_request_constraints(&request).await?;
 
         // ── Resource governance check (Phase 5) ─────────────────────
         if let Some(ref gov) = self.resource_governor {
@@ -1593,7 +1790,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.validate_request_constraints(&request)?;
+        self.validate_request_constraints(&request).await?;
 
         let run_id = Uuid::new_v4().to_string();
         let session_id = request
@@ -2163,6 +2360,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.session_id.clone(),
         )
         .with_model(config.agent_profile.model_override.clone())
+        .with_llm_token_service(config.llm_token_service.clone())
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone());
 
@@ -2258,6 +2456,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint,
                 forward_headers: config.forward_headers.clone(),
+                llm_token_service: config.llm_token_service.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -2493,6 +2692,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
@@ -3113,6 +3313,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_tools: None,
@@ -3132,6 +3333,97 @@ mod tests {
         assert!(AgenticRunLifecycleService::extract_edge_tools(&test_request("hi")).is_empty());
     }
 
+    fn trusted_domains_for_tests() -> Vec<super::TrustedLlmDomain> {
+        vec![super::TrustedLlmDomain {
+            host: "catalog".to_string(),
+            port: Some(8081),
+        }]
+    }
+
+    #[test]
+    fn validate_llm_token_service_config_accepts_http_url() {
+        let config = astra_services::LlmTokenServiceConfig {
+            url: "http://catalog:8081/api/v1/llm-token".to_string(),
+            timeout_ms: Some(2500),
+        };
+        let trusted = trusted_domains_for_tests();
+        assert!(super::validate_llm_token_service_config(Some(&config), &trusted).is_ok());
+    }
+
+    #[test]
+    fn validate_llm_token_service_config_rejects_invalid_url() {
+        let config = astra_services::LlmTokenServiceConfig {
+            url: "not-a-url".to_string(),
+            timeout_ms: Some(2500),
+        };
+        let trusted = trusted_domains_for_tests();
+        let err = super::validate_llm_token_service_config(Some(&config), &trusted)
+            .expect_err("invalid url should fail");
+        assert!(err.contains("valid URL"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_llm_token_service_config_rejects_untrusted_url() {
+        let config = astra_services::LlmTokenServiceConfig {
+            url: "http://evil.example.com/v1/chat/completions".to_string(),
+            timeout_ms: Some(2500),
+        };
+        let trusted = trusted_domains_for_tests();
+        let err = super::validate_llm_token_service_config(Some(&config), &trusted)
+            .expect_err("untrusted url should fail");
+        assert!(
+            err.contains("trusted domains"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_llm_token_service_config_rejects_when_trusted_domains_unconfigured() {
+        let config = astra_services::LlmTokenServiceConfig {
+            url: "http://catalog:8081/api/v1/llm-token".to_string(),
+            timeout_ms: Some(2500),
+        };
+        let err = super::validate_llm_token_service_config(Some(&config), &[])
+            .expect_err("missing trusted domains should fail");
+        assert!(
+            err.contains(super::LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_llm_token_service_config_enforces_host_port_boundary_for_trusted_domains() {
+        let config = astra_services::LlmTokenServiceConfig {
+            url: "http://catalog:8082/api/v1/chat".to_string(),
+            timeout_ms: Some(2500),
+        };
+        let trusted = trusted_domains_for_tests();
+        let err = super::validate_llm_token_service_config(Some(&config), &trusted)
+            .expect_err("host:port boundary should be enforced");
+        assert!(
+            err.contains("trusted domains"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_llm_domain_from_db_values_accepts_valid_host_and_port() {
+        let parsed = super::trusted_llm_domain_from_db_values("catalog", Some(8081))
+            .expect("host+port should parse");
+        assert_eq!(parsed.host, "catalog");
+        assert_eq!(parsed.port, Some(8081));
+    }
+
+    #[test]
+    fn trusted_llm_domain_from_db_values_rejects_invalid_host_or_port() {
+        let host_err = super::trusted_llm_domain_from_db_values("http://catalog:8081", Some(8081))
+            .expect_err("host should not include scheme");
+        assert!(host_err.contains("host"));
+        let port_err = super::trusted_llm_domain_from_db_values("catalog", Some(70000))
+            .expect_err("port out of range should fail");
+        assert!(port_err.contains("port"));
+    }
+
     #[test]
     fn extract_edge_profile_from_context() {
         let mut ctx = serde_json::Map::new();
@@ -3144,6 +3436,7 @@ mod tests {
             session_id: None,
             agent_id: None,
             model: None,
+            llm_token_service: None,
             skill_search: None,
             allow_skills: None,
             allow_tools: None,

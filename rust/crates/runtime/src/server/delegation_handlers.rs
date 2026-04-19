@@ -42,7 +42,7 @@ pub(super) async fn delegate_run_handler(
 
     // Execute the delegation.
     let result = engine
-        .execute_with_forward_headers(request, &source_agent_id, None, forward_headers)
+        .execute_with_forward_headers(request, &source_agent_id, None, forward_headers, None)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

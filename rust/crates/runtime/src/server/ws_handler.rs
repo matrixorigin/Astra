@@ -906,6 +906,7 @@ fn build_ws_chat_request(
         session_id,
         agent_id,
         model,
+        llm_token_service: None,
         skill_search,
         allow_skills,
         allow_tools,

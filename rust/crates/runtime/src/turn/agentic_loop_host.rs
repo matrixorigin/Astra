@@ -440,6 +440,8 @@ pub struct StopHookState {
     /// Inbound request headers eligible for remote skill forwarding.
     /// Header names are normalized to lowercase.
     pub forward_headers: HashMap<String, String>,
+    /// Request-scoped LLM token service config propagated to nested sub-runs.
+    pub llm_token_service: Option<astra_services::LlmTokenServiceConfig>,
 }
 
 /// Cancellation state for the agentic loop.

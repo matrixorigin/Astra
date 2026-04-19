@@ -16,6 +16,7 @@ pub mod introspection;
 pub mod jobs;
 pub mod learning;
 pub mod learning_merge;
+pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
@@ -120,6 +121,11 @@ pub use learning::{
     DatabaseLearningFeedbackService, LearningFeedbackRecord, LearningFeedbackRequestData,
     LearningFeedbackService, UnconfiguredLearningFeedbackService,
 };
+pub use llm_trusted_domains::{
+    DatabaseLlmTrustedDomainService, LlmTrustedDomainDeleteResponse, LlmTrustedDomainRecord,
+    LlmTrustedDomainService, LlmTrustedDomainUpsertRequest, LlmTrustedDomainUpsertRequestData,
+    UnconfiguredLlmTrustedDomainService,
+};
 pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
 };
@@ -163,8 +169,9 @@ pub use reflect::{
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    InMemoryRunStateStore, RunLifecycleService, RunListRecord, RunMutationRecord, RunStateStore,
-    RunStatusRecord, UnconfiguredRunLifecycleService, transform_run_event_for_client,
+    InMemoryRunStateStore, LlmTokenServiceConfig, LlmTokenServiceRequest, RunLifecycleService,
+    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord,
+    UnconfiguredRunLifecycleService, transform_run_event_for_client,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,

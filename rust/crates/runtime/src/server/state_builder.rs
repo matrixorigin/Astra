@@ -100,6 +100,10 @@ pub async fn build_server_state(
     .with_skill_config_service(Arc::new(
         DatabaseSkillConfigService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
+    .with_llm_trusted_domain_service(Arc::new(
+        astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
+            .with_pool(shared_pool.clone()),
+    ))
     .with_fernet_encryptor(
         FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?,
     )
