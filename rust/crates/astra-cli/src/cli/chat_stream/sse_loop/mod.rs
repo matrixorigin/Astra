@@ -532,6 +532,7 @@ pub(crate) async fn stream_chat_sse(
             teammate_idle_hook_runs: 0,
             workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
             forward_headers: std::collections::HashMap::new(),
+            llm_token_service: None,
         },
         messaging: MessagingState {
             mailbox: root_mailbox,
