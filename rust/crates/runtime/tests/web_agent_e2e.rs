@@ -25,6 +25,7 @@ use axum::{
     body::{self, Body},
     http::{Request, StatusCode},
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
@@ -337,6 +338,40 @@ async fn read_sse_events_from_body(body: Body) -> Vec<Value> {
     let bytes = body::to_bytes(body, 16 * 1024 * 1024).await.unwrap();
     let body_str = String::from_utf8_lossy(&bytes);
     parse_sse_events(&body_str)
+}
+
+#[allow(dead_code)]
+/// Read SSE events from a body frame by frame, collecting them incrementally.
+async fn read_sse_events_incremental(body: Body) -> Vec<Value> {
+    let mut collected = Vec::new();
+    let mut buf = String::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        // Parse complete SSE events from buf.
+        while let Some(idx) = buf.find("\n\n") {
+            let event_str = buf[..idx].to_string();
+            buf = buf[idx + 2..].to_string();
+            if let Some(data) = event_str.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    collected.push(v);
+                }
+            }
+        }
+    }
+    collected
+}
+
+/// DELETE /chat/runs/{run_id} — cancel a run.
+async fn cancel_run(app: &Router, run_id: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/chat/runs/{run_id}"))
+        .header("authorization", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
 }
 
 #[allow(dead_code)]
@@ -1099,4 +1134,126 @@ async fn approval_denied_skips_tool_and_continues() {
     // LLM should still continue with final text.
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty(), "expected final text after denial");
+}
+
+// ── Cancellation test ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cancel_mid_stream_stops_further_rounds() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    // Round 1: edge tool (read_file) — will wait on ledger
+    // Round 2: text — should NOT execute if cancelled between rounds
+    let payload = json!({
+        "message": "Read and summarize",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "tc-cancel-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\": \"/src/main.rs\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "full_text": "This text should NOT appear because we cancelled."
+                }
+            ],
+            "edge_tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }
+            ]
+        }
+    });
+
+    // Start the stream.
+    let app_clone = app.clone();
+    let resp = chat_stream_start(&app_clone, payload).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Read SSE frames incrementally to get the run_id, then cancel.
+    let body = resp.into_body();
+    let mut collected_events: Vec<Value> = Vec::new();
+    let mut buf = String::new();
+    let mut stream = body.into_data_stream();
+    let mut run_id: Option<String> = None;
+    let mut cancelled = false;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+
+    loop {
+        let frame = tokio::time::timeout_at(deadline, stream.next()).await;
+        let frame = match frame {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(_))) | Err(_) => break, // error or timeout
+            Ok(None) => break,                  // stream ended
+        };
+        buf.push_str(&String::from_utf8_lossy(&frame));
+
+        // Parse complete SSE events from the buffer.
+        while let Some(idx) = buf.find("\n\n") {
+            let event_str = buf[..idx].to_string();
+            buf = buf[idx + 2..].to_string();
+            if let Some(data) = event_str.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    let event_type = v
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Capture run_id from session_info.
+                    if event_type == "session_info" {
+                        run_id = v.get("run_id").and_then(Value::as_str).map(String::from);
+                    }
+
+                    collected_events.push(v);
+
+                    // After seeing tool_request, cancel the run, then post result to unblock.
+                    if event_type == "tool_request" && !cancelled {
+                        if let Some(rid) = &run_id {
+                            let st = cancel_run(&app, rid).await;
+                            assert_eq!(st, 200, "cancel_run failed");
+                            cancelled = true;
+
+                            // Post tool result to unblock the ledger wait.
+                            post_tool_result(&app, "tc-cancel-1", "file contents", "ok").await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(cancelled, "should have cancelled the run");
+    assert!(
+        run_id.is_some(),
+        "should have received session_info with run_id"
+    );
+
+    // Round 2's text ("This text should NOT appear") should be absent
+    // because cancellation was detected before round 2 started.
+    let text_events = find_events(&collected_events, "text_delta");
+    let has_round2_text = text_events.iter().any(|t| {
+        t.get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("should NOT appear")
+    });
+    assert!(
+        !has_round2_text,
+        "round 2 text should not appear after cancellation"
+    );
 }
