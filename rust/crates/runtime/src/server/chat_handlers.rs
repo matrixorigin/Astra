@@ -76,6 +76,7 @@ pub(super) fn is_session_service_unconfigured_error(
     error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
 }
 
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 fn chat_stream_bridge_fallback_payload(
     chat_data: &astra_services::runs::ChatRequestData,
 ) -> serde_json::Value {
@@ -104,6 +105,7 @@ fn chat_stream_bridge_fallback_payload(
     })
 }
 
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
     entries.map(|entries| {
         let mut normalized = std::collections::BTreeSet::new();
@@ -192,20 +194,6 @@ pub(super) async fn chat_stream_handler(
                 stream.events,
             ));
             sse_json_response(events)
-        }
-        Err((status, error))
-            if astra_services::runs::is_run_lifecycle_unconfigured_error(status, &error.0) =>
-        {
-            // Fallback path: route /chat/stream through chat-turn bridge when lifecycle
-            // service isn't wired yet. This preserves CLI usability during cutover.
-            let payload = chat_stream_bridge_fallback_payload(&chat_data);
-            let body = match serde_json::to_vec(&payload).map(Bytes::from) {
-                Ok(body) => body,
-                Err(e) => {
-                    return sse_error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                }
-            };
-            dispatch_chat_turn_bridge(&state, &user, &headers, body).await
         }
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
@@ -1111,39 +1099,6 @@ mod chat_stream_bridge_fallback_tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_falls_back_to_bridge_disabled_when_lifecycle_unconfigured_and_no_bridge() {
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(StubSessionService))
-                .with_chat_turn_bridge_secret("test-secret"),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/stream")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"message":"hi","session_id":"s1","model":"demo-model"}"#,
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("chat turn bridge disabled"));
-    }
-
-    #[tokio::test]
     async fn chat_stream_uses_client_run_event_shape_for_live_lifecycle_streams() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -1211,35 +1166,5 @@ mod chat_stream_bridge_fallback_tests {
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"error\""));
         assert!(!text.contains("\"type\":\"text_delta\""));
-    }
-
-    #[tokio::test]
-    async fn chat_stream_fallback_returns_bridge_disabled_error_when_bridge_unconfigured() {
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(StubSessionService)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/stream")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(bytes.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("chat turn bridge disabled"));
     }
 }

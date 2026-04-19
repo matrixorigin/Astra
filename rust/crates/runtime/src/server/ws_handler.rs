@@ -36,9 +36,9 @@
 //! {"type": "pong"}
 //! ```
 
-use super::chat_handlers::{
-    is_session_service_unconfigured_error, resolve_or_create_chat_session_id,
-};
+#[cfg(test)]
+use super::chat_handlers::is_session_service_unconfigured_error;
+use super::chat_handlers::resolve_or_create_chat_session_id;
 use super::header_utils::collect_forward_headers;
 use super::http_types::merge_plan_subtask_context;
 use super::run_handlers::transform_stream_run_events_for_client_with_pending;
@@ -46,12 +46,9 @@ use super::*;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use futures_util::StreamExt;
 use serde_json::Value;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{MissedTickBehavior, timeout};
-use tokio_util::sync::CancellationToken;
 
 /// Timeout for the initial auth message after WebSocket upgrade.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -266,6 +263,7 @@ struct WsConnection {
     /// Active run ID (if any). Used for cancel/approval routing.
     active_run_id: Option<String>,
     /// Prepared bridge-local run ID used before the upstream stream reports a real one.
+    #[cfg_attr(not(test), allow(dead_code))]
     bridge_prepared_run_id: Option<String>,
 }
 
@@ -627,13 +625,6 @@ async fn handle_chat_message(
     let should_clear_pending_session_id =
         requested_session_id.is_some() || conn.pending_session_id.is_some();
     let request_session_id = chat_request_session_id(conn, requested_session_id);
-    let fallback_agent_id = agent_id.clone();
-    let fallback_model = model.clone();
-    let fallback_skill_search = skill_search.clone();
-    let fallback_allow_skills = allow_skills.clone();
-    let fallback_allow_tools = allow_tools.clone();
-    let fallback_max_candidates = max_candidates;
-    let fallback_explain = explain;
     let mut request = build_ws_chat_request(
         content,
         request_session_id,
@@ -649,7 +640,6 @@ async fn handle_chat_message(
         is_plan_subtask,
     );
     request.forward_headers = ws_forward_headers(conn);
-    let fallback_context = request.context.clone();
     request.session_id = match resolve_or_create_chat_session_id(
         state,
         &conn.user,
@@ -676,7 +666,6 @@ async fn handle_chat_message(
             return;
         }
     };
-    let resolved_session_id = request.session_id.clone();
 
     // Try RunLifecycleService first (server-side agentic loop)
     match state
@@ -707,28 +696,6 @@ async fn handle_chat_message(
 
             stream_run_over_websocket(socket, state, conn, &run.run_id).await;
             conn.active_run_id = None;
-        }
-        Err((status, err))
-            if astra_services::runs::is_run_lifecycle_unconfigured_error(status, &err.0) =>
-        {
-            // Lifecycle service not configured — fall back to bridge
-            handle_chat_message_via_bridge(
-                socket,
-                state,
-                conn,
-                content,
-                resolved_session_id,
-                request_session_id_is_trusted,
-                fallback_agent_id,
-                fallback_model,
-                fallback_skill_search,
-                fallback_allow_skills,
-                fallback_allow_tools,
-                fallback_context,
-                fallback_max_candidates,
-                fallback_explain,
-            )
-            .await;
         }
         Err((status, err)) => {
             send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
@@ -855,6 +822,7 @@ async fn handle_user_prompt_response(
     guard.insert(key, value);
 }
 
+#[cfg(test)]
 fn build_bridge_chat_payload(
     session_id: Option<String>,
     content: &str,
@@ -886,6 +854,7 @@ fn build_bridge_chat_payload(
     })
 }
 
+#[cfg(test)]
 fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
     entries.map(|entries| {
         let mut normalized = std::collections::BTreeSet::new();
@@ -933,6 +902,7 @@ fn ws_forward_headers(conn: &WsConnection) -> std::collections::HashMap<String, 
     headers
 }
 
+#[cfg(test)]
 fn build_ws_bridge_headers(
     state: &AppState,
     conn: &WsConnection,
@@ -960,6 +930,7 @@ fn build_ws_bridge_headers(
     Ok(bridge_headers)
 }
 
+#[cfg(test)]
 async fn resolve_bridge_payload_session_id(
     state: &AppState,
     user: &AuthUserRecord,
@@ -1596,223 +1567,14 @@ async fn stream_run_over_websocket(
     }
 }
 
-/// Legacy bridge-based chat handler (fallback when RunLifecycleService is unconfigured).
-async fn handle_chat_message_via_bridge(
-    socket: &mut WebSocket,
-    state: &AppState,
-    conn: &mut WsConnection,
-    content: &str,
-    request_session_id: Option<String>,
-    request_session_id_is_trusted: bool,
-    agent_id: Option<String>,
-    model: Option<String>,
-    skill_search: Option<astra_core::SkillSearchSettings>,
-    allow_skills: Option<Vec<String>>,
-    allow_tools: Option<Vec<String>>,
-    context: Option<serde_json::Map<String, serde_json::Value>>,
-    max_candidates: u32,
-    explain: bool,
-) {
-    let (bridge_payload_session_id, trusted_session_id_override) =
-        resolve_bridge_payload_session_id(
-            state,
-            &conn.user,
-            request_session_id,
-            request_session_id_is_trusted,
-        )
-        .await;
-
-    // Build the bridge request body (same format as /chat/turn)
-    let payload = build_bridge_chat_payload(
-        bridge_payload_session_id,
-        content,
-        agent_id,
-        model,
-        skill_search,
-        allow_skills,
-        allow_tools,
-        context,
-        max_candidates,
-        explain,
-    );
-
-    let body = match serde_json::to_vec(&payload) {
-        Ok(b) => Bytes::from(b),
-        Err(e) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: format!("Failed to serialize request: {e}"),
-                    code: "INTERNAL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
-            return;
-        }
-    };
-
-    let mut bridge_headers = match build_ws_bridge_headers(state, conn) {
-        Ok(headers) => headers,
-        Err(message) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: message.into(),
-                    code: "INTERNAL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
-            return;
-        }
-    };
-
-    // Prepare request through bridge_prep (session validation, etc.)
-    let prepared = match prepare_chat_turn_bridge_body(
-        state,
-        &conn.user,
-        body,
-        trusted_session_id_override.as_deref(),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err((status, error)) => {
-            send_msg(socket, &ws_error_from_status(status, error.0.detail)).await;
-            return;
-        }
-    };
-
-    // Add optional headers from prepared context
-    apply_prepared_headers(&mut bridge_headers, &prepared);
-    let prepared_trusted_session_id = prepared.trusted_session_id.clone();
-    let prepared_turn_chain_id = prepared.turn_chain_id.clone();
-
-    let client_cancel = Arc::new(CancellationToken::new());
-
-    // Call bridge
-    let bridge = match state.chat_turn_bridge.as_ref() {
-        Some(b) => b,
-        None => {
-            send_msg(
-                socket,
-                &ws_error_from_status(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "chat turn bridge disabled. Configure the runtime with an in-process bridge."
-                        .to_string(),
-                ),
-            )
-            .await;
-            return;
-        }
-    };
-    let response = bridge
-        .forward(
-            &bridge_headers,
-            prepared.body,
-            state.turn_core_event_writer.clone(),
-            state.turn_tool_event_writer.clone(),
-            state.turn_hook_db_writer.clone(),
-            state.turn_reflection_state_store.clone(),
-            state.turn_reflection_lesson_writer.clone(),
-            state.turn_observer_worker.clone(),
-            state.turn_auxiliary_event_writer.clone(),
-            state.turn_session_activity_writer.clone(),
-            Some(client_cancel.clone()),
-        )
-        .await;
-
-    match response {
-        Ok(resp) => {
-            let run_started_explain = bridge_run_started_explain(explain);
-            let preamble_messages = bridge_success_preamble_messages(
-                conn,
-                prepared_trusted_session_id.as_deref(),
-                prepared_turn_chain_id.as_deref(),
-                run_started_explain.as_ref(),
-            );
-            for message in &preamble_messages {
-                send_msg(socket, message).await;
-            }
-
-            let terminal_status = stream_sse_response_as_ws(
-                socket,
-                state,
-                conn,
-                resp,
-                Some(client_cancel),
-                run_started_explain,
-                !preamble_messages.is_empty(),
-            )
-            .await;
-            if let Some(run_id) = conn.active_run_id.clone() {
-                match terminal_status {
-                    BridgeWsTerminalStatus::Completed => {
-                        send_msg(
-                            socket,
-                            &WsServerMessage::RunFinished {
-                                run_id,
-                                status: STATUS_COMPLETED.to_string(),
-                                error: None,
-                            },
-                        )
-                        .await;
-                    }
-                    BridgeWsTerminalStatus::Cancelled => {
-                        send_msg(
-                            socket,
-                            &WsServerMessage::RunFinished {
-                                run_id,
-                                status: STATUS_CANCELLED.to_string(),
-                                error: None,
-                            },
-                        )
-                        .await;
-                    }
-                    BridgeWsTerminalStatus::Failed(error) => {
-                        send_msg(
-                            socket,
-                            &WsServerMessage::RunFinished {
-                                run_id,
-                                status: STATUS_FAILED.to_string(),
-                                error,
-                            },
-                        )
-                        .await;
-                    }
-                    BridgeWsTerminalStatus::Disconnected => {}
-                }
-            }
-            conn.active_run_id = None;
-            conn.bridge_prepared_run_id = None;
-        }
-        Err((status, error)) => {
-            let run_started_explain = bridge_run_started_explain(explain);
-            let error_message = format!("Bridge error: {error}");
-            let messages = bridge_forward_error_messages(
-                conn,
-                prepared_trusted_session_id.as_deref(),
-                prepared_turn_chain_id.as_deref(),
-                run_started_explain.as_ref(),
-                status,
-                error_message,
-            );
-            for message in &messages {
-                send_msg(socket, message).await;
-            }
-            conn.active_run_id = None;
-            conn.bridge_prepared_run_id = None;
-        }
-    }
-}
-
+#[cfg(test)]
 fn should_adopt_stream_run_id(conn: &WsConnection, run_id: &str) -> bool {
     conn.active_run_id.is_none()
         || (conn.bridge_prepared_run_id.as_deref() == conn.active_run_id.as_deref()
             && conn.active_run_id.as_deref() != Some(run_id))
 }
 
+#[cfg(test)]
 fn sync_conn_state_from_stream_event(
     conn: &mut WsConnection,
     event: &Value,
@@ -1848,6 +1610,7 @@ fn sync_conn_state_from_stream_event(
     None
 }
 
+#[cfg(test)]
 fn synthetic_bridge_run_started(
     conn: &WsConnection,
     adopted_run_id: Option<(String, bool)>,
@@ -1868,6 +1631,7 @@ fn synthetic_bridge_run_started(
     })
 }
 
+#[cfg(test)]
 fn bridge_run_started_explain(explain: bool) -> Option<Value> {
     explain.then(|| serde_json::json!({"mode": "background"}))
 }
@@ -1876,6 +1640,7 @@ fn session_info_message(session_id: String, run_id: Option<String>) -> WsServerM
     WsServerMessage::SessionInfo { session_id, run_id }
 }
 
+#[cfg(test)]
 fn bind_prepared_bridge_identity(
     conn: &mut WsConnection,
     trusted_session_id: Option<&str>,
@@ -1891,6 +1656,7 @@ fn bind_prepared_bridge_identity(
     Some((session_id, run_id))
 }
 
+#[cfg(test)]
 fn bridge_run_started_message(
     session_id: String,
     run_id: String,
@@ -1903,6 +1669,7 @@ fn bridge_run_started_message(
     }
 }
 
+#[cfg(test)]
 fn bridge_success_preamble_messages(
     conn: &mut WsConnection,
     trusted_session_id: Option<&str>,
@@ -1921,6 +1688,7 @@ fn bridge_success_preamble_messages(
     }
 }
 
+#[cfg(test)]
 fn bridge_forward_error_messages(
     conn: &mut WsConnection,
     trusted_session_id: Option<&str>,
@@ -1951,6 +1719,7 @@ fn bridge_forward_error_messages(
     }
 }
 
+#[cfg(test)]
 fn should_suppress_initial_bridge_session_info(
     suppress_session_info: &mut bool,
     event: &Value,
@@ -1963,7 +1732,9 @@ fn should_suppress_initial_bridge_session_info(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum BridgeWsTerminalStatus {
     Completed,
     Cancelled,
@@ -1971,6 +1742,7 @@ enum BridgeWsTerminalStatus {
     Disconnected,
 }
 
+#[cfg(test)]
 fn bridge_ws_terminal_status(
     saw_turn_complete: bool,
     terminal_error: Option<String>,
@@ -1984,12 +1756,14 @@ fn bridge_ws_terminal_status(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ProcessedBridgeStreamEvent {
     pre_messages: Vec<WsServerMessage>,
     raw_event: Option<Value>,
 }
 
+#[cfg(test)]
 fn process_bridge_stream_event(
     conn: &mut WsConnection,
     event: Value,
@@ -2031,90 +1805,8 @@ fn process_bridge_stream_event(
     }
 }
 
-async fn forward_bridge_stream_event(
-    socket: &mut WebSocket,
-    conn: &mut WsConnection,
-    event: Value,
-    cancel: Option<&Arc<CancellationToken>>,
-    run_started_explain: Option<&Value>,
-    suppress_initial_session_info: &mut bool,
-    saw_turn_complete: &mut bool,
-    terminal_error: &mut Option<String>,
-) -> Result<(), BridgeWsTerminalStatus> {
-    let processed = process_bridge_stream_event(
-        conn,
-        event,
-        run_started_explain,
-        suppress_initial_session_info,
-        saw_turn_complete,
-        terminal_error,
-    );
-
-    for message in processed.pre_messages {
-        send_msg(socket, &message).await;
-    }
-
-    let Some(raw_event) = processed.raw_event else {
-        return Ok(());
-    };
-
-    let text = match serde_json::to_string(&raw_event) {
-        Ok(s) => s,
-        Err(e) => {
-            let message = format!("Failed to serialize event: {e}");
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: message.clone(),
-                    code: "INTERNAL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
-            *terminal_error = Some(message.clone());
-            if let Some(t) = cancel {
-                t.cancel();
-            }
-            return Err(BridgeWsTerminalStatus::Failed(Some(message)));
-        }
-    };
-
-    send_bridge_frame_or_cancel(socket, text, cancel).await
-}
-
-async fn send_bridge_frame_or_cancel(
-    socket: &mut WebSocket,
-    text: String,
-    cancel: Option<&Arc<CancellationToken>>,
-) -> Result<(), BridgeWsTerminalStatus> {
-    if ws_text_frame_exceeds_limit(&text) {
-        let message = "Bridge event exceeded size limit".to_string();
-        send_msg(
-            socket,
-            &WsServerMessage::Error {
-                message: message.clone(),
-                code: "INTERNAL_ERROR".into(),
-                retryable: false,
-            },
-        )
-        .await;
-        if let Some(t) = cancel {
-            t.cancel();
-        }
-        return Err(BridgeWsTerminalStatus::Failed(Some(message)));
-    }
-
-    if socket.send(Message::Text(text.into())).await.is_err() {
-        if let Some(t) = cancel {
-            t.cancel();
-        }
-        return Err(BridgeWsTerminalStatus::Disconnected);
-    }
-
-    Ok(())
-}
-
 /// Apply optional prepared headers to bridge request.
+#[cfg(test)]
 fn apply_prepared_headers(
     headers: &mut HeaderMap,
     prepared: &bridge_prep::PreparedChatTurnBridgeRequest,
@@ -2143,280 +1835,6 @@ fn apply_prepared_headers(
             HeaderValue::from_static(if changed { "1" } else { "0" }),
         );
     }
-}
-
-/// Parse one blank-line SSE block into JSON values for WebSocket forwarding.
-/// Validates `data:` JSON lines; if the block has no `data:` events, accepts a single raw `{...}` payload (HTTP bridge compatibility).
-fn ws_json_events_from_sse_block(block: &str) -> Result<Vec<Value>, String> {
-    crate::turn::sse_data_lines::validate_sse_event_block_json(block)?;
-    let mut events = crate::turn::sse_data_lines::json_events_from_sse_event_block(block).events;
-    if events.is_empty() {
-        let t = block.trim();
-        if t.starts_with('{')
-            && let Ok(v) = serde_json::from_str::<Value>(t)
-        {
-            events.push(v);
-        }
-    }
-    Ok(events)
-}
-
-/// Convert SSE response from bridge into WebSocket text frames.
-///
-/// The bridge returns `text/event-stream` format: `data: {json}\n\n`.
-/// Streams the HTTP body so client disconnect stops in-process LLM work promptly
-/// (via [`CancellationToken`] passed into [`crate::turn::bridge_inprocess::InProcessChatTurnBridge::forward`]).
-async fn stream_sse_response_as_ws(
-    socket: &mut WebSocket,
-    state: &AppState,
-    conn: &mut WsConnection,
-    response: Response,
-    cancel: Option<Arc<CancellationToken>>,
-    run_started_explain: Option<Value>,
-    suppress_initial_session_info: bool,
-) -> BridgeWsTerminalStatus {
-    let (_parts, body) = response.into_parts();
-    let mut stream = body.into_data_stream();
-    let mut sse_in = crate::turn::sse_blocks::SseBlankLineUtf8Buf::new();
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut saw_turn_complete = false;
-    let mut terminal_error: Option<String> = None;
-    let mut suppress_initial_session_info = suppress_initial_session_info;
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = async {
-                if let Some(t) = cancel.as_ref() {
-                    t.cancelled().await;
-                }
-            }, if cancel.is_some() => {
-                astra_core::agent_warn!("ws", "bridge response stream cancelled");
-                return BridgeWsTerminalStatus::Cancelled;
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<WsClientMessage>(&text) {
-                            Ok(WsClientMessage::CancelRun { run_id }) => {
-                                if conn.active_run_id.as_deref() == Some(run_id.as_str())
-                                    || conn.bridge_prepared_run_id.as_deref() == Some(run_id.as_str())
-                                {
-                                    let effective_run_id = conn
-                                        .active_run_id
-                                        .clone()
-                                        .unwrap_or_else(|| run_id.clone());
-                                    if let Some(t) = cancel.as_ref() {
-                                        t.cancel();
-                                    }
-                                    send_msg(
-                                        socket,
-                                        &WsServerMessage::RunCancelled { run_id: effective_run_id },
-                                    )
-                                    .await;
-                                    return BridgeWsTerminalStatus::Cancelled;
-                                } else {
-                                    handle_cancel_run(socket, state, conn, &run_id).await;
-                                }
-                            }
-                            Ok(WsClientMessage::PauseRun { .. })
-                            | Ok(WsClientMessage::ResumeRun { .. }) => {
-                                send_msg(
-                                    socket,
-                                    &WsServerMessage::Error {
-                                        message: "Pause and resume are not supported for bridge fallback runs".into(),
-                                        code: "NOT_SUPPORTED".into(),
-                                        retryable: false,
-                                    },
-                                )
-                                .await;
-                            }
-                            Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
-                                handle_tool_approval(state, conn, &request_id, approved, reason).await;
-                            }
-                            Ok(WsClientMessage::UserPrompt {
-                                request_id,
-                                answer,
-                                was_custom,
-                            }) => {
-                                handle_user_prompt_response(
-                                    state,
-                                    conn,
-                                    &request_id,
-                                    answer,
-                                    was_custom,
-                                )
-                                .await;
-                            }
-                            Ok(WsClientMessage::Ping) => {
-                                send_msg(socket, &WsServerMessage::Pong).await;
-                            }
-                            Ok(WsClientMessage::ChatMessage { .. }) => {
-                                send_msg(
-                                    socket,
-                                    &WsServerMessage::Error {
-                                        message: "Run already in progress".into(),
-                                        code: "RUN_ACTIVE".into(),
-                                        retryable: false,
-                                    },
-                                )
-                                .await;
-                            }
-                            Ok(WsClientMessage::Auth { .. }) => {
-                                send_msg(
-                                    socket,
-                                    &WsServerMessage::Error {
-                                        message: "Already authenticated".into(),
-                                        code: "AUTH_ERROR".into(),
-                                        retryable: false,
-                                    },
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                send_msg(
-                                    socket,
-                                    &WsServerMessage::Error {
-                                        message: format!("Invalid message: {e}"),
-                                        code: "VALIDATION_ERROR".into(),
-                                        retryable: false,
-                                    },
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
-                            if let Some(t) = cancel.as_ref() {
-                                t.cancel();
-                            }
-                            return BridgeWsTerminalStatus::Disconnected;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        if let Some(t) = cancel.as_ref() {
-                            t.cancel();
-                        }
-                        return BridgeWsTerminalStatus::Disconnected;
-                    }
-                    Some(Ok(_)) => {}
-                }
-            }
-            _ = heartbeat.tick() => {
-                if socket.send(Message::Ping(vec![].into())).await.is_err() {
-                    if let Some(t) = cancel.as_ref() {
-                        t.cancel();
-                    }
-                    return BridgeWsTerminalStatus::Disconnected;
-                }
-            }
-            next = stream.next() => {
-                match next {
-                    None => break,
-                    Some(Ok(chunk)) => {
-                        for block in sse_in.push_lossy_bytes(&chunk) {
-                            let events = match ws_json_events_from_sse_block(&block) {
-                                Ok(e) => e,
-                                Err(m) => {
-                                    send_msg(
-                                        socket,
-                                        &WsServerMessage::Error {
-                                            message: m.clone(),
-                                            code: "PROTOCOL_ERROR".into(),
-                                            retryable: false,
-                                        },
-                                    )
-                                    .await;
-                                    terminal_error = Some(m);
-                                    if let Some(t) = cancel.as_ref() {
-                                        t.cancel();
-                                    }
-                                    return BridgeWsTerminalStatus::Failed(terminal_error);
-                                }
-                            };
-                            for event in events {
-                                if let Err(status) =
-                                    forward_bridge_stream_event(
-                                        socket,
-                                        conn,
-                                        event,
-                                        cancel.as_ref(),
-                                        run_started_explain.as_ref(),
-                                        &mut suppress_initial_session_info,
-                                        &mut saw_turn_complete,
-                                        &mut terminal_error,
-                                    )
-                                    .await
-                                {
-                                    return status;
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        let message = format!("Failed to read bridge response: {e}");
-                        send_msg(
-                            socket,
-                            &WsServerMessage::Error {
-                                message: message.clone(),
-                                code: "INTERNAL_ERROR".into(),
-                                retryable: false,
-                            },
-                        )
-                        .await;
-                        terminal_error = Some(message);
-                        if let Some(t) = cancel.as_ref() {
-                            t.cancel();
-                        }
-                        return BridgeWsTerminalStatus::Failed(terminal_error);
-                    }
-                }
-            }
-        }
-    }
-
-    let tail = sse_in.into_inner();
-    if !tail.trim().is_empty() {
-        match ws_json_events_from_sse_block(&tail) {
-            Ok(events) => {
-                for event in events {
-                    if let Err(status) = forward_bridge_stream_event(
-                        socket,
-                        conn,
-                        event,
-                        cancel.as_ref(),
-                        run_started_explain.as_ref(),
-                        &mut suppress_initial_session_info,
-                        &mut saw_turn_complete,
-                        &mut terminal_error,
-                    )
-                    .await
-                    {
-                        return status;
-                    }
-                }
-            }
-            Err(m) => {
-                send_msg(
-                    socket,
-                    &WsServerMessage::Error {
-                        message: m.clone(),
-                        code: "PROTOCOL_ERROR".into(),
-                        retryable: false,
-                    },
-                )
-                .await;
-                terminal_error = Some(m);
-                if let Some(t) = cancel.as_ref() {
-                    t.cancel();
-                }
-            }
-        }
-    }
-
-    bridge_ws_terminal_status(saw_turn_complete, terminal_error)
 }
 
 /// Send a typed server message as a WebSocket text frame.
