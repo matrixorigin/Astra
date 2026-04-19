@@ -2121,6 +2121,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
             let mut full_text = String::new();
             let mut all_round_tool_calls: Vec<Value> = Vec::new();
+            // Track (start_index, count) per round for post-hoc round assignment.
+            let mut round_boundaries: Vec<(usize, usize)> = Vec::new();
             let mut reasoning = String::new();
             let mut usage = Map::new();
             let mut resolved_model = model_name.clone();
@@ -2591,6 +2593,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 });
 
                 all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
+                round_boundaries.push((
+                    all_round_tool_calls.len() - loop_tool_calls.len(),
+                    loop_tool_calls.len(),
+                ));
 
                 llm_messages.push(assistant_message_with_tool_calls_and_reasoning(
                     &loop_tool_calls,
@@ -3137,8 +3143,51 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 );
             }
 
-            let tool_call_records =
+            let mut tool_call_records =
                 build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results);
+            // Post-process: assign round and batch_id/parallel from round_boundaries.
+            {
+                // Build tool_call_id → round mapping from boundaries.
+                let mut id_to_round: HashMap<String, u32> = HashMap::new();
+                let mut id_to_count: HashMap<String, usize> = HashMap::new();
+                for (round_idx, (start, count)) in round_boundaries.iter().enumerate() {
+                    for tc in &all_round_tool_calls[*start..*start + *count] {
+                        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            id_to_round.insert(id.to_string(), round_idx as u32);
+                            id_to_count.insert(id.to_string(), *count);
+                        }
+                    }
+                }
+                // Match records to tool_calls by name+position order.
+                // Records are built from tool_results which carry request_id matching tool_call id.
+                for rec in &mut tool_call_records {
+                    // Try to find the round for this record by matching against merged_tool_results.
+                    // The record's args_preview was built from the tool_call's arguments.
+                    // Simplest: iterate tool_calls and match by name order.
+                    for tc in all_round_tool_calls.iter() {
+                        let tc_name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let tc_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        if tc_name == rec.name {
+                            if let Some(&round) = id_to_round.get(tc_id) {
+                                rec.round = Some(round);
+                                if let Some(&count) = id_to_count.get(tc_id) {
+                                    if count > 1 {
+                                        rec.batch_id =
+                                            Some(format!("bridge-r{round}"));
+                                        rec.parallel = Some(true);
+                                    }
+                                }
+                            }
+                            // Remove matched to avoid double-matching same-name tools.
+                            break;
+                        }
+                    }
+                }
+            }
             let verdict_warning = bridge_verdict_events.iter().any(|event| {
                 event.severity.eq_ignore_ascii_case("warning")
                     || event.severity.eq_ignore_ascii_case("critical")

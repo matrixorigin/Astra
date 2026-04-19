@@ -1674,6 +1674,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.status == RunStatus::Cancelled {
                     persist_terminal_state = false;
                     merge_cancelled_run_events(run, events);
+                    // Best-effort flush partial observability events on cancel.
+                    if let Some(buf) = loop_state.turn_event_buffer.as_mut() {
+                        if !buf.is_empty() {
+                            if let Ok(writer) =
+                                astra_services::session_journal::JournalWriter::new(
+                                    &bg_session_id,
+                                )
+                            {
+                                let _ = buf.flush_interrupted(&writer);
+                            }
+                        }
+                    }
                 } else {
                     run.events.extend(events);
                     run.status = final_status;
@@ -1717,6 +1729,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             if persist_terminal_state {
+                // Flush turn observability events to local journal.
+                if let Some(buf) = loop_state.turn_event_buffer.as_mut() {
+                    if !buf.is_empty() {
+                        if let Ok(writer) =
+                            astra_services::session_journal::JournalWriter::new(&bg_session_id)
+                        {
+                            let _ = buf.flush(&writer);
+                        }
+                    }
+                }
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
             }
 
@@ -1880,6 +1902,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let (mut final_events, final_status, error_msg) =
             Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+        // Flush turn observability events to local journal.
+        if let Some(buf) = state.turn_event_buffer.as_mut() {
+            if !buf.is_empty() {
+                if let Ok(writer) =
+                    astra_services::session_journal::JournalWriter::new(&session_id)
+                {
+                    let _ = buf.flush(&writer);
+                }
+            }
+        }
         persist_turn_evaluation_journal(&session_id, "server_runtime", &state);
         let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
         all_events.append(&mut final_events);
@@ -2577,6 +2609,17 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .await;
         persist_turn_evaluation_journal(&config.session_id, "server_subrun", &loop_state);
+
+        // Flush turn observability events to local journal.
+        if let Some(buf) = loop_state.turn_event_buffer.as_mut() {
+            if !buf.is_empty() {
+                if let Ok(writer) =
+                    astra_services::session_journal::JournalWriter::new(&config.session_id)
+                {
+                    let _ = buf.flush(&writer);
+                }
+            }
+        }
 
         // Persist cross-session learning state.
         let active_canary = match loop_state.evolution_service.as_ref() {
