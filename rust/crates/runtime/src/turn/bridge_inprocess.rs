@@ -1062,7 +1062,6 @@ impl InProcessChatTurnBridge {
             };
 
             let mut last_measured_prompt: Option<u64> = None;
-            let bridge_ptl_streak: u32 = 0;
             let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
 
 
@@ -1094,7 +1093,7 @@ impl InProcessChatTurnBridge {
                     &budget,
                     cache_est_round.total_tokens,
                     last_measured_prompt,
-                    bridge_ptl_streak,
+                    0, // single-call proxy: no consecutive context-window errors to track
                 );
                 let mut pruned_tools = prune_tool_schemas(&round_edge_tools, round_tier);
                 annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
@@ -1202,7 +1201,6 @@ impl InProcessChatTurnBridge {
                         Ok(s) => s,
                         Err(e) if crate::turn::llm_client::is_context_window_error(&e.to_lowercase()) => {
                             // Context-window error: force aggressive compaction and retry once
-                            let _ = bridge_ptl_streak.saturating_add(1);
                             astra_core::agent_warn!(
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
