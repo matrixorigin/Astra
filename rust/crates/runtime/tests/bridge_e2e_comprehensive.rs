@@ -3303,3 +3303,1386 @@ async fn session_id_persisted_in_core_events_matches_created_session() {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AREA 1: Unhappy Paths & Exception Scenarios
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Persistence failure: core writer returns Err → PERSIST_FAIL counter increments,
+/// SSE stream still completes normally (fire-and-forget persist).
+#[tokio::test]
+async fn unhappy_core_persist_failure_still_completes_sse() {
+    init_env();
+    let cap = AllCaptures::default();
+    let enc =
+        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
+
+    // Build app with a FAILING core writer
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession))
+        .with_turn_core_event_writer(Arc::new(FailCoreWriter))
+        .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
+        .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
+        .with_turn_session_activity_writer(Arc::new(CapActivityWriter(cap.clone())))
+        .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap.clone())));
+    let bridge = InProcessChatTurnBridge::new(
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
+        enc,
+    )
+    .with_edge_callback_ledger(base.edge_callback_ledger());
+    let app = build_app(
+        base.with_chat_turn_bridge(Arc::new(bridge))
+            .with_chat_turn_bridge_secret("comp-e2e-bridge-secret"),
+    );
+
+    let payload = json!({
+        "agent_id": "fail-core-agent",
+        "messages": [{ "role": "user", "content": "trigger persist fail" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "LLM replies fine." }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK, "SSE stream should still return 200");
+
+    let events = parse_sse_events(&raw);
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(
+        tc.len(),
+        1,
+        "turn_complete still emitted despite persist fail"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Activity should NOT be updated (core persist failed → early return in spawn task)
+    let activity = cap.activity_plans.lock().await;
+    assert!(
+        activity.is_empty(),
+        "activity should not update when core persist fails"
+    );
+}
+
+/// Persistence failure: tool writer returns Err → PERSIST_FAIL counter increments,
+/// but core events still persisted and activity still updated (with reduced count).
+#[tokio::test]
+async fn unhappy_tool_persist_failure_core_still_persists() {
+    init_env();
+    let cap = AllCaptures::default();
+    let enc =
+        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
+
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession))
+        .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
+        .with_turn_tool_event_writer(Arc::new(FailToolWriter))
+        .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
+        .with_turn_session_activity_writer(Arc::new(CapActivityWriter(cap.clone())))
+        .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap.clone())));
+    let bridge = InProcessChatTurnBridge::new(
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
+        enc,
+    )
+    .with_edge_callback_ledger(base.edge_callback_ledger());
+    let app = build_app(
+        base.with_chat_turn_bridge(Arc::new(bridge))
+            .with_chat_turn_bridge_secret("comp-e2e-bridge-secret"),
+    );
+
+    let payload = json!({
+        "agent_id": "fail-tool-agent",
+        "messages": [{ "role": "user", "content": "trigger tool persist fail" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-fail-1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Core events persisted OK (uses CapCoreWriter, not FailToolWriter)
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "core events should still persist");
+
+    // Activity still updated but with only core event count (tool persist failed)
+    let activity = cap.activity_plans.lock().await;
+    assert!(
+        !activity.is_empty(),
+        "activity should still update (core succeeded)"
+    );
+}
+
+/// Empty user content + empty LLM response → no core events persisted, no activity update
+#[tokio::test]
+async fn unhappy_empty_content_both_sides_no_persist() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // No user message content, empty LLM text, no tool calls
+    let payload = json!({
+        "agent_id": "empty-agent",
+        "messages": [],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "" }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1, "turn_complete still emitted");
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    // should_persist_llm = false (empty text + no tool_calls), user_query_event = None (no user content)
+    if !core.is_empty() {
+        let plan = &core[0];
+        assert!(plan.user_query_event.is_none(), "no user query to persist");
+        assert!(
+            plan.llm_response_event.is_none(),
+            "empty LLM text + no tools → no llm_response"
+        );
+    }
+}
+
+/// Activity writer failure: core + tool succeed but activity update fails → PERSIST_FAIL
+#[tokio::test]
+async fn unhappy_activity_writer_failure() {
+    init_env();
+    let cap = AllCaptures::default();
+    let enc =
+        Arc::new(FernetTokenEncryptor::new("comp-e2e-fernet-key-32chars!").expect("fernet key"));
+
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession))
+        .with_turn_core_event_writer(Arc::new(CapCoreWriter(cap.clone())))
+        .with_turn_tool_event_writer(Arc::new(CapToolWriter(cap.clone())))
+        .with_turn_auxiliary_event_writer(Arc::new(CapAuxWriter(cap.clone())))
+        .with_turn_session_activity_writer(Arc::new(FailActivityWriter))
+        .with_turn_hook_db_writer(Arc::new(CapHookWriter(cap.clone())));
+    let bridge = InProcessChatTurnBridge::new(
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
+        enc,
+    )
+    .with_edge_callback_ledger(base.edge_callback_ledger());
+    let app = build_app(
+        base.with_chat_turn_bridge(Arc::new(bridge))
+            .with_chat_turn_bridge_secret("comp-e2e-bridge-secret"),
+    );
+
+    let payload = json!({
+        "agent_id": "fail-activity-agent",
+        "messages": [{ "role": "user", "content": "activity will fail" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "Response OK." }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Core events persisted OK despite activity failure
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "core events should still persist");
+}
+
+/// Continuation with empty tool_results array is treated as initial call, not continuation
+#[tokio::test]
+async fn unhappy_empty_tool_results_not_continuation() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "empty-tr-agent",
+        "messages": [{ "role": "user", "content": "with empty tool_results" }],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [],
+        "test_llm_rounds": [{ "full_text": "Treated as initial." }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty());
+    let plan = &core[0];
+    // Empty tool_results → is_continuation = false → user_query persisted
+    assert!(
+        plan.user_query_event.is_some(),
+        "empty tool_results = not continuation → user_query persisted"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AREA 2: Data Synchronization
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Event ordering: user_query event_id < llm_response event_id (UUID v7 time-ordered)
+#[tokio::test]
+async fn sync_event_ids_monotonically_increasing() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "ordering-agent",
+        "messages": [{ "role": "user", "content": "check ordering" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "ordered",
+            "tool_calls": [tool_call("tc-ord-1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty());
+    let plan = &core[0];
+
+    let uq = plan.user_query_event.as_ref().expect("user_query exists");
+    let lr = plan
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response exists");
+
+    // UUID v7 is time-ordered → user_query_event_id < llm_response_event_id
+    assert!(
+        uq.event_id < lr.event_id,
+        "user_query event_id ({}) should be < llm_response event_id ({}) (UUID v7 ordering)",
+        uq.event_id,
+        lr.event_id
+    );
+
+    // Tool events should also have monotonically increasing IDs
+    let tools = cap.tool_plans.lock().await;
+    if !tools.is_empty() {
+        let tool_events = &tools[0].events;
+        for window in tool_events.windows(2) {
+            assert!(
+                window[0].event_id < window[1].event_id,
+                "tool event IDs should be monotonically increasing"
+            );
+        }
+        // First tool event should be after llm_response
+        assert!(
+            lr.event_id < tool_events[0].event_id,
+            "tool event should be after llm_response"
+        );
+    }
+}
+
+/// Core, tool, and activity writes all reference same session_id
+#[tokio::test]
+async fn sync_all_writers_same_session_id() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "sync-sid-agent",
+        "messages": [{ "role": "user", "content": "sync check" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-sync-1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let expected_sid = "s-comp-created"; // From StubSession
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty());
+    let plan = &core[0];
+    if let Some(ref uq) = plan.user_query_event {
+        assert_eq!(uq.session_id, expected_sid);
+    }
+    if let Some(ref lr) = plan.llm_response_event {
+        assert_eq!(lr.session_id, expected_sid);
+    }
+
+    let tools = cap.tool_plans.lock().await;
+    if !tools.is_empty() {
+        for ev in &tools[0].events {
+            assert_eq!(ev.session_id, expected_sid, "tool event session_id");
+        }
+    }
+
+    let activity = cap.activity_plans.lock().await;
+    if !activity.is_empty() {
+        assert_eq!(activity[0].0, expected_sid, "activity session_id");
+    }
+
+    let aux = cap.aux_events.lock().await;
+    for ev in aux.iter() {
+        assert_eq!(ev.session_id, expected_sid, "auxiliary event session_id");
+    }
+}
+
+/// Activity event_count_increment matches actual persisted event count
+#[tokio::test]
+async fn sync_activity_count_matches_persisted_events() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "count-agent",
+        "messages": [{ "role": "user", "content": "count me" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "test_llm_rounds": [{
+            "full_text": "found it",
+            "tool_calls": [
+                tool_call("tc-c1", "read_file", json!({"path": "a.txt"})),
+                tool_call("tc-c2", "grep", json!({"path": "b.txt"}))
+            ]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let core = cap.core_plans.lock().await;
+    let plan = &core[0];
+    let core_count =
+        plan.user_query_event.is_some() as usize + plan.llm_response_event.is_some() as usize;
+
+    let tools = cap.tool_plans.lock().await;
+    let tool_count = if !tools.is_empty() {
+        tools[0].events.len()
+    } else {
+        0
+    };
+
+    let activity = cap.activity_plans.lock().await;
+    assert!(!activity.is_empty());
+    let increment = activity[0].1.event_count_increment;
+
+    // Increment should be core_count + tool_count
+    assert_eq!(
+        increment,
+        core_count + tool_count,
+        "activity increment ({increment}) should equal core({core_count}) + tool({tool_count})"
+    );
+}
+
+/// Causal chain consistency: all events in a turn share the same causal_chain_id
+#[tokio::test]
+async fn sync_causal_chain_consistent_within_turn() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "chain-agent",
+        "messages": [{ "role": "user", "content": "causal chain check" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "chained",
+            "tool_calls": [tool_call("tc-chain-1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Collect all causal_chain_ids
+    let core = cap.core_plans.lock().await;
+    let plan = &core[0];
+    let mut chain_ids = Vec::new();
+    if let Some(ref uq) = plan.user_query_event {
+        chain_ids.push(uq.causal_chain_id.clone());
+    }
+    if let Some(ref lr) = plan.llm_response_event {
+        chain_ids.push(lr.causal_chain_id.clone());
+    }
+
+    let tools = cap.tool_plans.lock().await;
+    if !tools.is_empty() {
+        for ev in &tools[0].events {
+            chain_ids.push(ev.causal_chain_id.clone());
+        }
+    }
+
+    let aux = cap.aux_events.lock().await;
+    for ev in aux.iter() {
+        chain_ids.push(ev.causal_chain_id.clone());
+    }
+
+    assert!(chain_ids.len() >= 2, "should have at least 2 events");
+    let first = &chain_ids[0];
+    for (i, cid) in chain_ids.iter().enumerate() {
+        assert_eq!(
+            cid, first,
+            "event {i} chain_id ({cid}) must equal first ({first})"
+        );
+    }
+}
+
+/// Parent event links: llm_response → user_query, tool_calls → user_query
+#[tokio::test]
+async fn sync_parent_event_links_correct() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "parent-agent",
+        "messages": [{ "role": "user", "content": "parent link check" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "linked",
+            "tool_calls": [tool_call("tc-par-1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let core = cap.core_plans.lock().await;
+    let plan = &core[0];
+    let uq = plan.user_query_event.as_ref().expect("user_query exists");
+    let lr = plan
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response exists");
+
+    // user_query has no parent
+    assert!(uq.parent_event_id.is_none(), "user_query has no parent");
+    assert!(
+        uq.parent_event_ids.is_empty(),
+        "user_query has empty parent_event_ids"
+    );
+
+    // llm_response parent = user_query event_id
+    assert_eq!(
+        lr.parent_event_id.as_deref(),
+        Some(uq.event_id.as_str()),
+        "llm_response parent should be user_query"
+    );
+    assert_eq!(lr.parent_event_ids, vec![uq.event_id.clone()]);
+
+    // Tool events parent = user_query event_id
+    let tools = cap.tool_plans.lock().await;
+    if !tools.is_empty() {
+        for ev in &tools[0].events {
+            assert_eq!(
+                ev.parent_event_id.as_deref(),
+                Some(uq.event_id.as_str()),
+                "tool event parent should be user_query"
+            );
+            assert_eq!(ev.parent_event_ids, vec![uq.event_id.clone()]);
+        }
+    }
+
+    // Auxiliary events parent = user_query event_id
+    let aux = cap.aux_events.lock().await;
+    for ev in aux.iter() {
+        assert_eq!(
+            ev.parent_event_id.as_deref(),
+            Some(uq.event_id.as_str()),
+            "auxiliary event parent should be user_query"
+        );
+    }
+}
+
+/// Activity last_event_id = llm_response event_id (or user_query if no llm_response)
+#[tokio::test]
+async fn sync_activity_last_event_id_correct() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "last-eid-agent",
+        "messages": [{ "role": "user", "content": "check last event id" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "some response" }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let core = cap.core_plans.lock().await;
+    let plan = &core[0];
+    let lr = plan
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response exists");
+
+    let activity = cap.activity_plans.lock().await;
+    assert!(!activity.is_empty());
+    let last_eid = activity[0].1.last_event_id.as_deref().unwrap();
+    assert_eq!(
+        last_eid, lr.event_id,
+        "activity last_event_id should be llm_response event_id"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AREA 3: Session State — Traceable, Forkable, Turn Ordering
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Helper: chat_turn with custom headers for causal chain testing
+async fn chat_turn_with_headers(
+    app: &Router,
+    payload: Value,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET);
+    for (k, v) in extra_headers {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::from(payload.to_string())).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let st = resp.status();
+    let bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (st, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Multi-turn: initial call → continuation → continuation reuses cached
+/// causal_chain_id (bridge_prep resolves from cache for tool_result turns)
+#[tokio::test]
+async fn session_multi_turn_causal_chain_propagation() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: Initial call with tool calls
+    let payload1 = json!({
+        "agent_id": "mt-chain-agent",
+        "messages": [{ "role": "user", "content": "turn 1" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-mt1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload1).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Turn 2: Continuation with tool results — last message is assistant (not user)
+    // bridge_prep reuses cached chain_id when has_tool_results && latest_role != "user"
+    let payload2 = json!({
+        "agent_id": "mt-chain-agent",
+        "messages": [
+            { "role": "user", "content": "turn 1" },
+            { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-mt1", "read_file", json!({"path": "a.txt"}))] },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-mt1", "content": "file contents" }],
+        "test_llm_rounds": [{ "full_text": "Final answer." }]
+    });
+    let (st2, _) = chat_turn(&app, payload2).await;
+    assert_eq!(st2, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(core.len() >= 2, "should have 2 core persist calls");
+
+    // Turn 1: has user_query (not continuation)
+    let turn1 = &core[0];
+    assert!(
+        turn1.user_query_event.is_some(),
+        "turn 1 should persist user_query"
+    );
+
+    // Turn 2: no user_query (is continuation)
+    let turn2 = &core[1];
+    assert!(
+        turn2.user_query_event.is_none(),
+        "turn 2 (continuation) should skip user_query"
+    );
+
+    // Both turns should share the same causal_chain_id (reused from cache)
+    let chain1 = turn1
+        .llm_response_event
+        .as_ref()
+        .or(turn1.user_query_event.as_ref())
+        .map(|e| e.causal_chain_id.as_str())
+        .expect("turn 1 has events");
+    let chain2 = turn2
+        .llm_response_event
+        .as_ref()
+        .map(|e| e.causal_chain_id.as_str())
+        .expect("turn 2 has llm_response");
+    assert_eq!(
+        chain1, chain2,
+        "continuation should reuse the same causal_chain_id from cache"
+    );
+}
+
+/// Forkable session: continuation reuses user_query_event_id from cache →
+/// all events across turns trace back to same original user query
+#[tokio::test]
+async fn session_fork_trace_user_query_event_id() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: tool call (new user query → generates fresh IDs, cached)
+    let p1 = json!({
+        "agent_id": "fork-agent",
+        "messages": [{ "role": "user", "content": "fork test" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-fork1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+    let (st, _) = chat_turn(&app, p1).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Turn 2: continuation (tool_results + last msg is assistant → reuse cached IDs)
+    let p2 = json!({
+        "agent_id": "fork-agent",
+        "messages": [
+            { "role": "user", "content": "fork test" },
+            { "role": "assistant", "content": "", "tool_calls": [tool_call("tc-fork1", "read_file", json!({"path": "a.txt"}))] },
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "tool_results": [{ "tool_call_id": "tc-fork1", "content": "data" }],
+        "test_llm_rounds": [{ "full_text": "Done." }]
+    });
+    let (st2, _) = chat_turn(&app, p2).await;
+    assert_eq!(st2, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(core.len() >= 2);
+
+    // Turn 1: user_query_event has a generated ID
+    let uq = core[0]
+        .user_query_event
+        .as_ref()
+        .expect("turn1 has user_query");
+    let original_uq_eid = &uq.event_id;
+
+    // Turn 1: llm_response parent = user_query event_id
+    if let Some(ref lr) = core[0].llm_response_event {
+        assert_eq!(
+            lr.parent_event_id.as_deref(),
+            Some(original_uq_eid.as_str()),
+            "turn 1 llm_response parent = user_query"
+        );
+    }
+
+    // Turn 2: continuation still references same user_query_event_id as parent
+    // (bridge_prep caches and reuses it for continuation turns)
+    if let Some(ref lr) = core[1].llm_response_event {
+        assert_eq!(
+            lr.parent_event_id.as_deref(),
+            Some(original_uq_eid.as_str()),
+            "continuation llm_response still points to original user_query"
+        );
+    }
+}
+
+/// Turn content accuracy: persisted content matches what was sent/returned
+#[tokio::test]
+async fn session_turn_content_accuracy() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let user_msg = "What is the meaning of life?";
+    let llm_response = "The meaning of life is 42.";
+    let reasoning_text = "Thinking deeply about philosophy...";
+
+    let payload = json!({
+        "agent_id": "accuracy-agent",
+        "messages": [{ "role": "user", "content": user_msg }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": llm_response,
+            "reasoning": reasoning_text,
+            "usage": { "prompt": 100, "completion": 50, "total": 150 }
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty());
+    let plan = &core[0];
+
+    let uq = plan.user_query_event.as_ref().expect("user_query");
+    assert_eq!(uq.content, user_msg, "persisted user content must match");
+    assert_eq!(uq.event_type, "user_query");
+
+    let lr = plan.llm_response_event.as_ref().expect("llm_response");
+    assert_eq!(lr.content, llm_response, "persisted llm content must match");
+    assert_eq!(lr.event_type, "llm_response");
+    assert_eq!(
+        lr.reasoning_content.as_deref(),
+        Some(reasoning_text),
+        "reasoning must be persisted"
+    );
+    assert!(lr.token_usage.is_some(), "token usage must be persisted");
+    let usage = lr.token_usage.as_ref().unwrap();
+    assert_eq!(usage.get("prompt").and_then(Value::as_i64), Some(100));
+    assert_eq!(usage.get("completion").and_then(Value::as_i64), Some(50));
+}
+
+/// Multi-turn: event_ids across turns are unique (no duplicates)
+#[tokio::test]
+async fn session_event_ids_unique_across_turns() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    for i in 0..3 {
+        let payload = json!({
+            "agent_id": "uniq-eid-agent",
+            "messages": [{ "role": "user", "content": format!("turn {i}") }],
+            "edge_tools": [tool_schema("read_file")],
+            "test_llm_rounds": [{
+                "full_text": format!("response {i}"),
+                "tool_calls": [tool_call(&format!("tc-uniq-{i}"), "read_file", json!({"path": "a.txt"}))]
+            }]
+        });
+        let (st, _) = chat_turn(&app, payload).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mut all_eids = std::collections::HashSet::new();
+
+    let core = cap.core_plans.lock().await;
+    for plan in core.iter() {
+        if let Some(ref uq) = plan.user_query_event {
+            assert!(
+                all_eids.insert(uq.event_id.clone()),
+                "duplicate event_id: {}",
+                uq.event_id
+            );
+        }
+        if let Some(ref lr) = plan.llm_response_event {
+            assert!(
+                all_eids.insert(lr.event_id.clone()),
+                "duplicate event_id: {}",
+                lr.event_id
+            );
+        }
+    }
+
+    let tools = cap.tool_plans.lock().await;
+    for plan in tools.iter() {
+        for ev in &plan.events {
+            assert!(
+                all_eids.insert(ev.event_id.clone()),
+                "duplicate tool event_id: {}",
+                ev.event_id
+            );
+        }
+    }
+
+    assert!(
+        all_eids.len() >= 9,
+        "should have at least 9 unique event_ids across 3 turns (3×uq + 3×lr + 3×tool_call)"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AREA 4: Explain/Trace Events
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// explain: true in payload → SSE explain event emitted with timing/token/tool info
+#[tokio::test]
+async fn explain_event_emitted_with_metadata() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "explain-agent",
+        "messages": [{ "role": "user", "content": "explain me" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Here's the explanation.",
+            "usage": { "prompt": 200, "completion": 80, "total": 280 },
+            "tool_calls": [tool_call("tc-exp1", "read_file", json!({"path": "a.txt"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let explain_events = events_of_type(&events, "explain");
+    assert_eq!(
+        explain_events.len(),
+        1,
+        "should emit exactly 1 explain event"
+    );
+
+    let ex = explain_events[0];
+    // Timing
+    assert!(
+        ex.get("total_ms").and_then(Value::as_i64).unwrap_or(-1) >= 0,
+        "total_ms should be non-negative"
+    );
+    // Token counts
+    assert_eq!(ex.get("prompt_tokens").and_then(Value::as_i64), Some(200));
+    assert_eq!(
+        ex.get("completion_tokens").and_then(Value::as_i64),
+        Some(80)
+    );
+    // Tool info
+    assert_eq!(
+        ex.get("tools_selected").and_then(Value::as_i64),
+        Some(1),
+        "1 tool call"
+    );
+    assert_eq!(
+        ex.get("tools_available").and_then(Value::as_i64),
+        Some(2),
+        "2 tools available"
+    );
+    // Tool selection detail
+    let selection = ex.get("tool_selection").expect("tool_selection present");
+    assert_eq!(
+        selection.get("name").and_then(Value::as_str),
+        Some("read_file")
+    );
+    // Steps
+    let steps = ex
+        .get("steps")
+        .and_then(Value::as_array)
+        .expect("steps present");
+    assert!(!steps.is_empty(), "should have at least 1 step");
+    assert_eq!(
+        steps[0].get("step").and_then(Value::as_str),
+        Some("llm"),
+        "step type should be 'llm'"
+    );
+    // Routing
+    let routing = ex.get("routing").expect("routing present");
+    assert_eq!(
+        routing.get("router").and_then(Value::as_str),
+        Some("inprocess-default")
+    );
+}
+
+/// explain: false (default) → no explain event emitted
+#[tokio::test]
+async fn explain_event_not_emitted_by_default() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "no-explain-agent",
+        "messages": [{ "role": "user", "content": "no explain" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "Regular response." }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let explain_events = events_of_type(&events, "explain");
+    assert!(
+        explain_events.is_empty(),
+        "explain should NOT be emitted when explain=false/absent"
+    );
+}
+
+/// explain event with no tool calls → tools_selected=0, no tool_selection
+#[tokio::test]
+async fn explain_event_text_only_no_tools() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "explain-notools-agent",
+        "messages": [{ "role": "user", "content": "explain text only" }],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Just text.",
+            "usage": { "prompt": 50, "completion": 20, "total": 70 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let explain_events = events_of_type(&events, "explain");
+    assert_eq!(explain_events.len(), 1);
+    let ex = explain_events[0];
+    assert_eq!(ex.get("tools_selected").and_then(Value::as_i64), Some(0));
+    assert!(
+        ex.get("tool_selection").map_or(true, Value::is_null),
+        "no tool_selection when no tools called"
+    );
+}
+
+/// explain event includes auxiliary_llm_calls with primary_generation info
+#[tokio::test]
+async fn explain_event_auxiliary_llm_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "explain-aux-agent",
+        "messages": [{ "role": "user", "content": "explain with aux" }],
+        "edge_tools": [],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Auxiliary check.",
+            "usage": { "prompt": 300, "completion": 100, "total": 400 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let explain_events = events_of_type(&events, "explain");
+    assert_eq!(explain_events.len(), 1);
+    let ex = explain_events[0];
+
+    let aux_calls = ex
+        .get("auxiliary_llm_calls")
+        .and_then(Value::as_array)
+        .expect("auxiliary_llm_calls present");
+    assert!(!aux_calls.is_empty());
+    assert_eq!(
+        aux_calls[0].get("purpose").and_then(Value::as_str),
+        Some("primary_generation")
+    );
+    assert_eq!(
+        aux_calls[0].get("tokens_in").and_then(Value::as_i64),
+        Some(300)
+    );
+    assert_eq!(
+        aux_calls[0].get("tokens_out").and_then(Value::as_i64),
+        Some(100)
+    );
+}
+
+/// Auxiliary routing_decision event emitted on every turn
+#[tokio::test]
+async fn trace_routing_decision_event_persisted() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "trace-route-agent",
+        "messages": [{ "role": "user", "content": "route decision" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{ "full_text": "Routed." }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let aux = cap.aux_events.lock().await;
+    let routing = aux
+        .iter()
+        .find(|e| e.event_type == "routing_decision")
+        .expect("routing_decision event should exist");
+
+    assert_eq!(routing.session_id, "s-comp-created");
+    assert!(!routing.event_id.is_empty());
+    let content: Value = serde_json::from_str(&routing.content).expect("valid JSON");
+    assert_eq!(
+        content.get("router").and_then(Value::as_str),
+        Some("inprocess-default")
+    );
+    assert_eq!(
+        content.get("intent").and_then(Value::as_str),
+        Some("default")
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AREA 5: Batch Tool Processing (multiple tool calls per round)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Batch: 5 tool calls in single LLM response → all persisted with correct parent
+#[tokio::test]
+async fn batch_five_tools_all_persisted() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "batch5-agent",
+        "messages": [{ "role": "user", "content": "batch 5 tools" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("grep"),
+            tool_schema("list_dir"),
+            tool_schema("find_refs"),
+            tool_schema("symbols")
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-b1", "read_file", json!({"path": "a.txt"})),
+                tool_call("tc-b2", "grep", json!({"pattern": "foo"})),
+                tool_call("tc-b3", "list_dir", json!({"path": "/"})),
+                tool_call("tc-b4", "find_refs", json!({"symbol": "main"})),
+                tool_call("tc-b5", "symbols", json!({"path": "b.rs"}))
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // SSE turn_complete should indicate has_tool_calls
+    let events = parse_sse_events(&raw);
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let tools = cap.tool_plans.lock().await;
+    assert!(!tools.is_empty());
+    let tool_events = &tools[0].events;
+
+    // All 5 tool calls persisted
+    let call_events: Vec<_> = tool_events
+        .iter()
+        .filter(|e| e.event_type == "tool_call")
+        .collect();
+    assert_eq!(call_events.len(), 5, "all 5 tool calls should be persisted");
+
+    // Each has distinct event_id
+    let eids: std::collections::HashSet<_> = call_events.iter().map(|e| &e.event_id).collect();
+    assert_eq!(eids.len(), 5, "each tool call has unique event_id");
+
+    // Each has correct skill_name
+    let skill_names: Vec<_> = call_events
+        .iter()
+        .filter_map(|e| e.skill_name.as_deref())
+        .collect();
+    assert!(skill_names.contains(&"read_file"), "read_file in batch");
+    assert!(skill_names.contains(&"grep"), "grep in batch");
+    assert!(skill_names.contains(&"list_dir"), "list_dir in batch");
+}
+
+/// Batch tool call + continuation: tool results returned, then final text response
+#[tokio::test]
+async fn batch_tool_round_trip_with_results() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Round 1: 3 tool calls
+    let p1 = json!({
+        "agent_id": "batch-rt-agent",
+        "messages": [{ "role": "user", "content": "batch round trip" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("list_dir")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-rt1", "read_file", json!({"path": "a.txt"})),
+                tool_call("tc-rt2", "grep", json!({"pattern": "x"})),
+                tool_call("tc-rt3", "list_dir", json!({"path": "/tmp"}))
+            ]
+        }]
+    });
+    let (st, _) = chat_turn(&app, p1).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Round 2: continuation with 3 tool results
+    let p2 = json!({
+        "agent_id": "batch-rt-agent",
+        "messages": [{ "role": "user", "content": "batch round trip" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("list_dir")],
+        "tool_results": [
+            { "tool_call_id": "tc-rt1", "content": "file: a.txt content" },
+            { "tool_call_id": "tc-rt2", "content": "grep: 3 matches" },
+            { "tool_call_id": "tc-rt3", "content": "list_dir: [a.txt, b.txt]" }
+        ],
+        "test_llm_rounds": [{ "full_text": "Based on the 3 results, here's my answer." }]
+    });
+    let (st2, raw2) = chat_turn(&app, p2).await;
+    assert_eq!(st2, StatusCode::OK);
+
+    let events = parse_sse_events(&raw2);
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false),
+        "final round = text only"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify tool results are persisted in turn 2
+    let tools = cap.tool_plans.lock().await;
+    // Turn 2 tool plan should contain tool_result events
+    let turn2_plans: Vec<_> = tools
+        .iter()
+        .filter(|p| p.events.iter().any(|e| e.event_type == "tool_result"))
+        .collect();
+    assert!(
+        !turn2_plans.is_empty(),
+        "continuation should persist tool_result events"
+    );
+    let results: Vec<_> = turn2_plans[0]
+        .events
+        .iter()
+        .filter(|e| e.event_type == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 3, "3 tool results persisted");
+}
+
+/// Batch: mixed tool calls with different argument structures
+#[tokio::test]
+async fn batch_mixed_tool_argument_types() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "batch-mixed-agent",
+        "messages": [{ "role": "user", "content": "mixed args" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-m1", "read_file", json!({"path": "simple.txt"})),
+                tool_call("tc-m2", "grep", json!({
+                    "pattern": "complex\\.(ts|js)",
+                    "path": "/src",
+                    "include": ["*.ts", "*.js"],
+                    "case_sensitive": false
+                }))
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let tools = cap.tool_plans.lock().await;
+    assert!(!tools.is_empty());
+    let calls: Vec<_> = tools[0]
+        .events
+        .iter()
+        .filter(|e| e.event_type == "tool_call")
+        .collect();
+    assert_eq!(calls.len(), 2, "2 tool calls with different arg structures");
+}
+
+/// Batch: 10 tool calls in single response (high batch count)
+#[tokio::test]
+async fn batch_ten_tools_stress() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let tool_calls: Vec<Value> = (0..10)
+        .map(|i| {
+            tool_call(
+                &format!("tc-stress-{i}"),
+                "read_file",
+                json!({"path": format!("file{i}.txt")}),
+            )
+        })
+        .collect();
+
+    let payload = json!({
+        "agent_id": "batch10-agent",
+        "messages": [{ "role": "user", "content": "10 tools at once" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{ "tool_calls": tool_calls }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(tc.len(), 1);
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let tools = cap.tool_plans.lock().await;
+    assert!(!tools.is_empty());
+    let calls: Vec<_> = tools[0]
+        .events
+        .iter()
+        .filter(|e| e.event_type == "tool_call")
+        .collect();
+    assert_eq!(calls.len(), 10, "all 10 tool calls persisted");
+
+    // Verify event_id ordering
+    for window in calls.windows(2) {
+        assert!(
+            window[0].event_id < window[1].event_id,
+            "tool event_ids should be monotonically increasing"
+        );
+    }
+}
+
+/// Explain event correctly counts batch tool calls
+#[tokio::test]
+async fn batch_explain_counts_all_tools() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "batch-explain-agent",
+        "messages": [{ "role": "user", "content": "batch explain" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("list_dir")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-be1", "read_file", json!({"path": "a.txt"})),
+                tool_call("tc-be2", "grep", json!({"pattern": "foo"})),
+                tool_call("tc-be3", "list_dir", json!({"path": "/"}))
+            ],
+            "usage": { "prompt": 500, "completion": 150, "total": 650 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+    let explain_events = events_of_type(&events, "explain");
+    assert_eq!(explain_events.len(), 1);
+    let ex = explain_events[0];
+    assert_eq!(
+        ex.get("tools_selected").and_then(Value::as_i64),
+        Some(3),
+        "explain should count all 3 batch tool calls"
+    );
+    assert_eq!(
+        ex.get("tools_available").and_then(Value::as_i64),
+        Some(3),
+        "3 tools available"
+    );
+    // First tool is read_file
+    let selection = ex.get("tool_selection").expect("tool_selection present");
+    assert_eq!(
+        selection.get("name").and_then(Value::as_str),
+        Some("read_file"),
+        "tool_selection = first tool in batch"
+    );
+    // Steps should record 3 tool_calls
+    let steps = ex.get("steps").and_then(Value::as_array).expect("steps");
+    assert_eq!(
+        steps[0].get("tool_calls").and_then(Value::as_i64),
+        Some(3),
+        "step records batch tool count"
+    );
+}
+
+// ── Failing writer stubs for unhappy path tests ─────────────────────────────
+
+#[derive(Clone)]
+struct FailCoreWriter;
+#[async_trait]
+impl TurnCoreEventWriter for FailCoreWriter {
+    async fn persist(&self, _plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String> {
+        Err("simulated core persist failure".to_string())
+    }
+}
+
+#[derive(Clone)]
+struct FailToolWriter;
+#[async_trait]
+impl TurnToolEventWriter for FailToolWriter {
+    async fn persist(&self, _plan: TurnToolEventPersistPlan) -> Result<(), String> {
+        Err("simulated tool persist failure".to_string())
+    }
+}
+
+#[derive(Clone)]
+struct FailActivityWriter;
+#[async_trait]
+impl TurnSessionActivityWriter for FailActivityWriter {
+    async fn update_session_activity(
+        &self,
+        _session_id: &str,
+        _plan: SessionActivityUpdatePlan,
+    ) -> Result<(), String> {
+        Err("simulated activity update failure".to_string())
+    }
+}
