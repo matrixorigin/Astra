@@ -436,6 +436,145 @@ impl ServerAgenticLoopHost {
         self.event_tx = Some(tx);
     }
 
+    /// Deliver edge tool calls via the ledger protocol.
+    ///
+    /// For each tool call:
+    /// 1. If approval required: emit `approval_required` SSE → wait on approval ledger
+    /// 2. Emit `tool_request` SSE (so client can execute the tool)
+    /// 3. Wait on tool result ledger (populated by client's `POST /tools/result`)
+    /// 4. Convert result to `EdgeToolExecResult`
+    ///
+    /// Events are streamed incrementally through `event_tx`.
+    async fn deliver_edge_tools_via_ledger(
+        &mut self,
+        tool_calls: &[Value],
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        use astra_turn_core::cloud_tool_delivery::{
+            cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
+            tool_approval_detail_for_delivery, tool_approval_kind_for_delivery,
+            tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
+            wait_tool_result_ledger_for_tool,
+        };
+        use astra_turn_core::headless_tool_assembly::ensure_tool_call_ids;
+        use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+
+        let tool_calls = ensure_tool_call_ids(tool_calls);
+        // 5-minute timeout: web clients may execute long-running tools.
+        let ledger_wait = std::time::Duration::from_secs(300);
+        let mut results = Vec::with_capacity(tool_calls.len());
+
+        for tc in tool_calls.iter() {
+            let tc_map = match tc.as_object() {
+                Some(m) => m,
+                None => continue,
+            };
+            let id = tc_map
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let tool_name = tc_map
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let args = tc_map
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            // Approval gate.
+            if cloud_tool_requires_approval_for_delivery(tc) {
+                let path = tool_path_hint_for_delivery(tc);
+                let detail = tool_approval_detail_for_delivery(tc);
+                let kind = tool_approval_kind_for_delivery(tc);
+                let approval_event = astra_turn_core::stream_events::build_approval_required_event(
+                    &id,
+                    &tool_name,
+                    kind,
+                    path.as_deref(),
+                    detail.as_deref(),
+                );
+                self.emit_event(Value::Object(approval_event));
+
+                if let Err(denied) = wait_approval_ledger_for_tool(
+                    &self.edge_callback_ledger,
+                    &self.user_id,
+                    tc,
+                    ledger_wait,
+                    None,
+                )
+                .await
+                {
+                    // Denied or timed out — emit tool_call_end with error, skip.
+                    for m in denied.sse_maps {
+                        self.emit_event(Value::Object(m));
+                    }
+                    results.push(EdgeToolExecResult {
+                        request_id: id,
+                        tool: tool_name,
+                        args,
+                        output: "Tool execution denied or timed out".to_string(),
+                        tool_result_fields: None,
+                        status: "error".to_string(),
+                        duration_ms: 0,
+                    });
+                    continue;
+                }
+            }
+
+            // Emit tool_request SSE (client receives this and executes the tool).
+            let sse_maps = sse_maps_through_tool_request(tc);
+            for m in sse_maps {
+                self.emit_event(Value::Object(m));
+            }
+
+            // Wait for the client to POST the tool result.
+            let started = std::time::Instant::now();
+            let delivery = wait_tool_result_ledger_for_tool(
+                &self.edge_callback_ledger,
+                &self.user_id,
+                tc,
+                ledger_wait,
+            )
+            .await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+
+            // Emit tool_call_end SSE.
+            for m in delivery.sse_maps {
+                self.emit_event(Value::Object(m));
+            }
+
+            // Build EdgeToolExecResult from the ledger response.
+            let output = delivery
+                .tool_messages
+                .first()
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let status = if output.contains("status=error") {
+                "error"
+            } else {
+                "ok"
+            };
+
+            results.push(EdgeToolExecResult {
+                request_id: id,
+                tool: tool_name,
+                args,
+                output,
+                tool_result_fields: None,
+                status: status.to_string(),
+                duration_ms,
+            });
+        }
+
+        results
+    }
+
     /// Build the system prompt from edge context and the tool schemas visible
     /// to the current turn.
     ///
@@ -1127,16 +1266,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }));
         }
 
-        // ── 5. Build turn result ────────────────────────────────────────
+        // ── 5. Edge tool delivery via ledger (streaming mode) ────────────
+        //
+        // When streaming to a web client with edge tools, emit `tool_request`
+        // SSE events so the client can execute tools locally, then wait on
+        // the ledger for the results posted via `POST /tools/result`.
+        //
+        // When server_side_tools is true, the headless pipeline uses
+        // server_tool_executor and no ledger is needed.
+        let edge_tool_round = if !self.server_side_tools
+            && self.event_tx.is_some()
+            && !result.tool_calls.is_empty()
+        {
+            self.deliver_edge_tools_via_ledger(&result.tool_calls).await
+        } else {
+            Vec::new()
+        };
+
+        // ── 6. Build turn result ────────────────────────────────────────
         let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
         let accum = Self::result_to_accum(&result);
 
-        // Edge tool round is empty — tools are executed by the runtime's
-        // headless round via the edge_callback_ledger, not inline here.
         Ok(HostTurnResult {
             accum,
             ttft_ms,
-            edge_tool_round: Vec::new(),
+            edge_tool_round,
             error_kind: None,
         })
     }
