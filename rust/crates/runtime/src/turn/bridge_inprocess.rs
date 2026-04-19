@@ -38,12 +38,7 @@ use std::{
 };
 
 use astra_core::SharedPool;
-use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::session_journal::ToolCallRecord;
-use astra_services::session_workspace::{
-    ContextTraceBudgetSignal, ContextTraceSignal, ContextTraceTimingSignal,
-    ContextTraceToolSelection,
-};
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -56,21 +51,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    ChatTurnBridge, DatabaseEvaluationService, DatabaseEventService, EvaluationService,
-    EventCreateRequestData, EventService, FernetTokenEncryptor, MatrixOneSettings,
-    SessionActivityUpdatePlan, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
-    TurnCorePersistPlan, TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter,
-    TurnReflectionStateStore, TurnSessionActivityWriter, TurnToolEventPersistPlan,
-    TurnToolEventRecord, TurnToolEventWriter, build_explain_event, build_stream_error_event,
-    prompts,
+    ChatTurnBridge, FernetTokenEncryptor, MatrixOneSettings, SessionActivityUpdatePlan,
+    TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan,
+    TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
+    TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    build_explain_event, build_stream_error_event, prompts,
     turn::edge_ledger::ensure_tool_call_ids,
     turn::llm_client::{LlmCancel, sleep_ms_or_llm_cancel},
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
     turn::sse_blocks::SseBlankLineUtf8Buf,
-    turn::sse_data_lines::{
-        drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
-        validated_json_events_from_sse_block,
-    },
     turn::tool_call_shape::tool_call_name,
     turn::tool_schema_prune::prune_tool_schemas,
 };
@@ -94,19 +83,11 @@ fn count_inprocess_persisted_events(
         }
 }
 
-fn render_sse(event: &Value) -> Bytes {
-    match serde_json::to_string(event) {
-        Ok(s) => Bytes::from(format!("data: {s}\n\n")),
-        Err(e) => {
-            astra_core::agent_error!("sse", "serialization failed: {e}");
-            Bytes::from("event: error\ndata: {\"error\":\"internal serialization failure\"}\n\n")
-        }
-    }
-}
-
-fn render_sse_map(event: &Map<String, Value>) -> Bytes {
-    render_sse(&Value::Object(event.clone()))
-}
+// ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────
+use super::bridge_sse_helpers::{
+    extend_forward_from_validated_sse_block, flush_tail_buf_into_llm_forward,
+    reasoning_done_sse_bytes_if_needed, render_sse, render_sse_map,
+};
 
 fn preview_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
@@ -254,160 +235,10 @@ fn build_bridge_tool_call_records(
     records
 }
 
-fn build_legacy_context_trace_signal(
-    turn: u32,
-    turn_id: String,
-    tools_available: usize,
-    selected_tools: Vec<String>,
-    selection_confidence: f64,
-    measured_prompt_tokens: Option<u64>,
-    model_limit: usize,
-    tool_execution_ms: u64,
-    total_ms: u64,
-) -> ContextTraceSignal {
-    let unique_selected = selected_tools.iter().cloned().collect::<HashSet<_>>().len();
-    let budget = measured_prompt_tokens.map(|total_used| ContextTraceBudgetSignal {
-        max_tokens: model_limit.min(u32::MAX as usize) as u32,
-        total_used: total_used.min(u32::MAX as u64) as u32,
-        budget_pressure: if model_limit > 0 {
-            total_used as f64 / model_limit as f64
-        } else {
-            0.0
-        },
-        compression_triggered: false,
-    });
-    let llm_total_ms = total_ms.saturating_sub(tool_execution_ms);
-
-    ContextTraceSignal {
-        turn_id,
-        captured_at: Some(chrono::Utc::now().to_rfc3339()),
-        tool_selection: Some(ContextTraceToolSelection {
-            tools_available: tools_available.min(u32::MAX as usize) as u32,
-            selected_tools,
-            rejected_tools: tools_available.saturating_sub(unique_selected),
-            strategy: "inprocess_bridge".to_string(),
-            confidence: selection_confidence,
-            latency_ms: 0,
-        }),
-        memory: None,
-        history: None,
-        budget,
-        timing: Some(ContextTraceTimingSignal {
-            turn,
-            context_assembly_ms: 0,
-            ttft_ms: 0,
-            llm_total_ms,
-            tool_execution_ms,
-            total_ms,
-        }),
-        explanations: Vec::new(),
-    }
-}
-
-async fn persist_legacy_bridge_trace_and_quality(
-    matrixone: &MatrixOneSettings,
-    shared_pool: Option<SharedPool>,
-    user_id: String,
-    session_id: String,
-    agent_id: Option<String>,
-    turn_chain_id: String,
-    signal: ContextTraceSignal,
-    evaluation: Option<crate::pipeline::evaluation::TurnEvaluation>,
-    step_count: usize,
-) {
-    let Some(shared_pool) = shared_pool else {
-        return;
-    };
-
-    if let Some(evaluation) = evaluation {
-        let evaluation_service =
-            DatabaseEvaluationService::new(matrixone.clone()).with_pool(shared_pool.clone());
-        let assessment = SessionQualityAssessmentRequest {
-            session_id: session_id.clone(),
-            score: evaluation.quality,
-            step_count: i32::try_from(step_count).unwrap_or(i32::MAX),
-        };
-        if let Err((status, response)) = evaluation_service
-            .record_session_quality_assessment(&user_id, assessment)
-            .await
-        {
-            astra_core::agent_warn!(
-                "legacy-bridge",
-                "Failed to persist session quality assessment for {}: {} {}",
-                session_id,
-                status,
-                response.0.detail
-            );
-        }
-    }
-
-    let event_service = DatabaseEventService::new(matrixone.clone()).with_pool(shared_pool);
-    let mut metadata = match serde_json::to_value(&signal) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            astra_core::agent_warn!(
-                "legacy-bridge",
-                "Failed to serialize context trace signal for {}: {}",
-                session_id,
-                err
-            );
-            return;
-        }
-    };
-    if let Some(metadata_obj) = metadata.as_object_mut() {
-        if let Some(duration_ms) = signal.timing.as_ref().map(|timing| timing.total_ms) {
-            metadata_obj.insert(
-                "duration_ms".to_string(),
-                json!(duration_ms.min(i32::MAX as u64)),
-            );
-        }
-        if let Some(tool_name) = signal
-            .tool_selection
-            .as_ref()
-            .and_then(|selection| selection.selected_tools.first())
-        {
-            metadata_obj.insert("tool_name".to_string(), json!(tool_name));
-        }
-    }
-
-    let content = {
-        let preview = signal.preview();
-        if preview.is_empty() {
-            "context trace signal".to_string()
-        } else {
-            preview
-        }
-    };
-    let turn_id = if signal.turn_id.is_empty() {
-        "latest".to_string()
-    } else {
-        signal.turn_id.clone()
-    };
-    if let Err((status, response)) = event_service
-        .create_event(
-            user_id,
-            EventCreateRequestData {
-                session_id,
-                event_type: "context_trace_signal".to_string(),
-                content,
-                agent_id,
-                agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                parent_event_id: None,
-                parent_event_ids: Some(Vec::new()),
-                causal_chain_id: Some(format!("{turn_chain_id}:context-trace:{turn_id}")),
-                metadata: Some(metadata),
-            },
-        )
-        .await
-    {
-        astra_core::agent_warn!(
-            "legacy-bridge",
-            "Failed to persist context trace signal: {} {}",
-            status,
-            response.0.detail
-        );
-    }
-}
+// ── Bridge observability — delegated to turn::bridge_observability ────────────
+use super::bridge_observability::{
+    build_legacy_context_trace_signal, persist_legacy_bridge_trace_and_quality,
+};
 
 /// Returns `true` if `name` looks like a valid tool function name.
 ///
@@ -424,55 +255,6 @@ fn is_valid_tool_name(name: &str) -> bool {
 }
 
 /// Maps one parsed JSON event from the in-process LLM SSE stream to bytes forwarded to the HTTP client.
-fn apply_forward_llm_sse_event(
-    event: &Value,
-    saw_inprocess_summary: &mut bool,
-    loop_text: &mut String,
-    loop_reasoning: &mut String,
-    loop_tool_calls: &mut Vec<Value>,
-    usage: &mut Map<String, Value>,
-    resolved_model: &mut String,
-) -> Result<Vec<Bytes>, String> {
-    let Some(t) = event.get("type").and_then(Value::as_str) else {
-        return Err("SSE event missing type field".into());
-    };
-    match t {
-        "_inprocess_summary" => {
-            *saw_inprocess_summary = true;
-            *loop_text = event
-                .get("full_text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            *loop_reasoning = event
-                .get("reasoning")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            *loop_tool_calls = event
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(u) = event.get("usage").and_then(Value::as_object) {
-                *usage = u.clone();
-            }
-            if let Some(m) = event.get("model_used").and_then(Value::as_str) {
-                *resolved_model = m.to_string();
-            }
-            Ok(vec![])
-        }
-        "text_delta" | "reasoning_delta" | "reasoning_done" | "tool_call_start" | "usage"
-        | "error" | "error_message" => Ok(vec![render_sse(event)]),
-        "warning" => Ok(vec![render_sse(event)]),
-        _ => Ok(vec![]),
-    }
-}
-
-fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
-    (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
-}
-
 #[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
     cancel: Option<&CancellationToken>,
@@ -619,74 +401,6 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
         );
     }
     Value::Object(event)
-}
-
-fn extend_forward_from_validated_sse_block(
-    block: &str,
-    saw_inprocess_summary: &mut bool,
-    loop_text: &mut String,
-    loop_reasoning: &mut String,
-    loop_tool_calls: &mut Vec<Value>,
-    usage: &mut Map<String, Value>,
-    resolved_model: &mut String,
-) -> Result<Vec<Bytes>, String> {
-    let events = validated_json_events_from_sse_block(block)?;
-    let mut out = Vec::new();
-    for ev in events {
-        out.extend(apply_forward_llm_sse_event(
-            &ev,
-            saw_inprocess_summary,
-            loop_text,
-            loop_reasoning,
-            loop_tool_calls,
-            usage,
-            resolved_model,
-        )?);
-    }
-    Ok(out)
-}
-
-fn flush_tail_buf_into_llm_forward(
-    buf: &mut String,
-    saw_inprocess_summary: &mut bool,
-    loop_text: &mut String,
-    loop_reasoning: &mut String,
-    loop_tool_calls: &mut Vec<Value>,
-    usage: &mut Map<String, Value>,
-    resolved_model: &mut String,
-) -> Result<Vec<Bytes>, String> {
-    if !buf.trim().is_empty() {
-        validate_sse_event_block_json(buf)?;
-    }
-    let mut out = Vec::new();
-    let d = drain_sse_data_lines(buf, "");
-    for ev in d.events {
-        out.extend(apply_forward_llm_sse_event(
-            &ev,
-            saw_inprocess_summary,
-            loop_text,
-            loop_reasoning,
-            loop_tool_calls,
-            usage,
-            resolved_model,
-        )?);
-    }
-    if d.stream_finished {
-        return Ok(out);
-    }
-    let fin = finish_sse_data_buffer(buf);
-    for ev in fin.events {
-        out.extend(apply_forward_llm_sse_event(
-            &ev,
-            saw_inprocess_summary,
-            loop_text,
-            loop_reasoning,
-            loop_tool_calls,
-            usage,
-            resolved_model,
-        )?);
-    }
-    Ok(out)
 }
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).
@@ -2780,6 +2494,7 @@ pub mod bridge_inprocess_test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
     use crate::turn::turn_guard::TurnGuard;
 
     #[test]
@@ -4323,17 +4038,6 @@ mod tests {
         assert!(s.contains("\"text_delta\""));
     }
 
-    #[test]
-    fn render_sse_map_delegates_to_render_sse() {
-        let mut map = Map::new();
-        map.insert("type".into(), json!("usage"));
-        map.insert("prompt_tokens".into(), json!(100));
-        let bytes = render_sse_map(&map);
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.starts_with("data: "));
-        assert!(s.contains("\"usage\""));
-    }
-
     // ── apply_forward_llm_sse_event tests ───────────────────────────────
 
     #[test]
@@ -4465,14 +4169,6 @@ mod tests {
         assert_eq!(result.len(), 1);
         let s = std::str::from_utf8(&result[0]).unwrap();
         assert!(s.contains("reasoning_done"));
-    }
-
-    #[test]
-    fn reasoning_done_sse_bytes_only_for_non_empty_reasoning() {
-        let bytes = reasoning_done_sse_bytes_if_needed("thinking...").unwrap();
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.contains("reasoning_done"));
-        assert!(reasoning_done_sse_bytes_if_needed("").is_none());
     }
 
     #[test]
