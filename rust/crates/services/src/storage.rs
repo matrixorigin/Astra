@@ -462,6 +462,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_agent_events_session_created (session_id, created_at),
             INDEX idx_agent_events_session_type_created (session_id, event_type, created_at),
+            INDEX idx_agent_events_session_model_created (session_id, llm_model_used, created_at DESC),
             INDEX idx_agent_events_session_parent (session_id, parent_event_id),
             INDEX idx_agent_events_user_created (user_id, created_at),
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),

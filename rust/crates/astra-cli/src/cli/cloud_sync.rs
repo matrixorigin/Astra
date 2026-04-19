@@ -331,9 +331,9 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
                                 if !existing.contains(&tool_name) {
                                     state.tool_health_entries.push(ToolHealthEntry {
                                         name: tool_name,
-                                        total_calls: 3,
-                                        total_failures: 3,
-                                        failure_rate: 1.0,
+                                        total_calls: 0,
+                                        total_failures: 0,
+                                        failure_rate: 0.0,
                                         last_updated_epoch: 0,
                                     });
                                 }

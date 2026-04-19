@@ -253,6 +253,8 @@ impl HybridRestoreService {
                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) \
                FROM agent_events ae WHERE ae.session_id = agent_sessions.session_id) AS total_tokens_out, \
              (SELECT COUNT(*) FROM session_checkpoints sc WHERE sc.session_id = agent_sessions.session_id AND state_json IS NULL) AS checkpoint_count, \
+             (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = agent_sessions.session_id \
+               AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model, \
              created_at, updated_at \
               FROM agent_sessions WHERE session_id = ?",
         )
@@ -306,11 +308,8 @@ impl HybridRestoreService {
                 if recent_tools.is_empty() {
                     recent_tools = recent_tools_from_context_trace(last_context_trace.as_ref());
                 }
-                let model = metadata_state.model.clone().or(self
-                    .restore_latest_model_used(session_id)
-                    .await
-                    .ok()
-                    .flatten());
+                let latest_model: Option<String> = row.try_get("latest_model").ok().flatten();
+                let model = metadata_state.model.clone().or(latest_model);
                 let learning_snapshot_json = if user_id.is_empty() {
                     None
                 } else {
@@ -559,34 +558,6 @@ impl HybridRestoreService {
                     .try_get("snapshot_json")
                     .map_err(|e| format!("decode learning: {e}"))?;
                 Ok(Some(json))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn restore_latest_model_used(&self, session_id: &str) -> Result<Option<String>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let row = sqlx::query(
-            "SELECT llm_model_used FROM agent_events \
-             WHERE session_id = ? AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("restore_latest_model_used: {e}"))?;
-
-        match row {
-            Some(row) => {
-                use sqlx::Row;
-                Ok(row
-                    .try_get::<Option<String>, _>("llm_model_used")
-                    .ok()
-                    .flatten())
             }
             None => Ok(None),
         }
@@ -890,11 +861,12 @@ impl SessionRestoreService for HybridRestoreService {
         };
 
         let rows = sqlx::query(
-            "SELECT session_id, title, status, CAST(metadata AS CHAR) AS metadata_json, \
-             (SELECT COUNT(*) FROM agent_events WHERE session_id = agent_sessions.session_id AND event_type = 'user_query') AS turn_count \
-             FROM agent_sessions \
-             WHERE user_id = ? AND status IN ('active', 'paused') \
-             ORDER BY updated_at DESC LIMIT 20",
+            "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
+         (SELECT COUNT(*) FROM agent_events WHERE session_id = s.session_id AND event_type = 'user_query') AS turn_count, \
+         (SELECT e.llm_model_used FROM agent_events e WHERE e.session_id = s.session_id AND e.llm_model_used IS NOT NULL AND e.llm_model_used != '' ORDER BY e.created_at DESC LIMIT 1) AS latest_model \
+         FROM agent_sessions s \
+         WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
+         ORDER BY s.updated_at DESC LIMIT 20",
         )
         .bind(user_id)
         .fetch_all(pool)
@@ -921,11 +893,8 @@ impl SessionRestoreService for HybridRestoreService {
                 .as_deref()
                 .map(extract_session_state_from_metadata)
                 .unwrap_or_default();
-            let model = metadata_state.model.clone().or(self
-                .restore_latest_model_used(&session_id)
-                .await
-                .ok()
-                .flatten());
+            let latest_model: Option<String> = row.try_get("latest_model").ok().flatten();
+            let model = metadata_state.model.clone().or(latest_model);
 
             sessions.push(RestoredSession {
                 session_id,
@@ -2398,8 +2367,8 @@ mod tests {
             "resumable session listing should read session metadata so git_branch/model can survive cloud-only resume lists"
         );
         assert!(
-            source.contains("restore_latest_model_used(&session_id)"),
-            "resumable session listing should fall back to the latest llm_model_used helper for older cloud sessions"
+            source.contains("latest_model"),
+            "resumable session listing should fetch latest_model via subquery to avoid N+1 queries"
         );
         assert!(
             source.contains("git_branch: metadata_state.git_branch.clone()"),
@@ -2562,8 +2531,8 @@ mod tests {
             .expect("restore cloud session end marker");
         let snippet = &source[start..end];
         assert!(
-            snippet.contains("restore_latest_model_used(session_id)"),
-            "cloud restore should fall back to the latest llm_model_used when metadata lacks model"
+            snippet.contains("latest_model"),
+            "cloud restore should fetch latest_model via subquery to avoid N+1 queries"
         );
         assert!(
             snippet.contains("CAST(metadata AS CHAR) AS metadata_json"),

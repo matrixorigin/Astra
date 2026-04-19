@@ -786,11 +786,6 @@ fn random_tips(logged_in: bool) -> [&'static str; 2] {
     [pool[i], pool[j]]
 }
 
-/// Approximate display width: ASCII = 1, emoji/CJK = 2.
-fn display_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
-}
-
 pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     let creds = load_credentials();
     let pname = profile_name(profile, &creds);
@@ -820,7 +815,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     ];
     let w = lines_plain
         .iter()
-        .map(|l| display_width(l))
+        .map(|l| crate::terminal_region::visible_char_width(l))
         .max()
         .unwrap_or(60)
         + 2;
@@ -857,11 +852,35 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     eprintln!();
     print_startup_logo();
     eprintln!("{}", format!("╭{hr}╮").cyan());
-    eprintln!("{}", row(&lines_colored[0], display_width(&lines_plain[0])));
-    eprintln!("{}", row(&lines_colored[1], display_width(&lines_plain[1])));
+    eprintln!(
+        "{}",
+        row(
+            &lines_colored[0],
+            crate::terminal_region::visible_char_width(&lines_plain[0]),
+        )
+    );
+    eprintln!(
+        "{}",
+        row(
+            &lines_colored[1],
+            crate::terminal_region::visible_char_width(&lines_plain[1]),
+        )
+    );
     eprintln!("{}", format!("├{hr}┤").cyan().dim());
-    eprintln!("{}", row(&lines_colored[2], display_width(&lines_plain[2])));
-    eprintln!("{}", row(&lines_colored[3], display_width(&lines_plain[3])));
+    eprintln!(
+        "{}",
+        row(
+            &lines_colored[2],
+            crate::terminal_region::visible_char_width(&lines_plain[2]),
+        )
+    );
+    eprintln!(
+        "{}",
+        row(
+            &lines_colored[3],
+            crate::terminal_region::visible_char_width(&lines_plain[3]),
+        )
+    );
     eprintln!("{}", format!("╰{hr}╯").cyan());
 
     // Show active limits (system prompt, max-budget, permission mode)

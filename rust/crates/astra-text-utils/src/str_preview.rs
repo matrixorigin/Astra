@@ -38,7 +38,10 @@ pub fn shorten_path(path: &str, max_chars: usize) -> String {
     }
 
     let filename = parts.last().copied().unwrap_or("");
-    if filename.chars().count() >= max_chars.saturating_sub(4) {
+    // Use `>` not `>=`: when max_chars is tight (e.g. 10) and the filename is short (6 chars),
+    // `>=` wrongly skips the `.../parent/file` branch and returns a bare filename — breaks
+    // tool lines that expect a `.../` prefix for long directory paths.
+    if filename.chars().count() > max_chars.saturating_sub(4) {
         return truncate_to_width(filename, max_chars);
     }
 

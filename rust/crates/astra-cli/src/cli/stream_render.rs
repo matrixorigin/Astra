@@ -2523,6 +2523,83 @@ struct ToolOutputSummary {
     text: String,
 }
 
+// ── Tool completion icon + output-summary sentinels (shared by `format_output_summary`) ──
+
+/// Sentinel strings returned by search tools when nothing matched.
+const SEARCH_NO_MATCH_SENTINELS: &[&str] = &["No matches", "No visible matches"];
+/// Sentinel strings returned by glob tools when nothing matched.
+const GLOB_NO_MATCH_SENTINELS: &[&str] = &["No files", "No visible files"];
+/// Platform banner prefixes that indicate a warning/note/incomplete-output injected by astra (not tool output).
+const PLATFORM_WARNING_PREFIXES: &[&str] = &["⚠ WARNING:", "⚠ Note:"];
+/// `read_file` synthetic lines to exclude from "content line" counts.
+const READ_FILE_METADATA_PREFIXES: &[&str] = &["[Auto-expanded", "[truncated"];
+
+#[inline]
+fn str_starts_with_any_prefix(text: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|&p| text.starts_with(p))
+}
+
+#[inline]
+fn tool_slow_warning_threshold_ms(tool: &str) -> u64 {
+    match tool {
+        "bash" | "shell" | "shell_exec" | "run_build_test" => 60_000,
+        _ => 30_000,
+    }
+}
+
+/// True when astra injected a banner line (`read_file` repeat warning, etc.).
+///
+/// Line-based only (never substring-scan the whole buffer): grep hits may contain `⚠ WARNING:`
+/// inside file content.
+fn tool_output_has_platform_warning_banner(output: &str) -> bool {
+    // Fast path: banners always contain U+26A0; skip per-line work on huge grep output.
+    if !output.contains('⚠') {
+        return false;
+    }
+    output.lines().any(|line| {
+        let t = line.trim_start();
+        str_starts_with_any_prefix(t, PLATFORM_WARNING_PREFIXES)
+    })
+}
+
+/// Tool completion icon: optional empty→warn (see below), platform banners, slow runs; else ok.
+///
+/// **Empty stdout:** warn only for `read_file` / `view_file` / `bash` / `shell` — those should
+/// normally return bytes. `grep` / `glob` often mean “nothing matched” or an edge empty payload
+/// while `status == ok`; that is **not** a warning.
+///
+/// Does **not** scan bash stdout for `warning:` (too many false positives from diffs / rustc).
+fn tool_completion_icon(
+    tool: &str,
+    status: &str,
+    output: &str,
+    duration_ms: u64,
+) -> (String, bool) {
+    if status == "error" {
+        return (theme::icon_err(), false);
+    }
+
+    let trimmed = output.trim();
+
+    let warn_if_empty_ok_status = matches!(
+        tool,
+        "read_file" | "view_file" | "bash" | "shell" | "shell_exec"
+    );
+    if warn_if_empty_ok_status && trimmed.is_empty() {
+        return (theme::icon_warn(), true);
+    }
+
+    if tool_output_has_platform_warning_banner(trimmed) {
+        return (theme::icon_warn(), true);
+    }
+
+    if duration_ms > tool_slow_warning_threshold_ms(tool) {
+        return (theme::icon_warn(), true);
+    }
+
+    (theme::icon_ok(), false)
+}
+
 impl StreamRenderState {
     #[cfg(test)]
     pub(super) fn new() -> Self {
@@ -2796,7 +2873,7 @@ impl StreamRenderState {
         let path_budget = |prefix_len: usize| desc_budget.saturating_sub(prefix_len).max(20);
 
         match tool {
-            "bash" => {
+            "bash" | "shell_exec" => {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
                 format!("$ {}", truncate_line(cmd, path_budget(2)))
             }
@@ -4431,7 +4508,7 @@ impl StreamRenderState {
         let line_count = output.lines().count();
         let byte_size = output.len();
         match tool {
-            "bash" | "shell" | "run_build_test" => {
+            "bash" | "shell" | "shell_exec" | "run_build_test" => {
                 if output.trim().is_empty() {
                     return None;
                 }
@@ -4451,10 +4528,8 @@ impl StreamRenderState {
             "read_file" | "view_file" => {
                 // Only skip our metadata lines, not code that happens to start with '['
                 let is_metadata = |l: &&str| {
-                    l.starts_with("[Auto-expanded")
-                        || l.starts_with("[truncated")
-                        || l.starts_with("⚠ WARNING:")
-                        || l.starts_with("⚠ Note:")
+                    str_starts_with_any_prefix(l, READ_FILE_METADATA_PREFIXES)
+                        || str_starts_with_any_prefix(l.trim_start(), PLATFORM_WARNING_PREFIXES)
                 };
 
                 // Count all non-empty, non-metadata lines for accurate remaining count
@@ -4534,6 +4609,10 @@ impl StreamRenderState {
                 }
             }
             "grep" | "search" => {
+                let head = output.trim_start();
+                if str_starts_with_any_prefix(head, SEARCH_NO_MATCH_SENTINELS) {
+                    return Some(structural("no matches".to_string()));
+                }
                 let match_lines: Vec<&str> = output.lines().collect();
                 let total = match_lines.len();
                 // Extract unique file names from grep output (file:line:content format)
@@ -4594,7 +4673,15 @@ impl StreamRenderState {
                 Some(structural(format!("{entries} entries")))
             }
             "glob" => {
-                let files: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+                let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+                // `glob` returns a single sentinel line when nothing matched (not a path).
+                if lines.len() == 1 {
+                    let only = lines[0].trim();
+                    if str_starts_with_any_prefix(only, GLOB_NO_MATCH_SENTINELS) {
+                        return Some(structural("no matches".to_string()));
+                    }
+                }
+                let files = lines;
                 let total = files.len();
                 if total == 0 {
                     Some(structural("no matches".to_string()))
@@ -4694,68 +4781,6 @@ fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
-/// Determine tool completion icon based on status, output, and execution context.
-/// Returns (icon_string, is_warning) where is_warning indicates warning-level result.
-fn tool_completion_icon(
-    tool: &str,
-    status: &str,
-    output: &str,
-    duration_ms: u64,
-) -> (String, bool) {
-    if status == "error" {
-        return (theme::icon_err(), false);
-    }
-
-    // Check for warning conditions.
-    let trimmed = output.trim();
-
-    // 1. Empty output for tools that should produce something.
-    let expects_output = matches!(
-        tool,
-        "read_file" | "view_file" | "grep" | "glob" | "bash" | "shell"
-    );
-    if expects_output && trimmed.is_empty() {
-        return (theme::icon_warn(), true);
-    }
-
-    // 2. "No matches" or empty results from search tools.
-    if matches!(tool, "grep" | "glob") {
-        if trimmed.is_empty()
-            || trimmed == "[]"
-            || trimmed.starts_with("No matches")
-            || trimmed.starts_with("No files")
-        {
-            return (theme::icon_warn(), true);
-        }
-    }
-
-    // 3. Truncated output (warning prefix in output).
-    if trimmed.contains("[truncated") || trimmed.contains("⚠ WARNING:") {
-        return (theme::icon_warn(), true);
-    }
-
-    // 4. Slow execution (>30s for most tools, >60s for bash).
-    let slow_threshold_ms = if matches!(tool, "bash" | "shell" | "run_build_test") {
-        60_000
-    } else {
-        30_000
-    };
-    if duration_ms > slow_threshold_ms {
-        return (theme::icon_warn(), true);
-    }
-
-    // 5. Partial success indicators in bash output.
-    if matches!(tool, "bash" | "shell") {
-        let lower = trimmed.to_lowercase();
-        if lower.contains("warning:") && !lower.contains("error:") {
-            return (theme::icon_warn(), true);
-        }
-    }
-
-    // Default: success.
-    (theme::icon_ok(), false)
-}
-
 /// Format error message for tool failures with helpful context.
 /// Extracts relevant info from common error patterns.
 fn format_tool_error_summary(tool: &str, output: &str) -> String {
@@ -4764,7 +4789,7 @@ fn format_tool_error_summary(tool: &str, output: &str) -> String {
 
     // Tool-specific error extraction
     match tool {
-        "bash" | "shell" | "run_build_test" => {
+        "bash" | "shell" | "shell_exec" | "run_build_test" => {
             // For bash errors, try to find the most informative part
             // Common patterns: "command not found", "No such file", "Permission denied"
             if let Some(line) = output.lines().find(|l| {
@@ -4821,20 +4846,262 @@ fn format_tool_error_summary(tool: &str, output: &str) -> String {
     truncate_line(first_line, 80)
 }
 
-/// Apply bold+magenta styling to Skill/MCP tool description prefixes,
-/// matching the visual weight of built-in tools like Read/Edit/Write.
-pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
-    if tool == "skill" {
-        // "Running skill: code-review" → bold magenta "Running skill:" + rest
-        if let Some(rest) = description.strip_prefix("Running skill:") {
-            return format!("{}{}", "Running skill:".magenta().bold(), rest);
-        }
-    } else if tool.starts_with("mcp_") {
-        // "MCP server tool" → bold magenta "MCP" + rest
-        if let Some(rest) = description.strip_prefix("MCP") {
-            return format!("{}{}", "MCP".magenta().bold(), rest);
+/// Bold+magenta prefix + plain rest (same accent as `Running skill:` / `MCP`).
+#[inline]
+fn magenta_bold_tool_prefix(prefix: &str, rest: &str) -> String {
+    format!("{}{}", prefix.magenta().bold(), rest)
+}
+
+/// Try `description.strip_prefix` for each prefix in `prefixes_longest_first` (must be ordered
+/// longest-first so e.g. `Git diff --staged ` wins over `Git diff `).
+fn style_prefix_longest_first(
+    description: &str,
+    prefixes_longest_first: &[&str],
+) -> Option<String> {
+    for p in prefixes_longest_first {
+        if let Some(rest) = description.strip_prefix(p) {
+            return Some(magenta_bold_tool_prefix(p, rest));
         }
     }
+    None
+}
+
+/// Sorts `prefixes` by length (longest first), then matches. For a single prefix, no allocation.
+fn style_first_matching_prefix(description: &str, prefixes: &[&str]) -> Option<String> {
+    match prefixes {
+        [] => None,
+        [only] => description
+            .strip_prefix(only)
+            .map(|rest| magenta_bold_tool_prefix(only, rest)),
+        _ => {
+            let mut sorted: Vec<&str> = prefixes.to_vec();
+            sorted.sort_by_key(|p| std::cmp::Reverse(p.len()));
+            style_prefix_longest_first(description, &sorted)
+        }
+    }
+}
+
+/// Apply bold+magenta styling to tool description verb prefixes (Read/Edit/Git/shell/…),
+/// aligned with `Running skill:` and `MCP`.
+pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
+    if tool == "skill" {
+        if let Some(rest) = description.strip_prefix("Running skill:") {
+            return magenta_bold_tool_prefix("Running skill:", rest);
+        }
+    } else if tool.starts_with("mcp_") {
+        if let Some(rest) = description.strip_prefix("MCP") {
+            return magenta_bold_tool_prefix("MCP", rest);
+        }
+    }
+
+    // Exact short Git lines (must not be split by the catch-all `Git ` prefix).
+    match description {
+        "Git status" | "Git log" | "Git contributors" | "Git stash" | "Git diff"
+        | "Git diff --staged" => {
+            return description.magenta().bold().to_string();
+        }
+        _ => {}
+    }
+
+    match tool {
+        "read_file" | "view_file" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Reading: "]) {
+                return s;
+            }
+        }
+        "write_file" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Writing: "]) {
+                return s;
+            }
+        }
+        "str_replace" | "multi_edit" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Editing: "]) {
+                return s;
+            }
+        }
+        "delete_file" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Deleting: "]) {
+                return s;
+            }
+        }
+        "list_dir" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Listing: "]) {
+                return s;
+            }
+        }
+        "grep" | "search" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Grep: "]) {
+                return s;
+            }
+        }
+        "glob" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Glob: "]) {
+                return s;
+            }
+        }
+        "bash" | "shell" | "shell_exec" | "run_build_test" => {
+            if let Some(rest) = description.strip_prefix("$ ") {
+                return magenta_bold_tool_prefix("$ ", rest);
+            }
+        }
+        "powershell" => {
+            if let Some(rest) = description.strip_prefix("PS> ") {
+                return magenta_bold_tool_prefix("PS> ", rest);
+            }
+        }
+        "web_fetch" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Fetching: "]) {
+                return s;
+            }
+        }
+        "web_search" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Searching web: "]) {
+                return s;
+            }
+        }
+        "hover_info" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Hover info at "]) {
+                return s;
+            }
+        }
+        "type_hierarchy" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Type hierarchy for "]) {
+                return s;
+            }
+        }
+        "symbol_search" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Search symbol "]) {
+                return s;
+            }
+        }
+        "find_definition" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Find definition of "]) {
+                return s;
+            }
+        }
+        "find_references" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Find references to "]) {
+                return s;
+            }
+        }
+        "symbols" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Get symbols in "]) {
+                return s;
+            }
+        }
+        "call_graph" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Call graph for "]) {
+                return s;
+            }
+        }
+        "rename_symbol" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Rename symbol "]) {
+                return s;
+            }
+        }
+        "dead_code" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Find dead code: "]) {
+                return s;
+            }
+        }
+        "extract_members" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Extract members: "]) {
+                return s;
+            }
+        }
+        "lsp" => {
+            if let Some(s) = style_first_matching_prefix(description, &["LSP: "]) {
+                return s;
+            }
+        }
+        "notebook_edit" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Notebook edit: "]) {
+                return s;
+            }
+        }
+        "reflect" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Reflecting: "]) {
+                return s;
+            }
+        }
+        "context_analysis" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Context analysis: "]) {
+                return s;
+            }
+        }
+        "run_chain" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Running chain: "]) {
+                return s;
+            }
+        }
+        "github_get_pr" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Getting PR: "]) {
+                return s;
+            }
+        }
+        "github_list_prs" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Listing PRs: "]) {
+                return s;
+            }
+        }
+        "github_get_issue" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Getting issue: "]) {
+                return s;
+            }
+        }
+        "github_list_issues" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Listing issues: "]) {
+                return s;
+            }
+        }
+        "github_repo_stats" => {
+            if let Some(s) = style_first_matching_prefix(description, &["GitHub stats: "]) {
+                return s;
+            }
+        }
+        "github_ci_status" => {
+            if let Some(s) = style_first_matching_prefix(description, &["GitHub CI: "]) {
+                return s;
+            }
+        }
+        "github_create_issue" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Creating issue: "]) {
+                return s;
+            }
+        }
+        "get_agent_info" => {
+            if let Some(s) = style_first_matching_prefix(description, &["Getting agent info: "]) {
+                return s;
+            }
+        }
+        _ => {}
+    }
+
+    if tool.starts_with("git_") {
+        // Longest first — do not reorder without checking overlaps.
+        const GIT_PREFIXES: &[&str] = &[
+            "Git diff --staged ",
+            "Git diff ",
+            "Git log search \"",
+            "Git contributors since ",
+            "Git contributors ",
+            "Git checkout ",
+            "Git worktree ",
+            "Git stash ",
+            "Git commit \"",
+            "Git commit ",
+            "Git revert ",
+            "Git show ",
+            "Git blame ",
+            "Git history ",
+            "Git log ",
+            "Git ",
+        ];
+        if let Some(s) = style_prefix_longest_first(description, GIT_PREFIXES) {
+            return s;
+        }
+    }
+
     description.to_string()
 }
 
@@ -5225,6 +5492,79 @@ mod tests {
         format!("data: {{\"type\":\"{event_type}\"{extra}}}\n\n")
     }
 
+    /// Longer than any realistic `path_budget` from `format_tool_description` (even on very wide
+    /// terminals), so `shorten_path` always produces a `.../` prefix in tests.
+    fn path_longer_than_any_sane_terminal_budget() -> String {
+        let mut p = String::from("/");
+        for i in 0..1200 {
+            p.push_str("dir");
+            p.push_str(&i.to_string());
+            p.push('/');
+        }
+        p.push_str("src/lib.rs");
+        p
+    }
+
+    #[test]
+    fn tool_completion_icon_grep_substring_warning_in_hit_is_not_warn() {
+        let out = r#"crates/x/src/lib.rs:42:    tracing::warn!("⚠ WARNING: retry");"#;
+        let (_icon, is_warning) = tool_completion_icon("grep", "ok", out, 50);
+        assert!(
+            !is_warning,
+            "grep output must not warn just because a match line contains the substring"
+        );
+    }
+
+    #[test]
+    fn tool_completion_icon_platform_banner_line_is_warn() {
+        let out = "\n\n⚠ WARNING: This file has been read 4+ times this session.";
+        let (_icon, is_warning) = tool_completion_icon("read_file", "ok", out, 10);
+        assert!(is_warning);
+    }
+
+    #[test]
+    fn tool_completion_icon_glob_no_files_found_is_ok() {
+        let (_icon, is_warning) = tool_completion_icon("glob", "ok", "No files found", 50);
+        assert!(!is_warning);
+    }
+
+    #[test]
+    fn tool_completion_icon_grep_no_matches_is_ok() {
+        let (_icon, is_warning) = tool_completion_icon("grep", "ok", "No matches found", 50);
+        assert!(!is_warning);
+    }
+
+    #[test]
+    fn tool_completion_icon_grep_empty_stdout_is_ok() {
+        let (_icon, is_warning) = tool_completion_icon("grep", "ok", "", 50);
+        assert!(
+            !is_warning,
+            "empty grep result must not be a warning when status is ok"
+        );
+    }
+
+    #[test]
+    fn tool_completion_icon_glob_empty_stdout_is_ok() {
+        let (_icon, is_warning) = tool_completion_icon("glob", "ok", "", 50);
+        assert!(!is_warning);
+    }
+
+    #[test]
+    fn tool_completion_icon_read_file_empty_still_warns() {
+        let (_icon, is_warning) = tool_completion_icon("read_file", "ok", "", 50);
+        assert!(is_warning);
+    }
+
+    #[test]
+    fn tool_completion_icon_bash_clippy_style_warning_substring_is_ok() {
+        let out = "warning: unused variable\n --> src/lib.rs:1:5\n\nwarning: another\n";
+        let (_icon, is_warning) = tool_completion_icon("bash", "ok", out, 50);
+        assert!(
+            !is_warning,
+            "stdout may contain compiler warning: lines; do not treat as completion warning"
+        );
+    }
+
     /// `dispatch_turn_event_block` with `quiet` must still fill the shared runtime accumulator.
     #[test]
     fn dispatch_quiet_wires_runtime_accumulator() {
@@ -5541,15 +5881,26 @@ mod tests {
     }
 
     #[test]
-    fn style_regular_tool_unchanged() {
+    fn style_read_file_has_bold_prefix() {
         let styled = style_tool_description("read_file", "Reading: src/main.rs");
-        assert_eq!(styled, "Reading: src/main.rs");
+        assert!(styled.contains("src/main.rs"));
+        assert!(styled.contains("Reading:"));
+        assert_ne!(styled, "Reading: src/main.rs");
     }
 
     #[test]
-    fn style_bash_tool_unchanged() {
+    fn style_bash_has_bold_prefix() {
         let styled = style_tool_description("bash", "$ echo hello");
-        assert_eq!(styled, "$ echo hello");
+        assert!(styled.contains("echo hello"));
+        assert!(styled.contains("$"));
+        assert_ne!(styled, "$ echo hello");
+    }
+
+    #[test]
+    fn style_shell_exec_matches_bash() {
+        let styled = style_tool_description("shell_exec", "$ cargo test -p astra-cli");
+        assert!(styled.contains("cargo test"));
+        assert_ne!(styled, "$ cargo test -p astra-cli");
     }
 
     // ── Skill/MCP format_tool_description tests ──
@@ -5560,6 +5911,16 @@ mod tests {
         let args = serde_json::json!({"skill_name": "code-review"});
         let desc = r.format_tool_description("skill", &args);
         assert_eq!(desc, "Running skill: code-review");
+    }
+
+    #[test]
+    fn format_shell_exec_same_as_bash() {
+        let r = StreamRenderState::new();
+        let args = serde_json::json!({"command": "echo hi"});
+        let bash = r.format_tool_description("bash", &args);
+        let shell_exec = r.format_tool_description("shell_exec", &args);
+        assert_eq!(bash, shell_exec);
+        assert!(bash.starts_with("$ "));
     }
 
     #[test]
@@ -5666,15 +6027,19 @@ mod tests {
     #[test]
     fn format_git_checkout_preview_shortens_long_path() {
         let r = StreamRenderState::new();
+        let path = path_longer_than_any_sane_terminal_budget();
         let desc = r.format_tool_description(
             "git_checkout_file",
             &serde_json::json!({
-                "path": "/very/long/path/to/deeply/nested/module/with/more/components/and/even/more/components/src/lib.rs",
+                "path": path,
                 "ref": "HEAD~1"
             }),
         );
-        assert!(desc.starts_with("Git checkout HEAD~1 -- .../"));
-        assert!(desc.ends_with("src/lib.rs"));
+        assert!(
+            desc.starts_with("Git checkout HEAD~1 -- .../"),
+            "expected ellipsis-prefixed path; got {desc:?}"
+        );
+        assert!(desc.ends_with("src/lib.rs"), "got {desc:?}");
     }
 
     #[test]
@@ -6092,16 +6457,20 @@ mod tests {
     #[test]
     fn format_code_navigation_truncates_long_position_paths() {
         let r = StreamRenderState::new();
+        let file = path_longer_than_any_sane_terminal_budget();
         let hover = r.format_tool_description(
             "hover_info",
             &serde_json::json!({
-                "file": "/very/long/path/to/deeply/nested/module/with/more/components/and/even/more/components/src/lib.rs",
+                "file": file,
                 "line": 42,
                 "column": 3
             }),
         );
-        assert!(hover.starts_with("Hover info at .../"));
-        assert!(hover.ends_with(":42:3"));
+        assert!(
+            hover.starts_with("Hover info at .../"),
+            "expected ellipsis-prefixed path; got {hover:?}"
+        );
+        assert!(hover.ends_with(":42:3"), "got {hover:?}");
     }
 
     #[test]
@@ -6291,6 +6660,26 @@ mod tests {
             .expect("summary");
         assert_eq!(summary.kind, ToolOutputSummaryKind::Preview);
         assert_eq!(summary.text, "3 matches in 2 file(s)");
+    }
+
+    #[test]
+    fn grep_output_summary_no_matches_found_not_one_match() {
+        let r = StreamRenderState::new();
+        let summary = r
+            .format_output_summary("grep", "No matches found", "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "no matches");
+    }
+
+    #[test]
+    fn glob_output_summary_no_files_found_not_one_file() {
+        let r = StreamRenderState::new();
+        let summary = r
+            .format_output_summary("glob", "No files found", "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "no matches");
     }
 
     #[test]

@@ -4468,9 +4468,9 @@ fn apply_heavy_state_fallback(
                 .tool_health_entries
                 .push(astra_runtime::pipeline::persistence::ToolHealthEntry {
                     name: tool.clone(),
-                    total_calls: 3,
-                    total_failures: 3,
-                    failure_rate: 1.0,
+                    total_calls: 0,
+                    total_failures: 0,
+                    failure_rate: 0.0,
                     last_updated_epoch: 0,
                 });
         }
@@ -4514,7 +4514,12 @@ fn apply_restored_cloud_heavy_state(state: &mut ReplState, restored: &RestoredSe
 
 fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
     let history = repl_runtime::restore_history_from_journal(session_id);
-    if !history.is_empty() || state.history.is_empty() {
+    // Prefer local journal when it has MORE entries than cloud-restored history,
+    // since more entries likely means a later or more complete session.
+    // When local journal is smaller, keep cloud history (it's fresher).
+    // Tiebreaker: when local and cloud have equal entry count, keep cloud
+    // (cloud restore is the authoritative source; local journal may be stale).
+    if history.len() > state.history.len() || state.history.is_empty() {
         state.history = history;
     }
 }
@@ -5398,17 +5403,64 @@ mod resume_tests {
     }
 
     #[test]
-    fn restore_journal_history_if_available_prefers_local_history_when_present() {
+    fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("resume-history-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 1);
 
         let mut state = ReplState::default();
-        state.history = vec![("from-cloud".to_string(), "old".to_string())];
+        state.history = vec![("from-cloud".to_string(), "cloud-data".to_string())];
 
         restore_journal_history_if_available(&mut state, &session_id);
 
-        assert_eq!(state.history, vec![("continue".into(), "restored".into())]);
+        // Cloud-restored history is preserved when non-empty; local journal is not used
+        // to overwrite fresher cloud state.
+        assert_eq!(
+            state.history,
+            vec![("from-cloud".to_string(), "cloud-data".to_string())]
+        );
+    }
+
+    #[test]
+    fn restore_journal_history_if_available_prefers_local_when_more_entries() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("resume-more-{}", uuid::Uuid::new_v4());
+        // Write a journal with multiple turn events so local has more history entries.
+        let writer = session_journal::JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        for i in 1..=3 {
+            writer
+                .append(&session_journal::JournalEvent::turn(
+                    Some(&session_id),
+                    i,
+                    Some("gpt-5"),
+                    &format!("prompt-{i}"),
+                    &format!("response-{i}"),
+                    0,
+                    10,
+                    5,
+                    5,
+                ))
+                .unwrap();
+        }
+
+        let mut state = ReplState::default();
+        state.history = vec![("from-cloud".to_string(), "cloud-1".to_string())];
+
+        restore_journal_history_if_available(&mut state, &session_id);
+
+        // Local journal wins when it has more entries (3 local vs 1 cloud).
+        assert_eq!(
+            state.history.len(),
+            3,
+            "local journal should win when it has more entries, got {} entries",
+            state.history.len()
+        );
     }
 
     #[tokio::test]

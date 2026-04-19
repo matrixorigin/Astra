@@ -90,7 +90,7 @@ After reading the diff, route based on **signals** in the diff:
 | Config struct, `Cargo.toml` | → 4.3 |
 | Pure docs/comments/config (no code logic) | → skip 2, 3, 4 |
 
-Output: `📋 Strategy: 1 → 3.1 → 5.1 → 6 | Skipped: 2, 3.2, 3.3, 4`
+Internally decide your strategy; do NOT output it yet. Include it as a brief line in the final report (Phase 6).
 
 **Common patterns:**
 | Profile | Phases | Tool calls |
@@ -162,13 +162,14 @@ For changed code paths: test exists? Covers new behavior? Edge cases?
 
 ## Phase 6: Report
 
-**⚠ Write the report ONLY after all analysis is complete. While making tool calls, output NOTHING.**
+**⚠ Write the report ONLY after all analysis is complete. While making tool calls, output NOTHING — no headers, no scope summaries, no strategy lines. All reporting belongs in Phase 6.**
 
 ---
 
 ## Code Review: {target}
 
-**Scope:** {n} files, +{added}/-{removed} lines
+**Scope:** {n} files, +{added}/-{removed} lines  
+**Strategy:** {phase path, e.g. 1 → 3.1 → 5.1 → 6 | Skipped: 2, 3.2, 3.3, 4}
 
 ### 🔴 Critical ({n})
 {issues with file:line and why}
