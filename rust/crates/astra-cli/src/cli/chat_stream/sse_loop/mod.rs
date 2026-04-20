@@ -466,6 +466,7 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
+        current_turn_index: 0,
         turn_guard,
         restricted_tools: initial_restricted,
         step_recorder,

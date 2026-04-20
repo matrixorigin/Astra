@@ -496,6 +496,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            current_turn_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,

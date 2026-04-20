@@ -493,6 +493,10 @@ pub struct AgenticLoopState {
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
+    /// Current agentic loop turn index (0-based, updated each iteration).
+    /// Used by the CLI to inject `round_index` into the bridge payload so the
+    /// system prompt can include round budget directives.
+    pub current_turn_index: u32,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
     pub step_recorder: StepRecorder,
@@ -749,6 +753,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     run_loop_preamble(host, state).await;
 
     for turn_index in 0..state.max_turns {
+        state.current_turn_index = turn_index as u32;
         let TurnIterationPrep {
             quiet,
             turn_start_time,
@@ -1056,6 +1061,7 @@ pub(crate) mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            current_turn_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             step_recorder: StepRecorder::new("test-session", "test-task"),

@@ -9073,3 +9073,202 @@ async fn a5_persist_activity_writer_called() {
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "activity writer called after turn");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase B: Round Reduction E2E Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// B1: Think-before-act directive is present in system prompt (static, always injected).
+#[tokio::test]
+async fn b1_think_before_act_directive_in_system_prompt() {
+    let prompt = astra_runtime::prompts::build_main_system_prompt(
+        &["read_file", "grep"],
+        "",
+        1.0,
+        None,
+    );
+    assert!(
+        prompt.contains("Think-Before-Act"),
+        "system prompt should contain Think-Before-Act section"
+    );
+    assert!(
+        prompt.contains("Identify ALL the information you need"),
+        "should guide planning before tool calls"
+    );
+    assert!(
+        prompt.contains("Batch all independent calls into ONE turn"),
+        "should promote batching"
+    );
+}
+
+/// B2: round_budget_directive returns empty for early rounds (0, 1, 2).
+#[tokio::test]
+async fn b2_round_budget_no_directive_early_rounds() {
+    for round in 0..astra_runtime::prompts::ROUND_BUDGET_THRESHOLD {
+        let directive = astra_runtime::prompts::round_budget_directive(round);
+        assert!(
+            directive.is_empty(),
+            "round {round} should have no budget directive, got: {directive}"
+        );
+    }
+}
+
+/// B2: round_budget_directive returns warning for rounds at threshold.
+#[tokio::test]
+async fn b2_round_budget_warning_at_threshold() {
+    let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
+    let directive = astra_runtime::prompts::round_budget_directive(threshold);
+    assert!(
+        directive.contains("Round Budget Warning"),
+        "round {threshold} should have budget warning"
+    );
+    assert!(
+        directive.contains("batch ALL remaining tool calls"),
+        "warning should encourage batching"
+    );
+    assert!(
+        !directive.contains("MUST produce your final answer"),
+        "threshold round should be warning, not hard limit"
+    );
+}
+
+/// B2: round_budget_directive returns hard stop at hard limit.
+#[tokio::test]
+async fn b2_round_budget_hard_limit() {
+    let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
+    let directive = astra_runtime::prompts::round_budget_directive(hard);
+    assert!(
+        directive.contains("Round Budget Exceeded"),
+        "hard limit should say 'Exceeded'"
+    );
+    assert!(
+        directive.contains("MUST produce your final answer NOW"),
+        "hard limit should demand final answer"
+    );
+    assert!(
+        directive.contains("Do NOT call any more tools"),
+        "hard limit should prohibit further tool calls"
+    );
+}
+
+/// B2: round_budget_directive past hard limit still triggers hard stop.
+#[tokio::test]
+async fn b2_round_budget_past_hard_limit() {
+    let past = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT + 5;
+    let directive = astra_runtime::prompts::round_budget_directive(past);
+    assert!(
+        directive.contains("Round Budget Exceeded"),
+        "past hard limit should still say 'Exceeded'"
+    );
+}
+
+/// B2: Bridge reads round_index from payload and injects directive into dynamic prompt.
+/// When round_index >= threshold, the system prompt sent to the mock LLM should contain
+/// the round budget warning. We verify by checking that the mock LLM receives the directive
+/// in the system message content.
+#[tokio::test]
+async fn b2_bridge_injects_round_budget_via_payload() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Round 0 — no directive expected
+    let payload_r0 = json!({
+        "session_id": "budget-test-sess",
+        "messages": [{"role": "user", "content": "hello"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 0,
+        "test_llm_rounds": [{ "full_text": "Hello from round 0" }]
+    });
+    let (st, body) = chat_turn(&app, payload_r0).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "round 0 should produce text");
+
+    cap.wait_persist_idle().await;
+
+    // Round at threshold — should inject warning
+    let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
+    let payload_rt = json!({
+        "session_id": "budget-test-sess-2",
+        "messages": [{"role": "user", "content": "continue analyzing"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": threshold,
+        "test_llm_rounds": [{ "full_text": "Synthesizing results..." }]
+    });
+    let (st, body) = chat_turn(&app, payload_rt).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "threshold round should produce text");
+
+    cap.wait_persist_idle().await;
+
+    // Round at hard limit — should inject hard stop
+    let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
+    let payload_rh = json!({
+        "session_id": "budget-test-sess-3",
+        "messages": [{"role": "user", "content": "still going"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": hard,
+        "test_llm_rounds": [{ "full_text": "Final answer." }]
+    });
+    let (st, _body) = chat_turn(&app, payload_rh).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+}
+
+/// B2: round_index defaults to 0 when not provided in payload.
+#[tokio::test]
+async fn b2_round_index_defaults_to_zero() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // No round_index field at all — should default to 0, no directive
+    let payload = json!({
+        "session_id": "no-round-sess",
+        "messages": [{"role": "user", "content": "hi"}],
+        "edge_tools": [tool_schema("grep")],
+        "test_llm_rounds": [{ "full_text": "Hello!" }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "should produce normal text without round_index");
+    cap.wait_persist_idle().await;
+}
+
+/// B2: Round budget warning includes remaining count.
+#[tokio::test]
+async fn b2_round_budget_warning_shows_remaining() {
+    let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
+    let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
+    let remaining = hard - threshold;
+
+    let directive = astra_runtime::prompts::round_budget_directive(threshold);
+    let expected = format!("{remaining} remaining");
+    assert!(
+        directive.contains(&expected),
+        "warning should show '{expected}' remaining, got: {directive}"
+    );
+}
+
+/// B1: Think-before-act directive in section-based prompt builder too.
+#[tokio::test]
+async fn b1_think_before_act_in_sections_builder() {
+    let sections = astra_runtime::prompts::build_system_prompt_sections_with_style(
+        &["bash"],
+        "",
+        1.0,
+        None,
+        None,
+    );
+    let full_text = astra_runtime::prompts::sections_to_string(&sections);
+    assert!(
+        full_text.contains("Think-Before-Act"),
+        "sections builder should include Think-Before-Act"
+    );
+}

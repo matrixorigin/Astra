@@ -25,9 +25,10 @@ pub use skills::{
 };
 pub use system::{
     CacheScope, LOW_CONFIDENCE_THRESHOLD, PromptSection, STALL_NUDGE, SYSTEM_PROMPT_BASE,
+    ROUND_BUDGET_THRESHOLD, ROUND_BUDGET_HARD_LIMIT,
     build_main_system_prompt, build_main_system_prompt_with_style, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, detect_task_type,
-    sections_to_string, self_awareness_prompt_section,
+    round_budget_directive, sections_to_string, self_awareness_prompt_section,
 };
 
 #[cfg(test)]

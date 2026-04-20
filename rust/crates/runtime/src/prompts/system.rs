@@ -95,7 +95,14 @@ fn coding_discipline_section() -> &'static str {
 
 /// Parallel tool calls + token efficiency + build/test warning. Pure static.
 fn parallel_and_efficiency_section() -> &'static str {
-    "\n## Parallel Tool Calls\n\
+    "\n## Think-Before-Act\n\
+     Before your FIRST tool call in any task:\n\
+     1. Identify ALL the information you need.\n\
+     2. Plan which tools to call and in what order.\n\
+     3. Batch all independent calls into ONE turn.\n\
+     4. Only make sequential calls when one result determines the next call's arguments.\n\
+     Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
+     ## Parallel Tool Calls\n\
      Call multiple tools in ONE turn when they are independent:\n\
      - Reading 3 files? Call read_file 3× in parallel.\n\
      - Need git_status AND git_diff? Call both.\n\
@@ -1054,6 +1061,36 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
+
+/// Round budget directive injected into the dynamic system prompt.
+///
+/// When `round_index` >= `ROUND_BUDGET_THRESHOLD`, nudges the LLM to synthesize
+/// what it has gathered so far rather than continuing sequential tool exploration.
+/// This is a **generic** mechanism — not task-specific.
+pub const ROUND_BUDGET_THRESHOLD: u32 = 3;
+pub const ROUND_BUDGET_HARD_LIMIT: u32 = 6;
+
+pub fn round_budget_directive(round_index: u32) -> String {
+    if round_index >= ROUND_BUDGET_HARD_LIMIT {
+        format!(
+            "\n\n## ⚠ Round Budget Exceeded (round {round_index}/{ROUND_BUDGET_HARD_LIMIT})\n\
+             You MUST produce your final answer NOW. Do NOT call any more tools.\n\
+             Synthesize everything you have gathered so far into a complete response.\n\
+             If some information is missing, state what you could not verify.\n"
+        )
+    } else if round_index >= ROUND_BUDGET_THRESHOLD {
+        let remaining = ROUND_BUDGET_HARD_LIMIT - round_index;
+        format!(
+            "\n\n## ⚡ Round Budget Warning (round {round_index}/{ROUND_BUDGET_HARD_LIMIT})\n\
+             You have used {round_index} tool rounds. {remaining} remaining before the hard limit.\n\
+             - If you have enough information, produce your final answer NOW.\n\
+             - If you still need data, batch ALL remaining tool calls into ONE parallel turn.\n\
+             - Do NOT make one-tool-at-a-time sequential calls.\n"
+        )
+    } else {
+        String::new()
+    }
+}
 
 /// Detect task type from user query text.
 /// Returns one of: `code_review`, `debugging`, `exploration`, `implementation`,

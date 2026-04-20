@@ -279,6 +279,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 3,
             remaining_turns: 3,
+            current_turn_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             step_recorder: StepRecorder::new("test", "run"),

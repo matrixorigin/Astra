@@ -486,6 +486,10 @@ impl InProcessChatTurnBridge {
             .get("model")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let round_index = payload
+            .get("round_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as u32;
         let _agent_id = payload
             .get("agent_id")
             .and_then(Value::as_str)
@@ -884,8 +888,11 @@ impl InProcessChatTurnBridge {
                 }
             };
 
-            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}");
+            // ── Round budget directive: encourage synthesis after several rounds ──
+            let round_budget_hint = prompts::round_budget_directive(round_index);
+
+            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor + round budget)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}{round_budget_hint}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;

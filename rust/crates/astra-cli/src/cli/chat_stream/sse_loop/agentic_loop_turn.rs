@@ -215,6 +215,8 @@ struct PrepareChatTurnRequest<'a> {
     turn_policy: &'a mut TurnInteractionPolicy,
     previous_confidence_fallback:
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
+    /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
+    round_index: u32,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -543,6 +545,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.skill_agent_type.as_deref(),
     );
 
+    // Inject round_index so the bridge can add round budget directives.
+    if let Some(root) = payload.as_object_mut() {
+        root.insert("round_index".into(), json!(ctx.round_index));
+    }
+
     // ─── SelfModel: inject self-awareness text into edge_profile ───
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
         let text = self_model.to_system_prompt_section();
@@ -718,9 +725,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// Fallback from previous turn's confidence diagnosis for broadening.
     pub previous_confidence_fallback:
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
+    /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
+    pub round_index: u32,
 }
-
-/// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
 struct ChatTurnSseFetchUi {
     timing: bool,
     show_prep_line: bool,
@@ -840,6 +847,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_continuation,
         tool_cache,
         previous_confidence_fallback,
+        round_index,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -885,6 +893,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             interaction_mode,
             turn_policy,
             previous_confidence_fallback,
+            round_index,
         },
     )
     .await?;
