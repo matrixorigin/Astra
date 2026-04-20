@@ -1420,6 +1420,24 @@ async fn cancel_mid_stream_stops_further_rounds() {
         !has_round2_text,
         "round 2 text should not appear after cancellation"
     );
+
+    // Verify run cleaned up — status should reach cancelled/completed.
+    let rid = run_id.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (st, body) = get_run_status(&app, &rid).await;
+        if st == StatusCode::OK {
+            let status = body["status"].as_str().unwrap_or("");
+            if status == "cancelled" || status == "completed" {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "run should finalize after cancel"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2582,7 +2600,14 @@ async fn a4_ledger_empty_after_tool_run_completes() {
         .expect("task panicked");
 
     let ledger_cl = ledger.clone();
-    poll_until(|| { let l = ledger_cl.clone(); async move { l.lock().await.is_empty() } }, 5).await;
+    poll_until(
+        || {
+            let l = ledger_cl.clone();
+            async move { l.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
 
     // Ledger should be empty — all tool entries consumed.
     let ledger_map = ledger.lock().await;
@@ -2642,7 +2667,14 @@ async fn a4_ledger_empty_after_cancelled_run() {
         .expect("task panicked");
 
     let ledger_cl = ledger.clone();
-    poll_until(|| { let l = ledger_cl.clone(); async move { l.lock().await.is_empty() } }, 5).await;
+    poll_until(
+        || {
+            let l = ledger_cl.clone();
+            async move { l.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
 
     let ledger_map = ledger.lock().await;
     assert!(
@@ -3047,7 +3079,14 @@ async fn hook_db_decision_audit_text_only() {
 
     // Wait for background persistence to complete.
     let hw = hook_writer.clone();
-    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let hw = hw.clone();
+            async move { hw.plans.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1, "exactly one hook persist call");
@@ -3108,7 +3147,14 @@ async fn hook_db_decision_audit_with_tools() {
         .expect("reader task failed");
     assert!(!events.is_empty());
     let hw = hook_writer.clone();
-    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let hw = hw.clone();
+            async move { hw.plans.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
@@ -3150,7 +3196,14 @@ async fn hook_db_decision_audit_model_name() {
     )
     .await;
     let hw = hook_writer.clone();
-    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let hw = hw.clone();
+            async move { hw.plans.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
@@ -3179,7 +3232,14 @@ async fn observer_fired_with_correct_metadata() {
     assert_eq!(session_id, "obs-session-123");
 
     let ow = observer_worker.clone();
-    poll_until(|| { let ow = ow.clone(); async move { ow.requests.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let ow = ow.clone();
+            async move { ow.requests.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let requests = observer_worker.requests.lock().await;
     assert_eq!(requests.len(), 1);
@@ -3237,7 +3297,14 @@ async fn hook_db_multiple_tools_selected() {
 
     // Wait for async persistence.
     let hw = hook_writer.clone();
-    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let hw = hw.clone();
+            async move { hw.plans.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
@@ -3304,7 +3371,14 @@ async fn tool_events_persisted_for_tool_calls() {
         .expect("reader task failed");
     assert!(!events.is_empty());
     let tw = tool_writer.clone();
-    poll_until(|| { let tw = tw.clone(); async move { tw.plans.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let tw = tw.clone();
+            async move { tw.plans.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let plans = tool_writer.plans.lock().await;
     assert_eq!(plans.len(), 1, "one tool event plan persisted");
@@ -3353,7 +3427,14 @@ async fn tool_events_multiple_tools_distinct_names() {
         .expect("reader task failed");
     assert!(!events.is_empty());
     let tw = tool_writer.clone();
-    poll_until(|| { let tw = tw.clone(); async move { tw.plans.lock().await.len() > 0 } }, 5).await;
+    poll_until(
+        || {
+            let tw = tw.clone();
+            async move { tw.plans.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
 
     let plans = tool_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);

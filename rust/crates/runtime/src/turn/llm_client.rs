@@ -399,6 +399,7 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
 ///
 /// Returns a vec of (chunk_str, is_reasoning) pairs. Callers should route
 /// is_reasoning=true chunks to `reasoning_delta` and false to `text_delta`.
+#[allow(dead_code)] // Reserved for MiniMax M2.7 streaming support
 pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut pos = 0;
