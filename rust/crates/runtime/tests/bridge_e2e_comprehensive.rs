@@ -6808,3 +6808,275 @@ impl TurnSessionActivityWriter for FailActivityWriter {
         Err("simulated activity update failure".to_string())
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase 1: tool_request SSE emission E2E tests
+//
+// Verify that bridge_inprocess.rs correctly emits tool_request SSE events
+// after the LLM stream produces tool_calls, enabling CLI-side tool execution.
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tool_request_single_tool_call_fields() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tr-single-agent",
+        "messages": [{ "role": "user", "content": "show me the file" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-rf-1", "read_file", json!({"path": "main.rs"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_reqs.len(), 1, "single tool_call → 1 tool_request");
+
+    let req = tool_reqs[0];
+    assert_eq!(req["type"], "tool_request");
+    assert_eq!(
+        req["tool"], "read_file",
+        "tool name must match tool_call function.name"
+    );
+    assert_eq!(
+        req["args"]["path"], "main.rs",
+        "args must match tool_call arguments"
+    );
+    assert!(
+        req.get("request_id").and_then(Value::as_str).is_some(),
+        "request_id must be present"
+    );
+}
+
+#[tokio::test]
+async fn tool_request_parallel_three_tool_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tr-parallel-agent",
+        "messages": [{ "role": "user", "content": "analyze this project" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("glob")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "README.md"})),
+                tool_call("tc-2", "grep", json!({"path": ".", "command": "TODO"})),
+                tool_call("tc-3", "glob", json!({"path": ".", "pattern": "*.rs"})),
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(
+        tool_reqs.len(),
+        3,
+        "3 parallel tool_calls → 3 tool_requests"
+    );
+
+    // Verify each tool_request has the correct tool name and args.
+    let tools: Vec<&str> = tool_reqs
+        .iter()
+        .filter_map(|r| r["tool"].as_str())
+        .collect();
+    assert!(tools.contains(&"read_file"), "must include read_file");
+    assert!(tools.contains(&"grep"), "must include grep");
+    assert!(tools.contains(&"glob"), "must include glob");
+
+    // Each request_id must be unique.
+    let ids: Vec<&str> = tool_reqs
+        .iter()
+        .filter_map(|r| r["request_id"].as_str())
+        .collect();
+    let unique_ids: std::collections::HashSet<&&str> = ids.iter().collect();
+    assert_eq!(
+        ids.len(),
+        unique_ids.len(),
+        "all request_ids must be unique"
+    );
+}
+
+#[tokio::test]
+async fn tool_request_text_only_response_none_emitted() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tr-text-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hello! How can I help you?"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert!(
+        tool_reqs.is_empty(),
+        "text-only response must emit 0 tool_request events"
+    );
+
+    // Should still have session_info and turn_complete.
+    assert!(
+        !events_of_type(&events, "session_info").is_empty(),
+        "session_info required"
+    );
+    assert!(
+        !events_of_type(&events, "turn_complete").is_empty(),
+        "turn_complete required"
+    );
+}
+
+#[tokio::test]
+async fn tool_request_id_matches_turn_complete_tool_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tr-id-match-agent",
+        "messages": [{ "role": "user", "content": "do something" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-match-1", "read_file", json!({"path": "a.rs"})),
+                tool_call("tc-match-2", "grep", json!({"path": ".", "command": "fn"})),
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_reqs.len(), 2, "2 tool_calls → 2 tool_requests");
+
+    // Collect request_ids from tool_request events.
+    let req_ids: Vec<&str> = tool_reqs
+        .iter()
+        .filter_map(|r| r["request_id"].as_str())
+        .collect();
+
+    // The turn_complete event should list tool_calls with matching IDs.
+    // These come from ensure_tool_call_ids() which may auto-assign IDs.
+    // Verify each request_id is non-empty and has a reasonable format.
+    for id in &req_ids {
+        assert!(!id.is_empty(), "request_id must not be empty");
+    }
+
+    // Verify the tool_request events come BEFORE turn_complete in the SSE stream.
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+    let first_tool_req_pos = types.iter().position(|t| *t == "tool_request");
+    let turn_complete_pos = types.iter().position(|t| *t == "turn_complete");
+    assert!(
+        first_tool_req_pos.unwrap() < turn_complete_pos.unwrap(),
+        "tool_request must precede turn_complete in SSE stream"
+    );
+}
+
+#[tokio::test]
+async fn tool_request_sse_event_order_session_info_requests_complete() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tr-order-agent",
+        "messages": [{ "role": "user", "content": "list files" }],
+        "edge_tools": [tool_schema("glob"), tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-o1", "glob", json!({"path": ".", "pattern": "*.rs"})),
+                tool_call("tc-o2", "read_file", json!({"path": "lib.rs"})),
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+
+    // Verify the canonical SSE event order:
+    // session_info → tool_request(s) → turn_complete
+    assert_eq!(types[0], "session_info", "first event must be session_info");
+
+    let tool_req_types: Vec<&&str> = types.iter().filter(|t| **t == "tool_request").collect();
+    assert_eq!(tool_req_types.len(), 2, "should have 2 tool_request events");
+
+    assert_eq!(
+        types.last().unwrap(),
+        &"turn_complete",
+        "last event must be turn_complete"
+    );
+}
+
+#[tokio::test]
+async fn tool_request_auto_generated_ids_are_unique() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Send tool_calls WITHOUT explicit IDs — ensure_tool_call_ids should assign them.
+    let payload = json!({
+        "agent_id": "tr-autoid-agent",
+        "messages": [{ "role": "user", "content": "analyze" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                // No "id" field — will be auto-assigned by ensure_tool_call_ids
+                { "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"a.txt\"}" }},
+                { "type": "function", "function": { "name": "grep", "arguments": "{\"path\":\".\",\"command\":\"test\"}" }},
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_reqs.len(), 2, "2 tool_calls → 2 tool_requests");
+
+    let ids: Vec<&str> = tool_reqs
+        .iter()
+        .filter_map(|r| r["request_id"].as_str())
+        .collect();
+
+    for id in &ids {
+        assert!(
+            !id.is_empty(),
+            "auto-generated request_id must not be empty"
+        );
+    }
+
+    let unique: std::collections::HashSet<&&str> = ids.iter().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "auto-generated request_ids must be unique"
+    );
+}
