@@ -202,22 +202,26 @@ mod tests {
         );
     }
 
-    /// Tool selection guidance: prefer specific tools over bash.
+    /// Tool selection guidance: prefer specific tools for single ops, bash for compound.
     #[test]
-    fn git_tools_get_bash_avoidance_rule() {
+    fn git_tools_get_compound_bash_guidance() {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 1.0, None);
         assert!(
-            p.contains("NOT bash"),
-            "should guide away from bash for git queries"
+            p.contains("SINGLE operations"),
+            "should guide git tools for single operations"
+        );
+        assert!(
+            p.contains("COMPOUND git operations"),
+            "should guide bash for compound git operations"
         );
     }
 
     #[test]
-    fn no_git_tools_omits_bash_avoidance() {
+    fn no_git_tools_omits_git_guidance() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
         assert!(
-            !p.contains("NOT bash"),
-            "should NOT include bash avoidance when no git tools selected"
+            !p.contains("COMPOUND git operations"),
+            "should NOT include git guidance when no git tools selected"
         );
     }
 
@@ -242,8 +246,8 @@ mod tests {
         // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 11700,
-            "compressed prompt should be under 11700 chars, got {}",
+            p.len() < 12300,
+            "compressed prompt should be under 12300 chars, got {}",
             p.len()
         );
     }
@@ -943,8 +947,8 @@ mod tests {
         // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 17100,
-            "full toolset prompt should be under 17100 chars, got {}",
+            p.len() < 18200,
+            "full toolset prompt should be under 18200 chars, got {}",
             p.len()
         );
     }

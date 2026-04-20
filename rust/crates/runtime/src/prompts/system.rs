@@ -100,9 +100,12 @@ fn parallel_and_efficiency_section() -> &'static str {
      - Reading 3 files? Call read_file 3× in parallel.\n\
      - Need git_status AND git_diff? Call both.\n\
      - Need glob AND grep with different patterns? Call both.\n\
+     - Reviewing a commit? Call git_log AND git_show (or git_diff) in the SAME turn.\n\
+     - Analyzing a project? Call list_dir + read_file for multiple key files in ONE turn.\n\
      Do NOT parallelize when one result determines the next call's arguments.\n\
       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
+      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
+      **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
      - Use glob to narrow candidates before grep.\n\
@@ -204,7 +207,8 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
 
     if has_git || has_github {
         s.push_str(
-            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* — NOT bash for `git status`/`git diff`/`git log` when those tools apply.\n",
+            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* for SINGLE operations.\n\
+             For COMPOUND git operations (e.g., log + diff + show in one step), prefer bash with && chaining: `git log -1 --format='%H %s' && git diff HEAD~1`.\n",
         );
     }
     if has_github {
@@ -368,7 +372,10 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               first tool call — wait for tool results.\n\
               \n\
               ### Process\n\
-              1. **Get the diff**: call git_status + git_diff in ONE parallel turn. \
+              1. **Get the diff**: Determine what type of review this is:\n\
+                 - **Working-tree / staged changes**: call git_status + git_diff in ONE parallel turn.\n\
+                 - **Specific commit review**: call git_log + git_show (or git_diff with ref) in ONE parallel turn.\n\
+                 - **Efficient alternative**: use bash with `git log -1 --format='%H %s' && git diff HEAD~1` for a single-tool compound fetch.\n\
               ONLY use git_diff with `path` if the output shows \"[truncated]\". \
               The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
               2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
@@ -398,6 +405,7 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               ### Anti-patterns (NEVER do these)\n\
               - Do NOT write a review summary in the same response where you call git_diff.\n\
               - Do NOT say \"tests look good\" without reading at least one test file.\n\
+              - Do NOT call git_log in one turn, wait, then call git_show — call BOTH in the first turn.\n\
               - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
               - Do NOT claim full confidence when evidence is incomplete.\n"
         }
@@ -1107,6 +1115,32 @@ mod tests {
             Some("code_review")
         );
         assert_eq!(detect_task_type("look at the changes"), Some("code_review"));
+        assert_eq!(
+            detect_task_type("review latest commit"),
+            Some("code_review")
+        );
+    }
+
+    #[test]
+    fn code_review_prompt_includes_commit_review_guidance() {
+        let p = build_main_system_prompt(
+            &["git_diff", "git_log", "git_show", "bash"],
+            "",
+            1.0,
+            Some("code_review"),
+        );
+        assert!(
+            p.contains("Specific commit review"),
+            "should include commit review variant"
+        );
+        assert!(
+            p.contains("git_log + git_show"),
+            "should guide git_log + git_show in parallel"
+        );
+        assert!(
+            p.contains("call BOTH in the first turn"),
+            "should warn against sequential git_log then git_show"
+        );
     }
 
     #[test]
@@ -1453,10 +1487,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_git_tool_preference_over_bash() {
+    fn prompt_git_tool_guidance_for_compound_ops() {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
         assert!(p.contains("git_status, git_diff"));
-        assert!(p.contains("NOT bash"));
+        assert!(p.contains("COMPOUND git operations"));
     }
 
     #[test]
