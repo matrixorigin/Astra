@@ -104,7 +104,8 @@ async fn prefetch_code_review_context(message: &str, project_root: &Path) -> Opt
 
     let lower = message.to_lowercase();
 
-    if mentions_commit(&lower) {
+    // Explicit commit hash takes priority over keyword matching.
+    if extract_commit_hash(message).is_some() || mentions_commit(&lower) {
         prefetch_commit_review(message, project_root).await
     } else if mentions_pr(&lower) {
         prefetch_branch_diff(project_root).await
@@ -117,7 +118,8 @@ async fn prefetch_code_review_context(message: &str, project_root: &Path) -> Opt
 
 async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<String> {
     // If the user specified a commit hash, use it; otherwise default to HEAD.
-    let commit = extract_commit_hash(message).unwrap_or_else(|| "HEAD".to_string());
+    let requested = extract_commit_hash(message);
+    let commit = requested.clone().unwrap_or_else(|| "HEAD".to_string());
     let parent = format!("{commit}~1");
 
     let log = run_git(
@@ -126,6 +128,16 @@ async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<St
         MAX_LOG_BYTES,
     )
     .await?;
+
+    // Validate: if user requested a specific hash, confirm git resolved it to
+    // that commit. A mismatch means the hash is wrong or ambiguous — don't
+    // inject stale/wrong context; let the model call git tools itself.
+    if let Some(ref req) = requested {
+        let resolved = log.lines().next().unwrap_or("").trim();
+        if !resolved.starts_with(req.as_str()) {
+            return None;
+        }
+    }
 
     let diff_range = format!("{parent}..{commit}");
     let stat = run_git(
