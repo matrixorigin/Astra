@@ -7080,3 +7080,605 @@ async fn tool_request_auto_generated_ids_are_unique() {
         "auto-generated request_ids must be unique"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase 2: Round-Efficiency E2E Tests
+//
+// Test that common task patterns complete within expected round limits.
+// Each HTTP POST to /chat/turn = 1 bridge round (single-call proxy).
+// "Round efficiency" = how many POSTs the CLI agentic loop needs.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Phase 2a: Text-only query → exactly 1 round, 0 tool_requests.
+/// This is the baseline: a greeting/simple question needs no tools.
+#[tokio::test]
+async fn round_efficiency_text_only_single_round() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "re-text-agent",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("bash")],
+        "test_llm_rounds": [{
+            "full_text": "Hello! How can I help you today?",
+            "usage": { "prompt_tokens": 100, "completion_tokens": 15 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+
+    // Exactly 1 turn_complete — 1 round.
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(
+        tc.len(),
+        1,
+        "text-only should produce exactly 1 turn_complete"
+    );
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(false),
+        "text-only response must not have tool_calls"
+    );
+
+    // 0 tool_request events.
+    let tr = events_of_type(&events, "tool_request");
+    assert_eq!(
+        tr.len(),
+        0,
+        "text-only response must not have tool_requests"
+    );
+
+    // session_info present.
+    let si = events_of_type(&events, "session_info");
+    assert_eq!(si.len(), 1, "should have exactly 1 session_info");
+
+    // Verify text was streamed.
+    let text_deltas = events_of_type(&events, "text_delta");
+    assert!(
+        !text_deltas.is_empty(),
+        "text-only response should emit text_delta"
+    );
+
+    // Verify persistence: 1 core persist.
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1, "1 round = 1 core persist");
+    assert!(
+        core[0].user_query_event.is_some(),
+        "first round persists user_query"
+    );
+    assert!(
+        core[0].llm_response_event.is_some(),
+        "first round persists llm_response"
+    );
+}
+
+/// Phase 2b: Single round with 3 parallel tool calls — optimal tool batching.
+/// LLM requests 3 read-only tools in ONE turn. Proves the bridge emits
+/// all tool_requests in a single round (no unnecessary extra rounds).
+#[tokio::test]
+async fn round_efficiency_parallel_tools_single_round() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "re-parallel-agent",
+        "messages": [{ "role": "user", "content": "read all config files" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("list_dir"),
+            tool_schema("glob"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-p1", "read_file", json!({"path": "config.toml"})),
+                tool_call("tc-p2", "read_file", json!({"path": "Cargo.toml"})),
+                tool_call("tc-p3", "list_dir", json!({"path": "."})),
+            ],
+            "usage": { "prompt_tokens": 200, "completion_tokens": 50 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&raw);
+
+    // 1 turn_complete with has_tool_calls=true.
+    let tc = events_of_type(&events, "turn_complete");
+    assert_eq!(
+        tc.len(),
+        1,
+        "parallel tools = 1 bridge round = 1 turn_complete"
+    );
+    assert_eq!(
+        tc[0].get("has_tool_calls").and_then(Value::as_bool),
+        Some(true),
+    );
+
+    // 3 tool_request events (one per tool_call).
+    let tr = events_of_type(&events, "tool_request");
+    assert_eq!(
+        tr.len(),
+        3,
+        "3 tool_calls = 3 tool_requests in a single round"
+    );
+
+    // Verify correct tool names.
+    let tool_names: Vec<&str> = tr.iter().filter_map(|r| r["tool"].as_str()).collect();
+    assert_eq!(tool_names, vec!["read_file", "read_file", "list_dir"]);
+
+    // All 3 IDs should be unique.
+    let ids: std::collections::HashSet<&str> =
+        tr.iter().filter_map(|r| r["request_id"].as_str()).collect();
+    assert_eq!(ids.len(), 3, "3 unique request_ids");
+
+    // 1 persistence round.
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1, "1 bridge call = 1 core persist");
+}
+
+/// Phase 2c: Multi-round review flow (suboptimal sequential pattern).
+///
+/// Simulates the SUBOPTIMAL pattern where the model calls tools sequentially:
+///   Round 1: user → LLM calls git_log → tool_request
+///   Round 2: tool_result → LLM calls git_show → tool_request
+///   Round 3: tool_result → LLM returns review text
+///
+/// This is the 3-round pattern we observe with less capable models.
+/// Phase 4 (prompt optimization) should reduce this to 2 rounds.
+#[tokio::test]
+async fn round_efficiency_review_commit_three_rounds_suboptimal() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // ── Round 1: User asks to review → LLM calls git_log ──
+    let round1 = json!({
+        "agent_id": "re-review-agent",
+        "messages": [{ "role": "user", "content": "review the latest commit" }],
+        "edge_tools": [
+            tool_schema("git_log"),
+            tool_schema("git_show"),
+            tool_schema("read_file"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-r1", "git_log", json!({"max_count": 1}))
+            ]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, round1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0]["session_id"].as_str().unwrap();
+
+    let tc1 = events_of_type(&ev1, "turn_complete");
+    assert_eq!(tc1.len(), 1);
+    assert_eq!(tc1[0]["has_tool_calls"].as_bool(), Some(true));
+    let tr1 = events_of_type(&ev1, "tool_request");
+    assert_eq!(tr1.len(), 1, "round 1: 1 tool_request (git_log)");
+    assert_eq!(tr1[0]["tool"].as_str(), Some("git_log"));
+
+    // ── Round 2: CLI provides git_log result → LLM calls git_show ──
+    let round2 = json!({
+        "agent_id": "re-review-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "review the latest commit" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-r1", "type": "function", "function": {
+                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                }}
+            ]},
+            { "role": "tool", "tool_call_id": "tc-r1",
+              "content": "abc1234 feat: add new feature (2 hours ago)" },
+        ],
+        "edge_tools": [
+            tool_schema("git_log"),
+            tool_schema("git_show"),
+            tool_schema("read_file"),
+        ],
+        "tool_results": [{
+            "tool_call_id": "tc-r1",
+            "content": "abc1234 feat: add new feature (2 hours ago)"
+        }],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-r2", "git_show", json!({"commit": "abc1234"}))
+            ]
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, round2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(tc2.len(), 1);
+    assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(true));
+    let tr2 = events_of_type(&ev2, "tool_request");
+    assert_eq!(tr2.len(), 1, "round 2: 1 tool_request (git_show)");
+    assert_eq!(tr2[0]["tool"].as_str(), Some("git_show"));
+
+    // ── Round 3: CLI provides git_show result → LLM returns review text ──
+    let round3 = json!({
+        "agent_id": "re-review-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "review the latest commit" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-r1", "type": "function", "function": {
+                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                }}
+            ]},
+            { "role": "tool", "tool_call_id": "tc-r1",
+              "content": "abc1234 feat: add new feature (2 hours ago)" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-r2", "type": "function", "function": {
+                    "name": "git_show", "arguments": "{\"commit\":\"abc1234\"}"
+                }}
+            ]},
+            { "role": "tool", "tool_call_id": "tc-r2",
+              "content": "+fn new_feature() {\n+    println!(\"Hello\");\n+}" },
+        ],
+        "edge_tools": [
+            tool_schema("git_log"),
+            tool_schema("git_show"),
+            tool_schema("read_file"),
+        ],
+        "tool_results": [{
+            "tool_call_id": "tc-r2",
+            "content": "+fn new_feature() {\n+    println!(\"Hello\");\n+}"
+        }],
+        "test_llm_rounds": [{
+            "full_text": "## Code Review\n\nThe commit adds a `new_feature()` function. LGTM.",
+            "usage": { "prompt_tokens": 500, "completion_tokens": 30 }
+        }]
+    });
+
+    let (st3, raw3) = chat_turn(&app, round3).await;
+    assert_eq!(st3, StatusCode::OK);
+    let ev3 = parse_sse_events(&raw3);
+
+    let tc3 = events_of_type(&ev3, "turn_complete");
+    assert_eq!(tc3.len(), 1);
+    assert_eq!(tc3[0]["has_tool_calls"].as_bool(), Some(false));
+    let tr3 = events_of_type(&ev3, "tool_request");
+    assert_eq!(tr3.len(), 0, "round 3: 0 tool_requests (final text)");
+
+    // ── Verify total round efficiency ──
+    // This 3-round pattern is SUBOPTIMAL. The ideal pattern (2d) does it in 2.
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        3,
+        "suboptimal review: 3 bridge rounds = 3 core persists"
+    );
+
+    // Round 1 persists user_query. Rounds 2-3 are continuations.
+    assert!(
+        core[0].user_query_event.is_some(),
+        "round 1 is initial query"
+    );
+    assert!(
+        core[1].user_query_event.is_none(),
+        "round 2 is continuation"
+    );
+    assert!(
+        core[2].user_query_event.is_none(),
+        "round 3 is continuation"
+    );
+}
+
+/// Phase 2d: Optimal review flow — model batches git_log + git_show in 1 round.
+///
+/// Simulates the OPTIMAL pattern (like claudecode):
+///   Round 1: user → LLM calls git_log AND git_show together → 2 tool_requests
+///   Round 2: tool_results → LLM returns review text
+///
+/// 2 rounds instead of 3. This is the target for Phase 4 prompt optimization.
+#[tokio::test]
+async fn round_efficiency_review_commit_two_rounds_optimal() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // ── Round 1: User asks to review → LLM calls git_log + git_show in parallel ──
+    let round1 = json!({
+        "agent_id": "re-optimal-agent",
+        "messages": [{ "role": "user", "content": "review the latest commit" }],
+        "edge_tools": [
+            tool_schema("git_log"),
+            tool_schema("git_show"),
+            tool_schema("read_file"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-opt1", "git_log", json!({"max_count": 1})),
+                tool_call("tc-opt2", "git_show", json!({"commit": "HEAD"})),
+            ]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, round1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0]["session_id"].as_str().unwrap();
+
+    let tc1 = events_of_type(&ev1, "turn_complete");
+    assert_eq!(tc1.len(), 1);
+    assert_eq!(tc1[0]["has_tool_calls"].as_bool(), Some(true));
+    let tr1 = events_of_type(&ev1, "tool_request");
+    assert_eq!(
+        tr1.len(),
+        2,
+        "optimal round 1: 2 tool_requests (git_log + git_show)"
+    );
+
+    let tool_names: Vec<&str> = tr1.iter().filter_map(|r| r["tool"].as_str()).collect();
+    assert_eq!(tool_names, vec!["git_log", "git_show"]);
+
+    // ── Round 2: CLI provides both results → LLM returns final review ──
+    let round2 = json!({
+        "agent_id": "re-optimal-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "review the latest commit" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-opt1", "type": "function", "function": {
+                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                }},
+                { "id": "tc-opt2", "type": "function", "function": {
+                    "name": "git_show", "arguments": "{\"commit\":\"HEAD\"}"
+                }}
+            ]},
+            { "role": "tool", "tool_call_id": "tc-opt1",
+              "content": "abc1234 feat: add new feature (2 hours ago)" },
+            { "role": "tool", "tool_call_id": "tc-opt2",
+              "content": "diff --git a/src/main.rs\n+fn new_feature() { println!(\"Hello\"); }" },
+        ],
+        "edge_tools": [
+            tool_schema("git_log"),
+            tool_schema("git_show"),
+            tool_schema("read_file"),
+        ],
+        "tool_results": [
+            { "tool_call_id": "tc-opt1", "content": "abc1234 feat: add new feature (2 hours ago)" },
+            { "tool_call_id": "tc-opt2", "content": "diff --git a/src/main.rs\n+fn new_feature() { println!(\"Hello\"); }" },
+        ],
+        "test_llm_rounds": [{
+            "full_text": "## Code Review\n\nThe commit adds `new_feature()`. Clean implementation. LGTM.",
+            "usage": { "prompt_tokens": 600, "completion_tokens": 25 }
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, round2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(tc2.len(), 1);
+    assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(false));
+    let tr2 = events_of_type(&ev2, "tool_request");
+    assert_eq!(
+        tr2.len(),
+        0,
+        "optimal round 2: 0 tool_requests (final text)"
+    );
+
+    // ── Verify: only 2 rounds (vs 3 in suboptimal) ──
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(
+        core.len(),
+        2,
+        "optimal review: 2 bridge rounds = 2 core persists"
+    );
+
+    assert!(
+        core[0].user_query_event.is_some(),
+        "round 1 is initial query"
+    );
+    assert!(
+        core[1].user_query_event.is_none(),
+        "round 2 is continuation"
+    );
+
+    // Verify final review text was captured.
+    let llm_resp = core[1]
+        .llm_response_event
+        .as_ref()
+        .expect("round 2 has llm_response");
+    assert!(
+        llm_resp.content.contains("Code Review"),
+        "final response contains review"
+    );
+}
+
+/// Phase 2e: Deep analysis flow — 4 read-only tools in 1 round, then synthesis.
+///
+/// Simulates "analyze the project structure":
+///   Round 1: LLM calls list_dir + read_file x3 → 4 tool_requests
+///   Round 2: tool_results → LLM returns analysis text
+///
+/// Tests efficient batch tool use for analysis tasks.
+#[tokio::test]
+async fn round_efficiency_deep_analysis_batch_tools() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // ── Round 1: User asks to analyze → LLM batches 4 tool calls ──
+    let round1 = json!({
+        "agent_id": "re-analyze-agent",
+        "messages": [{ "role": "user", "content": "analyze the project structure" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("list_dir"),
+            tool_schema("glob"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-a1", "list_dir", json!({"path": "."})),
+                tool_call("tc-a2", "read_file", json!({"path": "Cargo.toml"})),
+                tool_call("tc-a3", "read_file", json!({"path": "README.md"})),
+                tool_call("tc-a4", "read_file", json!({"path": "src/main.rs"})),
+            ]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, round1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0]["session_id"].as_str().unwrap();
+
+    let tr1 = events_of_type(&ev1, "tool_request");
+    assert_eq!(
+        tr1.len(),
+        4,
+        "round 1: 4 tool_requests batched in single round"
+    );
+
+    // ── Round 2: CLI provides all 4 results → LLM returns analysis ──
+    let round2 = json!({
+        "agent_id": "re-analyze-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "analyze the project structure" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-a1", "type": "function", "function": {
+                    "name": "list_dir", "arguments": "{\"path\":\".\"}" }},
+                { "id": "tc-a2", "type": "function", "function": {
+                    "name": "read_file", "arguments": "{\"path\":\"Cargo.toml\"}" }},
+                { "id": "tc-a3", "type": "function", "function": {
+                    "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }},
+                { "id": "tc-a4", "type": "function", "function": {
+                    "name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}" }},
+            ]},
+            { "role": "tool", "tool_call_id": "tc-a1", "content": "src/ tests/ Cargo.toml README.md" },
+            { "role": "tool", "tool_call_id": "tc-a2", "content": "[package]\nname = \"myproj\"" },
+            { "role": "tool", "tool_call_id": "tc-a3", "content": "# My Project\nA Rust project." },
+            { "role": "tool", "tool_call_id": "tc-a4", "content": "fn main() {\n    println!(\"Hello\");\n}" },
+        ],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("list_dir"),
+            tool_schema("glob"),
+        ],
+        "tool_results": [
+            { "tool_call_id": "tc-a1", "content": "src/ tests/ Cargo.toml README.md" },
+            { "tool_call_id": "tc-a2", "content": "[package]\nname = \"myproj\"" },
+            { "tool_call_id": "tc-a3", "content": "# My Project\nA Rust project." },
+            { "tool_call_id": "tc-a4", "content": "fn main() {\n    println!(\"Hello\");\n}" },
+        ],
+        "test_llm_rounds": [{
+            "full_text": "## Project Analysis\n\nThis is a minimal Rust project with a standard layout.",
+            "usage": { "prompt_tokens": 800, "completion_tokens": 40 }
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, round2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(false));
+    let tr2 = events_of_type(&ev2, "tool_request");
+    assert_eq!(tr2.len(), 0, "round 2: 0 tool_requests (synthesis)");
+
+    // ── Verify: 2 rounds total for 4-tool analysis ──
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 2, "batch analysis: 2 rounds = 2 core persists");
+}
+
+/// Phase 2f: Bash compound command flow — single tool call for compound operation.
+///
+/// Simulates claudecode-style compound git operation in 1 bash call:
+///   Round 1: LLM calls bash("git log -1 --format='%H %s' && git diff HEAD~1") → 1 tool_request
+///   Round 2: tool_result → LLM returns review text
+///
+/// This is the most efficient pattern: 2 rounds, 1 tool call.
+#[tokio::test]
+async fn round_efficiency_bash_compound_two_rounds() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // ── Round 1: LLM uses bash for compound git operation ──
+    let round1 = json!({
+        "agent_id": "re-bash-agent",
+        "messages": [{ "role": "user", "content": "review the latest commit" }],
+        "edge_tools": [
+            tool_schema("bash"),
+            tool_schema("read_file"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-b1", "bash", json!({
+                    "command": "git log -1 --format='%H %s' && git diff HEAD~1"
+                }))
+            ]
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, round1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let ev1 = parse_sse_events(&raw1);
+    let session_id = ev1[0]["session_id"].as_str().unwrap();
+
+    let tr1 = events_of_type(&ev1, "tool_request");
+    assert_eq!(tr1.len(), 1, "round 1: 1 tool_request (bash compound)");
+    assert_eq!(tr1[0]["tool"].as_str(), Some("bash"));
+
+    // ── Round 2: CLI provides bash result → LLM returns review ──
+    let round2 = json!({
+        "agent_id": "re-bash-agent",
+        "session_id": session_id,
+        "messages": [
+            { "role": "user", "content": "review the latest commit" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "tc-b1", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"git log -1 --format='%H %s' && git diff HEAD~1\"}"
+                }}
+            ]},
+            { "role": "tool", "tool_call_id": "tc-b1",
+              "content": "abc1234 feat: add new feature\ndiff --git a/src/main.rs\n+fn new_feature() {}" },
+        ],
+        "edge_tools": [
+            tool_schema("bash"),
+            tool_schema("read_file"),
+        ],
+        "tool_results": [{
+            "tool_call_id": "tc-b1",
+            "content": "abc1234 feat: add new feature\ndiff --git a/src/main.rs\n+fn new_feature() {}"
+        }],
+        "test_llm_rounds": [{
+            "full_text": "## Code Review\n\nCommit abc1234 adds `new_feature()`. Clean and minimal. LGTM.",
+            "usage": { "prompt_tokens": 400, "completion_tokens": 20 }
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, round2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let ev2 = parse_sse_events(&raw2);
+
+    let tc2 = events_of_type(&ev2, "turn_complete");
+    assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(false));
+
+    // ── Verify: 2 rounds, 1 tool call (most efficient) ──
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 2, "bash compound: 2 rounds (1 tool + 1 text)");
+}
