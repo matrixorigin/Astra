@@ -28,7 +28,8 @@ pub use system::{
     ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, build_main_system_prompt,
     build_main_system_prompt_with_style, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, detect_task_type,
-    round_budget_directive, round_budget_directive_with, parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
+    parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
+    sections_to_string, self_awareness_prompt_section,
 };
 
 #[cfg(test)]

@@ -358,13 +358,18 @@ impl ToolSelectionConfig {
 
     /// Resolved round budget warning threshold (0 → default of 3).
     pub fn effective_round_budget_warning(&self) -> u32 {
-        if self.round_budget_warning > 0 { self.round_budget_warning } else { 3 }
+        if self.round_budget_warning > 0 {
+            self.round_budget_warning
+        } else {
+            3
+        }
     }
 
     /// Resolved round budget hard limit (0 → default of 6).
     pub fn effective_round_budget_limit(&self) -> u32 {
         if self.round_budget_limit > 0 {
-            self.round_budget_limit.max(self.effective_round_budget_warning() + 1)
+            self.round_budget_limit
+                .max(self.effective_round_budget_warning() + 1)
         } else {
             6
         }

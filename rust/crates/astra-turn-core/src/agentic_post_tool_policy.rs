@@ -5,9 +5,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::agentic_verdict_audit::AgenticVerdictAuditEvent;
-use crate::chat_history_openai::{
-    append_openai_user_content_messages,
-};
+use crate::chat_history_openai::append_openai_user_content_messages;
 use crate::stall::{
     CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL, CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING,
 };

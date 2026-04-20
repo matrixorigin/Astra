@@ -993,10 +993,7 @@ fn commit_turn_journal_workspace_and_sidecars(
             // Annotate with prefetch info so token audits can account for it.
             if result.prefetch_injected {
                 if let Some(obj) = trace.as_object_mut() {
-                    obj.insert(
-                        "prefetch".into(),
-                        serde_json::json!({ "injected": true }),
-                    );
+                    obj.insert("prefetch".into(), serde_json::json!({ "injected": true }));
                 }
             }
             // Use the REPL's user-visible turn number, not the internal agentic
@@ -1700,12 +1697,12 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
             match last_type {
                 None | Some(session_journal::JournalEventType::SessionEnd) => true,
                 _ => {
-                    let last_start = events
-                        .iter()
-                        .rposition(|e| e.event_type == session_journal::JournalEventType::SessionStart);
-                    let last_end = events
-                        .iter()
-                        .rposition(|e| e.event_type == session_journal::JournalEventType::SessionEnd);
+                    let last_start = events.iter().rposition(|e| {
+                        e.event_type == session_journal::JournalEventType::SessionStart
+                    });
+                    let last_end = events.iter().rposition(|e| {
+                        e.event_type == session_journal::JournalEventType::SessionEnd
+                    });
                     let has_unmatched_start = match (last_start, last_end) {
                         (Some(s), Some(e)) => s > e,
                         (Some(_), None) => true,

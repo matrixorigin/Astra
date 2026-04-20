@@ -9246,12 +9246,18 @@ async fn b2_round_budget_custom_thresholds() {
 
     // At custom warning → warning with correct remaining count
     let w = round_budget_directive_with(5, 5, 10);
-    assert!(w.contains("Round Budget Warning"), "should warn at custom threshold");
+    assert!(
+        w.contains("Round Budget Warning"),
+        "should warn at custom threshold"
+    );
     assert!(w.contains("5 remaining"), "should show correct remaining");
 
     // At custom limit → exceeded
     let e = round_budget_directive_with(10, 5, 10);
-    assert!(e.contains("Round Budget Exceeded"), "should exceed at custom limit");
+    assert!(
+        e.contains("Round Budget Exceeded"),
+        "should exceed at custom limit"
+    );
     assert!(e.contains("round 10/10"), "should show custom limit");
 }
 
@@ -9407,9 +9413,18 @@ async fn b4_parallel_feedback_for_multiple_tools() {
         json!({"role": "tool", "tool_call_id": "tc3", "content": "glob results"}),
     ];
     let feedback = astra_runtime::prompts::parallel_execution_feedback(&messages);
-    assert!(feedback.contains("3 tools"), "should mention 3 tools: {feedback}");
-    assert!(feedback.contains("parallel"), "should mention parallel: {feedback}");
-    assert!(feedback.contains("Keep batching"), "should encourage batching: {feedback}");
+    assert!(
+        feedback.contains("3 tools"),
+        "should mention 3 tools: {feedback}"
+    );
+    assert!(
+        feedback.contains("parallel"),
+        "should mention parallel: {feedback}"
+    );
+    assert!(
+        feedback.contains("Keep batching"),
+        "should encourage batching: {feedback}"
+    );
 }
 
 /// B4: parallel_execution_feedback only counts trailing tool messages.
@@ -9456,7 +9471,10 @@ async fn b4_bridge_parallel_feedback_in_dynamic_prompt() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
-    assert!(!texts.is_empty(), "should produce text after parallel tools");
+    assert!(
+        !texts.is_empty(),
+        "should produce text after parallel tools"
+    );
     cap.wait_persist_idle().await;
 }
 
@@ -9499,7 +9517,11 @@ async fn golden_code_review_parallel_reads() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    let tools = vec![tool_schema("read_file"), tool_schema("grep"), tool_schema("glob")];
+    let tools = vec![
+        tool_schema("read_file"),
+        tool_schema("grep"),
+        tool_schema("glob"),
+    ];
 
     // ── Round 1: LLM requests parallel file reads ──
     let payload_r1 = json!({
@@ -9522,9 +9544,17 @@ async fn golden_code_review_parallel_reads() {
 
     // Verify: 3 tool_call events + tool_request events emitted
     let tool_calls: Vec<&Value> = events_of_type(&events_r1, "tool_call");
-    assert_eq!(tool_calls.len(), 3, "round 1 should emit 3 tool_call events");
+    assert_eq!(
+        tool_calls.len(),
+        3,
+        "round 1 should emit 3 tool_call events"
+    );
     let tool_requests: Vec<&Value> = events_of_type(&events_r1, "tool_request");
-    assert_eq!(tool_requests.len(), 3, "round 1 should emit 3 tool_request events");
+    assert_eq!(
+        tool_requests.len(),
+        3,
+        "round 1 should emit 3 tool_request events"
+    );
 
     // Verify: turn_complete event present
     let turn_complete: Vec<&Value> = events_of_type(&events_r1, "turn_complete");
@@ -9564,8 +9594,14 @@ async fn golden_code_review_parallel_reads() {
         .iter()
         .filter_map(|e| e.get("content").and_then(|c| c.as_str()))
         .collect();
-    assert!(full_text.contains("Code Review"), "should contain review header");
-    assert!(full_text.contains("JWT verification"), "should contain findings");
+    assert!(
+        full_text.contains("Code Review"),
+        "should contain review header"
+    );
+    assert!(
+        full_text.contains("JWT verification"),
+        "should contain findings"
+    );
 
     // Verify persistence
     cap.wait_persist_idle().await;
@@ -9580,7 +9616,11 @@ async fn golden_debugging_three_rounds() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    let tools = vec![tool_schema("read_file"), tool_schema("grep"), tool_schema("bash")];
+    let tools = vec![
+        tool_schema("read_file"),
+        tool_schema("grep"),
+        tool_schema("bash"),
+    ];
 
     // ── Round 1: LLM reads the error log ──
     let payload_r1 = json!({
@@ -9623,7 +9663,11 @@ async fn golden_debugging_three_rounds() {
     assert_eq!(st, StatusCode::OK);
     let events_r2 = parse_sse_events(&body);
     let tool_requests: Vec<&Value> = events_of_type(&events_r2, "tool_request");
-    assert_eq!(tool_requests.len(), 2, "round 2 should request 2 grep tools");
+    assert_eq!(
+        tool_requests.len(),
+        2,
+        "round 2 should request 2 grep tools"
+    );
     cap.wait_persist_idle().await;
 
     // ── Round 3: LLM provides fix ──
@@ -9658,7 +9702,10 @@ async fn golden_debugging_three_rounds() {
         .iter()
         .filter_map(|e| e.get("content").and_then(|c| c.as_str()))
         .collect();
-    assert!(full_text.contains("NullPointerException"), "should explain the bug");
+    assert!(
+        full_text.contains("NullPointerException"),
+        "should explain the bug"
+    );
     assert!(full_text.contains("Fix"), "should contain fix");
 
     cap.wait_persist_idle().await;
@@ -9726,8 +9773,10 @@ async fn golden_token_usage_tracking() {
     assert_eq!(turn_complete.len(), 1);
     let tc = turn_complete[0];
     // Usage is available in the event
-    assert!(tc.get("prompt_tokens").is_some() || tc.get("usage").is_some() || true,
-        "turn_complete event emitted");
+    assert!(
+        tc.get("prompt_tokens").is_some() || tc.get("usage").is_some() || true,
+        "turn_complete event emitted"
+    );
 
     cap.wait_persist_idle().await;
 }
@@ -9773,7 +9822,10 @@ async fn golden_round_budget_forces_synthesis() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
-    assert!(!texts.is_empty(), "should produce synthesis text at budget threshold");
+    assert!(
+        !texts.is_empty(),
+        "should produce synthesis text at budget threshold"
+    );
 
     cap.wait_persist_idle().await;
 }
@@ -9788,34 +9840,42 @@ async fn golden_session_continuity() {
     let sid = "golden-continuity-sess";
 
     // Round 1
-    let (st, _) = chat_turn(&app, json!({
-        "session_id": sid,
-        "messages": [{"role": "user", "content": "What does foo() do?"}],
-        "edge_tools": [tool_schema("read_file")],
-        "round_index": 0,
-        "test_llm_rounds": [{
-            "tool_calls": [tool_call("tc-1", "read_file", json!({"path": "src/foo.rs"}))]
-        }]
-    })).await;
+    let (st, _) = chat_turn(
+        &app,
+        json!({
+            "session_id": sid,
+            "messages": [{"role": "user", "content": "What does foo() do?"}],
+            "edge_tools": [tool_schema("read_file")],
+            "round_index": 0,
+            "test_llm_rounds": [{
+                "tool_calls": [tool_call("tc-1", "read_file", json!({"path": "src/foo.rs"}))]
+            }]
+        }),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     cap.wait_persist_idle().await;
 
     // Round 2 — same session, accumulated history
-    let (st, body) = chat_turn(&app, json!({
-        "session_id": sid,
-        "messages": [
-            {"role": "user", "content": "What does foo() do?"},
-            {"role": "assistant", "content": null, "tool_calls": [
-                tool_call("tc-1", "read_file", json!({"path": "src/foo.rs"}))
-            ]},
-            {"role": "tool", "tool_call_id": "tc-1", "content": "pub fn foo() -> i32 { 42 }"}
-        ],
-        "edge_tools": [tool_schema("read_file")],
-        "round_index": 1,
-        "test_llm_rounds": [{
-            "full_text": "The function `foo()` returns the integer 42."
-        }]
-    })).await;
+    let (st, body) = chat_turn(
+        &app,
+        json!({
+            "session_id": sid,
+            "messages": [
+                {"role": "user", "content": "What does foo() do?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    tool_call("tc-1", "read_file", json!({"path": "src/foo.rs"}))
+                ]},
+                {"role": "tool", "tool_call_id": "tc-1", "content": "pub fn foo() -> i32 { 42 }"}
+            ],
+            "edge_tools": [tool_schema("read_file")],
+            "round_index": 1,
+            "test_llm_rounds": [{
+                "full_text": "The function `foo()` returns the integer 42."
+            }]
+        }),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
@@ -9823,7 +9883,10 @@ async fn golden_session_continuity() {
         .iter()
         .filter_map(|e| e.get("content").and_then(|c| c.as_str()))
         .collect();
-    assert!(full_text.contains("42"), "should reference the function return value");
+    assert!(
+        full_text.contains("42"),
+        "should reference the function return value"
+    );
 
     cap.wait_persist_idle().await;
 
@@ -9840,15 +9903,19 @@ async fn golden_error_recovery_tool_result() {
     let app = build_test_app(cap.clone());
 
     // Round 1: LLM tries to read a file
-    let (st, _) = chat_turn(&app, json!({
-        "session_id": "golden-error-sess",
-        "messages": [{"role": "user", "content": "Read the config"}],
-        "edge_tools": [tool_schema("read_file")],
-        "round_index": 0,
-        "test_llm_rounds": [{
-            "tool_calls": [tool_call("tc-1", "read_file", json!({"path": "config.toml"}))]
-        }]
-    })).await;
+    let (st, _) = chat_turn(
+        &app,
+        json!({
+            "session_id": "golden-error-sess",
+            "messages": [{"role": "user", "content": "Read the config"}],
+            "edge_tools": [tool_schema("read_file")],
+            "round_index": 0,
+            "test_llm_rounds": [{
+                "tool_calls": [tool_call("tc-1", "read_file", json!({"path": "config.toml"}))]
+            }]
+        }),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK);
     cap.wait_persist_idle().await;
 
@@ -9871,7 +9938,11 @@ async fn golden_error_recovery_tool_result() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     let tool_requests: Vec<&Value> = events_of_type(&events, "tool_request");
-    assert_eq!(tool_requests.len(), 1, "LLM should try glob after file-not-found");
+    assert_eq!(
+        tool_requests.len(),
+        1,
+        "LLM should try glob after file-not-found"
+    );
 
     cap.wait_persist_idle().await;
 }
@@ -9903,7 +9974,10 @@ async fn d3_semantic_dedup_exact_duplicate_detected() {
         "contents of main.rs",
         1,
     );
-    assert!(result2.is_some(), "identical tool+args should be detected as duplicate");
+    assert!(
+        result2.is_some(),
+        "identical tool+args should be detected as duplicate"
+    );
 }
 
 /// D3: SemanticDedup does NOT flag different args as duplicates.
@@ -9926,7 +10000,10 @@ async fn d3_semantic_dedup_different_args_not_flagged() {
         "contents of lib.rs",
         1,
     );
-    assert!(result.is_none(), "different args should not be flagged as duplicate");
+    assert!(
+        result.is_none(),
+        "different args should not be flagged as duplicate"
+    );
 }
 
 /// D3: SemanticDedup normalizes paths (trailing slash equivalence).
@@ -9936,21 +10013,14 @@ async fn d3_semantic_dedup_normalized_paths() {
 
     let mut dedup = SemanticDedup::new(0.75);
 
-    dedup.check_and_record(
-        "glob",
-        &json!({"path": "src/"}),
-        "file1.rs\nfile2.rs",
-        0,
-    );
+    dedup.check_and_record("glob", &json!({"path": "src/"}), "file1.rs\nfile2.rs", 0);
 
     // Same path without trailing slash — should detect as duplicate
-    let result = dedup.check_and_record(
-        "glob",
-        &json!({"path": "src"}),
-        "file1.rs\nfile2.rs",
-        1,
+    let result = dedup.check_and_record("glob", &json!({"path": "src"}), "file1.rs\nfile2.rs", 1);
+    assert!(
+        result.is_some(),
+        "normalized paths should match as duplicates"
     );
-    assert!(result.is_some(), "normalized paths should match as duplicates");
 }
 
 /// D3: pre_check_block returns cached output for known duplicates.
@@ -9970,10 +10040,16 @@ async fn d3_semantic_dedup_pre_check_returns_cached() {
 
     // Pre-check should detect and return the cached output
     let blocked = dedup.pre_check_block("read_file", &json!({"path": "Cargo.toml"}), 1);
-    assert!(blocked.is_some(), "pre_check_block should block known duplicate");
+    assert!(
+        blocked.is_some(),
+        "pre_check_block should block known duplicate"
+    );
     let (prev_turn, cached_output) = blocked.unwrap();
     assert_eq!(prev_turn, 0);
-    assert!(cached_output.contains("package name"), "should return cached output");
+    assert!(
+        cached_output.contains("package name"),
+        "should return cached output"
+    );
 }
 
 /// D3: Non-cacheable tools (bash, write_file) are never flagged.
@@ -9997,7 +10073,10 @@ async fn d3_semantic_dedup_non_cacheable_tools_ignored() {
         "total 48\ndrwxr-xr-x",
         1,
     );
-    assert!(result.is_none(), "bash is non-cacheable, should not be flagged");
+    assert!(
+        result.is_none(),
+        "bash is non-cacheable, should not be flagged"
+    );
 }
 
 /// D3: System prompt includes dedup guidance.
@@ -10051,22 +10130,37 @@ async fn c1_trace_core_plan_has_user_and_response() {
     cap.wait_persist_idle().await;
 
     let core = cap.core_plans.lock().await;
-    assert!(!core.is_empty(), "should have at least one core persist plan");
+    assert!(
+        !core.is_empty(),
+        "should have at least one core persist plan"
+    );
 
     let plan = &core[0];
     // User query event
-    let uq = plan.user_query_event.as_ref().expect("user_query_event present");
+    let uq = plan
+        .user_query_event
+        .as_ref()
+        .expect("user_query_event present");
     assert_eq!(uq.event_type, "user_query");
     assert!(!uq.event_id.is_empty(), "event_id should be non-empty");
     assert!(!uq.session_id.is_empty(), "session_id should be non-empty");
-    assert!(!uq.causal_chain_id.is_empty(), "causal_chain_id should be non-empty");
+    assert!(
+        !uq.causal_chain_id.is_empty(),
+        "causal_chain_id should be non-empty"
+    );
     assert!(uq.content.contains("Rust"), "user query content preserved");
 
     // LLM response event
-    let lr = plan.llm_response_event.as_ref().expect("llm_response_event present");
+    let lr = plan
+        .llm_response_event
+        .as_ref()
+        .expect("llm_response_event present");
     assert_eq!(lr.event_type, "llm_response");
     assert!(!lr.event_id.is_empty());
-    assert!(lr.content.contains("systems programming"), "LLM response content preserved");
+    assert!(
+        lr.content.contains("systems programming"),
+        "LLM response content preserved"
+    );
     // Token usage should be captured
     assert!(lr.token_usage.is_some(), "token_usage should be captured");
 }
@@ -10096,13 +10190,26 @@ async fn c1_trace_tool_events_have_required_fields() {
 
     let tools = cap.tool_plans.lock().await;
     let all_events: Vec<_> = tools.iter().flat_map(|p| &p.events).collect();
-    assert!(all_events.len() >= 2, "at least 2 tool events, got {}", all_events.len());
+    assert!(
+        all_events.len() >= 2,
+        "at least 2 tool events, got {}",
+        all_events.len()
+    );
 
     for evt in &all_events {
         assert!(!evt.event_id.is_empty(), "tool event should have event_id");
-        assert!(!evt.session_id.is_empty(), "tool event should have session_id");
-        assert!(!evt.causal_chain_id.is_empty(), "tool event should have causal_chain_id");
-        assert!(!evt.event_type.is_empty(), "tool event should have event_type");
+        assert!(
+            !evt.session_id.is_empty(),
+            "tool event should have session_id"
+        );
+        assert!(
+            !evt.causal_chain_id.is_empty(),
+            "tool event should have causal_chain_id"
+        );
+        assert!(
+            !evt.event_type.is_empty(),
+            "tool event should have event_type"
+        );
     }
 }
 
@@ -10126,8 +10233,14 @@ async fn c1_trace_activity_plan_has_session_id() {
     let activities = cap.activity_plans.lock().await;
     assert!(!activities.is_empty(), "should have activity update");
     let (sess_id, plan) = &activities[0];
-    assert_eq!(sess_id, "c1-activity-unique-sess", "session_id should match payload");
-    assert!(plan.event_count_increment > 0, "should count at least one event");
+    assert_eq!(
+        sess_id, "c1-activity-unique-sess",
+        "session_id should match payload"
+    );
+    assert!(
+        plan.event_count_increment > 0,
+        "should count at least one event"
+    );
 }
 
 /// C1: Causal chain IDs link user query → LLM response → tool events.
@@ -10228,15 +10341,24 @@ async fn c2_journal_core_events_complete() {
             assert!(!uq.session_id.is_empty(), "user_query session_id required");
             assert_eq!(uq.event_type, "user_query");
             assert!(!uq.content.is_empty(), "user_query content required");
-            assert!(!uq.causal_chain_id.is_empty(), "user_query causal_chain_id required");
+            assert!(
+                !uq.causal_chain_id.is_empty(),
+                "user_query causal_chain_id required"
+            );
         }
         if let Some(lr) = &plan.llm_response_event {
             assert!(!lr.event_id.is_empty(), "llm_response event_id required");
             assert!(!lr.user_id.is_empty(), "llm_response user_id required");
-            assert!(!lr.session_id.is_empty(), "llm_response session_id required");
+            assert!(
+                !lr.session_id.is_empty(),
+                "llm_response session_id required"
+            );
             assert_eq!(lr.event_type, "llm_response");
             assert!(!lr.content.is_empty(), "llm_response content required");
-            assert!(!lr.causal_chain_id.is_empty(), "llm_response causal_chain_id required");
+            assert!(
+                !lr.causal_chain_id.is_empty(),
+                "llm_response causal_chain_id required"
+            );
         }
     }
 }
@@ -10332,7 +10454,10 @@ async fn c2_journal_aux_events_valid_structure() {
         assert!(!evt.event_id.is_empty(), "aux event_id required");
         assert!(!evt.session_id.is_empty(), "aux session_id required");
         assert!(!evt.event_type.is_empty(), "aux event_type required");
-        assert!(!evt.causal_chain_id.is_empty(), "aux causal_chain_id required");
+        assert!(
+            !evt.causal_chain_id.is_empty(),
+            "aux causal_chain_id required"
+        );
     }
 }
 
@@ -10371,15 +10496,29 @@ async fn c3_explain_event_comprehensive_fields() {
     let ex = explain[0];
     // Timing
     let total_ms = ex.get("total_ms").and_then(Value::as_i64);
-    assert!(total_ms.is_some() && total_ms.unwrap() >= 0, "total_ms non-negative");
+    assert!(
+        total_ms.is_some() && total_ms.unwrap() >= 0,
+        "total_ms non-negative"
+    );
 
     // Token usage
     assert_eq!(ex.get("prompt_tokens").and_then(Value::as_i64), Some(500));
-    assert_eq!(ex.get("completion_tokens").and_then(Value::as_i64), Some(200));
+    assert_eq!(
+        ex.get("completion_tokens").and_then(Value::as_i64),
+        Some(200)
+    );
 
     // Tool statistics
-    assert_eq!(ex.get("tools_selected").and_then(Value::as_i64), Some(2), "2 tool calls");
-    assert_eq!(ex.get("tools_available").and_then(Value::as_i64), Some(3), "3 available tools");
+    assert_eq!(
+        ex.get("tools_selected").and_then(Value::as_i64),
+        Some(2),
+        "2 tool calls"
+    );
+    assert_eq!(
+        ex.get("tools_available").and_then(Value::as_i64),
+        Some(3),
+        "3 available tools"
+    );
 
     // Type field
     assert_eq!(ex.get("type").and_then(Value::as_str), Some("explain"));
@@ -10410,11 +10549,13 @@ async fn c3_explain_text_only_zero_tools() {
 
     let ex = explain[0];
     assert_eq!(
-        ex.get("tools_selected").and_then(Value::as_i64), Some(0),
+        ex.get("tools_selected").and_then(Value::as_i64),
+        Some(0),
         "text-only turn should have 0 tools selected"
     );
     assert_eq!(
-        ex.get("tools_available").and_then(Value::as_i64), Some(1),
+        ex.get("tools_available").and_then(Value::as_i64),
+        Some(1),
         "1 tool available"
     );
     cap.wait_persist_idle().await;
@@ -10438,7 +10579,10 @@ async fn c3_explain_not_emitted_by_default() {
 
     let events = parse_sse_events(&body);
     let explain = events_of_type(&events, "explain");
-    assert!(explain.is_empty(), "explain should not be emitted without explain=true");
+    assert!(
+        explain.is_empty(),
+        "explain should not be emitted without explain=true"
+    );
     cap.wait_persist_idle().await;
 }
 
@@ -10463,7 +10607,8 @@ async fn c3_sse_event_ordering_correct() {
     assert_eq!(st, StatusCode::OK);
 
     let events = parse_sse_events(&body);
-    let types: Vec<&str> = events.iter()
+    let types: Vec<&str> = events
+        .iter()
         .filter_map(|e| e.get("type").and_then(Value::as_str))
         .collect();
 
@@ -10473,7 +10618,10 @@ async fn c3_sse_event_ordering_correct() {
     let explain_pos = types.iter().position(|t| *t == "explain");
 
     assert!(session_info_pos.is_some(), "session_info should be emitted");
-    assert!(turn_complete_pos.is_some(), "turn_complete should be emitted");
+    assert!(
+        turn_complete_pos.is_some(),
+        "turn_complete should be emitted"
+    );
     assert!(explain_pos.is_some(), "explain should be emitted");
 
     // session_info comes first; explain before turn_complete (turn_complete is final)
@@ -10572,7 +10720,10 @@ async fn d1_schema_pruning_aggressive_tier() {
     let func = &pruned[0]["function"];
     let props = &func["parameters"]["properties"];
     // "path" is optional (not in required), so it should be removed
-    assert!(props.get("path").is_none(), "aggressive removes optional params");
+    assert!(
+        props.get("path").is_none(),
+        "aggressive removes optional params"
+    );
     // "pattern" is required, so it stays
     assert!(props.get("pattern").is_some(), "keeps required params");
 }
@@ -10600,8 +10751,13 @@ async fn d2_truncation_constant_value() {
 #[tokio::test]
 async fn d2_small_result_not_truncated() {
     let content = "x".repeat(1000);
-    let out = astra_turn_core::tool_result_sanitize::tool_result_content_for_model("bash", &content);
-    assert_eq!(out.len(), 1000, "small result should pass through unchanged");
+    let out =
+        astra_turn_core::tool_result_sanitize::tool_result_content_for_model("bash", &content);
+    assert_eq!(
+        out.len(),
+        1000,
+        "small result should pass through unchanged"
+    );
 }
 
 /// D2: Tool result truncation — oversized results get truncated.
@@ -10609,9 +10765,13 @@ async fn d2_small_result_not_truncated() {
 async fn d2_oversized_result_truncated() {
     let max = astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS;
     let big = "Z".repeat(max + 20_000);
-    let out = astra_turn_core::tool_result_sanitize::tool_result_content_for_model("read_file", &big);
+    let out =
+        astra_turn_core::tool_result_sanitize::tool_result_content_for_model("read_file", &big);
     assert!(out.len() < big.len(), "should be smaller after truncation");
-    assert!(out.contains("truncated"), "should contain truncation notice");
+    assert!(
+        out.contains("truncated"),
+        "should contain truncation notice"
+    );
     assert!(out.starts_with("ZZZ"), "head preserved");
     assert!(out.ends_with("ZZZ"), "tail preserved");
 }
@@ -10641,6 +10801,9 @@ async fn d2_bridge_handles_large_tool_result_in_history() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
-    assert!(!texts.is_empty(), "should produce text even with large history");
+    assert!(
+        !texts.is_empty(),
+        "should produce text even with large history"
+    );
     cap.wait_persist_idle().await;
 }

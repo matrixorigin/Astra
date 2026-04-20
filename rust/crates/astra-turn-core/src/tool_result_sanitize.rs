@@ -221,8 +221,14 @@ mod tests {
     fn oversized_result_truncated() {
         let content = "A".repeat(MAX_TOOL_RESULT_CHARS + 10_000);
         let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
-        assert!(out.len() < content.len(), "should be smaller after truncation");
-        assert!(out.contains("truncated"), "should contain truncation notice");
+        assert!(
+            out.len() < content.len(),
+            "should be smaller after truncation"
+        );
+        assert!(
+            out.contains("truncated"),
+            "should contain truncation notice"
+        );
         assert!(out.contains("characters"), "should mention chars truncated");
         // Head and tail preserved
         assert!(out.starts_with("AAA"), "head preserved");
@@ -258,7 +264,10 @@ mod tests {
         // With max_chars=50, should truncate (100 chars > 50), not skip.
         let content = "é".repeat(100); // 'é' is 2 bytes in UTF-8
         let out = super::truncate_tool_result(&content, 50);
-        assert!(out.contains("truncated"), "should truncate by char count, not byte count");
+        assert!(
+            out.contains("truncated"),
+            "should truncate by char count, not byte count"
+        );
     }
 
     #[test]
@@ -268,6 +277,9 @@ mod tests {
         let max = 10_000;
         let out = super::truncate_tool_result(&content, max);
         // head=4000 chars, tail=4000 chars, omitted=2100 chars (not 6300 bytes)
-        assert!(out.contains("2100 characters"), "omitted count must be in chars: {out}");
+        assert!(
+            out.contains("2100 characters"),
+            "omitted count must be in chars: {out}"
+        );
     }
 }
