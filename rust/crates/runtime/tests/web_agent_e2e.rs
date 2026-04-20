@@ -18,7 +18,7 @@ use astra_runtime::{
     FernetTokenEncryptor, HealthChecker, MatrixOneSettings, ServiceInfo, SessionActivityRecord,
     SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
     SessionUpdateRequestData, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, build_app,
+    TurnObserverWorker, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
 };
 use async_trait::async_trait;
 use axum::{
@@ -212,6 +212,20 @@ impl TurnObserverWorker for RecordingObserverWorker {
     }
 }
 
+/// Records all tool event persist plans for test verification.
+#[derive(Default)]
+struct RecordingToolEventWriter {
+    plans: tokio::sync::Mutex<Vec<TurnToolEventPersistPlan>>,
+}
+
+#[async_trait]
+impl TurnToolEventWriter for RecordingToolEventWriter {
+    async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
+        self.plans.lock().await.push(plan);
+        Ok(())
+    }
+}
+
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
@@ -239,11 +253,12 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
     (build_app(state), ledger)
 }
 
-/// Build a test app with recording hook DB + observer writers for verification.
+/// Build a test app with recording hook DB + observer + tool event writers for verification.
 fn build_test_app_with_hooks() -> (
     Router,
     Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
+    Arc<RecordingToolEventWriter>,
 ) {
     init_env();
     let enc =
@@ -255,6 +270,7 @@ fn build_test_app_with_hooks() -> (
     let ledger = base.edge_callback_ledger();
     let hook_writer = Arc::new(RecordingHookDbWriter::default());
     let observer_worker = Arc::new(RecordingObserverWorker::default());
+    let tool_event_writer = Arc::new(RecordingToolEventWriter::default());
 
     let lifecycle = AgenticRunLifecycleService::new(
         MatrixOneSettings {
@@ -268,10 +284,16 @@ fn build_test_app_with_hooks() -> (
         ledger,
     )
     .with_hook_db_writer(hook_writer.clone())
-    .with_observer_worker(observer_worker.clone());
+    .with_observer_worker(observer_worker.clone())
+    .with_tool_event_writer(tool_event_writer.clone());
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), hook_writer, observer_worker)
+    (
+        build_app(state),
+        hook_writer,
+        observer_worker,
+        tool_event_writer,
+    )
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -3024,7 +3046,7 @@ async fn client_disconnect_run_still_finalizes() {
 /// Text-only response produces a "response_generation" decision audit with no skills.
 #[tokio::test]
 async fn hook_db_decision_audit_text_only() {
-    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
+    let (app, hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -3070,7 +3092,7 @@ async fn hook_db_decision_audit_text_only() {
 /// Tool-call response produces a "tool_selection" decision audit with skill selection.
 #[tokio::test]
 async fn hook_db_decision_audit_with_tools() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
     let app_clone = app.clone();
     let stream_task = tokio::spawn(async move {
@@ -3130,7 +3152,7 @@ async fn hook_db_decision_audit_with_tools() {
 /// Model name is propagated to decision audit.
 #[tokio::test]
 async fn hook_db_decision_audit_model_name() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
     chat_stream_collect(
         &app,
@@ -3154,7 +3176,7 @@ async fn hook_db_decision_audit_model_name() {
 /// Observer receives correct session_id and turn_count.
 #[tokio::test]
 async fn observer_fired_with_correct_metadata() {
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
+    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
 
     let events = chat_stream_collect(
         &app,
@@ -3182,7 +3204,7 @@ async fn observer_fired_with_correct_metadata() {
 /// Multiple tool calls across rounds produce a skill selection with all tool names.
 #[tokio::test]
 async fn hook_db_multiple_tools_selected() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+    let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
     // Two rounds of approval-free tools (read_file, list_dir) + final text.
     let app_clone = app.clone();
@@ -3242,4 +3264,127 @@ async fn hook_db_multiple_tools_selected() {
     // All unique tool names should be captured.
     assert!(skill.selected_skills.contains(&"read_file".to_string()));
     assert!(skill.selected_skills.contains(&"list_dir".to_string()));
+}
+
+// ── Tool Event Persistence Tests ─────────────────────────────────────────────
+
+/// Text-only response produces no tool events.
+#[tokio::test]
+async fn tool_events_empty_for_text_only() {
+    let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
+
+    chat_stream_collect(
+        &app,
+        json!({
+            "message": "hello",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "Hi there!" }]
+            }
+        }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = tool_writer.plans.lock().await;
+    assert!(plans.is_empty(), "no tool events for text-only response");
+}
+
+/// Tool calls produce tool_call events with correct tool_name metadata.
+#[tokio::test]
+async fn tool_events_persisted_for_tool_calls() {
+    let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
+
+    let app_clone = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(
+            &app_clone,
+            json!({
+                "message": "read the file",
+                "context": {
+                    "test_llm_rounds": [
+                        {
+                            "tool_calls": [tool_call("tc1", "read_file", json!({"path": "a.txt"}))]
+                        },
+                        { "full_text": "Done." }
+                    ],
+                    "edge_tools": [tool_schema("read_file")]
+                }
+            }),
+        )
+        .await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app, "tc1", "file contents", "success").await;
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("stream timed out")
+        .expect("stream task failed");
+    assert!(!events.is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = tool_writer.plans.lock().await;
+    assert_eq!(plans.len(), 1, "one tool event plan persisted");
+
+    let tool_events = &plans[0].events;
+    assert_eq!(tool_events.len(), 1, "one unique tool used");
+    assert_eq!(tool_events[0].event_type, "tool_call");
+
+    let meta = tool_events[0].metadata.as_ref().expect("metadata present");
+    assert_eq!(meta["tool_name"], "read_file");
+}
+
+/// Multiple distinct tools produce one event per unique tool name.
+#[tokio::test]
+async fn tool_events_multiple_tools_distinct_names() {
+    let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
+
+    let app_clone = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(
+            &app_clone,
+            json!({
+                "message": "check stuff",
+                "context": {
+                    "test_llm_rounds": [
+                        {
+                            "tool_calls": [
+                                tool_call("tc1", "read_file", json!({"path": "a.txt"})),
+                                tool_call("tc2", "list_dir", json!({"path": "."}))
+                            ]
+                        },
+                        { "full_text": "All done." }
+                    ],
+                    "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")]
+                }
+            }),
+        )
+        .await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
+    post_tool_result(&app, "tc2", "dir listing", "success").await;
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("stream timed out")
+        .expect("stream task failed");
+    assert!(!events.is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = tool_writer.plans.lock().await;
+    assert_eq!(plans.len(), 1);
+
+    let tool_events = &plans[0].events;
+    assert_eq!(tool_events.len(), 2, "two distinct tools");
+    let names: std::collections::HashSet<&str> = tool_events
+        .iter()
+        .map(|e| e.metadata.as_ref().unwrap()["tool_name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains("read_file"));
+    assert!(names.contains("list_dir"));
 }

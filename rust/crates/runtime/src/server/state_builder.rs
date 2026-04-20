@@ -301,7 +301,8 @@ pub async fn build_server_state(
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_hook_db_writer(state.turn_hook_db_writer.clone())
-    .with_observer_worker(state.turn_observer_worker.clone());
+    .with_observer_worker(state.turn_observer_worker.clone())
+    .with_tool_event_writer(state.turn_tool_event_writer.clone());
 
     // Wire team persistence store backed by MatrixOne.
     let team_store =

@@ -218,7 +218,7 @@ pub struct ChatStreamRecord {
     pub events: Vec<serde_json::Value>,
     /// When present, SSE events are streamed incrementally through this
     /// channel. The HTTP handler converts this into a streaming response.
-    pub event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>,
+    pub event_rx: Option<tokio::sync::mpsc::Receiver<serde_json::Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -40,7 +40,7 @@ pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>)
 pub(super) fn sse_streaming_response(
     session_id: String,
     run_id: String,
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    mut event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) -> Response {
     // Build an async stream that yields SSE frames from the channel.
     let stream = async_stream::stream! {

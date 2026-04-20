@@ -49,8 +49,9 @@ use crate::{
 };
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnLearningOutcome, TurnLearningWriter,
+    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
+    TurnToolEventRecord, TurnToolEventWriter,
 };
 
 use astra_core::{
@@ -799,6 +800,53 @@ async fn persist_server_loop_core_events(
     }
 }
 
+/// Persist `tool_call` events to `agent_events` for tools used during the
+/// server-driven agentic loop.  The bridge path creates detailed per-call
+/// records; here we create one event per unique tool name from
+/// `state.telemetry.all_tools_used` with metadata containing `tool_name`
+/// so that `session_audit` aggregate queries (`meta_tool_name`, `tool_calls_total`)
+/// return correct results for server-loop sessions.
+async fn persist_server_loop_tool_events(
+    writer: &dyn TurnToolEventWriter,
+    user_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    state: &AgenticLoopState,
+) {
+    if state.telemetry.all_tools_used.is_empty() {
+        return;
+    }
+
+    let chain_id = format!("{session_id}:server-loop-tools:{}", Uuid::now_v7());
+    let mut events = Vec::with_capacity(state.telemetry.all_tools_used.len());
+
+    for tool_name in &state.telemetry.all_tools_used {
+        events.push(TurnToolEventRecord {
+            event_id: Uuid::now_v7().to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.map(|s| s.to_string()),
+            event_type: "tool_call".to_string(),
+            content: format!("server-loop tool: {tool_name}"),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: chain_id.clone(),
+            metadata: Some(json!({ "tool_name": tool_name })),
+            skill_name: None,
+            skill_version: None,
+            reasoning_content: None,
+        });
+    }
+
+    let plan = TurnToolEventPersistPlan { events };
+    if let Err(e) = writer.persist(plan).await {
+        astra_core::agent_error!(
+            "server-loop",
+            "failed to persist tool events for session {session_id}: {e}"
+        );
+    }
+}
+
 /// Persist decision audit + skill selection to hook DB tables after the
 /// server-driven agentic loop completes.  This ensures the decisions API
 /// (`ctx_decision_audits`, `skill_selection_events`) has data for server-loop
@@ -914,6 +962,37 @@ fn truncate_for_audit(text: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = text.chars().take(max_chars).collect();
         format!("{truncated}…")
+    }
+}
+
+/// Record a pipeline learning outcome from the server-driven loop so the
+/// PatternLibrary / EntityGraph / ProgressiveCalibrator can learn across
+/// sessions.  This mirrors what the bridge path does via
+/// `PipelineLearningWriter.record_outcome()` in `side_effects.rs`.
+async fn record_server_loop_learning_outcome(
+    writer: &dyn TurnLearningWriter,
+    user_message: &str,
+    state: &AgenticLoopState,
+    success: bool,
+) {
+    let tools_used: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    let outcome = TurnLearningOutcome {
+        query: user_message.to_string(),
+        tools_selected: tools_used.clone(),
+        tools_used,
+        success,
+        quality: if success { 0.7 } else { 0.2 },
+        was_corrected: false,
+        task_type_label: None,
+        domain_hint_label: None,
+        user_feedback_score: None,
+        reward_hacking_risk: 0.0,
+        reward_hacking_flags: Vec::new(),
+        causal_support_score: if success { 0.8 } else { 0.3 },
+        causal_support_flags: Vec::new(),
+    };
+    if let Err(e) = writer.record_outcome(outcome).await {
+        astra_core::agent_error!("server-loop", "failed to record learning outcome: {e}");
     }
 }
 
@@ -1068,6 +1147,8 @@ pub struct AgenticRunLifecycleService {
     hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
+    /// Tool event writer for persisting tool_call events to agent_events.
+    tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1093,6 +1174,7 @@ impl AgenticRunLifecycleService {
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
             hook_db_writer: None,
             observer_worker: None,
+            tool_event_writer: None,
         }
     }
 
@@ -1143,6 +1225,11 @@ impl AgenticRunLifecycleService {
 
     pub fn with_observer_worker(mut self, worker: Arc<dyn TurnObserverWorker>) -> Self {
         self.observer_worker = Some(worker);
+        self
+    }
+
+    pub fn with_tool_event_writer(mut self, writer: Arc<dyn TurnToolEventWriter>) -> Self {
+        self.tool_event_writer = Some(writer);
         self
     }
 
@@ -1903,9 +1990,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_model_name = request.model.clone();
         let bg_hook_db_writer = self.hook_db_writer.clone();
         let bg_observer_worker = self.observer_worker.clone();
+        let bg_tool_event_writer = self.tool_event_writer.clone();
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+            let loop_success = outcome.is_ok();
             let (events, final_status, error_msg) =
                 Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
 
@@ -1986,6 +2075,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await;
 
+            // Persist tool_call events so session_audit metrics are correct.
+            if let Some(ref writer) = bg_tool_event_writer {
+                persist_server_loop_tool_events(
+                    writer.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    bg_agent_id.as_deref(),
+                    &loop_state,
+                )
+                .await;
+            }
+
             // Persist decision audit + skill selection to hook DB tables.
             if let Some(ref writer) = bg_hook_db_writer {
                 persist_server_loop_hook_events(
@@ -2009,6 +2110,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
                 .await;
             }
+
+            // Record pipeline learning outcome (PatternLibrary / EntityGraph).
+            record_server_loop_learning_outcome(
+                learning_stack.writer.as_ref(),
+                &bg_user_message,
+                &loop_state,
+                loop_success,
+            )
+            .await;
 
             // Fire SessionEnd hooks (best-effort, non-blocking).
             crate::skills::hooks::fire_session_end(
@@ -2103,6 +2213,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.validate_request_constraints(&request).await?;
 
+        // ── Resource governance check ────────────────────────────────
+        if let Some(ref gov) = self.resource_governor {
+            if let astra_services::resource_governor::LimitCheck::Denied { reason } =
+                gov.check_session_create(&user_id).await
+            {
+                return Err(error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("Resource limit exceeded: {reason}"),
+                ));
+            }
+        }
+
         let run_id = Uuid::new_v4().to_string();
         let session_id = request
             .session_id
@@ -2120,8 +2242,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             None
         };
 
-        // Create the incremental SSE channel.
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        // Create the bounded SSE channel. 512 events is generous for any single
+        // turn; hitting the limit means the client cannot keep up, so we treat
+        // channel-full the same as client disconnect (cancel the loop).
+        const SSE_CHANNEL_CAPACITY: usize = 512;
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
 
         let mut state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
@@ -2135,6 +2260,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         self.runs.write().await.insert(run_id.clone(), run_state);
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
+
+        // Record session creation for resource tracking.
+        if let Some(ref gov) = self.resource_governor {
+            gov.record_session_created(&user_id).await;
+        }
+
         self.configure_loop_state_runtime_controls(
             &mut state,
             &cancel_flag,
@@ -2183,6 +2314,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_model_name = request.model.clone();
         let bg_hook_db_writer = self.hook_db_writer.clone();
         let bg_observer_worker = self.observer_worker.clone();
+        let bg_tool_event_writer = self.tool_event_writer.clone();
 
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
@@ -2228,6 +2360,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await;
 
+            // Persist tool_call events so session_audit metrics are correct.
+            if let Some(ref writer) = bg_tool_event_writer {
+                persist_server_loop_tool_events(
+                    writer.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    bg_agent_id.as_deref(),
+                    &state,
+                )
+                .await;
+            }
+
             // Persist decision audit + skill selection to hook DB tables.
             if let Some(ref writer) = bg_hook_db_writer {
                 persist_server_loop_hook_events(
@@ -2246,6 +2390,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 fire_server_loop_observer(worker.as_ref(), &bg_user_id, &bg_session_id, &state)
                     .await;
             }
+
+            // Record pipeline learning outcome (PatternLibrary / EntityGraph).
+            let loop_success = loop_result.is_ok();
+            record_server_loop_learning_outcome(
+                learning_stack.writer.as_ref(),
+                &bg_user_message,
+                &state,
+                loop_success,
+            )
+            .await;
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -2308,7 +2462,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &crate::turn::stall::DivergenceStatus::Healthy,
                 None,
             );
-            let _ = event_tx.send(Value::Object(turn_complete));
+            let _ = event_tx.try_send(Value::Object(turn_complete));
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
             drop(event_tx);

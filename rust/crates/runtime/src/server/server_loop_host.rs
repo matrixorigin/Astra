@@ -226,7 +226,7 @@ pub struct ServerAgenticLoopHost {
     /// When set, SSE events are also pushed through this channel for
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
-    event_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     /// When the SSE channel's receiver is dropped (client disconnected),
     /// this flag is set so the agentic loop cancels at the next turn boundary.
     client_cancel_flag: Option<Arc<AtomicBool>>,
@@ -260,7 +260,7 @@ pub struct ServerAgenticLoopHostBuilder {
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
     interactive_client: bool,
-    event_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -350,7 +350,7 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub fn with_event_tx(mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) -> Self {
+    pub fn with_event_tx(mut self, tx: tokio::sync::mpsc::Sender<Value>) -> Self {
         self.event_tx = Some(tx);
         self
     }
@@ -426,15 +426,29 @@ impl ServerAgenticLoopHost {
     /// cancellation so the agentic loop stops at the next turn boundary.
     fn emit_event(&mut self, event: Value) {
         if let Some(ref tx) = self.event_tx {
-            if tx.send(event.clone()).is_err() {
-                // Client disconnected — cancel the loop to stop wasting LLM tokens.
-                if let Some(flag) = &self.client_cancel_flag {
-                    flag.store(true, Ordering::SeqCst);
+            match tx.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Client disconnected — cancel the loop to stop wasting LLM tokens.
+                    if let Some(flag) = &self.client_cancel_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(token) = &self.client_cancel_token {
+                        token.cancel();
+                    }
+                    self.event_tx = None;
                 }
-                if let Some(token) = &self.client_cancel_token {
-                    token.cancel();
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Backpressure: client can't keep up. Cancel to avoid unbounded buffering.
+                    tracing::warn!(target: "sse_channel", "SSE event channel full — cancelling run");
+                    if let Some(flag) = &self.client_cancel_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(token) = &self.client_cancel_token {
+                        token.cancel();
+                    }
+                    self.event_tx = None;
                 }
-                self.event_tx = None;
             }
         }
         self.emitted_events.push(event);
@@ -480,7 +494,7 @@ impl ServerAgenticLoopHost {
     /// this sender as they are emitted, enabling streaming to the client.
     /// When the channel closes (client disconnect), `cancel_flag` and
     /// `cancel_token` are triggered to stop the agentic loop.
-    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) {
+    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
         self.event_tx = Some(tx);
     }
 
