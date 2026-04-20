@@ -934,8 +934,9 @@ fn strip_thinking_tags(text: &str) -> String {
                     result = format!("{}{}", &result[..start], &result[end_pos..]);
                     continue;
                 }
-                // Unclosed tag — strip from open tag to end
-                result = result[..start].to_string();
+                // Unclosed tag — keep content after the open tag; the JSON
+                // may be embedded inside the thinking block itself.
+                result = result[start + open.len()..].to_string();
             }
             break;
         }
@@ -7228,7 +7229,15 @@ Done!"#;
     #[test]
     fn strip_thinking_tags_handles_unclosed() {
         let input = "before<think>reasoning without close";
-        assert_eq!(strip_thinking_tags(input), "before");
+        assert_eq!(strip_thinking_tags(input), "reasoning without close");
+    }
+
+    #[test]
+    fn strip_thinking_tags_unclosed_with_json() {
+        // Model outputs <think>...JSON... without </think> — JSON must survive
+        let input = "<think>some reasoning\n{\"phases\": []}";
+        let result = strip_thinking_tags(input);
+        assert!(result.contains("{\"phases\": []}"), "got: {result}");
     }
 
     #[test]
