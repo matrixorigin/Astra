@@ -196,7 +196,7 @@ pub(crate) async fn stream_chat_sse(
     // For well-known task patterns (code review, etc.), pre-fetch relevant
     // context locally so the LLM can respond in fewer rounds.
     let mut prefetch_injected = false;
-    if !p.plan_only_chat {
+    if !p.plan_only_chat && !p.is_plan_subtask {
         if let Some(ctx) =
             crate::context_prefetch::prefetch_context_for_message(p.message, &project_root).await
         {
