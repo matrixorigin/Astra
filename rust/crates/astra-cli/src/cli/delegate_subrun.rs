@@ -307,7 +307,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             has_any_usage: false,
             max_turns: DELEGATE_MAX_TURNS,
             remaining_turns: DELEGATE_MAX_TURNS,
-            current_turn_index: 0,
+            current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,

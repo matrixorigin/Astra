@@ -324,6 +324,16 @@ pub struct ToolSelectionConfig {
     /// Prevents pathological turns where the agent requests 50+ tool calls.
     #[serde(default)]
     pub max_tools_per_turn: u32,
+
+    /// Round index at which the LLM receives a "wrap up" warning.
+    /// 0 = use default (3). Set higher for complex multi-file tasks.
+    #[serde(default)]
+    pub round_budget_warning: u32,
+
+    /// Round index at which the LLM is forced to stop calling tools.
+    /// 0 = use default (6). Set higher for complex multi-file tasks.
+    #[serde(default)]
+    pub round_budget_limit: u32,
 }
 
 impl ToolSelectionConfig {
@@ -343,6 +353,20 @@ impl ToolSelectionConfig {
             self.max_tools_per_turn.max(5)
         } else {
             15
+        }
+    }
+
+    /// Resolved round budget warning threshold (0 → default of 3).
+    pub fn effective_round_budget_warning(&self) -> u32 {
+        if self.round_budget_warning > 0 { self.round_budget_warning } else { 3 }
+    }
+
+    /// Resolved round budget hard limit (0 → default of 6).
+    pub fn effective_round_budget_limit(&self) -> u32 {
+        if self.round_budget_limit > 0 {
+            self.round_budget_limit.max(self.effective_round_budget_warning() + 1)
+        } else {
+            6
         }
     }
 }
@@ -373,6 +397,8 @@ impl Default for ToolSelectionConfig {
             selector_model: None,
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
+            round_budget_warning: 0,
+            round_budget_limit: 0,
         }
     }
 }
@@ -889,6 +915,8 @@ impl RuntimeConfig {
             selector_model,
             max_identical_tool_calls,
             max_tools_per_turn,
+            round_budget_warning,
+            round_budget_limit,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -936,6 +964,16 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.max_tools_per_turn,
             max_tools_per_turn,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.round_budget_warning,
+            round_budget_warning,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.round_budget_limit,
+            round_budget_limit,
             0,
         );
 
@@ -1346,6 +1384,8 @@ mod tests {
                 selector_model: None,
                 max_identical_tool_calls: 0,
                 max_tools_per_turn: 0,
+                round_budget_warning: 0,
+                round_budget_limit: 0,
             },
             learning: LearningConfig {
                 enabled: false,
@@ -1508,5 +1548,44 @@ selector_model = "qwen-flash"
             merged.tool_selection.selector_model.as_deref(),
             Some("qwen3.5-flash")
         );
+    }
+
+    #[test]
+    fn round_budget_defaults() {
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_round_budget_warning(), 3);
+        assert_eq!(cfg.effective_round_budget_limit(), 6);
+    }
+
+    #[test]
+    fn round_budget_custom_values() {
+        let cfg = ToolSelectionConfig {
+            round_budget_warning: 5,
+            round_budget_limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_round_budget_warning(), 5);
+        assert_eq!(cfg.effective_round_budget_limit(), 10);
+    }
+
+    #[test]
+    fn round_budget_limit_enforces_above_warning() {
+        // limit set below warning → clamped to warning + 1
+        let cfg = ToolSelectionConfig {
+            round_budget_warning: 8,
+            round_budget_limit: 5,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_round_budget_limit(), 9);
+    }
+
+    #[test]
+    fn round_budget_limit_zero_uses_default_regardless_of_warning() {
+        let cfg = ToolSelectionConfig {
+            round_budget_warning: 5,
+            round_budget_limit: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_round_budget_limit(), 6);
     }
 }

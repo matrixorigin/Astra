@@ -889,7 +889,12 @@ impl InProcessChatTurnBridge {
             };
 
             // ── Round budget directive: encourage synthesis after several rounds ──
-            let round_budget_hint = prompts::round_budget_directive(round_index);
+            let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+            let round_budget_hint = prompts::round_budget_directive_with(
+                round_index,
+                tool_cfg.effective_round_budget_warning(),
+                tool_cfg.effective_round_budget_limit(),
+            );
 
             // ── B4: Parallel execution feedback — positive reinforcement for batching ──
             let parallel_feedback = prompts::parallel_execution_feedback(&messages);

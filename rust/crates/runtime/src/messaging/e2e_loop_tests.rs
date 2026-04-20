@@ -158,7 +158,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
-            current_turn_index: 0,
+            current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             step_recorder: StepRecorder::new("test-session", "test-task"),

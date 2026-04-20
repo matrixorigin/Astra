@@ -239,7 +239,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 .last_confidence_diagnosis
                 .as_ref()
                 .map(|d| d.fallback.clone()),
-            round_index: state.current_turn_index,
+            round_index: state.current_round_index,
         })
         .await;
 

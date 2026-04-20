@@ -206,7 +206,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
-            current_turn_index: 0,
+            current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,

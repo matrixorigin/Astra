@@ -1067,21 +1067,28 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
 /// When `round_index` >= `ROUND_BUDGET_THRESHOLD`, nudges the LLM to synthesize
 /// what it has gathered so far rather than continuing sequential tool exploration.
 /// This is a **generic** mechanism — not task-specific.
+///
+/// These constants are defaults; callers should prefer
+/// `ToolSelectionConfig::effective_round_budget_warning/limit` for runtime overrides.
 pub const ROUND_BUDGET_THRESHOLD: u32 = 3;
 pub const ROUND_BUDGET_HARD_LIMIT: u32 = 6;
 
 pub fn round_budget_directive(round_index: u32) -> String {
-    if round_index >= ROUND_BUDGET_HARD_LIMIT {
+    round_budget_directive_with(round_index, ROUND_BUDGET_THRESHOLD, ROUND_BUDGET_HARD_LIMIT)
+}
+
+pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -> String {
+    if round_index >= limit {
         format!(
-            "\n\n## ⚠ Round Budget Exceeded (round {round_index}/{ROUND_BUDGET_HARD_LIMIT})\n\
+            "\n\n## ⚠ Round Budget Exceeded (round {round_index}/{limit})\n\
              You MUST produce your final answer NOW. Do NOT call any more tools.\n\
              Synthesize everything you have gathered so far into a complete response.\n\
              If some information is missing, state what you could not verify.\n"
         )
-    } else if round_index >= ROUND_BUDGET_THRESHOLD {
-        let remaining = ROUND_BUDGET_HARD_LIMIT - round_index;
+    } else if round_index >= warning {
+        let remaining = limit - round_index;
         format!(
-            "\n\n## ⚡ Round Budget Warning (round {round_index}/{ROUND_BUDGET_HARD_LIMIT})\n\
+            "\n\n## ⚡ Round Budget Warning (round {round_index}/{limit})\n\
              You have used {round_index} tool rounds. {remaining} remaining before the hard limit.\n\
              - If you have enough information, produce your final answer NOW.\n\
              - If you still need data, batch ALL remaining tool calls into ONE parallel turn.\n\

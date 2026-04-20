@@ -9236,6 +9236,25 @@ async fn b2_round_budget_past_hard_limit() {
     );
 }
 
+/// B2: round_budget_directive_with respects custom thresholds.
+#[tokio::test]
+async fn b2_round_budget_custom_thresholds() {
+    use astra_runtime::prompts::round_budget_directive_with;
+
+    // Below custom warning → empty
+    assert!(round_budget_directive_with(4, 5, 10).is_empty());
+
+    // At custom warning → warning with correct remaining count
+    let w = round_budget_directive_with(5, 5, 10);
+    assert!(w.contains("Round Budget Warning"), "should warn at custom threshold");
+    assert!(w.contains("5 remaining"), "should show correct remaining");
+
+    // At custom limit → exceeded
+    let e = round_budget_directive_with(10, 5, 10);
+    assert!(e.contains("Round Budget Exceeded"), "should exceed at custom limit");
+    assert!(e.contains("round 10/10"), "should show custom limit");
+}
+
 /// B2: Bridge reads round_index from payload and injects directive into dynamic prompt.
 /// When round_index >= threshold, the system prompt sent to the mock LLM should contain
 /// the round budget warning. We verify by checking that the mock LLM receives the directive
