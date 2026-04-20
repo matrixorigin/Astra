@@ -133,17 +133,21 @@ pub(crate) async fn call_llm_stream(
         .build()
         .map_err(|e| e.to_string())?;
 
+    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+
     let mut body = json!({
         "model": model_name,
         "messages": messages,
         "stream": true,
-        "stream_options": {"include_usage": true},
     });
+    if !is_anthropic {
+        body["stream_options"] = json!({"include_usage": true});
+    }
 
     // Set max output tokens to prevent generation cutoff.
     // Use provider-appropriate field name.
     if let Some(max_out) = max_output_tokens {
-        if provider == "anthropic" || model_name.contains("claude") {
+        if is_anthropic {
             body["max_tokens"] = json!(max_out);
         } else {
             // OpenAI, DeepSeek, Qwen, etc. use max_completion_tokens (newer)
@@ -154,7 +158,11 @@ pub(crate) async fn call_llm_stream(
 
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = Value::String("auto".to_string());
+        if is_anthropic {
+            body["tool_choice"] = json!({"type": "auto"});
+        } else {
+            body["tool_choice"] = Value::String("auto".to_string());
+        }
     }
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
