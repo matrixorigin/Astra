@@ -633,6 +633,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_commit_review_with_valid_hash() {
+        // A real hash from this repo should resolve and inject the correct diff.
+        let root = test_project_root();
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let hash = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let msg = format!("review {hash}");
+        let ctx = prefetch_context_for_message(&msg, &root).await;
+        assert!(ctx.is_some(), "valid hash should produce context");
+        let body = ctx.unwrap().body;
+        // The injected diff must reference the requested hash, not some other commit.
+        assert!(
+            body.contains(&hash[..12]),
+            "injected context must contain the requested hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_commit_review_invalid_hash_returns_none() {
+        // A fake hash should cause git log to fail → return None → no injection.
+        let root = test_project_root();
+        let ctx = prefetch_context_for_message("review deadbeefdeadbeefdeadbeef00000000000", &root).await;
+        assert!(
+            ctx.is_none(),
+            "invalid hash should return None so model calls git tools itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_bare_hash_routes_to_commit_review() {
+        // "review <hash>" with no keyword like "commit" must still route correctly.
+        let root = test_project_root();
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let hash = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let ctx = prefetch_context_for_message(&format!("review {hash}"), &root).await;
+        assert!(ctx.is_some());
+        assert_eq!(ctx.unwrap().task_type, "code_review");
+    }
+
+    #[tokio::test]
     async fn prefetch_no_context_for_greeting() {
         let root = test_project_root();
         let ctx = prefetch_context_for_message("hello world", &root).await;
