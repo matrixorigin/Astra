@@ -1,16 +1,18 @@
 //! Phase B: `/chat/stream` (server-driven loop) persistence — verify session,
-//! context trace events, and run status in DB after web-agent mode chat.
+//! core events (`user_query`, `llm_response`), context trace events, and run
+//! status in DB after web-agent mode chat.
 //!
 //! ## Architecture note
 //!
 //! The `/chat/stream` path uses the server-driven agentic loop (`stream_chat()`),
-//! NOT the bridge-driven path. The bridge path (`/chat/turn`) persists `user_query`
-//! and `llm_response` events to `agent_events`. The server loop path persists:
+//! NOT the bridge-driven path. It persists:
 //!
-//! 1. **`context_trace_signal`** events — via `ContextTracePersistenceContext` during
+//! 1. **`user_query`** + **`llm_response`** events — via `persist_server_loop_core_events()`
+//!    using `TurnCoreEventWriter` after the agentic loop completes
+//! 2. **`context_trace_signal`** events — via `ContextTracePersistenceContext` during
 //!    `finalize_turn_trace()` at loop exit
-//! 2. **Run status + usage** — via `RunEngine` (when configured) to durable store
-//! 3. **Promotion events** — via `persist_runtime_promotion_events()`
+//! 3. **Run status + usage** — via `RunEngine` (when configured) to durable store
+//! 4. **Promotion events** — via `persist_runtime_promotion_events()`
 //!
 //! These tests verify that infrastructure.
 
@@ -176,7 +178,8 @@ pub async fn run_stream_session_and_run_status() {
     ctx.pool.close().await;
 }
 
-/// B2: Context trace signal is persisted to agent_events after stream_chat completes.
+/// B2: Core events (user_query, llm_response) and context_trace_signal are persisted
+/// to agent_events after stream_chat completes.
 pub async fn run_stream_context_trace_persistence() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -209,13 +212,12 @@ pub async fn run_stream_context_trace_persistence() {
         &body[..body.len().min(300)]
     );
 
-    // Wait for context_trace_signal to be persisted.
-    // The finalize_turn_trace → persist_latest_context_trace_signal path writes
-    // this event type asynchronously after the loop completes.
-    wait_for_agent_events_count(pool, &session_id, 1, std::time::Duration::from_secs(15)).await;
+    // Wait for events to be persisted (user_query + llm_response + context_trace_signal = 3).
+    wait_for_agent_events_count(pool, &session_id, 3, std::time::Duration::from_secs(15)).await;
 
     let recs = sqlx::query(
-        "SELECT event_id, event_type, content, causal_chain_id, agent_id \
+        "SELECT event_id, event_type, content, causal_chain_id, agent_id, \
+                llm_model_used, token_usage, parent_event_id \
          FROM agent_events WHERE session_id = ? ORDER BY created_at ASC",
     )
     .bind(&session_id)
@@ -224,37 +226,100 @@ pub async fn run_stream_context_trace_persistence() {
     .expect("select agent_events");
 
     assert!(
-        !recs.is_empty(),
-        "should have at least one agent_events row after stream_chat"
+        recs.len() >= 3,
+        "should have at least 3 agent_events rows (user_query + llm_response + context_trace_signal), got {}",
+        recs.len()
     );
 
-    // Expect context_trace_signal from the server-driven loop.
-    let trace_signal = recs.iter().find(|r| {
-        r.try_get::<String, _>("event_type").ok().as_deref() == Some("context_trace_signal")
-    });
+    // ── Verify user_query event ──
+    let user_query = recs
+        .iter()
+        .find(|r| r.try_get::<String, _>("event_type").ok().as_deref() == Some("user_query"));
     assert!(
-        trace_signal.is_some(),
-        "should have a context_trace_signal event. Found event types: {:?}",
+        user_query.is_some(),
+        "should have a user_query event. Found types: {:?}",
         recs.iter()
             .filter_map(|r| r.try_get::<String, _>("event_type").ok())
             .collect::<Vec<_>>()
     );
-
-    let trace = trace_signal.unwrap();
-    let event_id = trace.try_get::<String, _>("event_id").unwrap_or_default();
+    let uq = user_query.unwrap();
+    let uq_content = uq.try_get::<String, _>("content").unwrap_or_default();
     assert!(
-        !event_id.is_empty(),
-        "context_trace_signal should have an event_id"
+        uq_content.contains("context trace persistence test"),
+        "user_query content should contain the original message, got: {uq_content}"
     );
-
-    let chain_id = trace
+    let uq_event_id = uq.try_get::<String, _>("event_id").unwrap_or_default();
+    assert!(
+        !uq_event_id.is_empty(),
+        "user_query should have an event_id"
+    );
+    let uq_chain_id = uq
         .try_get::<Option<String>, _>("causal_chain_id")
         .ok()
         .flatten()
         .unwrap_or_default();
     assert!(
-        chain_id.contains("context-trace"),
-        "causal_chain_id should contain 'context-trace', got: {chain_id}"
+        uq_chain_id.contains("server-loop"),
+        "user_query causal_chain_id should contain 'server-loop', got: {uq_chain_id}"
+    );
+
+    // ── Verify llm_response event ──
+    let llm_response = recs
+        .iter()
+        .find(|r| r.try_get::<String, _>("event_type").ok().as_deref() == Some("llm_response"));
+    assert!(
+        llm_response.is_some(),
+        "should have an llm_response event. Found types: {:?}",
+        recs.iter()
+            .filter_map(|r| r.try_get::<String, _>("event_type").ok())
+            .collect::<Vec<_>>()
+    );
+    let lr = llm_response.unwrap();
+    let lr_content = lr.try_get::<String, _>("content").unwrap_or_default();
+    assert!(
+        lr_content.contains("Context trace reply."),
+        "llm_response content should contain LLM text, got: {lr_content}"
+    );
+    let lr_chain_id = lr
+        .try_get::<Option<String>, _>("causal_chain_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    assert_eq!(
+        uq_chain_id, lr_chain_id,
+        "user_query and llm_response should share the same causal_chain_id"
+    );
+    // llm_response should have parent_event_id pointing to user_query.
+    let lr_parent = lr
+        .try_get::<Option<String>, _>("parent_event_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    assert_eq!(
+        lr_parent, uq_event_id,
+        "llm_response parent_event_id should be user_query event_id"
+    );
+
+    // ── Verify context_trace_signal event ──
+    let trace_signal = recs.iter().find(|r| {
+        r.try_get::<String, _>("event_type").ok().as_deref() == Some("context_trace_signal")
+    });
+    assert!(
+        trace_signal.is_some(),
+        "should have a context_trace_signal event. Found types: {:?}",
+        recs.iter()
+            .filter_map(|r| r.try_get::<String, _>("event_type").ok())
+            .collect::<Vec<_>>()
+    );
+    let trace = trace_signal.unwrap();
+    let trace_chain_id = trace
+        .try_get::<Option<String>, _>("causal_chain_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    assert!(
+        trace_chain_id.contains("context-trace"),
+        "context_trace_signal causal_chain_id should contain 'context-trace', got: {trace_chain_id}"
     );
 
     // ── Cleanup ──
@@ -262,7 +327,7 @@ pub async fn run_stream_context_trace_persistence() {
     ctx.pool.close().await;
 }
 
-/// B3: Multiple stream_chat calls to same session → multiple context trace events.
+/// B3: Multiple stream_chat calls to same session → core events + context traces per turn.
 pub async fn run_stream_multi_turn_persistence() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -296,8 +361,8 @@ pub async fn run_stream_multi_turn_persistence() {
         &body1[..body1.len().min(200)]
     );
 
-    // Wait for Turn 1 events to persist.
-    wait_for_agent_events_count(pool, &session_id, 1, std::time::Duration::from_secs(15)).await;
+    // Wait for Turn 1 events (user_query + llm_response + context_trace_signal = 3).
+    wait_for_agent_events_count(pool, &session_id, 3, std::time::Duration::from_secs(15)).await;
 
     let count_after_turn1: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
@@ -306,9 +371,19 @@ pub async fn run_stream_multi_turn_persistence() {
             .await
             .unwrap_or(0);
     assert!(
-        count_after_turn1 >= 1,
-        "turn 1 should have >= 1 events, got {count_after_turn1}"
+        count_after_turn1 >= 3,
+        "turn 1 should have >= 3 events (user_query + llm_response + context_trace_signal), got {count_after_turn1}"
     );
+
+    // Verify turn 1 has user_query with the right content.
+    let uq1_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+    )
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(uq1_count, 1, "after turn 1: exactly 1 user_query event");
 
     // ── Turn 2 ──
     let payload2 = json!({
@@ -326,11 +401,11 @@ pub async fn run_stream_multi_turn_persistence() {
         &body2[..body2.len().min(200)]
     );
 
-    // Wait for Turn 2 events.
+    // Wait for Turn 2 events (3 more events).
     wait_for_agent_events_count(
         pool,
         &session_id,
-        count_after_turn1 + 1,
+        count_after_turn1 + 3,
         std::time::Duration::from_secs(15),
     )
     .await;
@@ -342,11 +417,37 @@ pub async fn run_stream_multi_turn_persistence() {
             .await
             .unwrap_or(0);
     assert!(
-        count_after_turn2 > count_after_turn1,
-        "turn 2 should add events: after_turn1={count_after_turn1}, after_turn2={count_after_turn2}"
+        count_after_turn2 >= count_after_turn1 + 3,
+        "turn 2 should add >= 3 events: after_turn1={count_after_turn1}, after_turn2={count_after_turn2}"
     );
 
-    // Verify multiple causal_chain_ids (each turn gets its own chain).
+    // ── Verify event types across both turns ──
+    let uq_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+    )
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(
+        uq_count, 2,
+        "should have 2 user_query events (one per turn)"
+    );
+
+    let lr_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'llm_response'",
+    )
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(
+        lr_count, 2,
+        "should have 2 llm_response events (one per turn)"
+    );
+
+    // Verify multiple causal_chain_ids — each turn's core events get a server-loop chain,
+    // and each turn's context_trace gets a context-trace chain.
     let chains: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT causal_chain_id FROM agent_events \
          WHERE session_id = ? AND causal_chain_id IS NOT NULL",
@@ -355,10 +456,19 @@ pub async fn run_stream_multi_turn_persistence() {
     .fetch_all(pool)
     .await
     .unwrap_or_default();
+    let server_loop_chains = chains.iter().filter(|c| c.contains("server-loop")).count();
+    let ctx_trace_chains = chains
+        .iter()
+        .filter(|c| c.contains("context-trace"))
+        .count();
     assert!(
-        chains.len() >= 2,
-        "multi-turn should produce >= 2 distinct causal chains, got {} ({:?})",
-        chains.len(),
+        server_loop_chains >= 2,
+        "should have >= 2 server-loop causal chains (one per turn), got {server_loop_chains} in {:?}",
+        chains
+    );
+    assert!(
+        ctx_trace_chains >= 2,
+        "should have >= 2 context-trace causal chains (one per turn), got {ctx_trace_chains} in {:?}",
         chains
     );
 

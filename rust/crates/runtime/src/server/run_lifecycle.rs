@@ -44,9 +44,10 @@ use crate::turn::agentic_loop_host::{
     run_agentic_loop_with_host,
 };
 use crate::{
-    DatabaseEvaluationService, DatabaseEventService, EvaluationService, EventCreateRequestData,
-    EventService,
+    DatabaseEvaluationService, DatabaseEventService, DatabaseTurnCoreEventWriter,
+    EvaluationService, EventCreateRequestData, EventService,
 };
+use astra_turn_core::contracts::{TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan};
 
 use astra_core::{
     STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
@@ -699,6 +700,95 @@ async fn persist_runtime_promotion_events(
                 "runtime promotion event persist failed"
             );
         }
+    }
+}
+
+/// Persist `user_query` + `llm_response` core events to `agent_events` after
+/// the server-driven agentic loop completes.  This closes the persistence gap
+/// where the bridge path (`/chat/turn`) wrote these events but the server loop
+/// path (`/chat/stream`) did not, breaking session replay and cloud sync.
+#[allow(clippy::too_many_arguments)]
+async fn persist_server_loop_core_events(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    user_message: &str,
+    state: &AgenticLoopState,
+    model_name: Option<&str>,
+) {
+    if user_message.is_empty() && state.final_text.is_empty() {
+        return;
+    }
+
+    let mut writer = DatabaseTurnCoreEventWriter::new(matrixone.clone());
+    if let Some(pool) = shared_pool {
+        writer = writer.with_pool(pool.clone());
+    }
+
+    let chain_id = format!("{session_id}:server-loop:{}", Uuid::now_v7());
+    let user_query_event_id = Uuid::now_v7().to_string();
+
+    let user_query_event = if !user_message.is_empty() {
+        Some(TurnCoreEventRecord {
+            event_id: user_query_event_id.clone(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.map(|s| s.to_string()),
+            event_type: "user_query".to_string(),
+            content: user_message.to_string(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: chain_id.clone(),
+            llm_model_used: None,
+            token_usage: None,
+            llm_params: None,
+            reasoning_content: None,
+        })
+    } else {
+        None
+    };
+
+    let llm_response_event = if !state.final_text.is_empty() {
+        let usage = if state.total_prompt > 0 || state.total_completion > 0 {
+            Some(json!({
+                "prompt": state.total_prompt,
+                "completion": state.total_completion,
+                "total": state.total_prompt + state.total_completion,
+            }))
+        } else {
+            None
+        };
+        Some(TurnCoreEventRecord {
+            event_id: Uuid::now_v7().to_string(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.map(|s| s.to_string()),
+            event_type: "llm_response".to_string(),
+            content: state.final_text.clone(),
+            parent_event_id: Some(user_query_event_id.clone()),
+            parent_event_ids: vec![user_query_event_id],
+            causal_chain_id: chain_id,
+            llm_model_used: model_name.map(|s| s.to_string()),
+            token_usage: usage,
+            llm_params: None,
+            reasoning_content: None,
+        })
+    } else {
+        None
+    };
+
+    let plan = TurnCorePersistPlan {
+        user_query_event,
+        llm_response_event,
+        snapshot_link_plan: None,
+    };
+    if let Err(e) = writer.persist(plan).await {
+        astra_core::agent_error!(
+            "server-loop",
+            "failed to persist core events for session {session_id}: {e}"
+        );
     }
 }
 
@@ -1667,6 +1757,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_session_id = session_id.clone();
         let bg_matrixone = self.matrixone.clone();
         let bg_shared_pool = self.shared_pool.clone();
+        let bg_user_message = request.message.clone();
+        let bg_agent_id = request.agent_id.clone();
+        let bg_model_name = request.model.clone();
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
@@ -1736,6 +1829,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 flush_turn_observability(&mut loop_state, &bg_session_id, false);
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
             }
+
+            // Persist user_query + llm_response core events (same as stream_chat).
+            persist_server_loop_core_events(
+                &bg_matrixone,
+                bg_shared_pool.as_ref(),
+                &bg_user_id,
+                &bg_session_id,
+                bg_agent_id.as_deref(),
+                &bg_user_message,
+                &loop_state,
+                bg_model_name.as_deref(),
+            )
+            .await;
 
             // Fire SessionEnd hooks (best-effort, non-blocking).
             crate::skills::hooks::fire_session_end(
@@ -1902,6 +2008,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_session_id = session_id.clone();
         let bg_matrixone = self.matrixone.clone();
         let bg_shared_pool = self.shared_pool.clone();
+        let bg_user_message = request.message.clone();
+        let bg_agent_id = request.agent_id.clone();
+        let bg_model_name = request.model.clone();
 
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
@@ -1930,6 +2039,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 None => None,
             };
             learning_stack.save_with_active_canary(active_canary);
+
+            // Persist user_query + llm_response core events to agent_events.
+            // The server-driven loop previously only persisted context_trace_signal;
+            // this closes the persistence gap so session replay, analytics, and
+            // cloud sync see the same events as the bridge path.
+            persist_server_loop_core_events(
+                &bg_matrixone,
+                bg_shared_pool.as_ref(),
+                &bg_user_id,
+                &bg_session_id,
+                bg_agent_id.as_deref(),
+                &bg_user_message,
+                &state,
+                bg_model_name.as_deref(),
+            )
+            .await;
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -2653,6 +2778,19 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .await;
         persist_turn_evaluation_journal(&config.session_id, "server_subrun", &loop_state);
         flush_turn_observability(&mut loop_state, &config.session_id, false);
+
+        // Persist core events for delegation sub-runs.
+        persist_server_loop_core_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &config.user_id,
+            &config.session_id,
+            Some(config.agent_profile.agent_id.as_str()),
+            &config.task,
+            &loop_state,
+            config.agent_profile.model_override.as_deref(),
+        )
+        .await;
 
         // Persist cross-session learning state.
         let active_canary = match loop_state.evolution_service.as_ref() {
