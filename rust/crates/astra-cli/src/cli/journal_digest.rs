@@ -660,6 +660,9 @@ mod tests {
     use astra_services::session_journal::JournalDirGuard;
     use std::fs;
 
+    const REAL_SESSION_0AC769_FIXTURE: &str =
+        include_str!("../../../services/fixtures/real_session_0ac769_min.jsonl");
+
     #[test]
     fn digest_counts_turns_and_aggregates() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -710,6 +713,52 @@ mod tests {
         assert_eq!(d.turns[0].tool_groups[0].call_count, 2);
         assert_eq!(d.turns[0].tool_groups[1].round, Some(1));
         assert_eq!(d.turns[0].tool_groups[1].fail_count, 1);
+    }
+
+    #[test]
+    fn digest_surfaces_real_session_fixture_rounds_and_grouped_tools() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.journal_lines_non_empty, 14);
+        assert_eq!(d.journal_lines_malformed, 0);
+        assert_eq!(d.aggregates.turn_count, 1);
+        assert_eq!(d.aggregates.total_tool_calls, 12);
+        assert_eq!(d.aggregates.avg_llm_rounds, 7.0);
+        assert_eq!(d.turns.len(), 1);
+
+        let turn = &d.turns[0];
+        assert_eq!(
+            turn.user_input_preview,
+            "review b273c589a73799070a71f4cfc6d55349b534d8d1"
+        );
+        assert_eq!(turn.tool_calls_ok, 12);
+        assert_eq!(turn.llm_rounds, Some(7));
+        assert!(
+            turn.tool_groups.iter().any(|group| {
+                group.round == Some(0)
+                    && group.call_count == 1
+                    && group.tools.iter().any(|tool| tool == "Git show b273c589")
+            }),
+            "digest should preserve the first repeated git_show round"
+        );
+        assert!(
+            turn.tool_groups.iter().any(|group| {
+                group.round == Some(2)
+                    && group.parallel
+                    && group.call_count == 4
+                    && group.tools.iter().any(|tool| tool.contains("run_lifecycle.rs"))
+            }),
+            "digest should preserve the large round-2 batch from the real session"
+        );
     }
 
     #[test]
