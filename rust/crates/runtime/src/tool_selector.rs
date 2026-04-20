@@ -3583,4 +3583,197 @@ mod tests {
             result_restricted.tool_names
         );
     }
+
+    // ── Phase 3: Tool Selection E2E Tests ──────────────────────────────────────
+    //
+    // Verify tool selector picks correct tools for common query patterns.
+    // These tests catch regressions in tool selection quality.
+
+    /// Phase 3a: "review latest commit" selects git tools.
+    #[tokio::test]
+    async fn tool_select_review_commit_selects_git_tools() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx = SelectionContext {
+            query: "review the latest commit",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            previous_confidence_fallback: None,
+        };
+        let result = selector.select(&ctx).await;
+
+        let git_tools: Vec<&String> = result
+            .tool_names
+            .iter()
+            .filter(|n| n.starts_with("git_"))
+            .collect();
+        assert!(
+            !git_tools.is_empty(),
+            "'review latest commit' should select at least 1 git tool, got: {:?}",
+            result.tool_names
+        );
+        // git_log or git_diff should be selected for commit review
+        let has_key_git_tool = result
+            .tool_names
+            .iter()
+            .any(|n| n == "git_log" || n == "git_diff" || n == "git_show");
+        assert!(
+            has_key_git_tool,
+            "'review latest commit' should select git_log, git_diff, or git_show, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    /// Phase 3b: "show git status" selects git_status.
+    #[tokio::test]
+    async fn tool_select_git_status_query() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx = SelectionContext {
+            query: "show git status",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            previous_confidence_fallback: None,
+        };
+        let result = selector.select(&ctx).await;
+        assert!(
+            result.tool_names.contains(&"git_status".to_string()),
+            "'show git status' should select git_status, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    /// Phase 3c: "hi" / conversational → only pinned tools, no dynamic.
+    #[tokio::test]
+    async fn tool_select_greeting_only_pinned() {
+        let selector = TfIdfSelector::new(mock_registry());
+        for query in &["hi", "hello", "thanks"] {
+            let ctx = SelectionContext {
+                query,
+                turn_count: 1,
+                recent_tools: &[],
+                budget_tokens: 800,
+                boost_terms: vec![],
+                budget_pressure: 0.0,
+                memory_domain_hints: vec![],
+                restricted_tools: vec![],
+                file_context: vec![],
+                previous_confidence_fallback: None,
+            };
+            let result = selector.select(&ctx).await;
+            let dynamic_count = result
+                .tool_names
+                .iter()
+                .filter(|n| {
+                    !TOOL_CATALOG
+                        .iter()
+                        .any(|t| t.pinned && t.name == n.as_str())
+                })
+                .count();
+            assert_eq!(
+                dynamic_count, 0,
+                "query '{query}' should have 0 dynamic tools, got {dynamic_count}: {:?}",
+                result.tool_names
+            );
+        }
+    }
+
+    /// Phase 3d: "read and edit the config file" selects file tools.
+    #[tokio::test]
+    async fn tool_select_file_edit_query() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx = SelectionContext {
+            query: "read and edit the config file",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            previous_confidence_fallback: None,
+        };
+        let result = selector.select(&ctx).await;
+        // read_file and str_replace are pinned, so always present.
+        // But write_file should also be selected for edit queries.
+        assert!(
+            result.tool_names.contains(&"read_file".to_string()),
+            "file edit query should include read_file (pinned): {:?}",
+            result.tool_names
+        );
+        assert!(
+            result.tool_names.contains(&"str_replace".to_string()),
+            "file edit query should include str_replace (pinned): {:?}",
+            result.tool_names
+        );
+    }
+
+    /// Phase 3e: "git diff HEAD~1" selects git_diff specifically.
+    #[tokio::test]
+    async fn tool_select_git_diff_query() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx = SelectionContext {
+            query: "git diff HEAD~1",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            previous_confidence_fallback: None,
+        };
+        let result = selector.select(&ctx).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "'git diff HEAD~1' must select git_diff, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    /// Phase 3f: Pinned tools always present regardless of query.
+    #[tokio::test]
+    async fn tool_select_pinned_always_present() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let pinned_names: Vec<&str> = TOOL_CATALOG
+            .iter()
+            .filter(|t| t.pinned)
+            .map(|t| t.name)
+            .collect();
+
+        for query in &["review latest commit", "hi", "search github", "run tests"] {
+            let ctx = SelectionContext {
+                query,
+                turn_count: 1,
+                recent_tools: &[],
+                budget_tokens: 800,
+                boost_terms: vec![],
+                budget_pressure: 0.0,
+                memory_domain_hints: vec![],
+                restricted_tools: vec![],
+                file_context: vec![],
+                previous_confidence_fallback: None,
+            };
+            let result = selector.select(&ctx).await;
+            for pinned in &pinned_names {
+                assert!(
+                    result.tool_names.contains(&pinned.to_string()),
+                    "query '{query}' missing pinned tool '{pinned}': {:?}",
+                    result.tool_names
+                );
+            }
+        }
+    }
 }
