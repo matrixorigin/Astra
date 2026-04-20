@@ -30,6 +30,12 @@
 //! - **`e2e_matrix_remote_skill_registration_user_system_integration`** — register remote skill via
 //!   `/skills` with mode-aware bootstrap (`local_jwt` or `trusted_moi`), verify validation behavior,
 //!   list/get/version discoverability, and `skills_registry.created_by` ownership mapping.
+//! - **`e2e_matrix_stream_session_and_run_status`** — `POST /chat/stream` with mock LLM → verify
+//!   `agent_sessions` row persisted, run transitions to `completed`, `events_count > 0`.
+//! - **`e2e_matrix_stream_context_trace_persistence`** — `POST /chat/stream` → verify
+//!   `context_trace_signal` event written to `agent_events` with valid causal chain.
+//! - **`e2e_matrix_stream_multi_turn_persistence`** — two sequential `POST /chat/stream` to same
+//!   session → verify event counts increment, distinct causal chains, both runs completed.
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -57,6 +63,7 @@ mod journey_audit_cross_session;
 mod journey_extended;
 mod journey_full;
 mod journey_remote_skills;
+mod journey_stream_persistence;
 mod journey_tasks_runs;
 mod journey_trusted_moi;
 
@@ -145,4 +152,25 @@ async fn e2e_matrix_trusted_moi_user_system_integration() {
 async fn e2e_matrix_remote_skill_registration_user_system_integration() {
     require_system_e2e_env();
     journey_remote_skills::run_remote_skill_registration_user_system_integration().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_stream_session_and_run_status() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_session_and_run_status().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_stream_context_trace_persistence() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_context_trace_persistence().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_stream_multi_turn_persistence() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_multi_turn_persistence().await;
 }
