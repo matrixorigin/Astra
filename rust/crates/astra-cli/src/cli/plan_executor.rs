@@ -1095,7 +1095,7 @@ async fn plan_executor_task(
 
                     // Write a turn event so plan executor turns appear in digest.
                     {
-                        let turn_event = session_journal::JournalEvent::turn(
+                        let mut turn_event = session_journal::JournalEvent::turn(
                             ctx.session_id.as_deref(),
                             ctx.turn,
                             ctx.model.as_deref(),
@@ -1107,6 +1107,7 @@ async fn plan_executor_task(
                             subtask_start.elapsed().as_millis() as u64,
                         )
                         .with_tool_calls(result.tool_call_records.clone());
+                        turn_event.llm_rounds = result.llm_rounds;
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 
