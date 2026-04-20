@@ -341,9 +341,7 @@ fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
     tool_calls
         .iter()
         .map(|tc| {
-            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args = tc.get("arguments").cloned().unwrap_or(json!({}));
+            let (id, name, args) = parse_flat_tool_call_event(tc);
             json!({
                 "id": id,
                 "type": "function",
@@ -1109,5 +1107,46 @@ mod tests {
             });
         assert_eq!(slot.name, "git_show");
         assert_eq!(slot.args, json!({"commit": "abc"}));
+    }
+
+    /// Regression: openai_tool_call_entries_from_server must handle OpenAI-format
+    /// tool_calls (function.name / function.arguments) — the format produced by
+    /// normalize_tool_call_for_accum and stored in accum.tool_calls.
+    /// Bug: old code read tc.get("name") (flat) instead of tc["function"]["name"],
+    /// producing empty names and empty arguments in assistant message history.
+    #[test]
+    fn openai_assistant_message_from_server_openai_format_tool_calls() {
+        let server = vec![json!({
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+                "name": "skill",
+                "arguments": "{\"skill_name\":\"review-changes\"}"
+            }
+        })];
+        let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
+        let tc = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(tc[0]["function"]["name"], "skill",
+            "must extract name from OpenAI-format function.name");
+        let args: Value =
+            serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["skill_name"], "review-changes",
+            "must preserve arguments from OpenAI-format function.arguments");
+    }
+
+    /// Regression: mixed flat + OpenAI format tool_calls in the same round.
+    #[test]
+    fn openai_assistant_message_mixed_format_tool_calls() {
+        let server = vec![
+            json!({"id": "c1", "name": "git_status", "arguments": {}}),
+            json!({"id": "c2", "type": "function", "function": {"name": "git_diff", "arguments": "{\"ref\":\"HEAD\"}"}}),
+        ];
+        let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
+        let tc = msg["tool_calls"].as_array().unwrap();
+        assert_eq!(tc[0]["function"]["name"], "git_status");
+        assert_eq!(tc[1]["function"]["name"], "git_diff");
+        let args: Value =
+            serde_json::from_str(tc[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["ref"], "HEAD");
     }
 }
