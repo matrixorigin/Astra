@@ -2719,12 +2719,12 @@ async fn sse_full_sequence_tool_call_turn() {
         .filter_map(|e| e.get("type").and_then(Value::as_str))
         .collect();
 
-    // The bridge emits tool_request events for each tool_call so the CLI can
-    // execute them locally and populate edge_tool_round.
+    // The bridge emits tool_call (with full args) then tool_request for each
+    // tool_call so the CLI can update accum.tool_calls and execute tools locally.
     assert_eq!(
         types,
-        vec!["session_info", "tool_request", "turn_complete"],
-        "tool-call turn SSE sequence should be: session_info → tool_request → turn_complete, got: {types:?}"
+        vec!["session_info", "tool_call", "tool_request", "turn_complete"],
+        "tool-call turn SSE sequence should be: session_info → tool_call → tool_request → turn_complete, got: {types:?}"
     );
 
     // Explicitly verify no text_delta.
@@ -7681,4 +7681,182 @@ async fn round_efficiency_bash_compound_two_rounds() {
     cap.wait_persist_idle().await;
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 2, "bash compound: 2 rounds (1 tool + 1 text)");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests: tool_call events with full args emitted before tool_request
+//
+// These tests verify the fix for the "headless edge protocol" production error
+// where accum.tool_calls had empty arguments (from tool_call_start) while
+// edge_tool_round had full parsed arguments (from tool_request), causing
+// signature mismatch in headless_tool_assembly.
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn tool_call_full_args_emitted_before_tool_request() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tc-full-args-agent",
+        "messages": [{ "role": "user", "content": "show recent commits" }],
+        "edge_tools": [tool_schema("git_log")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-gl-1", "git_log", json!({"n": 5}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Must have tool_call events with full args
+    let tool_calls = events_of_type(&events, "tool_call");
+    assert!(!tool_calls.is_empty(), "must emit tool_call events");
+    assert_eq!(tool_calls[0]["name"], "git_log");
+    // Arguments should be the FULL parsed object, not empty
+    let args = &tool_calls[0]["arguments"];
+    assert!(
+        args.get("n").is_some() || args.get("path").is_some(),
+        "tool_call arguments must contain full parsed args, got: {args}"
+    );
+
+    // tool_call must appear BEFORE tool_request in event stream
+    let tc_pos = events
+        .iter()
+        .position(|e| e.get("type").and_then(Value::as_str) == Some("tool_call"))
+        .expect("tool_call event must exist");
+    let tr_pos = events
+        .iter()
+        .position(|e| e.get("type").and_then(Value::as_str) == Some("tool_request"))
+        .expect("tool_request event must exist");
+    assert!(
+        tc_pos < tr_pos,
+        "tool_call (pos {tc_pos}) must appear before tool_request (pos {tr_pos})"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_and_tool_request_ids_match() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tc-id-match-agent",
+        "messages": [{ "role": "user", "content": "diff HEAD" }],
+        "edge_tools": [tool_schema("git_diff")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-gd-1", "git_diff", json!({"ref": "HEAD"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_calls = events_of_type(&events, "tool_call");
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_calls.len(), tool_reqs.len(), "same count of tool_call and tool_request");
+
+    for (tc, tr) in tool_calls.iter().zip(tool_reqs.iter()) {
+        let tc_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+        let tr_id = tr.get("request_id").and_then(Value::as_str).unwrap_or("");
+        assert_eq!(tc_id, tr_id, "tool_call id must match tool_request request_id");
+    }
+}
+
+#[tokio::test]
+async fn tool_call_full_args_parallel_tool_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tc-parallel-args-agent",
+        "messages": [{ "role": "user", "content": "review the latest commit" }],
+        "edge_tools": [tool_schema("git_log"), tool_schema("git_diff"), tool_schema("git_show")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-p1", "git_log", json!({"n": 3})),
+                tool_call("tc-p2", "git_diff", json!({"ref": "HEAD~1"})),
+                tool_call("tc-p3", "git_show", json!({"ref": "HEAD", "stat": true})),
+            ]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_calls = events_of_type(&events, "tool_call");
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_calls.len(), 3, "3 parallel tool_calls with full args");
+    assert_eq!(tool_reqs.len(), 3, "3 parallel tool_requests");
+
+    // Each tool_call must have non-empty parsed arguments
+    for tc in &tool_calls {
+        let args = &tc["arguments"];
+        assert!(
+            args.is_object() && !args.as_object().unwrap().is_empty(),
+            "tool_call must have non-empty args: {tc}"
+        );
+    }
+
+    // Verify ordering: each tool_call[i] precedes its matching tool_request[i]
+    for tc in &tool_calls {
+        let tc_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+        let tc_pos = events
+            .iter()
+            .position(|e| {
+                e.get("type").and_then(Value::as_str) == Some("tool_call")
+                    && e.get("id").and_then(Value::as_str) == Some(tc_id)
+            })
+            .expect("tool_call event must exist");
+        let tr_pos = events
+            .iter()
+            .position(|e| {
+                e.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && e.get("request_id").and_then(Value::as_str) == Some(tc_id)
+            })
+            .expect("matching tool_request event must exist");
+        assert!(
+            tc_pos < tr_pos,
+            "tool_call for {tc_id} (pos {tc_pos}) must precede its tool_request (pos {tr_pos})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_call_args_match_tool_request_args() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "tc-args-match-agent",
+        "messages": [{ "role": "user", "content": "read config" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-rf-args", "read_file", json!({"path": "/etc/config.toml"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_calls = events_of_type(&events, "tool_call");
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_reqs.len(), 1);
+
+    // The args in tool_call (parsed JSON object) must match tool_request args
+    let tc_args = &tool_calls[0]["arguments"];
+    let tr_args = &tool_reqs[0]["args"];
+    assert_eq!(
+        tc_args, tr_args,
+        "tool_call arguments must match tool_request args"
+    );
 }
