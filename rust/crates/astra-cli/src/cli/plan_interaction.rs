@@ -2368,11 +2368,16 @@ async fn expand_outline_to_plan(
                 );
             }
             Err(_) => {
-                // Retry once with a stricter prompt
+                // Retry once with a stricter prompt that includes the full schema
                 let retry_prompt = format!(
-                    "Output ONLY a JSON object: {{\"subtasks\": [...]}}. \
-                     No markdown, no explanation. Expand phase \"{}\" — {}",
-                    phase.id, phase.title
+                    "Your previous response was not valid JSON. Output ONLY this JSON object, \
+                     no markdown fences, no explanation:\n\
+                     {{\"subtasks\": [{{\"id\": \"{}-step-1\", \"title\": \"...\", \
+                     \"description\": \"...\", \"depends_on\": [], \"effort\": \"small\", \
+                     \"files\": [], \"acceptance_checks\": [{{\"kind\": \"file_exists\", \
+                     \"paths\": [\"tmp/x\"]}}]}}]}}\n\
+                     Expand phase \"{}\" — {}",
+                    phase.id, phase.id, phase.title
                 );
                 let retry_payload = serde_json::json!({
                     "messages": [
