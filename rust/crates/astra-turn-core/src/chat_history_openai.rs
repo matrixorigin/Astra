@@ -4,6 +4,10 @@ use serde_json::{Value, json};
 
 /// Convert REPL history plus the current user message into `messages` for `/chat` payloads.
 /// Empty `user` in a pair means compacted context: only the assistant summary is kept.
+///
+/// Prefetched context (`<prefetched_context>…</prefetched_context>`) injected in
+/// previous turns is stripped from history — it was only relevant for that turn's
+/// LLM call and would waste tokens if carried forward.
 pub fn openai_messages_from_repl_history(
     history: &[(String, String)],
     current_user_message: &str,
@@ -13,7 +17,7 @@ pub fn openai_messages_from_repl_history(
         .flat_map(|(u, a)| {
             let mut pair = Vec::with_capacity(2);
             if !u.is_empty() {
-                pair.push(json!({"role": "user", "content": u}));
+                pair.push(json!({"role": "user", "content": strip_prefetched_context(u)}));
             }
             if !a.is_empty() {
                 pair.push(json!({"role": "assistant", "content": a}));
@@ -23,6 +27,22 @@ pub fn openai_messages_from_repl_history(
         .collect();
     messages.push(json!({"role": "user", "content": current_user_message}));
     messages
+}
+
+/// Remove `<prefetched_context>…</prefetched_context>` blocks from a string.
+/// The block is ephemeral — only useful for the turn it was injected into.
+fn strip_prefetched_context(s: &str) -> String {
+    const OPEN: &str = "\n\n<prefetched_context>";
+    const CLOSE: &str = "</prefetched_context>";
+    if let Some(start) = s.find(OPEN) {
+        if let Some(end) = s[start..].find(CLOSE) {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..start]);
+            out.push_str(&s[start + end + CLOSE.len()..]);
+            return out;
+        }
+    }
+    s.to_string()
 }
 
 /// Injected `role: user` row (guard nudges, intent-drift correction, etc.).
@@ -120,5 +140,31 @@ mod tests {
         let m = openai_messages_from_repl_history(&[(String::new(), String::new())], "hi");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0]["content"], "hi");
+    }
+
+    #[test]
+    fn strip_prefetched_context_from_history() {
+        let user_with_ctx = "review commit\n\n<prefetched_context>\nguidance\n\ndiff here\n</prefetched_context>";
+        let m = openai_messages_from_repl_history(
+            &[(user_with_ctx.into(), "looks good".into())],
+            "next question",
+        );
+        let hist_content = m[0]["content"].as_str().unwrap();
+        assert!(!hist_content.contains("<prefetched_context>"), "history should not contain prefetched context");
+        assert_eq!(hist_content, "review commit");
+    }
+
+    #[test]
+    fn strip_prefetched_context_preserves_current_message() {
+        // Current user message is NOT stripped — it's the active turn.
+        let current = "review\n\n<prefetched_context>\nfresh diff\n</prefetched_context>";
+        let m = openai_messages_from_repl_history(&[], current);
+        assert!(m[0]["content"].as_str().unwrap().contains("<prefetched_context>"));
+    }
+
+    #[test]
+    fn strip_prefetched_context_no_match() {
+        let plain = "just a normal message";
+        assert_eq!(strip_prefetched_context(plain), plain);
     }
 }
