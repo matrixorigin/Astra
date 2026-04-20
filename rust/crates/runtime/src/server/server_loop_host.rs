@@ -16,11 +16,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::rate_limit_cooldown::{PerModelCooldown, RateLimitAction};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
@@ -225,6 +227,12 @@ pub struct ServerAgenticLoopHost {
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    /// When the SSE channel's receiver is dropped (client disconnected),
+    /// this flag is set so the agentic loop cancels at the next turn boundary.
+    client_cancel_flag: Option<Arc<AtomicBool>>,
+    /// Low-latency cancellation token — cancelled alongside `client_cancel_flag`
+    /// for immediate LLM abort on client disconnect.
+    client_cancel_token: Option<Arc<CancellationToken>>,
 
     // ── Agent progress ──
     /// Optional receiver for agent progress events (multi-agent tree updates).
@@ -393,6 +401,8 @@ impl ServerAgenticLoopHostBuilder {
             session_id: self.session_id,
             emitted_events: Vec::new(),
             event_tx: self.event_tx,
+            client_cancel_flag: None,
+            client_cancel_token: None,
             progress_rx,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
@@ -412,9 +422,20 @@ impl ServerAgenticLoopHost {
     }
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
+    /// If the streaming channel is closed (client disconnected), triggers
+    /// cancellation so the agentic loop stops at the next turn boundary.
     fn emit_event(&mut self, event: Value) {
         if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(event.clone());
+            if tx.send(event.clone()).is_err() {
+                // Client disconnected — cancel the loop to stop wasting LLM tokens.
+                if let Some(flag) = &self.client_cancel_flag {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                if let Some(token) = &self.client_cancel_token {
+                    token.cancel();
+                }
+                self.event_tx = None;
+            }
         }
         self.emitted_events.push(event);
     }
@@ -457,8 +478,16 @@ impl ServerAgenticLoopHost {
 
     /// Attach an incremental SSE channel. Events will be pushed through
     /// this sender as they are emitted, enabling streaming to the client.
+    /// When the channel closes (client disconnect), `cancel_flag` and
+    /// `cancel_token` are triggered to stop the agentic loop.
     pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Value>) {
         self.event_tx = Some(tx);
+    }
+
+    /// Set the cancellation handles used when client disconnects.
+    pub fn set_client_cancel(&mut self, flag: Arc<AtomicBool>, token: Arc<CancellationToken>) {
+        self.client_cancel_flag = Some(flag);
+        self.client_cancel_token = Some(token);
     }
 
     /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).

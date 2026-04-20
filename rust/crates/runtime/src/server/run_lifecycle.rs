@@ -718,14 +718,13 @@ async fn persist_server_loop_core_events(
     state: &AgenticLoopState,
     model_name: Option<&str>,
 ) {
+    // Skip when no DB pool is available (test/offline mode) or nothing to persist.
+    let Some(pool) = shared_pool else { return };
     if user_message.is_empty() && state.final_text.is_empty() {
         return;
     }
 
-    let mut writer = DatabaseTurnCoreEventWriter::new(matrixone.clone());
-    if let Some(pool) = shared_pool {
-        writer = writer.with_pool(pool.clone());
-    }
+    let writer = DatabaseTurnCoreEventWriter::new(matrixone.clone()).with_pool(pool.clone());
 
     let chain_id = format!("{session_id}:server-loop:{}", Uuid::now_v7());
     let user_query_event_id = Uuid::now_v7().to_string();
@@ -1956,12 +1955,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Create the incremental SSE channel.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
 
-        let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
-        host.set_event_tx(event_tx.clone());
         let mut state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+
+        let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
+        host.set_event_tx(event_tx.clone());
+        host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
+
         self.runs.write().await.insert(run_id.clone(), run_state);
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
@@ -2109,6 +2111,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     );
                 }
             }
+
+            // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
+            let turn_complete = astra_turn_core::complete::build_turn_complete_event(
+                state.total_tool_calls > 0,
+                false,
+                &crate::turn::stall::DivergenceStatus::Healthy,
+                None,
+            );
+            let _ = event_tx.send(Value::Object(turn_complete));
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
             drop(event_tx);

@@ -2770,3 +2770,185 @@ async fn a6_list_runs_shows_completed_runs() {
     let found = runs.iter().any(|r| r["run_id"].as_str() == Some(&run_id));
     assert!(found, "list_runs should include the completed run {run_id}");
 }
+
+// ─── Turn Complete Event Tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn turn_complete_event_emitted_text_only() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "say hi",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Hello!" }]
+        }
+    });
+
+    let (events, _, _) = stream_and_get_run_id(&app, payload).await;
+    let turn_completes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("turn_complete"))
+        .collect();
+    assert_eq!(
+        turn_completes.len(),
+        1,
+        "should emit exactly one turn_complete event"
+    );
+    assert_eq!(
+        turn_completes[0]["has_tool_calls"].as_bool(),
+        Some(false),
+        "text-only turn should have has_tool_calls=false"
+    );
+}
+
+#[tokio::test]
+async fn turn_complete_event_emitted_with_tools() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "run a tool",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "function": { "name": "Read", "arguments": "{\"file_path\":\"x.txt\"}" }
+                    }]
+                },
+                { "full_text": "Tool done." }
+            ]
+        }
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", TOKEN)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    let events = parse_sse_events(&body_str);
+
+    let turn_completes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("turn_complete"))
+        .collect();
+    assert_eq!(
+        turn_completes.len(),
+        1,
+        "should emit exactly one turn_complete"
+    );
+    assert_eq!(
+        turn_completes[0]["has_tool_calls"].as_bool(),
+        Some(true),
+        "turn with tools should have has_tool_calls=true"
+    );
+}
+
+#[tokio::test]
+async fn turn_complete_is_last_typed_event() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "order check",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Done." }]
+        }
+    });
+
+    let (events, _, _) = stream_and_get_run_id(&app, payload).await;
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+
+    let tc_pos = types.iter().position(|t| *t == "turn_complete");
+    assert!(
+        tc_pos.is_some(),
+        "turn_complete should be present, got: {types:?}"
+    );
+    // turn_complete should be the last event with a "type" field in the SSE stream.
+    assert_eq!(
+        tc_pos.unwrap(),
+        types.len() - 1,
+        "turn_complete should be the last typed SSE event, order: {types:?}"
+    );
+}
+
+// ─── Client Disconnect Cancellation Tests ───────────────────────────────────
+
+#[tokio::test]
+async fn client_disconnect_run_still_finalizes() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "disconnect test",
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Quick response." }]
+        }
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", TOKEN)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Read just session_info, then drop the body (simulating client disconnect).
+    let mut stream = resp.into_body().into_data_stream();
+    let mut run_id = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        let bytes = chunk.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(line) = text.lines().find(|l| l.starts_with("data: ")) {
+            if let Ok(v) = serde_json::from_str::<Value>(line.strip_prefix("data: ").unwrap()) {
+                if v["type"].as_str() == Some("session_info") {
+                    run_id = v["run_id"].as_str().unwrap_or("").to_string();
+                    break;
+                }
+            }
+        }
+    }
+    assert!(!run_id.is_empty(), "should get session_info with run_id");
+
+    // Drop the stream — simulating client disconnect.
+    drop(stream);
+
+    // Wait for the background task to finalize.
+    let mut final_status = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let (st, body) = get_run_status(&app, &run_id).await;
+        if st == StatusCode::OK {
+            final_status = body["status"].as_str().unwrap_or("").to_string();
+            if final_status == "completed" || final_status == "cancelled" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        final_status == "completed" || final_status == "cancelled",
+        "run should finalize after client disconnect, got: {final_status}"
+    );
+}
