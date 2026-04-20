@@ -7860,3 +7860,1216 @@ async fn tool_call_args_match_tool_request_args() {
         "tool_call arguments must match tool_request args"
     );
 }
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Phase A: Comprehensive E2E Coverage — Context Prefetch, Error Recovery,   ║
+// ║  Skill Interception, Observability, Tool Selection                         ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ── A1: Context Prefetch E2E Tests ──────────────────────────────────────────
+//
+// Verifies that <prefetched_context> blocks injected by the CLI-side context
+// prefetch module flow through the bridge correctly. The bridge doesn't process
+// the XML block itself — it passes the enriched user message to the mock LLM.
+// These tests verify the full lifecycle: enriched message → bridge → LLM → SSE.
+
+#[tokio::test]
+async fn a1_prefetched_context_flows_through_bridge_to_llm_response() {
+    // When the CLI injects <prefetched_context> into the user message, the
+    // bridge should pass it through to the LLM and the response should be
+    // emittable — the bridge must not strip or mangle the enriched content.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let enriched_message = concat!(
+        "review the latest commit\n\n",
+        "<prefetched_context>\n",
+        "The complete git context is provided below. Review it directly.\n\n",
+        "## Git Log\ncommit abc123\nAuthor: dev <dev@test.com>\nSubject: fix: resolve bug\n\n",
+        "## Diff Summary\n src/main.rs | 5 ++---\n 1 file changed, 2 insertions(+), 3 deletions(-)\n\n",
+        "## Full Diff\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10,5 +10,4 @@\n",
+        "-    old_code();\n+    new_code();\n",
+        "</prefetched_context>"
+    );
+
+    let payload = json!({
+        "agent_id": "a1-prefetch-agent",
+        "messages": [{ "role": "user", "content": enriched_message }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Code review: The commit abc123 fixes a bug by replacing old_code() with new_code(). LGTM."
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // The LLM should respond with text (no tool calls needed — context was prefetched)
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "exactly one turn_complete");
+    let tc = turn_completes[0];
+    assert_eq!(tc["has_tool_calls"], false, "no tool calls when context is prefetched");
+
+    // No tool_request events — prefetch eliminated the need for tool rounds
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_reqs.len(), 0, "zero tool_request events with prefetched context");
+
+    // The response text should contain the review
+    let text_deltas = events_of_type(&events, "text_delta");
+    let full_text: String = text_deltas.iter()
+        .filter_map(|e| e.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(full_text.contains("abc123"), "response references the commit from prefetched context");
+}
+
+#[tokio::test]
+async fn a1_prefetched_context_persisted_in_user_query_event() {
+    // The enriched user message (with <prefetched_context>) should be persisted
+    // in the user_query event so session replay shows what the LLM actually saw.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let enriched = "explain the project\n\n<prefetched_context>\nProject structure:\nsrc/\n  main.rs\n  lib.rs\n</prefetched_context>";
+
+    let payload = json!({
+        "agent_id": "a1-persist-prefetch",
+        "messages": [{ "role": "user", "content": enriched }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "This is a Rust project with main.rs and lib.rs."
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 1);
+    let uq = core[0].user_query_event.as_ref().expect("user_query persisted");
+    assert!(
+        uq.content.contains("<prefetched_context>"),
+        "persisted user_query should contain the prefetched context block"
+    );
+    assert!(
+        uq.content.contains("Project structure"),
+        "persisted user_query should contain the prefetched content"
+    );
+}
+
+#[tokio::test]
+async fn a1_prefetched_context_with_tool_follow_up() {
+    // Even with prefetched context, the LLM might still call tools (e.g., read_file
+    // for files not in the prefetched diff). Verify multi-round works correctly.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let enriched = concat!(
+        "review the latest commit\n\n",
+        "<prefetched_context>\n",
+        "## Git Log\ncommit def456\nSubject: refactor: move utils\n\n",
+        "## Diff Summary\n src/utils.rs | 10 ++++++++++\n 1 file changed\n",
+        "</prefetched_context>"
+    );
+
+    let payload = json!({
+        "agent_id": "a1-prefetch-followup",
+        "messages": [{ "role": "user", "content": enriched }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [
+            {
+                "tool_calls": [tool_call("tc-rf1", "read_file", json!({"path": "src/utils.rs"}))]
+            },
+            {
+                "full_text": "The refactor moves utility functions to src/utils.rs. The new code looks clean."
+            }
+        ]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // One tool_request (read_file), then final text
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_reqs.len(), 1, "one tool_request for follow-up read");
+    assert_eq!(tool_reqs[0]["tool"], "read_file");
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1);
+}
+
+#[tokio::test]
+async fn a1_no_prefetch_for_simple_greeting() {
+    // Simple greetings like "hi" should have no <prefetched_context> block.
+    // The bridge processes them normally — single round, text-only response.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a1-no-prefetch",
+        "messages": [{ "role": "user", "content": "hello!" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hello! How can I help you today?"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert_eq!(tool_reqs.len(), 0, "no tool calls for simple greeting");
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1);
+    assert_eq!(turn_completes[0]["has_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn a1_prefetched_context_with_explain_event() {
+    // When explain=true, the explain event should contain timing and routing data
+    // even when context was prefetched.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let enriched = "review code\n\n<prefetched_context>\nDiff: +1 -1\n</prefetched_context>";
+
+    let payload = json!({
+        "agent_id": "a1-prefetch-explain",
+        "messages": [{ "role": "user", "content": enriched }],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "edge_profile": {
+            "selection_task_type": "code_review"
+        },
+        "test_llm_rounds": [{
+            "full_text": "LGTM",
+            "usage": { "prompt": 500, "completion": 50, "total": 550 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1, "explain event emitted");
+    let ex = explains[0];
+    assert!(ex.get("total_ms").is_some(), "total_ms present");
+    assert!(ex.get("tools_available").is_some(), "tools_available present");
+    assert!(ex.get("routing").is_some(), "routing data present");
+}
+
+#[tokio::test]
+async fn a1_multi_turn_prefetch_only_first_turn() {
+    // In a multi-turn conversation, only the first user message should have
+    // prefetched context. Subsequent turns don't need re-prefetch.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: with prefetched context
+    let payload1 = json!({
+        "agent_id": "a1-multiturn",
+        "messages": [{
+            "role": "user",
+            "content": "review commit\n\n<prefetched_context>\ncommit: abc\ndiff: +1 -1\n</prefetched_context>"
+        }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "The commit looks good."
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, payload1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let events1 = parse_sse_events(&raw1);
+    let tool_reqs1 = events_of_type(&events1, "tool_request");
+    assert_eq!(tool_reqs1.len(), 0, "turn 1: no tool calls with prefetch");
+
+    // Turn 2: follow-up question without prefetch
+    let payload2 = json!({
+        "agent_id": "a1-multiturn",
+        "messages": [
+            { "role": "user", "content": "review commit\n\n<prefetched_context>\ncommit: abc\ndiff: +1 -1\n</prefetched_context>" },
+            { "role": "assistant", "content": "The commit looks good." },
+            { "role": "user", "content": "what about error handling?" }
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-eh1", "read_file", json!({"path": "src/error.rs"}))]
+        }, {
+            "full_text": "Error handling could be improved."
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, payload2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let events2 = parse_sse_events(&raw2);
+    let tool_reqs2 = events_of_type(&events2, "tool_request");
+    assert_eq!(tool_reqs2.len(), 1, "turn 2: LLM calls tools normally without prefetch");
+}
+
+#[tokio::test]
+async fn a1_prefetched_context_large_diff_truncation() {
+    // Prefetched context with a large body should still flow through the bridge
+    // without causing issues (the CLI truncates, but the bridge must handle any size).
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Simulate a large prefetched diff (10KB)
+    let large_diff = "- old_line\n+ new_line\n".repeat(500);
+    let enriched = format!(
+        "review commit\n\n<prefetched_context>\n## Full Diff\n{}\n</prefetched_context>",
+        large_diff
+    );
+
+    let payload = json!({
+        "agent_id": "a1-large-prefetch",
+        "messages": [{ "role": "user", "content": enriched }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Large commit with many changes. Overall looks good."
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "turn completes successfully with large prefetch");
+}
+
+// ── A2: Tool Selection E2E Tests (TfIdf-only verification) ───────────────────
+
+#[tokio::test]
+async fn a2_edge_profile_selection_task_type_reaches_bridge() {
+    // The CLI sends selection_task_type in edge_profile. Verify the bridge uses it
+    // for system prompt construction (task_type_section).
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a2-task-type",
+        "messages": [{ "role": "user", "content": "review the code" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("git_log")],
+        "edge_profile": {
+            "selection_task_type": "code_review",
+            "selection_confidence": 0.85
+        },
+        "selection_confidence": 0.85,
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "The code looks well-structured.",
+            "usage": { "prompt": 1000, "completion": 100, "total": 1100 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Explain event should be emitted with routing info
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1);
+    let ex = explains[0];
+    assert!(ex["tools_available"].as_i64().unwrap() >= 2, "tools available >= 2");
+
+    // Turn should complete normally
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1);
+}
+
+#[tokio::test]
+async fn a2_selection_confidence_passed_to_bridge() {
+    // selection_confidence is used by the bridge for compaction decisions.
+    // Verify a low-confidence selection doesn't break the flow.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a2-low-confidence",
+        "messages": [{ "role": "user", "content": "do something ambiguous" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("write_file"),
+            tool_schema("grep"),
+            tool_schema("bash")
+        ],
+        "selection_confidence": 0.3,
+        "test_llm_rounds": [{
+            "full_text": "I'll help with that. What specifically would you like me to do?"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "low confidence doesn't break the flow");
+}
+
+#[tokio::test]
+async fn a2_empty_edge_tools_still_works() {
+    // Even with zero edge tools, the bridge should produce a valid response.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a2-no-tools",
+        "messages": [{ "role": "user", "content": "what is 2+2?" }],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "2+2 equals 4."
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1);
+    assert_eq!(turn_completes[0]["has_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn a2_many_edge_tools_handled() {
+    // Verify the bridge handles a large number of edge tools without issues.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let tools: Vec<Value> = (0..50)
+        .map(|i| tool_schema(&format!("tool_{i}")))
+        .collect();
+
+    let payload = json!({
+        "agent_id": "a2-many-tools",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": tools,
+        "test_llm_rounds": [{
+            "full_text": "Hello!"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "handles 50 edge tools");
+}
+
+#[tokio::test]
+async fn a2_explain_shows_tools_selected_and_available_counts() {
+    // explain event must report accurate tools_selected and tools_available.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a2-explain-counts",
+        "messages": [{ "role": "user", "content": "read the README" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("write_file"),
+            tool_schema("grep"),
+        ],
+        "explain": true,
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-rd", "read_file", json!({"path": "README.md"}))],
+            "usage": { "prompt": 500, "completion": 30, "total": 530 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1);
+    let ex = explains[0];
+
+    let avail = ex["tools_available"].as_i64().unwrap();
+    assert!(avail >= 3, "tools_available should be >= 3, got {avail}");
+
+    let selected = ex["tools_selected"].as_i64().unwrap();
+    assert!(selected >= 1, "tools_selected should be >= 1 (at least the tool call count)");
+}
+
+// ── A3: Error Recovery E2E Tests ────────────────────────────────────────────
+
+#[tokio::test]
+async fn a3_malformed_tool_call_missing_function_name() {
+    // A tool_call without a function name should not crash the bridge.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a3-malformed-tc",
+        "messages": [{ "role": "user", "content": "do something" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [json!({
+                "id": "tc-bad",
+                "type": "function",
+                "function": {
+                    "arguments": "{\"path\": \"test.txt\"}"
+                }
+            })]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    // The bridge should still return OK (may report an error event, but not crash)
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Should have at least session_info
+    let session_infos = events_of_type(&events, "session_info");
+    assert!(!session_infos.is_empty(), "session_info always emitted");
+}
+
+#[tokio::test]
+async fn a3_malformed_tool_call_empty_arguments() {
+    // A tool_call with empty arguments string should be handled gracefully.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a3-empty-args",
+        "messages": [{ "role": "user", "content": "do something" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [json!({
+                "id": "tc-empty",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": ""
+                }
+            })]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Should complete (may have tool_request with empty args)
+    let session_infos = events_of_type(&events, "session_info");
+    assert!(!session_infos.is_empty(), "session_info emitted despite empty args");
+}
+
+#[tokio::test]
+async fn a3_malformed_tool_call_invalid_json_arguments() {
+    // Arguments that aren't valid JSON should not crash the bridge.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a3-invalid-json",
+        "messages": [{ "role": "user", "content": "do something" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [json!({
+                "id": "tc-badjson",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "not valid json {{"
+                }
+            })]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let session_infos = events_of_type(&events, "session_info");
+    assert!(!session_infos.is_empty(), "session_info emitted despite invalid JSON args");
+}
+
+#[tokio::test]
+async fn a3_multi_turn_error_isolation_turn2_error_preserves_turn1() {
+    // An error in turn 2 should not corrupt the persisted data from turn 1.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Turn 1: successful turn
+    let payload1 = json!({
+        "agent_id": "a3-error-iso",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hello! How can I help?"
+        }]
+    });
+
+    let (st1, _) = chat_turn(&app, payload1).await;
+    assert_eq!(st1, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let core_after_t1 = cap.core_plans.lock().await.len();
+    assert_eq!(core_after_t1, 1, "turn 1 persisted one core plan");
+
+    // Turn 2: with malformed tool call
+    let payload2 = json!({
+        "agent_id": "a3-error-iso",
+        "messages": [
+            { "role": "user", "content": "hello" },
+            { "role": "assistant", "content": "Hello! How can I help?" },
+            { "role": "user", "content": "read a file" }
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [json!({
+                "id": "tc-iso",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "not-json"
+                }
+            })]
+        }]
+    });
+
+    let (st2, _) = chat_turn(&app, payload2).await;
+    assert_eq!(st2, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    // Turn 1's persisted data should still be intact
+    let core = cap.core_plans.lock().await;
+    assert!(core.len() >= 1, "turn 1 core plan still present");
+    let t1_uq = core[0].user_query_event.as_ref().unwrap();
+    assert!(t1_uq.content.contains("hello"), "turn 1 data intact");
+}
+
+#[tokio::test]
+async fn a3_empty_test_llm_rounds_produces_error_event() {
+    // If test_llm_rounds is empty (no rounds at all), the bridge should handle gracefully.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a3-empty-rounds",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": []
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // Session info should always be emitted
+    let session_infos = events_of_type(&events, "session_info");
+    assert!(!session_infos.is_empty(), "session_info emitted even with empty rounds");
+
+    // Should have a turn_complete or error event
+    let turn_completes = events_of_type(&events, "turn_complete");
+    let errors = events_of_type(&events, "error");
+    assert!(
+        !turn_completes.is_empty() || !errors.is_empty(),
+        "either turn_complete or error event emitted"
+    );
+}
+
+#[tokio::test]
+async fn a3_tool_call_for_unknown_tool_handled() {
+    // LLM requests a tool that isn't in edge_tools. The bridge should still
+    // process it (edge tools execute on the CLI side) and emit tool_request.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a3-unknown-tool",
+        "messages": [{ "role": "user", "content": "use a special tool" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-unk", "nonexistent_tool", json!({"arg": "value"}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // The bridge should emit a tool_request for the unknown tool (edge execution)
+    // or handle it as an error — either way, no crash
+    let session_infos = events_of_type(&events, "session_info");
+    assert!(!session_infos.is_empty(), "session_info always emitted");
+}
+
+#[tokio::test]
+async fn a3_concurrent_turns_dont_interfere() {
+    // Two concurrent turns on different sessions should not interfere.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload_a = json!({
+        "agent_id": "a3-concurrent-a",
+        "messages": [{ "role": "user", "content": "turn A" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Response A"
+        }]
+    });
+
+    let payload_b = json!({
+        "agent_id": "a3-concurrent-b",
+        "messages": [{ "role": "user", "content": "turn B" }],
+        "edge_tools": [tool_schema("write_file")],
+        "test_llm_rounds": [{
+            "full_text": "Response B"
+        }]
+    });
+
+    // Run both turns concurrently
+    let (result_a, result_b) = tokio::join!(
+        chat_turn(&app, payload_a),
+        chat_turn(&app, payload_b),
+    );
+
+    assert_eq!(result_a.0, StatusCode::OK);
+    assert_eq!(result_b.0, StatusCode::OK);
+
+    let events_a = parse_sse_events(&result_a.1);
+    let events_b = parse_sse_events(&result_b.1);
+
+    // Each should have its own turn_complete
+    let tc_a = events_of_type(&events_a, "turn_complete");
+    let tc_b = events_of_type(&events_b, "turn_complete");
+    assert_eq!(tc_a.len(), 1, "turn A completed");
+    assert_eq!(tc_b.len(), 1, "turn B completed");
+}
+
+// ── A4: Skill Interception E2E Tests ────────────────────────────────────────
+//
+// Skills are intercepted by the bridge's `partition_and_execute_skills` function.
+// When the LLM calls a tool that matches a skill name, the skill is executed
+// and its output is injected as a tool_result before the next LLM round.
+
+#[tokio::test]
+async fn a4_skill_tool_name_in_edge_tools_treated_as_regular_tool() {
+    // When edge_tools contains a skill-like tool name, the bridge should treat
+    // it as a regular edge tool (no special interception in E2E mock mode).
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a4-skill-edge",
+        "messages": [{ "role": "user", "content": "use the skill tool" }],
+        "edge_tools": [
+            tool_schema("read_file"),
+            tool_schema("skill"),
+        ],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-sk1", "skill", json!({"name": "code-review", "args": {}}))]
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    // The skill tool call should be emitted as a tool_request (for edge execution)
+    let tool_reqs = events_of_type(&events, "tool_request");
+    assert!(tool_reqs.len() >= 1, "skill tool call emitted as tool_request");
+
+    // Verify the tool name
+    let skill_reqs: Vec<&&Value> = tool_reqs.iter()
+        .filter(|e| e.get("tool").and_then(Value::as_str) == Some("skill"))
+        .collect();
+    assert_eq!(skill_reqs.len(), 1, "exactly one skill tool_request");
+}
+
+#[tokio::test]
+async fn a4_active_skills_in_edge_profile() {
+    // active_skills in edge_profile should influence system prompt construction.
+    // Verify the bridge accepts active_skills without errors.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a4-active-skills",
+        "messages": [{ "role": "user", "content": "help me review" }],
+        "edge_tools": [tool_schema("read_file")],
+        "edge_profile": {
+            "active_skills": ["code-review", "test-writer"],
+            "selection_task_type": "code_review"
+        },
+        "test_llm_rounds": [{
+            "full_text": "I'll help you review the code."
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "turn completes with active_skills");
+}
+
+#[tokio::test]
+async fn a4_empty_active_skills_no_impact() {
+    // Empty active_skills array should not affect normal operation.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a4-empty-skills",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "edge_profile": {
+            "active_skills": []
+        },
+        "test_llm_rounds": [{
+            "full_text": "Hi!"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "works with empty active_skills");
+}
+
+// ── A5: Observability E2E Tests ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn a5_explain_event_has_complete_structure() {
+    // The explain event should contain all expected fields for observability.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-explain-struct",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Hi!",
+            "usage": { "prompt": 200, "completion": 10, "total": 210 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1, "exactly one explain event");
+    let ex = explains[0];
+
+    // Required fields
+    assert_eq!(ex["type"], "explain");
+    assert!(ex.get("total_ms").is_some(), "total_ms present");
+    assert!(ex.get("prompt_tokens").is_some(), "prompt_tokens present");
+    assert!(ex.get("completion_tokens").is_some(), "completion_tokens present");
+    assert!(ex.get("tools_selected").is_some(), "tools_selected present");
+    assert!(ex.get("tools_available").is_some(), "tools_available present");
+
+    // Token counts should match what mock LLM reported
+    assert_eq!(ex["prompt_tokens"], 200, "prompt_tokens matches usage");
+    assert_eq!(ex["completion_tokens"], 10, "completion_tokens matches usage");
+}
+
+#[tokio::test]
+async fn a5_explain_routing_block_present() {
+    // The explain event should include a routing block with router info.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-explain-routing",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Hi!",
+            "usage": { "prompt": 100, "completion": 5, "total": 105 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1);
+    let routing = &explains[0]["routing"];
+    assert!(routing.is_object(), "routing is an object");
+    assert_eq!(routing["router"], "inprocess-default", "router name");
+}
+
+#[tokio::test]
+async fn a5_explain_steps_array_present_for_tool_turn() {
+    // When the LLM makes tool calls, the explain event should have a non-empty steps array.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-explain-steps",
+        "messages": [{ "role": "user", "content": "read file" }],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-s1", "read_file", json!({"path": "a.txt"}))],
+            "usage": { "prompt": 300, "completion": 20, "total": 320 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1);
+    let steps = explains[0].get("steps").and_then(Value::as_array);
+    assert!(steps.is_some(), "steps array present");
+    let steps = steps.unwrap();
+    assert!(!steps.is_empty(), "steps array non-empty for tool turn");
+}
+
+#[tokio::test]
+async fn a5_explain_auxiliary_llm_calls_present() {
+    // The explain event should report auxiliary_llm_calls with timing and token info.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-aux-calls",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Hi!",
+            "usage": { "prompt": 150, "completion": 8, "total": 158 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1);
+    let aux = explains[0].get("auxiliary_llm_calls").and_then(Value::as_array);
+    assert!(aux.is_some(), "auxiliary_llm_calls present");
+    let aux = aux.unwrap();
+    assert!(!aux.is_empty(), "auxiliary_llm_calls non-empty");
+    assert_eq!(aux[0]["purpose"], "primary_generation");
+    assert_eq!(aux[0]["tokens_in"], 150);
+    assert_eq!(aux[0]["tokens_out"], 8);
+}
+
+#[tokio::test]
+async fn a5_explain_not_emitted_when_false() {
+    // When explain=false (or not set), no explain event should be emitted.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-no-explain",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hi!"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 0, "no explain event when explain not set");
+}
+
+#[tokio::test]
+async fn a5_persist_tool_call_with_full_args() {
+    // Tool calls should be persisted with full arguments (not truncated).
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let long_path = format!("/very/long/path/{}", "a".repeat(500));
+    let payload = json!({
+        "agent_id": "a5-persist-args",
+        "messages": [{ "role": "user", "content": "read file" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-fa", "read_file", json!({"path": long_path}))]
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let tools = cap.tool_plans.lock().await;
+    assert!(!tools.is_empty(), "tool events persisted");
+    // Check that at least one tool event record has the full path in content
+    let has_full_path = tools.iter().any(|tp| {
+        tp.events.iter().any(|r| r.content.contains(&long_path))
+    });
+    assert!(has_full_path, "persisted tool event content should contain the full long path");
+}
+
+#[tokio::test]
+async fn a5_session_info_always_first_event() {
+    // session_info should always be the first SSE event in any turn.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Test with text-only response
+    let payload1 = json!({
+        "agent_id": "a5-first-event",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hi!"
+        }]
+    });
+
+    let (st1, raw1) = chat_turn(&app, payload1).await;
+    assert_eq!(st1, StatusCode::OK);
+    let events1 = parse_sse_events(&raw1);
+    assert!(!events1.is_empty(), "has events");
+    assert_eq!(
+        events1[0]["type"], "session_info",
+        "first event is session_info for text-only"
+    );
+
+    // Test with tool call response
+    let payload2 = json!({
+        "agent_id": "a5-first-event-tc",
+        "messages": [{ "role": "user", "content": "read file" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-first", "read_file", json!({"path": "test.txt"}))]
+        }]
+    });
+
+    let (st2, raw2) = chat_turn(&app, payload2).await;
+    assert_eq!(st2, StatusCode::OK);
+    let events2 = parse_sse_events(&raw2);
+    assert!(!events2.is_empty(), "has events");
+    assert_eq!(
+        events2[0]["type"], "session_info",
+        "first event is session_info for tool call"
+    );
+}
+
+#[tokio::test]
+async fn a5_turn_complete_always_last_meaningful_event() {
+    // turn_complete should be the last meaningful event (explain may follow).
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-last-event",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hi!"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let turn_completes = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_completes.len(), 1, "exactly one turn_complete");
+
+    // turn_complete should be at or near the end
+    let tc_idx = events.iter().position(|e| e["type"] == "turn_complete").unwrap();
+    // Only explain event can follow turn_complete
+    for e in &events[tc_idx + 1..] {
+        let ty = e.get("type").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            ty == "explain" || ty.is_empty(),
+            "only explain can follow turn_complete, got: {ty}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a5_event_ordering_session_info_text_chunks_turn_complete() {
+    // Full event ordering: session_info → text_delta(s) → turn_complete
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-event-order",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hello there!"
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let types: Vec<&str> = events.iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+
+    // session_info must come first
+    assert_eq!(types[0], "session_info", "first event is session_info");
+
+    // turn_complete must come last (before any explain)
+    let tc_pos = types.iter().position(|&t| t == "turn_complete").unwrap();
+    assert!(tc_pos > 0, "turn_complete is not the first event");
+
+    // All text_deltas must come between session_info and turn_complete
+    for (i, &ty) in types.iter().enumerate() {
+        if ty == "text_delta" {
+            assert!(i > 0, "text_delta after session_info");
+            assert!(i < tc_pos, "text_delta before turn_complete");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a5_explain_with_multi_round_tool_flow() {
+    // Explain event should accurately report timing for multi-round tool flows.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-explain-multi",
+        "messages": [{ "role": "user", "content": "analyze the code" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "explain": true,
+        "test_llm_rounds": [
+            {
+                "tool_calls": [
+                    tool_call("tc-r1", "read_file", json!({"path": "main.rs"})),
+                    tool_call("tc-g1", "grep", json!({"pattern": "fn main"})),
+                ],
+                "usage": { "prompt": 500, "completion": 30, "total": 530 }
+            },
+            {
+                "full_text": "The code analysis shows a well-structured main function.",
+                "usage": { "prompt": 800, "completion": 50, "total": 850 }
+            }
+        ]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&raw);
+
+    let explains = events_of_type(&events, "explain");
+    assert_eq!(explains.len(), 1, "one explain event for multi-round");
+    let ex = explains[0];
+
+    // tools_selected should count the tool calls
+    let selected = ex["tools_selected"].as_i64().unwrap();
+    assert!(selected >= 2, "tools_selected >= 2 for multi-round, got {selected}");
+
+    // total_ms should be positive
+    let total_ms = ex["total_ms"].as_i64().unwrap();
+    assert!(total_ms >= 0, "total_ms is non-negative");
+
+    // routing should be present
+    assert!(ex.get("routing").is_some(), "routing present in multi-round explain");
+}
+
+#[tokio::test]
+async fn a5_persist_core_event_has_session_and_user_ids() {
+    // Persisted core events should contain correct session_id and user_id.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-persist-ids",
+        "session_id": "s-persist-test",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hi!"
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "core events persisted");
+    let plan = &core[0];
+    // Core plan stores user_query_event and llm_response_event which have session/user IDs
+    let uq = plan.user_query_event.as_ref().expect("user_query persisted");
+    assert_eq!(uq.session_id, "s-persist-test", "session_id matches");
+    assert_eq!(uq.user_id, USER_ID, "user_id matches");
+}
+
+#[tokio::test]
+async fn a5_persist_activity_writer_called() {
+    // Session activity writer should be called after each turn.
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "agent_id": "a5-activity",
+        "session_id": "s-activity-test",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Hi!"
+        }]
+    });
+
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let activities = cap.activity_plans.lock().await;
+    assert!(!activities.is_empty(), "activity writer called after turn");
+}
