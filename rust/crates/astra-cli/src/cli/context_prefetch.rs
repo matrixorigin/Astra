@@ -35,7 +35,10 @@ pub struct PrefetchedContext {
 /// context that eliminates the need for the LLM to call tools in early rounds.
 ///
 /// Returns `Some(PrefetchedContext)` when context was gathered, `None` otherwise.
-pub fn prefetch_context_for_message(message: &str, project_root: &Path) -> Option<PrefetchedContext> {
+pub fn prefetch_context_for_message(
+    message: &str,
+    project_root: &Path,
+) -> Option<PrefetchedContext> {
     let task_type = detect_task_type(message)?;
     let body = match task_type {
         "code_review" => prefetch_code_review_context(message, project_root)?,
@@ -54,21 +57,29 @@ pub fn prefetch_context_for_message(message: &str, project_root: &Path) -> Optio
 /// guidance telling the LLM what it already has and what it still needs tools for.
 pub fn inject_prefetched_context(messages: &mut [Value], ctx: &PrefetchedContext) {
     let guidance = match ctx.task_type {
-        "code_review" => "\
+        "code_review" => {
+            "\
             The complete git context is provided below. You already have the full diff — \
             review it directly without calling git tools or the skill tool. \
-            Only use read_file if you need to see surrounding code not in the diff.",
-        "exploration" => "\
+            Only use read_file if you need to see surrounding code not in the diff."
+        }
+        "exploration" => {
+            "\
             The project structure and key files are provided below. Use this to answer \
             the user's question directly. Only call tools if you need to read specific \
-            source files not included here.",
-        "debugging" => "\
+            source files not included here."
+        }
+        "debugging" => {
+            "\
             Recent changes and project context are provided below. Use this to narrow \
             down the problem. Call tools only for specific files you need to inspect \
-            that aren't shown here.",
-        "implementation" | "analysis" => "\
+            that aren't shown here."
+        }
+        "implementation" | "analysis" => {
+            "\
             Project structure is provided below to help you understand the codebase layout. \
-            Use it to decide where to make changes or which files to read next.",
+            Use it to decide where to make changes or which files to read next."
+        }
         _ => "Context pre-fetched below.",
     };
 
@@ -118,11 +129,7 @@ fn prefetch_commit_review(project_root: &Path) -> Option<String> {
     )
     .unwrap_or_default();
 
-    let diff = run_git(
-        project_root,
-        &["diff", "HEAD~1..HEAD"],
-        MAX_DIFF_BYTES,
-    )?;
+    let diff = run_git(project_root, &["diff", "HEAD~1..HEAD"], MAX_DIFF_BYTES)?;
 
     let mut ctx = String::with_capacity(log.len() + stat.len() + diff.len() + 200);
     ctx.push_str("## Latest Commit\n\n```\n");
@@ -139,11 +146,7 @@ fn prefetch_commit_review(project_root: &Path) -> Option<String> {
 fn prefetch_branch_diff(project_root: &Path) -> Option<String> {
     let default_branch = detect_default_branch(project_root)?;
 
-    let merge_base = run_git(
-        project_root,
-        &["merge-base", &default_branch, "HEAD"],
-        256,
-    )?;
+    let merge_base = run_git(project_root, &["merge-base", &default_branch, "HEAD"], 256)?;
     let merge_base = merge_base.trim();
 
     let log = run_git(
@@ -191,11 +194,10 @@ fn prefetch_working_changes(project_root: &Path) -> Option<String> {
         return prefetch_commit_review(project_root);
     }
 
-    let stat = run_git(project_root, &["diff", "--stat", "HEAD"], MAX_LOG_BYTES)
-        .unwrap_or_default();
+    let stat =
+        run_git(project_root, &["diff", "--stat", "HEAD"], MAX_LOG_BYTES).unwrap_or_default();
 
-    let mut ctx =
-        String::with_capacity(staged_text.len() + unstaged_text.len() + stat.len() + 200);
+    let mut ctx = String::with_capacity(staged_text.len() + unstaged_text.len() + stat.len() + 200);
     ctx.push_str("## Working Directory Changes\n\n### Changed Files\n\n```\n");
     ctx.push_str(&stat);
     ctx.push_str("```\n\n");
@@ -251,22 +253,14 @@ fn prefetch_exploration_context(_message: &str, project_root: &Path) -> Option<S
         if let Some(branch) = run_git(project_root, &["branch", "--show-current"], 256) {
             ctx.push_str(&format!("## Git\n\nCurrent branch: `{}`\n", branch.trim()));
         }
-        if let Some(log) = run_git(
-            project_root,
-            &["log", "--oneline", "-10"],
-            MAX_LOG_BYTES,
-        ) {
+        if let Some(log) = run_git(project_root, &["log", "--oneline", "-10"], MAX_LOG_BYTES) {
             ctx.push_str("\nRecent commits:\n```\n");
             ctx.push_str(&log);
             ctx.push_str("```\n\n");
         }
     }
 
-    if ctx.is_empty() {
-        None
-    } else {
-        Some(ctx)
-    }
+    if ctx.is_empty() { None } else { Some(ctx) }
 }
 
 // ─── Debugging ───────────────────────────────────────────────────────────────
@@ -306,11 +300,7 @@ fn prefetch_debugging_context(message: &str, project_root: &Path) -> Option<Stri
             }
         } else {
             // No uncommitted changes — show recent commit diffs
-            if let Some(log) = run_git(
-                project_root,
-                &["log", "--oneline", "-5"],
-                MAX_LOG_BYTES,
-            ) {
+            if let Some(log) = run_git(project_root, &["log", "--oneline", "-5"], MAX_LOG_BYTES) {
                 ctx.push_str("## Recent Commits\n\n```\n");
                 ctx.push_str(&log);
                 ctx.push_str("```\n\n");
@@ -327,11 +317,7 @@ fn prefetch_debugging_context(message: &str, project_root: &Path) -> Option<Stri
         }
     }
 
-    if ctx.is_empty() {
-        None
-    } else {
-        Some(ctx)
-    }
+    if ctx.is_empty() { None } else { Some(ctx) }
 }
 
 // ─── Implementation ──────────────────────────────────────────────────────────
@@ -355,11 +341,7 @@ fn prefetch_implementation_context(project_root: &Path) -> Option<String> {
         ctx.push_str("\n```\n\n");
     }
 
-    if ctx.is_empty() {
-        None
-    } else {
-        Some(ctx)
-    }
+    if ctx.is_empty() { None } else { Some(ctx) }
 }
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
@@ -528,11 +510,20 @@ fn detect_config_files(project_root: &Path) -> Vec<(String, String)> {
 fn extract_file_reference(message: &str, project_root: &Path) -> Option<String> {
     // Look for path-like tokens (contain / or end with common extensions)
     for word in message.split_whitespace() {
-        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-');
-        if clean.contains('/') || clean.ends_with(".rs") || clean.ends_with(".py")
-            || clean.ends_with(".js") || clean.ends_with(".ts") || clean.ends_with(".go")
-            || clean.ends_with(".java") || clean.ends_with(".rb") || clean.ends_with(".c")
-            || clean.ends_with(".cpp") || clean.ends_with(".h")
+        let clean = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+        });
+        if clean.contains('/')
+            || clean.ends_with(".rs")
+            || clean.ends_with(".py")
+            || clean.ends_with(".js")
+            || clean.ends_with(".ts")
+            || clean.ends_with(".go")
+            || clean.ends_with(".java")
+            || clean.ends_with(".rb")
+            || clean.ends_with(".c")
+            || clean.ends_with(".cpp")
+            || clean.ends_with(".h")
         {
             let path = project_root.join(clean);
             if path.is_file() {
@@ -682,9 +673,8 @@ mod tests {
 
     #[test]
     fn inject_context_appends_to_last_message() {
-        let mut messages = vec![
-            serde_json::json!({"role": "user", "content": "review the commit"}),
-        ];
+        let mut messages =
+            vec![serde_json::json!({"role": "user", "content": "review the commit"})];
         let ctx = PrefetchedContext {
             task_type: "code_review",
             body: "DIFF HERE".to_string(),
@@ -699,9 +689,8 @@ mod tests {
 
     #[test]
     fn inject_exploration_context_has_correct_guidance() {
-        let mut messages = vec![
-            serde_json::json!({"role": "user", "content": "how does this work?"}),
-        ];
+        let mut messages =
+            vec![serde_json::json!({"role": "user", "content": "how does this work?"})];
         let ctx = PrefetchedContext {
             task_type: "exploration",
             body: "TREE HERE".to_string(),
@@ -752,7 +741,9 @@ mod tests {
         let configs = detect_config_files(&root);
         assert!(!configs.is_empty(), "should find at least one config file");
         assert!(
-            configs.iter().any(|(label, _)| label.contains("Cargo") || label.contains("Makefile")),
+            configs
+                .iter()
+                .any(|(label, _)| label.contains("Cargo") || label.contains("Makefile")),
             "should detect Cargo.toml or Makefile"
         );
     }

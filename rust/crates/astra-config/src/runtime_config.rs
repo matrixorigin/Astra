@@ -306,9 +306,11 @@ pub struct ToolSelectionConfig {
     #[serde(default)]
     pub tool_budget_tokens: u32,
 
-    /// Model name for the LLM-based tool selector.
-    /// When set, overrides auto-detection (pick_cheapest_model).
-    /// Example: "qwen3.5-flash", "qwen-flash"
+    /// Legacy: model name for the removed CLI LLM-based tool selector.
+    ///
+    /// The `astra-cli` REPL and background plan executor use the TF-IDF tool selector only
+    /// (no extra LLM call before the task model). This field is still parsed from TOML for
+    /// backward compatibility but has **no effect** on tool selection today.
     #[serde(default)]
     pub selector_model: Option<String>,
 

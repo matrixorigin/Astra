@@ -80,7 +80,7 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 
 1. **Cross-session learning**: EntityGraph + PatternLibrary + ProgressiveCalibrator persist and evolve across sessions. No competitor does this.
 2. **Edge-cloud architecture**: Tools execute locally (100ms latency), LLM reasoning goes to cloud. Combines Claude Code's privacy with Codex's cloud power.
-3. **Self-improving selection**: ToolQualityTracker biases future selections based on historical outcomes. FallbackSelector uses TF-IDF fast path with LLM verification.
+3. **Self-improving selection**: ToolQualityTracker biases future selections based on historical outcomes. Production CLI uses TF-IDF tool selection (routing engine, entity graph, patterns) with no extra LLM pre-call; `LlmToolSelector`/`FallbackSelector` remain in `tool_selector.rs` for tests and optional composition.
 4. **Intent-driven context**: Load only task-relevant memory (preference query: ~100 tokens vs full memory: ~2400 tokens). 60% token savings.
 
 ### 2.3 Where We Must Catch Up
@@ -112,7 +112,7 @@ rust/crates/
 ├── runtime/         # Cognitive pipeline: tool selection, turn execution, learning, plan mode
 │   ├── plan_decompose.rs    # Long-horizon planning, templates, execution preview (moved from CLI)
 │   ├── sync_adapters.rs     # LearningAdapter, MatrixOneTransport, Event/Task adapters (moved from CLI; not in services — avoids runtime↔services cycle)
-│   ├── tool_selector.rs     # LearnedContext, TfIdf/LLM/FallbackSelector
+│   ├── tool_selector.rs     # LearnedContext, TfIdfSelector (CLI default); LLM/Fallback for tests
 │   ├── tool_registry/       # 8 modules: registry, scoring, report, meta
 │   ├── turn/                # 38 modules: bridge, stall detection, error recovery, health
 │   │   ├── bridge_inprocess.rs  # InProcessChatTurnBridge; single-call LLM proxy for /chat/turn
@@ -219,7 +219,7 @@ Clean ──write──▶ Dirty ──push──▶ Syncing ──ok──▶ C
 | Session journal + workspace | ✅ Production | Append-only JSONL, version tracking |
 | Event ingestion (async batch) | ✅ Production | Backpressure, idempotent, at-least-once |
 | Learning sync (EntityGraph) | ✅ Production | Delta support, optimistic locking, gzip compression |
-| Tool selection (FallbackSelector) | ✅ Production | TF-IDF + LLM hybrid, learned context reuse |
+| Tool selection (TfIdfSelector) | ✅ Production | TF-IDF + routing/entity/pattern pipeline; CLI skips LLM pre-selector |
 | Stall/error detection | ✅ Production | Intent drift, name stall, error budgets, circuit breaker |
 | Code intelligence (tree-sitter) | ✅ Production | 10 AST tools, 8 languages, 44 tests |
 | Git operations (gix) | ✅ Production | Pure-Rust, 46 tests, no binary dependency |
@@ -295,7 +295,7 @@ The graph is correct (no cycles), but `astra` being the **only crate that can br
 - **Local-first journal**: Append-only JSONL is the correct foundation. Fast, crash-safe, auditable.
 - **Sync envelope state machine**: Clean→Dirty→Syncing→Conflict is correct. Extend, don't replace.
 - **DomainAdapter trait**: The trait signature is well-designed. **Learning, Events, Tasks, Templates, and Preferences** now have real [`runtime::sync_adapters`](../../rust/crates/runtime/src/sync_adapters.rs) implementations (see §6.2.1); residual “stub” language in older sections is obsolete for those domains.
-- **FallbackSelector pattern**: TF-IDF fast path + LLM verification is the right hybrid. Extend with learned context.
+- **Tool selection default path**: TF-IDF + learned context (entity/pattern/calibration) without a per-turn LLM tool-selection call in CLI; optional `FallbackSelector`/`LlmToolSelector` in-library for experiments.
 - **LearnedContext flow**: Entity/pattern/calibration/tool hints as "priors, not hard requirements" is correct.
 
 ---
@@ -339,7 +339,7 @@ The target is a **three-tier architecture** where the cloud runtime is the brain
 │           │                                                              │
 │  ┌────────▼───────────────────────────────────────────────────────┐      │
 │  │  Cognitive Engine (today: runtime crate)                        │      │
-│  │  ├── FallbackSelector (TF-IDF + LLM tool selection)            │      │
+│  │  ├── TfIdfSelector (CLI default; no LLM tool pre-selection)   │      │
 │  │  ├── StallGuard + ErrorRecovery + Circuit Breaker               │      │
 │  │  ├── LearnedContext (EntityGraph, PatternLibrary, Calibrator)    │      │
 │  │  ├── Prompt Cache + Token Budget Management                     │      │
@@ -1947,7 +1947,7 @@ astra Orchestrator
 | Phase 3 registry & leases | `services/src/multi_agent.rs` | `DatabaseEdgeRegistryService`, `DatabaseTaskLeaseService`, `push_tasks_pack_held_mysql`, `TaskLeaseHoldCache` | services ✅ |
 | Sync adapters | `runtime/src/sync_adapters.rs` | LearningAdapter, EventAdapter (ingestion), TemplateAdapter (pull cache), PreferenceAdapter (bidirectional), TaskAdapter (lease-filtered tasks) | runtime ✅ |
 | Active LLM resolution | `services/src/models.rs` | `resolve_active_llm_model`, `ResolvedActiveLlmModel` | services ✅ |
-| Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, FallbackSelector, confidence gate | runtime ✅ |
+| Tool selector | `runtime/src/tool_selector.rs` | LearnedContext, TfIdfSelector (CLI), confidence gate | runtime ✅ |
 | Bridge (in-process) | `runtime/src/turn/bridge_inprocess.rs` | Prompt cache, streaming LLM; `sse_blocks` + `sse_data_lines` (`json_events_from_sse_event_block`, slice 39); `resolve_active_llm_model`; `tool_schema_prune` | runtime ✅ (SQL out of bridge) |
 | Edge prompt context | `runtime/src/turn/edge_prompt_context.rs` | Workspace/lang detection; `make_args_preview` uses `tool_argument_hints` for path/command (CLI `chat_stream`) | runtime ✅ |
 | Tool schema prune | `runtime/src/turn/tool_schema_prune.rs` | Tiered pruning + `filter_tool_schemas_by_excluded_names` (stall-restricted tools) | runtime ✅ |

@@ -1126,12 +1126,16 @@ mod tests {
         })];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
         let tc = msg["tool_calls"].as_array().unwrap();
-        assert_eq!(tc[0]["function"]["name"], "skill",
-            "must extract name from OpenAI-format function.name");
+        assert_eq!(
+            tc[0]["function"]["name"], "skill",
+            "must extract name from OpenAI-format function.name"
+        );
         let args: Value =
             serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["skill_name"], "review-changes",
-            "must preserve arguments from OpenAI-format function.arguments");
+        assert_eq!(
+            args["skill_name"], "review-changes",
+            "must preserve arguments from OpenAI-format function.arguments"
+        );
     }
 
     /// Regression: mixed flat + OpenAI format tool_calls in the same round.

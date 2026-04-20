@@ -386,7 +386,7 @@ Peak tokens_in: {peak} tokens ({peak/effective * 100}% utilization)
 ### Tool Schemas
 | Issue | Fix | Savings |
 |-------|-----|---------|
-| Low selection accuracy (<50%) | Switch to LLM selector for novel tasks | 2-5K tokens |
+| Low selection accuracy (<50%) | Strengthen TF-IDF signals (routing, entity graph, patterns, boost terms); tighten tool budget / thresholds — CLI does not use an LLM tool pre-selector | 2-5K tokens |
 | >25 tools selected | Tighten TF-IDF threshold | 2-4K tokens |
 | Large individual schemas | Trim verbose parameter descriptions | 100-500 tokens/tool |
 

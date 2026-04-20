@@ -7758,12 +7758,19 @@ async fn tool_call_and_tool_request_ids_match() {
 
     let tool_calls = events_of_type(&events, "tool_call");
     let tool_reqs = events_of_type(&events, "tool_request");
-    assert_eq!(tool_calls.len(), tool_reqs.len(), "same count of tool_call and tool_request");
+    assert_eq!(
+        tool_calls.len(),
+        tool_reqs.len(),
+        "same count of tool_call and tool_request"
+    );
 
     for (tc, tr) in tool_calls.iter().zip(tool_reqs.iter()) {
         let tc_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
         let tr_id = tr.get("request_id").and_then(Value::as_str).unwrap_or("");
-        assert_eq!(tc_id, tr_id, "tool_call id must match tool_request request_id");
+        assert_eq!(
+            tc_id, tr_id,
+            "tool_call id must match tool_request request_id"
+        );
     }
 }
 
@@ -7910,18 +7917,29 @@ async fn a1_prefetched_context_flows_through_bridge_to_llm_response() {
     let turn_completes = events_of_type(&events, "turn_complete");
     assert_eq!(turn_completes.len(), 1, "exactly one turn_complete");
     let tc = turn_completes[0];
-    assert_eq!(tc["has_tool_calls"], false, "no tool calls when context is prefetched");
+    assert_eq!(
+        tc["has_tool_calls"], false,
+        "no tool calls when context is prefetched"
+    );
 
     // No tool_request events — prefetch eliminated the need for tool rounds
     let tool_reqs = events_of_type(&events, "tool_request");
-    assert_eq!(tool_reqs.len(), 0, "zero tool_request events with prefetched context");
+    assert_eq!(
+        tool_reqs.len(),
+        0,
+        "zero tool_request events with prefetched context"
+    );
 
     // The response text should contain the review
     let text_deltas = events_of_type(&events, "text_delta");
-    let full_text: String = text_deltas.iter()
+    let full_text: String = text_deltas
+        .iter()
         .filter_map(|e| e.get("content").and_then(Value::as_str))
         .collect();
-    assert!(full_text.contains("abc123"), "response references the commit from prefetched context");
+    assert!(
+        full_text.contains("abc123"),
+        "response references the commit from prefetched context"
+    );
 }
 
 #[tokio::test]
@@ -7949,7 +7967,10 @@ async fn a1_prefetched_context_persisted_in_user_query_event() {
 
     let core = cap.core_plans.lock().await;
     assert_eq!(core.len(), 1);
-    let uq = core[0].user_query_event.as_ref().expect("user_query persisted");
+    let uq = core[0]
+        .user_query_event
+        .as_ref()
+        .expect("user_query persisted");
     assert!(
         uq.content.contains("<prefetched_context>"),
         "persisted user_query should contain the prefetched context block"
@@ -8064,7 +8085,10 @@ async fn a1_prefetched_context_with_explain_event() {
     assert_eq!(explains.len(), 1, "explain event emitted");
     let ex = explains[0];
     assert!(ex.get("total_ms").is_some(), "total_ms present");
-    assert!(ex.get("tools_available").is_some(), "tools_available present");
+    assert!(
+        ex.get("tools_available").is_some(),
+        "tools_available present"
+    );
     assert!(ex.get("routing").is_some(), "routing data present");
 }
 
@@ -8115,7 +8139,11 @@ async fn a1_multi_turn_prefetch_only_first_turn() {
     assert_eq!(st2, StatusCode::OK);
     let events2 = parse_sse_events(&raw2);
     let tool_reqs2 = events_of_type(&events2, "tool_request");
-    assert_eq!(tool_reqs2.len(), 1, "turn 2: LLM calls tools normally without prefetch");
+    assert_eq!(
+        tool_reqs2.len(),
+        1,
+        "turn 2: LLM calls tools normally without prefetch"
+    );
 }
 
 #[tokio::test]
@@ -8147,7 +8175,11 @@ async fn a1_prefetched_context_large_diff_truncation() {
     let events = parse_sse_events(&raw);
 
     let turn_completes = events_of_type(&events, "turn_complete");
-    assert_eq!(turn_completes.len(), 1, "turn completes successfully with large prefetch");
+    assert_eq!(
+        turn_completes.len(),
+        1,
+        "turn completes successfully with large prefetch"
+    );
 }
 
 // ── A2: Tool Selection E2E Tests (TfIdf-only verification) ───────────────────
@@ -8184,7 +8216,10 @@ async fn a2_edge_profile_selection_task_type_reaches_bridge() {
     let explains = events_of_type(&events, "explain");
     assert_eq!(explains.len(), 1);
     let ex = explains[0];
-    assert!(ex["tools_available"].as_i64().unwrap() >= 2, "tools available >= 2");
+    assert!(
+        ex["tools_available"].as_i64().unwrap() >= 2,
+        "tools available >= 2"
+    );
 
     // Turn should complete normally
     let turn_completes = events_of_type(&events, "turn_complete");
@@ -8219,7 +8254,11 @@ async fn a2_selection_confidence_passed_to_bridge() {
     let events = parse_sse_events(&raw);
 
     let turn_completes = events_of_type(&events, "turn_complete");
-    assert_eq!(turn_completes.len(), 1, "low confidence doesn't break the flow");
+    assert_eq!(
+        turn_completes.len(),
+        1,
+        "low confidence doesn't break the flow"
+    );
 }
 
 #[tokio::test]
@@ -8254,9 +8293,7 @@ async fn a2_many_edge_tools_handled() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    let tools: Vec<Value> = (0..50)
-        .map(|i| tool_schema(&format!("tool_{i}")))
-        .collect();
+    let tools: Vec<Value> = (0..50).map(|i| tool_schema(&format!("tool_{i}"))).collect();
 
     let payload = json!({
         "agent_id": "a2-many-tools",
@@ -8309,7 +8346,10 @@ async fn a2_explain_shows_tools_selected_and_available_counts() {
     assert!(avail >= 3, "tools_available should be >= 3, got {avail}");
 
     let selected = ex["tools_selected"].as_i64().unwrap();
-    assert!(selected >= 1, "tools_selected should be >= 1 (at least the tool call count)");
+    assert!(
+        selected >= 1,
+        "tools_selected should be >= 1 (at least the tool call count)"
+    );
 }
 
 // ── A3: Error Recovery E2E Tests ────────────────────────────────────────────
@@ -8375,7 +8415,10 @@ async fn a3_malformed_tool_call_empty_arguments() {
 
     // Should complete (may have tool_request with empty args)
     let session_infos = events_of_type(&events, "session_info");
-    assert!(!session_infos.is_empty(), "session_info emitted despite empty args");
+    assert!(
+        !session_infos.is_empty(),
+        "session_info emitted despite empty args"
+    );
 }
 
 #[tokio::test]
@@ -8406,7 +8449,10 @@ async fn a3_malformed_tool_call_invalid_json_arguments() {
     let events = parse_sse_events(&raw);
 
     let session_infos = events_of_type(&events, "session_info");
-    assert!(!session_infos.is_empty(), "session_info emitted despite invalid JSON args");
+    assert!(
+        !session_infos.is_empty(),
+        "session_info emitted despite invalid JSON args"
+    );
 }
 
 #[tokio::test]
@@ -8485,7 +8531,10 @@ async fn a3_empty_test_llm_rounds_produces_error_event() {
 
     // Session info should always be emitted
     let session_infos = events_of_type(&events, "session_info");
-    assert!(!session_infos.is_empty(), "session_info emitted even with empty rounds");
+    assert!(
+        !session_infos.is_empty(),
+        "session_info emitted even with empty rounds"
+    );
 
     // Should have a turn_complete or error event
     let turn_completes = events_of_type(&events, "turn_complete");
@@ -8549,10 +8598,8 @@ async fn a3_concurrent_turns_dont_interfere() {
     });
 
     // Run both turns concurrently
-    let (result_a, result_b) = tokio::join!(
-        chat_turn(&app, payload_a),
-        chat_turn(&app, payload_b),
-    );
+    let (result_a, result_b) =
+        tokio::join!(chat_turn(&app, payload_a), chat_turn(&app, payload_b),);
 
     assert_eq!(result_a.0, StatusCode::OK);
     assert_eq!(result_b.0, StatusCode::OK);
@@ -8599,10 +8646,14 @@ async fn a4_skill_tool_name_in_edge_tools_treated_as_regular_tool() {
 
     // The skill tool call should be emitted as a tool_request (for edge execution)
     let tool_reqs = events_of_type(&events, "tool_request");
-    assert!(tool_reqs.len() >= 1, "skill tool call emitted as tool_request");
+    assert!(
+        tool_reqs.len() >= 1,
+        "skill tool call emitted as tool_request"
+    );
 
     // Verify the tool name
-    let skill_reqs: Vec<&&Value> = tool_reqs.iter()
+    let skill_reqs: Vec<&&Value> = tool_reqs
+        .iter()
         .filter(|e| e.get("tool").and_then(Value::as_str) == Some("skill"))
         .collect();
     assert_eq!(skill_reqs.len(), 1, "exactly one skill tool_request");
@@ -8696,13 +8747,22 @@ async fn a5_explain_event_has_complete_structure() {
     assert_eq!(ex["type"], "explain");
     assert!(ex.get("total_ms").is_some(), "total_ms present");
     assert!(ex.get("prompt_tokens").is_some(), "prompt_tokens present");
-    assert!(ex.get("completion_tokens").is_some(), "completion_tokens present");
+    assert!(
+        ex.get("completion_tokens").is_some(),
+        "completion_tokens present"
+    );
     assert!(ex.get("tools_selected").is_some(), "tools_selected present");
-    assert!(ex.get("tools_available").is_some(), "tools_available present");
+    assert!(
+        ex.get("tools_available").is_some(),
+        "tools_available present"
+    );
 
     // Token counts should match what mock LLM reported
     assert_eq!(ex["prompt_tokens"], 200, "prompt_tokens matches usage");
-    assert_eq!(ex["completion_tokens"], 10, "completion_tokens matches usage");
+    assert_eq!(
+        ex["completion_tokens"], 10,
+        "completion_tokens matches usage"
+    );
 }
 
 #[tokio::test]
@@ -8788,7 +8848,9 @@ async fn a5_explain_auxiliary_llm_calls_present() {
 
     let explains = events_of_type(&events, "explain");
     assert_eq!(explains.len(), 1);
-    let aux = explains[0].get("auxiliary_llm_calls").and_then(Value::as_array);
+    let aux = explains[0]
+        .get("auxiliary_llm_calls")
+        .and_then(Value::as_array);
     assert!(aux.is_some(), "auxiliary_llm_calls present");
     let aux = aux.unwrap();
     assert!(!aux.is_empty(), "auxiliary_llm_calls non-empty");
@@ -8845,10 +8907,13 @@ async fn a5_persist_tool_call_with_full_args() {
     let tools = cap.tool_plans.lock().await;
     assert!(!tools.is_empty(), "tool events persisted");
     // Check that at least one tool event record has the full path in content
-    let has_full_path = tools.iter().any(|tp| {
-        tp.events.iter().any(|r| r.content.contains(&long_path))
-    });
-    assert!(has_full_path, "persisted tool event content should contain the full long path");
+    let has_full_path = tools
+        .iter()
+        .any(|tp| tp.events.iter().any(|r| r.content.contains(&long_path)));
+    assert!(
+        has_full_path,
+        "persisted tool event content should contain the full long path"
+    );
 }
 
 #[tokio::test]
@@ -8921,7 +8986,10 @@ async fn a5_turn_complete_always_last_meaningful_event() {
     assert_eq!(turn_completes.len(), 1, "exactly one turn_complete");
 
     // turn_complete should be at or near the end
-    let tc_idx = events.iter().position(|e| e["type"] == "turn_complete").unwrap();
+    let tc_idx = events
+        .iter()
+        .position(|e| e["type"] == "turn_complete")
+        .unwrap();
     // Only explain event can follow turn_complete
     for e in &events[tc_idx + 1..] {
         let ty = e.get("type").and_then(Value::as_str).unwrap_or("");
@@ -8952,7 +9020,8 @@ async fn a5_event_ordering_session_info_text_chunks_turn_complete() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&raw);
 
-    let types: Vec<&str> = events.iter()
+    let types: Vec<&str> = events
+        .iter()
         .filter_map(|e| e.get("type").and_then(Value::as_str))
         .collect();
 
@@ -9009,14 +9078,20 @@ async fn a5_explain_with_multi_round_tool_flow() {
 
     // tools_selected should count the tool calls
     let selected = ex["tools_selected"].as_i64().unwrap();
-    assert!(selected >= 2, "tools_selected >= 2 for multi-round, got {selected}");
+    assert!(
+        selected >= 2,
+        "tools_selected >= 2 for multi-round, got {selected}"
+    );
 
     // total_ms should be positive
     let total_ms = ex["total_ms"].as_i64().unwrap();
     assert!(total_ms >= 0, "total_ms is non-negative");
 
     // routing should be present
-    assert!(ex.get("routing").is_some(), "routing present in multi-round explain");
+    assert!(
+        ex.get("routing").is_some(),
+        "routing present in multi-round explain"
+    );
 }
 
 #[tokio::test]
@@ -9044,7 +9119,10 @@ async fn a5_persist_core_event_has_session_and_user_ids() {
     assert!(!core.is_empty(), "core events persisted");
     let plan = &core[0];
     // Core plan stores user_query_event and llm_response_event which have session/user IDs
-    let uq = plan.user_query_event.as_ref().expect("user_query persisted");
+    let uq = plan
+        .user_query_event
+        .as_ref()
+        .expect("user_query persisted");
     assert_eq!(uq.session_id, "s-persist-test", "session_id matches");
     assert_eq!(uq.user_id, USER_ID, "user_id matches");
 }
@@ -9081,12 +9159,8 @@ async fn a5_persist_activity_writer_called() {
 /// B1: Think-before-act directive is present in system prompt (static, always injected).
 #[tokio::test]
 async fn b1_think_before_act_directive_in_system_prompt() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(
-        &["read_file", "grep"],
-        "",
-        1.0,
-        None,
-    );
+    let prompt =
+        astra_runtime::prompts::build_main_system_prompt(&["read_file", "grep"], "", 1.0, None);
     assert!(
         prompt.contains("Think-Before-Act"),
         "system prompt should contain Think-Before-Act section"
@@ -9237,7 +9311,10 @@ async fn b2_round_index_defaults_to_zero() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
-    assert!(!texts.is_empty(), "should produce normal text without round_index");
+    assert!(
+        !texts.is_empty(),
+        "should produce normal text without round_index"
+    );
     cap.wait_persist_idle().await;
 }
 

@@ -223,8 +223,16 @@ mod tests {
     #[test]
     fn executed_record_error_truncates_at_500_chars() {
         let long_error = "E".repeat(600);
-        let r =
-            journal_record_executed_tool_call("bash".into(), true, 5, 10, &long_error, None, None, None);
+        let r = journal_record_executed_tool_call(
+            "bash".into(),
+            true,
+            5,
+            10,
+            &long_error,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r.error.unwrap().len(), 500);
     }
 
@@ -242,17 +250,24 @@ mod tests {
             Some("src/main.rs".into()),
             Some(full_args.to_string()),
         );
-        assert_eq!(r.args_full.as_deref(), Some(full_args), "args_full must store untruncated args");
-        assert_eq!(r.result_full.as_ref().map(|s| s.len()), Some(1000), "result_full must store untruncated result");
+        assert_eq!(
+            r.args_full.as_deref(),
+            Some(full_args),
+            "args_full must store untruncated args"
+        );
+        assert_eq!(
+            r.result_full.as_ref().map(|s| s.len()),
+            Some(1000),
+            "result_full must store untruncated result"
+        );
         // previews are still truncated
         assert!(r.result_preview.unwrap().chars().count() <= 501);
     }
 
     #[test]
     fn executed_record_full_fields_none_when_not_provided() {
-        let r = journal_record_executed_tool_call(
-            "bash".into(), false, 5, 10, "ok", None, None, None,
-        );
+        let r =
+            journal_record_executed_tool_call("bash".into(), false, 5, 10, "ok", None, None, None);
         assert!(r.args_full.is_none());
         assert_eq!(r.result_full.as_deref(), Some("ok"));
     }
@@ -261,9 +276,19 @@ mod tests {
     fn executed_record_result_full_capped_at_50kb() {
         let large = "x".repeat(51_000);
         let r = journal_record_executed_tool_call(
-            "bash".into(), false, 5, 10, &large, None, None, None,
+            "bash".into(),
+            false,
+            5,
+            10,
+            &large,
+            None,
+            None,
+            None,
         );
-        assert!(r.result_full.is_none(), "result_full must be None for outputs > 50KB");
+        assert!(
+            r.result_full.is_none(),
+            "result_full must be None for outputs > 50KB"
+        );
         assert!(r.result_preview.is_some(), "result_preview still populated");
     }
 }

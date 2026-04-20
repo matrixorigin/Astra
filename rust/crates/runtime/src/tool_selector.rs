@@ -2,6 +2,11 @@
 //!
 //! # Architecture
 //!
+//! **Production CLI** (`astra-cli` REPL and background plan) wires [`TfIdfSelector`] only so
+//! tool subsetting does not add a second LLM round-trip before the main task call.
+//! [`LlmToolSelector`] and [`FallbackSelector`] remain in this crate for unit tests and for
+//! callers that choose to compose them explicitly.
+//!
 //! Tool selection is a **separate concern** from tool execution and LLM chat.
 //! **Agent Skills** are surfaced and ranked in [`crate::turn::skill_tool`] (e.g. `select_skills_for_turn`);
 //! this module only scores tools from [`crate::tool_registry`].

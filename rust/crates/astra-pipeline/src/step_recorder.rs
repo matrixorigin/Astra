@@ -933,7 +933,8 @@ mod tests {
         let rec = StepRecorder::with_persistence(sid, "task-1");
         // checkpoint_count should be max(5,3) + 1 = 6
         assert_eq!(
-            rec.summary().checkpoints, 6,
+            rec.summary().checkpoints,
+            6,
             "checkpoint_count must start after existing max"
         );
         // tmp is dropped here, cleaning up automatically
