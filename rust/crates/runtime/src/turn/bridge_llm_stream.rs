@@ -21,7 +21,10 @@ use crate::bridge::rate_limit_cooldown::{
 };
 use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::edge_ledger::ensure_tool_call_ids;
-use crate::turn::llm_client::{LlmCancel, sleep_ms_or_llm_cancel};
+use crate::turn::llm_client::{
+    LlmCancel, consolidate_system_messages, llm_completions_url_for_provider,
+    sleep_ms_or_llm_cancel,
+};
 use futures_util::StreamExt;
 use std::sync::OnceLock;
 
@@ -134,6 +137,7 @@ pub(crate) async fn call_llm_stream(
         .map_err(|e| e.to_string())?;
 
     let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+    let messages = consolidate_system_messages(messages);
 
     let mut body = json!({
         "model": model_name,
@@ -165,7 +169,7 @@ pub(crate) async fn call_llm_stream(
         }
     }
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let url = llm_completions_url_for_provider(base_url, provider);
     let req_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
 
     // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
