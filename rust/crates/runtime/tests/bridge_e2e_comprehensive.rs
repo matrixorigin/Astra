@@ -9349,3 +9349,116 @@ async fn b1_think_before_act_in_sections_builder() {
         "sections builder should include Think-Before-Act"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase B3 + B4: Tool Cost Annotations & Parallel Execution Feedback
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// B4: parallel_execution_feedback returns empty for no messages.
+#[tokio::test]
+async fn b4_parallel_feedback_empty_for_no_messages() {
+    let feedback = astra_runtime::prompts::parallel_execution_feedback(&[]);
+    assert!(feedback.is_empty(), "no messages → no feedback");
+}
+
+/// B4: parallel_execution_feedback returns empty for single tool result.
+#[tokio::test]
+async fn b4_parallel_feedback_empty_for_single_tool() {
+    let messages = vec![
+        json!({"role": "user", "content": "hello"}),
+        json!({"role": "assistant", "content": "Let me check", "tool_calls": []}),
+        json!({"role": "tool", "tool_call_id": "tc1", "content": "result1"}),
+    ];
+    let feedback = astra_runtime::prompts::parallel_execution_feedback(&messages);
+    assert!(feedback.is_empty(), "single tool → no feedback");
+}
+
+/// B4: parallel_execution_feedback returns positive reinforcement for multiple tool results.
+#[tokio::test]
+async fn b4_parallel_feedback_for_multiple_tools() {
+    let messages = vec![
+        json!({"role": "user", "content": "review the code"}),
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+            {"id": "tc2", "type": "function", "function": {"name": "grep", "arguments": "{}"}},
+            {"id": "tc3", "type": "function", "function": {"name": "glob", "arguments": "{}"}}
+        ]}),
+        json!({"role": "tool", "tool_call_id": "tc1", "content": "file content"}),
+        json!({"role": "tool", "tool_call_id": "tc2", "content": "grep results"}),
+        json!({"role": "tool", "tool_call_id": "tc3", "content": "glob results"}),
+    ];
+    let feedback = astra_runtime::prompts::parallel_execution_feedback(&messages);
+    assert!(feedback.contains("3 tools"), "should mention 3 tools: {feedback}");
+    assert!(feedback.contains("parallel"), "should mention parallel: {feedback}");
+    assert!(feedback.contains("Keep batching"), "should encourage batching: {feedback}");
+}
+
+/// B4: parallel_execution_feedback only counts trailing tool messages.
+#[tokio::test]
+async fn b4_parallel_feedback_only_trailing_tools() {
+    // Two tool results from round 1, then a user message, then 1 tool result from round 2
+    let messages = vec![
+        json!({"role": "tool", "tool_call_id": "tc1", "content": "r1"}),
+        json!({"role": "tool", "tool_call_id": "tc2", "content": "r2"}),
+        json!({"role": "user", "content": "continue"}),
+        json!({"role": "assistant", "content": null}),
+        json!({"role": "tool", "tool_call_id": "tc3", "content": "r3"}),
+    ];
+    let feedback = astra_runtime::prompts::parallel_execution_feedback(&messages);
+    assert!(feedback.is_empty(), "only 1 trailing tool → no feedback");
+}
+
+/// B4: Bridge injects parallel feedback when messages contain multiple tool results.
+#[tokio::test]
+async fn b4_bridge_parallel_feedback_in_dynamic_prompt() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Simulate round 2: messages include assistant+3 tool results from previous round
+    let payload = json!({
+        "session_id": "parallel-feedback-sess",
+        "messages": [
+            {"role": "user", "content": "review this code"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tc1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "tc2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}},
+                {"id": "tc3", "type": "function", "function": {"name": "grep", "arguments": "{\"pattern\":\"TODO\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "file a content"},
+            {"role": "tool", "tool_call_id": "tc2", "content": "file b content"},
+            {"role": "tool", "tool_call_id": "tc3", "content": "grep results"}
+        ],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "round_index": 1,
+        "test_llm_rounds": [{ "full_text": "Based on my analysis..." }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "should produce text after parallel tools");
+    cap.wait_persist_idle().await;
+}
+
+/// B4: No parallel feedback when messages end with user (first round).
+#[tokio::test]
+async fn b4_bridge_no_feedback_first_round() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "no-feedback-sess",
+        "messages": [{"role": "user", "content": "hello"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 0,
+        "test_llm_rounds": [{ "full_text": "Hi there!" }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "first round should produce text");
+    cap.wait_persist_idle().await;
+}

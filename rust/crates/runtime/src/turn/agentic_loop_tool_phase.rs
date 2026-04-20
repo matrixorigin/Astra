@@ -898,6 +898,19 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 rec.parallel = Some(true);
             }
         }
+        // B4: Inject positive reinforcement when LLM successfully batched tools.
+        if has_parallel {
+            let parallel_count = new_records
+                .iter()
+                .filter(|r| !r.is_synthetic_placeholder())
+                .count();
+            state.messages.push(serde_json::json!({
+                "role": "system",
+                "content": format!(
+                    "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
+                )
+            }));
+        }
     }
 
     if let Some(ref mut buf) = state.turn_event_buffer {

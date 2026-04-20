@@ -891,8 +891,11 @@ impl InProcessChatTurnBridge {
             // ── Round budget directive: encourage synthesis after several rounds ──
             let round_budget_hint = prompts::round_budget_directive(round_index);
 
-            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor + round budget)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}{round_budget_hint}");
+            // ── B4: Parallel execution feedback — positive reinforcement for batching ──
+            let parallel_feedback = prompts::parallel_execution_feedback(&messages);
+
+            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor + round budget + parallel feedback)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}{round_budget_hint}{parallel_feedback}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;

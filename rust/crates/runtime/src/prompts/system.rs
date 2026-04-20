@@ -1092,6 +1092,32 @@ pub fn round_budget_directive(round_index: u32) -> String {
     }
 }
 
+/// Parallel execution feedback — injected into dynamic prompt when the previous
+/// round had multiple tool results, indicating the LLM successfully batched.
+///
+/// Generic mechanism: counts tool-role messages in conversation history, returns
+/// positive reinforcement hint when batching detected. Returns empty string for
+/// round 0 or when ≤1 tool result in previous round.
+pub fn parallel_execution_feedback(messages: &[serde_json::Value]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    // Count trailing consecutive tool-role messages (results from last round).
+    let tool_count = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count();
+    if tool_count > 1 {
+        format!(
+            "\n\n✓ Previous round: {tool_count} tools executed in parallel — excellent. \
+             Keep batching independent operations."
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Detect task type from user query text.
 /// Returns one of: `code_review`, `debugging`, `exploration`, `implementation`,
 /// `refactoring`, `testing`, `documentation`, `performance`, `analysis`,
