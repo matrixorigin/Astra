@@ -2719,11 +2719,12 @@ async fn sse_full_sequence_tool_call_turn() {
         .filter_map(|e| e.get("type").and_then(Value::as_str))
         .collect();
 
-    // context_meta is only emitted in the real LLM path, not the e2e mock path.
+    // The bridge emits tool_request events for each tool_call so the CLI can
+    // execute them locally and populate edge_tool_round.
     assert_eq!(
         types,
-        vec!["session_info", "turn_complete"],
-        "tool-call turn SSE sequence should be: session_info → turn_complete, got: {types:?}"
+        vec!["session_info", "tool_request", "turn_complete"],
+        "tool-call turn SSE sequence should be: session_info → tool_request → turn_complete, got: {types:?}"
     );
 
     // Explicitly verify no text_delta.

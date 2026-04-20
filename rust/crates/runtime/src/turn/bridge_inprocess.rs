@@ -1485,6 +1485,18 @@ impl InProcessChatTurnBridge {
                     // Accumulate tool calls for turn_complete event.
                     // Tool execution and continuation happen on the CLI side.
                     ensure_tool_call_ids(&mut loop_tool_calls);
+
+                    // Emit tool_request SSE events so the CLI's SseStreamHost
+                    // executes each tool locally and populates edge_tool_round.
+                    // Without these, the headless tool pipeline errors with
+                    // "expected SSE tool_request before assistant tool_call".
+                    for tc in &loop_tool_calls {
+                        if let Some(tc_map) = tc.as_object() {
+                            let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map);
+                            yield render_sse_map(&req_event);
+                        }
+                    }
+
                     let round_start = all_round_tool_calls.len();
                     all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
                     round_boundaries.push((round_start, loop_tool_calls.len()));

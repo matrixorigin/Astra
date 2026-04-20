@@ -289,11 +289,16 @@ async fn chat_turn_tool_request_tools_result_ledger_injects_before_second_round(
 
     let full = String::from_utf8_lossy(&acc);
 
-    // Single-call proxy: bridge must NOT emit tool_request events.
-    // Tool execution is handled by the CLI.
+    // Single-call proxy: bridge now emits tool_request SSE events so the CLI's
+    // SseStreamHost can execute tools locally and populate edge_tool_round.
     assert!(
-        !full.contains("\"type\":\"tool_request\""),
-        "bridge should not emit tool_request in single-call mode: {full}"
+        full.contains("\"type\":\"tool_request\""),
+        "bridge must emit tool_request for CLI-side tool execution: {full}"
+    );
+    // Verify the tool_request contains the correct tool name from the mock round.
+    assert!(
+        full.contains("\"tool\":\"read_file\""),
+        "tool_request should reference the read_file tool: {full}"
     );
 
     // Bridge must NOT run second mock round (round-2-after-ledger).

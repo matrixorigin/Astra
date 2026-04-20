@@ -262,16 +262,30 @@ async fn chat_turn_events(app: &Router, payload: Value) -> (String, Vec<Value>) 
 }
 
 fn assert_single_call(events: &[Value], full: &str) {
-    assert!(
-        events_of_type(events, "tool_request").is_empty(),
-        "single-call: no tool_request events: {full}"
-    );
+    // The bridge is a single-call proxy: it makes one LLM call and emits
+    // tool_request SSE events so the CLI can execute tools locally.
+    // It does NOT run multi-round tool loops itself.
+    let completes = events_of_type(events, "turn_complete");
+    assert!(!completes.is_empty(), "should have turn_complete: {full}");
+
+    // If the turn has tool_calls, bridge must emit tool_request events.
+    let has_tool_calls = completes.iter().any(|e| {
+        e.get("has_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let tool_requests = events_of_type(events, "tool_request");
+    if has_tool_calls {
+        assert!(
+            !tool_requests.is_empty(),
+            "bridge must emit tool_request for each tool_call: {full}"
+        );
+    }
+
     assert!(
         events_of_type(events, "approval_required").is_empty(),
         "single-call: no approval_required events: {full}"
     );
-    let completes = events_of_type(events, "turn_complete");
-    assert!(!completes.is_empty(), "should have turn_complete: {full}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
