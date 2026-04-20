@@ -668,7 +668,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
-    let mut result = build_stream_result(StreamResultBuild {
+    let result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
         run_id: state.current_run_id,
@@ -705,8 +705,8 @@ pub(crate) async fn stream_chat_sse(
             .map(|b| b.drain())
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
+        prefetch_injected: state.prefetch_injected,
     });
-    result.prefetch_injected = state.prefetch_injected;
     Ok(result)
 }
 

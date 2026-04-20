@@ -98,7 +98,7 @@ async fn plan_llm_call(
                 }
                 return PlanLlmOutcome::Ok { text: sse_result.text, session_id: sse_result.session_id };
             }
-            unreachable!()
+            PlanLlmOutcome::Error("SSE retries exhausted".into())
         } => r,
     };
     result

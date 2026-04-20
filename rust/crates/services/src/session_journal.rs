@@ -5842,6 +5842,71 @@ mod turn_event_buffer_tests {
         assert_eq!(llm_rounds[2].round, Some(1));
         assert_eq!(llm_rounds[3].round, Some(0));
     }
+
+    /// Verify the needs_start_event logic for resumed sessions.
+    /// This mirrors the rposition-based check in repl_turn::initialize_journal.
+    #[test]
+    fn needs_start_event_scenarios() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        // Helper: same logic as repl_turn::initialize_journal
+        fn needs_start(events: &[JournalEvent]) -> bool {
+            let last_type = events.last().map(|e| &e.event_type);
+            match last_type {
+                None | Some(JournalEventType::SessionEnd) => true,
+                _ => {
+                    let last_start = events
+                        .iter()
+                        .rposition(|e| e.event_type == JournalEventType::SessionStart);
+                    let last_end = events
+                        .iter()
+                        .rposition(|e| e.event_type == JournalEventType::SessionEnd);
+                    let has_unmatched_start = match (last_start, last_end) {
+                        (Some(s), Some(e)) => s > e,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    !has_unmatched_start
+                }
+            }
+        }
+
+        // Empty journal → needs start
+        assert!(needs_start(&[]));
+
+        // Clean end → needs start
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+            JournalEvent::session_end(Some("s"), 1),
+        ];
+        assert!(needs_start(&events));
+
+        // Interrupted (start, turn, no end) → already has open start, skip
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+        ];
+        assert!(!needs_start(&events));
+
+        // start → end → start → turn (interrupted) → already has open start, skip
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::session_end(Some("s"), 1),
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+        ];
+        assert!(!needs_start(&events));
+
+        // start → end → turn (orphan turn after clean end) → needs start
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::session_end(Some("s"), 1),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+        ];
+        assert!(needs_start(&events));
+    }
 }
 
 #[cfg(test)]
