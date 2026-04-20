@@ -424,8 +424,12 @@ fn truncate_output(raw: Vec<u8>, max_bytes: usize) -> Option<String> {
     if raw.len() <= max_bytes {
         String::from_utf8(raw).ok()
     } else {
-        let truncated = &raw[..max_bytes];
-        let s = String::from_utf8_lossy(truncated);
+        // Back up to a valid UTF-8 character boundary.
+        let mut end = max_bytes;
+        while end > 0 && (raw[end] & 0b1100_0000) == 0b1000_0000 {
+            end -= 1;
+        }
+        let s = String::from_utf8_lossy(&raw[..end]);
         Some(format!(
             "{}\n\n... [truncated at {} KB, {} KB total]",
             s.trim_end(),
