@@ -236,7 +236,13 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             JournalEventType::Turn => {
                 seq += 1;
                 let (ok_c, fail_c) = tool_call_counts(ev.tool_calls.as_ref());
-                total_tool_calls += u64::from(ok_c + fail_c);
+                // Fallback: if tool_calls Vec is absent, use tool_count scalar.
+                let effective_total = if ok_c + fail_c > 0 {
+                    u64::from(ok_c + fail_c)
+                } else {
+                    u64::from(ev.tool_count.unwrap_or(0))
+                };
+                total_tool_calls += effective_total;
                 tool_calls_failed += u64::from(fail_c);
                 if let Some(ti) = ev.tokens_in {
                     total_tokens_in += ti;
@@ -301,7 +307,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     } else {
                         Vec::new()
                     },
-                    tool_calls_ok: ok_c,
+                    tool_calls_ok: if ok_c + fail_c > 0 {
+                        ok_c
+                    } else {
+                        ev.tool_count.unwrap_or(0)
+                    },
                     tool_calls_fail: fail_c,
                     user_input_preview,
                     budget_pressure: ev.budget_pressure,

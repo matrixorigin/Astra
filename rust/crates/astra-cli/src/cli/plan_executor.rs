@@ -1105,7 +1105,8 @@ async fn plan_executor_task(
                             result.prompt_tokens,
                             result.completion_tokens,
                             subtask_start.elapsed().as_millis() as u64,
-                        );
+                        )
+                        .with_tool_calls(result.tool_call_records.clone());
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 
