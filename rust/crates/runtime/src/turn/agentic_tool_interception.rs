@@ -52,6 +52,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            args_full: None,
+            result_full: Some(result.result.clone()),
             round,
             start_offset_ms,
             ..Default::default()

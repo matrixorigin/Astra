@@ -110,10 +110,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }
 
-        let args_size = serde_json::to_string(&execution.args)
-            .map(|s| s.len() as u32)
-            .unwrap_or(0);
+        let args_json = serde_json::to_string(&execution.args).ok();
+        let args_size = args_json.as_ref().map(|s| s.len() as u32).unwrap_or(0);
         let args_preview = make_args_preview(&execution.name, &execution.args);
+        let args_full = args_json;
         let file_path = execution
             .args
             .get("path")
@@ -129,6 +129,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 execution.result_str.as_str(),
                 args_preview,
                 file_path,
+                args_full,
             ));
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {

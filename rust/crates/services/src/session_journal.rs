@@ -512,6 +512,14 @@ pub struct ToolCallRecord {
     /// cycle this call belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u32>,
+    /// Full tool arguments as JSON string (untruncated).
+    /// Enables exact tool call reproduction from journal data alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_full: Option<String>,
+    /// Full tool result text (untruncated, after per-tool output limit).
+    /// Enables debugging tool failures without re-execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_full: Option<String>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool

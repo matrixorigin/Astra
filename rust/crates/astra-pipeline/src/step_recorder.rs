@@ -68,10 +68,20 @@ impl StepRecorder {
     }
 
     /// Create with file-backed persistence (events written to JSONL on disk).
+    ///
+    /// Scans existing checkpoints so `checkpoint_count` starts after the
+    /// highest existing file number, preventing cross-turn overwrites.
     pub fn with_persistence(session_id: &str, task_id: &str) -> Self {
         let file_store = FileBackedEventStore::new(session_id);
+        let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|(n, _)| *n)
+            .max()
+            .unwrap_or(0);
         Self {
             file_store: Some(file_store),
+            checkpoint_count: existing_max.saturating_add(1),
             ..Self::new(session_id, task_id)
         }
     }
@@ -906,5 +916,26 @@ mod tests {
         assert!(phases.contains(&StepAction::Plan));
         assert!(phases.contains(&StepAction::Act));
         assert!(phases.contains(&StepAction::Evaluate));
+    }
+
+    #[test]
+    fn with_persistence_starts_after_existing_checkpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let sid = "test-cp-resume";
+
+        // Create checkpoint files directly (simulating previous turns)
+        let cp_dir = tmp.path().join(sid).join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("000003-light.json"), "{}").unwrap();
+        std::fs::write(cp_dir.join("000005-heavy.json"), "{}").unwrap();
+
+        let rec = StepRecorder::with_persistence(sid, "task-1");
+        // checkpoint_count should be max(5,3) + 1 = 6
+        assert_eq!(
+            rec.summary().checkpoints, 6,
+            "checkpoint_count must start after existing max"
+        );
+        // tmp is dropped here, cleaning up automatically
     }
 }

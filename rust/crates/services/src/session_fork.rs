@@ -187,6 +187,34 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     ws.status = "active".to_string();
     session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
 
+    // Copy step_checkpoints/ so the forked session can resume with conversation
+    // context (heavy checkpoints contain the full messages array).
+    // Skip composite_snapshots.json (index file, not a checkpoint).
+    {
+        let sessions_dir = crate::session_journal::local_sessions_dir();
+        let parent_cp_dir = sessions_dir.join(&parent).join("step_checkpoints");
+        if parent_cp_dir.is_dir() {
+            let new_cp_dir = sessions_dir.join(&new_id).join("step_checkpoints");
+            std::fs::create_dir_all(&new_cp_dir)
+                .map_err(|e| format!("create step_checkpoints dir: {e}"))?;
+            let mut entries: Vec<_> = std::fs::read_dir(&parent_cp_dir)
+                .map_err(|e| format!("read step_checkpoints: {e}"))?
+                .filter_map(|e| e.ok())
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // Skip non-checkpoint files (composite_snapshots.json, breakpoints.json).
+                if !name_str.ends_with("-heavy.json") && !name_str.ends_with("-light.json") {
+                    continue;
+                }
+                std::fs::copy(entry.path(), new_cp_dir.join(&name))
+                    .map_err(|e| format!("copy checkpoint {name_str}: {e}"))?;
+            }
+        }
+    }
+
     let data_branch_name = opts
         .data_branch
         .filter(|db| db.create_data_branch)
@@ -617,6 +645,55 @@ mod tests {
         let lineage = fork_event.session_lineage.as_ref().expect("lineage");
         assert_eq!(lineage.parent_session_id, parent_id);
         assert_eq!(lineage.forked_after_turn, Some(2));
+
+        cleanup_session(&parent_id);
+        cleanup_session(&result.new_session_id);
+    }
+
+    #[test]
+    fn fork_copies_step_checkpoints() {
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        setup_test_session(&parent_id, 3);
+
+        // Create fake checkpoints in parent
+        let sessions_dir = crate::session_journal::local_sessions_dir();
+        let cp_dir = sessions_dir.join(&parent_id).join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("000001-heavy.json"), r#"{"turn":1}"#).unwrap();
+        std::fs::write(cp_dir.join("000002-light.json"), r#"{"turn":2}"#).unwrap();
+        std::fs::write(cp_dir.join("000003-heavy.json"), r#"{"turn":3}"#).unwrap();
+        std::fs::write(cp_dir.join("composite_snapshots.json"), "{}").unwrap();
+
+        let opts = ForkSessionOptions {
+            parent_session_id: parent_id.clone(),
+            new_session_id: None,
+            label: None,
+            forked_after_turn: None,
+            data_branch: None,
+            snapshot_spec: None,
+        };
+        let result = fork_local_session(opts).expect("fork should succeed");
+
+        let new_cp_dir = sessions_dir
+            .join(&result.new_session_id)
+            .join("step_checkpoints");
+        assert!(new_cp_dir.exists(), "step_checkpoints dir should be copied");
+        assert!(
+            new_cp_dir.join("000001-heavy.json").exists(),
+            "heavy checkpoint should be copied"
+        );
+        assert!(
+            new_cp_dir.join("000002-light.json").exists(),
+            "light checkpoint should be copied"
+        );
+        assert!(
+            new_cp_dir.join("000003-heavy.json").exists(),
+            "heavy checkpoint should be copied"
+        );
+        assert!(
+            !new_cp_dir.join("composite_snapshots.json").exists(),
+            "composite_snapshots.json should NOT be copied"
+        );
 
         cleanup_session(&parent_id);
         cleanup_session(&result.new_session_id);

@@ -87,6 +87,7 @@ pub fn journal_record_blocked_tool(
 }
 
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn journal_record_executed_tool_call(
     name: String,
     is_err: bool,
@@ -95,6 +96,7 @@ pub fn journal_record_executed_tool_call(
     result_str: &str,
     args_preview: Option<String>,
     file_path: Option<String>,
+    args_full: Option<String>,
 ) -> ToolCallRecord {
     // Truncate to 500 chars for cloud audit (up from 200, multi-line)
     let preview: String = result_str.chars().take(500).collect();
@@ -106,6 +108,15 @@ pub fn journal_record_executed_tool_call(
         } else {
             preview
         })
+    };
+
+    // Store full result up to 50 KB. Larger outputs (bash, read_file) are
+    // already persisted to tool-results/<call_id>.txt by tool_result_storage.
+    const MAX_RESULT_FULL_BYTES: usize = 50_000;
+    let result_full = if result_str.is_empty() || result_str.len() > MAX_RESULT_FULL_BYTES {
+        None
+    } else {
+        Some(result_str.to_string())
     };
 
     ToolCallRecord {
@@ -125,6 +136,8 @@ pub fn journal_record_executed_tool_call(
         file_path,
         surgically_removed: None,
         original_tool_name: None,
+        args_full,
+        result_full,
         ..Default::default()
     }
 }
@@ -178,6 +191,7 @@ mod tests {
             "first line\nrest",
             None,
             None,
+            None,
         );
         // Now keeps multi-line errors (up to 500 chars)
         assert_eq!(r.error.as_deref(), Some("first line\nrest"));
@@ -197,6 +211,7 @@ mod tests {
             &long_output,
             None,
             None,
+            None,
         );
         assert!(r.ok);
         assert!(r.error.is_none());
@@ -209,7 +224,46 @@ mod tests {
     fn executed_record_error_truncates_at_500_chars() {
         let long_error = "E".repeat(600);
         let r =
-            journal_record_executed_tool_call("bash".into(), true, 5, 10, &long_error, None, None);
+            journal_record_executed_tool_call("bash".into(), true, 5, 10, &long_error, None, None, None);
         assert_eq!(r.error.unwrap().len(), 500);
+    }
+
+    #[test]
+    fn executed_record_stores_full_args_and_result() {
+        let full_args = r#"{"path":"src/main.rs","offset":100,"limit":50}"#;
+        let full_result = "x".repeat(1000);
+        let r = journal_record_executed_tool_call(
+            "read_file".into(),
+            false,
+            12,
+            full_args.len() as u32,
+            &full_result,
+            Some("src/main.rs".into()),
+            Some("src/main.rs".into()),
+            Some(full_args.to_string()),
+        );
+        assert_eq!(r.args_full.as_deref(), Some(full_args), "args_full must store untruncated args");
+        assert_eq!(r.result_full.as_ref().map(|s| s.len()), Some(1000), "result_full must store untruncated result");
+        // previews are still truncated
+        assert!(r.result_preview.unwrap().chars().count() <= 501);
+    }
+
+    #[test]
+    fn executed_record_full_fields_none_when_not_provided() {
+        let r = journal_record_executed_tool_call(
+            "bash".into(), false, 5, 10, "ok", None, None, None,
+        );
+        assert!(r.args_full.is_none());
+        assert_eq!(r.result_full.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn executed_record_result_full_capped_at_50kb() {
+        let large = "x".repeat(51_000);
+        let r = journal_record_executed_tool_call(
+            "bash".into(), false, 5, 10, &large, None, None, None,
+        );
+        assert!(r.result_full.is_none(), "result_full must be None for outputs > 50KB");
+        assert!(r.result_preview.is_some(), "result_preview still populated");
     }
 }
