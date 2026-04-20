@@ -152,7 +152,15 @@ pub fn shutdown_otel() {
     otel::shutdown_tracer_provider();
 }
 
-/// Like [`init_from_env`], but ignores "already initialized" errors (e.g. tests).
+/// Like [`init_from_env`], but returns quietly when the global subscriber was already
+/// installed ([`tracing_subscriber::util::TryInitError`]). Other failures are written to stderr.
 pub fn init_from_env_or_ignores_duplicate(config: LogInitConfig<'_>) {
-    let _ = init_from_env(config);
+    use tracing_subscriber::util::TryInitError;
+
+    if let Err(e) = init_from_env(config) {
+        if e.downcast_ref::<TryInitError>().is_some() {
+            return;
+        }
+        eprintln!("[astra-logging] logging init failed: {e}");
+    }
 }

@@ -6,6 +6,10 @@
 use std::sync::OnceLock;
 
 use crate::cli_args::Cli;
+use tracing_appender::non_blocking::WorkerGuard;
+
+/// Keeps the [`WorkerGuard`] alive so the non-blocking writer flushes on process exit (drop on shutdown).
+static FILE_LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 /// Initialize diagnostic logging once per process from parsed CLI + environment.
 ///
@@ -51,17 +55,23 @@ fn try_init_file_logging(path: &str) -> Result<(), Box<dyn std::error::Error + S
 
     let file = OpenOptions::new().create(true).append(true).open(path)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
-    // Leak the guard so the background writer stays alive for the process lifetime; abrupt exit may drop tail lines.
-    std::mem::forget(guard);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("warn,astra.agent=info,astra.thin_client=info,astra.logging=info")
     });
 
-    tracing_subscriber::fmt()
+    match tracing_subscriber::fmt()
         .json()
         .with_env_filter(filter)
         .with_timer(UtcTime::rfc_3339())
         .with_writer(non_blocking)
         .try_init()
+    {
+        Ok(()) => {
+            let _ = FILE_LOG_GUARD.set(guard);
+            Ok(())
+        }
+        // `fmt().try_init()` already returns `Box<dyn Error + Send + Sync>`.
+        Err(e) => Err(e),
+    }
 }

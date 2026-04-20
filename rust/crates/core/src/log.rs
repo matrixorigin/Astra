@@ -1,8 +1,9 @@
 //! Structured logging via [`tracing`] for consistent levels, targets, and fields.
 //!
 //! All agent-facing diagnostics use target **`astra.agent`** so operators can tune
-//! `RUST_LOG` (e.g. `astra.agent=debug`). Legacy **`MO_DEBUG=1`** still forces
-//! [`agent_debug!`] to echo a line to stderr when no subscriber is configured.
+//! `RUST_LOG` (e.g. `astra.agent=debug`). Legacy **`MO_DEBUG=1`** makes [`agent_debug!`]
+//! echo stderr only while [`tracing::dispatcher::has_been_set`] is false (before
+//! `set_global_default`), avoiding duplicate lines once CLI or server logging installs a subscriber.
 
 /// Log an error-level message with component tag.
 #[macro_export]
@@ -45,16 +46,22 @@ macro_rules! agent_info {
 
 /// Log a debug-level message with component tag.
 ///
-/// When **`MO_DEBUG`** is set, also prints to stderr (for CLIs without a tracing subscriber).
-/// When a subscriber is present, [`tracing::debug!`] respects `RUST_LOG`.
+/// [`tracing::debug!`] respects `RUST_LOG`. If **`MO_DEBUG`** is set and
+/// [`tracing::dispatcher::has_been_set`] is false, also prints one line to stderr
+/// (legacy CLIs with no global subscriber).
 #[macro_export]
 macro_rules! agent_debug {
     ($component:expr, $($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        if std::env::var("MO_DEBUG").is_ok() {
-            eprintln!("[{}] DEBUG: {}", $component, msg);
+        if std::env::var("MO_DEBUG").is_ok()
+            && !$crate::tracing::dispatcher::has_been_set()
+        {
+            eprintln!("[{}] DEBUG: {}", $component, format!($($arg)*));
         }
-        $crate::tracing::debug!(target: "astra.agent", component = $component, "{}", msg);
+        $crate::tracing::debug!(
+            target: "astra.agent",
+            component = $component,
+            $($arg)*
+        );
     }};
 }
 
@@ -118,6 +125,7 @@ mod tests {
         agent_error!("test", "something failed: {}", "reason");
         agent_warn!("test", "low disk space");
         agent_info!("test", "session started");
+        agent_debug!("test", "dbg {}", 1);
     }
 
     #[test]
