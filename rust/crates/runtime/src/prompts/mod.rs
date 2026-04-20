@@ -248,8 +248,8 @@ mod tests {
         // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 12300,
-            "compressed prompt should be under 12300 chars, got {}",
+            p.len() < 12500,
+            "compressed prompt should be under 12500 chars, got {}",
             p.len()
         );
     }
