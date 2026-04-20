@@ -368,6 +368,8 @@ impl ChatTurnSseFramer {
             || event_block.contains("\"thinking_delta\"")
             || event_block.contains("\"reasoning_delta\"")
             || event_block.contains("\"reasoning_message_content\"")
+            || event_block.contains("\"tool_call_start\"")
+            || event_block.contains("\"tool_call\"")
         {
             self.ttft_ms = Some(self.stream_start.elapsed().as_millis() as u64);
             self.first_token_recorded = true;
@@ -746,6 +748,32 @@ mod tests {
         let mut f = ChatTurnSseFramer::new();
         let _ = f.push_lossy_bytes(block.as_bytes());
         assert!(f.ttft_ms.is_some());
+    }
+
+    #[test]
+    fn framer_ttft_on_tool_call_start_block() {
+        // LLM responds with only tool calls (no text) — ttft must still be recorded.
+        let block = sse("tool_call_start", ",\"id\":\"call-1\",\"name\":\"bash\"");
+        let mut f = ChatTurnSseFramer::new();
+        let _ = f.push_lossy_bytes(block.as_bytes());
+        assert!(f.ttft_ms.is_some(), "ttft must be set when first SSE event is tool_call_start");
+    }
+
+    #[test]
+    fn framer_ttft_on_tool_call_block() {
+        let block = sse("tool_call", ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"}");
+        let mut f = ChatTurnSseFramer::new();
+        let _ = f.push_lossy_bytes(block.as_bytes());
+        assert!(f.ttft_ms.is_some(), "ttft must be set when first SSE event is tool_call");
+    }
+
+    #[test]
+    fn framer_ttft_not_set_on_usage_only() {
+        // usage events alone should not trigger ttft
+        let block = sse("usage", ",\"prompt_tokens\":100,\"completion_tokens\":5");
+        let mut f = ChatTurnSseFramer::new();
+        let _ = f.push_lossy_bytes(block.as_bytes());
+        assert!(f.ttft_ms.is_none(), "usage-only event must not set ttft");
     }
 
     // ── Cache token tests ────────────────────────────────────────────────
