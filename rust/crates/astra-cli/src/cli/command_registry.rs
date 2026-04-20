@@ -149,16 +149,22 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("feedback", "Record user feedback (+/-)"),
     ("health", "Skill catalog health"),
     ("info", "Skill details"),
+    ("installed", "List installed marketplace skills"),
     ("install", "Install from marketplace"),
     ("list", "List skills"),
     ("new", "Create skill"),
     ("pin", "Pin skill to always load"),
     ("publish", "Publish to marketplace"),
+    ("rollback", "Rollback installed skill version"),
     ("search", "Keyword search catalog"),
     ("stats", "Learning summary"),
     ("surfacing", "Agent catalog surfacing (dynamic/min/cap)"),
     ("system", "System skill helpers"),
     ("test", "Run skill test"),
+    ("trending", "Show trending marketplace skills"),
+    ("uninstall", "Remove local skill"),
+    ("unpin", "Remove pinned skill"),
+    ("upgrade", "Upgrade installed skill version"),
 ];
 
 const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -212,6 +218,8 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
 const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("analyze", "Deep session diagnostics"),
     ("cleanup", "Clean stale sessions"),
+    ("context", "Show context assembly trace"),
+    ("drift", "Inspect session drift signals"),
     ("errors", "Session errors"),
     ("export", "Export session"),
     ("fork", "Fork session"),
@@ -901,9 +909,25 @@ mod tests {
         let subs = subcommand_completions("/skill");
         assert!(subs.is_some());
         let subs = subs.unwrap();
+        assert!(subs.iter().any(|(tok, _)| *tok == "browse"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "installed"));
         assert!(subs.iter().any(|(tok, _)| *tok == "list"));
         assert!(subs.iter().any(|(tok, _)| *tok == "info"));
         assert!(subs.iter().any(|(tok, _)| *tok == "publish"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "rollback"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "trending"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "uninstall"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "unpin"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "upgrade"));
+    }
+
+    #[test]
+    fn session_subcommand_completions_include_runtime_tools() {
+        let subs = subcommand_completions("/session");
+        assert!(subs.is_some());
+        let subs = subs.unwrap();
+        assert!(subs.iter().any(|(tok, _)| *tok == "context"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "drift"));
     }
 
     #[test]
