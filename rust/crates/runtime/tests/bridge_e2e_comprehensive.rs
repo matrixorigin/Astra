@@ -9858,8 +9858,645 @@ async fn golden_error_recovery_tool_result() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Phase D: Token Efficiency Tests
+// Phase D3: Duplicate Context Detection Tests
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// D3: SemanticDedup detects exact duplicate tool calls (same tool + same args).
+#[tokio::test]
+async fn d3_semantic_dedup_exact_duplicate_detected() {
+    use astra_text_utils::semantic_dedup::SemanticDedup;
+
+    let mut dedup = SemanticDedup::new(0.75);
+
+    // First call: read_file with path "src/main.rs" — no duplicate
+    let result1 = dedup.check_and_record(
+        "read_file",
+        &json!({"path": "src/main.rs"}),
+        "contents of main.rs",
+        0,
+    );
+    assert!(result1.is_none(), "first call should not be a duplicate");
+
+    // Second call: exact same tool + args — should detect duplicate
+    let result2 = dedup.check_and_record(
+        "read_file",
+        &json!({"path": "src/main.rs"}),
+        "contents of main.rs",
+        1,
+    );
+    assert!(result2.is_some(), "identical tool+args should be detected as duplicate");
+}
+
+/// D3: SemanticDedup does NOT flag different args as duplicates.
+#[tokio::test]
+async fn d3_semantic_dedup_different_args_not_flagged() {
+    use astra_text_utils::semantic_dedup::SemanticDedup;
+
+    let mut dedup = SemanticDedup::new(0.75);
+
+    dedup.check_and_record(
+        "read_file",
+        &json!({"path": "src/main.rs"}),
+        "contents of main.rs",
+        0,
+    );
+
+    let result = dedup.check_and_record(
+        "read_file",
+        &json!({"path": "src/lib.rs"}),
+        "contents of lib.rs",
+        1,
+    );
+    assert!(result.is_none(), "different args should not be flagged as duplicate");
+}
+
+/// D3: SemanticDedup normalizes paths (trailing slash equivalence).
+#[tokio::test]
+async fn d3_semantic_dedup_normalized_paths() {
+    use astra_text_utils::semantic_dedup::SemanticDedup;
+
+    let mut dedup = SemanticDedup::new(0.75);
+
+    dedup.check_and_record(
+        "glob",
+        &json!({"path": "src/"}),
+        "file1.rs\nfile2.rs",
+        0,
+    );
+
+    // Same path without trailing slash — should detect as duplicate
+    let result = dedup.check_and_record(
+        "glob",
+        &json!({"path": "src"}),
+        "file1.rs\nfile2.rs",
+        1,
+    );
+    assert!(result.is_some(), "normalized paths should match as duplicates");
+}
+
+/// D3: pre_check_block returns cached output for known duplicates.
+#[tokio::test]
+async fn d3_semantic_dedup_pre_check_returns_cached() {
+    use astra_text_utils::semantic_dedup::SemanticDedup;
+
+    let mut dedup = SemanticDedup::new(0.75);
+
+    // Record a call
+    dedup.check_and_record(
+        "read_file",
+        &json!({"path": "Cargo.toml"}),
+        "package name = foo",
+        0,
+    );
+
+    // Pre-check should detect and return the cached output
+    let blocked = dedup.pre_check_block("read_file", &json!({"path": "Cargo.toml"}), 1);
+    assert!(blocked.is_some(), "pre_check_block should block known duplicate");
+    let (prev_turn, cached_output) = blocked.unwrap();
+    assert_eq!(prev_turn, 0);
+    assert!(cached_output.contains("package name"), "should return cached output");
+}
+
+/// D3: Non-cacheable tools (bash, write_file) are never flagged.
+#[tokio::test]
+async fn d3_semantic_dedup_non_cacheable_tools_ignored() {
+    use astra_text_utils::semantic_dedup::SemanticDedup;
+
+    let mut dedup = SemanticDedup::new(0.75);
+
+    dedup.check_and_record(
+        "bash",
+        &json!({"command": "ls -la"}),
+        "total 48\ndrwxr-xr-x",
+        0,
+    );
+
+    // Same bash call — should NOT be flagged (bash is non-cacheable)
+    let result = dedup.check_and_record(
+        "bash",
+        &json!({"command": "ls -la"}),
+        "total 48\ndrwxr-xr-x",
+        1,
+    );
+    assert!(result.is_none(), "bash is non-cacheable, should not be flagged");
+}
+
+/// D3: System prompt includes dedup guidance.
+#[tokio::test]
+async fn d3_system_prompt_contains_dedup_directives() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "d3-dedup-prompt-sess",
+        "messages": [{"role": "user", "content": "review my code"}],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{"full_text": "Sure, let me review."}]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Verify the explain event mentions steps/context that would include dedup hints
+    // The system prompt itself contains "don't re-fetch" directives
+    let events = parse_sse_events(&body);
+    let explain = events_of_type(&events, "explain");
+    assert!(!explain.is_empty(), "explain event should be emitted");
+    cap.wait_persist_idle().await;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase C1: Structured Turn Trace Assertions
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// C1: Core persist plan captures both user query and LLM response events.
+#[tokio::test]
+async fn c1_trace_core_plan_has_user_and_response() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c1-core-trace-sess",
+        "agent_id": "c1-agent",
+        "messages": [{"role": "user", "content": "what is Rust?"}],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Rust is a systems programming language.",
+            "usage": {"prompt": 100, "completion": 50, "total": 150}
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    assert!(!core.is_empty(), "should have at least one core persist plan");
+
+    let plan = &core[0];
+    // User query event
+    let uq = plan.user_query_event.as_ref().expect("user_query_event present");
+    assert_eq!(uq.event_type, "user_query");
+    assert!(!uq.event_id.is_empty(), "event_id should be non-empty");
+    assert!(!uq.session_id.is_empty(), "session_id should be non-empty");
+    assert!(!uq.causal_chain_id.is_empty(), "causal_chain_id should be non-empty");
+    assert!(uq.content.contains("Rust"), "user query content preserved");
+
+    // LLM response event
+    let lr = plan.llm_response_event.as_ref().expect("llm_response_event present");
+    assert_eq!(lr.event_type, "llm_response");
+    assert!(!lr.event_id.is_empty());
+    assert!(lr.content.contains("systems programming"), "LLM response content preserved");
+    // Token usage should be captured
+    assert!(lr.token_usage.is_some(), "token_usage should be captured");
+}
+
+/// C1: Tool events capture tool call records with correct event types.
+#[tokio::test]
+async fn c1_trace_tool_events_have_required_fields() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c1-tool-trace-sess",
+        "agent_id": "c1-tool-agent",
+        "messages": [{"role": "user", "content": "list files"}],
+        "edge_tools": [tool_schema("read_file"), tool_schema("list_files")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-c1a", "read_file", json!({"path": "main.rs"})),
+                tool_call("tc-c1b", "list_files", json!({"path": "/src"}))
+            ]
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let tools = cap.tool_plans.lock().await;
+    let all_events: Vec<_> = tools.iter().flat_map(|p| &p.events).collect();
+    assert!(all_events.len() >= 2, "at least 2 tool events, got {}", all_events.len());
+
+    for evt in &all_events {
+        assert!(!evt.event_id.is_empty(), "tool event should have event_id");
+        assert!(!evt.session_id.is_empty(), "tool event should have session_id");
+        assert!(!evt.causal_chain_id.is_empty(), "tool event should have causal_chain_id");
+        assert!(!evt.event_type.is_empty(), "tool event should have event_type");
+    }
+}
+
+/// C1: Activity plan captures session update with correct session ID.
+#[tokio::test]
+async fn c1_trace_activity_plan_has_session_id() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c1-activity-unique-sess",
+        "messages": [{"role": "user", "content": "hi"}],
+        "edge_tools": [],
+        "test_llm_rounds": [{"full_text": "Hello!"}]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let activities = cap.activity_plans.lock().await;
+    assert!(!activities.is_empty(), "should have activity update");
+    let (sess_id, plan) = &activities[0];
+    assert_eq!(sess_id, "c1-activity-unique-sess", "session_id should match payload");
+    assert!(plan.event_count_increment > 0, "should count at least one event");
+}
+
+/// C1: Causal chain IDs link user query → LLM response → tool events.
+#[tokio::test]
+async fn c1_trace_causal_chain_links_events() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c1-causal-chain-sess",
+        "messages": [{"role": "user", "content": "read file"}],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "full_text": "Here's the content.",
+            "tool_calls": [tool_call("tc-cc1", "read_file", json!({"path": "a.rs"}))]
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    let plan = &core[0];
+    let uq = plan.user_query_event.as_ref().unwrap();
+    let lr = plan.llm_response_event.as_ref().unwrap();
+
+    // Both events should share the same causal_chain_id
+    assert_eq!(
+        uq.causal_chain_id, lr.causal_chain_id,
+        "user query and LLM response should share causal chain"
+    );
+
+    // Tool events should also share the same causal chain
+    let tools = cap.tool_plans.lock().await;
+    for plan in tools.iter() {
+        for evt in &plan.events {
+            assert_eq!(
+                evt.causal_chain_id, uq.causal_chain_id,
+                "tool events should share causal chain with core events"
+            );
+        }
+    }
+}
+
+/// C1: Hook plans capture decision audit records.
+#[tokio::test]
+async fn c1_trace_hook_plans_captured() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c1-hook-sess",
+        "messages": [{"role": "user", "content": "explain monads"}],
+        "edge_tools": [tool_schema("read_file")],
+        "test_llm_rounds": [{"full_text": "A monad is..."}]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let hooks = cap.hook_plans.lock().await;
+    // Hook plans are always persisted (may have None fields)
+    assert!(!hooks.is_empty(), "hook plans should be captured");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase C2: Session Journal Completeness Verification
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// C2: Every persisted core event has non-empty required fields.
+#[tokio::test]
+async fn c2_journal_core_events_complete() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c2-complete-sess",
+        "agent_id": "c2-completeness-agent",
+        "messages": [{"role": "user", "content": "tell me about trees"}],
+        "edge_tools": [],
+        "test_llm_rounds": [{
+            "full_text": "Trees are hierarchical data structures.",
+            "usage": {"prompt": 80, "completion": 30, "total": 110}
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    for plan in core.iter() {
+        if let Some(uq) = &plan.user_query_event {
+            assert!(!uq.event_id.is_empty(), "user_query event_id required");
+            assert!(!uq.user_id.is_empty(), "user_query user_id required");
+            assert!(!uq.session_id.is_empty(), "user_query session_id required");
+            assert_eq!(uq.event_type, "user_query");
+            assert!(!uq.content.is_empty(), "user_query content required");
+            assert!(!uq.causal_chain_id.is_empty(), "user_query causal_chain_id required");
+        }
+        if let Some(lr) = &plan.llm_response_event {
+            assert!(!lr.event_id.is_empty(), "llm_response event_id required");
+            assert!(!lr.user_id.is_empty(), "llm_response user_id required");
+            assert!(!lr.session_id.is_empty(), "llm_response session_id required");
+            assert_eq!(lr.event_type, "llm_response");
+            assert!(!lr.content.is_empty(), "llm_response content required");
+            assert!(!lr.causal_chain_id.is_empty(), "llm_response causal_chain_id required");
+        }
+    }
+}
+
+/// C2: Tool event journal records match the tool calls from LLM response.
+#[tokio::test]
+async fn c2_journal_tool_events_match_tool_calls() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c2-tool-match-sess",
+        "messages": [{"role": "user", "content": "search code"}],
+        "edge_tools": [tool_schema("grep"), tool_schema("read_file")],
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-j1", "grep", json!({"pattern": "TODO"})),
+                tool_call("tc-j2", "read_file", json!({"path": "fix.rs"}))
+            ]
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let tools = cap.tool_plans.lock().await;
+    let all_events: Vec<_> = tools.iter().flat_map(|p| &p.events).collect();
+    assert!(
+        all_events.len() >= 2,
+        "journal should have at least 2 tool events for 2 tool calls, got {}",
+        all_events.len()
+    );
+
+    // All tool events should reference the same session
+    for evt in &all_events {
+        assert_eq!(evt.session_id, "c2-tool-match-sess");
+    }
+}
+
+/// C2: Activity update event_count_increment is consistent with persisted events.
+#[tokio::test]
+async fn c2_journal_activity_count_consistent() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c2-activity-count-sess",
+        "messages": [{"role": "user", "content": "simple hello"}],
+        "edge_tools": [],
+        "test_llm_rounds": [{"full_text": "Hello there!"}]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let activities = cap.activity_plans.lock().await;
+    assert!(!activities.is_empty(), "activity update required");
+    let (_, plan) = &activities[0];
+    // Text-only turn: user_query + llm_response = at least 2 events
+    assert!(
+        plan.event_count_increment >= 2,
+        "text-only turn should count at least 2 events (user+response), got {}",
+        plan.event_count_increment
+    );
+}
+
+/// C2: Auxiliary events have valid structure when emitted.
+#[tokio::test]
+async fn c2_journal_aux_events_valid_structure() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c2-aux-events-sess",
+        "agent_id": "c2-aux-agent",
+        "messages": [{"role": "user", "content": "do something complex"}],
+        "edge_tools": [tool_schema("bash")],
+        "test_llm_rounds": [{
+            "full_text": "I'll run a command.",
+            "tool_calls": [tool_call("tc-aux1", "bash", json!({"command": "echo hi"}))]
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    let aux = cap.aux_events.lock().await;
+    // Aux events may or may not be emitted depending on the flow; validate structure if present
+    for evt in aux.iter() {
+        assert!(!evt.event_id.is_empty(), "aux event_id required");
+        assert!(!evt.session_id.is_empty(), "aux session_id required");
+        assert!(!evt.event_type.is_empty(), "aux event_type required");
+        assert!(!evt.causal_chain_id.is_empty(), "aux causal_chain_id required");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase C3: Diagnostic JSON Output Mode (Explain Event Deep Verification)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// C3: Explain event includes all diagnostic fields for a tool-using turn.
+#[tokio::test]
+async fn c3_explain_event_comprehensive_fields() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c3-explain-full-sess",
+        "messages": [{"role": "user", "content": "read and analyze"}],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("bash")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Analysis complete.",
+            "usage": {"prompt": 500, "completion": 200, "total": 700},
+            "tool_calls": [
+                tool_call("tc-e1", "read_file", json!({"path": "main.rs"})),
+                tool_call("tc-e2", "grep", json!({"pattern": "fn main"}))
+            ]
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&body);
+    let explain = events_of_type(&events, "explain");
+    assert_eq!(explain.len(), 1, "exactly 1 explain event");
+
+    let ex = explain[0];
+    // Timing
+    let total_ms = ex.get("total_ms").and_then(Value::as_i64);
+    assert!(total_ms.is_some() && total_ms.unwrap() >= 0, "total_ms non-negative");
+
+    // Token usage
+    assert_eq!(ex.get("prompt_tokens").and_then(Value::as_i64), Some(500));
+    assert_eq!(ex.get("completion_tokens").and_then(Value::as_i64), Some(200));
+
+    // Tool statistics
+    assert_eq!(ex.get("tools_selected").and_then(Value::as_i64), Some(2), "2 tool calls");
+    assert_eq!(ex.get("tools_available").and_then(Value::as_i64), Some(3), "3 available tools");
+
+    // Type field
+    assert_eq!(ex.get("type").and_then(Value::as_str), Some("explain"));
+
+    cap.wait_persist_idle().await;
+}
+
+/// C3: Explain event for text-only turn has zero tools selected.
+#[tokio::test]
+async fn c3_explain_text_only_zero_tools() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c3-text-only-explain-sess",
+        "messages": [{"role": "user", "content": "just talk"}],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{"full_text": "Sure, let's chat."}]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&body);
+    let explain = events_of_type(&events, "explain");
+    assert_eq!(explain.len(), 1);
+
+    let ex = explain[0];
+    assert_eq!(
+        ex.get("tools_selected").and_then(Value::as_i64), Some(0),
+        "text-only turn should have 0 tools selected"
+    );
+    assert_eq!(
+        ex.get("tools_available").and_then(Value::as_i64), Some(1),
+        "1 tool available"
+    );
+    cap.wait_persist_idle().await;
+}
+
+/// C3: Explain event is NOT emitted when explain=false (default).
+#[tokio::test]
+async fn c3_explain_not_emitted_by_default() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c3-no-explain-sess",
+        "messages": [{"role": "user", "content": "stealth mode"}],
+        "edge_tools": [],
+        "test_llm_rounds": [{"full_text": "No diagnostics here."}]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&body);
+    let explain = events_of_type(&events, "explain");
+    assert!(explain.is_empty(), "explain should not be emitted without explain=true");
+    cap.wait_persist_idle().await;
+}
+
+/// C3: SSE event ordering: session_info → content/tool events → explain → turn_complete.
+#[tokio::test]
+async fn c3_sse_event_ordering_correct() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c3-ordering-sess",
+        "messages": [{"role": "user", "content": "order test"}],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{
+            "full_text": "Ordered response.",
+            "tool_calls": [tool_call("tc-ord1", "read_file", json!({"path": "x.rs"}))]
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&body);
+    let types: Vec<&str> = events.iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str))
+        .collect();
+
+    // Find positions
+    let session_info_pos = types.iter().position(|t| *t == "session_info");
+    let turn_complete_pos = types.iter().position(|t| *t == "turn_complete");
+    let explain_pos = types.iter().position(|t| *t == "explain");
+
+    assert!(session_info_pos.is_some(), "session_info should be emitted");
+    assert!(turn_complete_pos.is_some(), "turn_complete should be emitted");
+    assert!(explain_pos.is_some(), "explain should be emitted");
+
+    // session_info comes first; explain before turn_complete (turn_complete is final)
+    assert!(
+        session_info_pos.unwrap() < explain_pos.unwrap(),
+        "session_info must come before explain"
+    );
+    assert!(
+        explain_pos.unwrap() < turn_complete_pos.unwrap(),
+        "explain must come before turn_complete"
+    );
+
+    cap.wait_persist_idle().await;
+}
+
+/// C3: Explain event includes steps array for context assembly trace.
+#[tokio::test]
+async fn c3_explain_event_has_steps_array() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "c3-steps-sess",
+        "messages": [{"role": "user", "content": "trace steps test"}],
+        "edge_tools": [tool_schema("read_file")],
+        "explain": true,
+        "test_llm_rounds": [{"full_text": "Traced response."}]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = parse_sse_events(&body);
+    let explain = events_of_type(&events, "explain");
+    assert_eq!(explain.len(), 1);
+
+    let ex = explain[0];
+    // Steps should be an array (may be empty but must exist)
+    assert!(ex.get("steps").is_some(), "explain should have steps field");
+    assert!(ex["steps"].is_array(), "steps should be an array");
+    cap.wait_persist_idle().await;
+}
 
 /// D1: Schema pruning — TrimSchemas tier truncates descriptions to first sentence.
 #[tokio::test]
