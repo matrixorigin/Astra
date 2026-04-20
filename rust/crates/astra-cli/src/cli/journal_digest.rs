@@ -307,10 +307,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     } else {
                         Vec::new()
                     },
+                    // tool_count is a total; subtract known failures.
                     tool_calls_ok: if ok_c + fail_c > 0 {
                         ok_c
                     } else {
-                        ev.tool_count.unwrap_or(0)
+                        ev.tool_count.unwrap_or(0).saturating_sub(fail_c)
                     },
                     tool_calls_fail: fail_c,
                     user_input_preview,
