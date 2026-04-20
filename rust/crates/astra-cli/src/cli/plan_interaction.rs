@@ -70,8 +70,8 @@ async fn plan_llm_call(
             return PlanLlmOutcome::Cancelled;
         }
         r = async {
-            // Retry once on SSE transport errors (e.g. "error decoding response body").
-            for attempt in 0..2u8 {
+            // Retry up to 3 times on SSE transport errors (e.g. "error decoding response body").
+            for attempt in 0..3u8 {
                 let resp = match api.post_chat_turn_timeout(token, payload, PLAN_REQUEST_TIMEOUT).await {
                     Ok(r) => r,
                     Err(e) => return PlanLlmOutcome::Error(e.to_string()),
@@ -90,8 +90,9 @@ async fn plan_llm_call(
                     return PlanLlmOutcome::Cancelled;
                 }
                 if let Some(err) = sse_result.completion_error() {
-                    if attempt == 0 {
-                        eprintln!("  {} SSE error, retrying… ({})", crate::theme::icon_warn(), err);
+                    if attempt < 2 {
+                        eprintln!("  {} SSE error, retrying… ({}/3, {})", crate::theme::icon_warn(), attempt + 1, err);
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1))).await;
                         continue;
                     }
                     return PlanLlmOutcome::Error(err);
@@ -970,7 +971,13 @@ pub async fn handle_plan_mode_input(
         });
 
         eprintln!();
-        let full_text = match plan_llm_call(api, tok, &payload).await {
+        let plan_result = plan_llm_call(api, tok, &payload).await;
+        // Extract session_id as owned value — plan_state holds a mutable borrow of
+        // state.plan_mode, so we can't call maybe_init_session_from_plan(state, ..) directly.
+        let new_session_id: Option<String> = if let PlanLlmOutcome::Ok { session_id: Some(ref sid), .. } = plan_result {
+            if state.session_id.is_none() { Some(sid.clone()) } else { None }
+        } else { None };
+        let full_text = match plan_result {
             PlanLlmOutcome::Ok { text, .. } => text,
             PlanLlmOutcome::Cancelled => {
                 eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
@@ -1027,6 +1034,11 @@ pub async fn handle_plan_mode_input(
             }
         }
 
+        // Apply session_id captured from the LLM response (plan_state borrow ends here).
+        if let Some(sid) = new_session_id {
+            super::repl_turn::initialize_journal_pub(state, &sid);
+            state.session_id = Some(sid);
+        }
         return Ok(PlanInputResult::Handled);
     }
 
@@ -1232,7 +1244,9 @@ pub async fn handle_plan_mode_input(
     });
 
     eprintln!();
-    let llm_text = match plan_llm_call(api, tok, &payload).await {
+    let edit_result = plan_llm_call(api, tok, &payload).await;
+    maybe_init_session_from_plan(state, &edit_result);
+    let llm_text = match edit_result {
         PlanLlmOutcome::Ok { text, .. } => text,
         PlanLlmOutcome::Cancelled => {
             eprintln!("  {} Plan edit cancelled.", theme::icon_warn());
@@ -2077,10 +2091,11 @@ async fn handle_goal_submission(
     let Some(plan_ctx) = state.plan_mode.as_ref().map(|ps| ps.context.clone()) else {
         return Ok(PlanInputResult::Handled);
     };
-    let full_text =
-        match plan_generate_with_retry(api, tok, &goal, &plan_ctx, state.session_id.as_deref())
-            .await
-        {
+    let gen_result =
+        plan_generate_with_retry(api, tok, &goal, &plan_ctx, state.session_id.as_deref())
+            .await;
+    maybe_init_session_from_plan(state, &gen_result);
+    let full_text = match gen_result {
             PlanLlmOutcome::Ok { text, .. } => text,
             PlanLlmOutcome::Cancelled => {
                 eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
@@ -2198,15 +2213,16 @@ async fn handle_outline_clarifications(
             let Some(clarify_ctx) = state.plan_mode.as_ref().map(|ps| ps.context.clone()) else {
                 return Ok(PlanInputResult::Handled);
             };
-            let full_text = match plan_generate_with_retry(
+            let clarify_result = plan_generate_with_retry(
                 api,
                 tok,
                 &goal_with_context,
                 &clarify_ctx,
                 state.session_id.as_deref(),
             )
-            .await
-            {
+            .await;
+            maybe_init_session_from_plan(state, &clarify_result);
+            let full_text = match clarify_result {
                 PlanLlmOutcome::Ok { text, .. } => text,
                 PlanLlmOutcome::Cancelled => {
                     eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
@@ -2310,7 +2326,9 @@ async fn expand_outline_to_plan(
             "session_id": state.session_id.clone(),
         });
 
-        let text = match plan_llm_call(api, tok, &payload).await {
+        let expand_result = plan_llm_call(api, tok, &payload).await;
+        maybe_init_session_from_plan(state, &expand_result);
+        let text = match expand_result {
             PlanLlmOutcome::Ok { text: t, .. } => t,
             PlanLlmOutcome::Cancelled => {
                 eprintln!("  {} Cancelled during phase expansion.", theme::icon_warn());
@@ -2364,7 +2382,9 @@ async fn expand_outline_to_plan(
                     ],
                     "session_id": state.session_id.clone(),
                 });
-                match plan_llm_call(api, tok, &retry_payload).await {
+                let retry_result = plan_llm_call(api, tok, &retry_payload).await;
+                maybe_init_session_from_plan(state, &retry_result);
+                match retry_result {
                     PlanLlmOutcome::Ok {
                         text: retry_text, ..
                     } => match parse_plan_response(&retry_text) {
