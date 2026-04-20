@@ -187,12 +187,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             model_result_str,
         );
 
-        let (tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
+        let (mut tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
             &execution.id,
             &execution.name,
             &model_result_str,
             execution.tool_result_fields.as_ref(),
         );
+        // Add round index for compression protection (P6):
+        // Current-round tool results should never be truncated because
+        // the LLM hasn't seen them yet.
+        if let Some(obj) = tool_msg.as_object_mut() {
+            obj.insert(
+                "_round_index".to_string(),
+                serde_json::Value::Number(self.ctx.llm_round.into()),
+            );
+        }
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
     }

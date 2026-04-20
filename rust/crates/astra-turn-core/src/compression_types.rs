@@ -15,6 +15,9 @@ pub struct TokenBudget {
     pub last_measured_tokens: u64,
     /// Characters-per-token estimate (for cheap pre-checks).
     pub chars_per_token: f64,
+    /// Current LLM round index (0-based). Used to protect current-round tool
+    /// results from compression — they haven't been seen by the LLM yet.
+    pub current_round_index: Option<u32>,
 }
 
 impl TokenBudget {

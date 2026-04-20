@@ -257,7 +257,7 @@ impl CompressionLayer for ToolResultTruncation {
         budget.pressure() > self.trigger_pressure && self.estimate_savings(messages, budget) > 100
     }
 
-    fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
+    fn compress(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> CompressionResult {
         let cutoff = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -271,6 +271,16 @@ impl CompressionLayer for ToolResultTruncation {
         for (idx, msg) in messages.iter_mut().enumerate() {
             if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
                 continue;
+            }
+            // P6 fix: Never truncate tool results from the current LLM round.
+            // These results haven't been seen by the LLM yet, so truncating
+            // them would lose information before it can be processed.
+            if let Some(current_round) = budget.current_round_index {
+                if let Some(round_idx) = msg.get("_round_index").and_then(|v| v.as_u64()) {
+                    if round_idx as u32 >= current_round {
+                        continue; // protect current-round results
+                    }
+                }
             }
             if let Some(ts) = msg.get("_timestamp").and_then(|v| v.as_u64()) {
                 if ts > cutoff {
@@ -717,6 +727,7 @@ mod tests {
             max_prompt_tokens: max,
             last_measured_tokens: measured,
             chars_per_token: 4.0,
+            current_round_index: None,
         }
     }
 

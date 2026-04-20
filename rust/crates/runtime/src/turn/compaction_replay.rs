@@ -148,6 +148,7 @@ pub(crate) fn try_compact_for_retry_tiered(
         max_prompt_tokens: max_tokens,
         last_measured_tokens: measured,
         chars_per_token: 4.0,
+        current_round_index: None, // replay doesn't track round indices
     };
 
     if !budget.is_over_budget() && budget.pressure() < 0.85 {
