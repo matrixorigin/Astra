@@ -59,15 +59,37 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
 /// Truncate a tool result to `max_chars`, keeping head and tail with a notice.
 /// Returns the original string if within limits.
 fn truncate_tool_result(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
+    // Count chars once — used for both the early-exit guard and the truncation math.
+    // content.len() is bytes; for UTF-8 content len() >= chars().count(), so we must
+    // use chars().count() to correctly decide whether truncation is needed.
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
         return content.to_string();
     }
-    // Keep 40% head, 40% tail, 20% for truncation notice
-    let head_len = max_chars * 2 / 5;
-    let tail_len = max_chars * 2 / 5;
-    let omitted = content.len() - head_len - tail_len;
-    let head = &content[..head_len];
-    let tail = &content[content.len() - tail_len..];
+    // Keep 40% head, 40% tail, 20% for truncation notice.
+    // Use char_indices to find safe byte boundaries — content may contain
+    // multi-byte UTF-8 (CJK, emoji, etc.) and byte-offset slicing would panic.
+    let head_chars = max_chars * 2 / 5;
+    let tail_chars = max_chars * 2 / 5;
+
+    // Find byte offset after head_chars characters.
+    let head_end = content
+        .char_indices()
+        .nth(head_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+
+    // Find byte offset at (total_chars - tail_chars) from the start.
+    let tail_start_char = total_chars.saturating_sub(tail_chars);
+    let tail_start = content
+        .char_indices()
+        .nth(tail_start_char)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+
+    let omitted = total_chars - head_chars - tail_chars;
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
     format!(
         "{head}\n\n[… truncated {omitted} characters — output too large for context window …]\n\n{tail}"
     )
@@ -213,5 +235,39 @@ mod tests {
         let out = tool_result_content_for_model("bash", &big);
         assert!(out.len() < big.len(), "should truncate large bash output");
         assert!(out.contains("truncated"), "truncation notice present");
+    }
+
+    #[test]
+    fn truncation_safe_on_multibyte_utf8() {
+        // Each CJK char is 3 bytes. 20_000 chars = 60_000 bytes.
+        // Slicing at byte offset head_chars would panic without the fix.
+        let content = "你好世界".repeat(5_000); // 20_000 chars, 60_000 bytes
+        let max = 10_000;
+        let out = super::truncate_tool_result(&content, max);
+        // Must not panic, must be valid UTF-8, must contain truncation notice.
+        assert!(out.contains("truncated"));
+        // Output must be valid UTF-8 (no panic on chars().count()).
+        let _ = out.chars().count();
+        // Head and tail must start/end on valid char boundaries.
+        assert!(out.starts_with('你'));
+    }
+
+    #[test]
+    fn truncation_char_count_not_byte_count() {
+        // 3-byte chars: content has 100 chars but 300 bytes.
+        // With max_chars=50, should truncate (100 chars > 50), not skip.
+        let content = "é".repeat(100); // 'é' is 2 bytes in UTF-8
+        let out = super::truncate_tool_result(&content, 50);
+        assert!(out.contains("truncated"), "should truncate by char count, not byte count");
+    }
+
+    #[test]
+    fn truncation_omitted_count_is_chars_not_bytes() {
+        // 3-byte CJK chars: omitted count should be in chars, not bytes.
+        let content = "中".repeat(10_100); // 10_100 chars, 30_300 bytes
+        let max = 10_000;
+        let out = super::truncate_tool_result(&content, max);
+        // head=4000 chars, tail=4000 chars, omitted=2100 chars (not 6300 bytes)
+        assert!(out.contains("2100 characters"), "omitted count must be in chars: {out}");
     }
 }
