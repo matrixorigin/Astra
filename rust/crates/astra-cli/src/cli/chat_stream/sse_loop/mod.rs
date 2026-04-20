@@ -195,11 +195,13 @@ pub(crate) async fn stream_chat_sse(
     // ─── Context pre-fetch ───────────────────────────────────────────────
     // For well-known task patterns (code review, etc.), pre-fetch relevant
     // context locally so the LLM can respond in fewer rounds.
+    let mut prefetch_injected = false;
     if !p.plan_only_chat {
         if let Some(ctx) =
             crate::context_prefetch::prefetch_context_for_message(p.message, &project_root)
         {
             crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
+            prefetch_injected = true;
         }
     }
 
@@ -602,10 +604,16 @@ pub(crate) async fn stream_chat_sse(
         // after state.turn += 1, so add 1 here to keep llm_round.turn
         // consistent with the turn event's turn number.
         session_turn: p.turn_index + 1,
+        prefetch_injected,
         turn_event_buffer: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
+    // When prefetch injected live data, suppress the "no tool call on live query"
+    // corrective retry — the LLM already has the data it needs.
+    if prefetch_injected {
+        state.stall.forced_factual_retry = true;
+    }
     // Stop the early spinner — the per-turn prep spinner inside execute_turn takes over.
     if let Some(s) = early_spinner {
         s.stop_clear();
@@ -660,7 +668,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
-    Ok(build_stream_result(StreamResultBuild {
+    let mut result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
         run_id: state.current_run_id,
@@ -697,7 +705,9 @@ pub(crate) async fn stream_chat_sse(
             .map(|b| b.drain())
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
-    }))
+    });
+    result.prefetch_injected = state.prefetch_injected;
+    Ok(result)
 }
 
 #[cfg(test)]

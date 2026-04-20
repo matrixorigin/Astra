@@ -70,27 +70,35 @@ async fn plan_llm_call(
             return PlanLlmOutcome::Cancelled;
         }
         r = async {
-            let resp = match api.post_chat_turn_timeout(token, payload, PLAN_REQUEST_TIMEOUT).await {
-                Ok(r) => r,
-                Err(e) => return PlanLlmOutcome::Error(e.to_string()),
-            };
-            if !resp.status().is_success() {
-                return PlanLlmOutcome::Error(format!("HTTP {}", resp.status()));
+            // Retry once on SSE transport errors (e.g. "error decoding response body").
+            for attempt in 0..2u8 {
+                let resp = match api.post_chat_turn_timeout(token, payload, PLAN_REQUEST_TIMEOUT).await {
+                    Ok(r) => r,
+                    Err(e) => return PlanLlmOutcome::Error(e.to_string()),
+                };
+                if !resp.status().is_success() {
+                    return PlanLlmOutcome::Error(format!("HTTP {}", resp.status()));
+                }
+                let sse_result = collect_sse_cancellable(
+                    resp,
+                    &cancel,
+                    PLAN_STREAM_TIMEOUT,
+                    PLAN_IDLE_TIMEOUT,
+                    |_| {},
+                ).await;
+                if sse_result.is_cancelled() {
+                    return PlanLlmOutcome::Cancelled;
+                }
+                if let Some(err) = sse_result.completion_error() {
+                    if attempt == 0 {
+                        eprintln!("  {} SSE error, retrying… ({})", crate::theme::icon_warn(), err);
+                        continue;
+                    }
+                    return PlanLlmOutcome::Error(err);
+                }
+                return PlanLlmOutcome::Ok { text: sse_result.text, session_id: sse_result.session_id };
             }
-            let sse_result = collect_sse_cancellable(
-                resp,
-                &cancel,
-                PLAN_STREAM_TIMEOUT,
-                PLAN_IDLE_TIMEOUT,
-                |_| {},
-            ).await;
-            if sse_result.is_cancelled() {
-                return PlanLlmOutcome::Cancelled;
-            }
-            if let Some(err) = sse_result.completion_error() {
-                return PlanLlmOutcome::Error(err);
-            }
-            PlanLlmOutcome::Ok { text: sse_result.text, session_id: sse_result.session_id }
+            unreachable!()
         } => r,
     };
     result

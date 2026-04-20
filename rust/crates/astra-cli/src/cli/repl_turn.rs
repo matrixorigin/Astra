@@ -989,12 +989,22 @@ fn commit_turn_journal_workspace_and_sidecars(
 
         // Emit deferred context_assembly_recorded — only on successful turn commit.
         if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
+            let mut trace = trace_json.clone();
+            // Annotate with prefetch info so token audits can account for it.
+            if result.prefetch_injected {
+                if let Some(obj) = trace.as_object_mut() {
+                    obj.insert(
+                        "prefetch".into(),
+                        serde_json::json!({ "injected": true }),
+                    );
+                }
+            }
             // Use the REPL's user-visible turn number, not the internal agentic
             // loop counter that was stored in the trace.
             let assembly_event = session_journal::JournalEvent::context_assembly_recorded(
                 state.session_id.as_deref(),
                 state.turn,
-                trace_json.clone(),
+                trace,
             );
             if let Err(e) = journal.append(&assembly_event) {
                 astra_core::agent_warn!(
@@ -1434,7 +1444,9 @@ fn apply_turn_success(
         );
     }
 
-    if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
+    if result.tool_calls_count == 0
+        && !result.prefetch_injected
+        && looks_like_live_query_with_context(line, &state.recent_tools)
     {
         eprintln!(
             "{}",
@@ -1680,10 +1692,25 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
     }
 
     let needs_start_event = match session_journal::read_journal(session_id) {
-        Ok(events) => matches!(
-            events.last().map(|event| &event.event_type),
-            None | Some(session_journal::JournalEventType::SessionEnd)
-        ),
+        Ok(events) => {
+            // Write session_start if: journal is empty, last event is session_end
+            // (clean restart), or we're resuming an interrupted session (no session_end
+            // after the last session_start).
+            let last_type = events.last().map(|e| &e.event_type);
+            match last_type {
+                None | Some(session_journal::JournalEventType::SessionEnd) => true,
+                _ => {
+                    // Resumed session: check if there's already a session_start
+                    // without a matching session_end.
+                    let has_unmatched_start = events.iter().rev().any(|e| {
+                        e.event_type == session_journal::JournalEventType::SessionStart
+                    }) && !events.iter().rev().any(|e| {
+                        e.event_type == session_journal::JournalEventType::SessionEnd
+                    });
+                    !has_unmatched_start
+                }
+            }
+        }
         Err(_) => true,
     };
 
@@ -3413,6 +3440,7 @@ mod tests {
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
+            prefetch_injected: false,
             llm_rounds: None,
         }
     }

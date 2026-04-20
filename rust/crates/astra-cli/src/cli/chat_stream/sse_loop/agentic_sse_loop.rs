@@ -245,6 +245,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         pending_context_assembly_trace,
         turn_observability_events,
         llm_rounds,
+        prefetch_injected: false,
     }
 }
 

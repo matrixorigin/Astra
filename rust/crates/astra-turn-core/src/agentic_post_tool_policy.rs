@@ -6,11 +6,10 @@ use serde_json::Value;
 
 use crate::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use crate::chat_history_openai::{
-    append_openai_user_content_messages, openai_user_content_message,
+    append_openai_user_content_messages,
 };
 use crate::stall::{
     CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL, CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING,
-    IntentDrift, detect_intent_drift,
 };
 use crate::tool_call_shape::{tool_call_arguments_value, tool_call_name};
 use crate::turn_guard::{TurnGuard, VerdictSeverity};
@@ -72,11 +71,11 @@ pub fn apply_agentic_post_tool_policy(
 ) -> AgenticPostToolPolicyOutcome {
     let AgenticPostToolPolicyRequest {
         turn_index,
-        message,
+        message: _,
         tool_calls_for_guard,
         intent_tool_turns,
         messages,
-        stall_events,
+        stall_events: _,
         turn_guard,
         verdict_events,
         restricted_tools,
@@ -100,13 +99,6 @@ pub fn apply_agentic_post_tool_policy(
             .collect::<Vec<_>>()
             .join(" ");
         intent_tool_turns.push((turn_names, turn_args_text));
-
-        if let IntentDrift::Drifting { correction, .. } =
-            detect_intent_drift(message, intent_tool_turns)
-        {
-            messages.push(openai_user_content_message(&correction));
-            stall_events.push(("intent_drift".to_string(), turn_index));
-        }
     }
 
     {

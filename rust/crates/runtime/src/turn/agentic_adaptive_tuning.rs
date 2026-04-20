@@ -309,8 +309,9 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         .tool_selection
         .effective_max_tools_per_turn();
 
-    // Collect attribution data while lock is held.
-    let turn = session_guard.turn_number;
+    // Use the session-level turn number for journal events (not the
+    // observability session's internal counter which can diverge).
+    let turn = state.session_turn;
     let scenario_name = profile
         .scenario
         .map(|s| format!("{s:?}"))
@@ -448,7 +449,7 @@ pub(crate) fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_token
 
     // Read immutable session state first to avoid borrow conflicts.
     let compression_count = session_guard.compressed_turns.len();
-    let turn = session_guard.turn_number;
+    let turn = state.session_turn;
     let recent_corrections = session_guard
         .user_corrections
         .iter()
@@ -1046,7 +1047,7 @@ pub(crate) fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     };
 
     let actions = hub.run_tuning_cycle(&mut session_guard.config);
-    let turn = session_guard.turn_number;
+    let turn = state.session_turn;
 
     // Track token-budget direction changes from tuning rules for anti-flap.
     let new_budget = session_guard.config.token_budget.max_turn_input_tokens;

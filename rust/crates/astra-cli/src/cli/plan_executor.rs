@@ -1076,6 +1076,28 @@ async fn plan_executor_task(
                 Ok(result) => {
                     ctx.turn += 1;
 
+                    // Flush turn observability events (llm_round, tool timing)
+                    // so plan executor turns are visible in the journal.
+                    for evt in &result.turn_observability_events {
+                        emit_event(&update_tx, &ctx, evt.clone());
+                    }
+
+                    // Write a turn event so plan executor turns appear in digest.
+                    {
+                        let turn_event = session_journal::JournalEvent::turn(
+                            ctx.session_id.as_deref(),
+                            ctx.turn,
+                            ctx.model.as_deref(),
+                            &prompt,
+                            &result.full_text,
+                            result.tool_calls_count,
+                            result.prompt_tokens,
+                            result.completion_tokens,
+                            subtask_start.elapsed().as_millis() as u64,
+                        );
+                        emit_event(&update_tx, &ctx, turn_event);
+                    }
+
                     // Send turn result back to REPL for token accounting
                     let _ = update_tx.send(PlanUpdate::SubtaskTurnResult {
                         subtask_id: next_id.clone(),

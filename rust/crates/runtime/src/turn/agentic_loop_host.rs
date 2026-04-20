@@ -569,6 +569,11 @@ pub struct AgenticLoopState {
     /// on subsequent iterations (prevents markdown leak from draft text).
     pub skill_produced_output: bool,
 
+    /// True when context_prefetch injected data into the user message before
+    /// the agentic loop started. Suppresses "no tool call on live query" warnings
+    /// because the LLM already has the data it needs.
+    pub prefetch_injected: bool,
+
     // ── Cumulative token budget ──
     /// Maximum cumulative (prompt + completion) tokens across all rounds.
     /// 0 = unlimited (default for interactive sessions).
@@ -1124,6 +1129,7 @@ pub(crate) mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }
@@ -4818,6 +4824,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
+        state.session_turn = 10;
 
         {
             let mut guard = session.write().unwrap();
@@ -5000,6 +5007,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
+        state.session_turn = 10;
 
         {
             let mut guard = session.write().unwrap();
@@ -5091,6 +5099,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
+        state.session_turn = 1;
 
         {
             let mut guard = session.write().unwrap();

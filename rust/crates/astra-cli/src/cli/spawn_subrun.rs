@@ -288,6 +288,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            prefetch_injected: false,
             turn_event_buffer: None,
         };
 

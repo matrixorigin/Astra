@@ -121,6 +121,8 @@ pub(crate) struct StreamResult {
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
+    /// True when context_prefetch injected data before the agentic loop.
+    pub(crate) prefetch_injected: bool,
 }
 
 impl StreamResult {
