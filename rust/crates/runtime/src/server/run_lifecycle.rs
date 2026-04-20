@@ -2182,7 +2182,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Best-effort post-loop persistence (core events, tool events,
             // hook DB, observer, learning, session-end hooks, promotion events).
-            persist_ctx.run(&loop_state, &learning_stack, loop_success).await;
+            persist_ctx
+                .run(&loop_state, &learning_stack, loop_success)
+                .await;
 
             // Session-end governance: extract learnings, store to Memoria, purge working memory.
             // This is create_run-specific (background runs are long-lived sessions).

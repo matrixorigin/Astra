@@ -14,7 +14,6 @@ pub mod config;
 pub mod drift;
 pub mod error_kind;
 pub mod log;
-pub use log::log_timestamp;
 pub mod runtime_limits;
 
 /// Re-export for [`crate::agent_*!`] macros (call sites do not need a direct `tracing` dependency).

@@ -1043,10 +1043,6 @@ impl InProcessChatTurnBridge {
             let mut resolved_model = model_name.clone();
             let mut cloud_loop_turns: i64 = 0;
             let mut llm_steps: Vec<Value> = Vec::new();
-            // Approximate turn number from user message count in history.
-            let bridge_turn: u32 = messages.iter()
-                .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .count() as u32;
 
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
@@ -1189,12 +1185,6 @@ impl InProcessChatTurnBridge {
                         Some(max_output_tokens),
                         has_fallback,
                         cc.clone(),
-                        &crate::turn::llm_client::LlmTraceCtx {
-                            session_id: session_id.clone(),
-                            turn: bridge_turn,
-                            round: round_ix as u32,
-                            ..Default::default()
-                        },
                     )
                     .await
                     {
@@ -1283,12 +1273,6 @@ impl InProcessChatTurnBridge {
                                 Some(max_output_tokens / 2), // reduce output budget too
                                 has_fallback,
                                 cc.clone(),
-                                &crate::turn::llm_client::LlmTraceCtx {
-                                    session_id: session_id.clone(),
-                                    turn: bridge_turn,
-                                    round: round_ix as u32,
-                                    ..Default::default()
-                                },
                             )
                             .await
                             {

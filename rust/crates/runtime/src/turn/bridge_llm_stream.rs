@@ -122,7 +122,6 @@ pub(crate) async fn call_llm_stream(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
-    trace: &crate::turn::llm_client::LlmTraceCtx,
 ) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
@@ -186,24 +185,22 @@ pub(crate) async fn call_llm_stream(
             Ok(r) => {
                 astra_core::agent_info!(
                     "llm",
-                    "⏱ LLM HTTP ok: status={} connect={}ms req={}B model={} attempt={}{}",
+                    "⏱ LLM HTTP ok: status={} connect={}ms req={}B model={} attempt={}",
                     r.status().as_u16(),
                     request_start.elapsed().as_millis(),
                     req_bytes,
                     model_name,
                     attempt,
-                    trace.tag(),
                 );
                 r
             }
             Err(e) => {
                 astra_core::agent_warn!(
                     "llm",
-                    "⏱ LLM send failed: {}ms model={} attempt={}{}",
+                    "⏱ LLM send failed: {}ms model={} attempt={}",
                     request_start.elapsed().as_millis(),
                     model_name,
                     attempt,
-                    trace.tag(),
                 );
                 last_err = format!("LLM request failed: {e}");
                 // Network errors are always retryable
@@ -225,7 +222,6 @@ pub(crate) async fn call_llm_stream(
             let base_url_for_fallback = base_url.to_string();
             let provider_for_fallback = provider.to_string();
             let max_out_for_fallback = max_output_tokens;
-            let trace_for_fallback = trace.clone();
             let idle_pre = crate::turn::llm_client::stream_idle_timeout();
             let idle_post = crate::turn::llm_client::stream_idle_timeout_after_progress();
 
@@ -280,7 +276,6 @@ pub(crate) async fn call_llm_stream(
                                         &provider_for_fallback,
                                         max_out_for_fallback,
                                         fb_timeout,
-                                        &trace_for_fallback,
                                     )
                                     .await
                                     {

@@ -116,7 +116,6 @@ impl LlmConflictResolver {
             Some(8192),
             false,
             crate::turn::llm_client::LlmCancel::None,
-            &crate::turn::llm_client::LlmTraceCtx::default(),
         )
         .await
         .map_err(|e| format!("LLM call failed for {}: {e}", conflict.path))?;
