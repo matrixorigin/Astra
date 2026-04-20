@@ -497,6 +497,94 @@ fn find_event_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> 
         .collect()
 }
 
+// ── Event-driven synchronization helpers ─────────────────────────────────────
+
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// Spawn a background task that reads SSE events from a streaming body,
+/// sending each event through an unbounded channel for real-time consumption.
+/// Returns (receiver, join_handle). The join handle resolves to all collected events.
+async fn spawn_sse_reader(body: Body) -> (mpsc::UnboundedReceiver<Value>, JoinHandle<Vec<Value>>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut buf = String::new();
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(idx) = buf.find("\n\n") {
+                let event_str = buf[..idx].to_string();
+                buf = buf[idx + 2..].to_string();
+                if let Some(data) = event_str.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        let _ = tx.send(v.clone());
+                        events.push(v);
+                    }
+                }
+            }
+        }
+        events
+    });
+    (rx, handle)
+}
+
+/// Wait for an SSE event of a specific type from the channel (with timeout).
+async fn wait_for_sse(
+    rx: &mut mpsc::UnboundedReceiver<Value>,
+    event_type: &str,
+    timeout_secs: u64,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(event)) => {
+                if event.get("type").and_then(Value::as_str) == Some(event_type) {
+                    return event;
+                }
+            }
+            Ok(None) => panic!("stream ended without '{event_type}' event"),
+            Err(_) => panic!("timed out ({timeout_secs}s) waiting for '{event_type}' event"),
+        }
+    }
+}
+
+/// Poll run status until it reaches the expected value (with timeout).
+async fn poll_run_status(app: &Router, run_id: &str, expected: &str, timeout_secs: u64) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let (st, body) = get_run_status(app, run_id).await;
+        if st == StatusCode::OK {
+            if body["status"].as_str().unwrap_or("") == expected {
+                return body;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out ({timeout_secs}s) waiting for run '{run_id}' → '{expected}'");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll an async condition with timeout. Returns when the predicate returns true.
+async fn poll_until<F, Fut>(predicate: F, timeout_secs: u64)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if predicate().await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("poll_until timed out after {timeout_secs}s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // TESTS
 // ══════════════════════════════════════════════════════════════════════════════
@@ -634,26 +722,23 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
         }
     });
 
-    // Start the stream in a background task — it will block waiting for tool result.
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    // Start the stream and use event-driven synchronization.
+    let resp = chat_stream_start(&app, payload).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    // Wait a bit for the server to start processing and emit tool_request.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for tool_request event before posting tool result.
+    wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // Post tool result to the ledger.
     let status = post_tool_result(&app, "tc-read-1", "hello world", "ok").await;
     assert_eq!(status, StatusCode::OK);
 
     // Wait for the stream to complete.
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Verify session_info is present.
     assert_eq!(events[0]["type"], "session_info");
@@ -716,25 +801,21 @@ async fn multiple_tool_calls_in_single_round() {
         }
     });
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    // Wait for processing.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for tool_request before posting results for both tool calls.
+    wait_for_sse(&mut rx, "tool_request", 5).await;
 
-    // Post results for both tool calls.
     let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "ok").await;
     assert_eq!(s1, StatusCode::OK);
     let s2 = post_tool_result(&app, "tc-2", "content of b.txt", "ok").await;
     assert_eq!(s2, StatusCode::OK);
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Verify tool_call events for both.
     let tool_calls = find_events(&events, "tool_call");
@@ -812,26 +893,22 @@ async fn multi_round_tool_execution() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Post results as tool_request events are emitted.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_tool_result(&app_for_post, "tc-read", "fn main() {}", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-read", "fn main() {}", "ok").await;
     assert_eq!(st, 200, "tc-read POST failed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_tool_result(&app_for_post, "tc-list", "main.rs\nlib.rs\nmod.rs", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "ok").await;
     assert_eq!(st, 200, "tc-list POST failed");
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Should have 2 tool_call events (one per round).
     let tool_calls = find_events(&events, "tool_call");
@@ -1058,19 +1135,16 @@ async fn tool_call_with_error_result_continues() {
         }
     });
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     post_tool_result(&app, "tc-err-1", "status=error: file not found", "error").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Should still get final text.
     let text = find_events(&events, "text_delta");
@@ -1118,26 +1192,22 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for the approval_required SSE, then approve, then post tool result.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_approval_respond(&app_for_post, "tc-approve-1", "allow").await;
+    wait_for_sse(&mut rx, "approval_required", 5).await;
+    let st = post_approval_respond(&app, "tc-approve-1", "allow").await;
     assert_eq!(st, 200, "approval POST failed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let st = post_tool_result(&app_for_post, "tc-approve-1", "written", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-approve-1", "written", "ok").await;
     assert_eq!(st, 200, "tool result POST failed");
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Should have approval_required event.
     let approval_events = find_events(&events, "approval_required");
@@ -1198,22 +1268,18 @@ async fn approval_denied_skips_tool_and_continues() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Deny the approval.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_approval_respond(&app_for_post, "tc-deny-1", "deny").await;
+    wait_for_sse(&mut rx, "approval_required", 5).await;
+    let st = post_approval_respond(&app, "tc-deny-1", "deny").await;
     assert_eq!(st, 200, "approval deny POST failed");
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Should have approval_required event.
     let approval_events = find_events(&events, "approval_required");
@@ -1491,28 +1557,24 @@ async fn tool_call_with_empty_id_gets_auto_assigned() {
         }
     });
 
-    let app_clone = app.clone();
-    let _app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    // Wait for tool_request, then find the auto-generated ID and post result.
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    // Wait for tool_request and discover the auto-generated ID from the event.
+    let tool_req_event = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let auto_id = tool_req_event["request_id"]
+        .as_str()
+        .unwrap_or_else(|| tool_req_event["tool_call_id"].as_str().unwrap_or(""));
 
-    // We need to discover the auto-assigned ID. Read the tool_request event's request_id.
-    // Since we can't easily get intermediate events, we'll try posting with a wildcard approach.
-    // Actually, the ledger key uses the tool call ID. Let's see what happens if we post
-    // for a known pattern. The auto-generated ID is a UUID v7.
-    // For this test, we'll just let it timeout. Better to test that it doesn't crash.
-    // Instead, let's set a short timeout and verify graceful handling.
+    // Post tool result using the discovered ID (if available).
+    if !auto_id.is_empty() {
+        post_tool_result(&app, auto_id, "content", "ok").await;
+    }
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(8), stream_task).await;
+    let events = tokio::time::timeout(std::time::Duration::from_secs(8), reader).await;
 
-    // The stream may time out waiting for tool result (since we can't know the auto ID),
-    // but it should not panic. If it times out, that's acceptable for this edge case test.
-    // The important thing is no crash.
+    // The stream may time out if we couldn't discover the right ID,
+    // but it should not panic. The important thing is no crash.
     assert!(events.is_ok() || events.is_err(), "should not panic");
 }
 
@@ -1602,24 +1664,20 @@ async fn many_tool_calls_in_single_round() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    // Post all 5 results with small delays.
+    // Wait for tool_request then post all 5 results.
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     for i in 0..5 {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let id = format!("tc-many-{i}");
-        post_tool_result(&app_for_post, &id, &format!("content of file{i}"), "ok").await;
+        post_tool_result(&app, &id, &format!("content of file{i}"), "ok").await;
     }
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     let tool_calls_events = find_events(&events, "tool_call");
     assert!(
@@ -1673,26 +1731,22 @@ async fn three_sequential_rounds_all_with_tools() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     for (id, output) in [
         ("tc-r1", "grep matches: 3"),
         ("tc-r2", "found: main.rs, lib.rs"),
         ("tc-r3", "file content here"),
     ] {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        post_tool_result(&app_for_post, id, output, "ok").await;
+        wait_for_sse(&mut rx, "tool_request", 5).await;
+        post_tool_result(&app, id, output, "ok").await;
     }
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     let tool_calls_events = find_events(&events, "tool_call");
     assert!(
@@ -1747,21 +1801,17 @@ async fn tool_call_with_complex_json_arguments() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_tool_result(&app_for_post, "tc-complex", "file content", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-complex", "file content", "ok").await;
     assert_eq!(st, 200);
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Should complete normally even with complex args.
     let text = find_events(&events, "text_delta");
@@ -1800,20 +1850,16 @@ async fn text_then_tool_then_text_interleaved() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    post_tool_result(&app_for_post, "tc-mixed", "info content", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    post_tool_result(&app, "tc-mixed", "info content", "ok").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     let text = find_events(&events, "text_delta");
     // Should have text from round 1 and round 2.
@@ -1857,20 +1903,16 @@ async fn reasoning_tokens_with_tool_calls() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    post_tool_result(&app_for_post, "tc-think", "file data", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    post_tool_result(&app, "tc-think", "file data", "ok").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     // Should have reasoning events.
     let reasoning = find_events(&events, "reasoning_delta");
@@ -1915,20 +1957,16 @@ async fn multiple_usage_events_accumulate() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    post_tool_result(&app_for_post, "tc-usage", "file1\nfile2", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    post_tool_result(&app, "tc-usage", "file1\nfile2", "ok").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     let usage = find_events(&events, "usage");
     assert!(
@@ -1988,25 +2026,9 @@ async fn run_status_queryable_after_stream_completes() {
         .and_then(Value::as_str)
         .expect("run_id in session_info");
 
-    // Give the background task a moment to finalize.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Query run status.
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/chat/runs/{run_id}"))
-        .header("authorization", TOKEN)
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let status_json: Value = serde_json::from_slice(&body_bytes).unwrap();
-    let status = status_json
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    // Poll run status until finalized.
+    let body = poll_run_status(&app, &run_id, "completed", 5).await;
+    let status = body["status"].as_str().unwrap_or("");
     assert!(
         status == "completed" || status == "running",
         "expected completed or running, got: {status}"
@@ -2037,23 +2059,19 @@ async fn tool_result_with_large_output() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Post a large tool result (~50KB).
     let large_output = "y".repeat(50_000);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_tool_result(&app_for_post, "tc-large", &large_output, "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-large", &large_output, "ok").await;
     assert_eq!(st, 200);
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     let text = find_events(&events, "text_delta");
     assert!(
@@ -2087,25 +2105,21 @@ async fn approval_allow_session_approves_tool() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_approval_respond(&app_for_post, "tc-session-approve", "allow_session").await;
+    wait_for_sse(&mut rx, "approval_required", 5).await;
+    let st = post_approval_respond(&app, "tc-session-approve", "allow_session").await;
     assert_eq!(st, 200);
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let st = post_tool_result(&app_for_post, "tc-session-approve", "ok", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-session-approve", "ok", "ok").await;
     assert_eq!(st, 200);
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
 
     let text = find_events(&events, "text_delta");
     assert!(
@@ -2218,10 +2232,7 @@ async fn a1_run_status_all_fields_text_only() {
     });
 
     let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (status_code, body) = get_run_status(&app, &run_id).await;
-    assert_eq!(status_code, StatusCode::OK);
+    let body = poll_run_status(&app, &run_id, "completed", 5).await;
 
     // Verify ALL RunStatusResponse fields.
     assert_eq!(body["run_id"].as_str().unwrap(), run_id);
@@ -2261,18 +2272,14 @@ async fn a1_run_status_all_fields_after_tool_round() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let st = post_tool_result(&app_for_post, "tc-a1", "file contents", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    let st = post_tool_result(&app, "tc-a1", "file contents", "ok").await;
     assert_eq!(st, 200);
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("timed out")
         .expect("task panicked");
@@ -2281,10 +2288,7 @@ async fn a1_run_status_all_fields_after_tool_round() {
     let run_id = si[0]["run_id"].as_str().unwrap();
     let session_id = si[0]["session_id"].as_str().unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (status_code, body) = get_run_status(&app, run_id).await;
-    assert_eq!(status_code, StatusCode::OK);
+    let body = poll_run_status(&app, run_id, "completed", 5).await;
     assert_eq!(body["run_id"].as_str().unwrap(), run_id);
     assert_eq!(body["session_id"].as_str().unwrap(), session_id);
     assert_eq!(body["status"].as_str().unwrap(), "completed");
@@ -2307,9 +2311,7 @@ async fn a2_transition_running_to_completed_text_only() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (_, body) = get_run_status(&app, &run_id).await;
+    let body = poll_run_status(&app, &run_id, "completed", 5).await;
     assert_eq!(body["status"].as_str().unwrap(), "completed");
 }
 
@@ -2335,17 +2337,13 @@ async fn a2_transition_running_to_completed_after_tool_rounds() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    post_tool_result(&app_for_post, "tc-a2-tool", "file.rs", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    post_tool_result(&app, "tc-a2-tool", "file.rs", "ok").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("timed out")
         .expect("task panicked");
@@ -2353,9 +2351,7 @@ async fn a2_transition_running_to_completed_after_tool_rounds() {
     let si = find_events(&events, "session_info");
     let run_id = si[0]["run_id"].as_str().unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (_, body) = get_run_status(&app, run_id).await;
+    let body = poll_run_status(&app, run_id, "completed", 5).await;
     assert_eq!(body["status"].as_str().unwrap(), "completed");
 }
 
@@ -2382,14 +2378,11 @@ async fn a2_transition_running_to_cancelled() {
         }
     });
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_incremental(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    // Wait for stream to start, then extract run_id from initial events.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // Wait for tool_request to know the stream is running, then get run_id and cancel.
+    let tool_req = wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // We need to cancel — but first we need the run_id. We'll list runs to find it.
     let (_, list_body) = list_runs(&app, 10, 0).await;
@@ -2405,17 +2398,14 @@ async fn a2_transition_running_to_cancelled() {
     assert_eq!(cancel_status, StatusCode::OK);
 
     // Also post the tool result so the stream can terminate.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     post_tool_result(&app, "tc-a2-cancel", "cancelled", "ok").await;
 
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("timed out")
         .expect("task panicked");
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (_, body) = get_run_status(&app, &run_id).await;
+    let body = poll_run_status(&app, &run_id, "cancelled", 5).await;
     let status = body["status"].as_str().unwrap();
     assert!(
         status == "cancelled" || status == "completed",
@@ -2438,7 +2428,7 @@ async fn a3_event_replay_all_events_from_index_zero() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     // Replay from index 0 — should get all stored events.
     let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
@@ -2472,7 +2462,7 @@ async fn a3_event_replay_partial_from_middle() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     // Get all events first.
     let (_, all_events) = get_run_stream(&app, &run_id, 0).await;
@@ -2506,7 +2496,7 @@ async fn a3_event_replay_beyond_end_returns_empty() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     // Replay from a very high index.
     let (status, events) = get_run_stream(&app, &run_id, 9999).await;
@@ -2531,7 +2521,7 @@ async fn a3_event_replay_matches_sse_stream_content() {
     });
 
     let (sse_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     let (_, replay_events) = get_run_stream(&app, &run_id, 0).await;
 
@@ -2580,22 +2570,19 @@ async fn a4_ledger_empty_after_tool_run_completes() {
         }
     });
 
-    let app_clone = app.clone();
-    let app_for_post = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    post_tool_result(&app_for_post, "tc-a4-ledger", "content", "ok").await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
+    post_tool_result(&app, "tc-a4-ledger", "content", "ok").await;
 
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("timed out")
         .expect("task panicked");
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let ledger_cl = ledger.clone();
+    poll_until(|| { let l = ledger_cl.clone(); async move { l.lock().await.is_empty() } }, 5).await;
 
     // Ledger should be empty — all tool entries consumed.
     let ledger_map = ledger.lock().await;
@@ -2629,13 +2616,11 @@ async fn a4_ledger_empty_after_cancelled_run() {
         }
     });
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(&app_clone, payload).await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // Wait for tool_request so we know the stream is running, then cancel.
+    wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // Find running run and cancel it.
     let (_, list_body) = list_runs(&app, 10, 0).await;
@@ -2649,15 +2634,15 @@ async fn a4_ledger_empty_after_cancelled_run() {
     }
 
     // Post tool result so the stream can finish even if cancel didn't interrupt.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "ok").await;
 
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("timed out")
         .expect("task panicked");
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let ledger_cl = ledger.clone();
+    poll_until(|| { let l = ledger_cl.clone(); async move { l.lock().await.is_empty() } }, 5).await;
 
     let ledger_map = ledger.lock().await;
     assert!(
@@ -2696,7 +2681,7 @@ async fn a5_run_status_unauthorized() {
         }
     });
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     // Try with wrong token.
     let (status, _) = get_run_status_with_auth(&app, &run_id, "Bearer wrong-token").await;
@@ -2740,7 +2725,7 @@ async fn a6_session_id_consistent_across_events_and_run() {
     });
 
     let (events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     // Verify run status session_id matches.
     let (_, body) = get_run_status(&app, &run_id).await;
@@ -2777,7 +2762,7 @@ async fn a6_custom_session_id_preserved() {
     });
 
     let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     // The session_id in session_info should match our custom ID.
     assert_eq!(
@@ -2806,7 +2791,7 @@ async fn a6_multiple_runs_same_session() {
         }
     });
     let (_, run_id_1, sid_1) = stream_and_get_run_id(&app, payload1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    poll_run_status(&app, &run_id_1, "completed", 5).await;
 
     // Second run with same session.
     let payload2 = json!({
@@ -2817,7 +2802,7 @@ async fn a6_multiple_runs_same_session() {
         }
     });
     let (_, run_id_2, sid_2) = stream_and_get_run_id(&app, payload2).await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    poll_run_status(&app, &run_id_2, "completed", 5).await;
 
     // Both should share the same session_id.
     assert_eq!(sid_1, shared_sid);
@@ -2849,7 +2834,7 @@ async fn a6_list_runs_shows_completed_runs() {
     });
 
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    poll_run_status(&app, &run_id, "completed", 5).await;
 
     let (status, body) = list_runs(&app, 50, 0).await;
     assert_eq!(status, StatusCode::OK);
@@ -3060,8 +3045,9 @@ async fn hook_db_decision_audit_text_only() {
     .await;
     assert!(!events.is_empty());
 
-    // Allow background task to persist.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for background persistence to complete.
+    let hw = hook_writer.clone();
+    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1, "exactly one hook persist call");
@@ -3094,37 +3080,35 @@ async fn hook_db_decision_audit_text_only() {
 async fn hook_db_decision_audit_with_tools() {
     let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(
-            &app_clone,
-            json!({
-                "message": "list files",
-                "context": {
-                    "test_llm_rounds": [
-                        {
-                            "tool_calls": [tool_call("tc1", "list_files", json!({"path": "."}))]
-                        },
-                        { "full_text": "Here are the files." }
-                    ],
-                    "edge_tools": [tool_schema("list_files"), tool_schema("read_file")]
-                }
-            }),
-        )
-        .await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "list files",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc1", "list_files", json!({"path": "."}))]
+                    },
+                    { "full_text": "Here are the files." }
+                ],
+                "edge_tools": [tool_schema("list_files"), tool_schema("read_file")]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Deliver tool results for tc1.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "success").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
     assert!(!events.is_empty());
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let hw = hook_writer.clone();
+    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
@@ -3165,7 +3149,8 @@ async fn hook_db_decision_audit_model_name() {
         }),
     )
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let hw = hook_writer.clone();
+    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
@@ -3193,7 +3178,8 @@ async fn observer_fired_with_correct_metadata() {
     let session_id = session_info.unwrap()["session_id"].as_str().unwrap();
     assert_eq!(session_id, "obs-session-123");
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let ow = observer_worker.clone();
+    poll_until(|| { let ow = ow.clone(); async move { ow.requests.lock().await.len() > 0 } }, 5).await;
 
     let requests = observer_worker.requests.lock().await;
     assert_eq!(requests.len(), 1);
@@ -3207,53 +3193,51 @@ async fn hook_db_multiple_tools_selected() {
     let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
     // Two rounds of approval-free tools (read_file, list_dir) + final text.
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(
-            &app_clone,
-            json!({
-                "message": "do stuff",
-                "context": {
-                    "test_llm_rounds": [
-                        {
-                            "tool_calls": [
-                                tool_call("tc1", "read_file", json!({"path": "a.txt"}))
-                            ]
-                        },
-                        {
-                            "tool_calls": [
-                                tool_call("tc2", "list_dir", json!({"path": "/src"}))
-                            ]
-                        },
-                        { "full_text": "Done!" }
-                    ],
-                    "edge_tools": [
-                        tool_schema("read_file"),
-                        tool_schema("list_dir")
-                    ]
-                }
-            }),
-        )
-        .await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "do stuff",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call("tc1", "read_file", json!({"path": "a.txt"}))
+                        ]
+                    },
+                    {
+                        "tool_calls": [
+                            tool_call("tc2", "list_dir", json!({"path": "/src"}))
+                        ]
+                    },
+                    { "full_text": "Done!" }
+                ],
+                "edge_tools": [
+                    tool_schema("read_file"),
+                    tool_schema("list_dir")
+                ]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Deliver tool results for round 1 (tc1).
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
 
     // Deliver tool results for round 2 (tc2).
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     post_tool_result(&app, "tc2", "main.rs\nlib.rs", "success").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
     assert!(!events.is_empty());
 
     // Wait for async persistence.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let hw = hook_writer.clone();
+    poll_until(|| { let hw = hw.clone(); async move { hw.plans.lock().await.len() > 0 } }, 5).await;
 
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
@@ -3283,7 +3267,6 @@ async fn tool_events_empty_for_text_only() {
         }),
     )
     .await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let plans = tool_writer.plans.lock().await;
     assert!(plans.is_empty(), "no tool events for text-only response");
@@ -3294,36 +3277,34 @@ async fn tool_events_empty_for_text_only() {
 async fn tool_events_persisted_for_tool_calls() {
     let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(
-            &app_clone,
-            json!({
-                "message": "read the file",
-                "context": {
-                    "test_llm_rounds": [
-                        {
-                            "tool_calls": [tool_call("tc1", "read_file", json!({"path": "a.txt"}))]
-                        },
-                        { "full_text": "Done." }
-                    ],
-                    "edge_tools": [tool_schema("read_file")]
-                }
-            }),
-        )
-        .await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "read the file",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc1", "read_file", json!({"path": "a.txt"}))]
+                    },
+                    { "full_text": "Done." }
+                ],
+                "edge_tools": [tool_schema("read_file")]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     post_tool_result(&app, "tc1", "file contents", "success").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
     assert!(!events.is_empty());
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let tw = tool_writer.clone();
+    poll_until(|| { let tw = tw.clone(); async move { tw.plans.lock().await.len() > 0 } }, 5).await;
 
     let plans = tool_writer.plans.lock().await;
     assert_eq!(plans.len(), 1, "one tool event plan persisted");
@@ -3341,40 +3322,38 @@ async fn tool_events_persisted_for_tool_calls() {
 async fn tool_events_multiple_tools_distinct_names() {
     let (app, _hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
 
-    let app_clone = app.clone();
-    let stream_task = tokio::spawn(async move {
-        let resp = chat_stream_start(
-            &app_clone,
-            json!({
-                "message": "check stuff",
-                "context": {
-                    "test_llm_rounds": [
-                        {
-                            "tool_calls": [
-                                tool_call("tc1", "read_file", json!({"path": "a.txt"})),
-                                tool_call("tc2", "list_dir", json!({"path": "."}))
-                            ]
-                        },
-                        { "full_text": "All done." }
-                    ],
-                    "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")]
-                }
-            }),
-        )
-        .await;
-        read_sse_events_from_body(resp.into_body()).await
-    });
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "check stuff",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call("tc1", "read_file", json!({"path": "a.txt"})),
+                            tool_call("tc2", "list_dir", json!({"path": "."}))
+                        ]
+                    },
+                    { "full_text": "All done." }
+                ],
+                "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_sse(&mut rx, "tool_request", 5).await;
     post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
     post_tool_result(&app, "tc2", "dir listing", "success").await;
 
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
         .expect("stream timed out")
-        .expect("stream task failed");
+        .expect("reader task failed");
     assert!(!events.is_empty());
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let tw = tool_writer.clone();
+    poll_until(|| { let tw = tw.clone(); async move { tw.plans.lock().await.len() > 0 } }, 5).await;
 
     let plans = tool_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
