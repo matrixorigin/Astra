@@ -70,6 +70,7 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        state.prefetch_injected,
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,
@@ -148,6 +149,7 @@ fn refresh_runtime_promotion_signals_from_turn(
     stall_events: &[(String, u32)],
     verdict_events: &[super::agentic_verdict_audit::AgenticVerdictAuditEvent],
     budget_pressure: f64,
+    prefetch_injected: bool,
 ) -> Option<RuntimePromotionSignals> {
     let stall_count = stall_events
         .iter()
@@ -161,6 +163,7 @@ fn refresh_runtime_promotion_signals_from_turn(
         stall_count,
         verdict_warning,
         budget_pressure,
+        prefetch_injected,
     );
     let recent_turn = (!tool_call_records.is_empty()
         || stall_count > 0
@@ -1213,6 +1216,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         &state.stall.events,
                         &state.stall.verdict_events,
                         state.telemetry.first_budget_pressure,
+                        state.prefetch_injected,
                     );
                     state.telemetry.runtime_promotion_signals = updated_promotion_signals;
                     observe_gate_cancelled(state, turn_index, prep.turn_start_time, &turn_result);
@@ -1272,6 +1276,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 &state.stall.events,
                 &state.stall.verdict_events,
                 state.telemetry.first_budget_pressure,
+                state.prefetch_injected,
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             state.step_recorder.end_turn(true);
@@ -1355,6 +1360,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 &state.stall.events,
                 &state.stall.verdict_events,
                 state.telemetry.first_budget_pressure,
+                state.prefetch_injected,
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             state.step_recorder.end_turn(false);
@@ -1514,6 +1520,7 @@ mod tests {
             &[],
             &[],
             0.2,
+            false,
         )
         .expect("recent turn signal should be captured");
 
@@ -1554,6 +1561,7 @@ mod tests {
             &[],
             &[],
             0.0,
+            false,
         );
 
         assert!(updated.is_none());

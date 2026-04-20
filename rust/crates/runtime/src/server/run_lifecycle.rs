@@ -433,6 +433,7 @@ fn build_runtime_turn_evaluation_event(
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        state.prefetch_injected,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),

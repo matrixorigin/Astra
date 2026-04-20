@@ -1307,6 +1307,7 @@ pub(super) fn analyze_repl_turn_learning(
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
+        result.prefetch_injected,
     );
 
     ReplTurnLearningSnapshot { routing, eval }

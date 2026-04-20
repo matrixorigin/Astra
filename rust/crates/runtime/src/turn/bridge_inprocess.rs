@@ -1794,6 +1794,7 @@ impl InProcessChatTurnBridge {
                     0, // No stall events in single-call mode.
                     verdict_warning,
                     budget_pressure,
+                    false, // No prefetch in bridge single-call mode.
                 )
             });
             let tool_execution_ms: u64 = merged_tool_results
