@@ -634,7 +634,6 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_commit_review_with_valid_hash() {
-        // A real hash from this repo should resolve and inject the correct diff.
         let root = test_project_root();
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -642,11 +641,22 @@ mod tests {
             .output()
             .unwrap();
         let hash = String::from_utf8(head.stdout).unwrap().trim().to_string();
+
+        // Skip in shallow clones where HEAD~1 doesn't exist (e.g. CI with fetch-depth=1).
+        let has_parent = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_parent {
+            return;
+        }
+
         let msg = format!("review {hash}");
         let ctx = prefetch_context_for_message(&msg, &root).await;
         assert!(ctx.is_some(), "valid hash should produce context");
         let body = ctx.unwrap().body;
-        // The injected diff must reference the requested hash, not some other commit.
         assert!(
             body.contains(&hash[..12]),
             "injected context must contain the requested hash"
@@ -655,7 +665,6 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_commit_review_invalid_hash_returns_none() {
-        // A fake hash should cause git log to fail → return None → no injection.
         let root = test_project_root();
         let ctx = prefetch_context_for_message("review deadbeefdeadbeefdeadbeef00000000000", &root).await;
         assert!(
@@ -666,7 +675,6 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_bare_hash_routes_to_commit_review() {
-        // "review <hash>" with no keyword like "commit" must still route correctly.
         let root = test_project_root();
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -674,6 +682,18 @@ mod tests {
             .output()
             .unwrap();
         let hash = String::from_utf8(head.stdout).unwrap().trim().to_string();
+
+        // Skip in shallow clones where HEAD~1 doesn't exist.
+        let has_parent = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_parent {
+            return;
+        }
+
         let ctx = prefetch_context_for_message(&format!("review {hash}"), &root).await;
         assert!(ctx.is_some());
         assert_eq!(ctx.unwrap().task_type, "code_review");
