@@ -463,6 +463,17 @@ pub struct PlanExecutorHandle {
 /// Create a linked pair of channels for plan executor ↔ REPL communication.
 ///
 /// Returns `(handle, update_tx, cmd_rx)`:
+/// Errors that indicate authentication/credential failure — retrying is pointless.
+fn is_credential_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("could not validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("401")
+}
+
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
@@ -1282,6 +1293,20 @@ async fn plan_executor_task(
                         &failure.partial,
                     );
                     emit_event(&update_tx, &ctx, event);
+
+                    // Bail immediately on authentication/credential errors — retrying is pointless.
+                    if is_credential_error(&failure.error) {
+                        if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                            st.status = TaskStatus::Failed;
+                        }
+                        let _ = update_tx.send(PlanUpdate::PlanError {
+                            error: format!(
+                                "Authentication failed — please re-login: {}",
+                                failure.error
+                            ),
+                        });
+                        return;
+                    }
 
                     // Retry: mark subtask back to Pending so the next loop iteration
                     // picks it up again. Use local turn_retry_counts for LLM turn failures
