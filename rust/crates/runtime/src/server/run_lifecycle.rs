@@ -450,10 +450,20 @@ fn persist_turn_evaluation_journal(session_id: &str, source: &str, state: &Agent
     match astra_services::session_journal::JournalWriter::new(session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
-                eprintln!("  ⚠ turn evaluation journal append failed: {err}");
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    session_id = %session_id,
+                    error = %err,
+                    "turn evaluation journal append failed"
+                );
             }
         }
-        Err(err) => eprintln!("  ⚠ turn evaluation journal init failed: {err}"),
+        Err(err) => tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            session_id = %session_id,
+            error = %err,
+            "turn evaluation journal init failed"
+        ),
     }
 }
 
@@ -581,9 +591,12 @@ async fn configure_runtime_controllers(
         {
             Ok(context) => Some(context),
             Err((status, response)) => {
-                eprintln!(
-                    "[promotion-signals] failed to preload evaluation summaries for {user_id}: {status} {}",
-                    response.0.detail
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    user_id = %user_id,
+                    status = %status,
+                    detail = %response.0.detail,
+                    "promotion-signals preload failed"
                 );
                 None
             }
@@ -631,9 +644,11 @@ async fn persist_runtime_promotion_events(
         let metadata = match serde_json::to_value(promotion) {
             Ok(value) => Some(value),
             Err(err) => {
-                eprintln!(
-                    "[runtime-promotion] failed to serialize promotion event {}: {err}",
-                    promotion.subject_id
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    subject_id = %promotion.subject_id,
+                    error = %err,
+                    "runtime promotion event serialize failed"
                 );
                 continue;
             }
@@ -658,9 +673,12 @@ async fn persist_runtime_promotion_events(
             )
             .await
         {
-            eprintln!(
-                "[runtime-promotion] failed to persist promotion event {}: {status} {}",
-                promotion.subject_id, response.0.detail
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                subject_id = %promotion.subject_id,
+                status = %status,
+                detail = %response.0.detail,
+                "runtime promotion event persist failed"
             );
         }
     }

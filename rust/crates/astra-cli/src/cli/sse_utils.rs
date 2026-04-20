@@ -14,6 +14,24 @@ use tokio_util::sync::CancellationToken;
 /// `\n\n` delimiters, we truncate the buffer to prevent unbounded memory growth.
 const MAX_SSE_BUFFER: usize = 1024 * 1024;
 
+#[inline]
+fn trace_sse_buffer_truncated() {
+    tracing::warn!(
+        target: "astra_cli::sse",
+        max_bytes = MAX_SSE_BUFFER,
+        "sse buffer exceeded; truncated incomplete events"
+    );
+}
+
+#[inline]
+fn trace_sse_server_error_event(message: &str) {
+    tracing::warn!(
+        target: "astra_cli::sse",
+        message = %message,
+        "sse server error event"
+    );
+}
+
 /// Outcome of collecting text from an SSE stream.
 pub struct SseTextResult {
     pub text: String,
@@ -62,12 +80,13 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else {
-            result.stream_error = Some(format!(
-                "SSE stream read failed: {}",
-                chunk.expect_err("error branch checked above")
-            ));
-            break;
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(target: "astra_cli::sse", error = %e, "sse stream read failed");
+                result.stream_error = Some(format!("SSE stream read failed: {e}"));
+                break;
+            }
         };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -78,6 +97,7 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
                 theme::icon_warn(),
                 MAX_SSE_BUFFER
             );
+            trace_sse_buffer_truncated();
             result.truncated = true;
             buffer.clear();
             break;
@@ -117,6 +137,7 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
                                     .and_then(|v| v.as_str())
                                 {
                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
+                                    trace_sse_server_error_event(msg);
                                 }
                             }
                             _ => {}
@@ -178,12 +199,13 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else {
-            result.stream_error = Some(format!(
-                "SSE stream read failed: {}",
-                chunk.expect_err("error branch checked above")
-            ));
-            break;
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(target: "astra_cli::sse", error = %e, "sse stream read failed");
+                result.stream_error = Some(format!("SSE stream read failed: {e}"));
+                break;
+            }
         };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -194,6 +216,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
                 theme::icon_warn(),
                 MAX_SSE_BUFFER
             );
+            trace_sse_buffer_truncated();
             result.truncated = true;
             buffer.clear();
             break;
@@ -235,6 +258,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
                                     .and_then(|v| v.as_str())
                                 {
                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
+                                    trace_sse_server_error_event(msg);
                                 }
                             }
                             _ => {}
@@ -304,12 +328,13 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else {
-            result.stream_error = Some(format!(
-                "SSE stream read failed: {}",
-                chunk.expect_err("error branch checked above")
-            ));
-            break;
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(target: "astra_cli::sse", error = %e, "sse stream read failed");
+                result.stream_error = Some(format!("SSE stream read failed: {e}"));
+                break;
+            }
         };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -319,6 +344,7 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
                 theme::icon_warn(),
                 MAX_SSE_BUFFER
             );
+            trace_sse_buffer_truncated();
             result.truncated = true;
             buffer.clear();
             break;
@@ -356,6 +382,7 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
                                     .and_then(|v| v.as_str())
                                 {
                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
+                                    trace_sse_server_error_event(msg);
                                 }
                             }
                             _ => {}
@@ -433,21 +460,26 @@ pub async fn collect_sse_cancellable(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                tracing::debug!(target: "astra_cli::sse", "sse plan stream cancelled");
                 result.stream_error = Some("Plan generation cancelled".into());
                 result.cancelled = true;
                 break;
             }
             _ = tokio::time::sleep_until(deadline) => {
+                let secs = stream_timeout.as_secs();
+                tracing::warn!(target: "astra_cli::sse", stream_timeout_secs = secs, "sse stream wall-clock timeout");
                 result.stream_error = Some(format!(
                     "Stream timeout after {}s",
-                    stream_timeout.as_secs()
+                    secs
                 ));
                 break;
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
+                let secs = idle_timeout.as_secs();
+                tracing::warn!(target: "astra_cli::sse", idle_timeout_secs = secs, "sse stream idle timeout");
                 result.stream_error = Some(format!(
                     "No data received for {}s",
-                    idle_timeout.as_secs()
+                    secs
                 ));
                 break;
             }
@@ -458,6 +490,12 @@ pub async fn collect_sse_cancellable(
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                         if buffer.len() > MAX_SSE_BUFFER {
+                            eprintln!(
+                                "\r  {} SSE buffer exceeded {} bytes, truncating incomplete events",
+                                theme::icon_warn(),
+                                MAX_SSE_BUFFER
+                            );
+                            trace_sse_buffer_truncated();
                             result.truncated = true;
                             buffer.clear();
                             break;
@@ -500,6 +538,7 @@ pub async fn collect_sse_cancellable(
                                                     .and_then(|v| v.as_str())
                                                 {
                                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
+                                                    trace_sse_server_error_event(msg);
                                                 }
                                             }
                                             _ => {}
@@ -510,6 +549,7 @@ pub async fn collect_sse_cancellable(
                         }
                     }
                     Some(Err(e)) => {
+                        tracing::warn!(target: "astra_cli::sse", error = %e, "sse stream read failed");
                         result.stream_error = Some(format!("SSE stream read failed: {e}"));
                         break;
                     }

@@ -148,7 +148,11 @@ impl AppState {
             fernet_encryptor: FernetTokenEncryptor::new("dev-key-not-for-production")
                 .or_else(|_| FernetTokenEncryptor::new("0123456789abcdef"))
                 .unwrap_or_else(|e| {
-                    eprintln!("  ⚠ fallback encryption init failed: {e}; using insecure default");
+                    tracing::warn!(
+                        target: "astra_runtime::app_state",
+                        error = %e,
+                        "fallback encryption init failed; using insecure default key"
+                    );
                     // Last resort: use a deterministic key so the app doesn't crash.
                     FernetTokenEncryptor::new("abcdefghijklmnop").expect("hardcoded key must work")
                 }),
