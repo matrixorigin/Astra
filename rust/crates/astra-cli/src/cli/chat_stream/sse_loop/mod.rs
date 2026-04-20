@@ -198,7 +198,7 @@ pub(crate) async fn stream_chat_sse(
     let mut prefetch_injected = false;
     if !p.plan_only_chat {
         if let Some(ctx) =
-            crate::context_prefetch::prefetch_context_for_message(p.message, &project_root)
+            crate::context_prefetch::prefetch_context_for_message(p.message, &project_root).await
         {
             crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
             prefetch_injected = true;

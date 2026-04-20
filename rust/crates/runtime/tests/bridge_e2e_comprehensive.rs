@@ -10054,7 +10054,7 @@ async fn d3_semantic_dedup_pre_check_returns_cached() {
 
 /// D3: Non-cacheable tools (bash, write_file) are never flagged.
 #[tokio::test]
-async fn d3_semantic_dedup_non_cacheable_tools_ignored() {
+async fn d3_semantic_dedup_non_read_only_tools_ignored() {
     use astra_text_utils::semantic_dedup::SemanticDedup;
 
     let mut dedup = SemanticDedup::new(0.75);

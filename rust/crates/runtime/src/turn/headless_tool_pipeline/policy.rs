@@ -2,7 +2,7 @@ use astra_core::agent_warn;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
 use super::super::headless_tool_assembly::{
-    CACHEABLE_TOOLS, headless_idempotency_hit_openai_pair,
+    READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
     openai_tool_roundtrip_values, unknown_local_tool_error_message,
 };
@@ -177,7 +177,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
-        if CACHEABLE_TOOLS.contains(&slot.name.as_str())
+        if READ_ONLY_TOOLS.contains(&slot.name.as_str())
             && let Some(cached) = self.ctx.idempotency_cache.check(&idem_key)
         {
             if !self.ctx.quiet {
@@ -215,7 +215,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        if CACHEABLE_TOOLS.contains(&slot.name.as_str())
+        if READ_ONLY_TOOLS.contains(&slot.name.as_str())
             && let Some((prev_turn, cached_output)) =
                 self.ctx
                     .semantic_dedup

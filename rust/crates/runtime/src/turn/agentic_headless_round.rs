@@ -280,7 +280,7 @@ pub(crate) fn partition_tool_batches(
     indices: &[HeadlessRoundToolIdx],
     tool_calls: &[Value],
 ) -> Vec<ToolBatch> {
-    use super::headless_tool_assembly::CACHEABLE_TOOLS;
+    use super::headless_tool_assembly::READ_ONLY_TOOLS;
 
     let mut batches = Vec::new();
     let mut concurrent_buf: Vec<HeadlessRoundToolIdx> = Vec::new();
@@ -296,7 +296,7 @@ pub(crate) fn partition_tool_batches(
             HeadlessRoundToolIdx::SyntheticEdge(_) => "synthetic_edge",
         };
 
-        let is_readonly = CACHEABLE_TOOLS.contains(&tool_name) || tool_name == "synthetic_edge";
+        let is_readonly = READ_ONLY_TOOLS.contains(&tool_name) || tool_name == "synthetic_edge";
 
         if is_readonly {
             concurrent_buf.push(idx);

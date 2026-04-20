@@ -2,7 +2,7 @@ use super::*;
 use astra_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
-use astra_runtime::turn::headless_tool_assembly::CACHEABLE_TOOLS;
+use astra_runtime::turn::headless_tool_assembly::READ_ONLY_TOOLS;
 use astra_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
 };
@@ -1558,7 +1558,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Cache hit for read-only (cacheable) tools
-        if CACHEABLE_TOOLS.contains(&tool)
+        if READ_ONLY_TOOLS.contains(&tool)
             && let Some((cached_output, cached_status)) =
                 self.tool_cache.output_cache.get(&dedup_sig).cloned()
         {
@@ -1939,7 +1939,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Store successful cacheable tool results for cross-turn dedup.
-        if allowed && status != "error" && CACHEABLE_TOOLS.contains(&tool) {
+        if allowed && status != "error" && READ_ONLY_TOOLS.contains(&tool) {
             self.tool_cache
                 .output_cache
                 .insert(dedup_sig.clone(), (output.clone(), status.clone()));
@@ -6876,14 +6876,14 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[test]
-    fn edge_tool_cache_cacheable_tools_lookup() {
+    fn edge_tool_cache_read_only_tools_lookup() {
         // Verify that well-known cacheable tools are in the set
-        assert!(CACHEABLE_TOOLS.contains(&"read_file"));
-        assert!(CACHEABLE_TOOLS.contains(&"grep"));
-        assert!(CACHEABLE_TOOLS.contains(&"glob"));
-        assert!(CACHEABLE_TOOLS.contains(&"git_log"));
+        assert!(READ_ONLY_TOOLS.contains(&"read_file"));
+        assert!(READ_ONLY_TOOLS.contains(&"grep"));
+        assert!(READ_ONLY_TOOLS.contains(&"glob"));
+        assert!(READ_ONLY_TOOLS.contains(&"git_log"));
         // bash is NOT cacheable (side effects)
-        assert!(!CACHEABLE_TOOLS.contains(&"bash"));
+        assert!(!READ_ONLY_TOOLS.contains(&"bash"));
     }
 
     #[test]

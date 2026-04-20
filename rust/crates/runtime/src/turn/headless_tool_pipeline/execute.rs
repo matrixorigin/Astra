@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
-use super::super::headless_tool_assembly::CACHEABLE_TOOLS;
+use super::super::headless_tool_assembly::READ_ONLY_TOOLS;
 use super::super::headless_tool_postprocess::{
     HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
     enrich_headless_tool_output_for_errors_and_limits,
@@ -70,7 +70,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         .await;
 
         let tool_start = Instant::now();
-        let tool_idem_key = if CACHEABLE_TOOLS.contains(&execution.name.as_str()) {
+        let tool_idem_key = if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
             Some(idem_key.cache_key())
         } else {
             None

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
 use super::super::headless_tool_assembly::{
-    CACHEABLE_TOOLS, openai_tool_roundtrip_values_with_result_fields,
+    READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
 };
 use super::super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::super::headless_tool_journal::journal_record_executed_tool_call;
@@ -152,7 +152,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             try_write_light_headless_step_checkpoint(sid, self.ctx.step_recorder);
         }
 
-        if !is_err && CACHEABLE_TOOLS.contains(&execution.name.as_str()) {
+        if !is_err && READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
             record_headless_cacheable_success_and_semantic_hint(
                 &execution.name,
                 &execution.args,

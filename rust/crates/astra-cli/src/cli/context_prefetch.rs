@@ -8,7 +8,7 @@
 //! the first LLM call rather than letting the model discover it over many tool rounds.
 
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 
 use astra_runtime::prompts::detect_task_type;
 use serde_json::Value;
@@ -35,17 +35,17 @@ pub struct PrefetchedContext {
 /// context that eliminates the need for the LLM to call tools in early rounds.
 ///
 /// Returns `Some(PrefetchedContext)` when context was gathered, `None` otherwise.
-pub fn prefetch_context_for_message(
+pub async fn prefetch_context_for_message(
     message: &str,
     project_root: &Path,
 ) -> Option<PrefetchedContext> {
     let task_type = detect_task_type(message)?;
     let body = match task_type {
-        "code_review" => prefetch_code_review_context(message, project_root)?,
-        "exploration" => prefetch_exploration_context(message, project_root)?,
-        "debugging" => prefetch_debugging_context(message, project_root)?,
-        "implementation" => prefetch_implementation_context(project_root)?,
-        "analysis" => prefetch_exploration_context(message, project_root)?,
+        "code_review" => prefetch_code_review_context(message, project_root).await?,
+        "exploration" => prefetch_exploration_context(message, project_root).await?,
+        "debugging" => prefetch_debugging_context(message, project_root).await?,
+        "implementation" => prefetch_implementation_context(project_root).await?,
+        "analysis" => prefetch_exploration_context(message, project_root).await?,
         _ => return None,
     };
     Some(PrefetchedContext { task_type, body })
@@ -97,39 +97,41 @@ pub fn inject_prefetched_context(messages: &mut [Value], ctx: &PrefetchedContext
 // ─── Code Review ─────────────────────────────────────────────────────────────
 
 /// Pre-fetch git context for code review tasks.
-fn prefetch_code_review_context(message: &str, project_root: &Path) -> Option<String> {
-    if !is_git_repo(project_root) {
+async fn prefetch_code_review_context(message: &str, project_root: &Path) -> Option<String> {
+    if !is_git_repo(project_root).await {
         return None;
     }
 
     let lower = message.to_lowercase();
 
     if mentions_commit(&lower) {
-        prefetch_commit_review(project_root)
+        prefetch_commit_review(project_root).await
     } else if mentions_pr(&lower) {
-        prefetch_branch_diff(project_root)
+        prefetch_branch_diff(project_root).await
     } else if mentions_local_changes(&lower) {
-        prefetch_working_changes(project_root)
+        prefetch_working_changes(project_root).await
     } else {
-        prefetch_commit_review(project_root)
+        prefetch_commit_review(project_root).await
     }
 }
 
-fn prefetch_commit_review(project_root: &Path) -> Option<String> {
+async fn prefetch_commit_review(project_root: &Path) -> Option<String> {
     let log = run_git(
         project_root,
         &["log", "-1", "--format=%H%n%an <%ae>%n%ai%n%s%n%n%b"],
         MAX_LOG_BYTES,
-    )?;
+    )
+    .await?;
 
     let stat = run_git(
         project_root,
         &["diff", "--stat", "HEAD~1..HEAD"],
         MAX_LOG_BYTES,
     )
+    .await
     .unwrap_or_default();
 
-    let diff = run_git(project_root, &["diff", "HEAD~1..HEAD"], MAX_DIFF_BYTES)?;
+    let diff = run_git(project_root, &["diff", "HEAD~1..HEAD"], MAX_DIFF_BYTES).await?;
 
     let mut ctx = String::with_capacity(log.len() + stat.len() + diff.len() + 200);
     ctx.push_str("## Latest Commit\n\n```\n");
@@ -143,10 +145,10 @@ fn prefetch_commit_review(project_root: &Path) -> Option<String> {
     Some(ctx)
 }
 
-fn prefetch_branch_diff(project_root: &Path) -> Option<String> {
-    let default_branch = detect_default_branch(project_root)?;
+async fn prefetch_branch_diff(project_root: &Path) -> Option<String> {
+    let default_branch = detect_default_branch(project_root).await?;
 
-    let merge_base = run_git(project_root, &["merge-base", &default_branch, "HEAD"], 256)?;
+    let merge_base = run_git(project_root, &["merge-base", &default_branch, "HEAD"], 256).await?;
     let merge_base = merge_base.trim();
 
     let log = run_git(
@@ -154,6 +156,7 @@ fn prefetch_branch_diff(project_root: &Path) -> Option<String> {
         &["log", "--oneline", &format!("{merge_base}..HEAD")],
         MAX_LOG_BYTES,
     )
+    .await
     .unwrap_or_default();
 
     let stat = run_git(
@@ -161,13 +164,15 @@ fn prefetch_branch_diff(project_root: &Path) -> Option<String> {
         &["diff", "--stat", &format!("{merge_base}..HEAD")],
         MAX_LOG_BYTES,
     )
+    .await
     .unwrap_or_default();
 
     let diff = run_git(
         project_root,
         &["diff", &format!("{merge_base}..HEAD")],
         MAX_DIFF_BYTES,
-    )?;
+    )
+    .await?;
 
     let mut ctx = String::with_capacity(log.len() + stat.len() + diff.len() + 300);
     ctx.push_str(&format!(
@@ -183,19 +188,19 @@ fn prefetch_branch_diff(project_root: &Path) -> Option<String> {
     Some(ctx)
 }
 
-fn prefetch_working_changes(project_root: &Path) -> Option<String> {
-    let staged = run_git(project_root, &["diff", "--cached"], MAX_DIFF_BYTES);
-    let unstaged = run_git(project_root, &["diff"], MAX_DIFF_BYTES);
+async fn prefetch_working_changes(project_root: &Path) -> Option<String> {
+    let staged = run_git(project_root, &["diff", "--cached"], MAX_DIFF_BYTES).await;
+    let unstaged = run_git(project_root, &["diff"], MAX_DIFF_BYTES).await;
 
     let staged_text = staged.unwrap_or_default();
     let unstaged_text = unstaged.unwrap_or_default();
 
     if staged_text.is_empty() && unstaged_text.is_empty() {
-        return prefetch_commit_review(project_root);
+        return prefetch_commit_review(project_root).await;
     }
 
     let stat =
-        run_git(project_root, &["diff", "--stat", "HEAD"], MAX_LOG_BYTES).unwrap_or_default();
+        run_git(project_root, &["diff", "--stat", "HEAD"], MAX_LOG_BYTES).await.unwrap_or_default();
 
     let mut ctx = String::with_capacity(staged_text.len() + unstaged_text.len() + stat.len() + 200);
     ctx.push_str("## Working Directory Changes\n\n### Changed Files\n\n```\n");
@@ -220,11 +225,11 @@ fn prefetch_working_changes(project_root: &Path) -> Option<String> {
 // ─── Exploration ─────────────────────────────────────────────────────────────
 
 /// Pre-fetch project structure and key files for exploration/understanding tasks.
-fn prefetch_exploration_context(_message: &str, project_root: &Path) -> Option<String> {
+async fn prefetch_exploration_context(_message: &str, project_root: &Path) -> Option<String> {
     let mut ctx = String::with_capacity(MAX_TREE_BYTES + MAX_FILE_BYTES * 3);
 
     // Project directory structure (2 levels deep)
-    if let Some(tree) = get_project_tree(project_root) {
+    if let Some(tree) = get_project_tree(project_root).await {
         ctx.push_str("## Project Structure\n\n```\n");
         ctx.push_str(&tree);
         ctx.push_str("\n```\n\n");
@@ -249,11 +254,11 @@ fn prefetch_exploration_context(_message: &str, project_root: &Path) -> Option<S
     }
 
     // Git info
-    if is_git_repo(project_root) {
-        if let Some(branch) = run_git(project_root, &["branch", "--show-current"], 256) {
+    if is_git_repo(project_root).await {
+        if let Some(branch) = run_git(project_root, &["branch", "--show-current"], 256).await {
             ctx.push_str(&format!("## Git\n\nCurrent branch: `{}`\n", branch.trim()));
         }
-        if let Some(log) = run_git(project_root, &["log", "--oneline", "-10"], MAX_LOG_BYTES) {
+        if let Some(log) = run_git(project_root, &["log", "--oneline", "-10"], MAX_LOG_BYTES).await {
             ctx.push_str("\nRecent commits:\n```\n");
             ctx.push_str(&log);
             ctx.push_str("```\n\n");
@@ -267,19 +272,19 @@ fn prefetch_exploration_context(_message: &str, project_root: &Path) -> Option<S
 
 /// Pre-fetch context useful for debugging: recent changes, project structure,
 /// and git status (uncommitted changes that may have introduced the bug).
-fn prefetch_debugging_context(message: &str, project_root: &Path) -> Option<String> {
+async fn prefetch_debugging_context(message: &str, project_root: &Path) -> Option<String> {
     let mut ctx = String::with_capacity(MAX_DIFF_BYTES + MAX_TREE_BYTES);
 
     // Project structure (helps LLM find relevant files)
-    if let Some(tree) = get_project_tree(project_root) {
+    if let Some(tree) = get_project_tree(project_root).await {
         ctx.push_str("## Project Structure\n\n```\n");
         ctx.push_str(&tree);
         ctx.push_str("\n```\n\n");
     }
 
-    if is_git_repo(project_root) {
+    if is_git_repo(project_root).await {
         // Git status — shows uncommitted changes that may be the bug source
-        if let Some(status) = run_git(project_root, &["status", "--short"], MAX_LOG_BYTES) {
+        if let Some(status) = run_git(project_root, &["status", "--short"], MAX_LOG_BYTES).await {
             if !status.trim().is_empty() {
                 ctx.push_str("## Uncommitted Changes\n\n```\n");
                 ctx.push_str(&status);
@@ -289,18 +294,19 @@ fn prefetch_debugging_context(message: &str, project_root: &Path) -> Option<Stri
 
         // Recent changes — diff of uncommitted work
         let has_uncommitted = run_git(project_root, &["diff", "--stat", "HEAD"], 1024)
+            .await
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
 
         if has_uncommitted {
-            if let Some(diff) = run_git(project_root, &["diff", "HEAD"], MAX_DIFF_BYTES) {
+            if let Some(diff) = run_git(project_root, &["diff", "HEAD"], MAX_DIFF_BYTES).await {
                 ctx.push_str("## Current Diff (uncommitted)\n\n```diff\n");
                 ctx.push_str(&diff);
                 ctx.push_str("\n```\n\n");
             }
         } else {
             // No uncommitted changes — show recent commit diffs
-            if let Some(log) = run_git(project_root, &["log", "--oneline", "-5"], MAX_LOG_BYTES) {
+            if let Some(log) = run_git(project_root, &["log", "--oneline", "-5"], MAX_LOG_BYTES).await {
                 ctx.push_str("## Recent Commits\n\n```\n");
                 ctx.push_str(&log);
                 ctx.push_str("```\n\n");
@@ -324,10 +330,10 @@ fn prefetch_debugging_context(message: &str, project_root: &Path) -> Option<Stri
 
 /// Pre-fetch project structure for implementation tasks — helps the LLM
 /// know where to create/modify files without needing to explore first.
-fn prefetch_implementation_context(project_root: &Path) -> Option<String> {
+async fn prefetch_implementation_context(project_root: &Path) -> Option<String> {
     let mut ctx = String::with_capacity(MAX_TREE_BYTES + MAX_FILE_BYTES);
 
-    if let Some(tree) = get_project_tree(project_root) {
+    if let Some(tree) = get_project_tree(project_root).await {
         ctx.push_str("## Project Structure\n\n```\n");
         ctx.push_str(&tree);
         ctx.push_str("\n```\n\n");
@@ -346,21 +352,23 @@ fn prefetch_implementation_context(project_root: &Path) -> Option<String> {
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────
 
-fn is_git_repo(dir: &Path) -> bool {
+async fn is_git_repo(dir: &Path) -> bool {
     Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(dir)
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn detect_default_branch(project_root: &Path) -> Option<String> {
+async fn detect_default_branch(project_root: &Path) -> Option<String> {
     for branch in &["main", "master"] {
         let result = Command::new("git")
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
             .current_dir(project_root)
-            .output();
+            .output()
+            .await;
         if result.map(|o| o.status.success()).unwrap_or(false) {
             return Some(branch.to_string());
         }
@@ -370,14 +378,16 @@ fn detect_default_branch(project_root: &Path) -> Option<String> {
         &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
         256,
     )
+    .await
     .map(|s| s.trim().trim_start_matches("origin/").to_string())
 }
 
-fn run_git(dir: &Path, args: &[&str], max_bytes: usize) -> Option<String> {
+async fn run_git(dir: &Path, args: &[&str], max_bytes: usize) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(dir)
         .output()
+        .await
         .ok()?;
 
     if !output.status.success() {
@@ -392,11 +402,12 @@ fn run_git(dir: &Path, args: &[&str], max_bytes: usize) -> Option<String> {
     truncate_output(raw, max_bytes)
 }
 
-fn run_command(dir: &Path, cmd: &str, args: &[&str], max_bytes: usize) -> Option<String> {
+async fn run_command(dir: &Path, cmd: &str, args: &[&str], max_bytes: usize) -> Option<String> {
     let output = Command::new(cmd)
         .args(args)
         .current_dir(dir)
         .output()
+        .await
         .ok()?;
 
     if !output.status.success() {
@@ -425,7 +436,7 @@ fn truncate_output(raw: Vec<u8>, max_bytes: usize) -> Option<String> {
 }
 
 /// Get a 2-level-deep directory listing, ignoring common noise dirs.
-fn get_project_tree(project_root: &Path) -> Option<String> {
+async fn get_project_tree(project_root: &Path) -> Option<String> {
     // Try `find` for a portable 2-level listing (tree may not be installed)
     let output = Command::new("find")
         .args([
@@ -459,6 +470,7 @@ fn get_project_tree(project_root: &Path) -> Option<String> {
         ])
         .current_dir(project_root)
         .output()
+        .await
         .ok()?;
 
     if !output.status.success() {
@@ -577,10 +589,10 @@ mod tests {
 
     // ─── Code Review ─────────────────────────────────────────────
 
-    #[test]
-    fn prefetch_code_review_returns_context() {
+    #[tokio::test]
+    async fn prefetch_code_review_returns_context() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("review latest commit", &root);
+        let ctx = prefetch_context_for_message("review latest commit", &root).await;
         assert!(ctx.is_some(), "should return context for code review");
         let ctx = ctx.unwrap();
         assert_eq!(ctx.task_type, "code_review");
@@ -588,69 +600,69 @@ mod tests {
         assert!(ctx.body.contains("Full Diff"));
     }
 
-    #[test]
-    fn prefetch_no_context_for_greeting() {
+    #[tokio::test]
+    async fn prefetch_no_context_for_greeting() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("hello world", &root);
+        let ctx = prefetch_context_for_message("hello world", &root).await;
         assert!(ctx.is_none());
     }
 
     // ─── Exploration ─────────────────────────────────────────────
 
-    #[test]
-    fn prefetch_exploration_returns_project_structure() {
+    #[tokio::test]
+    async fn prefetch_exploration_returns_project_structure() {
         let root = test_project_root();
         // "explore the codebase" unambiguously triggers exploration
-        let ctx = prefetch_context_for_message("explore the codebase", &root);
+        let ctx = prefetch_context_for_message("explore the codebase", &root).await;
         assert!(ctx.is_some(), "should return context for exploration");
         let ctx = ctx.unwrap();
         assert_eq!(ctx.task_type, "exploration");
         assert!(ctx.body.contains("Project Structure"));
     }
 
-    #[test]
-    fn prefetch_exploration_includes_readme() {
+    #[tokio::test]
+    async fn prefetch_exploration_includes_readme() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("understand the architecture", &root);
+        let ctx = prefetch_context_for_message("understand the architecture", &root).await;
         assert!(ctx.is_some());
         let ctx = ctx.unwrap();
         assert!(ctx.body.contains("README") || ctx.body.contains("Project Structure"));
     }
 
-    #[test]
-    fn prefetch_exploration_chinese() {
+    #[tokio::test]
+    async fn prefetch_exploration_chinese() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("了解一下这个项目", &root);
+        let ctx = prefetch_context_for_message("了解一下这个项目", &root).await;
         assert!(ctx.is_some());
         assert_eq!(ctx.unwrap().task_type, "exploration");
     }
 
     // ─── Debugging ───────────────────────────────────────────────
 
-    #[test]
-    fn prefetch_debugging_returns_context() {
+    #[tokio::test]
+    async fn prefetch_debugging_returns_context() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("debug this error in the code", &root);
+        let ctx = prefetch_context_for_message("debug this error in the code", &root).await;
         assert!(ctx.is_some(), "should return context for debugging");
         let ctx = ctx.unwrap();
         assert_eq!(ctx.task_type, "debugging");
         assert!(ctx.body.contains("Project Structure"));
     }
 
-    #[test]
-    fn prefetch_debugging_chinese() {
+    #[tokio::test]
+    async fn prefetch_debugging_chinese() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("程序崩溃了", &root);
+        let ctx = prefetch_context_for_message("程序崩溃了", &root).await;
         assert!(ctx.is_some());
         assert_eq!(ctx.unwrap().task_type, "debugging");
     }
 
     // ─── Implementation ──────────────────────────────────────────
 
-    #[test]
-    fn prefetch_implementation_returns_structure() {
+    #[tokio::test]
+    async fn prefetch_implementation_returns_structure() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("implement a new feature for authentication", &root);
+        let ctx = prefetch_context_for_message("implement a new feature for authentication", &root).await;
         assert!(ctx.is_some(), "should return context for implementation");
         let ctx = ctx.unwrap();
         assert_eq!(ctx.task_type, "implementation");
@@ -659,10 +671,10 @@ mod tests {
 
     // ─── Analysis ────────────────────────────────────────────────
 
-    #[test]
-    fn prefetch_analysis_returns_structure() {
+    #[tokio::test]
+    async fn prefetch_analysis_returns_structure() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("analyze this code for issues", &root);
+        let ctx = prefetch_context_for_message("analyze this code for issues", &root).await;
         assert!(ctx.is_some());
         let ctx = ctx.unwrap();
         assert_eq!(ctx.task_type, "analysis");
@@ -726,10 +738,10 @@ mod tests {
 
     // ─── Helpers ─────────────────────────────────────────────────
 
-    #[test]
-    fn get_project_tree_works() {
+    #[tokio::test]
+    async fn get_project_tree_works() {
         let root = test_project_root();
-        let tree = get_project_tree(&root);
+        let tree = get_project_tree(&root).await;
         assert!(tree.is_some());
         let tree = tree.unwrap();
         assert!(tree.contains("Cargo.toml") || tree.contains("rust"));

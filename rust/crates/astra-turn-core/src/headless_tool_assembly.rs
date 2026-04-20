@@ -211,9 +211,9 @@ pub fn headless_unknown_local_tool_openai_pair(
     openai_tool_roundtrip_values(tool_call_id, tool_name, err.as_str())
 }
 
-/// Tools that are idempotent reads — safe to cache across turns.
+/// Read-only tools — safe to execute concurrently and cache across turns.
 /// Side-effectful tools must not appear here.
-pub const CACHEABLE_TOOLS: &[&str] = &[
+pub const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
     "grep",
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn cacheable_tools_are_all_read_only() {
+    fn read_only_tools_are_all_read_only() {
         const SIDE_EFFECTFUL: &[&str] = &[
             "bash",
             "write_file",
@@ -816,16 +816,16 @@ mod tests {
             "memory_purge",
             "memory_correct",
         ];
-        for tool in CACHEABLE_TOOLS {
+        for tool in READ_ONLY_TOOLS {
             assert!(
                 !SIDE_EFFECTFUL.contains(tool),
-                "CACHEABLE_TOOLS must not contain side-effectful tool: {tool}"
+                "READ_ONLY_TOOLS must not contain side-effectful tool: {tool}"
             );
         }
     }
 
     #[test]
-    fn cacheable_tools_covers_git_and_github_reads() {
+    fn read_only_tools_covers_git_and_github_reads() {
         for expected in &[
             "git_status",
             "git_diff",
@@ -839,7 +839,7 @@ mod tests {
             "github_get_pr",
         ] {
             assert!(
-                CACHEABLE_TOOLS.contains(expected),
+                READ_ONLY_TOOLS.contains(expected),
                 "missing cacheable tool: {expected}"
             );
         }
@@ -964,9 +964,9 @@ mod tests {
     }
 
     #[test]
-    fn cacheable_tools_includes_git_show() {
+    fn read_only_tools_includes_git_show() {
         assert!(
-            CACHEABLE_TOOLS.contains(&"git_show"),
+            READ_ONLY_TOOLS.contains(&"git_show"),
             "git_show should be cacheable (idempotent read of committed content)"
         );
     }
