@@ -194,14 +194,11 @@ fn create_tool_selector_with_quality_internal(
 
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
-    let token = creds
+    let _token = creds
         .profiles
         .get(&name)
         .and_then(|p| p.access_token.as_ref())
         .cloned();
-
-    // Clone calibrator for FallbackSelector before moving into PipelineModules
-    let calibrator_for_selector = calibrator.clone();
 
     let modules = PipelineModules {
         entity_graph,
@@ -212,42 +209,21 @@ fn create_tool_selector_with_quality_internal(
         _skill_watcher: skill_watcher,
     };
 
-    // Use LLM selector only when logged in, with TF-IDF as fast fallback.
-    // FallbackSelector tries LLM first; if it fails or returns empty, uses TF-IDF.
-    // Skill activation is handled by the `skill` tool in the agentic loop, not
-    // by the tool selector.
-    let config = astra_runtime::runtime_config::RuntimeConfig::load();
-    let selector: Box<dyn tool_selector::ToolSelector> = match token {
-        Some(tok) => {
-            let mut llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
-            // Auto-detect cheapest model by pricing_prompt; config override if set.
-            let selector_model = config
-                .tool_selection
-                .selector_model
-                .clone()
-                .or_else(|| pick_cheapest_model(&api, &tok));
-            if let Some(m) = selector_model {
-                llm = llm.with_model(m);
-            }
-            Box::new(
-                tool_selector::FallbackSelector::new(Box::new(llm), Box::new(tfidf))
-                    .with_progressive_calibrator(calibrator_for_selector),
-            )
-        }
-        None => Box::new(tfidf),
-    };
+    // TF-IDF selector only — no LLM-based tool selection.
+    // The previous FallbackSelector(LLM, TfIdf) added an extra LLM API call per turn
+    // just to pick tools, adding 10-80s latency depending on the model. TF-IDF is
+    // fast (<1ms), deterministic, and works well for all common query patterns.
+    // Skill activation is handled by the `skill` tool in the agentic loop.
+    let selector: Box<dyn tool_selector::ToolSelector> = Box::new(tfidf);
 
     (selector, modules)
 }
 
 /// Tool selector for background plan execution.
 ///
-/// When `ctx.entity_graph`, `pattern_library`, and `calibrator` are all `Some`, attaches the
-/// same `Arc`s to [`TfIdfSelector`] so subtasks read the same learned state as the REPL and
-/// the plan learning bridge.
-///
-/// With a non-empty `ctx.token` and unless `ASTRA_BACKGROUND_PLAN_SELECTOR_TFIDF_ONLY` is `1`
-/// or `true`, uses [`FallbackSelector`] + [`LlmToolSelector`] like the foreground REPL.
+/// Uses TF-IDF selector only — no LLM-based tool selection (same as foreground REPL).
+/// Attaches entity_graph, pattern_library, and calibrator `Arc`s when available so
+/// subtasks read the same learned state as the REPL.
 pub(crate) fn create_background_plan_selector(
     ctx: &crate::plan_executor::BackgroundPlanContext,
 ) -> Box<dyn tool_selector::ToolSelector> {
@@ -269,85 +245,7 @@ pub(crate) fn create_background_plan_selector(
             .with_progressive_calibrator(cal.clone());
     }
 
-    let tfidf_only = std::env::var("ASTRA_BACKGROUND_PLAN_SELECTOR_TFIDF_ONLY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if tfidf_only || ctx.token.is_empty() {
-        return Box::new(tfidf);
-    }
-
-    let mut llm = tool_selector::LlmToolSelector::new(ctx.api.clone(), ctx.token.clone());
-    let config = astra_runtime::runtime_config::RuntimeConfig::load();
-    let selector_model = config
-        .tool_selection
-        .selector_model
-        .clone()
-        .or_else(|| pick_cheapest_model(&ctx.api, &ctx.token));
-    if let Some(m) = selector_model {
-        llm = llm.with_model(m);
-    }
-
-    let mut fb = tool_selector::FallbackSelector::new(Box::new(llm), Box::new(tfidf));
-    if let Some(cal) = ctx.calibrator.clone() {
-        fb = fb.with_progressive_calibrator(cal);
-    }
-    Box::new(fb)
-}
-
-/// Pick the model with the smallest context window from /models (proxy for cheapest).
-/// Blocking call — safe to use from sync context when a tokio Handle is available.
-/// Returns None on any error (network, parse, empty list).
-fn pick_cheapest_model(api: &astra_thin_client::ThinClient, token: &str) -> Option<String> {
-    let handle = tokio::runtime::Handle::current();
-    let api = api.clone();
-    let token = token.to_string();
-    std::thread::scope(|s| {
-        s.spawn(move || {
-            handle.block_on(async {
-                let resp = api
-                    .get_models_response_timeout(&token, std::time::Duration::from_secs(3))
-                    .await
-                    .ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
-                let body: serde_json::Value = resp.json().await.ok()?;
-                cheapest_model_from_json(&body)
-            })
-        })
-        .join()
-        .ok()
-        .flatten()
-    })
-}
-
-/// Extract the cheapest active model from a /models response.
-/// Priority: lowest pricing_prompt > smallest context_window (fallback).
-fn cheapest_model_from_json(body: &serde_json::Value) -> Option<String> {
-    let arr = body
-        .as_array()
-        .or_else(|| body.get("models").and_then(|v| v.as_array()))?;
-    arr.iter()
-        .filter(|m| m.get("is_active").and_then(|v| v.as_bool()).unwrap_or(true))
-        .filter_map(|m| {
-            let name = m.get("name").and_then(|v| v.as_str())?;
-            let price = m
-                .get("pricing_prompt")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(f64::MAX);
-            let cw = m
-                .get("context_window")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(i64::MAX);
-            Some((name.to_string(), price, cw))
-        })
-        .min_by(|(_, p1, cw1), (_, p2, cw2)| {
-            p1.partial_cmp(p2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(cw1.cmp(cw2))
-        })
-        .map(|(name, _, _)| name)
+    Box::new(tfidf)
 }
 
 /// Quick check whether the server has at least one LLM model configured.
@@ -1522,87 +1420,5 @@ mod tests {
         for (idx, frame) in frames.iter().enumerate() {
             assert_eq!(frame.lines().count(), idx + 1);
         }
-    }
-
-    // ── cheapest_model_from_json tests ──
-
-    #[test]
-    fn cheapest_model_picks_lowest_pricing_prompt() {
-        let body = serde_json::json!([
-            {"name": "opus", "context_window": 200000, "pricing_prompt": 0.015, "is_active": true},
-            {"name": "sonnet", "context_window": 100000, "pricing_prompt": 0.003, "is_active": true},
-            {"name": "haiku", "context_window": 32000, "pricing_prompt": 0.00025, "is_active": true},
-        ]);
-        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("haiku"));
-    }
-
-    #[test]
-    fn cheapest_model_falls_back_to_context_window_without_pricing() {
-        let body = serde_json::json!([
-            {"name": "opus", "context_window": 200000, "is_active": true},
-            {"name": "haiku", "context_window": 32000, "is_active": true},
-        ]);
-        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("haiku"));
-    }
-
-    #[test]
-    fn cheapest_model_pricing_beats_context_window() {
-        // Large context but cheapest price should win
-        let body = serde_json::json!([
-            {"name": "small-expensive", "context_window": 8000, "pricing_prompt": 0.01, "is_active": true},
-            {"name": "large-cheap", "context_window": 1000000, "pricing_prompt": 0.0001, "is_active": true},
-        ]);
-        assert_eq!(
-            cheapest_model_from_json(&body).as_deref(),
-            Some("large-cheap")
-        );
-    }
-
-    #[test]
-    fn cheapest_model_skips_inactive() {
-        let body = serde_json::json!([
-            {"name": "haiku", "context_window": 32000, "pricing_prompt": 0.0001, "is_active": false},
-            {"name": "sonnet", "context_window": 100000, "pricing_prompt": 0.003, "is_active": true},
-        ]);
-        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("sonnet"));
-    }
-
-    #[test]
-    fn cheapest_model_handles_nested_models_key() {
-        let body = serde_json::json!({
-            "models": [
-                {"name": "gpt-4o-mini", "context_window": 16000, "is_active": true},
-                {"name": "gpt-4o", "context_window": 128000, "is_active": true},
-            ]
-        });
-        assert_eq!(
-            cheapest_model_from_json(&body).as_deref(),
-            Some("gpt-4o-mini")
-        );
-    }
-
-    #[test]
-    fn cheapest_model_returns_none_on_empty() {
-        assert_eq!(cheapest_model_from_json(&serde_json::json!([])), None);
-        assert_eq!(cheapest_model_from_json(&serde_json::json!({})), None);
-        assert_eq!(cheapest_model_from_json(&serde_json::json!("bad")), None);
-    }
-
-    #[test]
-    fn cheapest_model_defaults_inactive_to_true() {
-        let body = serde_json::json!([
-            {"name": "flash", "context_window": 8000},
-            {"name": "pro", "context_window": 200000},
-        ]);
-        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("flash"));
-    }
-
-    #[test]
-    fn cheapest_model_same_price_picks_smaller_context() {
-        let body = serde_json::json!([
-            {"name": "a", "pricing_prompt": 0.001, "context_window": 128000, "is_active": true},
-            {"name": "b", "pricing_prompt": 0.001, "context_window": 32000, "is_active": true},
-        ]);
-        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("b"));
     }
 }
