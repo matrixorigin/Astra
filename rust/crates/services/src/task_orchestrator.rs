@@ -538,6 +538,14 @@ impl TaskService for MatrixOneTaskService {
         .await
         .map_err(|e| format!("create_task: {e}"))?;
 
+        tracing::info!(
+            target: "astra_services::task_orchestrator",
+            task_id = %task_id,
+            user_id,
+            session_id,
+            "durable task created"
+        );
+
         Ok(task_id)
     }
 
@@ -610,6 +618,14 @@ impl TaskService for MatrixOneTaskService {
             .await
             .map_err(|e| format!("update_status: {e}"))?;
         }
+        if status.is_terminal() {
+            tracing::info!(
+                target: "astra_services::task_orchestrator",
+                task_id,
+                status = status.as_str(),
+                "task status terminal"
+            );
+        }
         Ok(())
     }
 
@@ -681,6 +697,13 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("fail_task: {e}"))?;
+        let preview: String = error.chars().take(200).collect();
+        tracing::warn!(
+            target: "astra_services::task_orchestrator",
+            task_id,
+            error = %preview,
+            "task marked failed"
+        );
         Ok(())
     }
 
@@ -693,6 +716,11 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_task: {e}"))?;
+        tracing::info!(
+            target: "astra_services::task_orchestrator",
+            task_id,
+            "task completed"
+        );
         Ok(())
     }
 
@@ -717,6 +745,15 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_plan_run: {e}"))?;
+        tracing::info!(
+            target: "astra_services::task_orchestrator",
+            task_id,
+            outcome = outcome.as_str(),
+            progress_pct,
+            items_done,
+            items_total,
+            "plan run completed"
+        );
         Ok(())
     }
 

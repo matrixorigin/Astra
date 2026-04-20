@@ -832,6 +832,14 @@ impl ThinClient {
                         let delay_secs =
                             parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
                         if !quiet {
+                            tracing::warn!(
+                                target: "astra.thin_client",
+                                status = 429u16,
+                                delay_secs,
+                                attempt = attempt + 1,
+                                max_attempts,
+                                "rate limited, retrying"
+                            );
                             eprintln!("  ⏳ Rate limited (429), retrying in {delay_secs}s…");
                         }
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -843,6 +851,14 @@ impl ThinClient {
                     if attempt + 1 < max_attempts && e.is_transport() {
                         let delay_secs = 1u64 << attempt; // 1s, 2s, 4s…
                         if !quiet {
+                            tracing::warn!(
+                                target: "astra.thin_client",
+                                error = %e,
+                                delay_secs,
+                                attempt = attempt + 1,
+                                max_attempts,
+                                "transport error, retrying"
+                            );
                             eprintln!("  ⏳ Transport error, retrying in {delay_secs}s… ({e})");
                         }
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;

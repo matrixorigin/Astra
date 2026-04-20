@@ -4,6 +4,8 @@
 //! - Fill `request_id` on [`astra_core::ErrorResponse`] bodies, or
 //! - Insert `request_id` on top-level JSON **objects** that omit it (generic errors).
 
+use std::time::Instant;
+
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::header::CONTENT_TYPE;
@@ -11,10 +13,16 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 use http_body_util::BodyExt;
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Maximum length for a client-supplied `x-request-id` (after trim).
 const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// High-frequency probe paths: skip the `astra.http.access` line to cut log volume (span + headers unchanged).
+fn should_emit_http_access_line(path: &str) -> bool {
+    path != "/health"
+}
 
 /// Populated by [`request_trace_middleware`] for handlers that need explicit access.
 #[derive(Clone, Debug)]
@@ -130,16 +138,43 @@ fn try_enrich_json_body(collected: &[u8], request_id: &str) -> Option<Vec<u8>> {
 
 /// Ensures every request has a `RequestTrace` extension and echoes `x-request-id`.
 ///
+/// Installs a per-request [`tracing::Span`] (`http.request`) with `request_id`, HTTP method,
+/// and path so nested `tracing` events correlate with the request. Emits one access line per
+/// request at target `astra.http.access` (latency + status).
+///
 /// For `4xx`/`5xx` responses with `Content-Type: application/json`, attempts to attach
 /// `request_id` to structured error bodies (see module docs).
 pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response {
     let request_id = resolve_request_id(req.headers());
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
 
     req.extensions_mut().insert(RequestTrace {
         request_id: request_id.clone(),
     });
 
-    let mut res = next.run(req).await;
+    let span = tracing::info_span!(
+        "http.request",
+        request_id = %request_id,
+        http.method = %method.as_str(),
+        http.route = %path,
+    );
+
+    let start = Instant::now();
+    let mut res = next.run(req).instrument(span).await;
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    if should_emit_http_access_line(path.as_str()) {
+        tracing::info!(
+            target: "astra.http.access",
+            request_id = %request_id,
+            http.method = %method.as_str(),
+            http.route = %path,
+            status = res.status().as_u16(),
+            latency_ms,
+            "http request"
+        );
+    }
 
     if let Ok(val) = HeaderValue::from_str(&request_id) {
         res.headers_mut()
@@ -202,6 +237,12 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(request_trace_middleware))
+    }
+
+    #[test]
+    fn health_probe_skips_access_log_line() {
+        assert!(!should_emit_http_access_line("/health"));
+        assert!(should_emit_http_access_line("/api/v1/sessions"));
     }
 
     #[tokio::test]

@@ -1,21 +1,19 @@
-//! Structured logging helpers for consistent diagnostic output.
+//! Structured logging via [`tracing`] for consistent levels, targets, and fields.
 //!
-//! All runtime log output goes through these helpers to ensure consistent
-//! formatting: `[component] LEVEL: message`.  This enables grep-based
-//! filtering and future migration to a structured logging framework.
-//!
-//! # Format
-//! ```text
-//! [journal] ERROR: disk full, journal event lost
-//! [bridge] WARN: Turn exceeded max_tool_rounds (10), forcing completion
-//! [memory] ERROR: fetch error: connection refused
-//! ```
+//! All agent-facing diagnostics use target **`astra.agent`** so operators can tune
+//! `RUST_LOG` (e.g. `astra.agent=debug`). Legacy **`MO_DEBUG=1`** still forces
+//! [`agent_debug!`] to echo a line to stderr when no subscriber is configured.
 
 /// Log an error-level message with component tag.
 #[macro_export]
 macro_rules! agent_error {
     ($component:expr, $($arg:tt)*) => {
-        eprintln!("[{}] ERROR: {}", $component, format_args!($($arg)*))
+        $crate::tracing::error!(
+            target: "astra.agent",
+            component = $component,
+            "{}",
+            format_args!($($arg)*)
+        );
     };
 }
 
@@ -23,7 +21,12 @@ macro_rules! agent_error {
 #[macro_export]
 macro_rules! agent_warn {
     ($component:expr, $($arg:tt)*) => {
-        eprintln!("[{}] WARN: {}", $component, format_args!($($arg)*))
+        $crate::tracing::warn!(
+            target: "astra.agent",
+            component = $component,
+            "{}",
+            format_args!($($arg)*)
+        );
     };
 }
 
@@ -31,43 +34,45 @@ macro_rules! agent_warn {
 #[macro_export]
 macro_rules! agent_info {
     ($component:expr, $($arg:tt)*) => {
-        eprintln!("[{}] INFO: {}", $component, format_args!($($arg)*))
+        $crate::tracing::info!(
+            target: "astra.agent",
+            component = $component,
+            "{}",
+            format_args!($($arg)*)
+        );
     };
 }
 
 /// Log a debug-level message with component tag.
-/// Only emitted when `MO_DEBUG=1` or `RUST_LOG` is set.
+///
+/// When **`MO_DEBUG`** is set, also prints to stderr (for CLIs without a tracing subscriber).
+/// When a subscriber is present, [`tracing::debug!`] respects `RUST_LOG`.
 #[macro_export]
 macro_rules! agent_debug {
-    ($component:expr, $($arg:tt)*) => {
-        if std::env::var("MO_DEBUG").is_ok() || std::env::var("RUST_LOG").is_ok() {
-            eprintln!("[{}] DEBUG: {}", $component, format_args!($($arg)*))
+    ($component:expr, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if std::env::var("MO_DEBUG").is_ok() {
+            eprintln!("[{}] DEBUG: {}", $component, msg);
         }
-    };
+        $crate::tracing::debug!(target: "astra.agent", component = $component, "{}", msg);
+    }};
 }
 
 /// Structured persistence failure log with key=value fields.
-/// Used for critical data-loss paths where structured parsing matters.
 #[macro_export]
 macro_rules! agent_persist_fail {
     ($component:expr, $($key:ident = $val:expr),+ $(,)?) => {
-        eprint!("[{}] PERSIST_FAIL", $component);
-        $(eprint!(" {}={}", stringify!($key), $val);)+
-        eprintln!();
+        $crate::tracing::error!(
+            target: "astra.agent",
+            component = $component,
+            kind = "PERSIST_FAIL",
+            $($key = ?$val),+,
+            "persist failure"
+        );
     };
 }
 
 /// Log-and-discard helper for best-effort persistence calls.
-///
-/// Evaluates `$expr` (an async `Result`). On `Err`, logs a warning with the
-/// component tag, operation label, run ID, and error — then continues.
-/// Persistence failures must not abort control flow, but silent discard
-/// (`let _ = ...`) hides diagnostics.
-///
-/// # Example
-/// ```ignore
-/// log_persist!(engine.persist_status(&id, "running", None, None).await, "bridge", &id, "status");
-/// ```
 #[macro_export]
 macro_rules! log_persist {
     ($expr:expr, $component:expr, $run_id:expr, $op:expr) => {
@@ -78,44 +83,31 @@ macro_rules! log_persist {
 }
 
 /// Structured tool event log with key=value fields.
-/// Used for tool errors, retries, and escalations.
-///
-/// # Example
-/// ```ignore
-/// agent_tool_event!("runtime", "tool_error",
-///     tool = "bash",
-///     category = "Transient",
-///     attempt = 1,
-///     error = "timeout"
-/// );
-/// ```
 #[macro_export]
 macro_rules! agent_tool_event {
     ($component:expr, $event:expr, $($key:ident = $val:expr),+ $(,)?) => {
-        eprint!("[{}] TOOL_EVENT event={}", $component, $event);
-        $(eprint!(" {}={}", stringify!($key), $val);)+
-        eprintln!();
+        $crate::tracing::warn!(
+            target: "astra.agent",
+            component = $component,
+            kind = "TOOL_EVENT",
+            event_kind = %$event,
+            $($key = ?$val),+,
+            "tool event"
+        );
     };
 }
 
 /// Structured escalation event log.
-/// Used when turn guard escalates to Warning or Critical.
-///
-/// # Example
-/// ```ignore
-/// agent_escalation!("turnguard",
-///     severity = "Critical",
-///     nudge_count = 5,
-///     error_count = 3,
-///     force_stop = true
-/// );
-/// ```
 #[macro_export]
 macro_rules! agent_escalation {
     ($component:expr, $($key:ident = $val:expr),+ $(,)?) => {
-        eprint!("[{}] ESCALATION", $component);
-        $(eprint!(" {}={}", stringify!($key), $val);)+
-        eprintln!();
+        $crate::tracing::warn!(
+            target: "astra.agent",
+            component = $component,
+            kind = "ESCALATION",
+            $($key = ?$val),+,
+            "escalation"
+        );
     };
 }
 
@@ -123,7 +115,6 @@ macro_rules! agent_escalation {
 mod tests {
     #[test]
     fn macros_compile_and_format_correctly() {
-        // Just verify they don't panic — output goes to stderr
         agent_error!("test", "something failed: {}", "reason");
         agent_warn!("test", "low disk space");
         agent_info!("test", "session started");
@@ -131,7 +122,12 @@ mod tests {
 
     #[test]
     fn persist_fail_macro_formats_kv() {
-        agent_persist_fail!("bridge", session = "abc123", events = 42, error = "timeout");
+        agent_persist_fail!(
+            "bridge",
+            session = "abc123",
+            events = 42usize,
+            error = "timeout"
+        );
     }
 
     #[test]
@@ -141,7 +137,7 @@ mod tests {
             "tool_error",
             tool = "bash",
             category = "Transient",
-            attempt = 1
+            attempt = 1usize
         );
     }
 
@@ -150,7 +146,7 @@ mod tests {
         agent_escalation!(
             "turnguard",
             severity = "Critical",
-            nudge_count = 5,
+            nudge_count = 5usize,
             force_stop = true
         );
     }

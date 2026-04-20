@@ -538,7 +538,7 @@ pub struct SyncEvent {
     pub timestamp: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncOperation {
     Pull,
@@ -599,7 +599,16 @@ impl SyncOrchestrator {
 
     /// Check cloud health and update availability flag.
     pub async fn check_health(&mut self) -> bool {
+        let prev = self.cloud_available;
         self.cloud_available = self.transport.health_check().await;
+        if prev != self.cloud_available {
+            tracing::info!(
+                target: "astra_services::sync_engine",
+                user_id = %self.user_id,
+                cloud_available = self.cloud_available,
+                "cloud transport health changed"
+            );
+        }
         self.cloud_available
     }
 
@@ -768,6 +777,14 @@ impl SyncOrchestrator {
                 .unwrap_or(false)
                 && attempt < max_retries
             {
+                tracing::info!(
+                    target: "astra_services::sync_engine",
+                    user_id = %self.user_id,
+                    domain = %domain,
+                    attempt = attempt + 1,
+                    max_retries,
+                    "push conflict; pulling fresh data before retry"
+                );
                 // Pull fresh data, merge, then retry
                 let _pull_result = self.pull_domain(domain).await;
                 // After pull+merge, the adapter now has merged state → re-export and push
@@ -971,6 +988,27 @@ impl SyncOrchestrator {
             error: error.map(|s| s.to_string()),
             timestamp: epoch_secs(),
         });
+        if !success {
+            tracing::warn!(
+                target: "astra_services::sync_engine",
+                user_id = %self.user_id,
+                domain = %domain,
+                ?op,
+                duration_ms,
+                err = error.unwrap_or(""),
+                "external sync event failed"
+            );
+        } else {
+            tracing::debug!(
+                target: "astra_services::sync_engine",
+                user_id = %self.user_id,
+                domain = %domain,
+                ?op,
+                duration_ms,
+                bytes,
+                "external sync event ok"
+            );
+        }
     }
 
     fn log_event(
@@ -982,6 +1020,7 @@ impl SyncOrchestrator {
         bytes: u64,
         error: Option<&str>,
     ) {
+        let duration_ms = start.elapsed().as_millis() as u64;
         // Keep bounded event log (last 100 events)
         if self.event_log.len() >= 100 {
             self.event_log.remove(0);
@@ -990,13 +1029,34 @@ impl SyncOrchestrator {
             domain,
             operation: op,
             success,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms,
             bytes_transferred: bytes,
             version_before: None,
             version_after: None,
             error: error.map(|s| s.to_string()),
             timestamp: epoch_secs(),
         });
+        if !success {
+            tracing::warn!(
+                target: "astra_services::sync_engine",
+                user_id = %self.user_id,
+                domain = %domain,
+                ?op,
+                duration_ms,
+                err = error.unwrap_or(""),
+                "sync operation failed"
+            );
+        } else {
+            tracing::debug!(
+                target: "astra_services::sync_engine",
+                user_id = %self.user_id,
+                domain = %domain,
+                ?op,
+                duration_ms,
+                bytes,
+                "sync operation succeeded"
+            );
+        }
     }
 }
 

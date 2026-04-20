@@ -3,6 +3,8 @@
 import { useEffect } from 'react';
 import Link from 'next/link';
 
+import { logger } from '@/lib/logger';
+
 export default function WorkspaceError({
   error,
   reset,
@@ -11,7 +13,11 @@ export default function WorkspaceError({
   reset: () => void;
 }) {
   useEffect(() => {
-    console.error('[workspace error]', error);
+    logger.error('workspace error boundary', {
+      name: error.name,
+      message: error.message,
+      digest: error.digest,
+    });
   }, [error]);
 
   return (

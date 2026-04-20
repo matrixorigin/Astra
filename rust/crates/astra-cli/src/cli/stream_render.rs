@@ -2865,9 +2865,7 @@ impl StreamRenderState {
     ) -> String {
         // Dynamic budget based on terminal width.
         // Layout: "  ✓ {description} {duration}" — prefix ~6 chars, duration ~6 chars.
-        let term_w = crossterm::terminal::size()
-            .map(|(c, _)| c as usize)
-            .unwrap_or(80);
+        let term_w = self.term_width;
         let desc_budget = term_w.saturating_sub(14); // room for prefix + duration
         // Path budget: description budget minus the label prefix (e.g. "Reading: ")
         let path_budget = |prefix_len: usize| desc_budget.saturating_sub(prefix_len).max(20);
@@ -6476,17 +6474,20 @@ mod tests {
     #[test]
     fn format_code_navigation_keeps_medium_position_paths() {
         let r = StreamRenderState::new();
+        // Path must fit within the 80-col budget:
+        // desc_budget = 80 - 14 = 66; "Hover info at " (14) + path + ":42:3" (5) ≤ 66
+        // => path ≤ 47 chars.  This path is 38 chars.
         let hover = r.format_tool_description(
             "hover_info",
             &serde_json::json!({
-                "file": "/moderately/long/path/to/nested/module/file.rs",
+                "file": "/moderately/long/path/to/module/file.rs",
                 "line": 42,
                 "column": 3
             }),
         );
         assert_eq!(
             hover,
-            "Hover info at /moderately/long/path/to/nested/module/file.rs:42:3"
+            "Hover info at /moderately/long/path/to/module/file.rs:42:3"
         );
     }
 

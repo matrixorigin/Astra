@@ -97,13 +97,10 @@ pub fn build_app(state: AppState) -> Router {
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     static TRACING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     TRACING.get_or_init(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new("warn,astra_runtime=info")
-                }),
-            )
-            .try_init();
+        let _ = astra_logging::init_from_env(
+            astra_logging::LogInitConfig::new("warn,astra_runtime=info,astra.http.access=info")
+                .with_service_name("astra-server"),
+        );
     });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -114,9 +111,10 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
         && !proxy.is_empty()
     {
-        eprintln!(
-            "[warn] HTTP proxy detected: {proxy}. \
-             Local callers should set NO_PROXY=127.0.0.1,localhost or use --noproxy."
+        tracing::warn!(
+            target: "astra_runtime::serve",
+            http_proxy = %proxy,
+            "HTTP proxy set; local callers should set NO_PROXY=127.0.0.1,localhost or use --noproxy"
         );
     }
 
@@ -126,8 +124,39 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         astra_services::session_reaper::spawn_session_reaper(pool.clone());
     }
 
-    axum::serve(listener, build_app(state)).await?;
+    axum::serve(listener, build_app(state))
+        .with_graceful_shutdown(http_shutdown_signal())
+        .await?;
+    astra_logging::shutdown_otel();
     Ok(())
+}
+
+/// Completes on SIGTERM (Unix) or Ctrl+C so `axum::serve` can exit cleanly and OTLP can flush.
+async fn http_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_runtime::serve",
+                    error = %e,
+                    "failed to register SIGTERM; graceful stop uses Ctrl+C only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Spawn a background task that periodically cleans up expired data.
@@ -151,14 +180,17 @@ fn spawn_data_cleanup(pool: astra_core::SharedPool) {
             let results = astra_services::cleanup_expired_data(pool.get(), &policy).await;
             let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
             if total > 0 {
-                eprintln!(
-                    "[cleanup] Purged {total} expired rows: {}",
-                    results
-                        .iter()
-                        .filter(|r| r.rows_deleted > 0)
-                        .map(|r| format!("{}={}", r.table, r.rows_deleted))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                let detail = results
+                    .iter()
+                    .filter(|r| r.rows_deleted > 0)
+                    .map(|r| format!("{}={}", r.table, r.rows_deleted))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::info!(
+                    target: "astra_runtime::cleanup",
+                    rows_purged = total,
+                    tables = %detail,
+                    "expired data cleanup"
                 );
             }
         }

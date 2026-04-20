@@ -65,6 +65,10 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     let (token, edge_agent_id, hostname, workspace_dir) = match auth_result {
         Ok(Some(auth)) => auth,
         _ => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                "edge WebSocket auth timeout or closed before edge_auth"
+            );
             let _ = send_edge_msg(
                 &ws_sink,
                 EdgeServerMessage::AuthError {
@@ -84,6 +88,11 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     let user = match state.auth_service.current_user(&headers).await {
         Ok(user) => user,
         Err(_) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                edge_agent_id = %edge_agent_id,
+                "edge WebSocket auth failed: invalid token"
+            );
             let _ = send_edge_msg(
                 &ws_sink,
                 EdgeServerMessage::AuthError {

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 astra-core.workspace = true
+astra-logging.workspace = true
 astra-services.workspace = true
 astra-runtime.workspace = true
 astra-text-utils.workspace = true
@@ -35,6 +36,9 @@ sqlx.workspace = true
 termimad = "0.23"
 unicode-width = "0.1"
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
 tokio-util.workspace = true
 uuid.workspace = true

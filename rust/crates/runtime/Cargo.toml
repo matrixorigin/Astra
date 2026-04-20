@@ -7,6 +7,8 @@ edition.workspace = true
 default = []
 # Full `/chat/turn` ledger inject tests (see `tests/chat_turn_bridge_ledger_inject_e2e.rs`).
 bridge-e2e-hooks = []
+# Enables OTLP trace export via `astra-logging` (build with `--features otel`).
+otel = ["astra-logging/otel"]
 
 [[test]]
 name = "chat_turn_bridge_ledger_inject_e2e"
@@ -31,6 +33,7 @@ path = "src/main.rs"
 dirs = "6.0.0"
 fastrand = "2"
 percent-encoding = "2.3"
+astra-logging.workspace = true
 astra-config.workspace = true
 astra-evolution.workspace = true
 astra-core.workspace = true
@@ -69,7 +72,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 http-body-util.workspace = true
 uuid.workspace = true
 thiserror.workspace = true

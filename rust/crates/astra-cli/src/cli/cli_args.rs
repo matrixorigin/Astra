@@ -3,6 +3,19 @@
 //! All main entry point arguments, subcommands, and their nested argument
 //! types are defined here. These are used by `main.rs` for parsing and
 //! by `command_router.rs` for dispatch.
+//!
+//! ## Observability (flags and environment)
+//!
+//! Applied in [`crate::diagnostic_log::init_cli_observability`] immediately after [`Cli`] is parsed.
+//!
+//! **Priority:** `--log-file` → `ASTRA_LOG_FILE` → (`--diagnostic-log` or `ASTRA_DIAGNOSTIC_LOG=1`) for stderr.
+//!
+//! - **`--log-file <PATH>`** (hidden): append JSON lines to a file; overrides `ASTRA_LOG_FILE` when both are set.
+//! - **`--diagnostic-log`** (hidden): structured [`tracing`] on stderr (`astra-logging`); same effect as `ASTRA_DIAGNOSTIC_LOG=1`.
+//! - **`ASTRA_LOG_FILE`**: same as `--log-file` when the flag is absent.
+//! - **`ASTRA_DIAGNOSTIC_LOG=1`**: stderr diagnostics when no file target is selected.
+//!
+//! See repository `README.md` for `RUST_LOG` / `ASTRA_LOG_FORMAT`.
 
 use clap::{Args, Parser, Subcommand};
 
@@ -79,6 +92,12 @@ pub(crate) struct Cli {
     /// Print startup timing for each initialization phase
     #[arg(long = "startup-trace")]
     pub startup_trace: bool,
+    /// Emit structured tracing to stderr (same as ASTRA_DIAGNOSTIC_LOG=1); hidden from --help
+    #[arg(long = "diagnostic-log", hide = true)]
+    pub diagnostic_log: bool,
+    /// Append JSON tracing lines to this file (overrides ASTRA_LOG_FILE env); hidden from --help
+    #[arg(long = "log-file", value_name = "PATH", hide = true)]
+    pub log_file: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }

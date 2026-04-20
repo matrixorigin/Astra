@@ -1,0 +1,24 @@
+[package]
+name = "astra-logging"
+version.workspace = true
+edition.workspace = true
+description = "Shared tracing subscriber initialization for Astra binaries"
+
+[features]
+default = []
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tokio",
+]
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }

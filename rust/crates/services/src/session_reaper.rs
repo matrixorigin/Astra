@@ -172,9 +172,13 @@ pub fn spawn_session_reaper(pool: astra_core::SharedPool) {
             let r = reap_sessions(pool.get(), &policy).await;
             let total = r.marked_idle + r.marked_ended + r.deleted;
             if total > 0 {
-                eprintln!(
-                    "[session-reaper] sweep: idle={} ended={} deleted={} workspaces_removed={}",
-                    r.marked_idle, r.marked_ended, r.deleted, r.workspaces_removed,
+                tracing::info!(
+                    target: "astra_services::session_reaper",
+                    marked_idle = r.marked_idle,
+                    marked_ended = r.marked_ended,
+                    deleted = r.deleted,
+                    workspaces_removed = r.workspaces_removed,
+                    "session reaper sweep"
                 );
             }
         }

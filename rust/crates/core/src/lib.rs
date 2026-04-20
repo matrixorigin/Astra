@@ -15,6 +15,10 @@ pub mod drift;
 pub mod error_kind;
 pub mod log;
 pub mod runtime_limits;
+
+/// Re-export for [`crate::agent_*!`] macros (call sites do not need a direct `tracing` dependency).
+#[doc(hidden)]
+pub use tracing;
 pub mod session_env_overlay;
 pub mod sync_poison;
 pub use confidence::ConfidenceInterval;

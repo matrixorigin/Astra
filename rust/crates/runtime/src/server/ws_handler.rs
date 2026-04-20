@@ -396,6 +396,10 @@ async fn authenticate(
             Err(())
         }
         Err(_) => {
+            tracing::warn!(
+                target: "astra_runtime::ws_handler",
+                "browser WebSocket auth timeout waiting for first message"
+            );
             send_msg(
                 socket,
                 &WsServerMessage::AuthError {
@@ -450,6 +454,11 @@ async fn authenticate_with_token(
             })
         }
         Err((_status, error)) => {
+            tracing::warn!(
+                target: "astra_runtime::ws_handler",
+                detail = %error.0.detail,
+                "browser WebSocket token rejected"
+            );
             send_msg(
                 socket,
                 &WsServerMessage::AuthError {

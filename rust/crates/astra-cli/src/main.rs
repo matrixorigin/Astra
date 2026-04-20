@@ -77,6 +77,8 @@ mod command_registry;
 mod command_router;
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
+#[path = "cli/diagnostic_log.rs"]
+mod diagnostic_log;
 #[path = "cli/diff_presenter.rs"]
 mod diff_presenter;
 #[path = "cli/durable_bridge.rs"]
@@ -964,11 +966,18 @@ use project_instructions::{
 async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
+    diagnostic_log::init_cli_observability(&cli);
     // Resolve API URL: --api-url flag > ASTRA_API_URL env var > config file > default
     let base = command_router::resolve_api_url(cli.api_url.as_deref());
     let api = match astra_thin_client::ThinClient::new(&base, None) {
         Ok(api) => api,
         Err(err) => {
+            tracing::error!(
+                target: "astra_cli",
+                api_base = %base,
+                error = %err,
+                "invalid API URL or thin client init failed"
+            );
             eprintln!(
                 "{}",
                 format!("Error: invalid API URL '{base}': {err}").red()
@@ -1014,6 +1023,8 @@ async fn main() {
         bare,
         no_instructions,
         startup_trace,
+        diagnostic_log: _,
+        log_file: _,
         command,
     } = cli;
 
@@ -1056,6 +1067,7 @@ async fn main() {
     let system_prompt = system_prompt.map(|sp| match resolve_system_prompt(sp) {
         Ok(content) => content,
         Err(e) => {
+            tracing::error!(target: "astra_cli", error = %e, "failed to resolve --system-prompt");
             eprintln!("{}", e.red());
             std::process::exit(1);
         }
@@ -1145,6 +1157,11 @@ async fn main() {
     // --session-id: validate UUID format and export for REPL to pick up
     if let Some(ref sid) = cli_session_id {
         if uuid::Uuid::parse_str(sid).is_err() {
+            tracing::error!(
+                target: "astra_cli",
+                session_id = %sid,
+                "invalid --session-id (expected UUID)"
+            );
             eprintln!(
                 "{}",
                 format!("Error: --session-id must be a valid UUID, got '{sid}'").red()

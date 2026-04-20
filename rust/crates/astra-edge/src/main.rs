@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::Instrument;
 
 /// Astra remote edge agent — execute tool calls locally for web sessions.
 #[derive(Parser, Debug)]
@@ -108,7 +109,16 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
 
     tracing::info!(url = %url, edge_id = %args.edge_id, "Connecting to server...");
 
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
+        tracing::error!(
+            target: "astra.edge",
+            edge_id = %args.edge_id,
+            url = %url,
+            error = %e,
+            "WebSocket connect failed"
+        );
+        e
+    })?;
     let (mut write, mut read) = ws_stream.split();
 
     tracing::info!("WebSocket connected, authenticating...");
@@ -141,13 +151,29 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                 tracing::info!(user_id = %user_id, "Authenticated successfully");
             }
             Ok(ServerToEdge::AuthError { message }) => {
+                tracing::error!(
+                    target: "astra.edge",
+                    edge_id = %args.edge_id,
+                    detail = %message,
+                    "server rejected edge authentication"
+                );
                 return Err(format!("Authentication failed: {message}").into());
             }
             _ => {
+                tracing::error!(
+                    target: "astra.edge",
+                    edge_id = %args.edge_id,
+                    "unexpected auth response payload"
+                );
                 return Err("Unexpected auth response".into());
             }
         },
         _ => {
+            tracing::error!(
+                target: "astra.edge",
+                edge_id = %args.edge_id,
+                "auth timeout or connection closed before auth_ok"
+            );
             return Err("Auth timeout or connection closed".into());
         }
     }
@@ -268,12 +294,9 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let _ = astra_logging::init_from_env(
+        astra_logging::LogInitConfig::new("info").with_service_name("astra-edge"),
+    );
 
     let args = Args::parse();
 
@@ -286,8 +309,14 @@ async fn main() {
     eprintln!("  workspace: {}", args.workspace_dir.display());
     eprintln!();
 
+    let mut exit_with_error = false;
     loop {
-        match run_edge_connection(&args).await {
+        let edge_span = tracing::info_span!(
+            "edge.agent",
+            edge_id = %args.edge_id,
+            server_url = %args.server_url,
+        );
+        match run_edge_connection(&args).instrument(edge_span).await {
             Ok(()) => {
                 if !args.reconnect {
                     break;
@@ -297,11 +326,17 @@ async fn main() {
             Err(e) => {
                 tracing::error!(error = %e, "Connection error");
                 if !args.reconnect {
-                    std::process::exit(1);
+                    exit_with_error = true;
+                    break;
                 }
                 tracing::info!("Reconnecting in 5s...");
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    astra_logging::shutdown_otel();
+    if exit_with_error {
+        std::process::exit(1);
     }
 }

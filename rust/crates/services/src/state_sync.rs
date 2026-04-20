@@ -651,11 +651,13 @@ impl StateSyncService for MatrixOneSyncService {
                         }
                         Err(e) => {
                             if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                                eprintln!(
-                                    "  ↻ push_learning_versioned retry {} of {}: {}",
-                                    attempt + 1,
-                                    MAX_RETRIES,
-                                    &e
+                                tracing::debug!(
+                                    target: "astra_services::state_sync",
+                                    operation = "push_learning_versioned",
+                                    attempt = attempt + 1,
+                                    max_retries = MAX_RETRIES,
+                                    error = %e,
+                                    "retry after transient DB error"
                                 );
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
@@ -742,11 +744,13 @@ impl StateSyncService for MatrixOneSyncService {
                             }
                             // Check for retryable network error
                             if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                                eprintln!(
-                                    "  ↻ push_learning_versioned (new) retry {} of {}: {}",
-                                    attempt + 1,
-                                    MAX_RETRIES,
-                                    &e
+                                tracing::debug!(
+                                    target: "astra_services::state_sync",
+                                    operation = "push_learning_versioned_new",
+                                    attempt = attempt + 1,
+                                    max_retries = MAX_RETRIES,
+                                    error = %e,
+                                    "retry after transient DB error"
                                 );
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
@@ -825,11 +829,13 @@ impl StateSyncService for MatrixOneSyncService {
                 Ok(None) => return Ok(None),
                 Err(e) => {
                     if attempt < MAX_RETRIES && is_retryable_error(&e) {
-                        eprintln!(
-                            "  ↻ pull_learning_versioned retry {} of {}: {}",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            &e
+                        tracing::debug!(
+                            target: "astra_services::state_sync",
+                            operation = "pull_learning_versioned",
+                            attempt = attempt + 1,
+                            max_retries = MAX_RETRIES,
+                            error = %e,
+                            "retry after transient DB error"
                         );
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);

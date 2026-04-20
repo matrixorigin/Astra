@@ -286,7 +286,11 @@ pub async fn build_server_state(
     let resource_governor =
         astra_services::resource_governor::DatabaseResourceGovernor::new(shared_pool.clone());
     if let Err(e) = resource_governor.ensure_tables().await {
-        eprintln!("[state_builder] resource_governor table init failed: {e}");
+        tracing::warn!(
+            target: "astra_runtime::state_builder",
+            error = %e,
+            "resource_governor table init failed"
+        );
     }
     let resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor> =
         std::sync::Arc::new(resource_governor);
@@ -309,7 +313,12 @@ pub async fn build_server_state(
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     if let Err(e) = team_store.ensure_builtins(&user_id).await {
-        eprintln!("[state_builder] team builtins seed failed: {e}");
+        tracing::warn!(
+            target: "astra_runtime::state_builder",
+            error = %e,
+            user_id = %user_id,
+            "team builtins seed failed"
+        );
     }
     let team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService> =
         Arc::new(team_store);

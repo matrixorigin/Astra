@@ -1,6 +1,9 @@
+use axum::extract::Extension;
+
 use super::*;
 
 pub(super) async fn auth_register_handler(
+    Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     Json(request): Json<AuthRegisterRequest>,
 ) -> Result<(StatusCode, Json<AuthRegisterResponse>), (StatusCode, Json<ErrorResponse>)> {
@@ -19,6 +22,12 @@ pub(super) async fn auth_register_handler(
         .auth_service
         .login(AuthLoginRequestData { username, password })
         .await?;
+    tracing::info!(
+        target: "astra_runtime::auth",
+        request_id = %trace.request_id,
+        user_id = %user.user_id,
+        "user registered"
+    );
     Ok((
         StatusCode::CREATED,
         Json(AuthRegisterResponse {
@@ -35,6 +44,7 @@ pub(super) async fn auth_register_handler(
 }
 
 pub(super) async fn auth_login_handler(
+    Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     Json(request): Json<AuthLoginRequest>,
 ) -> Result<Json<AuthTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -45,10 +55,17 @@ pub(super) async fn auth_login_handler(
             password: request.password,
         })
         .await?;
+    // Intentionally omit username: avoid PII in application logs (correlate via request_id / JWT).
+    tracing::info!(
+        target: "astra_runtime::auth",
+        request_id = %trace.request_id,
+        "login succeeded"
+    );
     Ok(Json(AuthTokenResponse::from(tokens)))
 }
 
 pub(super) async fn auth_refresh_handler(
+    Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     Json(request): Json<AuthRefreshRequest>,
 ) -> Result<Json<AuthTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -58,10 +75,16 @@ pub(super) async fn auth_refresh_handler(
             refresh_token: request.refresh_token,
         })
         .await?;
+    tracing::info!(
+        target: "astra_runtime::auth",
+        request_id = %trace.request_id,
+        "access token refreshed"
+    );
     Ok(Json(AuthTokenResponse::from(tokens)))
 }
 
 pub(super) async fn auth_logout_handler(
+    Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     Json(request): Json<AuthRefreshRequest>,
 ) -> Result<Json<AuthLogoutResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -71,6 +94,11 @@ pub(super) async fn auth_logout_handler(
             refresh_token: request.refresh_token,
         })
         .await?;
+    tracing::info!(
+        target: "astra_runtime::auth",
+        request_id = %trace.request_id,
+        "logout"
+    );
     Ok(Json(AuthLogoutResponse {
         message: "Logged out successfully".to_string(),
     }))
@@ -111,6 +139,12 @@ async fn memory_proxy_call(
         .await
         .map(Json)
         .map_err(|error| {
+            tracing::warn!(
+                target: "astra_runtime::auth",
+                endpoint = endpoint,
+                error = %error,
+                "memory proxy forward failed"
+            );
             if error.contains("not configured") {
                 error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
             } else {

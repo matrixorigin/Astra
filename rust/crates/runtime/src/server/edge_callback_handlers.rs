@@ -5,6 +5,8 @@
 //! [`crate::turn::cloud_tool_delivery`] poll and `remove` keys until `turn_timeout_s` (user id from
 //! `x-mo-user-id` on the chat turn).
 
+use axum::extract::Extension;
+
 use super::*;
 
 use astra_services::session_journal::{
@@ -59,6 +61,7 @@ fn insert_approval_ledger_entry(
 }
 
 pub(super) async fn post_tool_result_handler(
+    Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<astra_thin_client::ToolResultRequest>,
@@ -78,6 +81,15 @@ pub(super) async fn post_tool_result_handler(
         }),
     )
     .map_err(|()| ledger_capacity_error())?;
+    tracing::info!(
+        target: "astra_runtime::edge_callback",
+        request_id = %trace.request_id,
+        user_id = %user.user_id,
+        edge_id = %edge_id,
+        callback_request_id = %body.request_id,
+        kind = "tool_result",
+        "edge tool result callback recorded"
+    );
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,
@@ -85,6 +97,7 @@ pub(super) async fn post_tool_result_handler(
 }
 
 pub(super) async fn post_approval_respond_handler(
+    Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
@@ -144,6 +157,16 @@ pub(super) async fn post_approval_respond_handler(
         body.session_id.is_some(),
     )
     .map_err(|()| ledger_capacity_error())?;
+    tracing::info!(
+        target: "astra_runtime::edge_callback",
+        request_id = %trace.request_id,
+        user_id = %user.user_id,
+        edge_id = %edge_id,
+        callback_request_id = %body.request_id,
+        kind = "approval_respond",
+        ledger_enqueued,
+        "edge approval callback recorded"
+    );
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,

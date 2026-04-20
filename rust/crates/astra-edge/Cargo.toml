@@ -4,19 +4,23 @@ version.workspace = true
 edition.workspace = true
 description = "Lightweight remote edge agent that connects to an Astra server via WebSocket for local tool execution"
 
+[features]
+default = []
+otel = ["astra-logging/otel"]
+
 [[bin]]
 name = "astra-edge"
 path = "src/main.rs"
 
 [dependencies]
+astra-logging.workspace = true
 clap = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["signal", "time"] }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 hostname = { workspace = true }
 reqwest = { workspace = true }

@@ -296,9 +296,10 @@ impl IngestionSender {
     pub fn enqueue(&self, event: IngestionEvent) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
             let n = self.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
-            astra_core::agent_warn!(
-                "event_ingestion",
-                "channel full, event dropped (overflow_count={n})"
+            tracing::warn!(
+                target: "astra_services::event_ingestion",
+                overflow_count = n,
+                "ingestion channel full; event dropped"
             );
         }
     }
@@ -380,6 +381,14 @@ impl EventIngestionWorker {
         let stats_clone = stats.clone();
         let notify = Arc::new(tokio::sync::Notify::new());
 
+        tracing::info!(
+            target: "astra_services::event_ingestion",
+            batch_size = config.batch_size,
+            flush_interval_secs = config.flush_interval_secs,
+            channel_capacity = config.channel_capacity,
+            "event ingestion worker spawned"
+        );
+
         let worker = Self {
             rx,
             pool,
@@ -404,6 +413,11 @@ impl EventIngestionWorker {
         let mut buffer: Vec<IngestionEvent> = Vec::with_capacity(self.config.batch_size);
         let flush_interval = tokio::time::Duration::from_secs(self.config.flush_interval_secs);
 
+        tracing::debug!(
+            target: "astra_services::event_ingestion",
+            "event ingestion worker run loop started"
+        );
+
         loop {
             let deadline = tokio::time::sleep(flush_interval);
             tokio::pin!(deadline);
@@ -420,6 +434,10 @@ impl EventIngestionWorker {
                     if !buffer.is_empty() {
                         self.flush_batch_once(&mut buffer).await;
                     }
+                    tracing::info!(
+                        target: "astra_services::event_ingestion",
+                        "event ingestion worker stopped after shutdown signal"
+                    );
                     break;
                 }
                 Some(event) = self.rx.recv() => {
@@ -441,6 +459,10 @@ impl EventIngestionWorker {
                     if !buffer.is_empty() {
                         self.flush_batch_once(&mut buffer).await;
                     }
+                    tracing::info!(
+                        target: "astra_services::event_ingestion",
+                        "event ingestion worker stopped (channel closed)"
+                    );
                     break;
                 }
             }
@@ -467,6 +489,14 @@ impl EventIngestionWorker {
                 Err(e) => {
                     if attempt + 1 < self.config.max_retries {
                         let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                        tracing::debug!(
+                            target: "astra_services::event_ingestion",
+                            attempt = attempt + 1,
+                            max_retries = self.config.max_retries,
+                            event_count = count,
+                            error = %e,
+                            "batch flush retry after transient error"
+                        );
                         tokio::time::sleep(delay).await;
                     } else {
                         if let Ok(mut s) = self.stats.lock() {
@@ -476,6 +506,13 @@ impl EventIngestionWorker {
                                 self.config.max_retries
                             ));
                         }
+                        tracing::warn!(
+                            target: "astra_services::event_ingestion",
+                            event_count = count,
+                            max_retries = self.config.max_retries,
+                            error = %e,
+                            "batch flush failed after retries"
+                        );
                     }
                 }
             }
@@ -502,6 +539,12 @@ impl EventIngestionWorker {
                     s.errors += 1;
                     s.last_error = Some(format!("shutdown flush failed: {e}"));
                 }
+                tracing::warn!(
+                    target: "astra_services::event_ingestion",
+                    event_count = count,
+                    error = %e,
+                    "shutdown flush failed (single attempt)"
+                );
             }
         }
     }

@@ -103,6 +103,12 @@ pub(super) async fn try_cloud_pull(
             };
         }
     };
+    tracing::info!(
+        target: "astra_cli::cloud_sync",
+        profile = %profile_name,
+        operation = "pull_learning",
+        "starting MatrixOne learning pull"
+    );
     let svc = MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     match StateSyncService::pull_learning_versioned(&svc, &user_id, profile_name).await {
