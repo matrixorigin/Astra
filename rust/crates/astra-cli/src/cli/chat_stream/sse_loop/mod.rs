@@ -191,6 +191,19 @@ pub(crate) async fn stream_chat_sse(
         }
     }
     let mut messages = openai_messages_from_repl_history(p.history, p.message);
+
+    // ─── Context pre-fetch ───────────────────────────────────────────────
+    // For well-known task patterns (code review, etc.), pre-fetch relevant
+    // context locally so the LLM can respond in fewer rounds.
+    if !p.plan_only_chat {
+        if let Some(ctx) = crate::context_prefetch::prefetch_context_for_message(
+            p.message,
+            &project_root,
+        ) {
+            crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
+        }
+    }
+
     let all_schemas = if p.plan_only_chat {
         messages.insert(
             0,

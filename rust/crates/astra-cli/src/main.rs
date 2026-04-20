@@ -202,6 +202,8 @@ mod terminal_region;
 #[path = "cli/theme.rs"]
 mod theme;
 mod tool_safety_guard;
+#[path = "cli/context_prefetch.rs"]
+mod context_prefetch;
 
 use agent_runtime::initialize_multi_agent_runtime;
 use astra_runtime::turn::chat_turn_heuristics::{
