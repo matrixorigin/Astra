@@ -598,6 +598,10 @@ pub(crate) async fn stream_chat_sse(
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
+        // turn_index is 0-based (pre-increment); turn events are written
+        // after state.turn += 1, so add 1 here to keep llm_round.turn
+        // consistent with the turn event's turn number.
+        session_turn: p.turn_index + 1,
         turn_event_buffer: None,
     };
 

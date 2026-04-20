@@ -997,7 +997,7 @@ impl TurnEventBuffer {
             evt.cache_read_tokens = Some(r.cache_read_tokens);
         }
         evt.tool_calls_returned = Some(r.tool_calls_returned);
-        if !r.tool_call_names.is_empty() {
+        if !r.tool_call_names.is_empty() || r.finish_reason.is_some() {
             evt.metadata = Some(serde_json::json!({
                 "tool_call_names": r.tool_call_names,
                 "finish_reason": r.finish_reason,
@@ -5450,6 +5450,137 @@ mod turn_event_buffer_tests {
         assert_eq!(buf.next_batch_id(), "b-1-0");
     }
 
+    /// Regression: llm_round events must carry the session-level turn number,
+    /// not the internal agentic loop iteration count.
+    #[test]
+    fn llm_round_turn_uses_session_turn_number() {
+        // Simulate session turn 7 (the 7th user message in the session)
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-turn"), 7);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(100),
+            duration_ms: 500,
+            prompt_tokens: 5000,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: None,
+        });
+        let events = buf.drain();
+        assert_eq!(
+            events[0].turn,
+            Some(7),
+            "llm_round must use session turn number"
+        );
+    }
+
+    /// Regression: text-only LLM responses (no tool calls) must still record
+    /// an llm_round event so llm_rounds count is correct.
+    #[test]
+    fn text_only_response_records_llm_round() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-text"), 3);
+        // Simulate a text-only response (0 tool calls)
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(48521),
+            duration_ms: 120000,
+            prompt_tokens: 24829,
+            completion_tokens: 1281,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: None,
+        });
+        assert_eq!(
+            buf.current_round(),
+            1,
+            "round must advance even for text-only"
+        );
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens_in, Some(24829));
+        assert_eq!(events[0].tool_calls_returned, Some(0));
+    }
+
+    /// Regression: auto-reflection LLM calls must record llm_round events
+    /// so turn.tokens_in breakdown is complete.
+    #[test]
+    fn auto_reflection_round_has_finish_reason() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-refl"), 2);
+        // Normal round
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(100),
+            duration_ms: 500,
+            prompt_tokens: 10000,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["read_file".into()],
+            finish_reason: None,
+        });
+        // Auto-reflection round
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 0,
+            prompt_tokens: 54000,
+            completion_tokens: 500,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("auto_reflection".into()),
+        });
+        assert_eq!(buf.current_round(), 2);
+        let events = buf.drain();
+        assert_eq!(events.len(), 2);
+        // Verify auto-reflection round has the finish_reason in metadata
+        let refl = &events[1];
+        assert_eq!(refl.round, Some(1));
+        assert_eq!(refl.tokens_in, Some(54000));
+    }
+
+    /// Regression: rate-limited early exit must record an llm_round with
+    /// finish_reason so the journal reflects the LLM call happened.
+    #[test]
+    fn rate_limited_round_records_finish_reason() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-rl"), 2);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(50),
+            duration_ms: 200,
+            prompt_tokens: 8000,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("rate_limited".into()),
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let meta = events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["finish_reason"], "rate_limited");
+        assert_eq!(events[0].tool_calls_returned, Some(0));
+    }
+
+    /// Regression: token-budget-exceeded early exit must record an llm_round.
+    #[test]
+    fn token_budget_exceeded_round_records_finish_reason() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-tb"), 5);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 100,
+            prompt_tokens: 128000,
+            completion_tokens: 50,
+            cache_read_tokens: 64000,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("token_budget_exceeded".into()),
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let meta = events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["finish_reason"], "token_budget_exceeded");
+        assert_eq!(events[0].tokens_in, Some(128000));
+        assert_eq!(events[0].cache_read_tokens, Some(64000));
+    }
+
     #[test]
     fn flush_writes_events_to_journal() {
         let tmp = tempdir().unwrap();
@@ -5557,6 +5688,159 @@ mod turn_event_buffer_tests {
         let content = std::fs::read_to_string(writer.path()).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3);
+    }
+
+    /// E2E regression test using real session data (a33177cc).
+    ///
+    /// Before the fix, llm_round events used 0-based turn numbers while
+    /// turn events used 1-based numbers (state.turn += 1 happens before
+    /// the turn event is written, but after stream_chat_sse returns).
+    ///
+    /// Real data (buggy):
+    ///   llm_round turn=0  ← should be 1
+    ///   turn      turn=1
+    ///   llm_round turn=1  ← should be 2
+    ///   llm_round turn=1  ← should be 2
+    ///   turn      turn=2
+    ///   llm_round turn=2  ← should be 3
+    ///   turn      turn=3
+    #[test]
+    fn e2e_llm_round_turn_matches_turn_event() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-e2e-turn").unwrap();
+
+        // Simulate 3 turns with the FIXED numbering (1-based).
+        // Turn 1: "hi" — 1 round, text-only
+        let mut buf1 = TurnEventBuffer::begin_turn(Some("sess-e2e-turn"), 1);
+        buf1.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(988),
+            duration_ms: 1831,
+            prompt_tokens: 9375,
+            completion_tokens: 11,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("stop".into()),
+        });
+        let obs1 = buf1.drain();
+        writer.append_bulk(&obs1).unwrap();
+        let turn1 = JournalEvent::turn(
+            Some("sess-e2e-turn"),
+            1,
+            Some("qwen-turbo"),
+            "hi",
+            "你好！",
+            0,
+            9375,
+            11,
+            1831,
+        );
+        writer.append(&turn1).unwrap();
+
+        // Turn 2: "描述一下这个项目" — 2 rounds, 1 tool call
+        let mut buf2 = TurnEventBuffer::begin_turn(Some("sess-e2e-turn"), 2);
+        buf2.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(2388),
+            duration_ms: 3500,
+            prompt_tokens: 10070,
+            completion_tokens: 30,
+            cache_read_tokens: 0,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["read_file".into()],
+            finish_reason: None,
+        });
+        buf2.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(1200),
+            duration_ms: 7121,
+            prompt_tokens: 19744,
+            completion_tokens: 539,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("stop".into()),
+        });
+        let obs2 = buf2.drain();
+        writer.append_bulk(&obs2).unwrap();
+        let turn2 = JournalEvent::turn(
+            Some("sess-e2e-turn"),
+            2,
+            Some("qwen-turbo"),
+            "描述一下这个项目",
+            "这个项目是...",
+            1,
+            29814,
+            569,
+            10621,
+        );
+        writer.append(&turn2).unwrap();
+
+        // Turn 3: "review local changes" — 1 round, text-only (prefetch)
+        let mut buf3 = TurnEventBuffer::begin_turn(Some("sess-e2e-turn"), 3);
+        buf3.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(21633),
+            duration_ms: 85243,
+            prompt_tokens: 21454,
+            completion_tokens: 1347,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("stop".into()),
+        });
+        let obs3 = buf3.drain();
+        writer.append_bulk(&obs3).unwrap();
+        let turn3 = JournalEvent::turn(
+            Some("sess-e2e-turn"),
+            3,
+            Some("qwen3.6-plus"),
+            "review local changes",
+            "Code review...",
+            0,
+            43815,
+            3308,
+            85243,
+        );
+        writer.append(&turn3).unwrap();
+
+        // Parse back and verify consistency
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let events: Vec<JournalEvent> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let llm_rounds: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == JournalEventType::LlmRound)
+            .collect();
+        let turns: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == JournalEventType::Turn)
+            .collect();
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(llm_rounds.len(), 4); // 1 + 2 + 1
+
+        // Core invariant: every llm_round's turn must match its parent turn event
+        // Turn 1 has 1 llm_round
+        assert_eq!(llm_rounds[0].turn, Some(1), "llm_round[0] must be turn 1");
+        assert_eq!(turns[0].turn, Some(1));
+
+        // Turn 2 has 2 llm_rounds
+        assert_eq!(llm_rounds[1].turn, Some(2), "llm_round[1] must be turn 2");
+        assert_eq!(llm_rounds[2].turn, Some(2), "llm_round[2] must be turn 2");
+        assert_eq!(turns[1].turn, Some(2));
+
+        // Turn 3 has 1 llm_round
+        assert_eq!(llm_rounds[3].turn, Some(3), "llm_round[3] must be turn 3");
+        assert_eq!(turns[2].turn, Some(3));
+
+        // Verify round numbers within each turn
+        assert_eq!(llm_rounds[0].round, Some(0));
+        assert_eq!(llm_rounds[1].round, Some(0));
+        assert_eq!(llm_rounds[2].round, Some(1));
+        assert_eq!(llm_rounds[3].round, Some(0));
     }
 }
 

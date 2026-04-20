@@ -343,7 +343,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.turn_event_buffer = Some(
             astra_services::session_journal::TurnEventBuffer::begin_turn(
                 state.current_session_id.as_deref(),
-                (state.max_turns - state.remaining_turns) as u32,
+                state.session_turn,
             ),
         );
     }

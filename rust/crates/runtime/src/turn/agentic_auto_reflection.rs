@@ -626,6 +626,20 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
 
     apply_auto_reflection_usage(state, &reflection_result);
 
+    // Record the auto-reflection LLM call so turn.tokens_in breakdown is complete.
+    if let Some(ref mut buf) = state.turn_event_buffer {
+        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 0,
+            prompt_tokens: reflection_result.prompt_tokens,
+            completion_tokens: reflection_result.completion_tokens,
+            cache_read_tokens: reflection_result.cache_read_tokens,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("auto_reflection".into()),
+        });
+    }
+
     let (pending_before, applied_before, canary_before, resolved_before) =
         snapshot_evolution_promotion_ids(&evo).await;
     match evo

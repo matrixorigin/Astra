@@ -211,6 +211,7 @@ mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
             turn_event_buffer: None,
         }
     }

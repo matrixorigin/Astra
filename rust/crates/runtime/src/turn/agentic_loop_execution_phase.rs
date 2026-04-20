@@ -13,6 +13,27 @@ use super::agentic_turn_ingest::{
 };
 use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
+/// Record an `llm_round` event for an early-exit path (no tool calls).
+fn record_early_exit_llm_round(
+    state: &mut AgenticLoopState,
+    turn_result: &HostTurnResult,
+    turn_start: Instant,
+    finish_reason: Option<&str>,
+) {
+    if let Some(ref mut buf) = state.turn_event_buffer {
+        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            ttft_ms: turn_result.ttft_ms,
+            duration_ms: turn_start.elapsed().as_millis() as u64,
+            prompt_tokens: turn_result.accum.prompt_tokens,
+            completion_tokens: turn_result.accum.completion_tokens,
+            cache_read_tokens: turn_result.accum.cache_read_tokens,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: finish_reason.map(Into::into),
+        });
+    }
+}
+
 pub(crate) struct TurnExecutionPhase {
     pub(crate) llm_wall_start: Instant,
     pub(crate) turn_result: HostTurnResult,
@@ -118,6 +139,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         Some(format!("Rate limit during streaming: {}", e.message)),
                     ),
                 ));
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("rate_limited"),
+                );
                 observe_turn_end_without_tools(
                     state,
                     turn_index,
@@ -255,6 +282,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
 
+            // Record the LLM round even for text-only responses (no tool calls).
+            // Without this, prefetch-enriched turns and simple Q&A turns have
+            // llm_rounds=0 in the journal despite the LLM being called.
+            record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
+
             observe_turn_end_without_tools(
                 state,
                 turn_index,
@@ -377,6 +409,12 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 )),
             ),
         ));
+        record_early_exit_llm_round(
+            state,
+            turn_result,
+            prep.turn_start_time,
+            Some("token_budget_exceeded"),
+        );
         observe_turn_end_without_tools(
             state,
             turn_index,

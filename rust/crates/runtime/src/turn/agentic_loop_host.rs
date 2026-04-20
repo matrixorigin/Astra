@@ -672,6 +672,9 @@ pub struct AgenticLoopState {
 
     // ── Turn observability (Phase 1) ──
     /// In-memory collector for fine-grained turn events (llm_round, tool timing).
+    /// Session-level turn number (1-based). Set by the CLI from ReplState.turn
+    /// so that llm_round journal events carry the correct turn number.
+    pub session_turn: u32,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 }
@@ -1120,6 +1123,7 @@ pub(crate) mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
             turn_event_buffer: None,
         }
     }
@@ -7650,12 +7654,12 @@ mod observability_e2e_tests {
         );
 
         // The buffer persists across iterations within the same agentic loop.
-        // It should have recorded 2 llm_round events (for the 2 tool rounds).
+        // It should have recorded 3 llm_round events: 2 tool rounds + 1 text-only final.
         if let Some(buf) = &state.turn_event_buffer {
             assert_eq!(
                 buf.current_round(),
-                2,
-                "buffer should have 2 rounds recorded"
+                3,
+                "buffer should have 3 rounds recorded (2 tool + 1 text-only)"
             );
         }
     }
