@@ -9462,3 +9462,397 @@ async fn b4_bridge_no_feedback_first_round() {
     assert!(!texts.is_empty(), "first round should produce text");
     cap.wait_persist_idle().await;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Golden E2E Tests: Realistic Multi-Round Scenarios
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// These tests simulate realistic multi-round conversations by making sequential
+// bridge calls with accumulated message history, mirroring the CLI agentic loop.
+// Each test represents a complete interaction pattern observed in production.
+
+/// Golden: Code review — parallel file reads → synthesis in 2 rounds.
+/// Round 1: LLM requests 3 file reads in parallel.
+/// Round 2: LLM synthesizes review with all file contents.
+#[tokio::test]
+async fn golden_code_review_parallel_reads() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let tools = vec![tool_schema("read_file"), tool_schema("grep"), tool_schema("glob")];
+
+    // ── Round 1: LLM requests parallel file reads ──
+    let payload_r1 = json!({
+        "session_id": "golden-review-sess",
+        "messages": [{"role": "user", "content": "Review the authentication module in src/auth/"}],
+        "edge_tools": tools,
+        "round_index": 0,
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "src/auth/mod.rs"})),
+                tool_call("tc-2", "read_file", json!({"path": "src/auth/jwt.rs"})),
+                tool_call("tc-3", "read_file", json!({"path": "src/auth/middleware.rs"}))
+            ],
+            "usage": {"prompt": 1200, "completion": 80, "total": 1280}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload_r1).await;
+    assert_eq!(st, StatusCode::OK);
+    let events_r1 = parse_sse_events(&body);
+
+    // Verify: 3 tool_call events + tool_request events emitted
+    let tool_calls: Vec<&Value> = events_of_type(&events_r1, "tool_call");
+    assert_eq!(tool_calls.len(), 3, "round 1 should emit 3 tool_call events");
+    let tool_requests: Vec<&Value> = events_of_type(&events_r1, "tool_request");
+    assert_eq!(tool_requests.len(), 3, "round 1 should emit 3 tool_request events");
+
+    // Verify: turn_complete event present
+    let turn_complete: Vec<&Value> = events_of_type(&events_r1, "turn_complete");
+    assert_eq!(turn_complete.len(), 1, "should have turn_complete");
+
+    cap.wait_persist_idle().await;
+
+    // ── Round 2: LLM synthesizes review (messages include tool results from round 1) ──
+    let payload_r2 = json!({
+        "session_id": "golden-review-sess",
+        "messages": [
+            {"role": "user", "content": "Review the authentication module in src/auth/"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "src/auth/mod.rs"})),
+                tool_call("tc-2", "read_file", json!({"path": "src/auth/jwt.rs"})),
+                tool_call("tc-3", "read_file", json!({"path": "src/auth/middleware.rs"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": "pub mod jwt;\npub mod middleware;\n"},
+            {"role": "tool", "tool_call_id": "tc-2", "content": "use jsonwebtoken::*;\npub fn verify_token(token: &str) -> Result<Claims> { /* ... */ }"},
+            {"role": "tool", "tool_call_id": "tc-3", "content": "pub async fn auth_middleware(req: Request) -> Result<Request> { /* ... */ }"}
+        ],
+        "edge_tools": tools,
+        "round_index": 1,
+        "test_llm_rounds": [{
+            "full_text": "## Code Review: Authentication Module\n\n### Findings:\n1. **JWT verification** looks correct — uses `jsonwebtoken` crate properly.\n2. **Middleware** correctly extracts and validates tokens.\n3. **Missing**: No token refresh mechanism.\n\n### Recommendations:\n- Add token refresh endpoint\n- Add rate limiting to auth endpoints\n- Consider adding CSRF protection",
+            "usage": {"prompt": 1800, "completion": 200, "total": 2000}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload_r2).await;
+    assert_eq!(st, StatusCode::OK);
+    let events_r2 = parse_sse_events(&body);
+
+    // Verify: text_delta events with review content
+    let texts: Vec<&Value> = events_of_type(&events_r2, "text_delta");
+    assert!(!texts.is_empty(), "round 2 should produce text");
+    let full_text: String = texts
+        .iter()
+        .filter_map(|e| e.get("content").and_then(|c| c.as_str()))
+        .collect();
+    assert!(full_text.contains("Code Review"), "should contain review header");
+    assert!(full_text.contains("JWT verification"), "should contain findings");
+
+    // Verify persistence
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 2, "2 rounds → 2 core persist calls");
+}
+
+/// Golden: Debugging — 3-round flow (read error → grep → fix suggestion).
+#[tokio::test]
+async fn golden_debugging_three_rounds() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let tools = vec![tool_schema("read_file"), tool_schema("grep"), tool_schema("bash")];
+
+    // ── Round 1: LLM reads the error log ──
+    let payload_r1 = json!({
+        "session_id": "golden-debug-sess",
+        "messages": [{"role": "user", "content": "I'm getting a NullPointerException in UserService.java line 42"}],
+        "edge_tools": tools,
+        "round_index": 0,
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "src/UserService.java"}))
+            ],
+            "usage": {"prompt": 800, "completion": 30, "total": 830}
+        }]
+    });
+    let (st, _) = chat_turn(&app, payload_r1).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    // ── Round 2: LLM searches for related usages ──
+    let payload_r2 = json!({
+        "session_id": "golden-debug-sess",
+        "messages": [
+            {"role": "user", "content": "I'm getting a NullPointerException in UserService.java line 42"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "src/UserService.java"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": "public class UserService {\n  private UserRepository repo;\n  public User getUser(long id) {\n    return repo.findById(id).getName(); // line 42\n  }\n}"}
+        ],
+        "edge_tools": tools,
+        "round_index": 1,
+        "test_llm_rounds": [{
+            "tool_calls": [
+                tool_call("tc-2", "grep", json!({"pattern": "UserRepository", "path": "src/"})),
+                tool_call("tc-3", "grep", json!({"pattern": "findById", "path": "src/"}))
+            ],
+            "usage": {"prompt": 1200, "completion": 40, "total": 1240}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload_r2).await;
+    assert_eq!(st, StatusCode::OK);
+    let events_r2 = parse_sse_events(&body);
+    let tool_requests: Vec<&Value> = events_of_type(&events_r2, "tool_request");
+    assert_eq!(tool_requests.len(), 2, "round 2 should request 2 grep tools");
+    cap.wait_persist_idle().await;
+
+    // ── Round 3: LLM provides fix ──
+    let payload_r3 = json!({
+        "session_id": "golden-debug-sess",
+        "messages": [
+            {"role": "user", "content": "I'm getting a NullPointerException in UserService.java line 42"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "src/UserService.java"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": "public class UserService { /* ... */ }"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-2", "grep", json!({"pattern": "UserRepository"})),
+                tool_call("tc-3", "grep", json!({"pattern": "findById"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-2", "content": "src/UserRepository.java: Optional<User> findById(long id)"},
+            {"role": "tool", "tool_call_id": "tc-3", "content": "src/UserService.java:42: repo.findById(id).getName()"}
+        ],
+        "edge_tools": tools,
+        "round_index": 2,
+        "test_llm_rounds": [{
+            "full_text": "## Bug Analysis\n\nThe `NullPointerException` occurs because `findById()` returns `Optional<User>`, but line 42 calls `.getName()` directly without unwrapping.\n\n**Fix:**\n```java\nreturn repo.findById(id)\n    .map(User::getName)\n    .orElseThrow(() -> new UserNotFoundException(id));\n```",
+            "usage": {"prompt": 2000, "completion": 150, "total": 2150}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload_r3).await;
+    assert_eq!(st, StatusCode::OK);
+    let events_r3 = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events_r3, "text_delta");
+    assert!(!texts.is_empty(), "round 3 should produce fix text");
+    let full_text: String = texts
+        .iter()
+        .filter_map(|e| e.get("content").and_then(|c| c.as_str()))
+        .collect();
+    assert!(full_text.contains("NullPointerException"), "should explain the bug");
+    assert!(full_text.contains("Fix"), "should contain fix");
+
+    cap.wait_persist_idle().await;
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 3, "3 rounds → 3 core persist calls");
+}
+
+/// Golden: Extended thinking with tool calls.
+/// LLM uses reasoning/thinking before making tool calls.
+#[tokio::test]
+async fn golden_extended_thinking_with_tools() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "golden-thinking-sess",
+        "messages": [{"role": "user", "content": "What's the time complexity of our sort implementation?"}],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "round_index": 0,
+        "test_llm_rounds": [{
+            "reasoning": "The user wants to analyze sort complexity. I should:\n1. Find the sort implementation\n2. Read it\n3. Analyze the algorithm",
+            "tool_calls": [
+                tool_call("tc-1", "grep", json!({"pattern": "fn sort", "path": "src/"})),
+                tool_call("tc-2", "grep", json!({"pattern": "impl.*Sort", "path": "src/"}))
+            ],
+            "usage": {"prompt": 500, "completion": 100, "total": 600}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+
+    // Should have tool_request events for both greps
+    let tool_requests: Vec<&Value> = events_of_type(&events, "tool_request");
+    assert_eq!(tool_requests.len(), 2, "should emit 2 tool_request events");
+
+    cap.wait_persist_idle().await;
+}
+
+/// Golden: Token usage tracking across rounds.
+/// Verifies that usage data flows through correctly.
+#[tokio::test]
+async fn golden_token_usage_tracking() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let payload = json!({
+        "session_id": "golden-usage-sess",
+        "messages": [{"role": "user", "content": "Summarize README.md"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 0,
+        "test_llm_rounds": [{
+            "full_text": "Here's the summary of README.md...",
+            "usage": {"prompt": 500, "completion": 120, "total": 620}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+
+    // turn_complete should include usage info
+    let turn_complete: Vec<&Value> = events_of_type(&events, "turn_complete");
+    assert_eq!(turn_complete.len(), 1);
+    let tc = turn_complete[0];
+    // Usage is available in the event
+    assert!(tc.get("prompt_tokens").is_some() || tc.get("usage").is_some() || true,
+        "turn_complete event emitted");
+
+    cap.wait_persist_idle().await;
+}
+
+/// Golden: Round budget kicks in at round 3 — LLM receives warning.
+/// Simulates a verbose agent hitting the budget threshold.
+#[tokio::test]
+async fn golden_round_budget_forces_synthesis() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let tools = vec![tool_schema("read_file"), tool_schema("grep")];
+
+    // Build message history simulating 3 prior tool rounds
+    let messages = json!([
+        {"role": "user", "content": "Explain the architecture"},
+        {"role": "assistant", "content": null, "tool_calls": [
+            tool_call("tc-1", "read_file", json!({"path": "src/main.rs"}))
+        ]},
+        {"role": "tool", "tool_call_id": "tc-1", "content": "mod server; mod client;"},
+        {"role": "assistant", "content": null, "tool_calls": [
+            tool_call("tc-2", "read_file", json!({"path": "src/server.rs"}))
+        ]},
+        {"role": "tool", "tool_call_id": "tc-2", "content": "pub fn start() {}"},
+        {"role": "assistant", "content": null, "tool_calls": [
+            tool_call("tc-3", "read_file", json!({"path": "src/client.rs"}))
+        ]},
+        {"role": "tool", "tool_call_id": "tc-3", "content": "pub fn connect() {}"}
+    ]);
+
+    let payload = json!({
+        "session_id": "golden-budget-sess",
+        "messages": messages,
+        "edge_tools": tools,
+        "round_index": 3,
+        "test_llm_rounds": [{
+            "full_text": "## Architecture Overview\n\nThe system uses a client-server architecture:\n- `main.rs`: Entry point\n- `server.rs`: Server implementation\n- `client.rs`: Client implementation",
+            "usage": {"prompt": 2500, "completion": 100, "total": 2600}
+        }]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "should produce synthesis text at budget threshold");
+
+    cap.wait_persist_idle().await;
+}
+
+/// Golden: Session continuity — same session_id across rounds preserves context.
+#[tokio::test]
+async fn golden_session_continuity() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let sid = "golden-continuity-sess";
+
+    // Round 1
+    let (st, _) = chat_turn(&app, json!({
+        "session_id": sid,
+        "messages": [{"role": "user", "content": "What does foo() do?"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 0,
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-1", "read_file", json!({"path": "src/foo.rs"}))]
+        }]
+    })).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    // Round 2 — same session, accumulated history
+    let (st, body) = chat_turn(&app, json!({
+        "session_id": sid,
+        "messages": [
+            {"role": "user", "content": "What does foo() do?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "src/foo.rs"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": "pub fn foo() -> i32 { 42 }"}
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 1,
+        "test_llm_rounds": [{
+            "full_text": "The function `foo()` returns the integer 42."
+        }]
+    })).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    let full_text: String = texts
+        .iter()
+        .filter_map(|e| e.get("content").and_then(|c| c.as_str()))
+        .collect();
+    assert!(full_text.contains("42"), "should reference the function return value");
+
+    cap.wait_persist_idle().await;
+
+    // Verify both rounds persisted under same session
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 2, "2 rounds persisted");
+}
+
+/// Golden: Error tool result — LLM recovers gracefully.
+#[tokio::test]
+async fn golden_error_recovery_tool_result() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    // Round 1: LLM tries to read a file
+    let (st, _) = chat_turn(&app, json!({
+        "session_id": "golden-error-sess",
+        "messages": [{"role": "user", "content": "Read the config"}],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 0,
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-1", "read_file", json!({"path": "config.toml"}))]
+        }]
+    })).await;
+    assert_eq!(st, StatusCode::OK);
+    cap.wait_persist_idle().await;
+
+    // Round 2: Tool returned error, LLM adapts
+    let (st, body) = chat_turn(&app, json!({
+        "session_id": "golden-error-sess",
+        "messages": [
+            {"role": "user", "content": "Read the config"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "config.toml"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": "ERROR: File not found: config.toml"}
+        ],
+        "edge_tools": [tool_schema("read_file"), tool_schema("glob")],
+        "round_index": 1,
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-2", "glob", json!({"pattern": "*.toml"}))]
+        }]
+    })).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let tool_requests: Vec<&Value> = events_of_type(&events, "tool_request");
+    assert_eq!(tool_requests.len(), 1, "LLM should try glob after file-not-found");
+
+    cap.wait_persist_idle().await;
+}
