@@ -19,7 +19,14 @@ fn str_replace_diff_block_re() -> &'static Regex {
     })
 }
 
+/// Maximum tool result size in characters before truncation.
+/// ~50K chars ≈ 12.5K tokens — generous for individual tool results while
+/// preventing unbounded context growth from large file reads or verbose bash output.
+pub const MAX_TOOL_RESULT_CHARS: usize = 50_000;
+
 /// Remove `_cli_*` keys from JSON tool results and diff sentinels from `str_replace` text.
+/// Also truncates oversized results to `MAX_TOOL_RESULT_CHARS`, keeping head + tail with
+/// a truncation notice in the middle.
 #[must_use]
 pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
     let content = match tool_name {
@@ -46,7 +53,24 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
             tool_name
         );
     }
-    sanitized.content
+    truncate_tool_result(&sanitized.content, MAX_TOOL_RESULT_CHARS)
+}
+
+/// Truncate a tool result to `max_chars`, keeping head and tail with a notice.
+/// Returns the original string if within limits.
+fn truncate_tool_result(content: &str, max_chars: usize) -> String {
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+    // Keep 40% head, 40% tail, 20% for truncation notice
+    let head_len = max_chars * 2 / 5;
+    let tail_len = max_chars * 2 / 5;
+    let omitted = content.len() - head_len - tail_len;
+    let head = &content[..head_len];
+    let tail = &content[content.len() - tail_len..];
+    format!(
+        "{head}\n\n[… truncated {omitted} characters — output too large for context window …]\n\n{tail}"
+    )
 }
 
 fn strip_cli_json_keys(content: &str) -> String {
@@ -153,5 +177,41 @@ mod tests {
         assert!(!out.contains("_cli_"));
         assert!(out.contains("success"));
         assert!(out.contains("path"));
+    }
+
+    // ── Truncation tests ──
+
+    #[test]
+    fn small_result_not_truncated() {
+        let content = "a".repeat(1000);
+        let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
+        assert_eq!(out.len(), 1000);
+    }
+
+    #[test]
+    fn exact_limit_not_truncated() {
+        let content = "x".repeat(MAX_TOOL_RESULT_CHARS);
+        let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
+        assert_eq!(out.len(), MAX_TOOL_RESULT_CHARS);
+    }
+
+    #[test]
+    fn oversized_result_truncated() {
+        let content = "A".repeat(MAX_TOOL_RESULT_CHARS + 10_000);
+        let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
+        assert!(out.len() < content.len(), "should be smaller after truncation");
+        assert!(out.contains("truncated"), "should contain truncation notice");
+        assert!(out.contains("characters"), "should mention chars truncated");
+        // Head and tail preserved
+        assert!(out.starts_with("AAA"), "head preserved");
+        assert!(out.ends_with("AAA"), "tail preserved");
+    }
+
+    #[test]
+    fn truncation_through_tool_result_for_model() {
+        let big = "B".repeat(MAX_TOOL_RESULT_CHARS + 5_000);
+        let out = tool_result_content_for_model("bash", &big);
+        assert!(out.len() < big.len(), "should truncate large bash output");
+        assert!(out.contains("truncated"), "truncation notice present");
     }
 }

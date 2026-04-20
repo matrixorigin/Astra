@@ -9856,3 +9856,135 @@ async fn golden_error_recovery_tool_result() {
 
     cap.wait_persist_idle().await;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase D: Token Efficiency Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// D1: Schema pruning — TrimSchemas tier truncates descriptions to first sentence.
+#[tokio::test]
+async fn d1_schema_pruning_trim_tier() {
+    use astra_turn_core::compaction_types::CompactionTier;
+    use astra_turn_core::tool_schema_prune::prune_tool_schemas;
+
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file. This tool supports line ranges and encoding options. Use it when you need to examine file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The file path to read" },
+                    "line_range": { "type": "string", "description": "Optional line range like 1-50" }
+                },
+                "required": ["path"]
+            }
+        }
+    })];
+
+    let pruned = prune_tool_schemas(&tools, CompactionTier::TrimSchemas);
+    let desc = pruned[0]["function"]["description"].as_str().unwrap();
+    assert!(desc.contains("Read the contents"), "keeps first sentence");
+    assert!(!desc.contains("Use it when"), "removes later sentences");
+}
+
+/// D1: Schema pruning — AggressivePrune removes descriptions and optional params.
+#[tokio::test]
+async fn d1_schema_pruning_aggressive_tier() {
+    use astra_turn_core::compaction_types::CompactionTier;
+    use astra_turn_core::tool_schema_prune::prune_tool_schemas;
+
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for patterns in files. Supports regex and glob filters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "The regex pattern" },
+                    "path": { "type": "string", "description": "Directory to search" }
+                },
+                "required": ["pattern"]
+            }
+        }
+    })];
+
+    let pruned = prune_tool_schemas(&tools, CompactionTier::AggressivePrune);
+    // AggressivePrune truncates descriptions and strips optional params
+    let func = &pruned[0]["function"];
+    let props = &func["parameters"]["properties"];
+    // "path" is optional (not in required), so it should be removed
+    assert!(props.get("path").is_none(), "aggressive removes optional params");
+    // "pattern" is required, so it stays
+    assert!(props.get("pattern").is_some(), "keeps required params");
+}
+
+/// D1: Schema pruning — Normal tier leaves schemas unchanged.
+#[tokio::test]
+async fn d1_schema_pruning_normal_unchanged() {
+    use astra_turn_core::compaction_types::CompactionTier;
+    use astra_turn_core::tool_schema_prune::prune_tool_schemas;
+
+    let tools = vec![tool_schema("bash")];
+    let pruned = prune_tool_schemas(&tools, CompactionTier::Normal);
+    assert_eq!(pruned, tools, "Normal tier should not modify schemas");
+}
+
+/// D2: Tool result truncation — verify constant is reasonable.
+#[tokio::test]
+async fn d2_truncation_constant_value() {
+    let max = astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS;
+    assert!(max >= 10_000, "limit should be at least 10K chars");
+    assert!(max <= 200_000, "limit should not exceed 200K chars");
+}
+
+/// D2: Tool result truncation — small results pass through.
+#[tokio::test]
+async fn d2_small_result_not_truncated() {
+    let content = "x".repeat(1000);
+    let out = astra_turn_core::tool_result_sanitize::tool_result_content_for_model("bash", &content);
+    assert_eq!(out.len(), 1000, "small result should pass through unchanged");
+}
+
+/// D2: Tool result truncation — oversized results get truncated.
+#[tokio::test]
+async fn d2_oversized_result_truncated() {
+    let max = astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS;
+    let big = "Z".repeat(max + 20_000);
+    let out = astra_turn_core::tool_result_sanitize::tool_result_content_for_model("read_file", &big);
+    assert!(out.len() < big.len(), "should be smaller after truncation");
+    assert!(out.contains("truncated"), "should contain truncation notice");
+    assert!(out.starts_with("ZZZ"), "head preserved");
+    assert!(out.ends_with("ZZZ"), "tail preserved");
+}
+
+/// D2: Truncation integrates with bridge — oversized tool results in messages.
+#[tokio::test]
+async fn d2_bridge_handles_large_tool_result_in_history() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let big_result = "X".repeat(60_000);
+    let payload = json!({
+        "session_id": "d2-large-result-sess",
+        "messages": [
+            {"role": "user", "content": "Read that large file"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                tool_call("tc-1", "read_file", json!({"path": "huge.rs"}))
+            ]},
+            {"role": "tool", "tool_call_id": "tc-1", "content": big_result}
+        ],
+        "edge_tools": [tool_schema("read_file")],
+        "round_index": 1,
+        "test_llm_rounds": [{"full_text": "The file is very large, here's a summary..."}]
+    });
+    let (st, body) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK);
+    let events = parse_sse_events(&body);
+    let texts: Vec<&Value> = events_of_type(&events, "text_delta");
+    assert!(!texts.is_empty(), "should produce text even with large history");
+    cap.wait_persist_idle().await;
+}
