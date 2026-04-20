@@ -47,7 +47,11 @@ use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTurnCoreEventWriter,
     EvaluationService, EventCreateRequestData, EventService,
 };
-use astra_turn_core::contracts::{TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan};
+use astra_turn_core::contracts::{
+    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
+    TurnSkillSelectionRecord,
+};
 
 use astra_core::{
     STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
@@ -657,8 +661,12 @@ async fn persist_runtime_promotion_events(
     if promotions.is_empty() {
         return;
     }
+    // Skip when no shared pool — avoids blocking on connect_matrixone() in tests.
+    let Some(pool) = shared_pool else {
+        return;
+    };
 
-    let service = build_runtime_event_service(matrixone, shared_pool);
+    let service = build_runtime_event_service(matrixone, Some(pool));
     for promotion in promotions {
         let metadata = match serde_json::to_value(promotion) {
             Ok(value) => Some(value),
@@ -788,6 +796,124 @@ async fn persist_server_loop_core_events(
             "server-loop",
             "failed to persist core events for session {session_id}: {e}"
         );
+    }
+}
+
+/// Persist decision audit + skill selection to hook DB tables after the
+/// server-driven agentic loop completes.  This ensures the decisions API
+/// (`ctx_decision_audits`, `skill_selection_events`) has data for server-loop
+/// sessions, matching what the bridge path persisted via hook side effects.
+#[allow(clippy::too_many_arguments)]
+async fn persist_server_loop_hook_events(
+    hook_db_writer: &dyn TurnHookDbWriter,
+    user_id: &str,
+    session_id: &str,
+    user_message: &str,
+    state: &AgenticLoopState,
+    model_name: Option<&str>,
+) {
+    // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
+    // tool name across all rounds.  state.messages does NOT carry assistant
+    // tool_call objects in the server loop path.
+    let tool_call_names: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    let event_id = Uuid::now_v7().to_string();
+
+    let decision_audit = Some(TurnDecisionAuditRecord {
+        decision_id: Uuid::now_v7().to_string(),
+        session_id: session_id.to_string(),
+        event_id: event_id.clone(),
+        decision_type: if tool_call_names.is_empty() {
+            "response_generation".to_string()
+        } else {
+            "tool_selection".to_string()
+        },
+        decision_output: json!({
+            "text": truncate_for_audit(&state.final_text, 500),
+            "tool_calls": tool_call_names,
+            "model_used": model_name,
+            "total_tool_calls": state.total_tool_calls,
+            "total_prompt_tokens": state.total_prompt,
+            "total_completion_tokens": state.total_completion,
+        }),
+        model_used: model_name.map(|s| s.to_string()),
+        context_capture_id: None,
+    });
+
+    let skill_selection = tool_call_names
+        .first()
+        .map(|first_tool| TurnSkillSelectionRecord {
+            event_id: Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+            user_id: user_id.to_string(),
+            agent_id: None,
+            user_query: truncate_for_audit(user_message, 2000),
+            selected_skills: tool_call_names.clone(),
+            skill_name: first_tool.clone(),
+            skill_version: None,
+            selection_method: "llm_tool_choice".to_string(),
+            execution_success: Some(1),
+            execution_time_ms: None,
+        });
+
+    let plan = TurnHookDbPersistPlan {
+        decision_audit,
+        skill_selection,
+        implicit_feedback: None,
+        reflection_mark: None,
+        reflection_lesson: None,
+    };
+
+    if let Err(e) = hook_db_writer.persist(plan).await {
+        astra_core::agent_error!(
+            "server-loop",
+            "failed to persist hook events for session {session_id}: {e}"
+        );
+    }
+}
+
+/// Fire the Memoria observer after the server-driven loop completes.
+/// This sends the conversation messages to the Memoria `/v1/observe` endpoint
+/// for cross-session knowledge extraction.
+async fn fire_server_loop_observer(
+    observer_worker: &dyn TurnObserverWorker,
+    user_id: &str,
+    session_id: &str,
+    state: &AgenticLoopState,
+) {
+    let messages: Vec<serde_json::Map<String, serde_json::Value>> = state
+        .messages
+        .iter()
+        .filter_map(|m| m.as_object().cloned())
+        .collect();
+
+    if messages.is_empty() {
+        return;
+    }
+
+    let turn_count = state.max_turns.saturating_sub(state.remaining_turns) as i64;
+    let request = TurnObserverRequest {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        messages,
+        turn_count,
+        session_start: None,
+    };
+
+    if let Err(e) = observer_worker.run(request).await {
+        astra_core::agent_error!(
+            "server-loop",
+            "failed to run observer for session {session_id}: {e}"
+        );
+    }
+}
+
+/// Truncate text for audit records, preserving UTF-8 boundaries.
+fn truncate_for_audit(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -938,6 +1064,10 @@ pub struct AgenticRunLifecycleService {
     /// Per-run progress event channel receivers (Phase F.3).
     /// Key: run_id → receiver that the WS handler drains.
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<ProgressEvent>>>>,
+    /// Hook DB writer for decision audit + skill selection persistence.
+    hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
+    /// Memoria observer worker for cross-session knowledge extraction.
+    observer_worker: Option<Arc<dyn TurnObserverWorker>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -961,6 +1091,8 @@ impl AgenticRunLifecycleService {
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
+            hook_db_writer: None,
+            observer_worker: None,
         }
     }
 
@@ -1001,6 +1133,16 @@ impl AgenticRunLifecycleService {
     pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
         self.skill_service = Some(service);
         self.server_skill_resolver_cache = std::sync::OnceLock::new();
+        self
+    }
+
+    pub fn with_hook_db_writer(mut self, writer: Arc<dyn TurnHookDbWriter>) -> Self {
+        self.hook_db_writer = Some(writer);
+        self
+    }
+
+    pub fn with_observer_worker(mut self, worker: Arc<dyn TurnObserverWorker>) -> Self {
+        self.observer_worker = Some(worker);
         self
     }
 
@@ -1759,6 +1901,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_user_message = request.message.clone();
         let bg_agent_id = request.agent_id.clone();
         let bg_model_name = request.model.clone();
+        let bg_hook_db_writer = self.hook_db_writer.clone();
+        let bg_observer_worker = self.observer_worker.clone();
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
@@ -1841,6 +1985,30 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 bg_model_name.as_deref(),
             )
             .await;
+
+            // Persist decision audit + skill selection to hook DB tables.
+            if let Some(ref writer) = bg_hook_db_writer {
+                persist_server_loop_hook_events(
+                    writer.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    &bg_user_message,
+                    &loop_state,
+                    bg_model_name.as_deref(),
+                )
+                .await;
+            }
+
+            // Fire Memoria observer (cross-session knowledge extraction).
+            if let Some(ref worker) = bg_observer_worker {
+                fire_server_loop_observer(
+                    worker.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    &loop_state,
+                )
+                .await;
+            }
 
             // Fire SessionEnd hooks (best-effort, non-blocking).
             crate::skills::hooks::fire_session_end(
@@ -2013,6 +2181,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_user_message = request.message.clone();
         let bg_agent_id = request.agent_id.clone();
         let bg_model_name = request.model.clone();
+        let bg_hook_db_writer = self.hook_db_writer.clone();
+        let bg_observer_worker = self.observer_worker.clone();
 
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
@@ -2057,6 +2227,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 bg_model_name.as_deref(),
             )
             .await;
+
+            // Persist decision audit + skill selection to hook DB tables.
+            if let Some(ref writer) = bg_hook_db_writer {
+                persist_server_loop_hook_events(
+                    writer.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    &bg_user_message,
+                    &state,
+                    bg_model_name.as_deref(),
+                )
+                .await;
+            }
+
+            // Fire Memoria observer (cross-session knowledge extraction).
+            if let Some(ref worker) = bg_observer_worker {
+                fire_server_loop_observer(worker.as_ref(), &bg_user_id, &bg_session_id, &state)
+                    .await;
+            }
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);

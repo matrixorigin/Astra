@@ -17,7 +17,8 @@ use astra_runtime::{
     AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
     FernetTokenEncryptor, HealthChecker, MatrixOneSettings, ServiceInfo, SessionActivityRecord,
     SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData, build_app,
+    SessionUpdateRequestData, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
+    TurnObserverWorker, build_app,
 };
 use async_trait::async_trait;
 use axum::{
@@ -181,6 +182,36 @@ impl SessionService for StubSession {
     }
 }
 
+// ── Recording test doubles ───────────────────────────────────────────────────
+
+/// Records all hook DB persist calls for test verification.
+#[derive(Default)]
+struct RecordingHookDbWriter {
+    plans: tokio::sync::Mutex<Vec<TurnHookDbPersistPlan>>,
+}
+
+#[async_trait]
+impl TurnHookDbWriter for RecordingHookDbWriter {
+    async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String> {
+        self.plans.lock().await.push(plan);
+        Ok(())
+    }
+}
+
+/// Records all observer requests for test verification.
+#[derive(Default)]
+struct RecordingObserverWorker {
+    requests: tokio::sync::Mutex<Vec<TurnObserverRequest>>,
+}
+
+#[async_trait]
+impl TurnObserverWorker for RecordingObserverWorker {
+    async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+        self.requests.lock().await.push(request);
+        Ok(())
+    }
+}
+
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
@@ -206,6 +237,41 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), ledger)
+}
+
+/// Build a test app with recording hook DB + observer writers for verification.
+fn build_test_app_with_hooks() -> (
+    Router,
+    Arc<RecordingHookDbWriter>,
+    Arc<RecordingObserverWorker>,
+) {
+    init_env();
+    let enc =
+        Arc::new(FernetTokenEncryptor::new("web-e2e-fernet-key-32-chars!!!").expect("fernet key"));
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession));
+
+    let ledger = base.edge_callback_ledger();
+    let hook_writer = Arc::new(RecordingHookDbWriter::default());
+    let observer_worker = Arc::new(RecordingObserverWorker::default());
+
+    let lifecycle = AgenticRunLifecycleService::new(
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
+        enc,
+        ledger,
+    )
+    .with_hook_db_writer(hook_writer.clone())
+    .with_observer_worker(observer_worker.clone());
+
+    let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
+    (build_app(state), hook_writer, observer_worker)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2951,4 +3017,229 @@ async fn client_disconnect_run_still_finalizes() {
         final_status == "completed" || final_status == "cancelled",
         "run should finalize after client disconnect, got: {final_status}"
     );
+}
+
+// ── Hook DB + Observer Persistence Tests ─────────────────────────────────────
+
+/// Text-only response produces a "response_generation" decision audit with no skills.
+#[tokio::test]
+async fn hook_db_decision_audit_text_only() {
+    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "hello",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "Hi there!" }]
+            }
+        }),
+    )
+    .await;
+    assert!(!events.is_empty());
+
+    // Allow background task to persist.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = hook_writer.plans.lock().await;
+    assert_eq!(plans.len(), 1, "exactly one hook persist call");
+    let plan = &plans[0];
+
+    let audit = plan
+        .decision_audit
+        .as_ref()
+        .expect("decision_audit present");
+    assert_eq!(audit.decision_type, "response_generation");
+    assert!(!audit.decision_id.is_empty());
+    let output = &audit.decision_output;
+    assert!(output["tool_calls"].as_array().unwrap().is_empty());
+    assert!(output["text"].as_str().unwrap().contains("Hi there"));
+
+    // No skill selection for text-only.
+    assert!(plan.skill_selection.is_none());
+    // No implicit feedback (server loop doesn't have next-turn signal).
+    assert!(plan.implicit_feedback.is_none());
+
+    // Observer should have been called with messages.
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(requests.len(), 1, "observer fired once");
+    assert_eq!(requests[0].user_id, USER_ID);
+    assert!(!requests[0].messages.is_empty());
+}
+
+/// Tool-call response produces a "tool_selection" decision audit with skill selection.
+#[tokio::test]
+async fn hook_db_decision_audit_with_tools() {
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+
+    let app_clone = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(
+            &app_clone,
+            json!({
+                "message": "list files",
+                "context": {
+                    "test_llm_rounds": [
+                        {
+                            "tool_calls": [tool_call("tc1", "list_files", json!({"path": "."}))]
+                        },
+                        { "full_text": "Here are the files." }
+                    ],
+                    "edge_tools": [tool_schema("list_files"), tool_schema("read_file")]
+                }
+            }),
+        )
+        .await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    // Deliver tool results for tc1.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "success").await;
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), stream_task)
+        .await
+        .expect("stream timed out")
+        .expect("stream task failed");
+    assert!(!events.is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = hook_writer.plans.lock().await;
+    assert_eq!(plans.len(), 1);
+    let plan = &plans[0];
+
+    let audit = plan
+        .decision_audit
+        .as_ref()
+        .expect("decision_audit present");
+    assert_eq!(audit.decision_type, "tool_selection");
+    let tool_calls = audit.decision_output["tool_calls"].as_array().unwrap();
+    assert!(tool_calls.iter().any(|t| t.as_str() == Some("list_files")));
+
+    let skill = plan
+        .skill_selection
+        .as_ref()
+        .expect("skill_selection present");
+    assert_eq!(skill.skill_name, "list_files");
+    assert_eq!(skill.selection_method, "llm_tool_choice");
+    assert!(skill.selected_skills.contains(&"list_files".to_string()));
+    assert_eq!(skill.user_query, "list files");
+    assert_eq!(skill.execution_success, Some(1));
+}
+
+/// Model name is propagated to decision audit.
+#[tokio::test]
+async fn hook_db_decision_audit_model_name() {
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+
+    chat_stream_collect(
+        &app,
+        json!({
+            "message": "test",
+            "model": "test-model-v1",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "ok" }]
+            }
+        }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = hook_writer.plans.lock().await;
+    assert_eq!(plans.len(), 1);
+    let audit = plans[0].decision_audit.as_ref().unwrap();
+    assert_eq!(audit.model_used.as_deref(), Some("test-model-v1"));
+}
+
+/// Observer receives correct session_id and turn_count.
+#[tokio::test]
+async fn observer_fired_with_correct_metadata() {
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "hello",
+            "session_id": "obs-session-123",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "Hi!" }]
+            }
+        }),
+    )
+    .await;
+    let session_info = events.iter().find(|e| e["type"] == "session_info");
+    let session_id = session_info.unwrap()["session_id"].as_str().unwrap();
+    assert_eq!(session_id, "obs-session-123");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].session_id, "obs-session-123");
+    assert!(requests[0].turn_count >= 1, "at least one turn completed");
+}
+
+/// Multiple tool calls across rounds produce a skill selection with all tool names.
+#[tokio::test]
+async fn hook_db_multiple_tools_selected() {
+    let (app, hook_writer, _observer) = build_test_app_with_hooks();
+
+    // Two rounds of approval-free tools (read_file, list_dir) + final text.
+    let app_clone = app.clone();
+    let stream_task = tokio::spawn(async move {
+        let resp = chat_stream_start(
+            &app_clone,
+            json!({
+                "message": "do stuff",
+                "context": {
+                    "test_llm_rounds": [
+                        {
+                            "tool_calls": [
+                                tool_call("tc1", "read_file", json!({"path": "a.txt"}))
+                            ]
+                        },
+                        {
+                            "tool_calls": [
+                                tool_call("tc2", "list_dir", json!({"path": "/src"}))
+                            ]
+                        },
+                        { "full_text": "Done!" }
+                    ],
+                    "edge_tools": [
+                        tool_schema("read_file"),
+                        tool_schema("list_dir")
+                    ]
+                }
+            }),
+        )
+        .await;
+        read_sse_events_from_body(resp.into_body()).await
+    });
+
+    // Deliver tool results for round 1 (tc1).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
+
+    // Deliver tool results for round 2 (tc2).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "success").await;
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(15), stream_task)
+        .await
+        .expect("stream timed out")
+        .expect("stream task failed");
+    assert!(!events.is_empty());
+
+    // Wait for async persistence.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let plans = hook_writer.plans.lock().await;
+    assert_eq!(plans.len(), 1);
+    let audit = plans[0].decision_audit.as_ref().expect("decision_audit");
+    assert_eq!(audit.decision_type, "tool_selection");
+
+    let skill = plans[0].skill_selection.as_ref().expect("skill_selection");
+    // All unique tool names should be captured.
+    assert!(skill.selected_skills.contains(&"read_file".to_string()));
+    assert!(skill.selected_skills.contains(&"list_dir".to_string()));
 }

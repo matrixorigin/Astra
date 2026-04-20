@@ -299,7 +299,9 @@ pub async fn build_server_state(
     .with_delegation_engine(Arc::clone(&delegation_engine))
     .with_edge_connection_pool(state.edge_connection_pool.clone())
     .with_resource_governor(resource_governor.clone())
-    .with_skill_service(state.skill_service.clone());
+    .with_skill_service(state.skill_service.clone())
+    .with_hook_db_writer(state.turn_hook_db_writer.clone())
+    .with_observer_worker(state.turn_observer_worker.clone());
 
     // Wire team persistence store backed by MatrixOne.
     let team_store =
