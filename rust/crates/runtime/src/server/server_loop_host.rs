@@ -588,20 +588,106 @@ impl ServerAgenticLoopHost {
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         use astra_turn_core::cloud_tool_delivery::{
-            cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
-            tool_approval_detail_for_delivery, tool_approval_kind_for_delivery,
-            tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
+            cloud_tool_requires_approval_for_delivery, collect_approval_batches,
+            sse_maps_through_tool_request, wait_approval_ledger_for_tool,
             wait_tool_result_ledger_for_tool,
         };
         use astra_turn_core::headless_tool_assembly::ensure_tool_call_ids;
         use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+        use astra_turn_core::stream_events::{
+            ApprovalBatchRequestEvent, build_approval_batch_required_event,
+            build_approval_required_event,
+        };
+        use std::collections::{HashMap, HashSet};
 
         let tool_calls = ensure_tool_call_ids(tool_calls);
         // 5-minute timeout: web clients may execute long-running tools.
         let ledger_wait = std::time::Duration::from_secs(300);
-        let mut results = Vec::with_capacity(tool_calls.len());
+        let mut approved_request_ids = HashSet::new();
+        let mut results_by_id: HashMap<String, EdgeToolExecResult> = HashMap::new();
 
-        for tc in tool_calls.iter() {
+        for batch in collect_approval_batches(&tool_calls) {
+            if batch.items.len() == 1 {
+                let item = &batch.items[0];
+                self.emit_event(Value::Object(build_approval_required_event(
+                    &item.request_id,
+                    &item.tool_name,
+                    item.approval_kind,
+                    item.path.as_deref(),
+                    item.detail.as_deref(),
+                )));
+            } else {
+                let requests = batch
+                    .items
+                    .iter()
+                    .map(|item| ApprovalBatchRequestEvent {
+                        request_id: &item.request_id,
+                        tool_name: &item.tool_name,
+                        approval_kind: item.approval_kind,
+                        path: item.path.as_deref(),
+                        detail: item.detail.as_deref(),
+                    })
+                    .collect::<Vec<_>>();
+                self.emit_event(Value::Object(build_approval_batch_required_event(
+                    &requests,
+                )));
+            }
+
+            for item in &batch.items {
+                if let Err(denied) = wait_approval_ledger_for_tool(
+                    &self.edge_callback_ledger,
+                    &self.user_id,
+                    &item.tool_call,
+                    ledger_wait,
+                    None,
+                )
+                .await
+                {
+                    for m in denied.sse_maps {
+                        self.emit_event(Value::Object(m));
+                    }
+                    results_by_id.insert(
+                        item.request_id.clone(),
+                        EdgeToolExecResult {
+                            request_id: item.request_id.clone(),
+                            tool: item.tool_name.clone(),
+                            args: item
+                                .tool_call
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            output: "Tool execution denied or timed out".to_string(),
+                            tool_result_fields: None,
+                            status: "error".to_string(),
+                            duration_ms: 0,
+                        },
+                    );
+                    continue;
+                }
+                approved_request_ids.insert(item.request_id.clone());
+            }
+        }
+
+        let executable_calls: Vec<_> = tool_calls
+            .iter()
+            .filter(|tc| {
+                let Some(tc_map) = tc.as_object() else {
+                    return false;
+                };
+                let request_id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
+                !cloud_tool_requires_approval_for_delivery(tc)
+                    || approved_request_ids.contains(request_id)
+            })
+            .collect();
+
+        for tc in &executable_calls {
+            for m in sse_maps_through_tool_request(tc) {
+                self.emit_event(Value::Object(m));
+            }
+        }
+
+        for tc in executable_calls {
             let tc_map = match tc.as_object() {
                 Some(m) => m,
                 None => continue,
@@ -622,54 +708,6 @@ impl ServerAgenticLoopHost {
                 .and_then(|f| f.get("arguments"))
                 .cloned()
                 .unwrap_or(Value::Null);
-
-            // Approval gate.
-            if cloud_tool_requires_approval_for_delivery(tc) {
-                let path = tool_path_hint_for_delivery(tc);
-                let detail = tool_approval_detail_for_delivery(tc);
-                let kind = tool_approval_kind_for_delivery(tc);
-                let approval_event = astra_turn_core::stream_events::build_approval_required_event(
-                    &id,
-                    &tool_name,
-                    kind,
-                    path.as_deref(),
-                    detail.as_deref(),
-                );
-                self.emit_event(Value::Object(approval_event));
-
-                if let Err(denied) = wait_approval_ledger_for_tool(
-                    &self.edge_callback_ledger,
-                    &self.user_id,
-                    tc,
-                    ledger_wait,
-                    None,
-                )
-                .await
-                {
-                    // Denied or timed out — emit tool_call_end with error, skip.
-                    for m in denied.sse_maps {
-                        self.emit_event(Value::Object(m));
-                    }
-                    results.push(EdgeToolExecResult {
-                        request_id: id,
-                        tool: tool_name,
-                        args,
-                        output: "Tool execution denied or timed out".to_string(),
-                        tool_result_fields: None,
-                        status: "error".to_string(),
-                        duration_ms: 0,
-                    });
-                    continue;
-                }
-            }
-
-            // Emit tool_request SSE (client receives this and executes the tool).
-            let sse_maps = sse_maps_through_tool_request(tc);
-            for m in sse_maps {
-                self.emit_event(Value::Object(m));
-            }
-
-            // Wait for the client to POST the tool result.
             let started = std::time::Instant::now();
             let delivery = wait_tool_result_ledger_for_tool(
                 &self.edge_callback_ledger,
@@ -680,12 +718,10 @@ impl ServerAgenticLoopHost {
             .await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
-            // Emit tool_call_end SSE.
             for m in delivery.sse_maps {
                 self.emit_event(Value::Object(m));
             }
 
-            // Build EdgeToolExecResult from the ledger response.
             let output = delivery
                 .tool_messages
                 .first()
@@ -699,15 +735,33 @@ impl ServerAgenticLoopHost {
                 "ok"
             };
 
-            results.push(EdgeToolExecResult {
-                request_id: id,
-                tool: tool_name,
-                args,
-                output,
-                tool_result_fields: None,
-                status: status.to_string(),
-                duration_ms,
-            });
+            results_by_id.insert(
+                id.clone(),
+                EdgeToolExecResult {
+                    request_id: id,
+                    tool: tool_name,
+                    args,
+                    output,
+                    tool_result_fields: None,
+                    status: status.to_string(),
+                    duration_ms,
+                },
+            );
+        }
+
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for tc in tool_calls.iter() {
+            let Some(tc_map) = tc.as_object() else {
+                continue;
+            };
+            let request_id = tc_map
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(result) = results_by_id.remove(&request_id) {
+                results.push(result);
+            }
         }
 
         results
@@ -1711,6 +1765,7 @@ mod tests {
     use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
     use crate::turn::cloud::summary::SummaryLlmClient;
+    use crate::turn::edge_ledger::{approval_callback_key, tool_callback_key};
     use crate::turn::sse_stream_host::EdgeToolExecResult;
 
     fn mock_matrixone() -> MatrixOneSettings {
@@ -2054,6 +2109,93 @@ mod tests {
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");
+    }
+
+    #[tokio::test]
+    async fn deliver_edge_tools_batches_multiple_approval_prompts() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-batch".to_string(),
+            "s-batch".to_string(),
+        )
+        .build();
+        let ledger = host.edge_callback_ledger.clone();
+        let tool_calls = vec![
+            json!({
+                "id": "w1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"a.rs","content":"1"}"#}
+            }),
+            json!({
+                "id": "w2",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"2"}"#}
+            }),
+        ];
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut guard = ledger.lock().await;
+            guard.insert(
+                approval_callback_key("u-batch", "w1"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+            );
+            guard.insert(
+                approval_callback_key("u-batch", "w2"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+            );
+            drop(guard);
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut guard = ledger.lock().await;
+            guard.insert(
+                tool_callback_key("u-batch", "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-a"}}),
+            );
+            guard.insert(
+                tool_callback_key("u-batch", "w2"),
+                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-b"}}),
+            );
+        });
+
+        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| event.get("type").and_then(Value::as_str) != Some("approval_required"))
+        );
+        let batch = host
+            .emitted_events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("approval_batch_required")
+            })
+            .expect("approval batch event");
+        assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
+
+        let tool_request_positions: Vec<_> = host
+            .emitted_events
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, event)| {
+                (event.get("type").and_then(Value::as_str) == Some("tool_request")).then_some(idx)
+            })
+            .collect();
+        assert_eq!(tool_request_positions.len(), 2);
+        let first_end = host
+            .emitted_events
+            .iter()
+            .position(|event| event.get("type").and_then(Value::as_str) == Some("tool_call_end"))
+            .expect("tool_call_end");
+        assert!(tool_request_positions.iter().all(|idx| *idx < first_end));
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_id, "w1");
+        assert_eq!(results[1].request_id, "w2");
+        assert_eq!(results[0].status, "ok");
+        assert_eq!(results[1].status, "ok");
     }
 
     // ── Mock host tests for agentic loop integration ───────────────────────

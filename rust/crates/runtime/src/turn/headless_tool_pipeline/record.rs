@@ -193,13 +193,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &model_result_str,
             execution.tool_result_fields.as_ref(),
         );
-        // Add round index for compression protection (P6):
-        // Current-round tool results should never be truncated because
-        // the LLM hasn't seen them yet.
+        // Add metadata for compression (P6) and folding (P0):
+        // - _round_index: Current-round tool results should never be truncated
+        //   because the LLM hasn't seen them yet.
+        // - _tool_name: Enables proactive folding of old read-only tool results.
         if let Some(obj) = tool_msg.as_object_mut() {
             obj.insert(
                 "_round_index".to_string(),
                 serde_json::Value::Number(self.ctx.llm_round.into()),
+            );
+            obj.insert(
+                "_tool_name".to_string(),
+                serde_json::Value::String(execution.name.clone()),
             );
         }
         self.ctx.messages.push(tool_msg);

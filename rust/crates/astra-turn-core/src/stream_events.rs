@@ -187,6 +187,55 @@ pub fn build_approval_required_event(
     m
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalBatchRequestEvent<'a> {
+    pub request_id: &'a str,
+    pub tool_name: &'a str,
+    pub approval_kind: ApprovalKind,
+    pub path: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
+/// Batch approval request for multiple gated tools in the same round.
+pub fn build_approval_batch_required_event(
+    requests: &[ApprovalBatchRequestEvent<'_>],
+) -> Map<String, Value> {
+    let payload = requests
+        .iter()
+        .map(|request| {
+            let mut item = Map::from_iter([
+                (
+                    "request_id".to_string(),
+                    Value::String(request.request_id.to_string()),
+                ),
+                (
+                    "tool".to_string(),
+                    Value::String(request.tool_name.to_string()),
+                ),
+                (
+                    "approval_kind".to_string(),
+                    serde_json::to_value(request.approval_kind)
+                        .unwrap_or(Value::String("explicit".to_string())),
+                ),
+            ]);
+            if let Some(path) = request.path.filter(|s| !s.is_empty()) {
+                item.insert("path".to_string(), Value::String(path.to_string()));
+            }
+            if let Some(detail) = request.detail.filter(|s| !s.is_empty()) {
+                item.insert("detail".to_string(), Value::String(detail.to_string()));
+            }
+            Value::Object(item)
+        })
+        .collect::<Vec<_>>();
+    Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("approval_batch_required".to_string()),
+        ),
+        ("requests".to_string(), Value::Array(payload)),
+    ])
+}
+
 /// §5.5 thin-client `tool_request` — `request_id` matches `POST /tools/result` and ledger keys.
 pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, Value> {
     let edge = build_edge_tool_call_event(tool_call);
@@ -259,6 +308,37 @@ mod tests {
             Some("git status"),
         );
         assert_eq!(ev.get("detail").and_then(Value::as_str), Some("git status"));
+    }
+
+    #[test]
+    fn approval_batch_required_contains_requests() {
+        let ev = build_approval_batch_required_event(&[
+            ApprovalBatchRequestEvent {
+                request_id: "a1",
+                tool_name: "write_file",
+                approval_kind: ApprovalKind::Standard,
+                path: Some("src/a.rs"),
+                detail: Some("src/a.rs"),
+            },
+            ApprovalBatchRequestEvent {
+                request_id: "a2",
+                tool_name: "write_file",
+                approval_kind: ApprovalKind::Standard,
+                path: Some("src/b.rs"),
+                detail: Some("src/b.rs"),
+            },
+        ]);
+        assert_eq!(
+            ev.get("type").and_then(Value::as_str),
+            Some("approval_batch_required")
+        );
+        let requests = ev
+            .get("requests")
+            .and_then(Value::as_array)
+            .expect("requests array");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["request_id"].as_str(), Some("a1"));
+        assert_eq!(requests[1]["detail"].as_str(), Some("src/b.rs"));
     }
 
     #[test]

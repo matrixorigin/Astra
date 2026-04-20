@@ -743,6 +743,108 @@ mod tests {
     }
 
     #[test]
+    fn real_session_0ac769_pattern_surfaces_git_show_and_read_file_repeats() {
+        use astra_services::session_journal::ToolCallRecord;
+
+        let record = |name: &str, args_preview: &str| ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ms: 20,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(120),
+            args_preview: Some(args_preview.to_string()),
+            result_preview: Some("ok".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            ..Default::default()
+        };
+
+        // Real session 0ac7696c had 7 LLM rounds with this 12-tool pattern:
+        // git_show, git_show, read_file x3 + grep, grep x3 + read_file, git_show, git_show.
+        // The persisted turn_evaluation surfaced repeat loops for read_file and
+        // git_show, while distinct grep queries stayed healthy.
+        let records = vec![
+            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
+            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record("grep", r#"/factual retry/ in rust/crates/runtime/src"#),
+            record("grep", r#"/ContinueLoop/ in rust/crates/runtime/src"#),
+            record("grep", r#"/TPM/ in rust/crates/runtime/src"#),
+            record("read_file", r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#),
+            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
+            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
+            record("grep", r#"/turn_evaluation/ in rust/crates/runtime/src"#),
+        ];
+
+        let eval = evaluate_tool_call_records(
+            "review b273c589a73799070a71f4cfc6d55349b534d8d1",
+            &["git_show".to_string(), "read_file".to_string(), "grep".to_string()],
+            &records,
+            0,
+            false,
+            0.446_225,
+            true,
+        );
+
+        assert!(eval.success, "real-session loop still completed successfully");
+        assert_eq!(eval.quality, 0.5);
+        assert_eq!(eval.confidence, 0.7);
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "read_file")),
+            "expected read_file repeat signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
+            "expected git_show repeat signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "grep")),
+            "distinct grep queries should not collapse into a repeat loop: {:?}",
+            eval.signals
+        );
+
+        let event = build_turn_evaluation_journal_event(
+            Some("0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0"),
+            Some(1),
+            "cli_repl",
+            "review b273c589a73799070a71f4cfc6d55349b534d8d1",
+            &["git_show".to_string(), "read_file".to_string(), "grep".to_string()],
+            &records,
+            0,
+            false,
+            0.446_225,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["tool_call_count"], 12);
+        assert_eq!(metadata["signal_count"], 4);
+        assert_eq!(metadata["quality"], 0.5);
+        assert_eq!(metadata["confidence"], 0.7);
+    }
+
+    #[test]
     fn tool_call_count_excludes_synthetic_placeholders() {
         use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 

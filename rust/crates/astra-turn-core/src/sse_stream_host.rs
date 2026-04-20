@@ -16,7 +16,7 @@
 //! ```
 
 use crate::chat_turn_sse_dispatch::{
-    ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, SseRenderEffect,
+    ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, EdgeApprovalRequest, SseRenderEffect,
     dispatch_chat_turn_sse_event_block,
 };
 use astra_thin_client::ApprovalKind;
@@ -252,6 +252,28 @@ pub trait SseStreamHost: Send {
         session_id: Option<&str>,
         detail: Option<&str>,
     ) -> EdgeApprovalResult;
+
+    /// Resolve a batch of approval requests in one interactive step when supported.
+    async fn resolve_approvals_batch(
+        &mut self,
+        requests: &[EdgeApprovalRequest],
+        session_id: Option<&str>,
+    ) -> Vec<EdgeApprovalResult> {
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            results.push(
+                self.resolve_approval(
+                    &request.request_id,
+                    &request.tool,
+                    request.approval_kind,
+                    session_id,
+                    request.detail.as_deref(),
+                )
+                .await,
+            );
+        }
+        results
+    }
 
     /// Execute a batch of tool requests, potentially in parallel.
     ///
@@ -503,7 +525,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
 ) {
     let items = std::mem::take(pending);
     let mut tool_batch: Vec<ToolBatchRequest> = Vec::new();
-    let mut approvals: Vec<ChatTurnEdgePending> = Vec::new();
+    let mut approval_requests: Vec<EdgeApprovalRequest> = Vec::new();
 
     for item in items {
         match item {
@@ -521,7 +543,20 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     args,
                 });
             }
-            approval => approvals.push(approval),
+            ChatTurnEdgePending::ApprovalRequired {
+                request_id,
+                tool,
+                approval_kind,
+                detail,
+            } => approval_requests.push(EdgeApprovalRequest {
+                request_id,
+                tool,
+                approval_kind,
+                detail,
+            }),
+            ChatTurnEdgePending::ApprovalBatchRequired { requests } => {
+                approval_requests.extend(requests);
+            }
         }
     }
 
@@ -531,29 +566,22 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         tool_results.extend(results);
     }
 
-    // Approvals are always sequential (interactive prompts).
-    for item in approvals {
-        if let ChatTurnEdgePending::ApprovalRequired {
-            request_id,
-            tool,
-            approval_kind,
-            detail,
-        } = item
-        {
-            if request_id.is_empty() {
-                continue;
-            }
-            let result = host
-                .resolve_approval(
-                    &request_id,
-                    &tool,
-                    approval_kind,
-                    session_id,
-                    detail.as_deref(),
-                )
-                .await;
-            approval_results.push(result);
-        }
+    if approval_requests.len() > 1 {
+        approval_results.extend(
+            host.resolve_approvals_batch(&approval_requests, session_id)
+                .await,
+        );
+    } else if let Some(request) = approval_requests.into_iter().next() {
+        approval_results.push(
+            host.resolve_approval(
+                &request.request_id,
+                &request.tool,
+                request.approval_kind,
+                session_id,
+                request.detail.as_deref(),
+            )
+            .await,
+        );
     }
 }
 

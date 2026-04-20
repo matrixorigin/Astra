@@ -1,6 +1,6 @@
 use super::*;
 use astra_runtime::turn::chat_turn_sse_dispatch::{
-    ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+    ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
 use astra_runtime::turn::headless_tool_assembly::READ_ONLY_TOOLS;
 use astra_runtime::turn::sse_edge_stderr_lines::{
@@ -14,6 +14,7 @@ use astra_runtime::turn::tool_result_semantics::{
     cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
 };
 use astra_services::session_journal::{JournalEvent, JournalWriter};
+use astra_tools::git_gix::{git_worktree_is_clean, head_short};
 use crossterm::style::Stylize;
 use futures_util::FutureExt;
 use futures_util::StreamExt;
@@ -23,6 +24,7 @@ use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -104,9 +106,32 @@ impl RenderPolicy {
 /// scoped to edge-path tool calls (`tool_request` SSE events).  Cacheable tools
 /// (read_file, grep, git_log, …) get their output stored and replayed on repeat.
 /// All tools get a hard call-count limit to prevent runaway repetition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EdgeToolCacheValidation {
+    FileMtime {
+        path: PathBuf,
+        timestamp_ms: u128,
+    },
+    DirectoryMtime {
+        path: PathBuf,
+        timestamp_ms: u128,
+    },
+    GitHeadClean {
+        project_root: PathBuf,
+        head_short: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EdgeToolCacheEntry {
+    output: String,
+    status: String,
+    validation: EdgeToolCacheValidation,
+}
+
 pub(super) struct EdgeToolCache {
-    /// `dedup_signature → (output, status)` for read-only tools.
-    output_cache: std::collections::HashMap<String, (String, String)>,
+    /// `dedup_signature → cached output + validity contract` for safe replay.
+    output_cache: std::collections::HashMap<String, EdgeToolCacheEntry>,
     /// `dedup_signature → count` across all turns.
     call_counts: std::collections::HashMap<String, u32>,
     /// Hard cap on identical calls (same tool + same args).
@@ -119,6 +144,31 @@ impl EdgeToolCache {
             output_cache: std::collections::HashMap::new(),
             call_counts: std::collections::HashMap::new(),
             max_identical_calls,
+        }
+    }
+}
+
+fn path_mtime_ms(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+impl EdgeToolCacheValidation {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::FileMtime { path, timestamp_ms }
+            | Self::DirectoryMtime { path, timestamp_ms } => path_mtime_ms(path) == *timestamp_ms,
+            Self::GitHeadClean {
+                project_root,
+                head_short: cached_head,
+            } => {
+                git_worktree_is_clean(project_root).unwrap_or(false)
+                    && head_short(project_root) == *cached_head
+            }
         }
     }
 }
@@ -320,6 +370,53 @@ impl<'a> CliSseStreamHost<'a> {
             print!("{s}");
             let _ = io::stdout().flush();
             self.render.track_output(s);
+        }
+    }
+
+    fn validated_cache_entry(&self, dedup_sig: &str) -> Option<(String, String)> {
+        let entry = self.tool_cache.output_cache.get(dedup_sig)?;
+        entry
+            .validation
+            .is_valid()
+            .then_some((entry.output.clone(), entry.status.clone()))
+    }
+
+    fn cache_validation_for_tool(
+        &self,
+        tool: &str,
+        args: &Value,
+    ) -> Option<EdgeToolCacheValidation> {
+        match tool {
+            "read_file" => {
+                let path = self
+                    .executor
+                    .resolve_checked(args.get("path").and_then(Value::as_str)?)
+                    .ok()?;
+                let timestamp_ms = path_mtime_ms(&path);
+                (timestamp_ms > 0)
+                    .then_some(EdgeToolCacheValidation::FileMtime { path, timestamp_ms })
+            }
+            "list_dir" => {
+                let path = match args.get("path").and_then(Value::as_str) {
+                    Some(path) => self.executor.resolve_checked(path).ok()?,
+                    None => self.executor.project_root.clone(),
+                };
+                let timestamp_ms = path_mtime_ms(&path);
+                (timestamp_ms > 0)
+                    .then_some(EdgeToolCacheValidation::DirectoryMtime { path, timestamp_ms })
+            }
+            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame"
+            | "git_file_history" | "git_contributors" | "git_log_search" => {
+                if !git_worktree_is_clean(&self.executor.project_root).unwrap_or(false) {
+                    return None;
+                }
+                let cached_head = head_short(&self.executor.project_root);
+                (!cached_head.is_empty()).then_some(EdgeToolCacheValidation::GitHeadClean {
+                    project_root: self.executor.project_root.clone(),
+                    head_short: cached_head,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -1522,22 +1619,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         // ── Edge-path dedup: call-count limit + output cache ───────────
         let dedup_sig = tool_dedup_signature(tool, args);
-        let call_count = self
-            .tool_cache
-            .call_counts
-            .entry(dedup_sig.clone())
-            .or_insert(0);
-        *call_count += 1;
+        let call_count = {
+            let count = self
+                .tool_cache
+                .call_counts
+                .entry(dedup_sig.clone())
+                .or_insert(0);
+            *count += 1;
+            *count
+        };
         let max_calls = self.tool_cache.max_identical_calls;
 
-        if *call_count > max_calls {
+        if call_count > max_calls {
             // Hard cap exceeded — return a stub telling the LLM to stop.
-            let body = if let Some((cached_out, _)) = self.tool_cache.output_cache.get(&dedup_sig) {
+            let body = if let Some((cached_out, _)) = self.validated_cache_entry(&dedup_sig) {
                 format!(
                     "⛔ Cached repeat (call #{} for identical args, limit: {}). \
                      The result is already in this conversation from an earlier call. \
                      Do NOT call this tool again with the same arguments.\n\n{}",
-                    *call_count,
+                    call_count,
                     max_calls,
                     &cached_out[..cached_out.len().min(200)],
                 )
@@ -1545,7 +1645,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 format!(
                     "⛔ Duplicate call #{} (limit: {}). This tool has been called too many times \
                      with the same arguments. Use the results from earlier calls instead.",
-                    *call_count, max_calls,
+                    call_count, max_calls,
                 )
             };
             let status = "error";
@@ -1559,8 +1659,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         // Cache hit for read-only (cacheable) tools
         if READ_ONLY_TOOLS.contains(&tool)
-            && let Some((cached_output, cached_status)) =
-                self.tool_cache.output_cache.get(&dedup_sig).cloned()
+            && let Some((cached_output, cached_status)) = self.validated_cache_entry(&dedup_sig)
         {
             if let Some(idx) = tool_idx {
                 self.render
@@ -1939,10 +2038,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Store successful cacheable tool results for cross-turn dedup.
-        if allowed && status != "error" && READ_ONLY_TOOLS.contains(&tool) {
-            self.tool_cache
-                .output_cache
-                .insert(dedup_sig.clone(), (output.clone(), status.clone()));
+        if allowed
+            && status != "error"
+            && READ_ONLY_TOOLS.contains(&tool)
+            && let Some(validation) = self.cache_validation_for_tool(tool, args)
+        {
+            self.tool_cache.output_cache.insert(
+                dedup_sig.clone(),
+                EdgeToolCacheEntry {
+                    output: output.clone(),
+                    status: status.clone(),
+                    validation,
+                },
+            );
         }
 
         // Forward tool-completed event to observer channel
@@ -2105,6 +2213,87 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             decision: decision_str.to_string(),
             reason: None,
         }
+    }
+
+    async fn resolve_approvals_batch(
+        &mut self,
+        requests: &[EdgeApprovalRequest],
+        session_id: Option<&str>,
+    ) -> Vec<EdgeApprovalResult> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+
+        self.render.stop_tool_stderr_running();
+        self.render.stop_tool_stdout_anim();
+        self.render.stop_thinking();
+
+        let decisions = match &mut self.perm_manager {
+            Some(pm) => {
+                let items = requests
+                    .iter()
+                    .map(|request| {
+                        (
+                            request.tool.as_str(),
+                            request.detail.as_deref(),
+                            request.approval_kind,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                pm.resolve_cloud_approval_batch_async(&items, self.render_policy.is_silent())
+                    .await
+            }
+            None => vec![astra_thin_client::ApprovalDecision::Deny; requests.len()],
+        };
+
+        let mut results = Vec::with_capacity(requests.len());
+        for (request, decision) in requests.iter().zip(decisions.into_iter()) {
+            let decision_str = match &decision {
+                astra_thin_client::ApprovalDecision::Allow
+                | astra_thin_client::ApprovalDecision::AllowSession => {
+                    self.cloud_pre_approved.insert(request.request_id.clone());
+                    "allow"
+                }
+                _ => "deny",
+            };
+            let body = astra_thin_client::ApprovalRespondRequest {
+                request_id: request.request_id.clone(),
+                decision,
+                reason: None,
+                session_id: session_id.map(ToString::to_string),
+                tool_name: Some(request.tool.clone()),
+                approval_kind: Some(request.approval_kind),
+            };
+            let post_result = self.api.post_approval(Some(self.token), &body).await;
+            if let Err(ref e) = post_result {
+                let is_auth_failure = matches!(
+                    e,
+                    astra_thin_client::ThinClientError::Api { status, .. }
+                        if status.as_u16() == 401
+                );
+
+                if is_auth_failure {
+                    if let Some(token) = self.cancel_token {
+                        token.cancel();
+                    }
+                    if !self.render_policy.is_silent() {
+                        eprintln!(
+                            "{}",
+                            "Session expired. Please re-authenticate with `astra auth login`."
+                                .red()
+                        );
+                    }
+                } else if !self.render_policy.suppress_tool_ui() {
+                    eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+                }
+            }
+            results.push(EdgeApprovalResult {
+                request_id: request.request_id.clone(),
+                decision: decision_str.to_string(),
+                reason: None,
+            });
+        }
+        results
     }
 
     /// Parallel batch execution for concurrent-safe tools.
@@ -6842,13 +7031,20 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let sig = "read_file:{\"path\":\"/tmp/foo\"}".to_string();
         cache.output_cache.insert(
             sig.clone(),
-            ("file content".to_string(), "success".to_string()),
+            EdgeToolCacheEntry {
+                output: "file content".to_string(),
+                status: "success".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: PathBuf::from("/tmp/foo"),
+                    timestamp_ms: 1,
+                },
+            },
         );
         let hit = cache.output_cache.get(&sig);
         assert!(hit.is_some());
-        let (output, status) = hit.unwrap();
-        assert_eq!(output, "file content");
-        assert_eq!(status, "success");
+        let hit = hit.unwrap();
+        assert_eq!(hit.output, "file content");
+        assert_eq!(hit.status, "success");
     }
 
     #[test]
@@ -7779,6 +7975,181 @@ diff --git a/src/a.rs b/src/a.rs\n\
             results[2].output.contains("existing"),
             "read_file should return actual file content: {}",
             results[2].output
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_tool_cache_invalidates_read_file_after_file_change() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let file = temp.path().join("cached.txt");
+        std::fs::write(&file, "v1\n").expect("seed");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let first = host
+            .execute_tool(
+                "cache-read-1",
+                "read_file",
+                &serde_json::json!({"path": "cached.txt"}),
+            )
+            .await;
+        assert!(first.output.contains("v1"), "{}", first.output);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file, "v2\n").expect("update");
+
+        let second = host
+            .execute_tool(
+                "cache-read-2",
+                "read_file",
+                &serde_json::json!({"path": "cached.txt"}),
+            )
+            .await;
+        assert!(second.output.contains("v2"), "{}", second.output);
+        assert!(
+            !second.output.contains("v1"),
+            "stale cache should not replay old file contents: {}",
+            second.output
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_tool_cache_reuses_git_show_when_head_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = init_temp_git_repo();
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let first = host
+            .execute_tool(
+                "cache-git-1",
+                "git_show",
+                &serde_json::json!({"commit": "HEAD", "stat_only": true}),
+            )
+            .await;
+        let second = host
+            .execute_tool(
+                "cache-git-2",
+                "git_show",
+                &serde_json::json!({"commit": "HEAD", "stat_only": true}),
+            )
+            .await;
+
+        assert_eq!(first.output, second.output);
+        assert_eq!(
+            second.duration_ms, 0,
+            "second git_show should be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_tool_cache_invalidates_git_status_after_worktree_change() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = init_temp_git_repo();
+        let tracked = temp.path().join("tracked.txt");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let first = host
+            .execute_tool("cache-git-status-1", "git_status", &serde_json::json!({}))
+            .await;
+        assert!(
+            !first.output.contains("tracked.txt"),
+            "expected clean repo output without dirty entries: {}",
+            first.output
+        );
+
+        std::fs::write(&tracked, "modified\n").expect("modify tracked file");
+
+        let second = host
+            .execute_tool("cache-git-status-2", "git_status", &serde_json::json!({}))
+            .await;
+        assert!(
+            second.output.contains("tracked.txt"),
+            "stale git cache should not hide worktree changes: {}",
+            second.output
         );
     }
 

@@ -1,5 +1,6 @@
 //! Local session journal digest for `astra journal digest` and tooling.
 
+use crate::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
 use serde::Serialize;
 use serde_json::json;
@@ -151,6 +152,21 @@ pub struct TurnRow {
     /// Total tool execution time (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tool_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_groups: Vec<ToolGroupRow>,
+}
+
+#[derive(Serialize)]
+pub struct ToolGroupRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    pub parallel: bool,
+    pub call_count: usize,
+    pub ok_count: usize,
+    pub fail_count: usize,
+    pub tools: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -203,6 +219,30 @@ fn tool_call_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u3
         }
     }
     (ok, fail)
+}
+
+fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
+    tool_call_groups::group_tool_calls(calls)
+        .into_iter()
+        .map(|group| ToolGroupRow {
+            round: group.round,
+            batch_id: group.batch_id.map(|batch_id| batch_id.to_string()),
+            parallel: group.parallel,
+            call_count: group.calls.len(),
+            ok_count: group.ok_count(),
+            fail_count: group.fail_count(),
+            tools: group
+                .calls
+                .iter()
+                .map(|call| {
+                    crate::stream_render::format_tool_display_from_preview(
+                        &call.name,
+                        call.args_preview.as_deref(),
+                    )
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
@@ -320,6 +360,14 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     llm_rounds: ev.llm_rounds,
                     total_llm_ms: ev.total_llm_ms,
                     total_tool_ms: ev.total_tool_ms,
+                    tool_groups: if matches!(focus, DigestFocus::All) {
+                        ev.tool_calls
+                            .as_ref()
+                            .map(|calls| build_tool_group_rows(calls))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 turns_out.push(row);
             }
@@ -503,6 +551,29 @@ pub fn print_text(d: &JournalDigest) {
                 ms,
                 t.user_input_preview.as_str().dim()
             );
+            for group in &t.tool_groups {
+                let mut scope = match group.round {
+                    Some(round) => format!("r{round}"),
+                    None => "r?".to_string(),
+                };
+                if let Some(batch_id) = group.batch_id.as_deref() {
+                    scope.push_str(&format!(" · {batch_id}"));
+                }
+                if group.parallel || group.call_count > 1 {
+                    scope.push_str(&format!(" · {} calls", group.call_count));
+                }
+                let status = if group.fail_count > 0 {
+                    format!("{} ok / {} fail", group.ok_count, group.fail_count)
+                } else {
+                    format!("{} ok", group.ok_count)
+                };
+                println!(
+                    "                          {} {} — {}",
+                    scope.as_str().dim(),
+                    status.as_str().dim(),
+                    group.tools.join(", ").dim()
+                );
+            }
         }
     }
     if !d.compaction_events.is_empty() {
@@ -616,6 +687,29 @@ mod tests {
         assert_eq!(d.turns[0].seq, 1);
         assert_eq!(d.turns[0].turn_id, Some(1));
         assert_eq!(d.turns[1].tool_calls_ok, 1);
+    }
+
+    #[test]
+    fn digest_includes_grouped_tool_batches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-digest-groups-00000000-0000-0000-0000-000000000003";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":10,"args_preview":"src/lib.rs","batch_id":"b-0-0","parallel":true,"round":0},{"name":"grep","ok":true,"ms":11,"args_preview":"SessionState","batch_id":"b-0-0","parallel":true,"round":0},{"name":"bash","ok":false,"ms":20,"round":1,"error":"boom"}]}
+"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.turns.len(), 1);
+        assert_eq!(d.turns[0].tool_groups.len(), 2);
+        assert_eq!(d.turns[0].tool_groups[0].batch_id.as_deref(), Some("b-0-0"));
+        assert!(d.turns[0].tool_groups[0].parallel);
+        assert_eq!(d.turns[0].tool_groups[0].call_count, 2);
+        assert_eq!(d.turns[0].tool_groups[1].round, Some(1));
+        assert_eq!(d.turns[0].tool_groups[1].fail_count, 1);
     }
 
     #[test]

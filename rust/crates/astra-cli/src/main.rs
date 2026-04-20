@@ -203,6 +203,8 @@ mod streaming_types;
 mod terminal_region;
 #[path = "cli/theme.rs"]
 mod theme;
+#[path = "cli/tool_call_groups.rs"]
+mod tool_call_groups;
 mod tool_safety_guard;
 
 use agent_runtime::initialize_multi_agent_runtime;

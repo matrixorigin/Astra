@@ -550,20 +550,13 @@ impl PermissionManager {
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        if quiet {
-            return if self.mode == PermissionMode::Auto {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            };
+        if let Some(decision) =
+            self.preflight_cloud_approval_decision(tool, detail, approval_kind, quiet)
+        {
+            return decision;
         }
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            match self.mode {
-                PermissionMode::Deny => return ApprovalDecision::Deny,
-                PermissionMode::Auto => return ApprovalDecision::Allow,
-                PermissionMode::Prompt => {}
-            }
             eprintln!(
                 "{}",
                 format!("  ☁  Cloud approval required: {tool}").yellow()
@@ -590,37 +583,6 @@ impl PermissionManager {
                 _ => ApprovalDecision::Deny,
             };
         }
-        match self.mode {
-            PermissionMode::Auto => return ApprovalDecision::Allow,
-            PermissionMode::Deny => return ApprovalDecision::Deny,
-            PermissionMode::Prompt => {}
-        }
-        let fp = match (cloud_gated_tool_kind(tool), detail) {
-            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
-                    tool, cmd, false,
-                )
-            }
-            (Some(CloudGatedToolKind::Write), d) => {
-                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
-            }
-            _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
-        };
-        if let Some(allowed) = self.session_overrides.check(&fp) {
-            return if allowed {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            };
-        }
-        match self.denial_tracker.should_prompt(&fp) {
-            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
-                return ApprovalDecision::Deny;
-            }
-            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {}
-            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
-        }
-
         eprintln!(
             "{}",
             format!("  ☁  Cloud approval required: {tool}").yellow()
@@ -634,6 +596,166 @@ impl PermissionManager {
         .await
         .unwrap_or('n');
         self.apply_cloud_approval_choice(tool, detail, ch)
+    }
+
+    pub(super) async fn resolve_cloud_approval_batch_async(
+        &mut self,
+        requests: &[(&str, Option<&str>, ApprovalKind)],
+        quiet: bool,
+    ) -> Vec<astra_thin_client::ApprovalDecision> {
+        use astra_thin_client::ApprovalDecision;
+
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        if requests.len() == 1 {
+            let (tool, detail, approval_kind) = requests[0];
+            return vec![
+                self.resolve_cloud_approval_async(tool, detail, approval_kind, quiet)
+                    .await,
+            ];
+        }
+
+        let mut decisions: Vec<Option<ApprovalDecision>> = vec![None; requests.len()];
+        let mut unresolved: Vec<(usize, &str, Option<&str>, ApprovalKind)> = Vec::new();
+
+        for (idx, (tool, detail, approval_kind)) in requests.iter().copied().enumerate() {
+            if let Some(decision) =
+                self.preflight_cloud_approval_decision(tool, detail, approval_kind, quiet)
+            {
+                decisions[idx] = Some(decision);
+            } else {
+                unresolved.push((idx, tool, detail, approval_kind));
+            }
+        }
+
+        if unresolved.is_empty() {
+            return decisions
+                .into_iter()
+                .map(|decision| decision.unwrap_or(ApprovalDecision::Deny))
+                .collect();
+        }
+
+        let all_explicit = unresolved
+            .iter()
+            .all(|(_, _, _, approval_kind)| Self::cloud_approval_is_explicit(*approval_kind));
+        let prompt_kind = if all_explicit {
+            ApprovalPromptKind::ConfirmOnce
+        } else {
+            ApprovalPromptKind::CloudStandard
+        };
+
+        eprintln!(
+            "{}",
+            format!(
+                "  ☁  Cloud approval required for {} tools",
+                unresolved.len()
+            )
+            .yellow()
+        );
+        for (_, tool, detail, _) in &unresolved {
+            eprintln!(
+                "  {} {}",
+                "•".dim(),
+                match detail.filter(|detail| !detail.is_empty()) {
+                    Some(detail) =>
+                        format!("{tool} — {}", Self::format_prompt_detail(detail).trim()),
+                    None => (*tool).to_string(),
+                }
+                .dim()
+            );
+        }
+
+        let ch = tokio::task::spawn_blocking(move || Self::prompt_approval(prompt_kind))
+            .await
+            .unwrap_or('n');
+
+        if ch == '!' {
+            self.set_mode(PermissionMode::Auto);
+            eprintln!(
+                "  {}",
+                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore.".yellow()
+            );
+            for (idx, _, _, _) in unresolved {
+                decisions[idx] = Some(ApprovalDecision::Allow);
+            }
+        } else if all_explicit {
+            let decision = if ch == 'y' {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+            for (idx, _, _, _) in unresolved {
+                decisions[idx] = Some(decision.clone());
+            }
+        } else {
+            for (idx, tool, detail, _) in unresolved {
+                decisions[idx] = Some(self.apply_cloud_approval_choice(tool, detail, ch));
+            }
+        }
+
+        decisions
+            .into_iter()
+            .map(|decision| decision.unwrap_or(ApprovalDecision::Deny))
+            .collect()
+    }
+
+    fn preflight_cloud_approval_decision(
+        &mut self,
+        tool: &str,
+        detail: Option<&str>,
+        approval_kind: ApprovalKind,
+        quiet: bool,
+    ) -> Option<astra_thin_client::ApprovalDecision> {
+        use astra_thin_client::ApprovalDecision;
+
+        if quiet {
+            return Some(if self.mode == PermissionMode::Auto {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            });
+        }
+
+        if Self::cloud_approval_is_explicit(approval_kind) {
+            return match self.mode {
+                PermissionMode::Auto => Some(ApprovalDecision::Allow),
+                PermissionMode::Deny => Some(ApprovalDecision::Deny),
+                PermissionMode::Prompt => None,
+            };
+        }
+
+        match self.mode {
+            PermissionMode::Auto => return Some(ApprovalDecision::Allow),
+            PermissionMode::Deny => return Some(ApprovalDecision::Deny),
+            PermissionMode::Prompt => {}
+        }
+
+        let fp = match (cloud_gated_tool_kind(tool), detail) {
+            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                    tool, cmd, false,
+                )
+            }
+            (Some(CloudGatedToolKind::Write), d) => {
+                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+            }
+            _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+        };
+        if let Some(allowed) = self.session_overrides.check(&fp) {
+            return Some(if allowed {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            });
+        }
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                Some(ApprovalDecision::Deny)
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => None,
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => None,
+        }
     }
 
     fn classify(name: &str) -> SideEffect {
@@ -909,7 +1031,7 @@ impl PermissionManager {
         rc
     }
 
-    fn apply_cloud_approval_choice(
+    pub(super) fn apply_cloud_approval_choice(
         &mut self,
         tool: &str,
         detail: Option<&str>,

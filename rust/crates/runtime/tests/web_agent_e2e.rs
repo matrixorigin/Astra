@@ -20,9 +20,13 @@ use astra_runtime::{
     SessionUpdateRequestData, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
     TurnObserverWorker, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
 };
+use astra_services::skills::{
+    SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
+    SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
+};
 use async_trait::async_trait;
 use axum::{
-    Router,
+    Json, Router,
     body::{self, Body},
     http::{Request, StatusCode},
 };
@@ -226,6 +230,115 @@ impl TurnToolEventWriter for RecordingToolEventWriter {
     }
 }
 
+struct TestSkillService;
+
+#[async_trait]
+impl SkillService for TestSkillService {
+    async fn register_skill(
+        &self,
+        _: String,
+        _: SkillRegisterRequestData,
+    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn list_skills(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
+        if offset > 0 {
+            return Ok(SkillListRecord {
+                skills: Vec::new(),
+                total: 1,
+                limit,
+                offset,
+            });
+        }
+
+        Ok(SkillListRecord {
+            skills: vec![SkillListItem {
+                skill_id: "test-skill@1.0.0".to_string(),
+                skill_name: "test-skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("Test skill".to_string()),
+                status: Some("active".to_string()),
+                source: Some("user".to_string()),
+                category: Some("testing".to_string()),
+                created_at: None,
+            }],
+            total: 1,
+            limit,
+            offset,
+        })
+    }
+
+    async fn get_skill(
+        &self,
+        skill_id: String,
+        _version: Option<String>,
+    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
+        if skill_id == "test-skill" || skill_id == "test-skill@1.0.0" {
+            return Ok(SkillRecord {
+                skill_id: "test-skill@1.0.0".to_string(),
+                skill_name: "test-skill".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("Test skill".to_string()),
+                metadata: Some(json!({
+                    "skill_type": "local",
+                    "instructions": "You are the test skill. Return the prepared instructions.",
+                    "when_to_use": "when validating skill interception"
+                })),
+                created_at: None,
+            });
+        }
+
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("not found".to_string())),
+        ))
+    }
+
+    async fn get_skill_info(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn list_skill_versions(
+        &self,
+        _: String,
+    ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn get_skill_status(
+        &self,
+        _: String,
+        _: u32,
+    ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn publish_skill(
+        &self,
+        _: String,
+        _: SkillPublishRequestData,
+    ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn unpublish_skill(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+}
+
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
@@ -283,6 +396,49 @@ fn build_test_app_with_hooks() -> (
         enc,
         ledger,
     )
+    .with_hook_db_writer(hook_writer.clone())
+    .with_observer_worker(observer_worker.clone())
+    .with_tool_event_writer(tool_event_writer.clone());
+
+    let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
+    (
+        build_app(state),
+        hook_writer,
+        observer_worker,
+        tool_event_writer,
+    )
+}
+
+fn build_test_app_with_hooks_and_skills() -> (
+    Router,
+    Arc<RecordingHookDbWriter>,
+    Arc<RecordingObserverWorker>,
+    Arc<RecordingToolEventWriter>,
+) {
+    init_env();
+    let enc =
+        Arc::new(FernetTokenEncryptor::new("web-e2e-fernet-key-32-chars!!!").expect("fernet key"));
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession));
+
+    let ledger = base.edge_callback_ledger();
+    let hook_writer = Arc::new(RecordingHookDbWriter::default());
+    let observer_worker = Arc::new(RecordingObserverWorker::default());
+    let tool_event_writer = Arc::new(RecordingToolEventWriter::default());
+
+    let lifecycle = AgenticRunLifecycleService::new(
+        MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "x".into(),
+            password: "x".into(),
+            database: "x".into(),
+        },
+        enc,
+        ledger,
+    )
+    .with_skill_service(Arc::new(TestSkillService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_tool_event_writer(tool_event_writer.clone());
@@ -1004,6 +1160,120 @@ async fn empty_test_llm_rounds_completes_gracefully() {
     // Should at least have session_info.
     assert!(!events.is_empty(), "expected at least session_info event");
     assert_eq!(events[0]["type"], "session_info");
+}
+
+#[tokio::test]
+async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
+    init_env();
+    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
+
+    let payload = json!({
+        "message": "Use the test skill",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        tool_call("tc-skill-1", "skill", json!({"skill_name": "test-skill"}))
+                    ]
+                },
+                {
+                    "full_text": "I used the skill instructions."
+                }
+            ]
+        }
+    });
+
+    let events = chat_stream_collect(&app, payload).await;
+
+    assert!(
+        find_events(&events, "tool_request").is_empty(),
+        "intercepted skill should not fall through to edge tool execution"
+    );
+
+    let ow = observer_worker.clone();
+    poll_until(
+        || {
+            let ow = ow.clone();
+            async move { ow.requests.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
+
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(requests.len(), 1, "expected one observer request");
+    let result = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-1"))
+        .and_then(|message| message.get("content").and_then(Value::as_str))
+        .unwrap_or("");
+    assert!(
+        result.contains("<skill-loaded name=\"test-skill\"/>"),
+        "skill result should be injected into the turn: {result}"
+    );
+
+    let text_events = find_events(&events, "text_delta");
+    assert!(
+        text_events
+            .iter()
+            .any(|event| event["content"].as_str() == Some("I used the skill instructions.")),
+        "final LLM round should continue after skill interception"
+    );
+}
+
+#[tokio::test]
+async fn unknown_skill_returns_error_without_edge_tool_request() {
+    init_env();
+    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
+
+    let payload = json!({
+        "message": "Use a missing skill",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        tool_call("tc-skill-unknown", "skill", json!({"skill_name": "missing-skill"}))
+                    ]
+                },
+                {
+                    "full_text": "The skill was unavailable."
+                }
+            ]
+        }
+    });
+
+    let events = chat_stream_collect(&app, payload).await;
+
+    assert!(
+        find_events(&events, "tool_request").is_empty(),
+        "unknown skill should fail in interception, not as an edge tool"
+    );
+
+    let ow = observer_worker.clone();
+    poll_until(
+        || {
+            let ow = ow.clone();
+            async move { ow.requests.lock().await.len() > 0 }
+        },
+        5,
+    )
+    .await;
+
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(requests.len(), 1, "expected one observer request");
+    let result = requests[0]
+        .messages
+        .iter()
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-unknown")
+        })
+        .and_then(|message| message.get("content").and_then(Value::as_str))
+        .unwrap_or("");
+    assert!(
+        result.contains("Unknown skill") || result.contains("unknown skill"),
+        "unknown skill should surface a clear error: {result}"
+    );
 }
 
 // ── Event ordering ───────────────────────────────────────────────────────────

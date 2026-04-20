@@ -23,12 +23,9 @@ const GIT_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Run a git command with a timeout, returning None if it times out or fails.
 /// Uses spawn + thread polling pattern because wait_timeout doesn't work with
 /// piped stdout (the output buffer fills up and the process blocks).
-fn run_git_with_timeout(
-    project_root: &Path,
-    args: &[&str],
-) -> Option<std::process::Output> {
+fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
     use std::process::{Command, Stdio};
-    
+
     let child = Command::new("git")
         .args(args)
         .current_dir(project_root)
@@ -36,13 +33,13 @@ fn run_git_with_timeout(
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    
+
     let start = std::time::Instant::now();
-    
+
     // Spawn a thread to wait for output (necessary because wait_with_output
     // blocks, and wait_timeout doesn't work with piped stdout)
     let handle = std::thread::spawn(move || child.wait_with_output());
-    
+
     // Poll for completion with timeout
     loop {
         if handle.is_finished() {

@@ -283,3 +283,74 @@ async fn http_handler_payload_matches_delivery_parser() {
             .contains("ok")
     );
 }
+
+#[tokio::test]
+async fn http_handler_payload_supports_batched_approval_delivery() {
+    let (app, ledger) = e2e_app();
+    for request_id in ["w-batch-1", "w-batch-2"] {
+        post_json(
+            app.clone(),
+            "/approval/respond",
+            json!({"request_id": request_id, "decision": "allow"}),
+        )
+        .await;
+    }
+    tokio::spawn({
+        let ledger = ledger.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut guard = ledger.lock().await;
+            guard.insert(
+                tool_callback_key("e2e-user", "w-batch-1"),
+                json!({"body": {"request_id": "w-batch-1", "status": "ok", "output": "ok-1"}}),
+            );
+            guard.insert(
+                tool_callback_key("e2e-user", "w-batch-2"),
+                json!({"body": {"request_id": "w-batch-2", "status": "ok", "output": "ok-2"}}),
+            );
+        }
+    });
+    let tcs = vec![
+        json!({
+            "id": "w-batch-1",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": r#"{"path":"a.rs","content":"1"}"#}
+        }),
+        json!({
+            "id": "w-batch-2",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"2"}"#}
+        }),
+    ];
+    let d =
+        deliver_tool_calls_through_edge_ledger(&ledger, "e2e-user", &tcs, Duration::from_secs(2))
+            .await;
+
+    assert!(
+        d.sse_maps
+            .iter()
+            .all(|m| m.get("type").and_then(|v| v.as_str()) != Some("approval_required"))
+    );
+    let batch = d
+        .sse_maps
+        .iter()
+        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("approval_batch_required"))
+        .expect("approval_batch_required event");
+    assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
+
+    let tool_request_positions: Vec<_> = d
+        .sse_maps
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, m)| {
+            (m.get("type").and_then(|v| v.as_str()) == Some("tool_request")).then_some(idx)
+        })
+        .collect();
+    assert_eq!(tool_request_positions.len(), 2);
+    let first_end = d
+        .sse_maps
+        .iter()
+        .position(|m| m.get("type").and_then(|v| v.as_str()) == Some("tool_call_end"))
+        .expect("tool_call_end");
+    assert!(tool_request_positions.iter().all(|idx| *idx < first_end));
+}

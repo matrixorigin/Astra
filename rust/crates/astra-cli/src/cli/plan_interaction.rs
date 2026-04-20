@@ -974,9 +974,19 @@ pub async fn handle_plan_mode_input(
         let plan_result = plan_llm_call(api, tok, &payload).await;
         // Extract session_id as owned value — plan_state holds a mutable borrow of
         // state.plan_mode, so we can't call maybe_init_session_from_plan(state, ..) directly.
-        let new_session_id: Option<String> = if let PlanLlmOutcome::Ok { session_id: Some(ref sid), .. } = plan_result {
-            if state.session_id.is_none() { Some(sid.clone()) } else { None }
-        } else { None };
+        let new_session_id: Option<String> = if let PlanLlmOutcome::Ok {
+            session_id: Some(ref sid),
+            ..
+        } = plan_result
+        {
+            if state.session_id.is_none() {
+                Some(sid.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let full_text = match plan_result {
             PlanLlmOutcome::Ok { text, .. } => text,
             PlanLlmOutcome::Cancelled => {
@@ -2092,20 +2102,19 @@ async fn handle_goal_submission(
         return Ok(PlanInputResult::Handled);
     };
     let gen_result =
-        plan_generate_with_retry(api, tok, &goal, &plan_ctx, state.session_id.as_deref())
-            .await;
+        plan_generate_with_retry(api, tok, &goal, &plan_ctx, state.session_id.as_deref()).await;
     maybe_init_session_from_plan(state, &gen_result);
     let full_text = match gen_result {
-            PlanLlmOutcome::Ok { text, .. } => text,
-            PlanLlmOutcome::Cancelled => {
-                eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
-                return Ok(PlanInputResult::Handled);
-            }
-            PlanLlmOutcome::Error(e) => {
-                eprintln!("  {} {}", theme::icon_err(), e.red());
-                return Ok(PlanInputResult::Handled);
-            }
-        };
+        PlanLlmOutcome::Ok { text, .. } => text,
+        PlanLlmOutcome::Cancelled => {
+            eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+            return Ok(PlanInputResult::Handled);
+        }
+        PlanLlmOutcome::Error(e) => {
+            eprintln!("  {} {}", theme::icon_err(), e.red());
+            return Ok(PlanInputResult::Handled);
+        }
+    };
 
     if let Some(questions) = detect_clarification_questions(&full_text) {
         return handle_outline_clarifications(questions, &goal, token, state, api).await;

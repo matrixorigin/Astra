@@ -120,11 +120,15 @@ async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<St
     // If the user specified a commit hash, use it; otherwise default to HEAD.
     let requested = extract_commit_hash(message);
     let commit = requested.clone().unwrap_or_else(|| "HEAD".to_string());
-    let parent = format!("{commit}~1");
 
     let log = run_git(
         project_root,
-        &["log", "-1", "--format=%H%n%an <%ae>%n%ai%n%s%n%n%b", &commit],
+        &[
+            "log",
+            "-1",
+            "--format=%H%n%an <%ae>%n%ai%n%s%n%n%b",
+            &commit,
+        ],
         MAX_LOG_BYTES,
     )
     .await?;
@@ -139,16 +143,15 @@ async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<St
         }
     }
 
-    let diff_range = format!("{parent}..{commit}");
     let stat = run_git(
         project_root,
-        &["diff", "--stat", &diff_range],
+        &["show", "--stat", "--format=", &commit],
         MAX_LOG_BYTES,
     )
     .await
     .unwrap_or_default();
 
-    let diff = run_git(project_root, &["diff", &diff_range], MAX_DIFF_BYTES).await?;
+    let diff = run_git(project_root, &["show", "--format=", &commit], MAX_DIFF_BYTES).await?;
 
     let mut ctx = String::with_capacity(log.len() + stat.len() + diff.len() + 200);
     ctx.push_str("## Latest Commit\n\n```\n");
@@ -216,8 +219,9 @@ async fn prefetch_working_changes(project_root: &Path) -> Option<String> {
         return prefetch_commit_review("", project_root).await;
     }
 
-    let stat =
-        run_git(project_root, &["diff", "--stat", "HEAD"], MAX_LOG_BYTES).await.unwrap_or_default();
+    let stat = run_git(project_root, &["diff", "--stat", "HEAD"], MAX_LOG_BYTES)
+        .await
+        .unwrap_or_default();
 
     let mut ctx = String::with_capacity(staged_text.len() + unstaged_text.len() + stat.len() + 200);
     ctx.push_str("## Working Directory Changes\n\n### Changed Files\n\n```\n");
@@ -275,7 +279,8 @@ async fn prefetch_exploration_context(_message: &str, project_root: &Path) -> Op
         if let Some(branch) = run_git(project_root, &["branch", "--show-current"], 256).await {
             ctx.push_str(&format!("## Git\n\nCurrent branch: `{}`\n", branch.trim()));
         }
-        if let Some(log) = run_git(project_root, &["log", "--oneline", "-10"], MAX_LOG_BYTES).await {
+        if let Some(log) = run_git(project_root, &["log", "--oneline", "-10"], MAX_LOG_BYTES).await
+        {
             ctx.push_str("\nRecent commits:\n```\n");
             ctx.push_str(&log);
             ctx.push_str("```\n\n");
@@ -323,7 +328,9 @@ async fn prefetch_debugging_context(message: &str, project_root: &Path) -> Optio
             }
         } else {
             // No uncommitted changes — show recent commit diffs
-            if let Some(log) = run_git(project_root, &["log", "--oneline", "-5"], MAX_LOG_BYTES).await {
+            if let Some(log) =
+                run_git(project_root, &["log", "--oneline", "-5"], MAX_LOG_BYTES).await
+            {
                 ctx.push_str("## Recent Commits\n\n```\n");
                 ctx.push_str(&log);
                 ctx.push_str("```\n\n");
@@ -608,7 +615,10 @@ fn mentions_local_changes(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
+    use tempfile::TempDir;
 
     fn test_project_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -617,6 +627,48 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+
+    fn run_git_test(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_commit_prefetch_repo() -> (TempDir, String, String, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        run_git_test(root, &["init"]);
+        run_git_test(root, &["config", "user.name", "Prefetch Tester"]);
+        run_git_test(root, &["config", "user.email", "prefetch@test.local"]);
+
+        let file = root.join("review.txt");
+        fs::write(&file, "first version\n").expect("write first version");
+        run_git_test(root, &["add", "review.txt"]);
+        run_git_test(root, &["commit", "-m", "first"]);
+        let first_sha = run_git_test(root, &["rev-parse", "HEAD"]);
+
+        fs::write(&file, "second version\n").expect("write second version");
+        run_git_test(root, &["add", "review.txt"]);
+        run_git_test(root, &["commit", "-m", "second"]);
+        let requested_sha = run_git_test(root, &["rev-parse", "HEAD"]);
+
+        fs::write(&file, "third version\n").expect("write third version");
+        run_git_test(root, &["add", "review.txt"]);
+        run_git_test(root, &["commit", "-m", "third"]);
+        let head_sha = run_git_test(root, &["rev-parse", "HEAD"]);
+
+        (tmp, first_sha, requested_sha, head_sha)
     }
 
     // ─── Code Review ─────────────────────────────────────────────
@@ -664,6 +716,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_code_review_uses_user_requested_commit_not_head() {
+        let (tmp, _first_sha, requested_sha, head_sha) = init_commit_prefetch_repo();
+        let root = tmp.path();
+        let query = format!("review {requested_sha}");
+
+        let ctx = prefetch_context_for_message(&query, root).await;
+        assert!(
+            ctx.is_some(),
+            "should prefetch a specifically requested commit"
+        );
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.task_type, "code_review");
+        assert!(
+            ctx.body.contains(&requested_sha),
+            "prefetched context should contain the requested commit sha: {}",
+            ctx.body
+        );
+        assert!(
+            !ctx.body.contains(&head_sha),
+            "prefetched context should not silently fall back to HEAD"
+        );
+    }
+
+    #[tokio::test]
     async fn prefetch_commit_review_invalid_hash_returns_none() {
         let root = test_project_root();
         let ctx = prefetch_context_for_message("review deadbeefdeadbeefdeadbeef00000000000", &root).await;
@@ -697,6 +773,28 @@ mod tests {
         let ctx = prefetch_context_for_message(&format!("review {hash}"), &root).await;
         assert!(ctx.is_some());
         assert_eq!(ctx.unwrap().task_type, "code_review");
+    }
+
+    #[tokio::test]
+    async fn prefetch_code_review_handles_root_commit_without_parent() {
+        let (tmp, first_sha, _requested_sha, head_sha) = init_commit_prefetch_repo();
+        let root = tmp.path();
+        let query = format!("review {first_sha}");
+
+        let ctx = prefetch_context_for_message(&query, root).await;
+        assert!(ctx.is_some(), "root commit should still prefetch correctly");
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.task_type, "code_review");
+        assert!(
+            ctx.body.contains(&first_sha),
+            "prefetched context should contain the requested root commit sha: {}",
+            ctx.body
+        );
+        assert!(
+            !ctx.body.contains(&head_sha),
+            "root commit review should not fall back to HEAD"
+        );
+        assert!(ctx.body.contains("Full Diff"));
     }
 
     #[tokio::test]
@@ -761,7 +859,8 @@ mod tests {
     #[tokio::test]
     async fn prefetch_implementation_returns_structure() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("implement a new feature for authentication", &root).await;
+        let ctx =
+            prefetch_context_for_message("implement a new feature for authentication", &root).await;
         assert!(ctx.is_some(), "should return context for implementation");
         let ctx = ctx.unwrap();
         assert_eq!(ctx.task_type, "implementation");

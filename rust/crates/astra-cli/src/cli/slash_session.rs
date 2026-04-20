@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::repl_runtime;
+use crate::tool_call_groups;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
 fn tilde_path(abs: &str) -> String {
@@ -876,24 +877,56 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 );
                                 // Show any failed tool calls for auditability
                                 if let Some(calls) = &evt.tool_calls {
-                                    for tc in calls.iter().filter(|c| !c.ok) {
-                                        let err_preview = tc
-                                            .error
-                                            .as_deref()
-                                            .unwrap_or("(no details)")
-                                            .chars()
-                                            .take(80)
-                                            .collect::<String>();
+                                    for group in tool_call_groups::group_tool_calls(calls) {
+                                        let displays = group
+                                            .calls
+                                            .iter()
+                                            .map(|tc| {
+                                                super::stream_render::format_tool_display_from_preview(
+                                                    &tc.name,
+                                                    tc.args_preview.as_deref(),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        let mut scope = match group.round {
+                                            Some(round) => format!("r{round}"),
+                                            None => "r?".to_string(),
+                                        };
+                                        if let Some(batch_id) = group.batch_id {
+                                            scope.push_str(&format!(" · {batch_id}"));
+                                        }
+                                        if group.parallel || group.calls.len() > 1 {
+                                            scope.push_str(&format!(
+                                                " · {} calls",
+                                                group.calls.len()
+                                            ));
+                                        }
                                         eprintln!(
-                                            "    {} {} ({}ms) {}",
-                                            theme::icon_err(),
-                                            super::stream_render::format_tool_display_from_preview(
-                                                &tc.name,
-                                                tc.args_preview.as_deref(),
-                                            ),
-                                            tc.ms,
-                                            err_preview.dim(),
+                                            "    {} {} {}",
+                                            "↳".dim(),
+                                            scope.dim(),
+                                            ellipsize(&displays, 96).dim(),
                                         );
+                                        for tc in group.calls.iter().copied().filter(|c| !c.ok) {
+                                            let err_preview = tc
+                                                .error
+                                                .as_deref()
+                                                .unwrap_or("(no details)")
+                                                .chars()
+                                                .take(80)
+                                                .collect::<String>();
+                                            eprintln!(
+                                                "      {} {} ({}ms) {}",
+                                                theme::icon_err(),
+                                                super::stream_render::format_tool_display_from_preview(
+                                                    &tc.name,
+                                                    tc.args_preview.as_deref(),
+                                                ),
+                                                tc.ms,
+                                                err_preview.dim(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2414,28 +2447,39 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
 fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
     let mut out = String::new();
     out.push_str("\n<details>\n<summary>Tool calls</summary>\n\n");
-    for tc in calls {
-        let status = if tc.ok { "✓" } else { "✗" };
-        let display = super::stream_render::format_tool_display_from_preview(
-            &tc.name,
-            tc.args_preview.as_deref(),
-        );
-        out.push_str(&format!("- `{display}` {status} ({}ms)", tc.ms));
-        out.push('\n');
-        if let Some(ref err) = tc.error {
-            out.push_str(&format!("  > Error: {err}\n"));
+    for group in tool_call_groups::group_tool_calls(calls) {
+        let mut header = match group.round {
+            Some(round) => format!("Round {round}"),
+            None => "Round ?".to_string(),
+        };
+        if let Some(batch_id) = group.batch_id {
+            header.push_str(&format!(" · batch {batch_id}"));
         }
-        if let Some(ref preview) = tc.result_preview {
-            // Show a short excerpt of the result
-            let short = if preview.len() > 200 {
-                format!("{}…", &preview[..preview.floor_char_boundary(200)])
-            } else {
-                preview.clone()
-            };
-            out.push_str(&format!(
-                "  > ```\n  > {}\n  > ```\n",
-                short.replace('\n', "\n  > ")
-            ));
+        if group.parallel || group.calls.len() > 1 {
+            header.push_str(&format!(" · {} parallel calls", group.calls.len()));
+        }
+        out.push_str(&format!("- **{header}**\n"));
+        for tc in &group.calls {
+            let status = if tc.ok { "✓" } else { "✗" };
+            let display = super::stream_render::format_tool_display_from_preview(
+                &tc.name,
+                tc.args_preview.as_deref(),
+            );
+            out.push_str(&format!("  - `{display}` {status} ({}ms)\n", tc.ms));
+            if let Some(ref err) = tc.error {
+                out.push_str(&format!("    > Error: {err}\n"));
+            }
+            if let Some(ref preview) = tc.result_preview {
+                let short = if preview.len() > 200 {
+                    format!("{}…", &preview[..preview.floor_char_boundary(200)])
+                } else {
+                    preview.clone()
+                };
+                out.push_str(&format!(
+                    "    > ```\n    > {}\n    > ```\n",
+                    short.replace('\n', "\n    > ")
+                ));
+            }
         }
     }
     out.push_str("\n</details>\n\n");
@@ -4117,7 +4161,39 @@ mod export_tests {
         let block = format_tool_calls_md(&calls);
         assert!(block.contains("<details>"));
         assert!(block.contains("</details>"));
+        assert!(block.contains("Round ?"));
         assert!(block.contains("`Grep: pattern in src/` ✓ (10ms)"));
+    }
+
+    #[test]
+    fn format_tool_calls_md_groups_parallel_batch() {
+        let mut first = ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            ms: 11,
+            args_preview: Some("src/lib.rs".into()),
+            batch_id: Some("b-0-0".into()),
+            parallel: Some(true),
+            round: Some(0),
+            ..Default::default()
+        };
+        first.result_preview = Some("mod app;".into());
+
+        let second = ToolCallRecord {
+            name: "grep".into(),
+            ok: true,
+            ms: 7,
+            args_preview: Some("SessionState".into()),
+            batch_id: Some("b-0-0".into()),
+            parallel: Some(true),
+            round: Some(0),
+            ..Default::default()
+        };
+
+        let block = format_tool_calls_md(&[first, second]);
+        assert!(block.contains("Round 0 · batch b-0-0 · 2 parallel calls"));
+        assert!(block.contains("`Reading: src/lib.rs` ✓ (11ms)"));
+        assert!(block.contains("`Grep: SessionState` ✓ (7ms)"));
     }
 
     // ── /export edge case tests ──

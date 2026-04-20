@@ -11,6 +11,7 @@
 //! 3. **TieredCompaction** — Delegate to the existing tier-based compactor.
 //! 4. **ReactiveCompact** — Emergency compression triggered by API 413 errors.
 
+use crate::turn::headless_tool_assembly::READ_ONLY_TOOLS;
 pub use astra_turn_core::compression_types::{
     CompressionLayer, CompressionResult, PipelineOutcome, TokenBudget,
 };
@@ -706,6 +707,124 @@ impl CompressionLayer for ReactiveCompact {
     }
 }
 
+// ───────────────────────────── Proactive Context Folding (P0) ────────────
+
+/// Number of rounds to wait before folding read-only tool results.
+/// Results from round R are eligible for folding when current round > R + FOLD_AFTER_ROUNDS.
+const FOLD_AFTER_ROUNDS: u32 = 2;
+
+/// Maximum chars to keep in a folded tool result.
+const FOLD_KEEP_CHARS: usize = 200;
+
+/// Result of proactive folding.
+#[derive(Debug, Clone)]
+pub struct FoldingResult {
+    /// Number of tool results folded.
+    pub folded_count: usize,
+    /// Total characters removed.
+    pub chars_removed: usize,
+    /// Estimated tokens freed (chars_removed / 4).
+    pub tokens_freed_estimate: u64,
+}
+
+/// Proactively fold old read-only tool results at turn end.
+///
+/// This is called at the end of each LLM turn (in `ProceedEndTurn`) to summarize
+/// tool results that are old enough to have been "seen" by the LLM and are now
+/// just taking up context space.
+///
+/// Unlike the pressure-based compression pipeline, this runs unconditionally
+/// to maintain a consistent, predictable context size.
+///
+/// # Arguments
+/// * `messages` - The conversation message history (modified in place)
+/// * `current_round` - The current LLM round index
+///
+/// # Returns
+/// Summary of what was folded.
+pub fn fold_old_read_only_results(messages: &mut Vec<Value>, current_round: u32) -> FoldingResult {
+    let mut folded_count = 0;
+    let mut chars_removed = 0;
+
+    for msg in messages.iter_mut() {
+        // Only process tool messages
+        if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+
+        // Check if this is a foldable read-only tool
+        let tool_name = match msg.get("_tool_name").and_then(|v| v.as_str()) {
+            Some(name) => name,
+            None => continue, // No tool name metadata, skip
+        };
+
+        if !READ_ONLY_TOOLS.contains(&tool_name) {
+            continue; // Not a read-only tool
+        }
+
+        // Check if it's old enough to fold
+        let round_idx = match msg.get("_round_index").and_then(|v| v.as_u64()) {
+            Some(r) => r as u32,
+            None => continue, // No round index, skip
+        };
+
+        if current_round <= round_idx + FOLD_AFTER_ROUNDS {
+            continue; // Too recent, don't fold yet
+        }
+
+        // Check if already folded
+        if msg
+            .get("_folded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue; // Already folded
+        }
+
+        // Fold the content
+        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+            let original_len = content.len();
+            if original_len <= FOLD_KEEP_CHARS {
+                continue; // Already small enough
+            }
+
+            // Create a summary: keep first part + note
+            let safe_end = content
+                .char_indices()
+                .take_while(|(i, _)| *i < FOLD_KEEP_CHARS)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+
+            let summary = format!(
+                "{}… [folded: {} → {} chars, round {}]",
+                &content[..safe_end],
+                original_len,
+                safe_end,
+                round_idx
+            );
+
+            if let Some(obj) = msg.as_object_mut() {
+                obj.insert("content".into(), Value::String(summary));
+                obj.insert("_folded".into(), Value::Bool(true));
+                obj.insert(
+                    "_original_length".into(),
+                    Value::Number(original_len.into()),
+                );
+            }
+
+            chars_removed += original_len - safe_end;
+            folded_count += 1;
+        }
+    }
+
+    FoldingResult {
+        folded_count,
+        chars_removed,
+        tokens_freed_estimate: (chars_removed / 4) as u64,
+    }
+}
+
 // ───────────────────────────── Tests ─────────────────────────────────────
 
 #[cfg(test)]
@@ -988,5 +1107,144 @@ mod tests {
             has_task,
             "First user message must survive even when preceded by tool msg"
         );
+    }
+
+    // ───────────────────────────── Proactive Folding Tests ─────────────────
+
+    #[test]
+    fn fold_old_read_only_results_folds_old_large_results() {
+        let long_content = "x".repeat(500);
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": long_content,
+            "_tool_name": "read_file",
+            "_round_index": 0
+        })];
+
+        // Current round 3 -> round 0 is old enough (0 + 2 < 3)
+        let result = fold_old_read_only_results(&mut msgs, 3);
+
+        assert_eq!(result.folded_count, 1);
+        assert!(result.chars_removed > 0);
+        let content = msgs[0].get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("[folded:"));
+        assert!(msgs[0].get("_folded").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn fold_old_read_only_results_skips_recent_results() {
+        let long_content = "x".repeat(500);
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": long_content.clone(),
+            "_tool_name": "read_file",
+            "_round_index": 1
+        })];
+
+        // Current round 3 -> round 1 is NOT old enough (1 + 2 = 3, not < 3)
+        let result = fold_old_read_only_results(&mut msgs, 3);
+
+        assert_eq!(result.folded_count, 0);
+        let content = msgs[0].get("content").unwrap().as_str().unwrap();
+        assert_eq!(content, long_content);
+    }
+
+    #[test]
+    fn fold_old_read_only_results_skips_non_read_only_tools() {
+        let long_content = "x".repeat(500);
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": long_content.clone(),
+            "_tool_name": "edit_file", // Not read-only
+            "_round_index": 0
+        })];
+
+        let result = fold_old_read_only_results(&mut msgs, 5);
+
+        assert_eq!(result.folded_count, 0);
+        let content = msgs[0].get("content").unwrap().as_str().unwrap();
+        assert_eq!(content, long_content);
+    }
+
+    #[test]
+    fn fold_old_read_only_results_skips_small_results() {
+        let small_content = "x".repeat(100); // Less than FOLD_KEEP_CHARS
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": small_content.clone(),
+            "_tool_name": "read_file",
+            "_round_index": 0
+        })];
+
+        let result = fold_old_read_only_results(&mut msgs, 5);
+
+        assert_eq!(result.folded_count, 0);
+        let content = msgs[0].get("content").unwrap().as_str().unwrap();
+        assert_eq!(content, small_content);
+    }
+
+    #[test]
+    fn fold_old_read_only_results_skips_already_folded() {
+        let long_content = "x".repeat(500);
+        let mut msgs = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": long_content,
+            "_tool_name": "read_file",
+            "_round_index": 0,
+            "_folded": true
+        })];
+
+        let result = fold_old_read_only_results(&mut msgs, 5);
+
+        assert_eq!(result.folded_count, 0);
+    }
+
+    #[test]
+    fn fold_old_read_only_results_multiple_tools() {
+        let long_content = "x".repeat(500);
+        let mut msgs = vec![
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": long_content.clone(),
+                "_tool_name": "read_file",
+                "_round_index": 0
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-2",
+                "content": long_content.clone(),
+                "_tool_name": "grep",
+                "_round_index": 0
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-3",
+                "content": long_content.clone(),
+                "_tool_name": "edit_file", // Not read-only, should be skipped
+                "_round_index": 0
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-4",
+                "content": long_content.clone(),
+                "_tool_name": "git_show",
+                "_round_index": 2 // Too recent for round 4
+            }),
+        ];
+
+        let result = fold_old_read_only_results(&mut msgs, 4);
+
+        // Only read_file and grep from round 0 should be folded
+        assert_eq!(result.folded_count, 2);
+        assert!(msgs[0].get("_folded").unwrap().as_bool().unwrap());
+        assert!(msgs[1].get("_folded").unwrap().as_bool().unwrap());
+        assert!(msgs[2].get("_folded").is_none()); // edit_file not folded
+        assert!(msgs[3].get("_folded").is_none()); // git_show too recent
     }
 }

@@ -3487,6 +3487,9 @@ mod tests {
     use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
 
+    const REAL_SESSION_0AC769_FIXTURE: &str =
+        include_str!("../fixtures/real_session_0ac769_min.jsonl");
+
     fn base_tool_record(name: &str, ok: bool, preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
@@ -3502,6 +3505,66 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn real_session_fixture_parses_with_expected_rounds_and_repeat_signals() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        std::fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .unwrap();
+
+        let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(non_empty_lines, 14);
+        assert_eq!(malformed_lines, 0);
+        assert_eq!(events.len(), 14);
+
+        let llm_rounds: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::LlmRound)
+            .collect();
+        assert_eq!(llm_rounds.len(), 7, "fixture should preserve the 7-round loop");
+
+        let turn = events
+            .iter()
+            .find(|event| event.event_type == JournalEventType::Turn)
+            .expect("turn event");
+        assert_eq!(
+            turn.user_input.as_deref(),
+            Some("review b273c589a73799070a71f4cfc6d55349b534d8d1")
+        );
+        assert!(
+            turn.assistant_output
+                .as_deref()
+                .unwrap_or("")
+                .contains("not b273c589"),
+            "fixture should preserve the wrong-prefetch symptom"
+        );
+
+        let eval = events
+            .iter()
+            .find(|event| event.event_type == JournalEventType::TurnEvaluation)
+            .expect("turn_evaluation event");
+        let metadata = eval.metadata.as_ref().expect("turn evaluation metadata");
+        assert_eq!(metadata["tool_call_count"], 12);
+        assert_eq!(metadata["signal_count"], 4);
+        assert_eq!(metadata["quality"], 0.5);
+        assert_eq!(metadata["confidence"], 0.7);
+
+        let signals = metadata["signals"].as_array().expect("signals array");
+        let repeat_tools: std::collections::BTreeSet<_> = signals
+            .iter()
+            .filter(|signal| signal["kind"].as_str() == Some("repeat_tool_call"))
+            .filter_map(|signal| signal["tool"].as_str())
+            .collect();
+        assert_eq!(
+            repeat_tools,
+            std::collections::BTreeSet::from(["git_show", "read_file"])
+        );
     }
 
     #[test]

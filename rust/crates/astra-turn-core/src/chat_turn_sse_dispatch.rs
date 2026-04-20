@@ -36,6 +36,15 @@ pub struct ChatTurnSseAccum {
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeApprovalRequest {
+    pub request_id: String,
+    pub tool: String,
+    pub approval_kind: ApprovalKind,
+    pub detail: Option<String>,
+}
+
+/// Deferred edge work from `tool_request` / approval SSE events.
 #[derive(Debug, Clone)]
 pub enum ChatTurnEdgePending {
     ToolRequest {
@@ -48,6 +57,9 @@ pub enum ChatTurnEdgePending {
         tool: String,
         approval_kind: ApprovalKind,
         detail: Option<String>,
+    },
+    ApprovalBatchRequired {
+        requests: Vec<EdgeApprovalRequest>,
     },
 }
 
@@ -123,6 +135,39 @@ fn approval_kind_from_event(event: &Value) -> ApprovalKind {
         .cloned()
         .and_then(|value| serde_json::from_value::<ApprovalKind>(value).ok())
         .unwrap_or(ApprovalKind::Explicit)
+}
+
+fn approval_request_from_event(event: &Value) -> Option<EdgeApprovalRequest> {
+    let request_id = event
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool = event
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let approval_kind = approval_kind_from_event(event);
+    let detail = event
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string)
+        .or_else(|| {
+            event
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        });
+    if request_id.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(EdgeApprovalRequest {
+        request_id,
+        tool,
+        approval_kind,
+        detail,
+    })
 }
 
 fn apply_one_event(
@@ -214,34 +259,28 @@ fn apply_one_event(
             }
         }
         "approval_required" => {
-            let request_id = event
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tool = event
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let approval_kind = approval_kind_from_event(event);
-            let detail = event
-                .get("detail")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string)
-                .or_else(|| {
-                    event
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .map(std::string::ToString::to_string)
-                });
-            if !request_id.is_empty() && !tool.is_empty() {
+            if let Some(request) = approval_request_from_event(event) {
                 edge_pending.push(ChatTurnEdgePending::ApprovalRequired {
-                    request_id,
-                    tool,
-                    approval_kind,
-                    detail,
+                    request_id: request.request_id,
+                    tool: request.tool,
+                    approval_kind: request.approval_kind,
+                    detail: request.detail,
                 });
+            }
+        }
+        "approval_batch_required" => {
+            let requests = event
+                .get("requests")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(approval_request_from_event)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !requests.is_empty() {
+                edge_pending.push(ChatTurnEdgePending::ApprovalBatchRequired { requests });
             }
         }
         "explain" => {
@@ -699,6 +738,24 @@ mod tests {
                 assert_eq!(*approval_kind, ApprovalKind::Explicit);
             }
             other => panic!("expected ApprovalRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_batch_required_enqueues_pending() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        let block = "data: {\"type\":\"approval_batch_required\",\"requests\":[{\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"detail\":\"src/a.rs\"},{\"request_id\":\"ap-2\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"detail\":\"src/b.rs\"}]}\n\n";
+        dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            ChatTurnEdgePending::ApprovalBatchRequired { requests } => {
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].request_id, "ap-1");
+                assert_eq!(requests[1].detail.as_deref(), Some("src/b.rs"));
+                assert_eq!(requests[0].approval_kind, ApprovalKind::Standard);
+            }
+            other => panic!("expected ApprovalBatchRequired, got {other:?}"),
         }
     }
 
