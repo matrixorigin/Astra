@@ -61,6 +61,7 @@ use astra_core::{
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
+use super::state_builder::PipelineLearningStack;
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
@@ -709,6 +710,119 @@ async fn persist_runtime_promotion_events(
                 "runtime promotion event persist failed"
             );
         }
+    }
+}
+
+/// Bundles all handles needed by post-loop best-effort persistence calls.
+///
+/// Both `create_run` and `stream_chat` run the same set of side effects after
+/// the agentic loop finishes: core event persistence, tool event persistence,
+/// hook DB writes, Memoria observer, pipeline learning, session-end hooks,
+/// runtime promotion events, and learning-stack save.  This struct captures
+/// the shared state so both paths can call `run()` instead of duplicating
+/// ~60 lines of glue code.
+struct PostLoopPersistContext {
+    matrixone: MatrixOneSettings,
+    shared_pool: Option<SharedPool>,
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    agent_id: Option<String>,
+    model_name: Option<String>,
+    user_message: String,
+    hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
+    observer_worker: Option<Arc<dyn TurnObserverWorker>>,
+    tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
+}
+
+impl PostLoopPersistContext {
+    /// Run all best-effort post-loop persistence side effects.
+    ///
+    /// The `loop_success` flag comes from `outcome.is_ok()` (before consuming
+    /// the outcome in `finalize_run_events`).
+    async fn run(
+        &self,
+        state: &AgenticLoopState,
+        learning_stack: &PipelineLearningStack,
+        loop_success: bool,
+    ) {
+        // 1. Persist user_query + llm_response core events.
+        persist_server_loop_core_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &self.user_id,
+            &self.session_id,
+            self.agent_id.as_deref(),
+            &self.user_message,
+            state,
+            self.model_name.as_deref(),
+        )
+        .await;
+
+        // 2. Persist tool_call events for session_audit metrics.
+        if let Some(ref writer) = self.tool_event_writer {
+            persist_server_loop_tool_events(
+                writer.as_ref(),
+                &self.user_id,
+                &self.session_id,
+                self.agent_id.as_deref(),
+                state,
+            )
+            .await;
+        }
+
+        // 3. Persist decision audit + skill selection to hook DB.
+        if let Some(ref writer) = self.hook_db_writer {
+            persist_server_loop_hook_events(
+                writer.as_ref(),
+                &self.user_id,
+                &self.session_id,
+                &self.user_message,
+                state,
+                self.model_name.as_deref(),
+            )
+            .await;
+        }
+
+        // 4. Fire Memoria observer (cross-session knowledge extraction).
+        if let Some(ref worker) = self.observer_worker {
+            fire_server_loop_observer(worker.as_ref(), &self.user_id, &self.session_id, state)
+                .await;
+        }
+
+        // 5. Record pipeline learning outcome (PatternLibrary / EntityGraph).
+        record_server_loop_learning_outcome(
+            learning_stack.writer.as_ref(),
+            &self.user_message,
+            state,
+            loop_success,
+        )
+        .await;
+
+        // 6. Fire SessionEnd hooks.
+        crate::skills::hooks::fire_session_end(
+            &state.skills.session_event_hooks,
+            state.current_session_id.as_deref().unwrap_or(""),
+        )
+        .await;
+
+        // 7. Persist runtime promotion events.
+        persist_runtime_promotion_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &self.user_id,
+            &self.session_id,
+            &self.run_id,
+            &state.telemetry.promotion_events,
+        )
+        .await;
+
+        // 8. Save cross-session learning state.
+        let active_canary = match state.evolution_service.as_ref() {
+            Some(evolution_service) => evolution_service.export_active_canary().await,
+            None => None,
+        };
+        learning_stack.save_with_active_canary(active_canary);
     }
 }
 
@@ -1981,16 +2095,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let runs = self.runs_handle();
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
-        let bg_user_id = user_id.clone();
         let bg_session_id = session_id.clone();
-        let bg_matrixone = self.matrixone.clone();
-        let bg_shared_pool = self.shared_pool.clone();
-        let bg_user_message = request.message.clone();
-        let bg_agent_id = request.agent_id.clone();
-        let bg_model_name = request.model.clone();
-        let bg_hook_db_writer = self.hook_db_writer.clone();
-        let bg_observer_worker = self.observer_worker.clone();
-        let bg_tool_event_writer = self.tool_event_writer.clone();
+        let persist_ctx = PostLoopPersistContext {
+            matrixone: self.matrixone.clone(),
+            shared_pool: self.shared_pool.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: request.agent_id.clone(),
+            model_name: request.model.clone(),
+            user_message: request.message.clone(),
+            hook_db_writer: self.hook_db_writer.clone(),
+            observer_worker: self.observer_worker.clone(),
+            tool_event_writer: self.tool_event_writer.clone(),
+        };
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
@@ -2062,72 +2180,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
             }
 
-            // Persist user_query + llm_response core events (same as stream_chat).
-            persist_server_loop_core_events(
-                &bg_matrixone,
-                bg_shared_pool.as_ref(),
-                &bg_user_id,
-                &bg_session_id,
-                bg_agent_id.as_deref(),
-                &bg_user_message,
-                &loop_state,
-                bg_model_name.as_deref(),
-            )
-            .await;
-
-            // Persist tool_call events so session_audit metrics are correct.
-            if let Some(ref writer) = bg_tool_event_writer {
-                persist_server_loop_tool_events(
-                    writer.as_ref(),
-                    &bg_user_id,
-                    &bg_session_id,
-                    bg_agent_id.as_deref(),
-                    &loop_state,
-                )
-                .await;
-            }
-
-            // Persist decision audit + skill selection to hook DB tables.
-            if let Some(ref writer) = bg_hook_db_writer {
-                persist_server_loop_hook_events(
-                    writer.as_ref(),
-                    &bg_user_id,
-                    &bg_session_id,
-                    &bg_user_message,
-                    &loop_state,
-                    bg_model_name.as_deref(),
-                )
-                .await;
-            }
-
-            // Fire Memoria observer (cross-session knowledge extraction).
-            if let Some(ref worker) = bg_observer_worker {
-                fire_server_loop_observer(
-                    worker.as_ref(),
-                    &bg_user_id,
-                    &bg_session_id,
-                    &loop_state,
-                )
-                .await;
-            }
-
-            // Record pipeline learning outcome (PatternLibrary / EntityGraph).
-            record_server_loop_learning_outcome(
-                learning_stack.writer.as_ref(),
-                &bg_user_message,
-                &loop_state,
-                loop_success,
-            )
-            .await;
-
-            // Fire SessionEnd hooks (best-effort, non-blocking).
-            crate::skills::hooks::fire_session_end(
-                &loop_state.skills.session_event_hooks,
-                loop_state.current_session_id.as_deref().unwrap_or(""),
-            )
-            .await;
+            // Best-effort post-loop persistence (core events, tool events,
+            // hook DB, observer, learning, session-end hooks, promotion events).
+            persist_ctx.run(&loop_state, &learning_stack, loop_success).await;
 
             // Session-end governance: extract learnings, store to Memoria, purge working memory.
+            // This is create_run-specific (background runs are long-lived sessions).
             if let Some(ref memoria_client) =
                 crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
             {
@@ -2171,24 +2229,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
             }
-
-            persist_runtime_promotion_events(
-                &bg_matrixone,
-                bg_shared_pool.as_ref(),
-                &bg_user_id,
-                &bg_session_id,
-                &bg_run_id,
-                &loop_state.telemetry.promotion_events,
-            )
-            .await;
-
-            // Persist learning state (patterns, calibration, entities) so the
-            // next session starts with accumulated cross-session knowledge.
-            let active_canary = match loop_state.evolution_service.as_ref() {
-                Some(evolution_service) => evolution_service.export_active_canary().await,
-                None => None,
-            };
-            learning_stack.save_with_active_canary(active_canary);
         });
 
         Ok(ChatRunRecord {
@@ -2305,101 +2345,30 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let runs = self.runs_handle();
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
-        let bg_user_id = user_id.clone();
         let bg_session_id = session_id.clone();
-        let bg_matrixone = self.matrixone.clone();
-        let bg_shared_pool = self.shared_pool.clone();
-        let bg_user_message = request.message.clone();
-        let bg_agent_id = request.agent_id.clone();
-        let bg_model_name = request.model.clone();
-        let bg_hook_db_writer = self.hook_db_writer.clone();
-        let bg_observer_worker = self.observer_worker.clone();
-        let bg_tool_event_writer = self.tool_event_writer.clone();
+        let persist_ctx = PostLoopPersistContext {
+            matrixone: self.matrixone.clone(),
+            shared_pool: self.shared_pool.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: request.agent_id.clone(),
+            model_name: request.model.clone(),
+            user_message: request.message.clone(),
+            hook_db_writer: self.hook_db_writer.clone(),
+            observer_worker: self.observer_worker.clone(),
+            tool_event_writer: self.tool_event_writer.clone(),
+        };
 
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
         tokio::spawn(async move {
             let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-            // Fire SessionEnd hooks (best-effort).
-            crate::skills::hooks::fire_session_end(
-                &state.skills.session_event_hooks,
-                state.current_session_id.as_deref().unwrap_or(""),
-            )
-            .await;
-            persist_runtime_promotion_events(
-                &bg_matrixone,
-                bg_shared_pool.as_ref(),
-                &bg_user_id,
-                &bg_session_id,
-                &bg_run_id,
-                &state.telemetry.promotion_events,
-            )
-            .await;
-
-            // Persist cross-session learning state.
-            let active_canary = match state.evolution_service.as_ref() {
-                Some(evolution_service) => evolution_service.export_active_canary().await,
-                None => None,
-            };
-            learning_stack.save_with_active_canary(active_canary);
-
-            // Persist user_query + llm_response core events to agent_events.
-            // The server-driven loop previously only persisted context_trace_signal;
-            // this closes the persistence gap so session replay, analytics, and
-            // cloud sync see the same events as the bridge path.
-            persist_server_loop_core_events(
-                &bg_matrixone,
-                bg_shared_pool.as_ref(),
-                &bg_user_id,
-                &bg_session_id,
-                bg_agent_id.as_deref(),
-                &bg_user_message,
-                &state,
-                bg_model_name.as_deref(),
-            )
-            .await;
-
-            // Persist tool_call events so session_audit metrics are correct.
-            if let Some(ref writer) = bg_tool_event_writer {
-                persist_server_loop_tool_events(
-                    writer.as_ref(),
-                    &bg_user_id,
-                    &bg_session_id,
-                    bg_agent_id.as_deref(),
-                    &state,
-                )
-                .await;
-            }
-
-            // Persist decision audit + skill selection to hook DB tables.
-            if let Some(ref writer) = bg_hook_db_writer {
-                persist_server_loop_hook_events(
-                    writer.as_ref(),
-                    &bg_user_id,
-                    &bg_session_id,
-                    &bg_user_message,
-                    &state,
-                    bg_model_name.as_deref(),
-                )
-                .await;
-            }
-
-            // Fire Memoria observer (cross-session knowledge extraction).
-            if let Some(ref worker) = bg_observer_worker {
-                fire_server_loop_observer(worker.as_ref(), &bg_user_id, &bg_session_id, &state)
-                    .await;
-            }
-
-            // Record pipeline learning outcome (PatternLibrary / EntityGraph).
             let loop_success = loop_result.is_ok();
-            record_server_loop_learning_outcome(
-                learning_stack.writer.as_ref(),
-                &bg_user_message,
-                &state,
-                loop_success,
-            )
-            .await;
+
+            // Best-effort post-loop persistence (core events, tool events,
+            // hook DB, observer, learning, session-end hooks, promotion events).
+            persist_ctx.run(&state, &learning_stack, loop_success).await;
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
