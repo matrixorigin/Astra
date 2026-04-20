@@ -105,33 +105,38 @@ async fn prefetch_code_review_context(message: &str, project_root: &Path) -> Opt
     let lower = message.to_lowercase();
 
     if mentions_commit(&lower) {
-        prefetch_commit_review(project_root).await
+        prefetch_commit_review(message, project_root).await
     } else if mentions_pr(&lower) {
         prefetch_branch_diff(project_root).await
     } else if mentions_local_changes(&lower) {
         prefetch_working_changes(project_root).await
     } else {
-        prefetch_commit_review(project_root).await
+        prefetch_commit_review(message, project_root).await
     }
 }
 
-async fn prefetch_commit_review(project_root: &Path) -> Option<String> {
+async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<String> {
+    // If the user specified a commit hash, use it; otherwise default to HEAD.
+    let commit = extract_commit_hash(message).unwrap_or_else(|| "HEAD".to_string());
+    let parent = format!("{commit}~1");
+
     let log = run_git(
         project_root,
-        &["log", "-1", "--format=%H%n%an <%ae>%n%ai%n%s%n%n%b"],
+        &["log", "-1", "--format=%H%n%an <%ae>%n%ai%n%s%n%n%b", &commit],
         MAX_LOG_BYTES,
     )
     .await?;
 
+    let diff_range = format!("{parent}..{commit}");
     let stat = run_git(
         project_root,
-        &["diff", "--stat", "HEAD~1..HEAD"],
+        &["diff", "--stat", &diff_range],
         MAX_LOG_BYTES,
     )
     .await
     .unwrap_or_default();
 
-    let diff = run_git(project_root, &["diff", "HEAD~1..HEAD"], MAX_DIFF_BYTES).await?;
+    let diff = run_git(project_root, &["diff", &diff_range], MAX_DIFF_BYTES).await?;
 
     let mut ctx = String::with_capacity(log.len() + stat.len() + diff.len() + 200);
     ctx.push_str("## Latest Commit\n\n```\n");
@@ -196,7 +201,7 @@ async fn prefetch_working_changes(project_root: &Path) -> Option<String> {
     let unstaged_text = unstaged.unwrap_or_default();
 
     if staged_text.is_empty() && unstaged_text.is_empty() {
-        return prefetch_commit_review(project_root).await;
+        return prefetch_commit_review("", project_root).await;
     }
 
     let stat =
@@ -550,6 +555,17 @@ fn extract_file_reference(message: &str, project_root: &Path) -> Option<String> 
     None
 }
 
+/// Extract a hex commit hash (7-40 chars) from the user's message.
+fn extract_commit_hash(message: &str) -> Option<String> {
+    message
+        .split_whitespace()
+        .find(|w| {
+            let len = w.len();
+            (7..=40).contains(&len) && w.chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .map(|s| s.to_string())
+}
+
 fn mentions_commit(lower: &str) -> bool {
     lower.contains("commit")
         || lower.contains("提交")
@@ -723,6 +739,20 @@ mod tests {
         assert!(mentions_commit("review latest commit"));
         assert!(mentions_commit("看看最新提交"));
         assert!(!mentions_commit("review the code"));
+    }
+
+    #[test]
+    fn extract_commit_hash_from_message() {
+        assert_eq!(
+            extract_commit_hash("review fcb776d81c0cc43ff80dca0feb2a89ab786ee1b5"),
+            Some("fcb776d81c0cc43ff80dca0feb2a89ab786ee1b5".to_string())
+        );
+        assert_eq!(
+            extract_commit_hash("review abc1234"),
+            Some("abc1234".to_string())
+        );
+        assert_eq!(extract_commit_hash("review latest commit"), None);
+        assert_eq!(extract_commit_hash("hello world"), None);
     }
 
     #[test]
