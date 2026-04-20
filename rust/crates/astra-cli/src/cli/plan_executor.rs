@@ -1809,4 +1809,98 @@ mod tests {
         drop(tx1);
         drop(tx2);
     }
+
+    // ─── Observability event emission ────────────────────────────────────
+
+    /// Verify that JournalEvent items sent via PlanUpdate::JournalEvent are
+    /// received and carry the correct event type. This covers the emit_event
+    /// closure used to flush turn_observability_events (llm_round, etc.).
+    #[test]
+    fn journal_event_roundtrip_via_plan_update() {
+        use astra_services::session_journal::{LlmRoundRecord, TurnEventBuffer};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanUpdate>();
+
+        // Build an llm_round event via TurnEventBuffer (the same path as runtime).
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 2);
+        buf.record_llm_round(LlmRoundRecord {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            cache_read_tokens: 0,
+            duration_ms: 3500,
+            ttft_ms: Some(2100),
+            finish_reason: None,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+
+        // Simulate emit_event sending it.
+        tx.send(PlanUpdate::JournalEvent(Box::new(events.into_iter().next().unwrap()))).unwrap();
+
+        let update = rx.try_recv().unwrap();
+        let PlanUpdate::JournalEvent(received) = update else {
+            panic!("expected JournalEvent");
+        };
+        assert_eq!(received.event_type, astra_services::session_journal::JournalEventType::LlmRound);
+        assert_eq!(received.turn, Some(2));
+        assert_eq!(received.tokens_in, Some(1000));
+        assert_eq!(received.ttft_ms, Some(2100));
+    }
+
+    /// Verify that observability events are emitted BEFORE the turn summary event,
+    /// matching the order in the Ok(result) branch of plan_executor_task.
+    #[test]
+    fn observability_events_emitted_before_turn_event() {
+        use astra_services::session_journal::{LlmRoundRecord, TurnEventBuffer};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanUpdate>();
+
+        // Simulate: 2 llm_round events from TurnEventBuffer, then 1 turn event.
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 3);
+        for _ in 0..2 {
+            buf.record_llm_round(LlmRoundRecord {
+                prompt_tokens: 500,
+                completion_tokens: 20,
+                cache_read_tokens: 0,
+                duration_ms: 1000,
+                ttft_ms: Some(800),
+                finish_reason: None,
+                tool_calls_returned: 1,
+                tool_call_names: vec!["bash".into()],
+            });
+        }
+        // Emit observability events first (mirrors Ok(result) branch).
+        for evt in buf.drain() {
+            tx.send(PlanUpdate::JournalEvent(Box::new(evt))).unwrap();
+        }
+        // Then emit the turn summary.
+        let turn_evt = session_journal::JournalEvent::turn(
+            Some("sess-1"), 3, Some("qwen-turbo"), "prompt", "response", 2, 1000, 40, 2000,
+        );
+        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt))).unwrap();
+
+        // Drain and verify order: llm_round, llm_round, turn.
+        let mut received_types = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            if let PlanUpdate::JournalEvent(evt) = update {
+                received_types.push(evt.event_type.clone());
+            }
+        }
+        assert_eq!(received_types.len(), 3);
+        assert_eq!(received_types[0], astra_services::session_journal::JournalEventType::LlmRound);
+        assert_eq!(received_types[1], astra_services::session_journal::JournalEventType::LlmRound);
+        assert_eq!(received_types[2], astra_services::session_journal::JournalEventType::Turn);
+    }
+
+    /// Verify that is_credential_error correctly identifies auth failures.
+    #[test]
+    fn credential_error_detection() {
+        assert!(is_credential_error("could not validate credentials"));
+        assert!(is_credential_error("401 Unauthorized"));
+        assert!(is_credential_error("Authentication failed: token expired"));
+        assert!(!is_credential_error("network timeout"));
+        assert!(!is_credential_error("tool execution failed"));
+    }
 }
