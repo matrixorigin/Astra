@@ -2665,7 +2665,9 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
 
     prompt.push_str(
         "\nPlease implement this change. Read the relevant files first, \
-         make the changes, and verify they compile/pass tests.",
+         make the changes, and verify they compile/pass tests.\n\
+         Before referencing any project type, function, struct, or API in new code, \
+         confirm it exists using read_file, grep, or LSP tools. Do not assume symbol names.",
     );
 
     prompt
