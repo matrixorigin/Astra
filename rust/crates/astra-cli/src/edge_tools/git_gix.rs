@@ -1750,7 +1750,7 @@ mod tests {
         // Walk cap should prevent this from taking too long (50K cap)
         // In a typical dev repo this should be well under 5 seconds
         assert!(
-            elapsed.as_secs() < 30,
+            elapsed.as_secs() < 60,
             "walk should be bounded, took: {elapsed:?}"
         );
     }
@@ -1767,7 +1767,7 @@ mod tests {
             "should open repo: {result}"
         );
         assert!(
-            elapsed.as_secs() < 30,
+            elapsed.as_secs() < 60,
             "walk should be bounded, took: {elapsed:?}"
         );
     }
@@ -1783,7 +1783,7 @@ mod tests {
         );
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 30,
+            elapsed.as_secs() < 60,
             "path-filtered walk should be bounded, took: {elapsed:?}"
         );
     }

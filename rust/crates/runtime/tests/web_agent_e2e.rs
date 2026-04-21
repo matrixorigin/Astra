@@ -2894,7 +2894,7 @@ async fn a2_transition_running_to_cancelled() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     // Wait for tool_request to know the stream is running, then get run_id and cancel.
-    let tool_req = wait_for_sse(&mut rx, "tool_request", 5).await;
+    let _tool_req = wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // We need to cancel — but first we need the run_id. We'll list runs to find it.
     let (_, list_body) = list_runs(&app, 10, 0).await;
