@@ -7464,6 +7464,7 @@ mod learning_sync_cloud_proofs {
                     latency_ms: 9,
                     result_hash: 42,
                     at_epoch: 100,
+                    failure_category: None,
                 }],
             }],
         }];
