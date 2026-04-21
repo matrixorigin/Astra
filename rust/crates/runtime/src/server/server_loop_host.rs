@@ -908,7 +908,15 @@ impl ServerAgenticLoopHost {
             task_type,
             cache_cfg,
         );
-        let breakdown = crate::prompts::build_system_prompt_trace(&sections, vec![], vec![]);
+        let breakdown = crate::prompts::build_system_prompt_trace_with_context_signals(
+            &sections,
+            vec![],
+            vec![],
+            crate::turn::context_assembly_trace::PromptContextSignals {
+                system_prompt_override: !system_override.is_empty(),
+                ..Default::default()
+            },
+        );
         let mut system_messages = vec![sys_msg];
         if let Some(dm) = dynamic_msg {
             system_messages.push(dm);
@@ -2077,6 +2085,10 @@ mod tests {
             "learned_context_hint".to_string(),
             json!("matrixorigin => github"),
         );
+        profile.insert(
+            "system_prompt_override".to_string(),
+            json!("You are operating under a delegated reviewer contract."),
+        );
 
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -2102,6 +2114,7 @@ mod tests {
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);
         assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);
         assert!(breakdown.context_signals.agent_type_hint);
     }

@@ -27,10 +27,11 @@ pub use system::{
     CacheScope, LOW_CONFIDENCE_THRESHOLD, PromptSection, ROUND_BUDGET_HARD_LIMIT,
     ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, build_main_system_prompt,
     build_main_system_prompt_with_style, build_system_prompt_sections,
-    build_system_prompt_sections_with_style, build_system_prompt_trace, detect_task_type,
-    parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
-    sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
-    tool_round_guidance, tool_round_guidance_with,
+    build_system_prompt_sections_with_style, build_system_prompt_trace,
+    build_system_prompt_trace_with_context_signals, detect_task_type, parallel_execution_feedback,
+    round_budget_directive, round_budget_directive_with, sections_to_string,
+    self_awareness_prompt_section, synthesize_or_batch_directive, tool_round_guidance,
+    tool_round_guidance_with,
 };
 
 #[cfg(test)]

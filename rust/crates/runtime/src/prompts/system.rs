@@ -844,6 +844,20 @@ pub fn build_system_prompt_trace(
     skills_injected: Vec<SkillInjection>,
     repository_memories: Vec<MemoryInjection>,
 ) -> SystemPromptBreakdown {
+    build_system_prompt_trace_with_context_signals(
+        sections,
+        skills_injected,
+        repository_memories,
+        PromptContextSignals::default(),
+    )
+}
+
+pub fn build_system_prompt_trace_with_context_signals(
+    sections: &[PromptSection],
+    skills_injected: Vec<SkillInjection>,
+    repository_memories: Vec<MemoryInjection>,
+    extra_context_signals: PromptContextSignals,
+) -> SystemPromptBreakdown {
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
     let mut user_preferences_tokens = 0u32;
@@ -873,6 +887,9 @@ pub fn build_system_prompt_trace(
         }
         if text.contains("⚡ MEMORY SIGNAL DETECTED") {
             context_signals.memory_signal_detected = true;
+        }
+        if text.contains("## System Prompt Override") {
+            context_signals.system_prompt_override = true;
         }
         if text.contains("## Effort Level") {
             context_signals.effort_hint = true;
@@ -932,6 +949,17 @@ pub fn build_system_prompt_trace(
     // Add memory tokens
     let memory_tokens: u32 = repository_memories.iter().map(|m| m.tokens).sum();
     total_tokens += memory_tokens;
+
+    context_signals.active_output_skills |= extra_context_signals.active_output_skills;
+    context_signals.learned_runtime_context |= extra_context_signals.learned_runtime_context;
+    context_signals.memory_signal_detected |= extra_context_signals.memory_signal_detected;
+    context_signals.system_prompt_override |= extra_context_signals.system_prompt_override;
+    context_signals.effort_hint |= extra_context_signals.effort_hint;
+    context_signals.agent_type_hint |= extra_context_signals.agent_type_hint;
+    context_signals.self_awareness |= extra_context_signals.self_awareness;
+    context_signals.implicit_feedback |= extra_context_signals.implicit_feedback;
+    context_signals.learned_feedback_rules |= extra_context_signals.learned_feedback_rules;
+    context_signals.session_anchor |= extra_context_signals.session_anchor;
 
     SystemPromptBreakdown {
         base_persona_tokens,
@@ -2705,11 +2733,30 @@ mod tests {
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);
         assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(!breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);
         assert!(breakdown.context_signals.agent_type_hint);
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
         assert!(breakdown.context_signals.session_anchor);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_applies_explicit_context_signal_overrides() {
+        let breakdown = build_system_prompt_trace_with_context_signals(
+            &[PromptSection {
+                text: "cwd: /tmp".to_string(),
+                scope: CacheScope::None,
+            }],
+            vec![],
+            vec![],
+            PromptContextSignals {
+                system_prompt_override: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(breakdown.context_signals.system_prompt_override);
     }
 }
