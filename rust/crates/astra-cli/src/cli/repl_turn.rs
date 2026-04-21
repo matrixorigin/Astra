@@ -1202,7 +1202,14 @@ fn commit_turn_journal_workspace_and_sidecars(
             // Annotate with prefetch info so token audits can account for it.
             if result.prefetch_injected {
                 if let Some(obj) = trace.as_object_mut() {
-                    obj.insert("prefetch".into(), serde_json::json!({ "injected": true }));
+                    let mut pf = serde_json::json!({ "injected": true });
+                    if let Some(tt) = &result.prefetch_task_type {
+                        pf["task_type"] = serde_json::json!(tt);
+                    }
+                    if let Some(bb) = result.prefetch_body_bytes {
+                        pf["body_bytes"] = serde_json::json!(bb);
+                    }
+                    obj.insert("prefetch".into(), pf);
                 }
             }
             // Use the REPL's user-visible turn number, not the internal agentic
@@ -1739,6 +1746,11 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
             / (result.prompt_tokens + result.cache_read_tokens).max(1) as f64
             * 100.0;
         parts.push(format!("cache:{cache_pct:.0}%"));
+    }
+
+    // Prefetch indicator
+    if let Some(ref task_type) = result.prefetch_task_type {
+        parts.push(format!("prefetch:{task_type}"));
     }
 
     let line = format!("  ─ {} ─", parts.join(" │ "));
@@ -3680,6 +3692,8 @@ mod tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             prefetch_injected: false,
+            prefetch_task_type: None,
+            prefetch_body_bytes: None,
             llm_rounds: None,
         }
     }

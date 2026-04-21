@@ -196,10 +196,20 @@ pub(crate) async fn stream_chat_sse(
     // For well-known task patterns (code review, etc.), pre-fetch relevant
     // context locally so the LLM can respond in fewer rounds.
     let mut prefetch_injected = false;
+    let mut prefetch_task_type: Option<String> = None;
+    let mut prefetch_body_bytes: Option<usize> = None;
     if !p.plan_only_chat && !p.is_plan_subtask {
         if let Some(ctx) =
             crate::context_prefetch::prefetch_context_for_message(p.message, &project_root).await
         {
+            prefetch_task_type = Some(ctx.task_type.to_string());
+            prefetch_body_bytes = Some(ctx.body.len());
+            astra_core::agent_info!(
+                "prefetch",
+                "injected task_type={} body_bytes={}",
+                ctx.task_type,
+                ctx.body.len()
+            );
             crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
             prefetch_injected = true;
         }
@@ -706,10 +716,11 @@ pub(crate) async fn stream_chat_sse(
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
         prefetch_injected: state.prefetch_injected,
+        prefetch_task_type,
+        prefetch_body_bytes,
     });
     Ok(result)
 }
-
 #[cfg(test)]
 mod tests {
     use super::detect_turn_hook_sets;

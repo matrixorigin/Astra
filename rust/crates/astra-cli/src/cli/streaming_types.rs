@@ -123,6 +123,10 @@ pub(crate) struct StreamResult {
     pub(crate) llm_rounds: Option<u32>,
     /// True when context_prefetch injected data before the agentic loop.
     pub(crate) prefetch_injected: bool,
+    /// Task type detected by context_prefetch (e.g. "code_review", "exploration").
+    pub(crate) prefetch_task_type: Option<String>,
+    /// Size of the prefetched context body in bytes.
+    pub(crate) prefetch_body_bytes: Option<usize>,
 }
 
 impl StreamResult {

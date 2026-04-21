@@ -40,15 +40,39 @@ pub async fn prefetch_context_for_message(
     project_root: &Path,
 ) -> Option<PrefetchedContext> {
     let task_type = detect_task_type(message)?;
+    astra_core::agent_debug!(
+        "prefetch",
+        "detected task_type={task_type} for message={:?}",
+        message.get(..80).unwrap_or(message)
+    );
+    let start = std::time::Instant::now();
     let body = match task_type {
-        "code_review" => prefetch_code_review_context(message, project_root).await?,
-        "exploration" => prefetch_exploration_context(message, project_root).await?,
-        "debugging" => prefetch_debugging_context(message, project_root).await?,
-        "implementation" => prefetch_implementation_context(project_root).await?,
-        "analysis" => prefetch_exploration_context(message, project_root).await?,
-        _ => return None,
+        "code_review" => prefetch_code_review_context(message, project_root).await,
+        "exploration" => prefetch_exploration_context(message, project_root).await,
+        "debugging" => prefetch_debugging_context(message, project_root).await,
+        "implementation" => prefetch_implementation_context(project_root).await,
+        "analysis" => prefetch_exploration_context(message, project_root).await,
+        _ => {
+            astra_core::agent_debug!("prefetch", "unknown task_type={task_type}, skipping");
+            return None;
+        }
     };
-    Some(PrefetchedContext { task_type, body })
+    let elapsed_ms = start.elapsed().as_millis();
+    match &body {
+        Some(b) => astra_core::agent_debug!(
+            "prefetch",
+            "gathered task_type={task_type} body_bytes={} elapsed_ms={elapsed_ms}",
+            b.len()
+        ),
+        None => astra_core::agent_debug!(
+            "prefetch",
+            "no context for task_type={task_type} elapsed_ms={elapsed_ms}"
+        ),
+    }
+    Some(PrefetchedContext {
+        task_type,
+        body: body?,
+    })
 }
 
 /// Inject pre-fetched context into the last user message in the messages array.
