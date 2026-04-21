@@ -8,7 +8,53 @@
 //! ends. It complements the cross-session `ToolQualityTracker` which
 //! tracks long-term tool reliability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+/// Maximum number of historical outcomes cached per (tool, signature) key.
+/// Bounded to keep memory predictable: 8 entries × small struct ≈ 128 B/key.
+pub const OUTCOME_RING_CAPACITY: usize = 8;
+
+/// Per-call outcome captured in the per-tool outcome cache.
+///
+/// Records one execution of a specific `(tool_name, canonical_args)` signature
+/// so the agent can consult prior attempts before repeating work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolOutcome {
+    /// Whether the call succeeded (quality != Error).
+    pub success: bool,
+    /// Execution latency in milliseconds (0 if unknown).
+    pub latency_ms: u64,
+    /// Stable 64-bit hash of the raw result payload, for identity comparison
+    /// without retaining the full output.
+    pub result_hash: u64,
+    /// Unix epoch seconds when the outcome was recorded.
+    pub at_epoch: u64,
+}
+
+impl ToolOutcome {
+    /// Build a `ToolOutcome` from a raw result payload.
+    ///
+    /// `success` should be `false` iff the result was classified as an error
+    /// by `tool_result_semantics::classify_result`. Callers typically know
+    /// this already; exposing it explicitly keeps this helper pure.
+    #[must_use]
+    pub fn new(success: bool, latency_ms: u64, result_str: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        result_str.hash(&mut hasher);
+        let result_hash = hasher.finish();
+        let at_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        Self {
+            success,
+            latency_ms,
+            result_hash,
+            at_epoch,
+        }
+    }
+}
 
 /// Maximum consecutive failures before a tool is deprioritized.
 const CONSECUTIVE_FAILURE_THRESHOLD: usize = 3;
@@ -71,6 +117,12 @@ pub struct ToolHealthTracker {
     dirty_tools: std::collections::HashSet<String>,
     /// Unix timestamp of last successful sync export.
     last_sync_epoch: u64,
+    /// Per-`(tool_name, canonical_args_sig)` ring of recent outcomes.
+    ///
+    /// The key is `tool_dedup_signature(name, args)` (see
+    /// `tool_result_semantics`). Session-scoped; not exported across sessions
+    /// in this revision (MVP — follow-up may extend `ToolHealthEntry`).
+    outcome_cache: HashMap<String, VecDeque<ToolOutcome>>,
 }
 
 impl ToolHealthTracker {
@@ -465,6 +517,42 @@ impl ToolHealthTracker {
     /// Total cache hits across all tools.
     pub fn total_cache_hits(&self) -> usize {
         self.tools.values().map(|h| h.cache_hit_count).sum()
+    }
+
+    // ─── Outcome cache (P3.2) ─────────────────────────────────────────────
+
+    /// Record a `ToolOutcome` under the canonical `(tool_name, args)` key.
+    ///
+    /// `sig_key` is typically produced by `tool_dedup_signature` so identical
+    /// calls land in the same ring. The ring is bounded by
+    /// [`OUTCOME_RING_CAPACITY`]; oldest entries are evicted first.
+    pub fn record_outcome(&mut self, sig_key: &str, outcome: ToolOutcome) {
+        let ring = self
+            .outcome_cache
+            .entry(sig_key.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(OUTCOME_RING_CAPACITY));
+        if ring.len() == OUTCOME_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(outcome);
+    }
+
+    /// Most recent outcome for a `(tool_name, args)` signature, if any.
+    #[must_use]
+    pub fn recent_outcome(&self, sig_key: &str) -> Option<&ToolOutcome> {
+        self.outcome_cache.get(sig_key).and_then(|r| r.back())
+    }
+
+    /// Full history ring for a `(tool_name, args)` signature.
+    #[must_use]
+    pub fn outcome_history(&self, sig_key: &str) -> Option<&VecDeque<ToolOutcome>> {
+        self.outcome_cache.get(sig_key)
+    }
+
+    /// Total number of signatures currently cached (diagnostic).
+    #[must_use]
+    pub fn outcome_cache_len(&self) -> usize {
+        self.outcome_cache.len()
     }
 }
 
@@ -1018,5 +1106,59 @@ mod tests {
             find.last_updated_epoch > 1000,
             "new tool should have fresh timestamp"
         );
+    }
+
+    // ─── Outcome cache (P3.2) ─────────────────────────────────────────────
+
+    #[test]
+    fn outcome_cache_records_and_recalls_most_recent() {
+        let mut tracker = ToolHealthTracker::new();
+        let sig = "grep:{\"pattern\":\"TODO\"}";
+        tracker.record_outcome(sig, ToolOutcome::new(true, 12, "match 1"));
+        tracker.record_outcome(sig, ToolOutcome::new(true, 15, "match 2"));
+
+        let recent = tracker.recent_outcome(sig).expect("outcome present");
+        assert!(recent.success);
+        assert_eq!(recent.latency_ms, 15);
+        assert_eq!(tracker.outcome_history(sig).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outcome_cache_isolates_distinct_signatures() {
+        let mut tracker = ToolHealthTracker::new();
+        let sig_a = "grep:{\"pattern\":\"A\"}";
+        let sig_b = "grep:{\"pattern\":\"B\"}";
+        tracker.record_outcome(sig_a, ToolOutcome::new(true, 10, "ra"));
+        tracker.record_outcome(sig_b, ToolOutcome::new(false, 20, "rb"));
+
+        assert!(tracker.recent_outcome(sig_a).unwrap().success);
+        assert!(!tracker.recent_outcome(sig_b).unwrap().success);
+        assert_eq!(tracker.outcome_cache_len(), 2);
+    }
+
+    #[test]
+    fn outcome_cache_ring_is_bounded() {
+        let mut tracker = ToolHealthTracker::new();
+        let sig = "bash:{}";
+        for i in 0..(OUTCOME_RING_CAPACITY + 5) {
+            tracker.record_outcome(sig, ToolOutcome::new(true, i as u64, "ok"));
+        }
+        let hist = tracker.outcome_history(sig).unwrap();
+        assert_eq!(hist.len(), OUTCOME_RING_CAPACITY);
+        // Oldest evicted: earliest survivor's latency == 5 (shift by 5).
+        assert_eq!(hist.front().unwrap().latency_ms, 5);
+        assert_eq!(
+            hist.back().unwrap().latency_ms,
+            (OUTCOME_RING_CAPACITY + 4) as u64
+        );
+    }
+
+    #[test]
+    fn outcome_hash_distinguishes_result_payloads() {
+        let a = ToolOutcome::new(true, 0, "aaa");
+        let b = ToolOutcome::new(true, 0, "bbb");
+        let c = ToolOutcome::new(true, 0, "aaa");
+        assert_ne!(a.result_hash, b.result_hash);
+        assert_eq!(a.result_hash, c.result_hash);
     }
 }

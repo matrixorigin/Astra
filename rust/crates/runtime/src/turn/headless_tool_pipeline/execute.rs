@@ -116,7 +116,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
             },
         );
-        let _result_quality = append_headless_result_quality_feedback(
+        let result_quality = append_headless_result_quality_feedback(
             &execution.name,
             &mut execution.result_str,
             resource_limit_recorded,
@@ -128,6 +128,19 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         } else {
             tool_start.elapsed().as_millis() as u64
         };
+
+        // Record outcome under the canonical `(tool, args)` signature so
+        // later turns can consult prior attempts before repeating work.
+        let outcome_sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+            &execution.name,
+            &execution.args,
+        );
+        self.ctx.turn_guard.record_tool_outcome(
+            &outcome_sig,
+            result_quality,
+            executed_ms,
+            &execution.result_str,
+        );
 
         ExecutedExecution {
             execution,

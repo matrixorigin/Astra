@@ -1108,6 +1108,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_populates_outcome_cache_under_canonical_signature() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("outline".to_string());
+        harness.tool_calls.push(json!({
+            "id": "call-outline-0",
+            "function": { "name": "outline", "arguments": "{}" }
+        }));
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(v) => v,
+            _ => panic!("expected Continue"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(p) => p,
+            _ => panic!("expected Continue"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+
+        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+            &executed.execution.name,
+            &executed.execution.args,
+        );
+        let outcome = pipeline
+            .ctx
+            .turn_guard
+            .health
+            .recent_outcome(&sig)
+            .expect("outcome cache should have an entry for the executed signature");
+        assert!(
+            !outcome.success,
+            "unknown-tool error path should record a failure outcome"
+        );
+        assert_eq!(
+            pipeline
+                .ctx
+                .turn_guard
+                .health
+                .outcome_history(&sig)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_tool_failure_not_reset_by_valid_tool_success() {
         let mut harness = PipelineHarness::new();
         // Call 1: unknown tool "outline"
