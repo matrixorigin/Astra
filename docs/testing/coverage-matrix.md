@@ -74,6 +74,18 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | Test | Gate |
 |------|------|
 | `astra-services` `multi_agent_integration` | `ASTRA_MULTI_AGENT_IT=1` (PR CI when enabled in [`.github/workflows/test.yml`](../../.github/workflows/test.yml)) |
+| `astra-services` `team_persistence_integration` | `ASTRA_MULTI_AGENT_IT=1` + live MatrixOne (`#[ignore]`); see module doc in `rust/crates/services/tests/team_persistence_integration.rs` |
+
+## Team (`/teams/*`, orchestration, persistence)
+
+| Capability | E2E (`system_matrix_http_e2e`) | Stub / integration | Other |
+|------------|-------------------------------|----------------------|-------|
+| Team CRUD, validation, executions, snapshots (HTTP) | — (not in system matrix yet; see [`system-e2e-matrix.md`](./system-e2e-matrix.md)) | `rust/crates/runtime/tests/team_api_integration.rs` (Tower oneshot, `InMemoryTeamStore`, no DB) | — |
+| `POST /teams/{name}/execute` (HTTP → `TeamExecutionOrchestrator`, mock `SubRunExecutor`) | — | `team_execute_http_integration.rs` includes built-in **`review`** + task `review the latest commit` (CLI parity with `/team run review review the latest commit`) happy + failing executor paths | Handler: `team_handlers::execute_team_handler` |
+| `TeamExecutionOrchestrator` + `DelegationEngine` (coordination modes, gates, failure paths) | — | `rust/crates/runtime/tests/team_delegation_integration.rs` (`StubSubRunExecutor` + custom `SubRunExecutor` fakes) | `rust/crates/runtime/src/server/team_orchestrator.rs` `#[cfg(test)]` |
+| Sub-run uses scripted `MockHost` + `run_agentic_loop_with_host` (non-zero usage vs `StubSubRunExecutor`) | — | — | `team_orchestrator.rs` `mock_host_subrun_*` tests |
+| Team definitions + execution history (SQL store) | — | — | `team_persistence_integration` (MatrixOne, `#[ignore]`) |
+| Delegation mailbox with team-shaped agent ids | — | — | `rust/crates/runtime/src/messaging/orchestrator_mailbox_tests.rs` |
 
 ## How to run
 

@@ -109,6 +109,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Admin | — | `/admin/*` | — | — |
 | WebSocket | — | `/chat/ws` | — | — |
 | Delegation | — | `/chat/runs/.../delegate` | — | — |
+| Team | — | `/teams`, `/teams/{name}`, `/teams/{name}/execute`, `/teams/{name}/executions`, `/teams/.../snapshots` | `team_definitions` / related tables when using DB-backed store | Offline HTTP: `team_api_integration` + **`team_execute_http_integration`** (mock delegation); no `system_matrix_http_e2e` journey yet — see [`coverage-matrix.md`](./coverage-matrix.md) **Team** |
 
 ## CI
 
@@ -138,6 +139,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../rust/crat
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 | tasks | `/tasks` | Yes | `e2e_matrix_tasks_lease_and_db_assertions` |
+| teams | `/teams` | No | `team_api_integration` + `team_execute_http_integration` (`POST .../execute` with mock executor); Matrix-backed team execute not in system E2E yet |
 
 Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
@@ -146,4 +148,5 @@ Additional route families in `router_builder` not named above: **memory** (`/mem
 - **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
 - **Evaluation writes**: add a focused test when `validate_gate` / `run_drift_pipeline` / `run_closed_loop` return **200** with stable response shapes.
 - **Branches, admin, WS, delegation**: add focused journeys + rows in this matrix.
+- **Teams**: optional `system_matrix_http_e2e` journey for `/teams` (including `POST /teams/{name}/execute`) with DB assertions when team store is Matrix-backed in test harness.
 - **Real Memoria**: optional second target with a Memoria test double URL instead of the stub forwarder.
