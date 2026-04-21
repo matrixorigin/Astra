@@ -758,10 +758,9 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 25,
     },
-    // memory_store stays pinned: preference expressions ("苹果比较好吃") have
-    // zero keyword overlap with memory triggers, so tfidf can't select it.
-    // The system prompt tells the LLM to call memory_store for preferences,
-    // so the tool must always be available. Cost: ~35 tokens/turn.
+    // memory_store is now selective, not baseline-pinned. We only surface it
+    // when the query explicitly signals remember/track/preference intent,
+    // instead of paying the schema tax on every unrelated turn.
     ToolMeta {
         name: "memory_store",
         description: "Store information to persistent memory",
@@ -792,7 +791,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "存一下",
             "帮我记住",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 35,
@@ -1418,11 +1417,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_store_is_pinned() {
+    fn catalog_memory_store_is_not_pinned() {
         let ms = TOOL_CATALOG
             .iter()
             .find(|t| t.name == "memory_store")
             .unwrap();
-        assert!(ms.pinned, "memory_store should be pinned");
+        assert!(!ms.pinned, "memory_store should be selected dynamically");
     }
 }

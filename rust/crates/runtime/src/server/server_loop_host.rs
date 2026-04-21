@@ -872,9 +872,21 @@ impl ServerAgenticLoopHost {
             .map(|s| format!("\n\n{s}"))
             .unwrap_or_default();
 
+        let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+        let round_budget_hint = crate::prompts::round_budget_directive_with(
+            state.current_round_index,
+            tool_cfg.effective_round_budget_warning(),
+            tool_cfg.effective_round_budget_limit(),
+        );
+        let synthesize_or_batch_hint =
+            crate::prompts::synthesize_or_batch_directive(&state.messages, state.current_round_index);
+        let parallel_feedback = crate::prompts::parallel_execution_feedback(&state.messages);
+
         // All dynamic per-turn content (not cached)
         let full_dynamic =
-            format!("{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}");
+            format!(
+                "{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}{round_budget_hint}{synthesize_or_batch_hint}{parallel_feedback}"
+            );
 
         // Build structured system messages with Anthropic cache annotations.
         // Stable sections (Global/Session) get cache_control; dynamic content does not.
@@ -1030,8 +1042,16 @@ impl ServerAgenticLoopHost {
         } else {
             String::new()
         };
+        let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+        let round_budget_hint = crate::prompts::round_budget_directive_with(
+            0,
+            tool_cfg.effective_round_budget_warning(),
+            tool_cfg.effective_round_budget_limit(),
+        );
         let full_dynamic =
-            format!("{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}");
+            format!(
+                "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}"
+            );
 
         cached_system_prompt(
             &tool_names,

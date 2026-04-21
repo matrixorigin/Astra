@@ -668,6 +668,30 @@ async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
     assert!(resumed_text.contains("Two independent fixes in one commit. Let me review each."));
     assert!(resumed_text.contains("thread leak on timeout"));
     assert!(resumed_text.contains("[User follow-up]\\n修复?"));
+    let edge_tool_names: std::collections::HashSet<String> = resumed
+        .get("edge_tools")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect();
+    assert!(
+        edge_tool_names.contains("str_replace"),
+        "repair follow-up must keep str_replace available: {:?}",
+        edge_tool_names
+    );
+    for unexpected in ["write_file", "list_dir", "grep", "glob"] {
+        assert!(
+            !edge_tool_names.contains(unexpected),
+            "repair follow-up should not re-expose {unexpected}: {:?}",
+            edge_tool_names
+        );
+    }
     assert_eq!(state.pending_recovery, None);
     assert_eq!(
         state.session_id.as_deref(),

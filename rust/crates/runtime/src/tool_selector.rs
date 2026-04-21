@@ -828,7 +828,7 @@ fn build_catalog_summary() -> String {
 const TOOL_SELECT_SYSTEM: &str = "\
 You are a tool selector. Given the user's query and context, decide which tools are needed.
 Return ONLY a JSON array of tool names. Select 1-5 items total. Do not explain.
-Pinned tools (bash, read_file, str_replace, memory_store) are always available — do NOT include them.
+Pinned tools (bash, read_file, str_replace) are always available — do NOT include them.
 Only select from the dynamic tools listed below. The list is executable registry tools only — never output Agent Skill names (skills use the separate `skill` tool in the main agent loop).";
 
 fn build_tool_select_prompt(
@@ -1213,10 +1213,7 @@ impl ToolSelector for FallbackSelector {
 // ─── Helpers for callers ────────────────────────────────────────────────────
 
 /// Given selected tool names from a [`ToolSelector`], resolve them to full
-/// JSON schemas from the registry.  Pinned tools are always included, but
-/// under extreme token pressure (`budget_pressure >= 0.8`), non-core pinned
-/// tools (memory_store, memory_search) are demoted unless they were
-/// explicitly selected by the scoring pipeline.
+/// JSON schemas from the registry. Pinned tools are always included.
 pub fn resolve_schemas(
     registry: &ToolRegistry,
     selected_names: &[String],
@@ -1235,13 +1232,6 @@ pub fn resolve_schemas_with_pressure(
     selected_names: &[String],
     budget_pressure: f64,
 ) -> (Vec<Value>, tool_registry::SelectionReport) {
-    // Under high pressure, skip non-core pinned tools unless explicitly selected.
-    const DEFERRABLE_PINNED: &[&str] = &["memory_store", "memory_search"];
-    let skip_deferrable = budget_pressure >= 0.8
-        && !selected_names
-            .iter()
-            .any(|n| DEFERRABLE_PINNED.contains(&n.as_str()));
-
     // Determine pruning level based on pressure
     let prune_level = if budget_pressure >= 0.8 {
         PruneLevel::Aggressive
@@ -1263,9 +1253,6 @@ pub fn resolve_schemas_with_pressure(
 
     // Use pre-resolved pinned schemas (cached at registry construction)
     for (name, schema) in registry.pinned_schemas() {
-        if skip_deferrable && DEFERRABLE_PINNED.contains(&name.as_str()) {
-            continue;
-        }
         schemas.push(prune_schema(schema.clone(), prune_level));
         names.push(name.clone());
     }

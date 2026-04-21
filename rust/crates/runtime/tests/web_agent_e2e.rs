@@ -706,6 +706,210 @@ async fn wait_for_sse(
     }
 }
 
+#[derive(Clone)]
+struct MockToolScenarioStep {
+    request_id: &'static str,
+    tool_name: &'static str,
+    args: Value,
+    result_output: &'static str,
+    requires_approval: bool,
+}
+
+#[derive(Clone)]
+struct MockToolScenario {
+    name: &'static str,
+    message: String,
+    edge_tools: Vec<&'static str>,
+    steps: Vec<MockToolScenarioStep>,
+    final_text: &'static str,
+    expected_query_fragments: Vec<&'static str>,
+}
+
+async fn run_mock_tool_scenario(case: MockToolScenario) {
+    let (app, hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
+    let edge_tools: Vec<Value> = case.edge_tools.iter().map(|tool| tool_schema(tool)).collect();
+
+    if case.steps.is_empty() {
+        let events = chat_stream_collect(
+            &app,
+            json!({
+                "message": &case.message,
+                "context": {
+                    "test_llm_rounds": [{ "full_text": case.final_text }]
+                }
+            }),
+        )
+        .await;
+        assert!(
+            find_events(&events, "text_delta")
+                .iter()
+                .any(|event| event["content"].as_str() == Some(case.final_text)),
+            "{}: expected final text",
+            case.name
+        );
+
+        let hw = hook_writer.clone();
+        poll_until(
+            move || {
+                let hw = hw.clone();
+                async move { !hw.plans.lock().await.is_empty() }
+            },
+            5,
+        )
+        .await;
+
+        let plans = hook_writer.plans.lock().await;
+        let plan = plans.last().expect("text-only hook plan");
+        let audit = plan
+            .decision_audit
+            .as_ref()
+            .expect("text-only decision audit");
+        assert_eq!(
+            audit.decision_type, "response_generation",
+            "{}: text-only case should persist response_generation",
+            case.name
+        );
+        assert!(
+            plan.skill_selection.is_none(),
+            "{}: text-only case should not persist skill_selection",
+            case.name
+        );
+        return;
+    }
+
+    let tool_calls: Vec<Value> = case
+        .steps
+        .iter()
+        .map(|step| tool_call(step.request_id, step.tool_name, step.args.clone()))
+        .collect();
+
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": &case.message,
+            "context": {
+                "test_llm_rounds": [
+                    { "tool_calls": tool_calls },
+                    { "full_text": case.final_text }
+                ],
+                "edge_tools": edge_tools
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    for step in &case.steps {
+        if step.requires_approval {
+            let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
+            assert_eq!(
+                approval["request_id"].as_str(),
+                Some(step.request_id),
+                "{}: approval should match {}",
+                case.name,
+                step.request_id
+            );
+            let status = post_approval_respond(&app, step.request_id, "allow").await;
+            assert_eq!(status, StatusCode::OK, "{}: approval accepted", case.name);
+        }
+
+        let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+        assert_eq!(
+            request["request_id"].as_str(),
+            Some(step.request_id),
+            "{}: tool_request should match {}",
+            case.name,
+            step.request_id
+        );
+        let status = post_tool_result(&app, step.request_id, step.result_output, "success").await;
+        assert_eq!(status, StatusCode::OK, "{}: tool result accepted", case.name);
+    }
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+    assert!(
+        find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some(case.final_text)),
+        "{}: expected final text",
+        case.name
+    );
+
+    let hw = hook_writer.clone();
+    poll_until(
+        move || {
+            let hw = hw.clone();
+            async move { !hw.plans.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+
+    let plans = hook_writer.plans.lock().await;
+    let plan = plans.last().expect("tool hook plan");
+    let audit = plan
+        .decision_audit
+        .as_ref()
+        .expect("tool decision audit");
+    assert_eq!(
+        audit.decision_type, "tool_selection",
+        "{}: tool case should persist tool_selection",
+        case.name
+    );
+    let skill = plan.skill_selection.as_ref().expect("tool skill selection");
+    let selected_skills: std::collections::HashSet<&str> =
+        skill.selected_skills.iter().map(String::as_str).collect();
+    for step in &case.steps {
+        assert!(
+            selected_skills.contains(step.tool_name),
+            "{}: missing selected skill {}",
+            case.name,
+            step.tool_name
+        );
+    }
+    for fragment in &case.expected_query_fragments {
+        assert!(
+            skill.user_query.contains(fragment),
+            "{}: user_query should contain {:?}",
+            case.name,
+            fragment
+        );
+    }
+
+    let tw = tool_writer.clone();
+    poll_until(
+        move || {
+            let tw = tw.clone();
+            async move { !tw.plans.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+
+    let tool_plans = tool_writer.plans.lock().await;
+    let tool_events = &tool_plans.last().expect("tool event plan").events;
+    let tool_names: std::collections::HashSet<&str> = tool_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("tool_name"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    for step in &case.steps {
+        assert!(
+            tool_names.contains(step.tool_name),
+            "{}: missing persisted tool event {}",
+            case.name,
+            step.tool_name
+        );
+    }
+}
+
 /// Poll run status until it reaches the expected value (with timeout).
 async fn poll_run_status(app: &Router, run_id: &str, expected: &str, timeout_secs: u64) -> Value {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -3585,6 +3789,147 @@ async fn hook_db_multiple_tools_selected() {
     // All unique tool names should be captured.
     assert!(skill.selected_skills.contains(&"read_file".to_string()));
     assert!(skill.selected_skills.contains(&"list_dir".to_string()));
+}
+
+#[tokio::test]
+async fn mock_llm_tool_flow_scenario_matrix() {
+    let attachment = "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
+Latest assistant summary:\n\
+## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
+Two independent fixes in one commit. Let me review each.\n\
+P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
+[User follow-up]\n修复?";
+
+    let cases = vec![
+        MockToolScenario {
+            name: "text_only",
+            message: "hello".to_string(),
+            edge_tools: vec![],
+            steps: vec![],
+            final_text: "Hi there!",
+            expected_query_fragments: vec![],
+        },
+        MockToolScenario {
+            name: "read_file",
+            message: "read the README".to_string(),
+            edge_tools: vec!["read_file"],
+            steps: vec![MockToolScenarioStep {
+                request_id: "tc-matrix-read",
+                tool_name: "read_file",
+                args: json!({"path": "README.md"}),
+                result_output: "README contents",
+                requires_approval: false,
+            }],
+            final_text: "Read the README.",
+            expected_query_fragments: vec!["read the README"],
+        },
+        MockToolScenario {
+            name: "write_file_with_approval",
+            message: "create a new file named notes.txt".to_string(),
+            edge_tools: vec!["write_file"],
+            steps: vec![MockToolScenarioStep {
+                request_id: "tc-matrix-write",
+                tool_name: "write_file",
+                args: json!({"path": "notes.txt", "content": "hello"}),
+                result_output: "file created",
+                requires_approval: true,
+            }],
+            final_text: "Created the file.",
+            expected_query_fragments: vec!["create a new file named notes.txt"],
+        },
+        MockToolScenario {
+            name: "search_with_grep",
+            message: "search the repo for TODO".to_string(),
+            edge_tools: vec!["grep"],
+            steps: vec![MockToolScenarioStep {
+                request_id: "tc-matrix-grep",
+                tool_name: "grep",
+                args: json!({"pattern": "TODO", "path": "."}),
+                result_output: "src/main.rs:12:// TODO",
+                requires_approval: false,
+            }],
+            final_text: "Found TODO matches.",
+            expected_query_fragments: vec!["search the repo for TODO"],
+        },
+        MockToolScenario {
+            name: "memory_store",
+            message: "记住我喜欢 Rust".to_string(),
+            edge_tools: vec!["memory_store"],
+            steps: vec![MockToolScenarioStep {
+                request_id: "tc-matrix-mstore",
+                tool_name: "memory_store",
+                args: json!({"content": "User likes Rust"}),
+                result_output: "memory stored",
+                requires_approval: false,
+            }],
+            final_text: "I stored that preference.",
+            expected_query_fragments: vec!["记住我喜欢 Rust"],
+        },
+        MockToolScenario {
+            name: "memory_search",
+            message: "我之前说过我喜欢什么语言?".to_string(),
+            edge_tools: vec!["memory_search"],
+            steps: vec![MockToolScenarioStep {
+                request_id: "tc-matrix-msearch",
+                tool_name: "memory_search",
+                args: json!({"query": "preferred language"}),
+                result_output: "User likes Rust",
+                requires_approval: false,
+            }],
+            final_text: "You said you like Rust.",
+            expected_query_fragments: vec!["我之前说过我喜欢什么语言?"],
+        },
+        MockToolScenario {
+            name: "multi_tool_batch",
+            message: "inspect the project files".to_string(),
+            edge_tools: vec!["read_file", "list_dir"],
+            steps: vec![
+                MockToolScenarioStep {
+                    request_id: "tc-matrix-list",
+                    tool_name: "list_dir",
+                    args: json!({"path": "."}),
+                    result_output: "Cargo.toml\nREADME.md",
+                    requires_approval: false,
+                },
+                MockToolScenarioStep {
+                    request_id: "tc-matrix-read-batch",
+                    tool_name: "read_file",
+                    args: json!({"path": "README.md"}),
+                    result_output: "README contents",
+                    requires_approval: false,
+                },
+            ],
+            final_text: "Inspected the project files.",
+            expected_query_fragments: vec!["inspect the project files"],
+        },
+        MockToolScenario {
+            name: "attachment_followup_repair",
+            message: attachment.to_string(),
+            edge_tools: vec!["str_replace"],
+            steps: vec![MockToolScenarioStep {
+                request_id: "tc-matrix-repair",
+                tool_name: "str_replace",
+                args: json!({"path": "rust/crates/astra-tools/src/git_gix.rs"}),
+                result_output: "updated helper",
+                requires_approval: true,
+            }],
+            final_text: "Patched the timeout path.",
+            expected_query_fragments: vec![
+                "[Active task attachment]",
+                "aa1f419bc040003f5de8cdfa6b414225ade82e2b",
+                "thread leak on timeout",
+                "[User follow-up]\n修复?",
+            ],
+        },
+    ];
+
+    for case in cases {
+        run_mock_tool_scenario(case).await;
+    }
 }
 
 /// Low-information repair follow-up stays scoped when the caller provides an active-task attachment.

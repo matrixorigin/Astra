@@ -424,9 +424,279 @@ fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+#[derive(Clone)]
+struct BridgeTurnScenario {
+    name: &'static str,
+    payload: Value,
+    expected_text: Option<&'static str>,
+    expect_explain: bool,
+    expected_tools_available_min: Option<i64>,
+    expected_tools_selected_min: Option<i64>,
+    expected_tool_event_names: Vec<&'static str>,
+    expect_user_query_event: bool,
+    expected_skill_selection: Vec<&'static str>,
+}
+
+async fn run_bridge_turn_scenario(case: BridgeTurnScenario) {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let (st, raw) = chat_turn(&app, case.payload).await;
+    assert_eq!(st, StatusCode::OK, "{}: request should succeed", case.name);
+    let events = parse_sse_events(&raw);
+
+    if let Some(expected_text) = case.expected_text {
+        assert!(
+            events_of_type(&events, "text_delta")
+                .iter()
+                .any(|event| event["content"].as_str() == Some(expected_text)),
+            "{}: expected text_delta {:?}",
+            case.name,
+            expected_text
+        );
+    }
+
+    if case.expect_explain {
+        let explains = events_of_type(&events, "explain");
+        assert_eq!(explains.len(), 1, "{}: expected one explain event", case.name);
+        let explain = explains[0];
+        if let Some(min_available) = case.expected_tools_available_min {
+            let available = explain["tools_available"]
+                .as_i64()
+                .expect("tools_available should be present");
+            assert!(
+                available >= min_available,
+                "{}: expected tools_available >= {min_available}, got {available}",
+                case.name
+            );
+        }
+        if let Some(min_selected) = case.expected_tools_selected_min {
+            let selected = explain["tools_selected"]
+                .as_i64()
+                .expect("tools_selected should be present");
+            assert!(
+                selected >= min_selected,
+                "{}: expected tools_selected >= {min_selected}, got {selected}",
+                case.name
+            );
+        }
+    } else {
+        assert!(
+            events_of_type(&events, "explain").is_empty(),
+            "{}: explain event should be absent",
+            case.name
+        );
+    }
+
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    let plan = core.last().expect("core persist plan");
+    assert_eq!(
+        plan.user_query_event.is_some(),
+        case.expect_user_query_event,
+        "{}: unexpected user_query persistence",
+        case.name
+    );
+    drop(core);
+
+    let hook_plans = cap.hook_plans.lock().await;
+    let hook_plan = hook_plans.last().expect("hook persist plan");
+    if case.expected_skill_selection.is_empty() {
+        assert!(
+            hook_plan.skill_selection.is_none(),
+            "{}: skill_selection should be absent",
+            case.name
+        );
+    } else {
+        let skill = hook_plan
+            .skill_selection
+            .as_ref()
+            .expect("skill_selection should be present");
+        let selected: std::collections::HashSet<&str> =
+            skill.selected_skills.iter().map(String::as_str).collect();
+        for tool_name in &case.expected_skill_selection {
+            assert!(
+                selected.contains(tool_name),
+                "{}: missing selected skill {}",
+                case.name,
+                tool_name
+            );
+        }
+    }
+    drop(hook_plans);
+
+    let tool_plans = cap.tool_plans.lock().await;
+    let tool_names: std::collections::HashSet<&str> = if let Some(plan) = tool_plans.last() {
+        plan.events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+            })
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    if case.expected_tool_event_names.is_empty() {
+        assert!(
+            tool_names.is_empty(),
+            "{}: expected no named tool events, got {:?}",
+            case.name,
+            tool_names
+        );
+        return;
+    }
+    for tool_name in &case.expected_tool_event_names {
+        assert!(
+            tool_names.contains(tool_name),
+            "{}: missing tool event {}",
+            case.name,
+            tool_name
+        );
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Test: Persist events — user_query + llm_response persisted once, no duplicates
 // ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn bridge_mock_llm_turn_scenario_matrix() {
+    let attachment = "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
+Latest assistant summary:\n\
+## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
+Two independent fixes in one commit. Let me review each.\n\
+P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
+[User follow-up]\n修复?";
+
+    let cases = vec![
+        BridgeTurnScenario {
+            name: "text_only_with_explain",
+            payload: json!({
+                "agent_id": "matrix-text-only",
+                "messages": [{ "role": "user", "content": "hello" }],
+                "edge_tools": [tool_schema("read_file")],
+                "explain": true,
+                "test_llm_rounds": [{ "full_text": "Hi there!" }]
+            }),
+            expected_text: Some("Hi there!"),
+            expect_explain: true,
+            expected_tools_available_min: Some(1),
+            expected_tools_selected_min: Some(0),
+            expected_tool_event_names: vec![],
+            expect_user_query_event: true,
+            expected_skill_selection: vec![],
+        },
+        BridgeTurnScenario {
+            name: "single_tool_with_explain",
+            payload: json!({
+                "agent_id": "matrix-single-tool",
+                "messages": [{ "role": "user", "content": "read the README" }],
+                "edge_tools": [tool_schema("read_file"), tool_schema("write_file"), tool_schema("grep")],
+                "explain": true,
+                "test_llm_rounds": [{
+                    "tool_calls": [tool_call("tc-matrix-read", "read_file", json!({"path": "README.md"}))],
+                    "usage": { "prompt": 500, "completion": 30, "total": 530 }
+                }]
+            }),
+            expected_text: None,
+            expect_explain: true,
+            expected_tools_available_min: Some(3),
+            expected_tools_selected_min: Some(1),
+            expected_tool_event_names: vec!["read_file"],
+            expect_user_query_event: true,
+            expected_skill_selection: vec!["read_file"],
+        },
+        BridgeTurnScenario {
+            name: "multi_tool_batch_with_explain",
+            payload: json!({
+                "agent_id": "matrix-multi-tool",
+                "messages": [{ "role": "user", "content": "inspect the project files" }],
+                "edge_tools": [tool_schema("read_file"), tool_schema("list_dir"), tool_schema("grep")],
+                "explain": true,
+                "test_llm_rounds": [{
+                    "tool_calls": [
+                        tool_call("tc-matrix-list", "list_dir", json!({"path": "."})),
+                        tool_call("tc-matrix-read", "read_file", json!({"path": "README.md"}))
+                    ],
+                    "usage": { "prompt": 700, "completion": 50, "total": 750 }
+                }]
+            }),
+            expected_text: None,
+            expect_explain: true,
+            expected_tools_available_min: Some(3),
+            expected_tools_selected_min: Some(2),
+            expected_tool_event_names: vec!["list_dir", "read_file"],
+            expect_user_query_event: true,
+            expected_skill_selection: vec!["list_dir", "read_file"],
+        },
+        BridgeTurnScenario {
+            name: "continuation_skips_user_query",
+            payload: json!({
+                "agent_id": "matrix-continuation",
+                "session_id": "s-comp-created",
+                "messages": [
+                    { "role": "user", "content": "read file" },
+                    { "role": "assistant", "content": "", "tool_calls": [
+                        { "id": "tc-cont", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+                    ]},
+                    { "role": "tool", "tool_call_id": "tc-cont", "content": "file data" }
+                ],
+                "edge_tools": [tool_schema("read_file"), tool_schema("grep"), tool_schema("glob")],
+                "tool_results": [{ "tool_call_id": "tc-cont", "content": "file data" }],
+                "explain": true,
+                "test_llm_rounds": [{ "full_text": "Done." }]
+            }),
+            expected_text: Some("Done."),
+            expect_explain: true,
+            expected_tools_available_min: Some(3),
+            expected_tools_selected_min: Some(0),
+            expected_tool_event_names: vec![],
+            expect_user_query_event: false,
+            expected_skill_selection: vec![],
+        },
+        BridgeTurnScenario {
+            name: "attachment_repair_with_str_replace",
+            payload: json!({
+                "agent_id": "matrix-attachment-repair",
+                "messages": [{ "role": "user", "content": attachment }],
+                "edge_tools": [
+                    tool_schema("read_file"),
+                    tool_schema("str_replace"),
+                    tool_schema("grep"),
+                    tool_schema("glob"),
+                    tool_schema("write_file")
+                ],
+                "explain": true,
+                "test_llm_rounds": [{
+                    "tool_calls": [tool_call("tc-matrix-repair", "str_replace", json!({"path": "rust/crates/astra-tools/src/git_gix.rs"}))],
+                    "usage": { "prompt": 900, "completion": 40, "total": 940 }
+                }]
+            }),
+            expected_text: None,
+            expect_explain: true,
+            expected_tools_available_min: Some(5),
+            expected_tools_selected_min: Some(1),
+            expected_tool_event_names: vec!["str_replace"],
+            expect_user_query_event: true,
+            expected_skill_selection: vec!["str_replace"],
+        },
+    ];
+
+    for case in cases {
+        run_bridge_turn_scenario(case).await;
+    }
+}
 
 #[tokio::test]
 async fn persist_core_events_user_query_and_llm_response_once() {

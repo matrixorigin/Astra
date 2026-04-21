@@ -1133,6 +1133,34 @@ pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -
     }
 }
 
+/// Inject an additional synthesis nudge once the loop has already spent several
+/// rounds without producing any assistant text after the latest tool batch.
+///
+/// This is generic and history-based: it looks only at the current round index
+/// plus whether the visible conversation ends with tool results.
+pub fn synthesize_or_batch_directive(messages: &[serde_json::Value], round_index: u32) -> String {
+    if round_index < ROUND_BUDGET_THRESHOLD {
+        return String::new();
+    }
+
+    let trailing_tool_count = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count();
+    if trailing_tool_count == 0 {
+        return String::new();
+    }
+
+    format!(
+        "\n\n## Synthesize Or Batch Now\n\
+         The last round ended with {trailing_tool_count} tool result(s) and no assistant synthesis yet.\n\
+         - If you already have enough information, produce your final answer NOW.\n\
+         - If you still need more data, make at most ONE more tool round and batch all remaining independent calls together.\n\
+         - Do NOT continue one-tool-at-a-time exploration.\n"
+    )
+}
+
 /// Parallel execution feedback — injected into dynamic prompt when the previous
 /// round had multiple tool results, indicating the LLM successfully batched.
 ///
