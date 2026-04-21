@@ -69,7 +69,18 @@ pub struct RoutingDecision {
 // ─── Preference Detection ────────────────────────────────────────────────────
 
 /// Chinese preference/interest verbs.
-const ZH_PREFERENCE: &[&str] = &["关注", "跟踪", "留意", "记住", "记一下", "收藏"];
+const ZH_PREFERENCE: &[&str] = &[
+    "关注",
+    "跟踪",
+    "留意",
+    "记住",
+    "记一下",
+    "收藏",
+    "偏好",
+    "偏爱",
+    "喜欢",
+    "倾向",
+];
 
 /// English preference/interest patterns.
 const EN_PREFERENCE: &[&str] = &[
@@ -77,6 +88,7 @@ const EN_PREFERENCE: &[&str] = &[
     "track",
     "remember",
     "bookmark",
+    "prefer",
     "interested in",
     "keep an eye on",
     "subscribe",

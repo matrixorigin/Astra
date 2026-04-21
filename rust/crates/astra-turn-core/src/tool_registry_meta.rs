@@ -758,9 +758,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 25,
     },
-    // memory_store is now selective, not baseline-pinned. We only surface it
-    // when the query explicitly signals remember/track/preference intent,
-    // instead of paying the schema tax on every unrelated turn.
+    // memory_store is now selective, not baseline-pinned. We surface it for
+    // explicit remember/track language plus common preference phrasing, so
+    // implicit user preferences can still route without paying the schema tax
+    // on unrelated turns.
     ToolMeta {
         name: "memory_store",
         description: "Store information to persistent memory",
@@ -779,12 +780,21 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "track",
             "subscribe",
             "bookmark",
+            "preference",
+            "preferences",
             "记住",
             "保存记忆",
             "存储",
             "记下",
             "记录",
             "保存",
+            "偏好",
+            "偏爱",
+            "喜欢",
+            "更喜欢",
+            "倾向",
+            "好吃",
+            "比较好",
             // Disambiguate from write_file "保存"
             "保存到记忆",
             "存储到记忆",

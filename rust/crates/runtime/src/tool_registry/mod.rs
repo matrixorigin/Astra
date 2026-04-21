@@ -262,16 +262,16 @@ mod tests {
         );
     }
 
-    /// Regression: explicit remember/preference phrasing should still surface memory_store
+    /// Regression: implicit Chinese preferences should still surface memory_store
     /// even after it leaves the pinned baseline.
     #[test]
     fn select_preference_statement_has_memory_store() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("记住我喜欢 Rust", 1);
+        let selected = registry.select("苹果比较好吃", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
             names.contains(&"memory_store".to_string()),
-            "memory_store must be selected for explicit remember intent, got: {:?}",
+            "memory_store must be selected for implicit preference intent, got: {:?}",
             names
         );
     }
