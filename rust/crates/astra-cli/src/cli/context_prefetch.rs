@@ -53,7 +53,7 @@ pub async fn prefetch_context_for_message(
         "implementation" => prefetch_implementation_context(project_root).await,
         "analysis" => prefetch_exploration_context(message, project_root).await,
         _ => {
-            astra_core::agent_debug!("prefetch", "unknown task_type={task_type}, skipping");
+            astra_core::agent_debug!("prefetch", "unsupported task_type={task_type}");
             return None;
         }
     };

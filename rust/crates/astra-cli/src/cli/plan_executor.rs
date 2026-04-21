@@ -1976,17 +1976,30 @@ mod tests {
 
         // Build a turn event with ttft_ms set (mirrors the Ok(result) branch).
         let turn_evt = session_journal::JournalEvent::turn(
-            Some("sess-1"), 3, Some("qwen-turbo"), "prompt", "response", 2, 1000, 40, 2000,
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            "response",
+            2,
+            1000,
+            40,
+            2000,
         )
         .with_ttft(Some(1750));
-        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt))).unwrap();
+        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt)))
+            .unwrap();
 
         let update = rx.try_recv().unwrap();
         let PlanUpdate::JournalEvent(received) = update else {
             panic!("expected JournalEvent");
         };
         assert_eq!(received.event_type, JournalEventType::Turn);
-        assert_eq!(received.ttft_ms, Some(1750), "turn event must carry ttft_ms");
+        assert_eq!(
+            received.ttft_ms,
+            Some(1750),
+            "turn event must carry ttft_ms"
+        );
     }
 
     /// Verify that is_credential_error correctly identifies auth failures.

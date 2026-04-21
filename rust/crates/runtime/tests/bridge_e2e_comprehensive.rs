@@ -459,7 +459,12 @@ async fn run_bridge_turn_scenario(case: BridgeTurnScenario) {
 
     if case.expect_explain {
         let explains = events_of_type(&events, "explain");
-        assert_eq!(explains.len(), 1, "{}: expected one explain event", case.name);
+        assert_eq!(
+            explains.len(),
+            1,
+            "{}: expected one explain event",
+            case.name
+        );
         let explain = explains[0];
         if let Some(min_available) = case.expected_tools_available_min {
             let available = explain["tools_available"]
