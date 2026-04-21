@@ -474,6 +474,48 @@ fn is_credential_error(msg: &str) -> bool {
         || lower.contains("401")
 }
 
+/// Build a one-line evidence sentence naming the tools with the highest
+/// failure rates across the caller's `ToolHealthEntry` set, so the retry
+/// hint can steer away from known-failing tools rather than emitting a
+/// generic "try something different" message. Returns `None` when no
+/// tool crosses the `min_calls` bar.
+fn high_failure_tool_evidence(
+    entries: &[astra_runtime::pipeline::persistence::ToolHealthEntry],
+    top_k: usize,
+) -> Option<String> {
+    const MIN_CALLS: usize = 2;
+    const MIN_FAIL_RATE: f64 = 0.5;
+    let mut scored: Vec<_> = entries
+        .iter()
+        .filter(|e| e.total_calls >= MIN_CALLS && e.failure_rate >= MIN_FAIL_RATE)
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by(|a, b| {
+        b.failure_rate
+            .partial_cmp(&a.failure_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let picks: Vec<String> = scored
+        .iter()
+        .take(top_k.max(1))
+        .map(|e| {
+            format!(
+                "{} ({:.0}% fail over {} calls)",
+                e.name,
+                e.failure_rate * 100.0,
+                e.total_calls
+            )
+        })
+        .collect();
+    Some(format!(
+        "5. Observed high-failure tools this session — prefer alternatives to: {}",
+        picks.join(", ")
+    ))
+}
+
+
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
@@ -1340,7 +1382,9 @@ async fn plan_executor_task(
                     if *retry_count >= STRATEGY_ESCALATION_THRESHOLD
                         && *retry_count <= MAX_TURN_RETRIES
                     {
-                        let strategy_hint = format!(
+                        let evidence_line =
+                            high_failure_tool_evidence(&ctx.tool_health_entries, 3);
+                        let mut strategy_hint = format!(
                             "⚠ Subtask '{}' has failed {} times. Try a DIFFERENT approach:\n\
                              1. Break the task into smaller, simpler steps\n\
                              2. Use alternative tools (e.g., grep instead of find, or vice versa)\n\
@@ -1348,6 +1392,10 @@ async fn plan_executor_task(
                              4. If stuck, describe what you've tried and ask for clarification",
                             title, *retry_count
                         );
+                        if let Some(line) = evidence_line {
+                            strategy_hint.push('\n');
+                            strategy_hint.push_str(&line);
+                        }
                         ctx.current_subtask_strategy_hint = Some(strategy_hint);
                         astra_core::agent_warn!(
                             "plan_executor",
@@ -1730,6 +1778,65 @@ mod tests {
         assert_eq!(*c, 1);
         // "s1" is still at 2
         assert_eq!(counts["s1"], 2);
+    }
+
+    #[test]
+    fn high_failure_tool_evidence_surfaces_repeat_offenders() {
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        let entries = vec![
+            ToolHealthEntry {
+                name: "flaky_tool".into(),
+                total_calls: 4,
+                total_failures: 4,
+                failure_rate: 1.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+            ToolHealthEntry {
+                name: "healthy_tool".into(),
+                total_calls: 10,
+                total_failures: 0,
+                failure_rate: 0.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+            ToolHealthEntry {
+                name: "one_shot".into(),
+                total_calls: 1,
+                total_failures: 1,
+                failure_rate: 1.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+        ];
+        let line =
+            super::high_failure_tool_evidence(&entries, 3).expect("should surface evidence");
+        assert!(
+            line.contains("flaky_tool"),
+            "evidence line must name the repeat offender: {line}"
+        );
+        assert!(
+            !line.contains("healthy_tool"),
+            "healthy tool should not appear: {line}"
+        );
+        assert!(
+            !line.contains("one_shot"),
+            "tools below MIN_CALLS should not appear: {line}"
+        );
+    }
+
+    #[test]
+    fn high_failure_tool_evidence_returns_none_when_no_signal() {
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        let entries = vec![ToolHealthEntry {
+            name: "steady".into(),
+            total_calls: 5,
+            total_failures: 1,
+            failure_rate: 0.2,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![],
+        }];
+        assert!(super::high_failure_tool_evidence(&entries, 3).is_none());
     }
 
     #[test]
