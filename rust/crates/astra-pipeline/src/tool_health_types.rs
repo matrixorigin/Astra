@@ -6,12 +6,17 @@ use serde::{Deserialize, Serialize};
 pub const TOOL_OUTCOME_RING_CAPACITY: usize = 8;
 
 /// Persisted per-call outcome for a specific tool signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutcome {
     pub success: bool,
     pub latency_ms: u64,
     pub result_hash: u64,
     pub at_epoch: u64,
+    /// Structured failure category tag (snake_case) when the call failed;
+    /// `None` on success or when the failure could not be classified.
+    /// Stored as a plain string to keep this crate free of turn-core dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
 }
 
 /// Persisted ring of outcomes for a canonical tool signature.

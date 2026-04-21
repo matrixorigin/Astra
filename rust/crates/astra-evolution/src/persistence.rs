@@ -357,7 +357,7 @@ fn merge_recent_outcomes(
             by_signature
                 .entry(entry.signature.clone())
                 .or_default()
-                .extend(entry.outcomes.iter().copied());
+                .extend(entry.outcomes.iter().cloned());
         }
     }
 
@@ -1342,6 +1342,7 @@ mod tests {
                     latency_ms: 10,
                     result_hash: 111,
                     at_epoch: 10,
+                    failure_category: None,
                 }],
             }],
         }];
@@ -1358,6 +1359,7 @@ mod tests {
                     latency_ms: 12,
                     result_hash: 222,
                     at_epoch: 20,
+                    failure_category: None,
                 }],
             }],
         }];
