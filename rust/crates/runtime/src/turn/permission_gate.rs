@@ -73,10 +73,11 @@ pub async fn check_tool_permission(
         let ctx_guard = ctx.read().await;
         if ctx_guard.is_denied(tool_name, rule_match_hint) {
             drop(ctx_guard);
-            ctx.write().await.record_blocked_tool(tool_name);
-            return PermissionCheckResult::Denied {
-                reason: format!("Tool '{}' denied by permission rules", tool_name),
-            };
+            let reason = format!("Tool '{}' denied by permission rules", tool_name);
+            ctx.write()
+                .await
+                .record_blocked_tool_with_reason(tool_name, Some(&reason));
+            return PermissionCheckResult::Denied { reason };
         }
 
         if explicit_approval.is_none() && ctx_guard.is_allowed(tool_name, rule_match_hint) {
@@ -91,10 +92,11 @@ pub async fn check_tool_permission(
         if ctx_guard.mode() == PermissionMode::Auto {
             if !ctx_guard.inherited.is_tool_allowed_by_allowlist(tool_name) {
                 drop(ctx_guard);
-                ctx.write().await.record_blocked_tool(tool_name);
-                return PermissionCheckResult::Denied {
-                    reason: format!("Tool '{}' not in allowed tools list", tool_name),
-                };
+                let reason = format!("Tool '{}' not in allowed tools list", tool_name);
+                ctx.write()
+                    .await
+                    .record_blocked_tool_with_reason(tool_name, Some(&reason));
+                return PermissionCheckResult::Denied { reason };
             }
             if explicit_approval.is_none() {
                 return PermissionCheckResult::Allowed;
@@ -104,29 +106,31 @@ pub async fn check_tool_permission(
         // If mode is Deny, don't even try to request
         if ctx_guard.mode() == PermissionMode::Deny {
             drop(ctx_guard);
-            ctx.write().await.record_blocked_tool(tool_name);
-            return PermissionCheckResult::Denied {
-                reason: explicit_approval
-                    .clone()
-                    .unwrap_or_else(|| format!("Tool '{}' denied by permission mode", tool_name)),
-            };
+            let reason = explicit_approval
+                .clone()
+                .unwrap_or_else(|| format!("Tool '{}' denied by permission mode", tool_name));
+            ctx.write()
+                .await
+                .record_blocked_tool_with_reason(tool_name, Some(&reason));
+            return PermissionCheckResult::Denied { reason };
         }
     }
 
     // Try to request permission from parent
     let Some(mailbox) = mailbox else {
-        ctx.write().await.record_blocked_tool(tool_name);
-        return PermissionCheckResult::Denied {
-            reason: explicit_approval.clone().map_or_else(
-                || {
-                    format!(
-                        "Tool '{}' requires permission but no parent available",
-                        tool_name
-                    )
-                },
-                |reason| format!("{reason} No parent is available to approve this tool call."),
-            ),
-        };
+        let reason = explicit_approval.clone().map_or_else(
+            || {
+                format!(
+                    "Tool '{}' requires permission but no parent available",
+                    tool_name
+                )
+            },
+            |reason| format!("{reason} No parent is available to approve this tool call."),
+        );
+        ctx.write()
+            .await
+            .record_blocked_tool_with_reason(tool_name, Some(&reason));
+        return PermissionCheckResult::Denied { reason };
     };
 
     // Build permission request
@@ -167,19 +171,21 @@ pub async fn check_tool_permission(
                 }
                 PermissionCheckResult::AllowedViaRequest { new_rules }
             } else {
-                ctx.write().await.record_blocked_tool(tool_name);
-                PermissionCheckResult::Denied {
-                    reason: response
-                        .reason
-                        .unwrap_or_else(|| "Permission denied by parent".to_string()),
-                }
+                let reason = response
+                    .reason
+                    .unwrap_or_else(|| "Permission denied by parent".to_string());
+                ctx.write()
+                    .await
+                    .record_blocked_tool_with_reason(tool_name, Some(&reason));
+                PermissionCheckResult::Denied { reason }
             }
         }
         Err(e) => {
-            ctx.write().await.record_blocked_tool(tool_name);
-            PermissionCheckResult::Denied {
-                reason: format!("Permission request failed: {}", e),
-            }
+            let reason = format!("Permission request failed: {}", e);
+            ctx.write()
+                .await
+                .record_blocked_tool_with_reason(tool_name, Some(&reason));
+            PermissionCheckResult::Denied { reason }
         }
     }
 }

@@ -293,6 +293,9 @@ pub(super) struct PermissionManager {
     cached_user_deny: Vec<PermissionRule>,
     /// Permissions inherited from parent agent (if this is a child agent).
     inherited: Option<astra_runtime::orchestration::InheritedPermissions>,
+    /// Gap 3: ring of the most recent `(tool, reason)` rejections for the
+    /// SelfModel surface. Newest at the back, capped at ~5 entries.
+    recent_rejections: std::collections::VecDeque<(String, String)>,
 }
 
 impl PermissionManager {
@@ -315,6 +318,25 @@ impl PermissionManager {
             self.denial_tracker.total_denials(),
             self.denial_tracker.limits().max_total,
         )
+    }
+
+    /// Gap 3: snapshot of recent `(tool, reason)` rejections for the
+    /// SelfModel surface. Newest at the back; caller clones.
+    pub(super) fn recent_rejections(&self) -> Vec<(String, String)> {
+        self.recent_rejections.iter().cloned().collect()
+    }
+
+    /// Gap 3: record a user/system rejection with a short reason. Dedups
+    /// `(tool, reason)` pairs and trims to a bounded buffer.
+    pub(super) fn record_rejection(&mut self, tool: &str, reason: &str) {
+        const MAX: usize = 5;
+        self.recent_rejections
+            .retain(|(t, r)| !(t == tool && r == reason));
+        self.recent_rejections
+            .push_back((tool.to_string(), reason.to_string()));
+        while self.recent_rejections.len() > MAX {
+            self.recent_rejections.pop_front();
+        }
     }
 
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
@@ -357,6 +379,7 @@ impl PermissionManager {
             session_overrides:
                 astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+            recent_rejections: std::collections::VecDeque::new(),
             settings: PermissionSettings::default(),
             project_root: None,
             cached_allow: Vec::new(),
@@ -392,6 +415,7 @@ impl PermissionManager {
             session_overrides:
                 astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+            recent_rejections: std::collections::VecDeque::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -428,6 +452,7 @@ impl PermissionManager {
             session_overrides:
                 astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+            recent_rejections: std::collections::VecDeque::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -1153,6 +1178,7 @@ impl PermissionManager {
                 };
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
+                self.record_rejection(tool, "user skipped for session");
                 eprintln!("  {}", format!("  ✗ {tool}: skipped for session").dim());
                 ApprovalDecision::Deny
             }
@@ -1374,11 +1400,13 @@ impl PermissionManager {
             's' => {
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
+                self.record_rejection(name, "user skipped for session");
                 eprintln!("  {}", format!("  ✗ {name}: skipped for session").dim());
                 false
             }
             _ => {
                 self.denial_tracker.record(&fp, false);
+                self.record_rejection(name, "user declined approval");
                 false
             }
         }
@@ -1626,6 +1654,7 @@ impl PermissionManager {
         self.session_overrides.insert(fp.clone(), allowed);
         if !allowed {
             self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "session override: deny");
         }
     }
 

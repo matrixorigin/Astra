@@ -396,6 +396,9 @@ pub struct PermissionTelemetry {
     pub permission_requests_approved: u32,
     pub tools_blocked: u32,
     pub recent_denials: Vec<String>,
+    /// Most-recent `(tool, reason)` denials, newest at the back.
+    /// Mirrors `recent_denials` but preserves *why* the call was refused.
+    pub recent_denials_with_reasons: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -539,6 +542,10 @@ impl PermissionSyncContext {
     }
 
     pub fn record_blocked_tool(&mut self, tool_name: &str) {
+        self.record_blocked_tool_with_reason(tool_name, None);
+    }
+
+    pub fn record_blocked_tool_with_reason(&mut self, tool_name: &str, reason: Option<&str>) {
         self.telemetry.tools_blocked = self.telemetry.tools_blocked.saturating_add(1);
         self.telemetry
             .recent_denials
@@ -548,6 +555,20 @@ impl PermissionSyncContext {
         if self.telemetry.recent_denials.len() > MAX_RECENT_DENIALS {
             let drop_count = self.telemetry.recent_denials.len() - MAX_RECENT_DENIALS;
             self.telemetry.recent_denials.drain(0..drop_count);
+        }
+        if let Some(reason_text) = reason {
+            let entry = (tool_name.to_string(), reason_text.to_string());
+            self.telemetry
+                .recent_denials_with_reasons
+                .retain(|(t, r)| !(t == &entry.0 && r == &entry.1));
+            self.telemetry.recent_denials_with_reasons.push(entry);
+            if self.telemetry.recent_denials_with_reasons.len() > MAX_RECENT_DENIALS {
+                let drop_count =
+                    self.telemetry.recent_denials_with_reasons.len() - MAX_RECENT_DENIALS;
+                self.telemetry
+                    .recent_denials_with_reasons
+                    .drain(0..drop_count);
+            }
         }
     }
 }

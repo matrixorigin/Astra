@@ -1559,6 +1559,19 @@ impl ToolExecutor {
         if let Some(dp) = session.last_denial_pressure {
             snapshot = snapshot.with_denial_pressure(dp);
         }
+        if !session.recent_failing_tests.is_empty() {
+            snapshot = snapshot.with_recent_failing_tests(session.recent_failing_tests.clone());
+        }
+        if !session.recent_rejections.is_empty() {
+            snapshot = snapshot.with_recent_rejections(session.recent_rejections.clone());
+        }
+        if !session.recent_correction_excerpts.is_empty() {
+            snapshot = snapshot
+                .with_recent_correction_excerpts(session.recent_correction_excerpts.clone());
+        }
+        if !session.outcome_bias.is_empty() {
+            snapshot = snapshot.with_outcome_bias(session.outcome_bias.clone());
+        }
         Some(snapshot)
     }
 }

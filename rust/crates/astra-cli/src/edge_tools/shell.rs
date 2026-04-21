@@ -3184,6 +3184,31 @@ impl ToolExecutor {
                     if !parsed.error_locations.is_empty() {
                         parsed.enrich_with_scope(&self.project_root);
                     }
+                    // Gap 2: publish failing test / error messages to the
+                    // SelfModel surface so the agent perceives which tests
+                    // are currently red on its next turn.
+                    if parsed.tests_failed > 0 || !parsed.error_messages.is_empty() {
+                        if let Some(session_lock) = &self.observability_session
+                            && let Ok(mut session) = session_lock.write()
+                        {
+                            let names: Vec<String> = parsed
+                                .error_messages
+                                .iter()
+                                .take(8)
+                                .map(|m| {
+                                    m.lines()
+                                        .next()
+                                        .unwrap_or(m)
+                                        .trim()
+                                        .chars()
+                                        .take(120)
+                                        .collect()
+                                })
+                                .filter(|s: &String| !s.is_empty())
+                                .collect();
+                            session.record_failing_test_names(names);
+                        }
+                    }
                     let delta = {
                         let mut tracker = self
                             .build_test_tracker

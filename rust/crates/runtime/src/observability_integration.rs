@@ -143,6 +143,24 @@ pub struct ObservabilitySession {
     /// its own session-wide rejection rate and can self-regulate before the
     /// hard fallback threshold fires.
     pub last_denial_pressure: Option<crate::self_model::DenialPressureView>,
+
+    /// Gap 2: bounded ring of the most recent failing test names observed
+    /// in tool outcomes (e.g., `cargo test` / `pytest` / `npm test`).
+    /// Newest at the back. Capacity managed by the publisher.
+    pub recent_failing_tests: Vec<String>,
+
+    /// Gap 3: bounded ring of recent `(tool, reason)` permission rejections
+    /// so the SelfModel can tell the agent *why* its last calls were
+    /// refused. Newest at the back.
+    pub recent_rejections: Vec<crate::self_model::RejectionSummary>,
+
+    /// Gap 5: short excerpts of user utterances that were detected as
+    /// corrections. Newest at the back. Capped by the publisher.
+    pub recent_correction_excerpts: Vec<String>,
+
+    /// Gap 6: per-tool outcome bias currently applied by the selector
+    /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
+    pub outcome_bias: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +275,10 @@ impl ObservabilitySession {
             last_strategy_application: None,
             last_guardrail_view: None,
             last_denial_pressure: None,
+            recent_failing_tests: Vec::new(),
+            recent_rejections: Vec::new(),
+            recent_correction_excerpts: Vec::new(),
+            outcome_bias: std::collections::BTreeMap::new(),
         }
     }
 
@@ -293,6 +315,10 @@ impl ObservabilitySession {
             last_strategy_application: None,
             last_guardrail_view: None,
             last_denial_pressure: None,
+            recent_failing_tests: Vec::new(),
+            recent_rejections: Vec::new(),
+            recent_correction_excerpts: Vec::new(),
+            outcome_bias: std::collections::BTreeMap::new(),
         }
     }
 
@@ -457,9 +483,68 @@ impl ObservabilitySession {
 
         if is_correction {
             self.record_user_correction();
+            // Gap 5: capture a short excerpt of the corrective utterance so
+            // the SelfModel can tell the agent *what* is being corrected,
+            // not just that a correction happened.
+            self.record_correction_excerpt(query);
         }
 
         is_correction
+    }
+
+    /// Gap 5: push a compact excerpt of the most recent user-correction
+    /// utterance. Keeps at most the latest 5 so prompt surface stays bounded.
+    pub fn record_correction_excerpt(&mut self, query: &str) {
+        const MAX_EXCERPTS: usize = 5;
+        // Clip to a reasonable prompt-safe length; renderer will further
+        // truncate for display.
+        let excerpt: String = query.chars().take(120).collect();
+        self.recent_correction_excerpts.push(excerpt);
+        if self.recent_correction_excerpts.len() > MAX_EXCERPTS {
+            let drop = self.recent_correction_excerpts.len() - MAX_EXCERPTS;
+            self.recent_correction_excerpts.drain(0..drop);
+        }
+    }
+
+    /// Gap 2: publish names of tests that failed in a recent tool outcome.
+    /// Dedup preserves the newest occurrence; the ring is bounded.
+    pub fn record_failing_test_names(&mut self, names: impl IntoIterator<Item = String>) {
+        const MAX_NAMES: usize = 8;
+        for name in names {
+            if name.trim().is_empty() {
+                continue;
+            }
+            self.recent_failing_tests.retain(|n| n != &name);
+            self.recent_failing_tests.push(name);
+        }
+        if self.recent_failing_tests.len() > MAX_NAMES {
+            let drop = self.recent_failing_tests.len() - MAX_NAMES;
+            self.recent_failing_tests.drain(0..drop);
+        }
+    }
+
+    /// Gap 3: record a permission rejection with its reason. Dedups by
+    /// `(tool, reason)` so repeated identical rejections don't flood the
+    /// prompt surface.
+    pub fn record_rejection(&mut self, tool: &str, reason: &str) {
+        const MAX_REJECTIONS: usize = 5;
+        let summary = crate::self_model::RejectionSummary {
+            tool: tool.to_string(),
+            reason: reason.to_string(),
+        };
+        self.recent_rejections
+            .retain(|r| !(r.tool == summary.tool && r.reason == summary.reason));
+        self.recent_rejections.push(summary);
+        if self.recent_rejections.len() > MAX_REJECTIONS {
+            let drop = self.recent_rejections.len() - MAX_REJECTIONS;
+            self.recent_rejections.drain(0..drop);
+        }
+    }
+
+    /// Gap 6: publish the current per-tool outcome bias snapshot. Passing
+    /// an empty map clears the prompt surface for this signal.
+    pub fn set_outcome_bias(&mut self, bias: std::collections::BTreeMap<String, f64>) {
+        self.outcome_bias = bias;
     }
 
     /// Record a query and return timing/correction behavior for signal wiring.
@@ -1694,5 +1779,70 @@ mod tests {
                 .resolve(TaskType::Fetch, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_record_failing_test_names_bounds_and_dedups() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u", "s");
+        let mut s = session.write().unwrap();
+        s.record_failing_test_names(vec!["test_a".into(), "test_b".into()]);
+        s.record_failing_test_names(vec!["test_a".into()]); // dedup + bump to back
+        assert_eq!(s.recent_failing_tests, vec!["test_b", "test_a"]);
+        // Overflow (cap = 8): push 10 more distinct, keep newest 8
+        let more: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        s.record_failing_test_names(more);
+        assert_eq!(s.recent_failing_tests.len(), 8);
+        assert!(s.recent_failing_tests.contains(&"t9".to_string()));
+    }
+
+    #[test]
+    fn test_record_correction_excerpt_bounds() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u", "s");
+        let mut s = session.write().unwrap();
+        for i in 0..7 {
+            s.record_correction_excerpt(&format!("correction {i}"));
+        }
+        assert_eq!(s.recent_correction_excerpts.len(), 5);
+        assert!(s.recent_correction_excerpts[0].contains("correction 2"));
+    }
+
+    #[test]
+    fn test_detect_correction_signal_captures_excerpt() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u", "s");
+        let mut s = session.write().unwrap();
+        assert!(s.detect_correction_signal("no, I meant the other file"));
+        assert_eq!(s.recent_correction_excerpts.len(), 1);
+        assert!(s.recent_correction_excerpts[0].contains("no, I meant"));
+    }
+
+    #[test]
+    fn test_record_rejection_dedups_and_bounds() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u", "s");
+        let mut s = session.write().unwrap();
+        s.record_rejection("bash", "denied by rules");
+        s.record_rejection("bash", "denied by rules"); // dedup
+        s.record_rejection("edit_file", "not in allowlist");
+        assert_eq!(s.recent_rejections.len(), 2);
+        for i in 0..6 {
+            s.record_rejection(&format!("tool_{i}"), "r");
+        }
+        assert_eq!(s.recent_rejections.len(), 5);
+    }
+
+    #[test]
+    fn test_set_outcome_bias_replaces_map() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u", "s");
+        let mut s = session.write().unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("bash".to_string(), 0.25);
+        s.set_outcome_bias(m);
+        assert_eq!(s.outcome_bias.get("bash"), Some(&0.25));
+        s.set_outcome_bias(std::collections::BTreeMap::new());
+        assert!(s.outcome_bias.is_empty());
     }
 }

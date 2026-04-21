@@ -58,6 +58,35 @@ pub struct SelfModel {
     /// before the session-wide fallback actually fires.
     #[serde(default)]
     pub denial_pressure: Option<DenialPressureView>,
+    /// Gap 2: names of tests that failed in recent tool outcomes (e.g., the
+    /// last few `cargo test` / `pytest` / `npm test` invocations). Empty
+    /// when the session has no recent test failures.
+    #[serde(default)]
+    pub recent_failing_tests: Vec<String>,
+    /// Gap 3: recent permission-rejection reasons keyed by tool, bounded to
+    /// a small ring so the agent perceives *why* the runtime is refusing
+    /// specific calls and can adjust scope instead of retrying blindly.
+    #[serde(default)]
+    pub recent_rejections: Vec<RejectionSummary>,
+    /// Gap 5: short excerpts of the most recent user-correction utterances
+    /// so the agent can recognize patterns ("wrong scope" vs "wrong tool")
+    /// across turns instead of only seeing a raw correction count.
+    #[serde(default)]
+    pub recent_correction_excerpts: Vec<String>,
+    /// Gap 6: per-tool outcome bias currently affecting the selector
+    /// (`ToolHealthTracker::outcome_bias_by_tool`). Positive entries mildly
+    /// boost the tool's score; negative entries penalize. Surfaced so the
+    /// agent can audit why a tool is being preferred or avoided.
+    #[serde(default)]
+    pub outcome_bias: std::collections::BTreeMap<String, f64>,
+}
+
+/// Gap 3: a single recent permission rejection, rendered into the
+/// self-awareness section so the agent learns *why* calls are refused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectionSummary {
+    pub tool: String,
+    pub reason: String,
 }
 
 /// Session-wide permission-denial pressure. The agent perceives both the
@@ -463,6 +492,10 @@ impl SelfModel {
             guardrail: None,
             skill_diff: last_strategy.and_then(|app| app.diff_entry.clone()),
             denial_pressure: None,
+            recent_failing_tests: Vec::new(),
+            recent_rejections: Vec::new(),
+            recent_correction_excerpts: Vec::new(),
+            outcome_bias: std::collections::BTreeMap::new(),
         }
     }
 
@@ -477,6 +510,36 @@ impl SelfModel {
     /// as "unknown ceiling" and will still render the raw count.
     pub fn with_denial_pressure(mut self, view: DenialPressureView) -> Self {
         self.denial_pressure = Some(view);
+        self
+    }
+
+    /// Gap 2: attach names of tests that failed in recent tool outcomes.
+    /// Empty vectors are preserved as empty (renderer skips).
+    pub fn with_recent_failing_tests(mut self, names: Vec<String>) -> Self {
+        self.recent_failing_tests = names;
+        self
+    }
+
+    /// Gap 3: attach a bounded list of recent permission-rejection reasons.
+    pub fn with_recent_rejections(mut self, rejections: Vec<RejectionSummary>) -> Self {
+        self.recent_rejections = rejections;
+        self
+    }
+
+    /// Gap 5: attach short excerpts of recent user-correction utterances so
+    /// the agent can perceive *what* it is being corrected on, not just
+    /// that it happened.
+    pub fn with_recent_correction_excerpts(mut self, excerpts: Vec<String>) -> Self {
+        self.recent_correction_excerpts = excerpts;
+        self
+    }
+
+    /// Gap 6: attach a per-tool outcome-bias snapshot
+    /// (`ToolHealthTracker::outcome_bias_by_tool`). Only non-zero entries
+    /// should be passed in; zeros will still render as "neutral" rows if
+    /// supplied.
+    pub fn with_outcome_bias(mut self, bias: std::collections::BTreeMap<String, f64>) -> Self {
+        self.outcome_bias = bias;
         self
     }
 
@@ -718,6 +781,85 @@ impl SelfModel {
             }
         }
 
+        // ── Gap 2: recent test failure names ──
+        // Specific failing test names are high-density signal — the agent
+        // can retry just those or inspect their code, rather than reruning
+        // the whole suite.
+        if !self.recent_failing_tests.is_empty() {
+            let sample: Vec<&str> = self
+                .recent_failing_tests
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect();
+            let extra = self.recent_failing_tests.len().saturating_sub(sample.len());
+            let suffix = if extra > 0 {
+                format!(" (+{extra} more)")
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                s,
+                "Recent test failures: {}{} — fix or investigate these specifically before re-running the whole suite",
+                sample.join(", "),
+                suffix
+            );
+        }
+
+        // ── Gap 3: recent permission-rejection reasons ──
+        // Surfaces *why* the runtime refused recent calls so the agent
+        // adjusts scope instead of retrying blindly.
+        if !self.recent_rejections.is_empty() {
+            let parts: Vec<String> = self
+                .recent_rejections
+                .iter()
+                .take(3)
+                .map(|r| format!("{} ({})", r.tool, r.reason))
+                .collect();
+            let _ = writeln!(
+                s,
+                "Recent rejections: {} — adjust scope or approach; don't re-issue the same call",
+                parts.join("; ")
+            );
+        }
+
+        // ── Gap 6: per-tool outcome bias applied by the selector ──
+        // Explains which tools the selector is currently boosting /
+        // penalizing based on recent success / failure history.
+        if !self.outcome_bias.is_empty() {
+            let mut entries: Vec<(String, f64)> = self
+                .outcome_bias
+                .iter()
+                .filter(|(_, b)| b.abs() >= 0.005)
+                .map(|(t, b)| (t.clone(), *b))
+                .collect();
+            entries.sort_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if !entries.is_empty() {
+                let rendered: Vec<String> = entries
+                    .into_iter()
+                    .take(4)
+                    .map(|(tool, bias)| {
+                        let arrow = if bias > 0.0 { "↑" } else { "↓" };
+                        let reason = if bias > 0.0 {
+                            "recent successes"
+                        } else {
+                            "recent failures"
+                        };
+                        format!("{tool} {arrow}{:.2} ({reason})", bias.abs())
+                    })
+                    .collect();
+                let _ = writeln!(
+                    s,
+                    "Tool outcome bias (selector-applied): {}",
+                    rendered.join(" · ")
+                );
+            }
+        }
+
         // ── Recent signals ──
         if !self.recent_signals.is_empty() {
             s.push_str("Recent signals: ");
@@ -744,6 +886,22 @@ impl SelfModel {
                 "User corrections: {} this session — adjust approach accordingly",
                 self.state.correction_count
             );
+            // Gap 5: render up to 3 recent correction excerpts so the agent
+            // can see *what* it's being corrected on, not just the count.
+            if !self.recent_correction_excerpts.is_empty() {
+                let rendered: Vec<String> = self
+                    .recent_correction_excerpts
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .map(|e| format!("\"{}\"", truncate_str(e, 80)))
+                    .collect();
+                let _ = writeln!(
+                    s,
+                    "  Recent corrections (most recent first): {}",
+                    rendered.join(" · ")
+                );
+            }
         }
 
         // ── Tools summary ──
@@ -1726,5 +1884,164 @@ mod tests {
             .pressure(),
             1.0
         );
+    }
+
+    #[test]
+    fn recent_failing_tests_renders_compact_list() {
+        let model = minimal_model().with_recent_failing_tests(vec![
+            "tests::parses_json".into(),
+            "tests::handles_empty".into(),
+        ]);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Recent test failures: tests::parses_json, tests::handles_empty"),
+            "got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("more"),
+            "no +N more when list is short: {rendered}"
+        );
+    }
+
+    #[test]
+    fn recent_failing_tests_truncates_and_counts_overflow() {
+        let tests: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        let model = minimal_model().with_recent_failing_tests(tests);
+        let rendered = model.to_system_prompt_section();
+        assert!(rendered.contains("t0, t1, t2, t3, t4"), "got: {rendered}");
+        assert!(rendered.contains("(+3 more)"), "got: {rendered}");
+    }
+
+    #[test]
+    fn recent_failing_tests_empty_renders_nothing() {
+        let model = minimal_model().with_recent_failing_tests(Vec::new());
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            !rendered.contains("Recent test failures"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn recent_rejections_renders_reasons() {
+        let model = minimal_model().with_recent_rejections(vec![
+            RejectionSummary {
+                tool: "bash".into(),
+                reason: "sandbox: write outside workspace".into(),
+            },
+            RejectionSummary {
+                tool: "write_file".into(),
+                reason: "denied path".into(),
+            },
+        ]);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Recent rejections: bash (sandbox: write outside workspace); write_file (denied path)"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn recent_rejections_empty_renders_nothing() {
+        let model = minimal_model().with_recent_rejections(Vec::new());
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Recent rejections"), "got: {rendered}");
+    }
+
+    #[test]
+    fn correction_excerpts_render_only_when_correction_count_positive() {
+        // With zero corrections, excerpts are suppressed even if provided
+        // (the count line itself is gated).
+        let model = minimal_model()
+            .with_recent_correction_excerpts(vec!["no I meant read the file".into()]);
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Recent corrections"), "got: {rendered}");
+    }
+
+    #[test]
+    fn correction_excerpts_render_most_recent_first() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            0,
+            None,
+            None,
+            None,
+            0,
+            2, // correction_count > 0
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_recent_correction_excerpts(vec![
+            "first correction".into(),
+            "second correction".into(),
+        ]);
+        let rendered = model.to_system_prompt_section();
+        assert!(rendered.contains("User corrections: 2"), "got: {rendered}");
+        // Most-recent-first ordering
+        let pos_first = rendered.find("first correction");
+        let pos_second = rendered.find("second correction");
+        assert!(
+            pos_second.is_some() && pos_first.is_some(),
+            "got: {rendered}"
+        );
+        assert!(
+            pos_second < pos_first,
+            "second (most recent) should render first: {rendered}"
+        );
+    }
+
+    #[test]
+    fn outcome_bias_renders_sorted_by_magnitude() {
+        let mut bias = std::collections::BTreeMap::new();
+        bias.insert("bash".to_string(), -0.10);
+        bias.insert("write_file".to_string(), 0.08);
+        bias.insert("read_file".to_string(), 0.02);
+        let model = minimal_model().with_outcome_bias(bias);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Tool outcome bias (selector-applied)"),
+            "got: {rendered}"
+        );
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("Tool outcome bias"))
+            .unwrap();
+        let pos_bash = line.find("bash").unwrap();
+        let pos_write = line.find("write_file").unwrap();
+        let pos_read = line.find("read_file").unwrap();
+        assert!(pos_bash < pos_write, "|0.10| > |0.08|: {line}");
+        assert!(pos_write < pos_read, "|0.08| > |0.02|: {line}");
+        assert!(line.contains("↓0.10"), "got: {line}");
+        assert!(line.contains("↑0.08"), "got: {line}");
+    }
+
+    #[test]
+    fn outcome_bias_filters_near_zero_entries() {
+        let mut bias = std::collections::BTreeMap::new();
+        bias.insert("noise".to_string(), 0.001);
+        let model = minimal_model().with_outcome_bias(bias);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            !rendered.contains("Tool outcome bias"),
+            "sub-threshold entries should be filtered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn outcome_bias_empty_renders_nothing() {
+        let model = minimal_model();
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Tool outcome bias"), "got: {rendered}");
     }
 }
