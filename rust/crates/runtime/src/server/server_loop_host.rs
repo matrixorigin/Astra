@@ -889,12 +889,13 @@ impl ServerAgenticLoopHost {
             .unwrap_or_default();
 
         let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
-        let tool_round_guidance = crate::prompts::tool_round_guidance_with(
-            &state.messages,
-            state.current_round_index,
-            tool_cfg.effective_round_budget_warning(),
-            tool_cfg.effective_round_budget_limit(),
-        );
+        let (tool_round_guidance, guidance_signals) =
+            crate::prompts::tool_round_guidance_trace_with(
+                &state.messages,
+                state.current_round_index,
+                tool_cfg.effective_round_budget_warning(),
+                tool_cfg.effective_round_budget_limit(),
+            );
 
         // All dynamic per-turn content (not cached)
         let full_dynamic = format!(
@@ -910,18 +911,21 @@ impl ServerAgenticLoopHost {
             task_type,
             cache_cfg,
         );
-        let breakdown = crate::prompts::build_system_prompt_trace_with_context_signals(
+        let breakdown = crate::prompts::build_system_prompt_trace_with_signals(
             &sections,
             vec![],
             vec![],
-            crate::turn::context_assembly_trace::PromptContextSignals {
-                active_output_skills: !active_skill_names.is_empty(),
-                learned_runtime_context: !learned_context_text.is_empty(),
-                memory_signal_detected: !memory_signal_hint.is_empty(),
-                system_prompt_override: !system_override.is_empty(),
-                effort_hint: state.skills.effort.is_some(),
-                agent_type_hint: state.skills.agent_type.is_some(),
-                ..Default::default()
+            crate::turn::context_assembly_trace::PromptTraceSignals {
+                context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    active_output_skills: !active_skill_names.is_empty(),
+                    learned_runtime_context: !learned_context_text.is_empty(),
+                    memory_signal_detected: !memory_signal_hint.is_empty(),
+                    system_prompt_override: !system_override.is_empty(),
+                    effort_hint: state.skills.effort.is_some(),
+                    agent_type_hint: state.skills.agent_type.is_some(),
+                    ..Default::default()
+                },
+                guidance_signals,
             },
         );
         let mut system_messages = vec![sys_msg];

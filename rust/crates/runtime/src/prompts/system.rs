@@ -829,8 +829,8 @@ pub fn apply_overrides(sections: &mut [PromptSection], overrides: &PromptOverrid
 // ── System Prompt Tracing ─────────────────────────────────────────────────────
 
 use crate::turn::context_assembly_trace::{
-    MemoryInjection, PromptContextSignals, PromptGuidanceSignals, SkillInjection,
-    SystemPromptBreakdown,
+    MemoryInjection, PromptContextSignals, PromptGuidanceSignals, PromptTraceSignals,
+    SkillInjection, SystemPromptBreakdown,
 };
 
 /// Build a trace breakdown from prompt sections.
@@ -844,19 +844,19 @@ pub fn build_system_prompt_trace(
     skills_injected: Vec<SkillInjection>,
     repository_memories: Vec<MemoryInjection>,
 ) -> SystemPromptBreakdown {
-    build_system_prompt_trace_with_context_signals(
+    build_system_prompt_trace_with_signals(
         sections,
         skills_injected,
         repository_memories,
-        PromptContextSignals::default(),
+        PromptTraceSignals::default(),
     )
 }
 
-pub fn build_system_prompt_trace_with_context_signals(
+pub fn build_system_prompt_trace_with_signals(
     sections: &[PromptSection],
     skills_injected: Vec<SkillInjection>,
     repository_memories: Vec<MemoryInjection>,
-    extra_context_signals: PromptContextSignals,
+    extra_signals: PromptTraceSignals,
 ) -> SystemPromptBreakdown {
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
@@ -950,16 +950,20 @@ pub fn build_system_prompt_trace_with_context_signals(
     let memory_tokens: u32 = repository_memories.iter().map(|m| m.tokens).sum();
     total_tokens += memory_tokens;
 
-    context_signals.active_output_skills |= extra_context_signals.active_output_skills;
-    context_signals.learned_runtime_context |= extra_context_signals.learned_runtime_context;
-    context_signals.memory_signal_detected |= extra_context_signals.memory_signal_detected;
-    context_signals.system_prompt_override |= extra_context_signals.system_prompt_override;
-    context_signals.effort_hint |= extra_context_signals.effort_hint;
-    context_signals.agent_type_hint |= extra_context_signals.agent_type_hint;
-    context_signals.self_awareness |= extra_context_signals.self_awareness;
-    context_signals.implicit_feedback |= extra_context_signals.implicit_feedback;
-    context_signals.learned_feedback_rules |= extra_context_signals.learned_feedback_rules;
-    context_signals.session_anchor |= extra_context_signals.session_anchor;
+    context_signals.active_output_skills |= extra_signals.context_signals.active_output_skills;
+    context_signals.learned_runtime_context |=
+        extra_signals.context_signals.learned_runtime_context;
+    context_signals.memory_signal_detected |= extra_signals.context_signals.memory_signal_detected;
+    context_signals.system_prompt_override |= extra_signals.context_signals.system_prompt_override;
+    context_signals.effort_hint |= extra_signals.context_signals.effort_hint;
+    context_signals.agent_type_hint |= extra_signals.context_signals.agent_type_hint;
+    context_signals.self_awareness |= extra_signals.context_signals.self_awareness;
+    context_signals.implicit_feedback |= extra_signals.context_signals.implicit_feedback;
+    context_signals.learned_feedback_rules |= extra_signals.context_signals.learned_feedback_rules;
+    context_signals.session_anchor |= extra_signals.context_signals.session_anchor;
+    guidance_signals.round_budget_warning |= extra_signals.guidance_signals.round_budget_warning;
+    guidance_signals.synthesize_or_batch |= extra_signals.guidance_signals.synthesize_or_batch;
+    guidance_signals.parallel_feedback |= extra_signals.guidance_signals.parallel_feedback;
 
     SystemPromptBreakdown {
         base_persona_tokens,
@@ -1242,12 +1246,7 @@ pub fn tool_round_guidance_with(
     warning: u32,
     limit: u32,
 ) -> String {
-    format!(
-        "{}{}{}",
-        round_budget_directive_with(round_index, warning, limit),
-        synthesize_or_batch_directive(messages, round_index),
-        parallel_execution_feedback(messages)
-    )
+    tool_round_guidance_trace_with(messages, round_index, warning, limit).0
 }
 
 pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> String {
@@ -1256,6 +1255,42 @@ pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> 
         round_index,
         ROUND_BUDGET_THRESHOLD,
         ROUND_BUDGET_HARD_LIMIT,
+    )
+}
+
+pub fn tool_round_guidance_trace_with(
+    messages: &[serde_json::Value],
+    round_index: u32,
+    warning: u32,
+    limit: u32,
+) -> (String, PromptGuidanceSignals) {
+    let round_budget_warning = round_index >= warning;
+    let synthesize_or_batch = round_index >= ROUND_BUDGET_THRESHOLD
+        && messages
+            .iter()
+            .rev()
+            .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .count()
+            > 0;
+    let parallel_feedback = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count()
+        > 1;
+
+    (
+        format!(
+            "{}{}{}",
+            round_budget_directive_with(round_index, warning, limit),
+            synthesize_or_batch_directive(messages, round_index),
+            parallel_execution_feedback(messages)
+        ),
+        PromptGuidanceSignals {
+            round_budget_warning,
+            synthesize_or_batch,
+            parallel_feedback,
+        },
     )
 }
 
@@ -2714,6 +2749,28 @@ mod tests {
     }
 
     #[test]
+    fn tool_round_guidance_trace_with_returns_matching_signals() {
+        let messages = vec![
+            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+            serde_json::json!({"role": "tool", "content": "README.md"}),
+        ];
+
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &messages,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+
+        assert!(guidance.contains("Round Budget Warning"));
+        assert!(guidance.contains("Synthesize Or Batch Now"));
+        assert!(guidance.contains("2 tools executed in parallel"));
+        assert!(signals.round_budget_warning);
+        assert!(signals.synthesize_or_batch);
+        assert!(signals.parallel_feedback);
+    }
+
+    #[test]
     fn build_system_prompt_trace_records_dynamic_context_signals() {
         let sections = vec![PromptSection {
             text: "\n\n## Active Output Skills\nconcise\n\
@@ -2743,20 +2800,27 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_trace_applies_explicit_context_signal_overrides() {
-        let breakdown = build_system_prompt_trace_with_context_signals(
+    fn build_system_prompt_trace_applies_explicit_signal_overrides() {
+        let breakdown = build_system_prompt_trace_with_signals(
             &[PromptSection {
                 text: "cwd: /tmp".to_string(),
                 scope: CacheScope::None,
             }],
             vec![],
             vec![],
-            PromptContextSignals {
-                system_prompt_override: true,
-                ..Default::default()
+            PromptTraceSignals {
+                context_signals: PromptContextSignals {
+                    system_prompt_override: true,
+                    ..Default::default()
+                },
+                guidance_signals: PromptGuidanceSignals {
+                    round_budget_warning: true,
+                    ..Default::default()
+                },
             },
         );
 
         assert!(breakdown.context_signals.system_prompt_override);
+        assert!(breakdown.guidance_signals.round_budget_warning);
     }
 }

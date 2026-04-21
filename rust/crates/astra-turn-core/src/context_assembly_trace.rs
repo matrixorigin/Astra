@@ -122,6 +122,14 @@ pub struct PromptContextSignals {
     pub session_anchor: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptTraceSignals {
+    #[serde(default)]
+    pub context_signals: PromptContextSignals,
+    #[serde(default)]
+    pub guidance_signals: PromptGuidanceSignals,
+}
+
 /// A skill that was injected into the system prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInjection {

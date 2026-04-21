@@ -892,7 +892,7 @@ impl InProcessChatTurnBridge {
 
             // ── Round budget directive: encourage synthesis after several rounds ──
             let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
-            let tool_round_guidance = prompts::tool_round_guidance_with(
+            let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
                 &messages,
                 round_index,
                 tool_cfg.effective_round_budget_warning(),
@@ -1178,19 +1178,22 @@ impl InProcessChatTurnBridge {
                                 content_preview: line.chars().take(100).collect(),
                             }
                         }).collect();
-                    let breakdown = prompts::build_system_prompt_trace_with_context_signals(
+                    let breakdown = prompts::build_system_prompt_trace_with_signals(
                         &prompt_sections,
                         skill_injections,
                         memory_injections,
-                        crate::turn::context_assembly_trace::PromptContextSignals {
-                            active_output_skills: !active_skill_names.is_empty(),
-                            learned_runtime_context: !learned_context_text.is_empty(),
-                            memory_signal_detected: !memory_signal_hint.is_empty(),
-                            self_awareness: !self_awareness_hint.is_empty(),
-                            implicit_feedback: !implicit_feedback_hint.is_empty(),
-                            learned_feedback_rules: !feedback_rules_hint.is_empty(),
-                            session_anchor: !session_anchor.is_empty(),
-                            ..Default::default()
+                        crate::turn::context_assembly_trace::PromptTraceSignals {
+                            context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                                active_output_skills: !active_skill_names.is_empty(),
+                                learned_runtime_context: !learned_context_text.is_empty(),
+                                memory_signal_detected: !memory_signal_hint.is_empty(),
+                                self_awareness: !self_awareness_hint.is_empty(),
+                                implicit_feedback: !implicit_feedback_hint.is_empty(),
+                                learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                                session_anchor: !session_anchor.is_empty(),
+                                ..Default::default()
+                            },
+                            guidance_signals,
                         },
                     );
                     yield render_sse(&json!({
@@ -2405,18 +2408,21 @@ mod tests {
             Some("implementation"),
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
-        let breakdown = prompts::build_system_prompt_trace_with_context_signals(
+        let breakdown = prompts::build_system_prompt_trace_with_signals(
             &prompt_sections,
             vec![],
             vec![],
-            crate::turn::context_assembly_trace::PromptContextSignals {
-                active_output_skills: !active_skill_names.is_empty(),
-                learned_runtime_context: !learned_context_text.is_empty(),
-                memory_signal_detected: !memory_signal_hint.is_empty(),
-                self_awareness: !self_awareness_hint.is_empty(),
-                implicit_feedback: !implicit_feedback_hint.is_empty(),
-                learned_feedback_rules: !feedback_rules_hint.is_empty(),
-                session_anchor: !session_anchor.is_empty(),
+            crate::turn::context_assembly_trace::PromptTraceSignals {
+                context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                    active_output_skills: !active_skill_names.is_empty(),
+                    learned_runtime_context: !learned_context_text.is_empty(),
+                    memory_signal_detected: !memory_signal_hint.is_empty(),
+                    self_awareness: !self_awareness_hint.is_empty(),
+                    implicit_feedback: !implicit_feedback_hint.is_empty(),
+                    learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                    session_anchor: !session_anchor.is_empty(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
