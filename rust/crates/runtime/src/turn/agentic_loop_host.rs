@@ -6476,6 +6476,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
         state.evolution_service = Some(evo.clone());
 
+        // Attach an observability session so the auto-reflection bridge can
+        // publish last_strategy_application → surfaced by SelfModel rendering.
+        let obs_session = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::observability_integration::ObservabilitySession::new_simple("sess-e2e"),
+        ));
+        state.telemetry.observability_session = Some(obs_session.clone());
+
         // Repeated failures on the same tool → FailureCategory::ToolFailures.
         let fail_rec = |err: &str| ToolCallRecord {
             name: "flaky_http".into(),
@@ -6536,6 +6543,46 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(
             state.widen_selection_pending,
             "expected widen_selection_pending = true after bridge applied strategy"
+        );
+        // Passive self-awareness loop: the bridge publishes StrategyApplication
+        // onto the observability session, and SelfModel rendering surfaces it
+        // to the agent on the next turn.
+        let obs_guard = obs_session.read().expect("obs session read");
+        let applied = obs_guard
+            .last_strategy_application
+            .as_ref()
+            .expect("expected last_strategy_application published on obs session");
+        assert!(applied.widen_requested, "widen should be recorded");
+        assert!(
+            applied.newly_blocked.iter().any(|t| t == "flaky_http"),
+            "flaky_http should be recorded as newly_blocked"
+        );
+        let self_model = crate::self_model::SelfModel::snapshot_with_strategy(
+            &["bash", "read_file"],
+            &[],
+            &[],
+            &[],
+            None,
+            (state.max_turns - state.remaining_turns) as u32,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &obs_guard.config,
+            Some(applied),
+        );
+        let rendered = self_model.to_system_prompt_section();
+        assert!(
+            rendered.contains("widened for next turn"),
+            "expected widen signal in self-awareness section, got: {rendered}"
         );
     }
 

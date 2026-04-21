@@ -123,6 +123,15 @@ pub struct ObservabilitySession {
     /// `Exploration` scenario, which in turn inflates the tool budget for
     /// the *next* turn.
     pub previous_turn_user_cancelled: bool,
+
+    /// Most recent [`StrategyApplication`] summary produced by the pipeline
+    /// reflect bridge after `apply_strategy_delta`. Surfaced into the per-turn
+    /// [`SelfModel`] rendering so the agent passively "knows" what the
+    /// auto-reflection system just adjusted (blocked/boosted/widen).
+    ///
+    /// Reset lazily — it lingers until the next `apply_strategy_delta` call.
+    pub last_strategy_application:
+        Option<crate::turn::agentic_stage_bridge::StrategyApplication>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +243,7 @@ impl ObservabilitySession {
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
             previous_turn_user_cancelled: false,
+            last_strategy_application: None,
         }
     }
 
@@ -267,6 +277,7 @@ impl ObservabilitySession {
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
             previous_turn_user_cancelled: false,
+            last_strategy_application: None,
         }
     }
 

@@ -60,6 +60,16 @@ pub struct CapabilityView {
     pub pinned_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
+    /// Tools currently boosted by the last auto-reflection strategy delta.
+    /// These are subtracted from any per-turn restricted set so the LLM sees
+    /// them even when general deprioritization would hide them.
+    #[serde(default)]
+    pub boosted_tools: Vec<String>,
+    /// Whether the next tool-visibility assembly will consume a one-shot
+    /// `widen_selection` request from the pipeline (skipping the
+    /// deprioritized→restricted merge).
+    #[serde(default)]
+    pub widen_selection_pending: bool,
 }
 
 /// Per-tool health summary.
@@ -193,6 +203,56 @@ impl SelfModel {
         recent_signals: &[FeedbackSignal],
         _config: &RuntimeConfig,
     ) -> Self {
+        Self::snapshot_with_strategy(
+            tool_names,
+            pinned_tools,
+            manual_deprioritized_tools,
+            skills,
+            tool_health,
+            turn_number,
+            latest_budget,
+            scenario,
+            active_experiment,
+            session_elapsed_secs,
+            correction_count,
+            compression_count,
+            session_goal,
+            plan_goal,
+            tracked_goal,
+            goal_progress,
+            milestones,
+            recent_signals,
+            _config,
+            None,
+        )
+    }
+
+    /// Same as [`Self::snapshot`] but also incorporates the most recent
+    /// pipeline [`StrategyApplication`] so the rendered self-awareness section
+    /// surfaces `boosted_tools` / `widen_selection_pending` to the agent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_with_strategy(
+        tool_names: &[&str],
+        pinned_tools: &[String],
+        manual_deprioritized_tools: &[String],
+        skills: &[String],
+        tool_health: Option<&ToolHealthTracker>,
+        turn_number: u32,
+        latest_budget: Option<&TokenBudgetTrace>,
+        scenario: Option<&Scenario>,
+        active_experiment: Option<&str>,
+        session_elapsed_secs: u64,
+        correction_count: usize,
+        compression_count: usize,
+        session_goal: Option<&str>,
+        plan_goal: Option<&str>,
+        tracked_goal: Option<&str>,
+        goal_progress: Option<&GoalProgress>,
+        milestones: Option<&[Milestone]>,
+        recent_signals: &[FeedbackSignal],
+        _config: &RuntimeConfig,
+        last_strategy: Option<&crate::turn::agentic_stage_bridge::StrategyApplication>,
+    ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
         let mut deprioritized = Vec::new();
@@ -224,6 +284,21 @@ impl SelfModel {
         }
         deprioritized.sort();
 
+        let (boosted_tools, widen_selection_pending) = match last_strategy {
+            Some(app) => {
+                let mut boosted: Vec<String> = app
+                    .newly_boosted
+                    .iter()
+                    .chain(app.already_boosted.iter())
+                    .cloned()
+                    .collect();
+                boosted.sort();
+                boosted.dedup();
+                (boosted, app.widen_requested)
+            }
+            None => (Vec::new(), false),
+        };
+
         let capabilities = CapabilityView {
             total_tools: tool_names.len(),
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
@@ -231,6 +306,8 @@ impl SelfModel {
             deprioritized_tools: deprioritized,
             pinned_tools: pinned_tools.to_vec(),
             skills: skills.to_vec(),
+            boosted_tools,
+            widen_selection_pending,
         };
 
         // ── Execution state ──
@@ -404,6 +481,20 @@ impl SelfModel {
                 s,
                 "Deprioritized tools: {} (repeated failures — try alternatives)",
                 self.capabilities.deprioritized_tools.join(", ")
+            );
+        }
+
+        // ── Strategy signals from last auto-reflection ──
+        if !self.capabilities.boosted_tools.is_empty() {
+            let _ = writeln!(
+                s,
+                "Boosted tools: {} (auto-reflection added these — prefer when the task fits)",
+                self.capabilities.boosted_tools.join(", ")
+            );
+        }
+        if self.capabilities.widen_selection_pending {
+            s.push_str(
+                "Tool selection: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
             );
         }
 
@@ -973,5 +1064,84 @@ mod tests {
         assert!((c.config_drift_ceiling - 0.30).abs() < f64::EPSILON);
         assert_eq!(c.min_tool_pool_size, 5);
         assert!((c.token_reserve_fraction - 0.20).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_with_strategy_renders_boosted_and_widen() {
+        let config = RuntimeConfig::default();
+        let app = crate::turn::agentic_stage_bridge::StrategyApplication {
+            newly_blocked: vec![],
+            already_blocked: vec![],
+            widen_requested: true,
+            newly_boosted: vec!["read_file".into(), "grep".into()],
+            already_boosted: vec!["bash".into()],
+        };
+        let model = SelfModel::snapshot_with_strategy(
+            &["bash", "read_file", "grep"],
+            &[],
+            &[],
+            &[],
+            None,
+            3,
+            None,
+            None,
+            None,
+            10,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+            Some(&app),
+        );
+        assert_eq!(
+            model.capabilities.boosted_tools,
+            vec!["bash", "grep", "read_file"]
+        );
+        assert!(model.capabilities.widen_selection_pending);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Boosted tools: bash, grep, read_file"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("widened for next turn"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn snapshot_without_strategy_omits_boost_and_widen_lines() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            1,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+        assert!(model.capabilities.boosted_tools.is_empty());
+        assert!(!model.capabilities.widen_selection_pending);
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
+        assert!(!rendered.contains("widened for next turn"), "got: {rendered}");
     }
 }

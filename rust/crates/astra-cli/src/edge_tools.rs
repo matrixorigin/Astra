@@ -1531,7 +1531,7 @@ impl ToolExecutor {
             .map(|gt| gt.milestones().to_vec());
         let milestone_slice = milestones.as_deref();
 
-        Some(astra_runtime::self_model::SelfModel::snapshot(
+        Some(astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
             &pinned_tools,
             &deprioritized_tools,
@@ -1551,6 +1551,7 @@ impl ToolExecutor {
             milestone_slice,
             &[], // recent signals — accessible via ObservabilityHub, not session
             &session.config,
+            session.last_strategy_application.as_ref(),
         ))
     }
 }

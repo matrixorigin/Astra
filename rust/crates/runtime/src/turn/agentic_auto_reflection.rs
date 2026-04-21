@@ -558,6 +558,16 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         // them. Report the applied summary via the headless log channel.
         let applied =
             crate::turn::agentic_stage_bridge::apply_strategy_delta(state, &diag.strategy);
+        // Publish the applied strategy summary onto the observability session
+        // so the SelfModel rendering (edge_tools → edge_profile.self_awareness_text)
+        // can surface it back to the agent on the next turn. This closes the
+        // passive-self-awareness loop for P2.1 boost/widen signals.
+        if !applied.is_noop()
+            && let Some(obs) = state.telemetry.observability_session.as_ref()
+            && let Ok(mut guard) = obs.write()
+        {
+            guard.last_strategy_application = Some(applied.clone());
+        }
         if !applied.is_noop() {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
