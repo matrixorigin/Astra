@@ -43,14 +43,13 @@ pub async fn run_context_decision_chain_db() {
         .as_str()
         .expect("context_capture_id");
 
-    let snap = sqlx::query(
-        "SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?",
-    )
-    .bind(capture_id)
-    .fetch_optional(&ctx.pool)
-    .await
-    .expect("ctx_snapshots")
-    .expect("ctx_snapshots row");
+    let snap =
+        sqlx::query("SELECT session_id, event_id FROM ctx_snapshots WHERE context_capture_id = ?")
+            .bind(capture_id)
+            .fetch_optional(&ctx.pool)
+            .await
+            .expect("ctx_snapshots")
+            .expect("ctx_snapshots row");
     assert_eq!(snap.get::<String, _>("session_id"), session_id);
     assert_eq!(snap.get::<String, _>("event_id"), event_id);
 
@@ -84,18 +83,10 @@ pub async fn run_context_decision_chain_db() {
         dec_row.get::<String, _>("decision_type"),
         "e2e_matrix_ctx_chain_decision"
     );
-    assert_eq!(
-        dec_row.get::<String, _>("context_capture_id"),
-        capture_id
-    );
+    assert_eq!(dec_row.get::<String, _>("context_capture_id"), capture_id);
 
-    let (st_gctx, got_ctx) = get_json(
-        &ctx.app,
-        &format!("/context/{capture_id}"),
-        Some(auth),
-        &[],
-    )
-    .await;
+    let (st_gctx, got_ctx) =
+        get_json(&ctx.app, &format!("/context/{capture_id}"), Some(auth), &[]).await;
     assert_eq!(st_gctx, StatusCode::OK, "GET context: {got_ctx}");
 
     let (st_gdec, got_dec) = get_json(

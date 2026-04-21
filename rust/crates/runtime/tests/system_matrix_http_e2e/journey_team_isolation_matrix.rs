@@ -4,9 +4,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::harness::{
-    E2E_PASSWORD, bootstrap, delete_json, get_json, post_json,
-};
+use super::harness::{E2E_PASSWORD, bootstrap, delete_json, get_json, post_json};
 
 pub async fn run_team_cross_user_isolation() {
     let b = bootstrap().await;
@@ -69,25 +67,15 @@ pub async fn run_team_cross_user_isolation() {
     )
     .await;
     assert_eq!(st_login, StatusCode::OK, "login B: {login_j}");
-    let access_b = login_j["access_token"]
-        .as_str()
-        .expect("B access_token");
+    let access_b = login_j["access_token"].as_str().expect("B access_token");
     let auth_b = format!("Bearer {access_b}");
 
     let path_t = format!("/teams/{team_name}");
     let (st_g, _) = get_json(&ctx.app, &path_t, Some(&auth_b), &[]).await;
-    assert_eq!(
-        st_g,
-        StatusCode::NOT_FOUND,
-        "B must not see A team by name"
-    );
+    assert_eq!(st_g, StatusCode::NOT_FOUND, "B must not see A team by name");
 
     let (st_d, _) = delete_json(&ctx.app, &path_t, Some(&auth_b)).await;
-    assert_eq!(
-        st_d,
-        StatusCode::NOT_FOUND,
-        "B must not delete A team"
-    );
+    assert_eq!(st_d, StatusCode::NOT_FOUND, "B must not delete A team");
 
     let (st_list_b, list_b) = get_json(&ctx.app, "/teams", Some(&auth_b), &[]).await;
     assert_eq!(st_list_b, StatusCode::OK);

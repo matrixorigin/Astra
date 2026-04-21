@@ -77,16 +77,14 @@ pub async fn run_team_http_db_fidelity() {
 
     let coord_db: String = row.get("coordination");
     let coord_http = get_j["coordination"].clone();
-    let coord_parsed: Value =
-        serde_json::from_str(&coord_db).expect("coordination JSON from DB");
+    let coord_parsed: Value = serde_json::from_str(&coord_db).expect("coordination JSON from DB");
     assert_eq!(
         coord_parsed, coord_http,
         "coordination DB vs GET detail mismatch"
     );
 
     let members_db: String = row.get("members_json");
-    let members_parsed: Value =
-        serde_json::from_str(&members_db).expect("members_json from DB");
+    let members_parsed: Value = serde_json::from_str(&members_db).expect("members_json from DB");
     assert_eq!(
         members_parsed,
         get_j["members"].clone(),
@@ -121,7 +119,10 @@ pub async fn run_team_http_db_fidelity() {
             let bv_db: Value = serde_json::from_str(bs).expect("budget_json");
             assert_eq!(bv_db, *bv, "budget_json DB vs GET");
         }
-        _ => panic!("budget roundtrip missing: db={budget_db:?} http={:?}", get_j.get("budget")),
+        _ => panic!(
+            "budget roundtrip missing: db={budget_db:?} http={:?}",
+            get_j.get("budget")
+        ),
     }
 
     let mp_db: i64 = row
@@ -130,37 +131,35 @@ pub async fn run_team_http_db_fidelity() {
         .unwrap_or(0);
     assert_eq!(
         mp_db,
-        get_j["max_parallel"].as_i64().unwrap_or_else(|| {
-            get_j["max_parallel"]
-                .as_u64()
-                .expect("max_parallel") as i64
-        }),
+        get_j["max_parallel"]
+            .as_i64()
+            .unwrap_or_else(|| { get_j["max_parallel"].as_u64().expect("max_parallel") as i64 }),
         "max_parallel DB vs GET"
     );
 
     let (st_list, list_j) = get_json(&ctx.app, "/teams", Some(auth), &[]).await;
     assert_eq!(st_list, StatusCode::OK);
     let listed = list_j["teams"].as_array().expect("teams");
-    let sql_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM team_definitions WHERE user_id = ?",
-    )
-    .bind(&ctx.user_id)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("COUNT team_definitions");
+    let sql_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM team_definitions WHERE user_id = ?")
+            .bind(&ctx.user_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("COUNT team_definitions");
     assert_eq!(
         listed.len() as i64,
         sql_count,
         "GET /teams len should match SQL COUNT(*) for user"
     );
 
-    let path_exec_limited = format!(
-        "/teams/{team_name}/executions?limit=3",
-    );
+    let path_exec_limited = format!("/teams/{team_name}/executions?limit=3",);
     let (st_ex, ex_j) = get_json(&ctx.app, &path_exec_limited, Some(auth), &[]).await;
     assert_eq!(st_ex, StatusCode::OK, "GET executions limited: {ex_j}");
     assert!(
-        ex_j["executions"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        ex_j["executions"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
         "still no executions: {ex_j}"
     );
 
@@ -219,8 +218,12 @@ pub async fn run_team_http_db_fidelity() {
     );
     assert_eq!(snaps[0]["git_commit"].as_str(), Some("cafef00d"));
 
-    let (_, _) =
-        delete_json(&ctx.app, &format!("/teams/snapshots/{snapshot_id}"), Some(auth)).await;
+    let (_, _) = delete_json(
+        &ctx.app,
+        &format!("/teams/snapshots/{snapshot_id}"),
+        Some(auth),
+    )
+    .await;
     let (_, _) = delete_json(&ctx.app, &path_detail, Some(auth)).await;
 
     b.ctx.pool.close().await;

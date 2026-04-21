@@ -1,9 +1,7 @@
 //! `GET /admin/tokens` — 403 without `astra_admin`, then 200 JSON array after role grant.
 use axum::http::StatusCode;
 
-use super::harness::{
-    bootstrap, get_json, grant_astra_admin_role, revoke_astra_admin_role,
-};
+use super::harness::{bootstrap, get_json, grant_astra_admin_role, revoke_astra_admin_role};
 
 pub async fn run_admin_tokens_smoke() {
     let b = bootstrap().await;
@@ -15,8 +13,7 @@ pub async fn run_admin_tokens_smoke() {
 
     revoke_astra_admin_role(pool, user_id).await;
 
-    let (st_denied, denied_j) =
-        get_json(app, "/admin/tokens", Some(auth.as_str()), &[]).await;
+    let (st_denied, denied_j) = get_json(app, "/admin/tokens", Some(auth.as_str()), &[]).await;
     assert_eq!(
         st_denied,
         StatusCode::FORBIDDEN,

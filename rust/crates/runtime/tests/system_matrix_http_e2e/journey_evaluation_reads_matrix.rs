@@ -28,7 +28,11 @@ pub async fn run_evaluation_read_http_smoke() {
         }),
     )
     .await;
-    assert_eq!(st_ag, StatusCode::CREATED, "seed agent for eval reads: {ag_j}");
+    assert_eq!(
+        st_ag,
+        StatusCode::CREATED,
+        "seed agent for eval reads: {ag_j}"
+    );
     let agent_id = ag_j["agent_id"].as_str().expect("agent_id");
 
     let endpoints: &[&str] = &[
@@ -51,8 +55,7 @@ pub async fn run_evaluation_read_http_smoke() {
         );
     }
 
-    let trust_path =
-        format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
+    let trust_path = format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
     let (st_trust, trust_j) = get_json(&ctx.app, &trust_path, None, xuid).await;
     assert_eq!(st_trust, StatusCode::OK, "trust-report: {trust_j}");
 
@@ -60,8 +63,7 @@ pub async fn run_evaluation_read_http_smoke() {
     let (st_slo_h, slo_h_j) = get_json(&ctx.app, &slo_hist, None, xuid).await;
     assert_eq!(st_slo_h, StatusCode::OK, "slo history: {slo_h_j}");
 
-    let obs_path =
-        format!("/evaluation/observability/metrics?agent_id={agent_id}&days=7");
+    let obs_path = format!("/evaluation/observability/metrics?agent_id={agent_id}&days=7");
     let (st_obs, obs_j) = get_json(&ctx.app, &obs_path, None, xuid).await;
     assert_eq!(st_obs, StatusCode::OK, "observability: {obs_j}");
 

@@ -18,13 +18,7 @@ pub async fn run_team_http_negative_paths() {
     );
 
     let ghost = format!("no_such_team_{}", ctx.suffix);
-    let (st_404_get, _) = get_json(
-        &ctx.app,
-        &format!("/teams/{ghost}"),
-        Some(auth),
-        &[],
-    )
-    .await;
+    let (st_404_get, _) = get_json(&ctx.app, &format!("/teams/{ghost}"), Some(auth), &[]).await;
     assert_eq!(st_404_get, StatusCode::NOT_FOUND);
 
     let (st_404_del, _) = delete_json(&ctx.app, &format!("/teams/{ghost}"), Some(auth)).await;
@@ -149,7 +143,8 @@ pub async fn run_team_http_negative_paths() {
             }
         ]
     });
-    let (st_adv, adv_j) = post_json(&ctx.app, "/teams", Some(auth), adversarial_three_members).await;
+    let (st_adv, adv_j) =
+        post_json(&ctx.app, "/teams", Some(auth), adversarial_three_members).await;
     assert_eq!(
         st_adv,
         StatusCode::BAD_REQUEST,

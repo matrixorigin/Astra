@@ -53,7 +53,9 @@ pub async fn run_team_crud_db() {
     assert_eq!(st_list, StatusCode::OK, "GET /teams: {list_j}");
     let teams = list_j["teams"].as_array().expect("teams array");
     assert!(
-        teams.iter().any(|t| t["name"].as_str() == Some(team_name.as_str())),
+        teams
+            .iter()
+            .any(|t| t["name"].as_str() == Some(team_name.as_str())),
         "list should include our team: {list_j}"
     );
 
@@ -110,14 +112,13 @@ pub async fn run_team_crud_db() {
     assert_eq!(st_del, StatusCode::OK, "DELETE team: {del_j}");
     assert_eq!(del_j["deleted"].as_bool(), Some(true));
 
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM team_definitions WHERE user_id = ? AND name = ?",
-    )
-    .bind(&ctx.user_id)
-    .bind(&team_name)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("count after delete");
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM team_definitions WHERE user_id = ? AND name = ?")
+            .bind(&ctx.user_id)
+            .bind(&team_name)
+            .fetch_one(&ctx.pool)
+            .await
+            .expect("count after delete");
     assert_eq!(n, 0, "team_definitions row removed");
 
     b.ctx.pool.close().await;
