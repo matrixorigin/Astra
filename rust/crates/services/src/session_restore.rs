@@ -705,10 +705,8 @@ fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
                 }
                 latest_turn_index = Some(idx);
             }
-            crate::session_journal::JournalEventType::SessionStart => {
-                if summary.model.is_none() {
-                    summary.model = event.model.clone();
-                }
+            crate::session_journal::JournalEventType::SessionStart if summary.model.is_none() => {
+                summary.model = event.model.clone();
             }
             crate::session_journal::JournalEventType::SessionEnd => {
                 summary.last_status = "completed".to_string();

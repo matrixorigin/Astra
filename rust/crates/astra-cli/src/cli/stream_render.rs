@@ -2247,7 +2247,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
 
         let mut results = Vec::with_capacity(requests.len());
-        for (request, decision) in requests.iter().zip(decisions.into_iter()) {
+        for (request, decision) in requests.iter().zip(decisions) {
             let decision_str = match &decision {
                 astra_thin_client::ApprovalDecision::Allow
                 | astra_thin_client::ApprovalDecision::AllowSession => {
