@@ -144,6 +144,11 @@ pub struct OutcomeMemoryHint {
     pub tool_name: String,
     pub signature: String,
     pub success: bool,
+    /// Stable snake_case tag of the structured failure class when the
+    /// recorded outcome was a failure (e.g. `"timeout"`, `"permission_denied"`).
+    /// Always `None` for successes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
 }
 
 /// Current execution state.
@@ -346,6 +351,9 @@ impl SelfModel {
                     tool_name: hint.tool_name,
                     signature: hint.signature,
                     success: hint.success,
+                    failure_category: hint
+                        .failure_category
+                        .map(|c| astra_turn_core::tool_health::failure_category_tag(c).to_string()),
                 })
                 .collect();
         }
@@ -511,11 +519,14 @@ fn goal_tracking_status(effective_goal: Option<&str>, tracked_goal: Option<&str>
 }
 
 fn render_outcome_memory_hint(hint: &OutcomeMemoryHint) -> String {
-    format!(
-        "{} {}",
-        if hint.success { "ok" } else { "fail" },
-        truncate_str(&hint.signature, 56)
-    )
+    let status = if hint.success {
+        "ok".to_string()
+    } else if let Some(ref cat) = hint.failure_category {
+        format!("fail[{cat}]")
+    } else {
+        "fail".to_string()
+    };
+    format!("{} {}", status, truncate_str(&hint.signature, 56))
 }
 
 // ─── System Prompt Rendering ────────────────────────────────────────────────
@@ -1136,6 +1147,7 @@ mod tests {
                 latency_ms: 9,
                 result_hash: 11,
                 at_epoch: 10,
+                failure_category: None,
             },
         );
         health.record_outcome(
@@ -1145,6 +1157,9 @@ mod tests {
                 latency_ms: 12,
                 result_hash: 22,
                 at_epoch: 20,
+                failure_category: Some(
+                    astra_turn_core::action_compensation::FailureCategory::Timeout,
+                ),
             },
         );
 
@@ -1187,6 +1202,10 @@ mod tests {
         assert!(
             section.contains(r#"bash:{"command":"pwd"}"#),
             "got: {section}"
+        );
+        assert!(
+            section.contains("fail[timeout]"),
+            "failure category tag should be rendered alongside signature, got: {section}"
         );
     }
 

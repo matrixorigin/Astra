@@ -8,6 +8,7 @@
 //! ends. It complements the cross-session `ToolQualityTracker` which
 //! tracks long-term tool reliability.
 
+use crate::action_compensation::{FailureCategory, classify_execution_outcome};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -30,6 +31,11 @@ pub struct ToolOutcome {
     pub result_hash: u64,
     /// Unix epoch seconds when the outcome was recorded.
     pub at_epoch: u64,
+    /// Structured failure class when `success == false`; `None` otherwise.
+    /// Surfaced back into the agent's self-awareness prompt so identical
+    /// failures can be reasoned about by *kind* (timeout / perm / net / …)
+    /// rather than only by signature.
+    pub failure_category: Option<FailureCategory>,
 }
 
 /// Compact view of the latest known outcome for a canonical tool signature.
@@ -39,6 +45,7 @@ pub struct RecentOutcomeHint {
     pub signature: String,
     pub success: bool,
     pub at_epoch: u64,
+    pub failure_category: Option<FailureCategory>,
 }
 
 impl ToolOutcome {
@@ -47,8 +54,28 @@ impl ToolOutcome {
     /// `success` should be `false` iff the result was classified as an error
     /// by `tool_result_semantics::classify_result`. Callers typically know
     /// this already; exposing it explicitly keeps this helper pure.
+    ///
+    /// When `success == false`, the failure category is derived automatically
+    /// from the result text via [`classify_execution_outcome`]. Callers that
+    /// already have a category handy should prefer [`ToolOutcome::with_category`].
     #[must_use]
     pub fn new(success: bool, latency_ms: u64, result_str: &str) -> Self {
+        let failure_category = if success {
+            None
+        } else {
+            classify_execution_outcome(result_str, true, latency_ms, false).failure_category
+        };
+        Self::with_category(success, latency_ms, result_str, failure_category)
+    }
+
+    /// Build a `ToolOutcome` with an explicit, already-classified failure category.
+    #[must_use]
+    pub fn with_category(
+        success: bool,
+        latency_ms: u64,
+        result_str: &str,
+        failure_category: Option<FailureCategory>,
+    ) -> Self {
         let mut hasher = DefaultHasher::new();
         result_str.hash(&mut hasher);
         let result_hash = hasher.finish();
@@ -61,8 +88,48 @@ impl ToolOutcome {
             latency_ms,
             result_hash,
             at_epoch,
+            failure_category: if success { None } else { failure_category },
         }
     }
+}
+
+/// Stable snake_case tag for a [`FailureCategory`], suitable for prompt
+/// rendering and cross-process serialization.
+#[must_use]
+pub fn failure_category_tag(category: FailureCategory) -> &'static str {
+    match category {
+        FailureCategory::CompileError => "compile_error",
+        FailureCategory::TestFailure => "test_failure",
+        FailureCategory::PermissionDenied => "permission_denied",
+        FailureCategory::ResourceNotFound => "resource_not_found",
+        FailureCategory::NetworkError => "network_error",
+        FailureCategory::SyntaxError => "syntax_error",
+        FailureCategory::RuntimeError => "runtime_error",
+        FailureCategory::Timeout => "timeout",
+        FailureCategory::ResourceExhaustion => "resource_exhaustion",
+        FailureCategory::ValidationError => "validation_error",
+        FailureCategory::Unknown => "unknown",
+    }
+}
+
+/// Parse a snake_case tag back into a [`FailureCategory`]; `None` on
+/// unrecognized input.
+#[must_use]
+pub fn failure_category_from_tag(tag: &str) -> Option<FailureCategory> {
+    Some(match tag {
+        "compile_error" => FailureCategory::CompileError,
+        "test_failure" => FailureCategory::TestFailure,
+        "permission_denied" => FailureCategory::PermissionDenied,
+        "resource_not_found" => FailureCategory::ResourceNotFound,
+        "network_error" => FailureCategory::NetworkError,
+        "syntax_error" => FailureCategory::SyntaxError,
+        "runtime_error" => FailureCategory::RuntimeError,
+        "timeout" => FailureCategory::Timeout,
+        "resource_exhaustion" => FailureCategory::ResourceExhaustion,
+        "validation_error" => FailureCategory::ValidationError,
+        "unknown" => FailureCategory::Unknown,
+        _ => return None,
+    })
 }
 
 /// Maximum consecutive failures before a tool is deprioritized.
@@ -476,7 +543,7 @@ impl ToolHealthTracker {
                 let ring: VecDeque<_> = outcome_entry
                     .outcomes
                     .iter()
-                    .copied()
+                    .cloned()
                     .rev()
                     .take(OUTCOME_RING_CAPACITY)
                     .collect::<Vec<_>>()
@@ -487,6 +554,10 @@ impl ToolHealthTracker {
                         latency_ms: outcome.latency_ms,
                         result_hash: outcome.result_hash,
                         at_epoch: outcome.at_epoch,
+                        failure_category: outcome
+                            .failure_category
+                            .as_deref()
+                            .and_then(failure_category_from_tag),
                     })
                     .collect();
                 if !ring.is_empty() {
@@ -517,6 +588,9 @@ impl ToolHealthTracker {
                         latency_ms: outcome.latency_ms,
                         result_hash: outcome.result_hash,
                         at_epoch: outcome.at_epoch,
+                        failure_category: outcome
+                            .failure_category
+                            .map(|c| failure_category_tag(c).to_string()),
                     })
                     .collect(),
             })
@@ -738,6 +812,7 @@ impl ToolHealthTracker {
                     signature: signature.clone(),
                     success: outcome.success,
                     at_epoch: outcome.at_epoch,
+                    failure_category: outcome.failure_category,
                 })
             })
             .collect();
@@ -1329,12 +1404,14 @@ mod tests {
                         latency_ms: 12,
                         result_hash: 11,
                         at_epoch: 10,
+                        failure_category: None,
                     },
                     ToolOutcome {
                         success: true,
                         latency_ms: 8,
                         result_hash: 22,
                         at_epoch: 20,
+                        failure_category: None,
                     },
                 ],
             }],
@@ -1355,6 +1432,58 @@ mod tests {
     }
 
     // ─── Outcome cache (P3.2) ─────────────────────────────────────────────
+
+    #[test]
+    fn tool_outcome_new_auto_classifies_failure_category() {
+        let ok = ToolOutcome::new(true, 5, "whatever");
+        assert_eq!(ok.failure_category, None);
+
+        let timeout = ToolOutcome::new(false, 130_000, "Error: operation timed out after 120s");
+        assert_eq!(timeout.failure_category, Some(FailureCategory::Timeout));
+
+        let perm = ToolOutcome::new(false, 4, "Error: Permission denied (EACCES)");
+        assert_eq!(
+            perm.failure_category,
+            Some(FailureCategory::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn failure_category_tag_roundtrip_is_stable() {
+        for cat in [
+            FailureCategory::CompileError,
+            FailureCategory::TestFailure,
+            FailureCategory::PermissionDenied,
+            FailureCategory::ResourceNotFound,
+            FailureCategory::NetworkError,
+            FailureCategory::SyntaxError,
+            FailureCategory::RuntimeError,
+            FailureCategory::Timeout,
+            FailureCategory::ResourceExhaustion,
+            FailureCategory::ValidationError,
+            FailureCategory::Unknown,
+        ] {
+            let tag = failure_category_tag(cat);
+            assert_eq!(failure_category_from_tag(tag), Some(cat));
+        }
+        assert_eq!(failure_category_from_tag("bogus"), None);
+    }
+
+    #[test]
+    fn latest_outcomes_propagate_failure_category() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_outcome(
+            r#"bash:{"command":"curl https://x"}"#,
+            ToolOutcome::new(false, 3_000, "Error: connection refused by server"),
+        );
+        let hints = tracker.latest_outcomes(1);
+        assert_eq!(hints.len(), 1);
+        assert!(!hints[0].success);
+        assert_eq!(
+            hints[0].failure_category,
+            Some(FailureCategory::NetworkError)
+        );
+    }
 
     #[test]
     fn outcome_cache_records_and_recalls_most_recent() {
@@ -1409,6 +1538,7 @@ mod tests {
                 latency_ms: 1,
                 result_hash: 1,
                 at_epoch: 10,
+                failure_category: None,
             },
         );
         tracker.record_outcome(
@@ -1418,6 +1548,7 @@ mod tests {
                 latency_ms: 2,
                 result_hash: 2,
                 at_epoch: 20,
+                failure_category: None,
             },
         );
 
@@ -1443,6 +1574,7 @@ mod tests {
                 latency_ms: 1,
                 result_hash: 1,
                 at_epoch: now,
+                failure_category: None,
             },
         );
         tracker.record_outcome(
@@ -1452,6 +1584,7 @@ mod tests {
                 latency_ms: 1,
                 result_hash: 2,
                 at_epoch: now,
+                failure_category: None,
             },
         );
         tracker.record_outcome(
@@ -1461,6 +1594,7 @@ mod tests {
                 latency_ms: 2,
                 result_hash: 3,
                 at_epoch: now,
+                failure_category: None,
             },
         );
         tracker.record_outcome(
@@ -1470,6 +1604,7 @@ mod tests {
                 latency_ms: 2,
                 result_hash: 4,
                 at_epoch: now,
+                failure_category: None,
             },
         );
 
@@ -1491,6 +1626,7 @@ mod tests {
                 latency_ms: 1,
                 result_hash: 1,
                 at_epoch: 10, // far in the past
+                failure_category: None,
             },
         );
         let bias = tracker.outcome_bias_by_tool(3600);

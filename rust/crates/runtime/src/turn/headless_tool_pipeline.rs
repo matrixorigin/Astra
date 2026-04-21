@@ -1183,6 +1183,7 @@ mod tests {
                 latency_ms: 10,
                 result_hash: 1,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
         harness.turn_guard.health.record_outcome(
@@ -1192,6 +1193,7 @@ mod tests {
                 latency_ms: 12,
                 result_hash: 2,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
 
@@ -1229,6 +1231,7 @@ mod tests {
                 latency_ms: 10,
                 result_hash: 1,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
         harness.turn_guard.health.record_outcome(
@@ -1238,6 +1241,7 @@ mod tests {
                 latency_ms: 8,
                 result_hash: 2,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
 
@@ -1270,6 +1274,7 @@ mod tests {
                 latency_ms: 10,
                 result_hash: 1,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
         session_one_guard.health.record_outcome(
@@ -1279,6 +1284,7 @@ mod tests {
                 latency_ms: 12,
                 result_hash: 2,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
 
@@ -1399,6 +1405,7 @@ mod tests {
                 latency_ms: 10,
                 result_hash: 1,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
         prior_guard.health.record_outcome(
@@ -1408,6 +1415,7 @@ mod tests {
                 latency_ms: 11,
                 result_hash: 2,
                 at_epoch: now_epoch,
+                failure_category: None,
             },
         );
         let restored =
