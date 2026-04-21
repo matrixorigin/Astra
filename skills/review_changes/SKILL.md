@@ -65,8 +65,17 @@ No changes? Check `git_status`, try `staged: true`. Still nothing? Ask user.
 - **Do not call `git_show` on the same commit more than once** unless you truly need a different object than the full diff you already fetched.
 - When searching changed symbols, prefer one decisive `grep` over a scoped `grep` followed by the same repo-wide `grep`.
 - Once the diff already identified the file to inspect, prefer `read_file` for local context instead of re-reading the whole commit diff.
+- Once the skill is loaded, **do not invoke `skill(review-changes)` again** in the same review. Continue with the evidence you already have.
 
-### 1.3 Strategy Router
+### 1.3 Hard review budgets
+
+- Treat the diff as the primary evidence source. **Do not start a file-by-file crawl** unless the diff leaves a concrete unresolved risk.
+- Default context budget: **at most 3 `read_file` calls** for the whole review.
+- You may extend to **at most 5 `read_file` calls** only when a specific unresolved risk is still plausible and the extra file is directly connected to that risk.
+- Before every `read_file`, be able to name the exact question it will answer. If you cannot, stop exploring and report with qualified confidence.
+- If the diff plus current context already supports a conclusion, stop and write the review. More reading without a new question is wasted latency.
+
+### 1.4 Strategy Router
 
 After reading the diff, route based on **signals** in the diff:
 
@@ -122,6 +131,13 @@ Internally decide your strategy; do NOT output it yet. Include it as a brief lin
 ### 3.0 Context (only if diff is ambiguous)
 
 You already read the diff in Phase 1 — don't re-read it. Only `read_file` surrounding context when the diff alone is unclear. For files >200 lines, `outline: true` first.
+
+Prioritize the first `read_file` calls by risk:
+1. changed public API / trait / config boundaries
+2. unsafe / security-sensitive / process-spawning logic
+3. tests covering the changed behavior
+
+Do not spend the initial budget on low-risk helper files before checking these.
 
 ### 3.1 Bug Detection
 

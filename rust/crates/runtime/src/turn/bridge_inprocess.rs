@@ -284,11 +284,26 @@ fn latest_assistant_message_text(messages: &[Value]) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(test)]
 fn turn_count_from_messages(messages: &[Value]) -> i64 {
     messages
         .iter()
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
         .count() as i64
+}
+
+async fn infer_bridge_session_turn(shared_pool: Option<&SharedPool>, session_id: &str) -> u32 {
+    let Some(shared_pool) = shared_pool else {
+        return 1;
+    };
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+    )
+    .bind(session_id)
+    .fetch_one(shared_pool.get())
+    .await
+    .unwrap_or(0);
+    (count.max(0) as u32).saturating_add(1)
 }
 
 fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
@@ -448,6 +463,10 @@ impl InProcessChatTurnBridge {
         // Extract trusted context injected by dispatch_chat_turn_bridge
         let user_id = header_str(headers, "x-mo-user-id").unwrap_or_default();
         let session_id = header_str(headers, "x-mo-session-id").unwrap_or_default();
+        let header_session_turn = header_str(headers, "x-mo-session-turn")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|turn| *turn > 0);
+        let root_runtime_owns_turn_journal = header_session_turn.is_some();
         let turn_chain_id =
             header_str(headers, "x-mo-turn-chain-id").unwrap_or_else(|| Uuid::now_v7().to_string());
         let user_query_event_id = header_str(headers, "x-mo-user-query-event-id")
@@ -503,6 +522,13 @@ impl InProcessChatTurnBridge {
         let matrixone = self.matrixone.clone();
         let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
+        let trace_turn = if let Some(turn) = header_session_turn {
+            turn
+        } else if !session_id.is_empty() {
+            infer_bridge_session_turn(shared_pool.as_ref(), &session_id).await
+        } else {
+            1
+        };
         let turn_learning_writer = self.turn_learning_writer.clone();
         let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
@@ -532,11 +558,12 @@ impl InProcessChatTurnBridge {
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             let run_id = uuid::Uuid::new_v4().to_string();
-            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
-            let mut turn_event_buffer = TurnEventBuffer::begin_turn(
-                (!session_id.is_empty()).then_some(session_id.as_str()),
-                trace_turn,
-            );
+            let mut turn_event_buffer = (!root_runtime_owns_turn_journal).then(|| {
+                TurnEventBuffer::begin_turn(
+                    (!session_id.is_empty()).then_some(session_id.as_str()),
+                    trace_turn,
+                )
+            });
             // Emit session_info first
             yield render_sse(&inprocess_session_info_event(&session_id, &run_id));
 
@@ -1630,33 +1657,38 @@ impl InProcessChatTurnBridge {
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
                 }
-                turn_event_buffer.record_llm_round(LlmRoundRecord {
-                    ttft_ms: None,
-                    duration_ms: round_ms as u64,
-                    prompt_tokens: usage
-                        .get("prompt")
-                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                        .unwrap_or(0),
-                    completion_tokens: usage
-                        .get("completion")
-                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                        .unwrap_or(0),
-                    cache_read_tokens: usage
-                        .get("cache_read")
-                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
-                        .unwrap_or(0),
-                    tool_calls_returned: loop_tool_calls.len().min(u32::MAX as usize) as u32,
-                    tool_call_names: loop_tool_calls
-                        .iter()
-                        .filter_map(tool_call_name)
-                        .map(ToString::to_string)
-                        .collect(),
-                    finish_reason: Some(if loop_tool_calls.is_empty() {
-                        "stop".to_string()
-                    } else {
-                        "tool_calls".to_string()
-                    }),
-                });
+                if let Some(buf) = turn_event_buffer.as_mut() {
+                    buf.record_llm_round(LlmRoundRecord {
+                        ttft_ms: None,
+                        duration_ms: round_ms as u64,
+                        prompt_tokens: usage
+                            .get("prompt")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                            .unwrap_or(0),
+                        completion_tokens: usage
+                            .get("completion")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                            .unwrap_or(0),
+                        cache_read_tokens: usage
+                            .get("cache_read")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                            .unwrap_or(0),
+                        tool_calls_returned: loop_tool_calls.len().min(u32::MAX as usize) as u32,
+                        tool_call_names: loop_tool_calls
+                            .iter()
+                            .filter_map(tool_call_name)
+                            .map(ToString::to_string)
+                            .collect(),
+                        finish_reason: Some(if loop_tool_calls.is_empty() {
+                            "stop".to_string()
+                        } else {
+                            "tool_calls".to_string()
+                        }),
+                        agentic_step: u32::try_from(round_ix).ok(),
+                        source: Some("bridge_inprocess".to_string()),
+                        run_id: Some(run_id.clone()),
+                    });
+                }
 
                 // ── Cache break detection ──
                 {
@@ -1896,7 +1928,9 @@ impl InProcessChatTurnBridge {
                 }
             });
 
-            if !turn_event_buffer.is_empty() && !session_id.is_empty() {
+            if !session_id.is_empty()
+                && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())
+            {
                 let journal_sid = session_id.clone();
                 tokio::task::spawn_blocking(move || {
                     let writer = match JournalWriter::new(&journal_sid) {
@@ -1935,7 +1969,7 @@ impl InProcessChatTurnBridge {
                     Some(&resolved_model),
                     _agent_id.as_deref(),
                     Some(&user_query_event_id),
-                    turn_count_from_messages(&messages),
+                    trace_turn as i64,
                     None, // session_start
                     false, // run_hook_db_writes = false → triggers persist
                     false, // run_observer = false → triggers observer

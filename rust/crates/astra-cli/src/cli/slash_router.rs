@@ -1,6 +1,7 @@
 //! Slash command routing for the REPL.
 
 use super::*;
+use crate::command_usage;
 
 /// GET `/models` returns `ModelListItemResponse` with field `is_active` (snake_case).
 /// Accept legacy `active` if present; if neither is a bool, treat as active for unknown servers.
@@ -87,6 +88,13 @@ pub(super) async fn handle_slash_command(
 
     if cmd == "/" && arg.is_empty() && is_slash_picker_active() {
         return Ok(false);
+    }
+
+    if let Err(err) = command_usage::record_command_use(cmd) {
+        eprintln!(
+            "{}",
+            format!("  Warning: failed to update command discovery history: {err}").yellow()
+        );
     }
 
     match cmd {

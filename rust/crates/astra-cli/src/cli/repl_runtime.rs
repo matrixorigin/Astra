@@ -651,6 +651,7 @@ fn random_tips(logged_in: bool) -> [&'static str; 2] {
 
     const TIPS: &[&str] = &[
         "Type / to browse all commands",
+        "Ctrl+K opens the command picker on an empty line",
         "Ctrl+R to search command history",
         "Alt+Enter for multi-line input",
         "/explain toggles reasoning visibility",
@@ -803,7 +804,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 
     eprintln!(
         "{}",
-        "  Ctrl-C to cancel │ /help for commands │ /quit to exit".dim()
+        "  Ctrl-C to cancel │ Ctrl+K command picker │ /help for commands │ /quit to exit".dim()
     );
     eprintln!();
 }

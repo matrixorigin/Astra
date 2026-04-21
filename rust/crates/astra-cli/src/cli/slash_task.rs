@@ -274,6 +274,7 @@ pub(super) async fn handle_task_command(
                     api: &api_clone,
                     token: &token_str,
                     message: &prompt,
+                    prefetched_context_override: None,
                     session_id: bg_session_id.as_deref(),
                     model: bg_model.as_deref(),
                     explain: ExplainMode::Off,

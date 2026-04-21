@@ -22,7 +22,7 @@ use super::agentic_loop_host::{
     MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
     record_edge_tool_observability,
 };
-use super::agentic_loop_lifecycle::TurnIterationPrep;
+use super::agentic_loop_lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use super::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
     map_post_tool_policy_outcome,
@@ -916,6 +916,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
     }
 
+    let agentic_step = current_agentic_step(state);
+    let run_id = state.current_run_id.clone();
     if let Some(ref mut buf) = state.turn_event_buffer {
         let tool_names: Vec<String> = turn_result
             .accum
@@ -937,6 +939,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
             tool_call_names: tool_names,
             finish_reason: None,
+            agentic_step: Some(agentic_step),
+            source: Some("agentic_loop".into()),
+            run_id,
         });
     }
 
@@ -1132,6 +1137,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         &state.skills.quality_tracker,
                         &state.skills.pinned,
                         &state.skills.discovered,
+                        &state.skills.invoked,
                         &state.skills.search,
                     );
                 host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
@@ -1338,7 +1344,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     .map(|e| e.duration_ms)
                     .sum();
                 let timing = crate::observability_integration::TurnTiming {
-                    turn: turn_index as u32,
+                    turn: session_turn_number(state),
                     context_assembly_ms: ctx_asm_ms,
                     ttft_ms: turn_result.ttft_ms.unwrap_or(0),
                     llm_total_ms: total_ms
@@ -1394,7 +1400,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
 fn observe_gate_cancelled(
     state: &mut AgenticLoopState,
-    turn_index: usize,
+    _turn_index: usize,
     turn_start_time: std::time::Instant,
     turn_result: &super::agentic_loop_host::HostTurnResult,
 ) {
@@ -1404,7 +1410,7 @@ fn observe_gate_cancelled(
     ) {
         let total_ms = turn_start_time.elapsed().as_millis() as u64;
         let timing = crate::observability_integration::TurnTiming {
-            turn: turn_index as u32,
+            turn: session_turn_number(state),
             context_assembly_ms: 0,
             ttft_ms: turn_result.ttft_ms.unwrap_or(0),
             llm_total_ms: total_ms,
@@ -1424,6 +1430,11 @@ mod tests {
         JournalEvent, JournalEventType, JournalWriter, ToolCallRecord,
     };
     use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::observability_integration::ObservabilityHub;
+    use crate::turn::agentic_loop_host::tests::{make_state, text_result};
 
     fn summary_tool_record(
         ok: bool,
@@ -1444,6 +1455,30 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn observe_gate_cancelled_records_outer_session_turn() {
+        let mut state = make_state();
+        state.session_turn = 6;
+        state.max_turns = 20;
+        state.remaining_turns = 4;
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_hub = Some(Arc::new(hub));
+        state.telemetry.observability_session = Some(session.clone());
+        let turn_result = text_result("cancelled", 10, 3, Some(2));
+
+        observe_gate_cancelled(
+            &mut state,
+            16,
+            Instant::now() - Duration::from_millis(25),
+            &turn_result,
+        );
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.turn_timings.len(), 1);
+        assert_eq!(guard.turn_timings[0].turn, 6);
     }
 
     #[test]

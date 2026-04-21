@@ -472,6 +472,27 @@ pub fn merge_discovered_skills_into_visible(
     out
 }
 
+fn filter_already_invoked_skills(
+    skills: Vec<SkillToolInfo>,
+    invoked: &HashMap<String, InvokedSkill>,
+) -> Vec<SkillToolInfo> {
+    if invoked.is_empty() {
+        return skills;
+    }
+
+    let active: HashSet<String> = invoked.keys().map(|name| name.to_lowercase()).collect();
+    skills
+        .into_iter()
+        .filter(|skill| {
+            !active.contains(&skill.name.to_lowercase())
+                && !skill
+                    .aliases
+                    .iter()
+                    .any(|alias| active.contains(&alias.to_lowercase()))
+        })
+        .collect()
+}
+
 /// Visible skills + whether dynamic surfacing is active (open `skill_name` + `discover_skills`).
 pub fn visible_skills_for_host_turn(
     full: &[SkillToolInfo],
@@ -479,14 +500,17 @@ pub fn visible_skills_for_host_turn(
     quality_tracker: &crate::skills::quality::SkillQualityTracker,
     pinned: &HashSet<String>,
     discovered: &HashSet<String>,
+    invoked: &HashMap<String, InvokedSkill>,
     cfg: &SkillSearchSettings,
 ) -> (Vec<SkillToolInfo>, bool) {
     if cfg.use_full_catalog(full.len()) {
-        return (full.to_vec(), false);
+        let filtered = filter_already_invoked_skills(full.to_vec(), invoked);
+        return (filtered, false);
     }
     let base = select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned), cfg);
     let visible = merge_discovered_skills_into_visible(base, full, discovered);
-    (visible, true)
+    let filtered = filter_already_invoked_skills(visible, invoked);
+    (filtered, true)
 }
 
 /// Lowercased canonical names and aliases — used to filter `discover_skills` results.
@@ -2229,6 +2253,106 @@ mod tests {
                 .get("enum")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn visible_skills_omit_already_invoked_entries() {
+        let skills = vec![
+            SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                source: SkillSourceKind::Bundled,
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "analyze-session".into(),
+                description: "Analyze a recorded session".into(),
+                source: SkillSourceKind::Bundled,
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "test-writer".into(),
+                description: "Generate tests".into(),
+                source: SkillSourceKind::Local,
+                ..Default::default()
+            },
+        ];
+        let invoked = HashMap::from([(
+            "review-changes".to_string(),
+            InvokedSkill {
+                name: "review-changes".into(),
+                content: "# Skill: review-changes".into(),
+                invoked_at_turn: 1,
+            },
+        )]);
+
+        let (visible, _open_skill_name) = visible_skills_for_host_turn(
+            &skills,
+            "review local changes",
+            &crate::skills::quality::SkillQualityTracker::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &invoked,
+            &SkillSearchSettings::default(),
+        );
+
+        assert!(
+            !visible.iter().any(|skill| skill.name == "review-changes"),
+            "already-invoked skill should be omitted from the surfaced catalog"
+        );
+        assert!(
+            visible.iter().any(|skill| skill.name == "analyze-session")
+                || visible.iter().any(|skill| skill.name == "test-writer"),
+            "catalog should keep alternate skills visible after omission"
+        );
+    }
+
+    #[test]
+    fn visible_skills_do_not_resurface_when_all_are_already_invoked() {
+        let skills = vec![
+            SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                source: SkillSourceKind::Bundled,
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "analyze-session".into(),
+                description: "Analyze a recorded session".into(),
+                source: SkillSourceKind::Bundled,
+                ..Default::default()
+            },
+        ];
+        let invoked = HashMap::from([
+            (
+                "review-changes".to_string(),
+                InvokedSkill {
+                    name: "review-changes".into(),
+                    content: "# Skill: review-changes".into(),
+                    invoked_at_turn: 1,
+                },
+            ),
+            (
+                "analyze-session".to_string(),
+                InvokedSkill {
+                    name: "analyze-session".into(),
+                    content: "# Skill: analyze-session".into(),
+                    invoked_at_turn: 1,
+                },
+            ),
+        ]);
+
+        let (visible, _open_skill_name) = visible_skills_for_host_turn(
+            &skills,
+            "review local changes",
+            &crate::skills::quality::SkillQualityTracker::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &invoked,
+            &SkillSearchSettings::default(),
+        );
+
+        assert!(visible.is_empty(), "all invoked skills should stay hidden");
     }
 
     #[test]

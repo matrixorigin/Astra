@@ -280,83 +280,20 @@ fn parse_review_git_target(arg: &str) -> ReviewGitTarget<'_> {
     }
 }
 
-const REVIEW_PREFETCH_MAX: usize = 12_000;
-
-fn prefetch_review_git_stat(project_root: &std::path::Path, target: ReviewGitTarget<'_>) -> String {
-    let mut out = String::new();
-    match target {
-        ReviewGitTarget::Head => {
-            let header = run_git_stdout(
-                project_root,
-                &["show", "--no-patch", "--format=Commit %H%n%s", "HEAD"],
-            );
-            if !header.trim().is_empty() {
-                out.push_str(header.trim_end());
-                out.push('\n');
-            }
-            let stat = run_git_stdout(project_root, &["show", "--stat", "HEAD"]);
-            if !stat.trim().is_empty() {
-                out.push_str(stat.trim_end());
-                out.push('\n');
-            }
-        }
+async fn prefetch_review_context(
+    arg: &str,
+    project_root: &std::path::Path,
+) -> Option<crate::context_prefetch::PrefetchedContext> {
+    let target = match parse_review_git_target(arg) {
+        ReviewGitTarget::Head => crate::context_prefetch::CodeReviewPrefetchTarget::Head,
         ReviewGitTarget::WorkingTree => {
-            let staged = run_git_stdout(project_root, &["diff", "--cached", "--stat"]);
-            let unstaged = run_git_stdout(project_root, &["diff", "--stat"]);
-            if !staged.trim().is_empty() {
-                out.push_str("Staged:\n");
-                out.push_str(&staged);
-                if !staged.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            if !unstaged.trim().is_empty() {
-                out.push_str("Unstaged:\n");
-                out.push_str(&unstaged);
-                if !unstaged.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            if out.trim().is_empty() {
-                let untracked = run_git_lines(
-                    project_root,
-                    &["ls-files", "--others", "--exclude-standard"],
-                );
-                if !untracked.is_empty() {
-                    out.push_str("Untracked files (no line counts):\n");
-                    for u in untracked.iter().take(40) {
-                        out.push_str(u);
-                        out.push('\n');
-                    }
-                    if untracked.len() > 40 {
-                        out.push_str(&format!("... +{} more\n", untracked.len() - 40));
-                    }
-                }
-            }
+            crate::context_prefetch::CodeReviewPrefetchTarget::WorkingTree
         }
         ReviewGitTarget::Rev(rev) => {
-            let stat = run_git_stdout(project_root, &["show", "--stat", rev]);
-            if !stat.trim().is_empty() {
-                out.push_str(stat.trim_end());
-                out.push('\n');
-            }
+            crate::context_prefetch::CodeReviewPrefetchTarget::Rev(rev.to_string())
         }
-    }
-
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        return "(no diff stat available — repo may be clean or not a git checkout)\n".to_string();
-    }
-    let mut s = trimmed.to_string();
-    if s.len() > REVIEW_PREFETCH_MAX {
-        s.truncate(s.floor_char_boundary(REVIEW_PREFETCH_MAX));
-        s.push_str("\n[truncated]");
-    }
-    s
-}
-
-fn fence_prefetch_block(raw: &str) -> String {
-    raw.replace("```", "'''")
+    };
+    crate::context_prefetch::prefetch_context_for_code_review_target(target, project_root).await
 }
 
 fn parse_review_match(line: &str) -> Option<ReviewMatch<'_>> {
@@ -474,39 +411,36 @@ fn review_search(executor: &edge_tools::ToolExecutor, pattern: &str) -> String {
     }
 }
 
-fn build_review_prompt(arg: &str, project_root: &std::path::Path) -> String {
-    let git_target = parse_review_git_target(arg);
-    let target_line = match git_target {
+fn build_review_prompt(arg: &str) -> String {
+    let target_line = match parse_review_git_target(arg) {
         ReviewGitTarget::Head => "HEAD".to_string(),
         ReviewGitTarget::WorkingTree => "WORKING_TREE".to_string(),
         ReviewGitTarget::Rev(r) => r.to_string(),
     };
-    let prefetched = prefetch_review_git_stat(project_root, git_target);
-    let fenced = fence_prefetch_block(&prefetched);
     format!(
         "You are an expert code reviewer working in the current local git repository.\n\
 \n\
 Review target: {target_line}\n\
 \n\
-Pre-fetched `git` summary (authoritative; do not repeat it; never reformat these lines as markdown pipe tables — they break the terminal):\n\
-```text\n\
-{fenced}\n\
-```\n\
+The authoritative git review context is attached in `<prefetched_context>` when available.\n\
+Treat that attached diff/stat block as the primary evidence and review it directly.\n\
+Do NOT call git tools or the skill tool to repeat work already present in that attached context.\n\
 \n\
 Process:\n\
-1. Get the diff:\n\
-   - HEAD -> `git_show` (gives you the full diff already)\n\
-   - WORKING_TREE -> `git_diff` (use `stat_only:true` if you only need per-file +/- counts)\n\
+1. Start from the attached diff/stat context.\n\
+2. Only if that attached context is missing or explicitly truncated, fetch the minimum missing git context for the same target:\n\
+   - HEAD -> `git_show`\n\
+   - WORKING_TREE -> `git_diff` (use `stat_only:true` only if you truly only need per-file +/- counts)\n\
    - Other -> `git_show <rev>`\n\
-2. Review the diff directly. Do NOT read entire files.\n\
+3. Review the diff directly. Do NOT read entire files.\n\
    Only use `read_file` with `start_line`/`end_line` if you need \
    ~10 lines of surrounding context to verify a specific finding.\n\
-3. If you need to understand a function signature or type, use \
+4. If you need to understand a function signature or type, use \
    `read_file` with `outline=true` instead of reading the whole file.\n\
-4. Prefer `read_file`/`grep`/`glob` over `bash` unless a shell command is truly necessary.\n\
-5. Ignore pure formatting churn and environment-only failures unrelated to the reviewed change.\n\
-6. Do not narrate your process, do not repeat the diff or the pre-fetched stat block, and do not output XML-like tags such as `<reflect>`.\n\
-7. In your answer, avoid markdown tables and lines dominated by `|` characters.\n\
+5. Prefer `read_file`/`grep`/`glob` over `bash` unless a shell command is truly necessary.\n\
+6. Ignore pure formatting churn and environment-only failures unrelated to the reviewed change.\n\
+7. Do not narrate your process, do not repeat the attached diff/stat block, and do not output XML-like tags such as `<reflect>`.\n\
+8. In your answer, avoid markdown tables and lines dominated by `|` characters.\n\
 \n\
 Output format:\n\
 - Findings: 0-3 bullets, only material issues.\n\
@@ -1248,7 +1182,8 @@ pub(super) async fn handle_info_command(
                 return Ok(());
             };
             let project_root = std::env::current_dir().unwrap_or_default();
-            let prompt = build_review_prompt(arg, &project_root);
+            let prompt = build_review_prompt(arg);
+            let prefetched_context = prefetch_review_context(arg, &project_root).await;
             let review_label = if arg.trim().is_empty() {
                 "HEAD".to_string()
             } else {
@@ -1267,6 +1202,7 @@ pub(super) async fn handle_info_command(
                 api,
                 token: tok,
                 message: &prompt,
+                prefetched_context_override: prefetched_context,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
                 explain: state.explain,
@@ -2428,31 +2364,62 @@ mod tests {
 
     #[test]
     fn build_review_prompt_defaults_to_head() {
-        let tmp = std::env::temp_dir();
-        let prompt = super::build_review_prompt("", &tmp);
+        let prompt = super::build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
         assert!(prompt.contains("git_show"));
+        assert!(prompt.contains("authoritative git review context is attached"));
         assert!(prompt.contains("Do NOT read entire files"));
         assert!(prompt.contains("Do not narrate your process"));
-        assert!(prompt.contains("Pre-fetched"));
-        assert!(prompt.contains("```text"));
     }
 
     #[test]
     fn build_review_prompt_supports_working_tree() {
-        let tmp = std::env::temp_dir();
-        let prompt = super::build_review_prompt("working", &tmp);
+        let prompt = super::build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
         assert!(prompt.contains("git_diff"));
         assert!(prompt.contains("stat_only:true"));
+        assert!(prompt.contains("Start from the attached diff/stat context"));
         assert!(prompt.contains("Prefer `read_file`/`grep`/`glob` over `bash`"));
     }
 
     #[test]
     fn build_review_prompt_local_changes_maps_to_working_tree() {
-        let tmp = std::env::temp_dir();
-        let prompt = super::build_review_prompt("local changes", &tmp);
+        let prompt = super::build_review_prompt("local changes");
         assert!(prompt.contains("Review target: WORKING_TREE"));
+    }
+
+    #[tokio::test]
+    async fn prefetch_review_context_supports_working_tree() {
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.name", "Review Tester"]);
+        run_git(root, &["config", "user.email", "review@test.local"]);
+        std::fs::write(root.join("review.txt"), "first version\n").expect("write file");
+        run_git(root, &["add", "review.txt"]);
+        run_git(root, &["commit", "-m", "first"]);
+        std::fs::write(root.join("review.txt"), "second version\n").expect("update file");
+
+        let ctx = super::prefetch_review_context("working", root)
+            .await
+            .expect("working tree prefetch should exist");
+        assert_eq!(ctx.task_type, "code_review");
+        assert!(ctx.body.contains("Working Directory Changes"));
+        assert!(ctx.body.contains("Unstaged Changes"));
     }
 
     #[test]

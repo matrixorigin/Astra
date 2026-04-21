@@ -5,8 +5,9 @@ use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, finalize_and_render,
     finalize_turn_trace, try_write_heavy_checkpoint,
 };
-use super::agentic_loop_lifecycle::TurnIterationPrep;
-use super::agentic_loop_lifecycle::interruption_state_summary;
+use super::agentic_loop_lifecycle::{
+    TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
+};
 use super::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, agentic_turn_stream_snapshot_with_kind,
     ingest_agentic_turn_stream, map_ingest_outcome_to_iteration_control,
@@ -20,6 +21,8 @@ fn record_early_exit_llm_round(
     turn_start: Instant,
     finish_reason: Option<&str>,
 ) {
+    let agentic_step = current_agentic_step(state);
+    let run_id = state.current_run_id.clone();
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             ttft_ms: turn_result.ttft_ms,
@@ -30,6 +33,9 @@ fn record_early_exit_llm_round(
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: finish_reason.map(Into::into),
+            agentic_step: Some(agentic_step),
+            source: Some("agentic_loop".into()),
+            run_id,
         });
     }
 }
@@ -203,7 +209,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
                     // Emit structured compaction telemetry for observability.
                     if let Some(sid) = state.current_session_id.as_deref() {
-                        let turn = (state.max_turns - state.remaining_turns) as u32;
                         let tokens_freed = result.pipeline_outcome.total_tokens_freed;
                         let budget_likely_satisfied = result.budget_likely_satisfied;
                         let layers: Vec<(String, u64)> = result
@@ -214,14 +219,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             .collect();
                         let evt = astra_services::session_journal::JournalEvent::compaction_retry(
                             Some(sid),
-                            turn,
+                            session_turn_number(state),
                             tier_label,
                             tokens_freed,
                             budget_likely_satisfied,
                             state.consecutive_context_window_errors,
                             layers,
                             state.consecutive_context_window_errors,
-                        );
+                        )
+                        .with_agentic_step(Some(current_agentic_step(state)));
                         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid)
                         {
                             let _ = writer.append(&evt);
@@ -338,7 +344,7 @@ fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostT
 
 pub(crate) fn observe_turn_end_without_tools(
     state: &mut AgenticLoopState,
-    turn_index: usize,
+    _turn_index: usize,
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
 ) {
@@ -348,7 +354,7 @@ pub(crate) fn observe_turn_end_without_tools(
     ) {
         let total_ms = turn_start_time.elapsed().as_millis() as u64;
         let timing = crate::observability_integration::TurnTiming {
-            turn: turn_index as u32,
+            turn: session_turn_number(state),
             context_assembly_ms: 0,
             ttft_ms: ttft_ms.unwrap_or(0),
             llm_total_ms: total_ms,
@@ -357,6 +363,35 @@ pub(crate) fn observe_turn_end_without_tools(
         };
         let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
         crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::observability_integration::ObservabilityHub;
+    use crate::turn::agentic_loop_host::tests::make_state;
+
+    #[test]
+    fn observe_turn_end_without_tools_records_outer_session_turn() {
+        let mut state = make_state();
+        state.session_turn = 6;
+        state.max_turns = 20;
+        state.remaining_turns = 4;
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_hub = Some(Arc::new(hub));
+        state.telemetry.observability_session = Some(session.clone());
+
+        let turn_start_time = Instant::now() - Duration::from_millis(25);
+        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.turn_timings.len(), 1);
+        assert_eq!(guard.turn_timings[0].turn, 6);
     }
 }
 

@@ -228,6 +228,7 @@ async fn intercept_skill_calls(
         &state.skills.quality_tracker,
         &state.skills.pinned,
         &state.skills.discovered,
+        &state.skills.invoked,
         &state.skills.search,
     );
     let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
@@ -661,6 +662,9 @@ mod tests {
             finish_reason: None,
             tool_calls_returned: 0,
             tool_call_names: vec![],
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             prompt_tokens: 200,
@@ -671,6 +675,9 @@ mod tests {
             finish_reason: None,
             tool_calls_returned: 0,
             tool_call_names: vec![],
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         assert_eq!(buf.current_round(), 2);
         state.turn_event_buffer = Some(buf);

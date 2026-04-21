@@ -453,12 +453,14 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
                  - **Efficient alternative**: use bash with `git log -1 --format='%H %s' && git diff HEAD~1` for a single-tool compound fetch.\n\
               ONLY use git_diff with `path` if the output shows \"[truncated]\". \
               The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
-              2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
-              3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
-              start_line/end_line for ~30 lines around the change, or outline=true for large files. \
-              NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
-              4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
-              5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
+               2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
+               Treat the diff as primary evidence — do NOT switch into a whole-repo or file-by-file crawl unless the diff leaves a specific unresolved question.\n\
+               3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
+               start_line/end_line for ~30 lines around the change, or outline=true for large files. \
+               Default budget: no more than 3 read_file calls for the review; only exceed that when a concrete unresolved risk still remains. \
+               NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
+               4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
+               5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
               \n\
               ### Output Format\n\
               Summary:\n\
@@ -478,11 +480,12 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               - NEVER say LGTM if you had read_file errors on logic-changed files.\n\
               \n\
               ### Anti-patterns (NEVER do these)\n\
-              - Do NOT write a review summary in the same response where you call git_diff.\n\
-              - Do NOT say \"tests look good\" without reading at least one test file.\n\
-              - Do NOT call git_log in one turn, wait, then call git_show — call BOTH in the first turn.\n\
-              - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
-              - Do NOT claim full confidence when evidence is incomplete.\n"
+               - Do NOT write a review summary in the same response where you call git_diff.\n\
+               - Do NOT say \"tests look good\" without reading at least one test file.\n\
+               - Do NOT call git_log in one turn, wait, then call git_show — call BOTH in the first turn.\n\
+               - Do NOT keep calling read_file without a new, explicit risk question to resolve.\n\
+               - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
+               - Do NOT claim full confidence when evidence is incomplete.\n"
         }
         Some("debugging") => {
             "\n## Debugging Strategy\n\
@@ -1341,6 +1344,10 @@ mod tests {
         assert!(
             p.contains("call BOTH in the first turn"),
             "should warn against sequential git_log then git_show"
+        );
+        assert!(
+            p.contains("Default budget: no more than 3 read_file calls"),
+            "should bound read_file fanout for review turns"
         );
     }
 

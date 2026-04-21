@@ -75,6 +75,8 @@ pub struct JournalDigest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stalls: Vec<SideEvent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub interruptions: Vec<SideEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub turn_errors: Vec<TurnErrRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub other_errors: Vec<SideEvent>,
@@ -164,7 +166,31 @@ pub struct TurnRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefetch_body_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub llm_round_details: Vec<LlmRoundRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_groups: Vec<ToolGroupRow>,
+}
+
+#[derive(Serialize)]
+pub struct LlmRoundRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agentic_step: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls_returned: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -186,6 +212,8 @@ pub struct SideEvent {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agentic_step: Option<u32>,
     pub detail: serde_json::Value,
 }
 
@@ -232,6 +260,30 @@ fn tool_call_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u3
     (ok, fail)
 }
 
+fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
+    let meta = ev.metadata.as_ref();
+    LlmRoundRow {
+        round: ev.round,
+        agentic_step: ev.agentic_step,
+        source: meta
+            .and_then(|m| m.get("source"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        run_id: meta
+            .and_then(|m| m.get("run_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        finish_reason: meta
+            .and_then(|m| m.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        tool_calls_returned: ev.tool_calls_returned,
+        tokens_in: ev.tokens_in,
+        tokens_out: ev.tokens_out,
+        duration_ms: ev.duration_ms,
+    }
+}
+
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
     tool_call_groups::group_tool_calls(calls)
         .into_iter()
@@ -266,6 +318,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut turns_out: Vec<TurnRow> = Vec::new();
     let mut compaction_events = Vec::new();
     let mut stalls = Vec::new();
+    let mut interruptions = Vec::new();
     let mut turn_errors = Vec::new();
     let mut other_errors = Vec::new();
 
@@ -283,6 +336,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
 
     // Prefetch data extracted from ContextAssemblyRecorded events, keyed by turn number.
     let mut prefetch_by_turn: std::collections::HashMap<u32, (Option<String>, Option<u64>)> =
+        std::collections::HashMap::new();
+    let mut llm_rounds_by_turn: std::collections::HashMap<u32, Vec<LlmRoundRow>> =
         std::collections::HashMap::new();
 
     let mut seq: u32 = 0;
@@ -378,6 +433,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     prefetch_injected: None,
                     prefetch_task_type: None,
                     prefetch_body_bytes: None,
+                    llm_round_details: Vec::new(),
                     tool_groups: if matches!(focus, DigestFocus::All) {
                         ev.tool_calls
                             .as_ref()
@@ -403,6 +459,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     ts: ev.ts.clone(),
                     kind: "compact".to_string(),
                     turn: ev.turn,
+                    agentic_step: ev.agentic_step,
                     detail: json!({
                         "turns_compacted": ev.turns_compacted,
                         "facts_stored": ev.facts_stored,
@@ -416,10 +473,25 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     ts: ev.ts.clone(),
                     kind: "stall".to_string(),
                     turn: ev.turn,
+                    agentic_step: ev.agentic_step,
                     detail: json!({
                         "stall_type": ev.stall_type,
                         "error": ev.error,
                     }),
+                });
+            }
+            JournalEventType::InterruptionRecorded => {
+                interruptions.push(SideEvent {
+                    ts: ev.ts.clone(),
+                    kind: "interruption".to_string(),
+                    turn: ev.turn,
+                    agentic_step: ev.agentic_step,
+                    detail: ev
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("interruption"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
                 });
             }
             JournalEventType::Error => {
@@ -428,6 +500,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     ts: ev.ts.clone(),
                     kind: "error".to_string(),
                     turn: ev.turn,
+                    agentic_step: ev.agentic_step,
                     detail: json!({ "message": ev.error }),
                 });
             }
@@ -449,6 +522,16 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     }
                 }
             }
+            JournalEventType::LlmRound => {
+                if matches!(focus, DigestFocus::All)
+                    && let Some(turn) = ev.turn
+                {
+                    llm_rounds_by_turn
+                        .entry(turn)
+                        .or_default()
+                        .push(llm_round_row(ev));
+                }
+            }
             _ => {}
         }
     }
@@ -460,6 +543,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 turn.prefetch_injected = Some(true);
                 turn.prefetch_task_type = task_type;
                 turn.prefetch_body_bytes = body_bytes;
+            }
+            if matches!(focus, DigestFocus::All)
+                && let Some(rounds) = llm_rounds_by_turn.remove(&turn_id)
+            {
+                turn.llm_round_details = rounds;
             }
         }
     }
@@ -525,6 +613,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         turns: turns_out,
         compaction_events,
         stalls,
+        interruptions,
         turn_errors,
         other_errors,
     })
@@ -635,6 +724,33 @@ pub fn print_text(d: &JournalDigest) {
                     group.tools.join(", ").dim()
                 );
             }
+            for round in &t.llm_round_details {
+                let mut scope = match round.round {
+                    Some(round_ix) => format!("llm r{round_ix}"),
+                    None => "llm r?".to_string(),
+                };
+                if let Some(step) = round.agentic_step {
+                    scope.push_str(&format!(" · step={step}"));
+                }
+                if let Some(source) = round.source.as_deref() {
+                    scope.push_str(&format!(" · {source}"));
+                }
+                let mut stats = Vec::new();
+                if let Some(tool_calls) = round.tool_calls_returned {
+                    stats.push(format!("tool_calls={tool_calls}"));
+                }
+                if let Some(finish_reason) = round.finish_reason.as_deref() {
+                    stats.push(format!("finish={finish_reason}"));
+                }
+                if let Some(run_id) = round.run_id.as_deref() {
+                    stats.push(format!("run={run_id}"));
+                }
+                println!(
+                    "                          {} {}",
+                    scope.as_str().dim(),
+                    stats.join(" · ").dim()
+                );
+            }
         }
     }
     if !d.compaction_events.is_empty() {
@@ -648,6 +764,26 @@ pub fn print_text(d: &JournalDigest) {
                 "    {} {} {}",
                 e.ts.as_str().dim(),
                 format!("turn={:?}", e.turn).dim(),
+                e.detail
+            );
+        }
+    }
+    if !d.interruptions.is_empty() {
+        println!(
+            "\n  {} {}",
+            "interruptions:".yellow(),
+            d.interruptions.len().to_string().cyan()
+        );
+        for e in &d.interruptions {
+            let step = e
+                .agentic_step
+                .map(|step| format!(" step={step}"))
+                .unwrap_or_default();
+            println!(
+                "    {} {}{} {}",
+                e.ts.as_str().dim(),
+                format!("turn={:?}", e.turn).dim(),
+                step.dim(),
                 e.detail
             );
         }
@@ -823,6 +959,36 @@ mod tests {
             }),
             "digest should preserve the large round-2 batch from the real session"
         );
+    }
+
+    #[test]
+    fn digest_surfaces_interruptions_and_llm_round_provenance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-digest-telemetry-00000000-0000-0000-0000-000000000004";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"bridge_inprocess","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
+{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":3,"agentic_step":5,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":2,"turns_completed":5,"remaining_turns":0}}}
+{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":3,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"continue","tool_calls":[{"name":"bash","ok":true,"ms":10}],"llm_rounds":1}
+"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.interruptions.len(), 1);
+        assert_eq!(d.interruptions[0].turn, Some(3));
+        assert_eq!(d.interruptions[0].agentic_step, Some(5));
+        assert_eq!(d.interruptions[0].detail["tool_calls_completed"], 2);
+
+        assert_eq!(d.turns.len(), 1);
+        assert_eq!(d.turns[0].llm_round_details.len(), 1);
+        let round = &d.turns[0].llm_round_details[0];
+        assert_eq!(round.agentic_step, Some(5));
+        assert_eq!(round.source.as_deref(), Some("bridge_inprocess"));
+        assert_eq!(round.run_id.as_deref(), Some("run-1"));
+        assert_eq!(round.finish_reason.as_deref(), Some("tool_calls"));
     }
 
     #[test]

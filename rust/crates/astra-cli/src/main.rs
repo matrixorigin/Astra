@@ -75,6 +75,8 @@ mod cloud_sync;
 mod command_registry;
 #[path = "cli/command_router.rs"]
 mod command_router;
+#[path = "cli/command_usage.rs"]
+mod command_usage;
 #[path = "cli/context_prefetch.rs"]
 mod context_prefetch;
 #[path = "cli/delegate_subrun.rs"]
@@ -1444,6 +1446,7 @@ mod tests {
             api: &api,
             token: "fake-token",
             message: "hi",
+            prefetched_context_override: None,
             session_id: None,
             model: None,
             explain: ExplainMode::Off,
@@ -1514,6 +1517,7 @@ mod tests {
             api: &api,
             token: "fake-token",
             message: "hi",
+            prefetched_context_override: None,
             session_id: None,
             model: None,
             explain: ExplainMode::Off,
@@ -1600,6 +1604,7 @@ mod tests {
             api: &api,
             token: "fake-token",
             message: "run echo hi",
+            prefetched_context_override: None,
             session_id: None,
             model: None,
             explain: ExplainMode::Off,

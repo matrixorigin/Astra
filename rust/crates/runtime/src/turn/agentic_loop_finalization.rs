@@ -9,6 +9,7 @@ use super::agentic_adaptive_tuning::{
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_impl,
 };
+use super::agentic_loop_lifecycle::{current_agentic_step, session_turn_number};
 
 /// Finalize the turn trace collector: record measured token budget, feed to
 /// observability session, and persist to journal. Called from every exit path
@@ -23,7 +24,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     if let Some(ref session_id) = state.current_session_id {
         collector.set_session_id(session_id);
     }
-    let session_turn = context_trace_turn_number(state);
+    let session_turn = session_turn_number(state);
     collector.set_turn_id(format!("turn-{session_turn}"));
     let measured = state.last_measured_prompt_tokens.unwrap_or(0);
     let max = state.max_turn_input_tokens;
@@ -60,15 +61,6 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         }
     }
     persist_latest_context_trace_signal(state).await;
-}
-
-fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
-    // Journal turn numbers should match the user-visible outer turn count.
-    // The observability session tracks its own internal counter, which can
-    // include sub-rounds and drift away from the REPL/session journal turn IDs.
-    state
-        .session_turn
-        .max((state.max_turns - state.remaining_turns).max(1) as u32)
 }
 
 async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
@@ -254,7 +246,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         );
     }
 
-    let turn = (state.max_turns - state.remaining_turns) as u32;
+    let turn = session_turn_number(state);
     let mut snapshot =
         astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
             .label(format!("checkpoint-t{turn}"))
@@ -284,7 +276,7 @@ pub(crate) async fn build_full_composite_snapshot(
     state: &mut AgenticLoopState,
 ) -> Option<astra_core::composite_snapshot::CompositeSnapshot> {
     let sid = state.current_session_id.as_ref()?;
-    let turn = (state.max_turns - state.remaining_turns) as u32;
+    let turn = session_turn_number(state);
     let ckpt_num = state.step_recorder.summary().checkpoints;
 
     let mut builder =
@@ -393,12 +385,12 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 }
             }
 
-            let turn_num = (state.max_turns - state.remaining_turns) as u32;
             let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
                 Some(sid.as_str()),
-                turn_num,
+                session_turn_number(state),
                 interruption.to_json(),
-            );
+            )
+            .with_agentic_step(Some(current_agentic_step(state)));
             if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
                 let _ = writer.append(&evt);
             }
@@ -468,7 +460,7 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
     use astra_services::session_journal::{JournalEvent, JournalEventType};
 
     // saturating_sub: max_turns=0 → immediate completion, turn_number is irrelevant
-    let turn_number = state.max_turns.saturating_sub(state.remaining_turns) as u32;
+    let turn_number = session_turn_number(state);
     let mut event = JournalEvent::base_public(JournalEventType::Turn, None);
     event.turn = Some(turn_number);
     event.tokens_in = Some(
@@ -862,6 +854,7 @@ mod tests {
         let mut state = make_state();
         state.max_turns = 5;
         state.remaining_turns = 4; // turn 1
+        state.session_turn = 7;
 
         // Simulate tool_call_records from a turn
         state.stall.tool_call_records = vec![
@@ -903,7 +896,7 @@ mod tests {
         finalize_turn_trace(&mut state).await;
 
         // After finalization, facts should be populated
-        assert_eq!(state.session_facts.turn, 1);
+        assert_eq!(state.session_facts.turn, 7);
         assert_eq!(state.session_facts.active_files.len(), 2);
         assert_eq!(state.session_facts.active_files[0].path, "src/main.rs");
         assert_eq!(state.session_facts.active_files[0].last_action, "read");

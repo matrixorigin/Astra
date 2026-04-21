@@ -799,6 +799,7 @@ mod tests {
             ts: "2025-01-15T10:30:00Z".into(),
             session_id: Some("sess-abc".into()),
             turn: Some(3),
+            agentic_step: None,
             model: Some("gpt-4".into()),
             user_input: Some("list PRs".into()),
             assistant_output: Some("Here are the PRs...".into()),
