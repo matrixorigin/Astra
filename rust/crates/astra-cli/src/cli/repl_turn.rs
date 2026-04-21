@@ -445,8 +445,12 @@ pub(super) async fn handle_chat_input(
                                             &line,
                                             result,
                                             turn_start,
+<<<<<<< HEAD
                                         )
                                         .await;
+=======
+                                        ).await;
+>>>>>>> 320d1def (fix: wire self-improvement & pipeline auto-reflection end-to-end)
                                         return Ok(());
                                     }
                                     Err(retry_failure) => {
@@ -2027,7 +2031,9 @@ pub(crate) async fn try_llm_skill_improvement(
             &recent,
         );
     let analysis_resp = llm.complete(&analysis_system, &analysis_user).await?;
-    let improvements = astra_runtime::skills::improvement::parse_improvements(&analysis_resp);
+<<<<<<< HEAD
+    let improvements =
+        astra_runtime::skills::improvement::parse_improvements(&analysis_resp);
     if improvements.is_empty() {
         state.skill_improvement_tracker.mark_analyzed(state.turn);
         return Ok(true);
@@ -5116,6 +5122,8 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         let skill_md = skill_dir.join("SKILL.md");
         let original = "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
+        let original =
+            "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
         std::fs::write(&skill_md, original).unwrap();
 
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();

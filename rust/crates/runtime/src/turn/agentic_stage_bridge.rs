@@ -37,7 +37,10 @@ impl PipelineDiagnosis {
     pub fn tactical_action_label(&self) -> String {
         format!(
             "pipeline-diagnose[{:?}/{:?}]: {} → {}",
-            self.failure_category, self.progress_category, self.what_happened, self.what_to_try,
+            self.failure_category,
+            self.progress_category,
+            self.what_happened,
+            self.what_to_try,
         )
     }
 }
@@ -70,7 +73,8 @@ fn snapshot_turn_state_from_signals(
     snapshot.total_tool_calls = total_records as u32;
 
     if total_records > 0 {
-        let success_ratio = 1.0 - (failed_records as f64 / total_records.max(1) as f64);
+        let success_ratio =
+            1.0 - (failed_records as f64 / total_records.max(1) as f64);
         snapshot.progress.record(success_ratio);
     }
 
@@ -97,7 +101,10 @@ pub fn diagnose_from_signals(
 
 /// Run the pipeline rule-based diagnosis against a runtime state snapshot.
 pub fn diagnose_from_loop_state(state: &AgenticLoopState) -> PipelineDiagnosis {
-    diagnose_from_signals(&state.stall.tool_call_records, &state.stall.turn_tool_names)
+    diagnose_from_signals(
+        &state.stall.tool_call_records,
+        &state.stall.turn_tool_names,
+    )
 }
 
 /// Summary of what the strategy-delta application actually changed in the
@@ -209,7 +216,10 @@ mod tests {
             .into_iter()
             .collect();
         let sigs = vec![sig.clone(), sig.clone(), sig.clone()];
-        let records = vec![record("grep", true, None), record("read", true, None)];
+        let records = vec![
+            record("grep", true, None),
+            record("read", true, None),
+        ];
         let diag = diagnose_from_signals(&records, &sigs);
         assert_eq!(diag.failure_category, FailureCategory::Stall);
         assert!(diag.strategy.widen_selection);
@@ -234,10 +244,6 @@ mod tests {
         // end-to-end application against AgenticLoopState is exercised in the
         // `auto_reflection_injects_pipeline_diagnosis_into_prompt` e2e test.
         assert!(!diag.strategy.block_tools.is_empty());
-        assert!(
-            diag.strategy
-                .block_tools
-                .contains(&"flaky_http".to_string())
-        );
+        assert!(diag.strategy.block_tools.contains(&"flaky_http".to_string()));
     }
 }
