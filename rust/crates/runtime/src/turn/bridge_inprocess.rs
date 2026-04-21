@@ -783,6 +783,14 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
+            // ── Memoria insights digest (injected by CLI via edge_profile) ──
+            let memoria_insights_hint = edge_profile
+                .get("memoria_insights_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|text| format!("\n\n{text}"))
+                .unwrap_or_default();
+
             // ── Memory lifecycle: detect tracking/store signals in user input ──
             // Injects a priority hint into the system prompt so the LLM stores
             // the user's interest immediately rather than exploring the codebase.
@@ -998,6 +1006,21 @@ impl InProcessChatTurnBridge {
                     .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
                         context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
                             self_awareness: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !memoria_insights_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        memoria_insights_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            memoria_insights: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -2661,6 +2684,19 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            prompts::PromptSection::dynamic(
+                "\n\n## Memoria Recall\n- Stored: prefer Rust for CLI work.".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        memoria_insights: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
         ];
         let (_, _, prompt_sections) = build_system_message_with_dynamic_sections(
             &["bash", "read_file"],
@@ -2678,6 +2714,7 @@ mod tests {
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
         assert!(breakdown.context_signals.session_anchor);
+        assert!(breakdown.context_signals.memoria_insights);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(!breakdown.context_signals.effort_hint);
         assert!(!breakdown.context_signals.agent_type_hint);

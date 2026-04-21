@@ -884,6 +884,8 @@ pub fn build_system_prompt_trace(
         context_signals.learned_feedback_rules |=
             section.trace_signals.context_signals.learned_feedback_rules;
         context_signals.session_anchor |= section.trace_signals.context_signals.session_anchor;
+        context_signals.memoria_insights |=
+            section.trace_signals.context_signals.memoria_insights;
         guidance_signals.round_budget_warning |=
             section.trace_signals.guidance_signals.round_budget_warning;
         guidance_signals.synthesize_or_batch |=

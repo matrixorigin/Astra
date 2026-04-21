@@ -366,6 +366,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.history,
         semantic_query_str,
     );
+    let mut memoria_insights_text: Option<String> = None;
     {
         if should_skip_memory_boost(ctx.message, ctx.history) {
             if let Some(collector) = ctx.telem.trace_collector {
@@ -411,6 +412,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     semantic_query_str,
                     &ranked,
                 );
+                memoria_insights_text =
+                    astra_runtime::memoria_insights::render_digest(&memory_contents);
                 // Send "useful" feedback for retrieved memories (fire-and-forget)
                 let feedback_ids: Vec<String> = memory_hits
                     .iter()
@@ -651,6 +654,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 ep_obj.insert("self_awareness_text".to_string(), json!(text));
             }
         }
+    }
+    // ─── Memoria insights: inject recall digest into edge_profile ───
+    if let Some(ref insights) = memoria_insights_text
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert("memoria_insights_text".to_string(), json!(insights));
     }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
 
