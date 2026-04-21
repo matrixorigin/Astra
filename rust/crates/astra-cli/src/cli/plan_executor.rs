@@ -515,7 +515,6 @@ fn high_failure_tool_evidence(
     ))
 }
 
-
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
@@ -1382,8 +1381,7 @@ async fn plan_executor_task(
                     if *retry_count >= STRATEGY_ESCALATION_THRESHOLD
                         && *retry_count <= MAX_TURN_RETRIES
                     {
-                        let evidence_line =
-                            high_failure_tool_evidence(&ctx.tool_health_entries, 3);
+                        let evidence_line = high_failure_tool_evidence(&ctx.tool_health_entries, 3);
                         let mut strategy_hint = format!(
                             "⚠ Subtask '{}' has failed {} times. Try a DIFFERENT approach:\n\
                              1. Break the task into smaller, simpler steps\n\
@@ -1809,8 +1807,7 @@ mod tests {
                 recent_outcomes: vec![],
             },
         ];
-        let line =
-            super::high_failure_tool_evidence(&entries, 3).expect("should surface evidence");
+        let line = super::high_failure_tool_evidence(&entries, 3).expect("should surface evidence");
         assert!(
             line.contains("flaky_tool"),
             "evidence line must name the repeat offender: {line}"

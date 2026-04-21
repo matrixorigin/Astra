@@ -355,11 +355,7 @@ mod tests {
         assert!(without.is_empty());
 
         // With health: bash's high fail rate synthesizes an opportunity.
-        let with = engine.check_and_create_experiments_with_health(
-            &library,
-            &store,
-            Some(&health),
-        );
+        let with = engine.check_and_create_experiments_with_health(&library, &store, Some(&health));
         assert!(
             !with.is_empty(),
             "health tracker with failing tool should produce an experiment"

@@ -1279,10 +1279,7 @@ mod tests {
         assert!(out.contains("grep"), "drifting tool shown: {out}");
         assert!(out.contains("glob"), "new tool shown: {out}");
         assert!(out.contains("new"), "new marker: {out}");
-        assert!(
-            out.contains("Δcalls +4"),
-            "grep call delta surfaced: {out}"
-        );
+        assert!(out.contains("Δcalls +4"), "grep call delta surfaced: {out}");
     }
 
     #[test]

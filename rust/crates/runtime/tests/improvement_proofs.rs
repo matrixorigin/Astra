@@ -9118,7 +9118,15 @@ mod cross_turn_cognition {
         // Turn-1 ranking with no outcome memory (learning OFF).
         let off_bias: HashMap<String, f64> = HashMap::new();
         let off_ranking = pre_filter_dynamic_with_outcome_bias(
-            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &off_bias,
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &off_bias,
         );
         assert!(
             !off_ranking.is_empty(),
@@ -9137,22 +9145,26 @@ mod cross_turn_cognition {
         }
         let on_bias = health.outcome_bias_by_tool(3600);
         assert!(
-            on_bias
-                .get(&top_off_name)
-                .copied()
-                .unwrap_or(0.0)
-                < 0.0,
+            on_bias.get(&top_off_name).copied().unwrap_or(0.0) < 0.0,
             "outcome bias for failing tool must be negative, got {on_bias:?}"
         );
 
         // Turn-2 ranking with learning ON.
         let on_ranking = pre_filter_dynamic_with_outcome_bias(
-            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &on_bias,
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &on_bias,
         );
 
         // Proof 1: the failing tool's score dropped.
-        let on_score_for_failing = score_of(&on_ranking, &top_off_name)
-            .expect("failing tool still in pool");
+        let on_score_for_failing =
+            score_of(&on_ranking, &top_off_name).expect("failing tool still in pool");
         assert!(
             on_score_for_failing < top_off_score,
             "tuning ON must lower the score of the failing tool: off={top_off_score} on={on_score_for_failing}"
@@ -9175,7 +9187,15 @@ mod cross_turn_cognition {
         // Proof 3: OFF baseline is stable under repeated calls (no hidden
         // side-effect) — re-running the OFF ranking yields the same top.
         let off_again = pre_filter_dynamic_with_outcome_bias(
-            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &off_bias,
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &off_bias,
         );
         assert_eq!(
             off_again[0].0, top_off_idx,
@@ -9190,7 +9210,15 @@ mod cross_turn_cognition {
 
         let off_bias: HashMap<String, f64> = HashMap::new();
         let off_ranking = pre_filter_dynamic_with_outcome_bias(
-            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &off_bias,
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &off_bias,
         );
         let top_name = TOOL_CATALOG[off_ranking[0].0].name.to_string();
         let off_score = off_ranking[0].1;
@@ -9202,16 +9230,20 @@ mod cross_turn_cognition {
         }
         let on_bias = health.outcome_bias_by_tool(3600);
         assert!(
-            on_bias
-                .get(&top_name)
-                .copied()
-                .unwrap_or(0.0)
-                > 0.0,
+            on_bias.get(&top_name).copied().unwrap_or(0.0) > 0.0,
             "successful tool must earn positive bias, got {on_bias:?}"
         );
 
         let on_ranking = pre_filter_dynamic_with_outcome_bias(
-            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &on_bias,
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &on_bias,
         );
         let on_score = score_of(&on_ranking, &top_name).expect("tool present");
         assert!(
