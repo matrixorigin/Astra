@@ -2662,6 +2662,7 @@ mod tests {
         assert!(breakdown.guidance_signals.synthesize_or_batch);
         assert!(!breakdown.guidance_signals.parallel_feedback);
     }
+    #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {

@@ -742,7 +742,7 @@ pub struct FoldingResult {
 ///
 /// # Returns
 /// Summary of what was folded.
-pub fn fold_old_read_only_results(messages: &mut Vec<Value>, current_round: u32) -> FoldingResult {
+pub fn fold_old_read_only_results(messages: &mut [Value], current_round: u32) -> FoldingResult {
     let mut folded_count = 0;
     let mut chars_removed = 0;
 
