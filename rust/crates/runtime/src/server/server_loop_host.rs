@@ -38,7 +38,7 @@ use crate::turn::llm_client::{
 };
 use crate::turn::prompt_cache::{
     PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
-    build_system_message,
+    build_system_message_with_dynamic_sections,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
 use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
@@ -850,7 +850,6 @@ impl ServerAgenticLoopHost {
         } else {
             format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
         };
-        let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
 
         // Skill effort/agent_type hints (dynamic per-turn)
         let mut extra_dynamic = String::new();
@@ -897,16 +896,56 @@ impl ServerAgenticLoopHost {
                 tool_cfg.effective_round_budget_limit(),
             );
 
-        // All dynamic per-turn content (not cached)
-        let full_dynamic = format!(
-            "{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}{tool_round_guidance}"
-        );
+        let mut dynamic_sections = Vec::new();
+        if !profile_desc.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                profile_desc.clone(),
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+        }
+        if !skill_hint.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                skill_hint.clone(),
+                crate::prompts::PromptTokenBucket::UserPreferences,
+            ));
+        }
+        if !learned_context_hint.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                learned_context_hint.clone(),
+                crate::prompts::PromptTokenBucket::UserPreferences,
+            ));
+        }
+        if !extra_dynamic.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                extra_dynamic.clone(),
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+        }
+        if !memory_signal_hint.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                memory_signal_hint.clone(),
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+        }
+        if !system_override.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                system_override.clone(),
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+        }
+        if !tool_round_guidance.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                tool_round_guidance.clone(),
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+        }
+        let full_dynamic = crate::prompts::sections_to_string(&dynamic_sections);
 
         // Build structured system messages with Anthropic cache annotations.
         // Stable sections (Global/Session) get cache_control; dynamic content does not.
-        let (sys_msg, dynamic_msg, sections) = build_system_message(
+        let (sys_msg, dynamic_msg, sections) = build_system_message_with_dynamic_sections(
             &tool_names,
-            &full_dynamic,
+            &dynamic_sections,
             self.selection_confidence,
             task_type,
             cache_cfg,
@@ -2132,6 +2171,8 @@ mod tests {
         assert!(!breakdown.context_signals.implicit_feedback);
         assert!(!breakdown.context_signals.learned_feedback_rules);
         assert!(!breakdown.context_signals.session_anchor);
+        assert!(breakdown.environment_tokens > 0);
+        assert!(breakdown.user_preferences_tokens > 0);
     }
 
     #[test]

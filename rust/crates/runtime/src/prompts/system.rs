@@ -26,11 +26,37 @@ pub enum CacheScope {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTokenBucket {
+    BasePersona,
+    Environment,
+    UserPreferences,
+}
+
 /// A section of the system prompt with cache scope metadata.
 #[derive(Debug, Clone)]
 pub struct PromptSection {
     pub text: String,
     pub scope: CacheScope,
+    pub token_bucket: PromptTokenBucket,
+}
+
+impl PromptSection {
+    pub fn stable(text: impl Into<String>, scope: CacheScope) -> Self {
+        Self {
+            text: text.into(),
+            scope,
+            token_bucket: PromptTokenBucket::BasePersona,
+        }
+    }
+
+    pub fn dynamic(text: impl Into<String>, token_bucket: PromptTokenBucket) -> Self {
+        Self {
+            text: text.into(),
+            scope: CacheScope::None,
+            token_bucket,
+        }
+    }
 }
 
 // ── Section builder functions ─────────────────────────────────────────────
@@ -626,100 +652,73 @@ pub fn build_system_prompt_sections_with_style(
 ) -> Vec<PromptSection> {
     if tool_names.is_empty() {
         return vec![
-            PromptSection {
-                text: format!(
+            PromptSection::stable(
+                format!(
                     "{SYSTEM_PROMPT_BASE}\n\n\
                  ## CRITICAL\n\
                  You have NO tools available in this turn. \
                  Do NOT generate fake data (PRs, issues, commits, file contents). \
                  If the user asks for real-time data, say: \"I don't have tools available to look that up.\""
                 ),
-                scope: CacheScope::Global,
-            },
-            PromptSection {
-                text: profile_desc.to_string(),
-                scope: CacheScope::None,
-            },
+                CacheScope::Global,
+            ),
+            PromptSection::dynamic(profile_desc.to_string(), PromptTokenBucket::Environment),
         ];
     }
 
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
-        PromptSection {
-            text: core_rules_section(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: planning_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: coding_discipline_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: parallel_and_efficiency_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: plan_execution_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: output_format_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: tool_error_recovery_section().to_string(),
-            scope: CacheScope::Global,
-        },
+        PromptSection::stable(core_rules_section(), CacheScope::Global),
+        PromptSection::stable(planning_section().to_string(), CacheScope::Global),
+        PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
+        PromptSection::stable(
+            parallel_and_efficiency_section().to_string(),
+            CacheScope::Global,
+        ),
+        PromptSection::stable(plan_execution_section().to_string(), CacheScope::Global),
+        PromptSection::stable(output_format_section().to_string(), CacheScope::Global),
+        PromptSection::stable(
+            tool_error_recovery_section().to_string(),
+            CacheScope::Global,
+        ),
     ];
 
     // ── Session sections (stable within a session) ──
-    sections.push(PromptSection {
-        text: self_model_section(tool_names),
-        scope: CacheScope::Session,
-    });
+    sections.push(PromptSection::stable(
+        self_model_section(tool_names),
+        CacheScope::Session,
+    ));
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection {
-            text: tool_cond,
-            scope: CacheScope::Session,
-        });
+        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
     }
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
-        sections.push(PromptSection {
-            text: tt.to_string(),
-            scope: CacheScope::Session,
-        });
+        sections.push(PromptSection::stable(tt.to_string(), CacheScope::Session));
     }
 
     let ss = search_strategy_section(tool_names);
     if !ss.is_empty() {
-        sections.push(PromptSection {
-            text: ss.to_string(),
-            scope: CacheScope::Session,
-        });
+        sections.push(PromptSection::stable(ss.to_string(), CacheScope::Session));
     }
 
     // ── Dynamic sections (change every turn) ──
     if let Some(style) = output_style
         && !style.prompt.is_empty()
     {
-        sections.push(PromptSection {
-            text: format!("\n{}\n", style.prompt),
-            scope: CacheScope::None,
-        });
+        sections.push(PromptSection::dynamic(
+            format!("\n{}\n", style.prompt),
+            PromptTokenBucket::UserPreferences,
+        ));
     }
 
     if !profile_desc.is_empty() {
-        sections.push(PromptSection {
-            text: profile_desc.to_string(),
-            scope: CacheScope::None,
-        });
+        sections.push(PromptSection::dynamic(
+            profile_desc.to_string(),
+            PromptTokenBucket::Environment,
+        ));
     }
 
     sections
@@ -737,10 +736,7 @@ pub fn self_awareness_prompt_section(
     if text.trim().len() <= "## Self-Awareness".len() + 5 {
         return None;
     }
-    Some(PromptSection {
-        text,
-        scope: CacheScope::None,
-    })
+    Some(PromptSection::dynamic(text, PromptTokenBucket::Environment))
 }
 
 /// Flatten sections into a single string (backward-compatible convenience).
@@ -910,35 +906,10 @@ pub fn build_system_prompt_trace_with_signals(
             context_signals.session_anchor = true;
         }
 
-        match section.scope {
-            CacheScope::Global => {
-                // Global sections = base persona + core rules
-                base_persona_tokens += tokens;
-            }
-            CacheScope::Session => {
-                // Session sections = tool list, task-type guidance
-                // Count as base persona (structural)
-                base_persona_tokens += tokens;
-            }
-            CacheScope::None => {
-                // Dynamic sections = profile, environment, preferences
-                // Try to categorize based on content markers
-                if text.contains("cwd:")
-                    || text.contains("git_branch:")
-                    || text.contains("## Environment")
-                    || text.contains("Working directory")
-                {
-                    environment_tokens += tokens;
-                } else if text.contains("## User Preferences")
-                    || text.contains("## Learned")
-                    || text.contains("Output Style")
-                {
-                    user_preferences_tokens += tokens;
-                } else {
-                    // Generic dynamic content
-                    environment_tokens += tokens;
-                }
-            }
+        match section.token_bucket {
+            PromptTokenBucket::BasePersona => base_persona_tokens += tokens,
+            PromptTokenBucket::Environment => environment_tokens += tokens,
+            PromptTokenBucket::UserPreferences => user_preferences_tokens += tokens,
         }
     }
 
@@ -2731,16 +2702,16 @@ mod tests {
 
     #[test]
     fn build_system_prompt_trace_records_guidance_signals() {
-        let sections = vec![PromptSection {
-            text: tool_round_guidance(
+        let sections = vec![PromptSection::dynamic(
+            tool_round_guidance(
                 &[
                     serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
                     serde_json::json!({"role": "tool", "content": "README.md"}),
                 ],
                 ROUND_BUDGET_THRESHOLD,
             ),
-            scope: CacheScope::None,
-        }];
+            PromptTokenBucket::Environment,
+        )];
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
         assert!(breakdown.guidance_signals.round_budget_warning);
@@ -2772,8 +2743,8 @@ mod tests {
 
     #[test]
     fn build_system_prompt_trace_records_dynamic_context_signals() {
-        let sections = vec![PromptSection {
-            text: "\n\n## Active Output Skills\nconcise\n\
+        let sections = vec![PromptSection::dynamic(
+            "\n\n## Active Output Skills\nconcise\n\
                    \n\n## Learned Runtime Context\nmatrixorigin => github\n\
                    \n\n## Effort Level\nhigh\n\
                    \n\n## Agent Type\nreviewer\n\
@@ -2783,8 +2754,8 @@ mod tests {
                    \n\n[Learned Feedback Rules]\n- prefer batching\n\
                    \n\n[session-anchor] Review the timeout path. Currently: validating. 2/3 steps."
                 .to_string(),
-            scope: CacheScope::None,
-        }];
+            PromptTokenBucket::Environment,
+        )];
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
         assert!(breakdown.context_signals.active_output_skills);
@@ -2800,12 +2771,42 @@ mod tests {
     }
 
     #[test]
+    fn build_system_prompt_trace_uses_section_token_buckets() {
+        let sections = vec![
+            PromptSection::stable("base".to_string(), CacheScope::Global),
+            PromptSection::dynamic(
+                "runtime preference without legacy marker".to_string(),
+                PromptTokenBucket::UserPreferences,
+            ),
+            PromptSection::dynamic(
+                "arbitrary environment payload".to_string(),
+                PromptTokenBucket::Environment,
+            ),
+        ];
+
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+
+        assert_eq!(
+            breakdown.base_persona_tokens,
+            estimate_section_tokens("base")
+        );
+        assert_eq!(
+            breakdown.user_preferences_tokens,
+            estimate_section_tokens("runtime preference without legacy marker")
+        );
+        assert_eq!(
+            breakdown.environment_tokens,
+            estimate_section_tokens("arbitrary environment payload")
+        );
+    }
+
+    #[test]
     fn build_system_prompt_trace_applies_explicit_signal_overrides() {
         let breakdown = build_system_prompt_trace_with_signals(
-            &[PromptSection {
-                text: "cwd: /tmp".to_string(),
-                scope: CacheScope::None,
-            }],
+            &[PromptSection::dynamic(
+                "cwd: /tmp".to_string(),
+                PromptTokenBucket::Environment,
+            )],
             vec![],
             vec![],
             PromptTraceSignals {

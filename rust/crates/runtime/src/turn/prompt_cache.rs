@@ -100,6 +100,30 @@ pub(crate) fn build_system_message(
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
 ) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
+    let dynamic_sections = if profile_desc.is_empty() {
+        Vec::new()
+    } else {
+        vec![prompts::PromptSection::dynamic(
+            profile_desc.to_string(),
+            prompts::PromptTokenBucket::Environment,
+        )]
+    };
+    build_system_message_with_dynamic_sections(
+        tool_names,
+        &dynamic_sections,
+        confidence,
+        task_type,
+        cache_cfg,
+    )
+}
+
+pub(crate) fn build_system_message_with_dynamic_sections(
+    tool_names: &[&str],
+    dynamic_sections: &[prompts::PromptSection],
+    confidence: f64,
+    task_type: Option<&str>,
+    cache_cfg: &PromptCacheConfig,
+) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
     let key = section_cache_key(tool_names, task_type, confidence);
 
     // Try cache for the stable (Global + Session) sections
@@ -141,15 +165,11 @@ pub(crate) fn build_system_message(
     });
 
     let is_anthropic = cache_cfg.is_anthropic;
+    let dynamic_text = prompts::sections_to_string(dynamic_sections);
 
     // Build complete sections list (stable + dynamic) for trace.
     let append_dynamic = |mut secs: Vec<prompts::PromptSection>| -> Vec<prompts::PromptSection> {
-        if !profile_desc.is_empty() {
-            secs.push(prompts::PromptSection {
-                text: profile_desc.to_string(),
-                scope: prompts::CacheScope::None,
-            });
-        }
+        secs.extend(dynamic_sections.iter().cloned());
         secs
     };
 
@@ -196,10 +216,10 @@ pub(crate) fn build_system_message(
             blocks.push(block);
         }
         // Dynamic section (profile + per-turn hints) — no cache_control
-        if !profile_desc.is_empty() {
+        for section in dynamic_sections {
             blocks.push(json!({
                 "type": "text",
-                "text": profile_desc,
+                "text": section.text,
             }));
         }
         // Anthropic: everything in one message (cache_control breakpoints handle caching)
@@ -219,12 +239,12 @@ pub(crate) fn build_system_message(
             "role": "system",
             "content": stable_text,
         });
-        let dynamic = if profile_desc.is_empty() {
+        let dynamic = if dynamic_text.is_empty() {
             None
         } else {
             Some(json!({
                 "role": "system",
-                "content": profile_desc,
+                "content": dynamic_text,
             }))
         };
         (primary, dynamic, append_dynamic(sections))

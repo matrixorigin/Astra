@@ -360,6 +360,7 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 pub use super::prompt_cache::PromptCacheConfig;
 pub(crate) use super::prompt_cache::{
     add_message_cache_breakpoint, annotate_tool_schemas_for_caching, build_system_message,
+    build_system_message_with_dynamic_sections,
 };
 
 #[derive(Clone)]
@@ -765,8 +766,6 @@ impl InProcessChatTurnBridge {
                 .get("selection_task_type")
                 .and_then(Value::as_str)
                 .or_else(|| prompts::detect_task_type(user_content_for_signal));
-            let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
-
             // ── Self-awareness section (injected by CLI via edge_profile) ──
             let self_awareness_hint = edge_profile
                 .get("self_awareness_text")
@@ -899,15 +898,67 @@ impl InProcessChatTurnBridge {
                 tool_cfg.effective_round_budget_limit(),
             );
 
-            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor + round budget + parallel feedback)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}{tool_round_guidance}");
-
+            let mut dynamic_sections = Vec::new();
+            if !profile_desc.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    profile_desc.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !skill_hint.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    skill_hint.clone(),
+                    prompts::PromptTokenBucket::UserPreferences,
+                ));
+            }
+            if !learned_context_hint.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    learned_context_hint.clone(),
+                    prompts::PromptTokenBucket::UserPreferences,
+                ));
+            }
+            if !memory_signal_hint.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    memory_signal_hint.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !implicit_feedback_hint.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    implicit_feedback_hint.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !feedback_rules_hint.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    feedback_rules_hint.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !self_awareness_hint.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    self_awareness_hint.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !session_anchor.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    session_anchor.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !tool_round_guidance.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    tool_round_guidance.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
             // OpenAI/others get two messages: stable prefix (cacheable) + dynamic per-turn.
-            let (system_msg, dynamic_msg, prompt_sections) = build_system_message(
+            let (system_msg, dynamic_msg, prompt_sections) = build_system_message_with_dynamic_sections(
                 &tool_names,
-                &dynamic_desc,
+                &dynamic_sections,
                 selection_confidence,
                 task_type,
                 &cache_cfg,
@@ -2397,13 +2448,46 @@ mod tests {
         let self_awareness_hint =
             "\n\n## Self-Awareness\nCurrent task: review runtime prompt assembly.";
         let session_anchor = "\n\n## Session Anchor\nOriginal task: optimize prompt tracing.";
-        let dynamic_desc = format!(
-            "\n\n# Project Profile\ncwd: /test\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. Follow their formatting rules strictly.\n\n## Learned Runtime Context\n{learned_context_text}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}",
-            active_skill_names.join(", ")
-        );
-        let (_, _, prompt_sections) = build_system_message(
+        let dynamic_sections = vec![
+            prompts::PromptSection::dynamic(
+                "\n\n# Project Profile\ncwd: /test".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                format!(
+                    "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. Follow their formatting rules strictly.",
+                    active_skill_names.join(", ")
+                ),
+                prompts::PromptTokenBucket::UserPreferences,
+            ),
+            prompts::PromptSection::dynamic(
+                format!("\n\n## Learned Runtime Context\n{learned_context_text}"),
+                prompts::PromptTokenBucket::UserPreferences,
+            ),
+            prompts::PromptSection::dynamic(
+                memory_signal_hint.to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                implicit_feedback_hint.to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                feedback_rules_hint.to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                self_awareness_hint.to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                session_anchor.to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+        ];
+        let (_, _, prompt_sections) = build_system_message_with_dynamic_sections(
             &["bash", "read_file"],
-            &dynamic_desc,
+            &dynamic_sections,
             0.8,
             Some("implementation"),
             &PromptCacheConfig::latch("openai", "gpt-4"),
@@ -2437,6 +2521,8 @@ mod tests {
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(!breakdown.context_signals.effort_hint);
         assert!(!breakdown.context_signals.agent_type_hint);
+        assert!(breakdown.environment_tokens > 0);
+        assert!(breakdown.user_preferences_tokens > 0);
     }
 
     #[test]
