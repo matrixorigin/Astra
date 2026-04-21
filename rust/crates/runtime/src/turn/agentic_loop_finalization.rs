@@ -66,7 +66,9 @@ fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
     // Journal turn numbers should match the user-visible outer turn count.
     // The observability session tracks its own internal counter, which can
     // include sub-rounds and drift away from the REPL/session journal turn IDs.
-    (state.max_turns - state.remaining_turns).max(1) as u32
+    state
+        .session_turn
+        .max((state.max_turns - state.remaining_turns).max(1) as u32)
 }
 
 async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
@@ -711,6 +713,37 @@ mod tests {
             .expect("pending_context_assembly_trace should be set");
         assert_eq!(*turn_num, 3);
         assert_eq!(trace_json["turn_id"], "turn-3");
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_trace_prefers_session_turn_across_requests() {
+        let mut state = make_state();
+        state.max_turns = 10;
+        state.remaining_turns = 9; // first internal round of a new request
+        state.session_turn = 2; // second outer turn in the persisted session
+
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        session.write().unwrap().turn_number = 99;
+        state.current_session_id = Some("s1".to_string());
+        state.telemetry.observability_session = Some(session);
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(42_000);
+
+        finalize_turn_trace(&mut state).await;
+
+        let (turn_num, trace_json) = state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .expect("pending_context_assembly_trace should be set");
+        assert_eq!(*turn_num, 2);
+        assert_eq!(trace_json["turn_id"], "turn-2");
     }
 
     #[tokio::test]

@@ -608,12 +608,11 @@ impl ServerAgenticLoopHost {
             ApprovalBatchRequestEvent, build_approval_batch_required_event,
             build_approval_required_event,
         };
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
 
         let tool_calls = ensure_tool_call_ids(tool_calls);
         // 5-minute timeout: web clients may execute long-running tools.
         let ledger_wait = std::time::Duration::from_secs(300);
-        let mut approved_request_ids = HashSet::new();
         let mut results_by_id: HashMap<String, EdgeToolExecResult> = HashMap::new();
 
         for batch in collect_approval_batches(&tool_calls) {
@@ -642,121 +641,144 @@ impl ServerAgenticLoopHost {
                     &requests,
                 )));
             }
+        }
 
-            for item in &batch.items {
-                if let Err(denied) = wait_approval_ledger_for_tool(
+        let mut block_start = 0;
+        while block_start < tool_calls.len() {
+            let approval_required =
+                cloud_tool_requires_approval_for_delivery(&tool_calls[block_start]);
+            let mut block_end = block_start + 1;
+            while block_end < tool_calls.len()
+                && cloud_tool_requires_approval_for_delivery(&tool_calls[block_end])
+                    == approval_required
+            {
+                block_end += 1;
+            }
+
+            let block = &tool_calls[block_start..block_end];
+            let mut executable_calls = Vec::new();
+            if approval_required {
+                for tc in block {
+                    let Some(tc_map) = tc.as_object() else {
+                        continue;
+                    };
+                    let request_id = tc_map
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let tool_name = tc_map
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let args = tc_map
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if let Err(denied) = wait_approval_ledger_for_tool(
+                        &self.edge_callback_ledger,
+                        &self.user_id,
+                        tc,
+                        ledger_wait,
+                        None,
+                    )
+                    .await
+                    {
+                        for m in denied.sse_maps {
+                            self.emit_event(Value::Object(m));
+                        }
+                        results_by_id.insert(
+                            request_id.clone(),
+                            EdgeToolExecResult {
+                                request_id,
+                                tool: tool_name,
+                                args,
+                                output: "Tool execution denied or timed out".to_string(),
+                                tool_result_fields: None,
+                                status: "error".to_string(),
+                                duration_ms: 0,
+                            },
+                        );
+                        continue;
+                    }
+                    executable_calls.push(tc);
+                }
+            } else {
+                executable_calls.extend(block.iter());
+            }
+
+            for tc in &executable_calls {
+                for m in sse_maps_through_tool_request(tc) {
+                    self.emit_event(Value::Object(m));
+                }
+            }
+
+            for tc in executable_calls {
+                let tc_map = match tc.as_object() {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let id = tc_map
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = tc_map
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = tc_map
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let started = std::time::Instant::now();
+                let delivery = wait_tool_result_ledger_for_tool(
                     &self.edge_callback_ledger,
                     &self.user_id,
-                    &item.tool_call,
+                    tc,
                     ledger_wait,
-                    None,
                 )
-                .await
-                {
-                    for m in denied.sse_maps {
-                        self.emit_event(Value::Object(m));
-                    }
-                    results_by_id.insert(
-                        item.request_id.clone(),
-                        EdgeToolExecResult {
-                            request_id: item.request_id.clone(),
-                            tool: item.tool_name.clone(),
-                            args: item
-                                .tool_call
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                            output: "Tool execution denied or timed out".to_string(),
-                            tool_result_fields: None,
-                            status: "error".to_string(),
-                            duration_ms: 0,
-                        },
-                    );
-                    continue;
+                .await;
+                let duration_ms = started.elapsed().as_millis() as u64;
+
+                for m in delivery.sse_maps {
+                    self.emit_event(Value::Object(m));
                 }
-                approved_request_ids.insert(item.request_id.clone());
-            }
-        }
 
-        let executable_calls: Vec<_> = tool_calls
-            .iter()
-            .filter(|tc| {
-                let Some(tc_map) = tc.as_object() else {
-                    return false;
+                let output = delivery
+                    .tool_messages
+                    .first()
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let status = if output.contains("status=error") {
+                    "error"
+                } else {
+                    "ok"
                 };
-                let request_id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
-                !cloud_tool_requires_approval_for_delivery(tc)
-                    || approved_request_ids.contains(request_id)
-            })
-            .collect();
 
-        for tc in &executable_calls {
-            for m in sse_maps_through_tool_request(tc) {
-                self.emit_event(Value::Object(m));
-            }
-        }
-
-        for tc in executable_calls {
-            let tc_map = match tc.as_object() {
-                Some(m) => m,
-                None => continue,
-            };
-            let id = tc_map
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let tool_name = tc_map
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let args = tc_map
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let started = std::time::Instant::now();
-            let delivery = wait_tool_result_ledger_for_tool(
-                &self.edge_callback_ledger,
-                &self.user_id,
-                tc,
-                ledger_wait,
-            )
-            .await;
-            let duration_ms = started.elapsed().as_millis() as u64;
-
-            for m in delivery.sse_maps {
-                self.emit_event(Value::Object(m));
+                results_by_id.insert(
+                    id.clone(),
+                    EdgeToolExecResult {
+                        request_id: id,
+                        tool: tool_name,
+                        args,
+                        output,
+                        tool_result_fields: None,
+                        status: status.to_string(),
+                        duration_ms,
+                    },
+                );
             }
 
-            let output = delivery
-                .tool_messages
-                .first()
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let status = if output.contains("status=error") {
-                "error"
-            } else {
-                "ok"
-            };
-
-            results_by_id.insert(
-                id.clone(),
-                EdgeToolExecResult {
-                    request_id: id,
-                    tool: tool_name,
-                    args,
-                    output,
-                    tool_result_fields: None,
-                    status: status.to_string(),
-                    duration_ms,
-                },
-            );
+            block_start = block_end;
         }
 
         let mut results = Vec::with_capacity(tool_calls.len());
@@ -2462,6 +2484,116 @@ mod tests {
         assert_eq!(results[1].request_id, "w2");
         assert_eq!(results[0].status, "ok");
         assert_eq!(results[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn deliver_edge_tools_does_not_block_later_read_only_block_on_future_approval_block() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-mixed".to_string(),
+            "s-mixed".to_string(),
+        )
+        .build();
+        let ledger = host.edge_callback_ledger.clone();
+        let tool_calls = vec![
+            json!({
+                "id": "r1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+            }),
+            json!({
+                "id": "w1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"1"}"#}
+            }),
+            json!({
+                "id": "r2",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"c.rs"}"#}
+            }),
+            json!({
+                "id": "w2",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"d.rs","content":"2"}"#}
+            }),
+        ];
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "r1"),
+                json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                approval_callback_key("u-mixed", "w1"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-b"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "r2"),
+                json!({"body": {"request_id": "r2", "status": "ok", "output": "read-c"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                approval_callback_key("u-mixed", "w2"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "w2"),
+                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-d"}}),
+            );
+        });
+
+        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+
+        let request_ids: Vec<_> = host
+            .emitted_events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
+            .filter_map(|event| event.get("request_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(request_ids, vec!["r1", "w1", "r2", "w2"]);
+
+        let w1_end = host
+            .emitted_events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                    && event.get("call_id").and_then(Value::as_str) == Some("w1")
+            })
+            .expect("w1 tool_call_end");
+        let r2_request = host
+            .emitted_events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && event.get("request_id").and_then(Value::as_str) == Some("r2")
+            })
+            .expect("r2 tool_request");
+        let w2_request = host
+            .emitted_events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && event.get("request_id").and_then(Value::as_str) == Some("w2")
+            })
+            .expect("w2 tool_request");
+        assert!(r2_request > w1_end);
+        assert!(r2_request < w2_request);
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].request_id, "r1");
+        assert_eq!(results[1].request_id, "w1");
+        assert_eq!(results[2].request_id, "r2");
+        assert_eq!(results[3].request_id, "w2");
     }
 
     // ── Mock host tests for agentic loop integration ───────────────────────

@@ -1723,6 +1723,133 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     assert!(!text.is_empty(), "expected final text");
 }
 
+#[tokio::test]
+async fn approval_batch_does_not_block_earlier_read_only_request() {
+    init_env();
+    let (app, _) = build_test_app();
+
+    let payload = json!({
+        "message": "Read first, then write both files",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "tc-read-first",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\": \"/tmp/in.txt\"}"
+                            }
+                        },
+                        {
+                            "id": "tc-write-a",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\": \"/tmp/a.txt\", \"content\": \"A\"}"
+                            }
+                        },
+                        {
+                            "id": "tc-write-b",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\": \"/tmp/b.txt\", \"content\": \"B\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "full_text": "Done."
+                }
+            ],
+            "edge_tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read file",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "description": "Write file",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }
+            ]
+        }
+    });
+
+    let resp = chat_stream_start(&app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    let approval = wait_for_sse(&mut rx, "approval_batch_required", 5).await;
+    let approval_ids: Vec<_> = approval["requests"]
+        .as_array()
+        .expect("approval requests")
+        .iter()
+        .filter_map(|req| req.get("request_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(approval_ids, vec!["tc-write-a", "tc-write-b"]);
+
+    let read_request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(
+        read_request["request_id"].as_str(),
+        Some("tc-read-first"),
+        "earlier read-only call should execute before later approval-gated block"
+    );
+    let st = post_tool_result(&app, "tc-read-first", "read-ok", "ok").await;
+    assert_eq!(st, 200, "read-only tool result POST failed");
+
+    let st = post_approval_respond(&app, "tc-write-a", "allow").await;
+    assert_eq!(st, 200, "first approval POST failed");
+    let st = post_approval_respond(&app, "tc-write-b", "allow").await;
+    assert_eq!(st, 200, "second approval POST failed");
+
+    let write_request_a = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
+    let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "ok").await;
+    assert_eq!(st, 200, "first write result POST failed");
+
+    let write_request_b = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
+    let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "ok").await;
+    assert_eq!(st, 200, "second write result POST failed");
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+
+    let read_request_pos = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("tool_request")
+                && event.get("request_id").and_then(Value::as_str) == Some("tc-read-first")
+        })
+        .expect("read tool_request");
+    let first_write_request_pos = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("tool_request")
+                && event.get("request_id").and_then(Value::as_str) == Some("tc-write-a")
+        })
+        .expect("first write tool_request");
+    assert!(
+        read_request_pos < first_write_request_pos,
+        "read-only request should be emitted before the later approval-gated block"
+    );
+    assert!(
+        !find_events(&events, "text_delta").is_empty(),
+        "expected final text after approval batch completes"
+    );
+}
+
 // ── Approval denied → error result ──────────────────────────────────────────
 
 #[tokio::test]

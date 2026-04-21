@@ -38,7 +38,9 @@ use std::{
 };
 
 use astra_core::SharedPool;
-use astra_services::session_journal::ToolCallRecord;
+use astra_services::session_journal::{
+    JournalWriter, LlmRoundRecord, ToolCallRecord, TurnEventBuffer,
+};
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -530,6 +532,11 @@ impl InProcessChatTurnBridge {
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             let run_id = uuid::Uuid::new_v4().to_string();
+            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
+            let mut turn_event_buffer = TurnEventBuffer::begin_turn(
+                (!session_id.is_empty()).then_some(session_id.as_str()),
+                trace_turn,
+            );
             // Emit session_info first
             yield render_sse(&inprocess_session_info_event(&session_id, &run_id));
 
@@ -1600,6 +1607,33 @@ impl InProcessChatTurnBridge {
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
                 }
+                turn_event_buffer.record_llm_round(LlmRoundRecord {
+                    ttft_ms: None,
+                    duration_ms: round_ms as u64,
+                    prompt_tokens: usage
+                        .get("prompt")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0),
+                    completion_tokens: usage
+                        .get("completion")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0),
+                    cache_read_tokens: usage
+                        .get("cache_read")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0),
+                    tool_calls_returned: loop_tool_calls.len().min(u32::MAX as usize) as u32,
+                    tool_call_names: loop_tool_calls
+                        .iter()
+                        .filter_map(tool_call_name)
+                        .map(ToString::to_string)
+                        .collect(),
+                    finish_reason: Some(if loop_tool_calls.is_empty() {
+                        "stop".to_string()
+                    } else {
+                        "tool_calls".to_string()
+                    }),
+                });
 
                 // ── Cache break detection ──
                 {
@@ -1839,6 +1873,32 @@ impl InProcessChatTurnBridge {
                 }
             });
 
+            if !turn_event_buffer.is_empty() && !session_id.is_empty() {
+                let journal_sid = session_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let writer = match JournalWriter::new(&journal_sid) {
+                        Ok(writer) => writer,
+                        Err(error) => {
+                            astra_core::agent_warn!(
+                                "bridge",
+                                "failed to create journal writer for llm_round flush: session={} error={}",
+                                journal_sid,
+                                error
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(error) = turn_event_buffer.flush(&writer) {
+                        astra_core::agent_warn!(
+                            "bridge",
+                            "failed to flush llm_round events: session={} error={}",
+                            journal_sid,
+                            error
+                        );
+                    }
+                });
+            }
+
             // Hook side effects: decision audit, skill selection, implicit feedback, reflection
             {
                 let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
@@ -1931,7 +1991,6 @@ impl InProcessChatTurnBridge {
                         .and_then(Value::as_u64)
                 })
                 .sum();
-            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
             let trace_signal = build_legacy_context_trace_signal(
                 trace_turn,
                 format!("turn-{trace_turn}"),

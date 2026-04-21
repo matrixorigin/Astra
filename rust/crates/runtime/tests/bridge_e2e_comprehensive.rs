@@ -25,6 +25,7 @@ use astra_runtime::{
     TurnHookDbPersistPlan, TurnHookDbWriter, TurnSessionActivityWriter, TurnToolEventPersistPlan,
     TurnToolEventWriter, build_app, turn::bridge_inprocess::InProcessChatTurnBridge,
 };
+use astra_services::session_journal::{JournalEventType, journal_file_path, read_journal};
 use async_trait::async_trait;
 use axum::{
     Router,
@@ -424,6 +425,18 @@ fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+async fn wait_for_journal(session_id: &str) -> Vec<astra_services::session_journal::JournalEvent> {
+    for _ in 0..50 {
+        if let Ok(events) = read_journal(session_id)
+            && !events.is_empty()
+        {
+            return events;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    read_journal(session_id).unwrap_or_default()
+}
+
 #[derive(Clone)]
 struct BridgeTurnScenario {
     name: &'static str,
@@ -565,6 +578,54 @@ async fn run_bridge_turn_scenario(case: BridgeTurnScenario) {
             tool_name
         );
     }
+}
+
+#[tokio::test]
+async fn bridge_turn_persists_llm_round_journal_event() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap);
+    let session_id = format!("bridge-llm-round-{}", uuid::Uuid::new_v4());
+    let journal_path = journal_file_path(&session_id);
+    let _ = std::fs::remove_file(&journal_path);
+
+    let payload = json!({
+        "agent_id": "matrix-llm-round",
+        "session_id": session_id,
+        "messages": [{ "role": "user", "content": "inspect README" }],
+        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
+        "test_llm_rounds": [{
+            "tool_calls": [tool_call("tc-bridge-round", "read_file", json!({"path": "README.md"}))],
+            "usage": { "prompt": 321, "completion": 45, "cache_read": 7, "total": 373 }
+        }]
+    });
+
+    let (st, raw) = chat_turn(&app, payload).await;
+    assert_eq!(st, StatusCode::OK, "request should succeed");
+    let events = parse_sse_events(&raw);
+    assert_eq!(events_of_type(&events, "tool_request").len(), 1);
+
+    let journal_events = wait_for_journal(&session_id).await;
+    let llm_round = journal_events
+        .iter()
+        .find(|event| event.event_type == JournalEventType::LlmRound)
+        .expect("llm_round event should be persisted");
+    assert_eq!(llm_round.turn, Some(1));
+    assert_eq!(llm_round.round, Some(0));
+    assert_eq!(llm_round.tokens_in, Some(321));
+    assert_eq!(llm_round.tokens_out, Some(45));
+    assert_eq!(llm_round.cache_read_tokens, Some(7));
+    assert_eq!(llm_round.tool_calls_returned, Some(1));
+    let tool_names = llm_round
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("tool_call_names"))
+        .and_then(Value::as_array)
+        .expect("tool_call_names metadata");
+    assert_eq!(tool_names.len(), 1);
+    assert_eq!(tool_names[0].as_str(), Some("read_file"));
+
+    let _ = std::fs::remove_file(journal_path);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

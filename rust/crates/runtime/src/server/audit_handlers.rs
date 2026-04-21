@@ -154,7 +154,7 @@ pub(super) async fn audit_mutation_state_handler(
                 agent_version: None,
                 parent_event_id: None,
                 parent_event_ids: Some(Vec::new()),
-                causal_chain_id: Some(format!("{session_id}:mutation:{mutation_id}")),
+                causal_chain_id: Some(format!("mutation:{mutation_id}")),
                 metadata: Some(serde_json::json!({
                     "mutation_id": mutation_id,
                     "state": body.state,

@@ -827,6 +827,29 @@ impl PostLoopPersistContext {
     }
 }
 
+fn server_loop_causal_chain_id(kind: &str) -> String {
+    let chain_id = format!("{kind}:{}", Uuid::now_v7());
+    debug_assert!(
+        chain_id.len() <= 64,
+        "server loop causal_chain_id must fit agent_events VARCHAR(64)"
+    );
+    chain_id
+}
+
+async fn infer_session_turn(shared_pool: Option<&SharedPool>, session_id: &str) -> u32 {
+    let Some(shared_pool) = shared_pool else {
+        return 1;
+    };
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+    )
+    .bind(session_id)
+    .fetch_one(shared_pool.get())
+    .await
+    .unwrap_or(0);
+    (count.max(0) as u32).saturating_add(1)
+}
+
 /// Persist `user_query` + `llm_response` core events to `agent_events` after
 /// the server-driven agentic loop completes.  This closes the persistence gap
 /// where the bridge path (`/chat/turn`) wrote these events but the server loop
@@ -842,15 +865,16 @@ async fn persist_server_loop_core_events(
     state: &AgenticLoopState,
     model_name: Option<&str>,
 ) {
-    // Skip when no DB pool is available (test/offline mode) or nothing to persist.
-    let Some(pool) = shared_pool else { return };
     if user_message.is_empty() && state.final_text.is_empty() {
         return;
     }
 
-    let writer = DatabaseTurnCoreEventWriter::new(matrixone.clone()).with_pool(pool.clone());
+    let writer = match shared_pool {
+        Some(pool) => DatabaseTurnCoreEventWriter::new(matrixone.clone()).with_pool(pool.clone()),
+        None => DatabaseTurnCoreEventWriter::new(matrixone.clone()),
+    };
 
-    let chain_id = format!("{session_id}:server-loop:{}", Uuid::now_v7());
+    let chain_id = server_loop_causal_chain_id("server-loop");
     let user_query_event_id = Uuid::now_v7().to_string();
 
     let user_query_event = if !user_message.is_empty() {
@@ -932,7 +956,7 @@ async fn persist_server_loop_tool_events(
         return;
     }
 
-    let chain_id = format!("{session_id}:server-loop-tools:{}", Uuid::now_v7());
+    let chain_id = server_loop_causal_chain_id("server-loop-tools");
     let mut events = Vec::with_capacity(state.telemetry.all_tools_used.len());
 
     for tool_name in &state.telemetry.all_tools_used {
@@ -1053,7 +1077,10 @@ async fn fire_server_loop_observer(
         return;
     }
 
-    let turn_count = state.max_turns.saturating_sub(state.remaining_turns) as i64;
+    let turn_count = state
+        .session_turn
+        .max(state.max_turns.saturating_sub(state.remaining_turns) as u32)
+        as i64;
     let request = TurnObserverRequest {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
@@ -2018,6 +2045,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
+        loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
             &cancel_flag,
@@ -2296,6 +2324,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let mut state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
+        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
 
@@ -3664,17 +3693,26 @@ mod tests {
             .stream_chat("user-1".into(), test_request("hello"))
             .await);
 
-        let status = ok(svc
-            .get_run_status(stream.run_id.clone(), "user-1".into())
-            .await);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let status = ok(svc
+                    .get_run_status(stream.run_id.clone(), "user-1".into())
+                    .await);
+                if status.status != "running" {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timeout waiting for stream_chat status to finish");
         let replay = ok(svc
             .stream_run(stream.run_id.clone(), "user-1".into(), 0)
             .await);
 
-        assert_ne!(status.status, "running");
         assert_eq!(status.run_id, stream.run_id);
-        assert_eq!(status.events_count as usize, stream.events.len());
-        assert_eq!(replay.len(), stream.events.len());
+        assert!(status.events_count > 0);
+        assert_eq!(replay.len(), status.events_count as usize);
         assert_eq!(replay[0]["event_type"], "run_started");
         assert_eq!(
             svc.test_llm_cancel_token_is_cancelled(&stream.run_id).await,
@@ -4151,6 +4189,12 @@ mod tests {
         assert_eq!(RunStatus::Paused.as_str(), "paused");
     }
 
+    #[test]
+    fn server_loop_causal_chain_ids_fit_agent_event_column() {
+        assert!(server_loop_causal_chain_id("server-loop").len() <= 64);
+        assert!(server_loop_causal_chain_id("server-loop-tools").len() <= 64);
+    }
+
     #[tokio::test]
     async fn pause_run_transitions_running_to_paused() {
         let svc = test_service();
@@ -4313,10 +4357,27 @@ mod tests {
             .await);
 
         let engine = svc.run_engine.as_ref().unwrap();
-        let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+                if durable.status != "running"
+                    && matches!(
+                        durable
+                            .events
+                            .last()
+                            .and_then(|event| event["event_type"].as_str()),
+                        Some("run_finished")
+                    )
+                {
+                    break durable;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timeout waiting for durable stream_chat final state");
         assert_eq!(durable.user_id, "user-1");
         assert_eq!(durable.session_id, stream.session_id);
-        assert_ne!(durable.status, "running");
         assert!(durable.events.len() >= 2);
         assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
     }
