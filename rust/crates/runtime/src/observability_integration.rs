@@ -136,6 +136,13 @@ pub struct ObservabilitySession {
     /// path after tuning the reflection threshold. Surfaced into the SelfModel
     /// so the agent passively "knows" how sensitive it currently is.
     pub last_guardrail_view: Option<crate::self_model::GuardrailView>,
+
+    /// Cumulative permission-denial pressure published by the CLI-side
+    /// `PermissionManager`. `None` when the CLI has not published yet (e.g.
+    /// headless runtime). Surfaced into the SelfModel so the agent perceives
+    /// its own session-wide rejection rate and can self-regulate before the
+    /// hard fallback threshold fires.
+    pub last_denial_pressure: Option<crate::self_model::DenialPressureView>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +256,7 @@ impl ObservabilitySession {
             previous_turn_user_cancelled: false,
             last_strategy_application: None,
             last_guardrail_view: None,
+            last_denial_pressure: None,
         }
     }
 
@@ -284,6 +292,7 @@ impl ObservabilitySession {
             previous_turn_user_cancelled: false,
             last_strategy_application: None,
             last_guardrail_view: None,
+            last_denial_pressure: None,
         }
     }
 

@@ -211,7 +211,7 @@ fn path_pattern_matches(pattern: &str, candidate: &str) -> bool {
 // ─── Denial Tracking ─────────────────────────────────────────────────────────
 
 /// Limits for denial tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DenialLimits {
     /// Max consecutive denials for the same fingerprint before fallback.
     pub max_consecutive: u32,
@@ -331,6 +331,12 @@ impl DenialTracker {
     #[must_use]
     pub fn total_denials(&self) -> u32 {
         self.total_denials
+    }
+
+    /// Configured denial limits (session-wide and per-fingerprint consecutive).
+    #[must_use]
+    pub fn limits(&self) -> DenialLimits {
+        self.limits
     }
 
     /// Reset all tracking state.

@@ -254,6 +254,18 @@ impl PermissionManager {
         self.mode
     }
 
+    /// Snapshot of cumulative denial pressure for the SelfModel surface.
+    /// Returns `(total_denials, max_total)` from the session-scoped
+    /// [`DenialTracker`]. Surfaced to the agent via `SelfModel` so it can
+    /// self-regulate (narrow scope / ask user) before the hard
+    /// fallback-to-user threshold actually fires.
+    pub(super) fn denial_pressure(&self) -> (u32, u32) {
+        (
+            self.denial_tracker.total_denials(),
+            self.denial_tracker.limits().max_total,
+        )
+    }
+
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
     pub(super) fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;

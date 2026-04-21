@@ -1556,6 +1556,9 @@ impl ToolExecutor {
         if let Some(g) = session.last_guardrail_view.clone() {
             snapshot = snapshot.with_guardrail(g);
         }
+        if let Some(dp) = session.last_denial_pressure {
+            snapshot = snapshot.with_denial_pressure(dp);
+        }
         Some(snapshot)
     }
 }
