@@ -319,8 +319,17 @@ pub fn merge_tool_health(
                 } else {
                     false // tie → local wins
                 };
+                let mut merged_entry = if use_cloud {
+                    cloud_entry.clone()
+                } else {
+                    local_entry.clone()
+                };
+                merged_entry.recent_outcomes = merge_recent_outcomes(
+                    &local_entry.recent_outcomes,
+                    &cloud_entry.recent_outcomes,
+                );
+                by_name.insert(cloud_entry.name.clone(), merged_entry);
                 if use_cloud {
-                    by_name.insert(cloud_entry.name.clone(), cloud_entry.clone());
                     cloud_wins += 1;
                 }
             }
@@ -334,6 +343,48 @@ pub fn merge_tool_health(
 
     let merged: Vec<ToolHealthEntry> = by_name.into_values().collect();
     (merged, cloud_wins, cloud_only)
+}
+
+fn merge_recent_outcomes(
+    local: &[astra_pipeline::ToolOutcomeCacheEntry],
+    cloud: &[astra_pipeline::ToolOutcomeCacheEntry],
+) -> Vec<astra_pipeline::ToolOutcomeCacheEntry> {
+    use std::collections::HashMap;
+
+    let mut by_signature: HashMap<String, Vec<astra_pipeline::ToolOutcome>> = HashMap::new();
+    for source in [local, cloud] {
+        for entry in source {
+            by_signature
+                .entry(entry.signature.clone())
+                .or_default()
+                .extend(entry.outcomes.iter().copied());
+        }
+    }
+
+    let mut merged: Vec<_> = by_signature
+        .into_iter()
+        .filter_map(|(signature, mut outcomes)| {
+            outcomes.sort_by_key(|outcome| {
+                (
+                    outcome.at_epoch,
+                    outcome.result_hash,
+                    outcome.latency_ms,
+                    outcome.success,
+                )
+            });
+            outcomes.dedup();
+            if outcomes.len() > astra_pipeline::TOOL_OUTCOME_RING_CAPACITY {
+                let overflow = outcomes.len() - astra_pipeline::TOOL_OUTCOME_RING_CAPACITY;
+                outcomes.drain(..overflow);
+            }
+            (!outcomes.is_empty()).then_some(astra_pipeline::ToolOutcomeCacheEntry {
+                signature,
+                outcomes,
+            })
+        })
+        .collect();
+    merged.sort_by(|left, right| left.signature.cmp(&right.signature));
+    merged
 }
 
 /// Save learning state from shared modules to disk.
@@ -693,6 +744,7 @@ pub fn export_tool_health_delta(
                     || prev.total_failures != entry.total_failures
                     || (prev.failure_rate - entry.failure_rate).abs() > f64::EPSILON
                     || prev.last_updated_epoch != entry.last_updated_epoch
+                    || prev.recent_outcomes != entry.recent_outcomes
             }
             None => true,
         })
@@ -965,6 +1017,7 @@ mod tests {
                     total_failures: 3,
                     failure_rate: 0.3,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
                 ToolHealthEntry {
                     name: "read_file".to_string(),
@@ -972,6 +1025,7 @@ mod tests {
                     total_failures: 0,
                     failure_rate: 0.0,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
             ],
             active_canary: None,
@@ -1070,6 +1124,7 @@ mod tests {
                 total_failures: 4,
                 failure_rate: 0.8,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             }],
             active_canary: None,
         };
@@ -1092,6 +1147,7 @@ mod tests {
                 total_failures: 2,
                 failure_rate: 2.0 / 7.0,
                 last_updated_epoch: 123,
+                recent_outcomes: vec![],
             }],
         };
         save_sync_metadata_to(&path, &metadata).unwrap();
@@ -1242,6 +1298,7 @@ mod tests {
             total_failures: 1,
             failure_rate: 1.0 / 3.0,
             last_updated_epoch: 42,
+            recent_outcomes: vec![],
         }];
         let delta = export_tool_health_delta(&entries, &entries);
         assert!(delta.is_empty());
@@ -1255,6 +1312,7 @@ mod tests {
             total_failures: 1,
             failure_rate: 1.0 / 3.0,
             last_updated_epoch: 42,
+            recent_outcomes: vec![],
         }];
         let current = vec![ToolHealthEntry {
             name: "bash".to_string(),
@@ -1262,9 +1320,54 @@ mod tests {
             total_failures: 1,
             failure_rate: 0.25,
             last_updated_epoch: 99,
+            recent_outcomes: vec![],
         }];
         let delta = export_tool_health_delta(&current, &baseline);
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0].get("name").and_then(|v| v.as_str()), Some("bash"));
+    }
+
+    #[test]
+    fn merge_tool_health_unions_recent_outcomes_for_same_tool() {
+        let local = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 4,
+            total_failures: 1,
+            failure_rate: 0.25,
+            last_updated_epoch: 100,
+            recent_outcomes: vec![astra_pipeline::ToolOutcomeCacheEntry {
+                signature: "bash:{\"cmd\":\"ls\"}".to_string(),
+                outcomes: vec![astra_pipeline::ToolOutcome {
+                    success: true,
+                    latency_ms: 10,
+                    result_hash: 111,
+                    at_epoch: 10,
+                }],
+            }],
+        }];
+        let cloud = vec![ToolHealthEntry {
+            name: "bash".to_string(),
+            total_calls: 5,
+            total_failures: 1,
+            failure_rate: 0.2,
+            last_updated_epoch: 200,
+            recent_outcomes: vec![astra_pipeline::ToolOutcomeCacheEntry {
+                signature: "bash:{\"cmd\":\"pwd\"}".to_string(),
+                outcomes: vec![astra_pipeline::ToolOutcome {
+                    success: true,
+                    latency_ms: 12,
+                    result_hash: 222,
+                    at_epoch: 20,
+                }],
+            }],
+        }];
+
+        let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
+        assert_eq!(cloud_wins, 1);
+        assert_eq!(cloud_only, 0);
+        assert_eq!(merged.len(), 1);
+        let bash = &merged[0];
+        assert_eq!(bash.total_calls, 5);
+        assert_eq!(bash.recent_outcomes.len(), 2);
     }
 }

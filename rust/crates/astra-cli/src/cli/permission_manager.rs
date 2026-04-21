@@ -11,7 +11,58 @@ use astra_runtime::turn::tool_argument_hints::{
 use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
 use astra_thin_client::ApprovalKind;
 
-/// Build a content-aware fingerprint from tool name and arguments.
+/// Classify a permission-denial reason and emit a short, actionable
+/// **safe-alternative** hint the agent can act on. The runtime never
+/// decides *what* the model should do instead — it just surfaces a
+/// concrete, pattern-matched suggestion so a denial is more than an
+/// opaque error string. Returns `None` when no obvious alternative
+/// applies (caller renders the bare reason).
+pub(super) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
+    let lower = reason.to_lowercase();
+    if lower.contains("sensitive path") {
+        Some(
+            "Write to a workspace-local path instead (e.g. under the current project tree), \
+             or set allow_sensitive_path_writes=true in .kiro/permissions.json to opt in.",
+        )
+    } else if lower.contains("git safety") || lower.contains("force push") {
+        Some(
+            "Use a non-forcing git operation (plain `git push`, `git commit`) or open a PR \
+             via `gh` instead of rewriting protected history.",
+        )
+    } else if lower.contains("shell_obfuscation")
+        || lower.contains("dangerous command")
+        || lower.contains("dangerous pattern")
+    {
+        Some(
+            "Invoke the binary directly with explicit arguments instead of wrapping in \
+             `eval`/backticks/`$(...)`; avoid chained control operators (`;`, `&&`, `||`).",
+        )
+    } else if lower.contains("blocked by default") {
+        Some(
+            "This tool requires an explicit allowlist entry. Either use a safer alternative \
+             tool for the same goal, or ask the user to approve adding a rule.",
+        )
+    } else if lower.contains("sandbox expansion") {
+        Some(
+            "Stay within the current sandbox workspace; if broader access is essential, \
+             request explicit approval before retrying.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Build the agent-visible error body for a denied tool call: wraps the
+/// raw reason and appends a structured safe-alternative hint when one
+/// applies. Kept as a free function so call sites (stream_render) remain
+/// a one-liner.
+pub(super) fn format_denied_message(reason: &str) -> String {
+    match safe_alternative_for(reason) {
+        Some(alt) => format!("Error: {reason}\nSafe alternative: {alt}"),
+        None => format!("Error: {reason}"),
+    }
+}
+
 ///
 /// For shell/execute tools, extracts the command prefix (e.g. `git commit`).
 /// For file/write tools, extracts the path pattern (e.g. `src/turn/**`).
@@ -160,6 +211,12 @@ pub(super) struct PermissionSettings {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Hard-boundary opt-in: allow Auto mode to bypass approval for sensitive
+    /// file paths (e.g. `.git/`, `.ssh/`, shell configs). Default `false` —
+    /// even in Auto mode, sensitive-path writes require explicit approval
+    /// unless the user sets this to `true` at project or user scope.
+    #[serde(default)]
+    pub allow_sensitive_path_writes: bool,
 }
 
 impl PermissionSettings {
@@ -1409,15 +1466,31 @@ impl PermissionManager {
             }
         }
 
-        // Step 5: Dangerous file path — respects Auto mode (user explicitly opted in).
+        // Step 5: Dangerous file path — respects Auto mode only when the user
+        // has explicitly opted in via `allow_sensitive_path_writes` (hard
+        // boundary: default strict even in Auto, so "模型绝不能越过" holds
+        // unless the operator has flipped the opt-in).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             match self.mode {
                 PermissionMode::Auto => {
-                    astra_core::agent_warn!(
-                        "permission",
-                        "Auto mode allowed write to sensitive path: tool={name} warning={warning}"
-                    );
-                    return PermissionDecision::Allow;
+                    let opted_in = self.settings.allow_sensitive_path_writes
+                        || self.user_settings.allow_sensitive_path_writes;
+                    if opted_in {
+                        astra_core::agent_warn!(
+                            "permission",
+                            "Auto mode allowed write to sensitive path (opt-in): tool={name} warning={warning}"
+                        );
+                        return PermissionDecision::Allow;
+                    }
+                    let (header, detail) = Self::format_tool_display(name, args);
+                    return PermissionDecision::NeedApproval {
+                        tool: name.to_string(),
+                        header,
+                        detail,
+                        reason: format!(
+                            "{warning} (Auto mode is strict for sensitive paths; set allow_sensitive_path_writes=true in .kiro/permissions.json to opt in)"
+                        ),
+                    };
                 }
                 PermissionMode::Deny => {
                     return PermissionDecision::Deny("Sensitive path (deny mode)".into());
@@ -1660,6 +1733,59 @@ mod tests {
     }
 
     // ── classify ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_alternative_covers_sensitive_path_denial() {
+        let out = super::safe_alternative_for("Sensitive path (deny mode)").unwrap();
+        assert!(
+            out.contains("allow_sensitive_path_writes"),
+            "safe alt must name the opt-in flag: {out}"
+        );
+    }
+
+    #[test]
+    fn safe_alternative_covers_git_force_push() {
+        let out = super::safe_alternative_for("Git safety violation: force push").unwrap();
+        assert!(
+            out.to_lowercase().contains("non-forcing") || out.contains("plain `git push`"),
+            "safe alt must steer away from force push: {out}"
+        );
+    }
+
+    #[test]
+    fn safe_alternative_covers_shell_obfuscation() {
+        let out =
+            super::safe_alternative_for("Dangerous pattern: shell_obfuscation detected (eval)")
+                .unwrap();
+        assert!(
+            out.contains("eval"),
+            "safe alt must mention eval specifically: {out}"
+        );
+    }
+
+    #[test]
+    fn safe_alternative_returns_none_for_unknown_reason() {
+        assert!(super::safe_alternative_for("some unrelated error").is_none());
+    }
+
+    #[test]
+    fn format_denied_message_appends_safe_alt_when_matched() {
+        let out = super::format_denied_message("Sensitive path (deny mode)");
+        assert!(
+            out.starts_with("Error: Sensitive path"),
+            "must preserve the raw error line: {out}"
+        );
+        assert!(
+            out.contains("Safe alternative:"),
+            "must append the labeled alternative: {out}"
+        );
+    }
+
+    #[test]
+    fn format_denied_message_omits_label_when_no_alt_known() {
+        let out = super::format_denied_message("some unrelated error");
+        assert_eq!(out, "Error: some unrelated error");
+    }
 
     #[test]
     fn resolve_cloud_approval_quiet_denies_without_auto() {
@@ -2316,15 +2442,24 @@ mod tests {
 
     #[test]
     fn session_override_cannot_bypass_dangerous_path() {
-        // In Auto mode, dangerous-path writes are allowed because the user
-        // explicitly opted in to unattended execution.
+        // Hard boundary: Auto mode is strict on sensitive paths by default,
+        // even with a session override — operator must flip the explicit
+        // `allow_sensitive_path_writes` opt-in to proceed unattended.
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "Auto mode should allow dangerous path writes: got {decision:?}"
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "Auto mode must require approval for sensitive paths by default: got {decision:?}"
+        );
+
+        // Opt-in unlocks it.
+        pm.settings.allow_sensitive_path_writes = true;
+        let decision2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision2, PermissionDecision::Allow),
+            "opt-in should unlock Auto mode sensitive writes: got {decision2:?}"
         );
     }
 
@@ -2478,6 +2613,7 @@ mod tests {
         let settings = PermissionSettings {
             allow: vec!["Bash(cargo:*)".to_string()],
             deny: vec!["Bash(rm:*)".to_string()],
+            allow_sensitive_path_writes: false,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         fs::write(&path, json).unwrap();
@@ -3089,6 +3225,32 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(options, built_options);
+    }
+
+    #[test]
+    fn auto_mode_strict_on_sensitive_path_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        // Target .ssh/id_rsa — sensitive by DANGEROUS_FILE_PATHS rule.
+        let args = serde_json::json!({"path": ".ssh/id_rsa", "content": "x"});
+        let d = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d, PermissionDecision::NeedApproval { .. }),
+            "Auto mode must be strict on sensitive paths by default, got {d:?}"
+        );
+
+        // Non-sensitive path still auto-allowed.
+        let safe = serde_json::json!({"path": "src/foo.rs", "content": "x"});
+        let d2 = pm.check_nonblocking("write_file", &safe);
+        assert!(matches!(d2, PermissionDecision::Allow));
+
+        // Opt-in via project settings flips it to Allow.
+        pm.settings.allow_sensitive_path_writes = true;
+        let d3 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d3, PermissionDecision::Allow),
+            "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
+        );
     }
 
     // ── check_nonblocking after set_mode(Auto) ───────────────────────────────

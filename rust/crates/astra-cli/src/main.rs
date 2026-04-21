@@ -243,7 +243,7 @@ use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
 use repl_runtime::{
     build_repl_editor, check_server_has_models, create_tool_selector, create_tool_selector_quiet,
     create_tool_selector_with_quality, current_access_token, initialize_repl_state,
-    print_repl_banner, try_silent_auth,
+    maybe_restore_pending_plan_mode, print_repl_banner, try_silent_auth,
 };
 use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
@@ -499,7 +499,9 @@ async fn run_chat_repl(
                             )
                             .await?;
                         }
-                    } else if state.plan_mode.is_some() {
+                    } else if state.plan_mode.is_some()
+                        || maybe_restore_pending_plan_mode(&line, &mut state)
+                    {
                         // Plan mode: handle input as plan editing
                         match handle_plan_mode_input(
                             line.clone(),
@@ -1845,6 +1847,7 @@ mod tests {
                     total_failures: 3,
                     failure_rate: 0.2,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
                 astra_runtime::pipeline::persistence::ToolHealthEntry {
                     name: "grep".into(),
@@ -1852,6 +1855,7 @@ mod tests {
                     total_failures: 0,
                     failure_rate: 0.0,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
             ],
             ..Default::default()
@@ -1875,6 +1879,7 @@ mod tests {
                 total_failures: 5,
                 failure_rate: 0.5,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             }],
             ..Default::default()
         };

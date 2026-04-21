@@ -18,7 +18,7 @@ use crate::error_recovery::{self, EscalationLevel, SessionErrorSummary};
 use crate::result_quality::{self, ResultQuality};
 use crate::stall::{self, DivergenceStatus, StallReflection};
 use crate::tool_call_shape::tool_call_name;
-use crate::tool_health::ToolHealthTracker;
+use crate::tool_health::{self, ToolHealthTracker};
 
 /// Actionable verdict for the current turn.
 #[derive(Debug, Clone)]
@@ -236,6 +236,26 @@ impl TurnGuard {
     /// Neutral for health — the tool didn't actually execute.
     pub fn record_cache_hit(&mut self, tool_name: &str) {
         self.health.record_cache_hit(tool_name);
+    }
+
+    /// Append a `ToolOutcome` to the per-`(tool, args)` outcome cache.
+    ///
+    /// This is a cross-turn session-local record of what happened when this
+    /// exact signature ran. Callers should supply `sig` from
+    /// [`tool_result_semantics::tool_dedup_signature`] so identical requests
+    /// collide into the same ring.
+    pub fn record_tool_outcome(
+        &mut self,
+        sig: &str,
+        quality: ResultQuality,
+        latency_ms: u64,
+        result_str: &str,
+    ) {
+        let success = !matches!(quality, ResultQuality::Error);
+        self.health.record_outcome(
+            sig,
+            tool_health::ToolOutcome::new(success, latency_ms, result_str),
+        );
     }
 
     /// Record that remaining tools were aborted due to step-level timeout.
@@ -759,6 +779,7 @@ mod tests {
             total_failures: 2,
             failure_rate: 0.67,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(
@@ -775,6 +796,7 @@ mod tests {
             total_failures: 7,
             failure_rate: 0.7,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
         let tracker = ToolHealthTracker::from_entries(&entries);
         assert!(tracker.is_deprioritized("mo_query"));

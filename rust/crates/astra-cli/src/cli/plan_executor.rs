@@ -474,6 +474,101 @@ fn is_credential_error(msg: &str) -> bool {
         || lower.contains("401")
 }
 
+/// Build a one-line evidence sentence naming the tools with the highest
+/// failure rates across the caller's `ToolHealthEntry` set, so the retry
+/// hint can steer away from known-failing tools rather than emitting a
+/// generic "try something different" message. Returns `None` when no
+/// tool crosses the `min_calls` bar.
+fn high_failure_tool_evidence(
+    entries: &[astra_runtime::pipeline::persistence::ToolHealthEntry],
+    top_k: usize,
+) -> Option<String> {
+    const MIN_CALLS: usize = 2;
+    const MIN_FAIL_RATE: f64 = 0.5;
+    let mut scored: Vec<_> = entries
+        .iter()
+        .filter(|e| e.total_calls >= MIN_CALLS && e.failure_rate >= MIN_FAIL_RATE)
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    scored.sort_by(|a, b| {
+        b.failure_rate
+            .partial_cmp(&a.failure_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let picks: Vec<String> = scored
+        .iter()
+        .take(top_k.max(1))
+        .map(|e| {
+            format!(
+                "{} ({:.0}% fail over {} calls)",
+                e.name,
+                e.failure_rate * 100.0,
+                e.total_calls
+            )
+        })
+        .collect();
+    Some(format!(
+        "5. Observed high-failure tools this session — prefer alternatives to: {}",
+        picks.join(", ")
+    ))
+}
+
+/// Render a structured diagnostic for subtask verifier failures so the next
+/// retry turn sees *why* acceptance-checks failed (criterion id + expected +
+/// evidence / error), instead of retrying blind. Returns `None` when all
+/// required criteria passed.
+fn render_verifier_failure_hint(
+    report: &astra_services::verification::SubtaskVerificationReport,
+) -> Option<String> {
+    let failed: Vec<_> = report.results.iter().filter(|r| !r.passed).collect();
+    if failed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(256);
+    out.push_str("⚠ Acceptance checks failed — address these before the next attempt:\n");
+    for r in failed.iter().take(5) {
+        let detail =
+            r.error
+                .as_deref()
+                .filter(|e| !e.is_empty())
+                .unwrap_or(if r.evidence.is_empty() {
+                    "<no evidence captured>"
+                } else {
+                    r.evidence.as_str()
+                });
+        let expected = if r.expected.is_empty() {
+            "passes".to_string()
+        } else {
+            r.expected.clone()
+        };
+        out.push_str(&format!(
+            "  - `{}`: expected {} · got {}\n",
+            r.criterion_id,
+            truncate_one_line(&expected, 120),
+            truncate_one_line(detail, 160),
+        ));
+    }
+    if failed.len() > 5 {
+        out.push_str(&format!(
+            "  ... plus {} more failed criteria\n",
+            failed.len() - 5
+        ));
+    }
+    Some(out)
+}
+
+fn truncate_one_line(s: &str, max: usize) -> String {
+    let single_line: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if single_line.chars().count() <= max {
+        single_line
+    } else {
+        let truncated: String = single_line.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
@@ -1173,6 +1268,18 @@ async fn plan_executor_task(
                         } else {
                             (true, None)
                         };
+                    // Capture a structured retry hint from the report before we
+                    // forward it on the channel — surfaces *which* acceptance
+                    // check failed (criterion id + expected vs evidence) to the
+                    // next retry turn instead of retrying blind.
+                    let verifier_retry_hint = if !verification_passed {
+                        verification_report
+                            .as_ref()
+                            .and_then(render_verifier_failure_hint)
+                    } else {
+                        None
+                    };
+                    let mut verifier_retry_pending = false;
                     if let Some(report) = verification_report {
                         let _ = update_tx.send(PlanUpdate::VerificationReport(report));
                     }
@@ -1273,6 +1380,7 @@ async fn plan_executor_task(
                                     failure_hint,
                                 );
                                 st.status = TaskStatus::Pending;
+                                verifier_retry_pending = true;
                             }
                             let event = session_journal::JournalEvent::verification_completed(
                                 ctx.session_id.as_deref(),
@@ -1286,6 +1394,15 @@ async fn plan_executor_task(
                         } else {
                             sink.subtask_verification_failed(next_id, &title, false, 0, 0, None);
                             st.status = TaskStatus::Pending;
+                        }
+                    }
+                    // After the mutable borrow of `ctx.plan.subtasks` ends,
+                    // stamp the verifier diagnostic as the retry turn's
+                    // strategy hint so the model sees *why* acceptance checks
+                    // failed instead of retrying blind.
+                    if verifier_retry_pending {
+                        if let Some(hint) = verifier_retry_hint {
+                            ctx.current_subtask_strategy_hint = Some(hint);
                         }
                     }
                 }
@@ -1341,7 +1458,8 @@ async fn plan_executor_task(
                     if *retry_count >= STRATEGY_ESCALATION_THRESHOLD
                         && *retry_count <= MAX_TURN_RETRIES
                     {
-                        let strategy_hint = format!(
+                        let evidence_line = high_failure_tool_evidence(&ctx.tool_health_entries, 3);
+                        let mut strategy_hint = format!(
                             "⚠ Subtask '{}' has failed {} times. Try a DIFFERENT approach:\n\
                              1. Break the task into smaller, simpler steps\n\
                              2. Use alternative tools (e.g., grep instead of find, or vice versa)\n\
@@ -1349,6 +1467,10 @@ async fn plan_executor_task(
                              4. If stuck, describe what you've tried and ask for clarification",
                             title, *retry_count
                         );
+                        if let Some(line) = evidence_line {
+                            strategy_hint.push('\n');
+                            strategy_hint.push_str(&line);
+                        }
                         ctx.current_subtask_strategy_hint = Some(strategy_hint);
                         astra_core::agent_warn!(
                             "plan_executor",
@@ -1678,6 +1800,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let res = selector.select(&sel_ctx).await;
@@ -1699,6 +1822,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let res = selector.select(&sel_ctx).await;
@@ -1729,6 +1853,155 @@ mod tests {
         assert_eq!(*c, 1);
         // "s1" is still at 2
         assert_eq!(counts["s1"], 2);
+    }
+
+    #[test]
+    fn high_failure_tool_evidence_surfaces_repeat_offenders() {
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        let entries = vec![
+            ToolHealthEntry {
+                name: "flaky_tool".into(),
+                total_calls: 4,
+                total_failures: 4,
+                failure_rate: 1.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+            ToolHealthEntry {
+                name: "healthy_tool".into(),
+                total_calls: 10,
+                total_failures: 0,
+                failure_rate: 0.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+            ToolHealthEntry {
+                name: "one_shot".into(),
+                total_calls: 1,
+                total_failures: 1,
+                failure_rate: 1.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+        ];
+        let line = super::high_failure_tool_evidence(&entries, 3).expect("should surface evidence");
+        assert!(
+            line.contains("flaky_tool"),
+            "evidence line must name the repeat offender: {line}"
+        );
+        assert!(
+            !line.contains("healthy_tool"),
+            "healthy tool should not appear: {line}"
+        );
+        assert!(
+            !line.contains("one_shot"),
+            "tools below MIN_CALLS should not appear: {line}"
+        );
+    }
+
+    #[test]
+    fn high_failure_tool_evidence_returns_none_when_no_signal() {
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        let entries = vec![ToolHealthEntry {
+            name: "steady".into(),
+            total_calls: 5,
+            total_failures: 1,
+            failure_rate: 0.2,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![],
+        }];
+        assert!(super::high_failure_tool_evidence(&entries, 3).is_none());
+    }
+
+    #[test]
+    fn render_verifier_failure_hint_none_when_all_passed() {
+        use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
+        let report = SubtaskVerificationReport {
+            subtask_id: "s1".into(),
+            all_required_passed: true,
+            results: vec![VerificationResult {
+                criterion_id: "c1".into(),
+                passed: true,
+                evidence: "ok".into(),
+                expected: "exists".into(),
+                duration_ms: 5,
+                error: None,
+            }],
+            timestamp: String::new(),
+        };
+        assert!(super::render_verifier_failure_hint(&report).is_none());
+    }
+
+    #[test]
+    fn render_verifier_failure_hint_surfaces_criterion_details() {
+        use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
+        let report = SubtaskVerificationReport {
+            subtask_id: "s1".into(),
+            all_required_passed: false,
+            results: vec![
+                VerificationResult {
+                    criterion_id: "file_exists_readme".into(),
+                    passed: false,
+                    evidence: String::new(),
+                    expected: "README.md exists".into(),
+                    duration_ms: 3,
+                    error: Some("ENOENT: README.md not found".into()),
+                },
+                VerificationResult {
+                    criterion_id: "ok_one".into(),
+                    passed: true,
+                    evidence: "found".into(),
+                    expected: "exists".into(),
+                    duration_ms: 2,
+                    error: None,
+                },
+            ],
+            timestamp: String::new(),
+        };
+        let hint = super::render_verifier_failure_hint(&report).expect("hint");
+        assert!(
+            hint.contains("Acceptance checks failed"),
+            "hint should lead with a clear header: {hint}"
+        );
+        assert!(
+            hint.contains("file_exists_readme"),
+            "hint should name the failed criterion id: {hint}"
+        );
+        assert!(
+            hint.contains("README.md exists"),
+            "hint should surface the expected clause: {hint}"
+        );
+        assert!(
+            hint.contains("ENOENT: README.md not found"),
+            "hint should surface the error detail: {hint}"
+        );
+        assert!(
+            !hint.contains("ok_one"),
+            "hint must not include passing criteria: {hint}"
+        );
+    }
+
+    #[test]
+    fn render_verifier_failure_hint_falls_back_to_evidence_when_no_error() {
+        use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
+        let report = SubtaskVerificationReport {
+            subtask_id: "s1".into(),
+            all_required_passed: false,
+            results: vec![VerificationResult {
+                criterion_id: "grep_import".into(),
+                passed: false,
+                evidence: "no matches for `use anyhow::`".into(),
+                expected: "at least one match".into(),
+                duration_ms: 7,
+                error: None,
+            }],
+            timestamp: String::new(),
+        };
+        let hint = super::render_verifier_failure_hint(&report).expect("hint");
+        assert!(
+            hint.contains("no matches for `use anyhow::`"),
+            "hint should fall back to evidence when error is None: {hint}"
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Build [`crate::tool_selector::SelectionContext`] for the agentic `/chat` payload path.
 
+use std::collections::HashMap;
+
 use crate::pipeline::routing::DomainHint;
 use crate::tool_registry::ToolRegistry;
 use crate::tool_selector::SelectionContext;
@@ -21,6 +23,7 @@ pub fn build_agentic_tool_selection_context<'a>(
     memory_domain_hints: Vec<DomainHint>,
     restricted_tools: Vec<String>,
     file_context: Vec<String>,
+    outcome_bias: HashMap<String, f64>,
     _follow_up_tool_round: bool,
     tool_budget_override: Option<u32>,
     previous_confidence_fallback: Option<crate::turn::confidence_contract::ConfidenceFallback>,
@@ -40,6 +43,7 @@ pub fn build_agentic_tool_selection_context<'a>(
         memory_domain_hints,
         restricted_tools,
         file_context,
+        outcome_bias,
         previous_confidence_fallback,
     }
 }
@@ -62,6 +66,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             false,
             None,
             None,
@@ -76,6 +81,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             true,
             None,
             None,
@@ -100,6 +106,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             false,
             None,
             None,
@@ -117,6 +124,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             false,
             Some(1200),
             None,
@@ -134,6 +142,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             false,
             Some(0),
             None,
@@ -151,6 +160,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            HashMap::new(),
             true,
             Some(1200),
             None,

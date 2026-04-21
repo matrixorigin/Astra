@@ -254,6 +254,16 @@ pub(crate) struct ReplState {
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
 
+    /// Pre-computed plan-resume digest (P3.3).
+    ///
+    /// Populated at REPL startup when a `plan_state.json` is detected.
+    ///
+    /// Kept pending until the user sends a resume-like message (for example
+    /// `continue`, `继续`, `resume`, or `@resume-plan`). At that point the
+    /// digest is consumed and injected into the next model turn, or cleared if
+    /// plan-mode restoration takes over first.
+    pub pending_plan_resume_digest: Option<String>,
+
     /// Turns where history compaction occurred (for drift detection).
     pub drift_compressed_turns: Vec<u32>,
     /// Turns where user provided correction/redirection (for drift detection).
@@ -422,6 +432,7 @@ impl Default for ReplState {
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
+            pending_plan_resume_digest: None,
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,

@@ -1424,4 +1424,198 @@ mod tests {
             Some(100)
         );
     }
+
+    // ─── MockHost-driven SubRunExecutor (vs StubSubRunExecutor) ───────────────
+
+    /// Runs `run_agentic_loop_with_host` with one scripted text turn; token fields
+    /// mirror SSE accumulators instead of `StubSubRunExecutor`'s zeros.
+    struct MockHostSingleTurnSubRunExecutor;
+
+    #[async_trait]
+    impl SubRunExecutor for MockHostSingleTurnSubRunExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            use crate::turn::agentic_loop_finalization::run_agentic_loop_with_host;
+            use crate::turn::agentic_loop_host::AgenticLoopOutcome;
+            use crate::turn::agentic_loop_host::tests::{MockHost, make_state, text_result};
+            use astra_core::STATUS_COMPLETED;
+
+            let scripted_output =
+                format!("mock-host sub-run ok for task_len={}", config.task.len());
+            let mut host = MockHost::new(vec![text_result(&scripted_output, 77, 33, Some(6))]);
+            let mut state = make_state();
+            state.message = config.task.clone();
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .map_err(|e| e.message)?;
+            match outcome {
+                AgenticLoopOutcome::Completed => {}
+                other => return Err(format!("expected Completed, got {other:?}")),
+            }
+
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: STATUS_COMPLETED.to_string(),
+                output: Some(state.final_text),
+                error: None,
+                prompt_tokens: state.total_prompt,
+                completion_tokens: state.total_completion,
+                tool_calls: state.total_tool_calls,
+            })
+        }
+    }
+
+    /// Two host rounds (edge tool round + final text) so usage reflects multi-turn ingest.
+    struct MockHostEdgeThenTextSubRunExecutor;
+
+    #[async_trait]
+    impl SubRunExecutor for MockHostEdgeThenTextSubRunExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            use crate::turn::agentic_loop_finalization::run_agentic_loop_with_host;
+            use crate::turn::agentic_loop_host::AgenticLoopOutcome;
+            use crate::turn::agentic_loop_host::tests::{
+                MockHost, edge_tool_result, make_edge_tool, make_state, text_result,
+            };
+            use astra_core::STATUS_COMPLETED;
+
+            let mut host = MockHost::new(vec![
+                edge_tool_result(
+                    vec![make_edge_tool("bash", "mock cmd output")],
+                    40,
+                    12,
+                    Some(2),
+                ),
+                text_result("final after edge", 18, 9, Some(5)),
+            ])
+            .with_valid_tools(&["bash"]);
+            let mut state = make_state();
+            state.message = config.task.clone();
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .map_err(|e| e.message)?;
+            match outcome {
+                AgenticLoopOutcome::Completed => {}
+                other => return Err(format!("expected Completed, got {other:?}")),
+            }
+
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: STATUS_COMPLETED.to_string(),
+                output: Some(state.final_text),
+                error: None,
+                prompt_tokens: state.total_prompt,
+                completion_tokens: state.total_completion,
+                tool_calls: state.total_tool_calls,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_host_subrun_single_turn_nonzero_usage_research_team() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let _ = reg.register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ));
+        }
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(MockHostSingleTurnSubRunExecutor),
+        ));
+
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine,
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: None,
+            },
+        );
+
+        let report = orch
+            .execute_team("research", "analyze codebase", None)
+            .await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+        let dr = report.delegation_result.expect("delegation result");
+        assert_eq!(dr.agent_results.len(), 2);
+        for ar in &dr.agent_results {
+            assert_eq!(
+                ar.prompt_tokens, 77,
+                "mock host should surface prompt usage"
+            );
+            assert_eq!(ar.completion_tokens, 33);
+            assert!(
+                ar.output
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("mock-host sub-run ok"),
+                "output={:?}",
+                ar.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_host_subrun_edge_then_text_multi_round_usage() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let _ = reg.register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ));
+        }
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(MockHostEdgeThenTextSubRunExecutor),
+        ));
+
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine,
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: None,
+            },
+        );
+
+        let report = orch.execute_team("research", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+        let dr = report.delegation_result.expect("delegation result");
+        let ar = &dr.agent_results[0];
+        assert!(
+            ar.prompt_tokens >= 58,
+            "expected summed prompt tokens across edge + text rounds (40+18), got {}",
+            ar.prompt_tokens
+        );
+    }
 }

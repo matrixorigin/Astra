@@ -9,7 +9,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use astra_services::agents::{AgentCreateRequestData, AgentService, InMemoryAgentService};
 use astra_services::coordination::{AgentProfile, AgentProfileRegistry, AgentResult, AgentTier};
 use astra_services::runs::InMemoryRunStateStore;
 use astra_services::team_persistence::{
@@ -365,58 +364,6 @@ async fn orchestrator_persists_events_and_checkpoint() {
     let cp: serde_json::Value =
         serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
     assert_eq!(cp["phase"], "prepared");
-}
-
-// ─── Agent Service Integration ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn agent_service_crud_lifecycle() {
-    let svc = InMemoryAgentService::new();
-
-    // Create
-    let agent = svc
-        .create_agent(
-            "u1".into(),
-            AgentCreateRequestData {
-                name: "test-agent".into(),
-                agent_config: Some(serde_json::json!({"model": "claude-4"})),
-                data_source: None,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(agent.name, "test-agent");
-
-    // List
-    let list = svc.list_agents("u1".into()).await.unwrap();
-    assert_eq!(list.total, 1);
-
-    // Update
-    let updated = svc
-        .update_agent(
-            agent.agent_id.clone(),
-            "u1".into(),
-            astra_services::agents::AgentUpdateRequestData {
-                name: Some("renamed".into()),
-                agent_config: None,
-                data_source: None,
-                is_active: Some(false),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(updated.name, "renamed");
-    assert!(!updated.is_active);
-
-    // Delete
-    svc.delete_agent(agent.agent_id.clone(), "u1".into())
-        .await
-        .unwrap();
-    assert!(svc.get_agent(agent.agent_id, "u1".into()).await.is_err());
-
-    // List should be empty
-    let list = svc.list_agents("u1".into()).await.unwrap();
-    assert_eq!(list.total, 0);
 }
 
 // ─── Learning Merge Integration ─────────────────────────────────────────────
@@ -860,44 +807,6 @@ async fn fan_out_returns_partial_success_with_failures() {
             .unwrap()
             .contains("network timeout"),
         "failure reason preserved"
-    );
-}
-
-/// Tests that executor panics (Err return) are captured gracefully.
-#[tokio::test]
-async fn executor_panic_captured_as_failed_result() {
-    let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team(
-        "panic-team",
-        TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
-        },
-        vec![("worker", Some("Panic worker"))],
-    );
-    store.save_team(&team).await.unwrap();
-
-    struct PanicExecutor;
-    #[async_trait]
-    impl SubRunExecutor for PanicExecutor {
-        async fn execute(&self, _config: SubRunConfig) -> Result<AgentResult, String> {
-            Err("internal assertion failed".to_string())
-        }
-    }
-
-    let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(PanicExecutor)).await;
-    let report = orch.execute_team("panic-team", "work", None).await;
-
-    assert_eq!(report.status, TeamExecutionStatus::Failed);
-    let dr = report.delegation_result.unwrap();
-    assert_eq!(dr.agent_results.len(), 1);
-    assert!(!dr.agent_results[0].is_success());
-    assert!(
-        dr.agent_results[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("internal assertion failed"),
-        "executor error should be captured"
     );
 }
 

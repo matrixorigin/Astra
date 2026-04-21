@@ -2,7 +2,7 @@
 
 This document maps **user-visible capabilities** to **HTTP routes**, **persistence (MatrixOne tables or in-process stores)**, and the **integration tests** that assert them. It complements `router_builder.rs` unit tests (route registration only).
 
-**Layout (system E2E plan):** the integration binary is `rust/crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and **`journey_full.rs` / `journey_tasks_runs.rs` / `journey_extended.rs`**. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
+**Layout (system E2E plan):** the integration binary is `rust/crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
 
 ## How to run
 
@@ -63,8 +63,21 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_models_admin_crud` | `journey_extended.rs` | Mode-aware: `local_jwt` runs SQL `astra_admin` role grant + `POST/PUT/DELETE /models` with DB checks; `trusted_moi` asserts current admin path rejects the call (admin auth still local-JWT based) |
 | `e2e_matrix_audit_cross_session_analytics_http` | `journey_audit_cross_session.rs` | Seed `agent_sessions` / `agent_events` / `ctx_decision_audits`; `GET /audit/stats`, `GET /audit/mutations`, `GET /audit/promotions` JSON assertions |
 | `e2e_matrix_trusted_moi_user_system_integration` | `journey_trusted_moi.rs` | Startup in `trusted_moi`; external JWT `/auth/me`; local auth endpoints disabled (`/auth/register|login|refresh`=403); `POST /sessions` + DB owner and memory proxy identity isolation bound to upstream user ID |
+| `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, empty `GET .../executions`, SQL `team_definitions` |
+| `e2e_matrix_team_snapshots_and_db` | `journey_team_snapshots_matrix.rs` | `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`, SQL `team_snapshots` |
+| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget, adversarial size) |
+| `e2e_matrix_team_http_db_fidelity` | `journey_team_data_fidelity_matrix.rs` | `GET` detail vs `team_definitions` JSON columns; list `len` = SQL `COUNT(*)`; snapshot blob + list fields; `executions?limit=` |
+| `e2e_matrix_team_cross_user_isolation` | `journey_team_isolation_matrix.rs` | Second user: 404 on other user's team; list has no foreign team name |
+| `e2e_matrix_meta_health` | `journey_meta_matrix.rs` | `GET /`, `GET /health` (root metadata, DB connected, persist counters) |
+| `e2e_matrix_session_http_db` | `journey_session_http_db_matrix.rs` | `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`) |
+| `e2e_matrix_evaluation_reads` | `journey_evaluation_reads_matrix.rs` | Evaluation GET smoke (`x-user-id`), seed agent for trust/SLO/observability; learning health/signals |
+| `e2e_matrix_context_decision_chain` | `journey_context_decision_chain_matrix.rs` | Event → context → decision chain + `ctx_snapshots` / `ctx_decision_audits` SQL |
+| `e2e_matrix_chat_route_models` | `journey_chat_route_models_matrix.rs` | `POST /chat/route`, `GET /models` |
+| `e2e_matrix_branches_cost_estimate_http` | `journey_branches_matrix.rs` | `POST /branches/cost-estimate` (+ 401 without auth); no DDL branch/create |
+| `e2e_matrix_delegate_http_boundaries` | `journey_delegate_http_matrix.rs` | `POST /chat` → `run_id`; `GET /chat/runs/{id}/delegations`; `POST .../delegate` validation `400` |
+| `e2e_matrix_admin_tokens_smoke` | `journey_admin_smoke_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `bootstrap_trusted_moi`, `grant_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `bootstrap_trusted_moi`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
 ## Database isolation
 
@@ -79,15 +92,15 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 
 | Group | P | Representative routes | Persistence check | Test(s) |
 |-------|---|----------------------|-------------------|---------|
-| Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*` |
+| Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*`, `e2e_matrix_meta_health` |
 | Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | Every test uses `bootstrap` (register/login); `product_matrix_*` also hits `/auth/refresh` and `/logout` |
-| Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` |
+| Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` + `e2e_matrix_session_http_db` |
 | Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*`; `e2e_matrix_audit_cross_session_analytics_http` (`/audit/stats`, `/audit/mutations`, `/audit/promotions` + DB seed) |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
-| Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
+| Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_chat_route_models` (list); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
-| Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*` |
-| Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*` |
+| Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
+| Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |
 | Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry` | `product_matrix_*`, tasks lease (edge register), `e2e_matrix_approval_respond_invalid_session_id`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_duplicate_tool_result_idempotency`, `e2e_matrix_duplicate_approval_response_idempotency` |
 | Jobs | P1 | `/jobs`, `/jobs/webhook` | service persistence | `product_matrix_*` |
@@ -95,7 +108,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Triggers | P1 | `/triggers`, fire, delete | `wf_triggers` | `product_matrix_*` |
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
 | Learning | P1 | `/api/v1/learning/*` | — | `product_matrix_*` |
-| Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*` |
+| Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*`, `e2e_matrix_evaluation_reads` |
 | Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
 | Chat turn (SSE) | P0 | `POST /chat/turn` + bridge secret | `agent_events` | `product_matrix_*`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_duplicate_tool_result_idempotency`, `e2e_matrix_duplicate_approval_response_idempotency`, `e2e_matrix_chat_turn_partial_batch_failure`, `e2e_matrix_chat_turn_out_of_order_tool_results`, `e2e_matrix_same_session_concurrent_turns_isolated`, `e2e_matrix_same_session_waiting_turn_overlap_isolated` |
@@ -105,10 +118,11 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Workflows | P1 | `GET /workflows` | — | `product_matrix_*` |
 | Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
 | Replay | P1 | `/sessions/{id}/replay/compare` | — | `product_matrix_*` |
-| Branches | — | `/branches/*` | — | — |
-| Admin | — | `/admin/*` | — | — |
+| Branches | P1 | `/branches/cost-estimate` (HTTP; no DDL in this journey) | — | `e2e_matrix_branches_cost_estimate_http` |
+| Admin | P1 | `GET /admin/tokens` | — | `e2e_matrix_admin_tokens_smoke` |
 | WebSocket | — | `/chat/ws` | — | — |
-| Delegation | — | `/chat/runs/.../delegate` | — | — |
+| Delegation | P1 | `GET .../delegations`, `POST .../delegate` (validation-only path) | **In-memory** tracker | `e2e_matrix_delegate_http_boundaries` |
+| Team | P1 | `/teams`, `/teams/{name}`, `/teams/{name}/executions`, `/teams/.../snapshots` (+ HTTP negatives, DB fidelity, user isolation) | `team_definitions`, `team_snapshots` | `e2e_matrix_team_crud_and_db`, `e2e_matrix_team_snapshots_and_db`, `e2e_matrix_team_http_negative_paths`, `e2e_matrix_team_http_db_fidelity`, `e2e_matrix_team_cross_user_isolation`; **`POST .../execute`** stays offline (**`team_execute_http_integration`**, mock `SubRunExecutor`) |
 
 ## CI
 
@@ -122,22 +136,23 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../rust/crat
 | Group (`router_builder`) | Prefix | System E2E | Notes |
 |--------------------------|--------|------------|--------|
 | auth | `/auth/` | Yes | `auth_users` in bootstrap / `product_matrix_*` |
-| chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`, plus callback HTTP-boundary failures in `e2e_matrix_edge_callback_http_boundary_failures`, duplicate callback handoff coverage in `e2e_matrix_duplicate_tool_result_idempotency` / `e2e_matrix_duplicate_approval_response_idempotency`, mixed-success handoff coverage in `e2e_matrix_chat_turn_partial_batch_failure`, out-of-order callback handoff coverage in `e2e_matrix_chat_turn_out_of_order_tool_results`, concurrent same-session isolation in `e2e_matrix_same_session_concurrent_turns_isolated`, and waiting-turn overlap isolation in `e2e_matrix_same_session_waiting_turn_overlap_isolated`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; `/chat/stream` smoke in `e2e_matrix_chat_stream_session_info`; no `/chat/ws` E2E |
+| chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`, plus callback HTTP-boundary failures in `e2e_matrix_edge_callback_http_boundary_failures`, duplicate callback handoff coverage in `e2e_matrix_duplicate_tool_result_idempotency` / `e2e_matrix_duplicate_approval_response_idempotency`, mixed-success handoff coverage in `e2e_matrix_chat_turn_partial_batch_failure`, out-of-order callback handoff coverage in `e2e_matrix_chat_turn_out_of_order_tool_results`, concurrent same-session isolation in `e2e_matrix_same_session_concurrent_turns_isolated`, and waiting-turn overlap isolation in `e2e_matrix_same_session_waiting_turn_overlap_isolated`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; `/chat/stream` smoke in `e2e_matrix_chat_stream_session_info`; delegation list + `POST .../delegate` validation boundary in `e2e_matrix_delegate_http_boundaries`; no `/chat/ws` E2E |
 | sessions | `/sessions` | Yes | CRUD/close/resume/activity + DB |
-| admin | `/admin/` | No | Needs admin bootstrap |
+| admin | `/admin/` | Partial | `GET /admin/tokens` smoke in `e2e_matrix_admin_tokens_smoke` |
 | learning | `/api/v1/learning/` | Yes (reads) | Health/signals/stats in `product_matrix_*` |
 | agents | `/agents` | Yes | Includes edge register path |
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
 | evaluation | `/evaluation/` | Partial | Reads in `product_matrix_*`; POST write paths not covered in system E2E until implemented; training-data extract/export not in system E2E |
 | introspection | `/introspection/` | Yes | |
-| branches | `/branches` | No | |
+| branches | `/branches` | Partial | `POST /branches/cost-estimate` in `e2e_matrix_branches_cost_estimate_http`; create/merge/diff not in system E2E |
 | marketplace | `/marketplace/` | Partial | Quality report / stats / search; not full install/upgrade/rollback/credentials |
 | sandbox | `/sandbox` | Yes | |
 | workflows | `/workflows` | Partial | `GET /workflows` only |
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 | tasks | `/tasks` | Yes | `e2e_matrix_tasks_lease_and_db_assertions` |
+| teams | `/teams` | Partial | CRUD + snapshots + negatives + `team_definitions` / `team_snapshots` in `e2e_matrix_team_*`; `POST .../execute` still covered only in offline `team_execute_http_integration` (mock executor) — not in system E2E |
 
 Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
@@ -145,5 +160,7 @@ Additional route families in `router_builder` not named above: **memory** (`/mem
 
 - **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
 - **Evaluation writes**: add a focused test when `validate_gate` / `run_drift_pipeline` / `run_closed_loop` return **200** with stable response shapes.
-- **Branches, admin, WS, delegation**: add focused journeys + rows in this matrix.
+- **Branches / admin HTTP** (beyond cost estimate + token list): optional deeper journeys when routes stabilize.
+- **`/chat/ws`**, **successful delegation execute** (long-running): optional fixtures; validation-only delegation is in `e2e_matrix_delegate_http_boundaries`.
+- **Teams execute**: optional `system_matrix_http_e2e` for `POST /teams/{name}/execute` with real `ServerSubRunExecutor` (long-running; not added by default). CRUD/snapshots/DB for `/teams` are in `e2e_matrix_team_*`.
 - **Real Memoria**: optional second target with a Memoria test double URL instead of the stub forwarder.

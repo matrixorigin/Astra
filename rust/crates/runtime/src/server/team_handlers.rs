@@ -6,9 +6,17 @@
 //!   GET    /teams/{name}                — get a team by name
 //!   DELETE /teams/{name}                — delete a team
 //!   GET    /teams/{name}/executions     — list execution history
-//!   POST   /teams/{name}/execute        — trigger a team execution (future)
+//!   POST   /teams/{name}/execute        — run team task via [`TeamExecutionOrchestrator`]
+
+use std::sync::Arc;
+
+use astra_server_types::team_orchestrator_traits::{
+    DelegationExecutor, DelegationTracking, RunPersistence,
+};
+use astra_server_types::team_orchestrator_types::{OrchestratorConfig, sum_usage};
 
 use super::*;
+use crate::server::team_orchestrator::{TeamExecutionOrchestrator, TeamExecutionReport};
 use astra_services::team_persistence::{
     TeamDefinition, TeamExecutionRecord, TeamPersistenceService,
 };
@@ -20,6 +28,21 @@ fn require_team_store(
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "team service not configured",
+        )
+    })
+}
+
+fn require_delegation_engine(
+    state: &AppState,
+) -> Result<
+    &Arc<crate::server::delegation_engine::DelegationEngine>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    state.delegation_engine().ok_or_else(|| {
+        astra_core::error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delegation engine not configured (multi-agent execution unavailable)",
+            "delegation_not_configured",
         )
     })
 }
@@ -196,7 +219,124 @@ pub(super) async fn list_executions_handler(
     }))
 }
 
+/// POST /teams/{name}/execute
+pub(super) async fn execute_team_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ExecuteTeamRequest>,
+) -> Result<Json<TeamExecuteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let team_store: Arc<dyn TeamPersistenceService> = require_team_store(&state)?.clone();
+    let engine = require_delegation_engine(&state)?;
+
+    let session_id = body
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "team-http-session".to_string());
+    let source_agent_id = body
+        .source_agent_id
+        .clone()
+        .unwrap_or_else(|| "orchestrator".to_string());
+    let delegation_engine: Arc<dyn DelegationExecutor> = engine.clone();
+    let delegation_tracker: Arc<dyn DelegationTracking> = engine.tracker().clone();
+    let run_engine: Arc<dyn RunPersistence> = engine.run_engine().clone();
+    let profile_registry = engine.registry().clone();
+
+    let orch = TeamExecutionOrchestrator::new(
+        team_store,
+        delegation_engine,
+        delegation_tracker,
+        run_engine,
+        profile_registry,
+        OrchestratorConfig {
+            user_id: user.user_id.clone(),
+            session_id,
+            source_agent_id,
+            progress: None,
+        },
+    );
+
+    let report = orch.execute_team(&name, &body.task, None).await;
+    map_team_execution_report_to_http(report)
+}
+
+fn map_team_execution_report_to_http(
+    report: TeamExecutionReport,
+) -> Result<Json<TeamExecuteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(ref err) = report.error {
+        if err.contains("not found") && err.contains("team") {
+            return Err(astra_core::error_response(
+                StatusCode::NOT_FOUND,
+                err.clone(),
+            ));
+        }
+        if err.contains("team validation failed") {
+            return Err(astra_core::error_response(
+                StatusCode::BAD_REQUEST,
+                err.clone(),
+            ));
+        }
+        if err.contains("failed to load team") {
+            return Err(astra_core::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.clone(),
+            ));
+        }
+    }
+
+    Ok(Json(TeamExecuteResponse::from(report)))
+}
+
 // ─── Request / Response Types ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ExecuteTeamRequest {
+    pub task: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct TeamExecuteResponse {
+    pub team_name: String,
+    pub status: String,
+    pub delegation_id: String,
+    pub parent_run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub agent_count: usize,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tool_calls: u32,
+}
+
+impl From<TeamExecutionReport> for TeamExecuteResponse {
+    fn from(r: TeamExecutionReport) -> Self {
+        let (tp, tc, tt) = r
+            .delegation_result
+            .as_ref()
+            .map(sum_usage)
+            .unwrap_or((0, 0, 0));
+        Self {
+            team_name: r.team_name,
+            status: r.status.to_string(),
+            delegation_id: r.delegation_id,
+            parent_run_id: r.parent_run_id,
+            error: r.error,
+            agent_count: r
+                .delegation_result
+                .as_ref()
+                .map(|d| d.agent_results.len())
+                .unwrap_or(0),
+            total_prompt_tokens: tp,
+            total_completion_tokens: tc,
+            total_tool_calls: tt,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateTeamRequest {

@@ -734,6 +734,15 @@ pub(super) async fn handle_state_command(
                 }
             };
             let (requested_focus, requested_question) = parse_reflect_args(arg);
+            // `/reflect diff` short-circuits: render the local tool-health
+            // delta between the most recently synced entries and the live
+            // session entries, so the agent can audit its own tuning
+            // without needing a server round-trip.
+            if requested_focus.as_deref() == Some("diff") {
+                let out = render_reflect_diff(state);
+                eprint!("{out}");
+                return Ok(());
+            }
             if let Ok(body) = crate::self_command::render_reflect_surface_for_session(
                 &sid,
                 20,
@@ -809,6 +818,7 @@ fn parse_reflect_args(arg: &str) -> (Option<String>, Option<String>) {
         "tool_selection",
         "history",
         "performance",
+        "diff",
     ];
     let mut parts = arg.splitn(2, ' ');
     let first = parts.next().unwrap_or("").trim();
@@ -826,6 +836,69 @@ fn parse_reflect_args(arg: &str) -> (Option<String>, Option<String>) {
 
 fn is_local_reflect_report(report: &serde_json::Value) -> bool {
     report.get("reflection_context").is_some()
+}
+
+/// Render a compact diff view of what the agent has learned this session
+/// vs the last cloud-synced baseline. Auto-populated — reads directly
+/// from `ReplState` without any new plumbing.
+///
+/// Output enumerates tool-health entries whose failure rate, call count,
+/// or presence changed since last sync. When nothing changed (e.g. fresh
+/// session) the output is an explicit "no delta" line.
+pub(super) fn render_reflect_diff(state: &super::repl_state::ReplState) -> String {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let sep = "─".repeat(38);
+    let _ = writeln!(out, "\n  ─── reflect diff {sep}");
+
+    let synced: HashMap<&str, &astra_runtime::pipeline::persistence::ToolHealthEntry> = state
+        .synced_tool_health_entries
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+
+    let mut rows: Vec<String> = Vec::new();
+    for cur in &state.tool_health_entries {
+        match synced.get(cur.name.as_str()) {
+            None => {
+                rows.push(format!(
+                    "  + {name:20}  new · {calls} calls · {rate:.0}% fail",
+                    name = cur.name,
+                    calls = cur.total_calls,
+                    rate = cur.failure_rate * 100.0
+                ));
+            }
+            Some(prev) => {
+                let rate_delta = cur.failure_rate - prev.failure_rate;
+                let call_delta = cur.total_calls as i64 - prev.total_calls as i64;
+                if call_delta == 0 && rate_delta.abs() < 0.005 {
+                    continue;
+                }
+                let sign = if rate_delta >= 0.0 { "+" } else { "" };
+                rows.push(format!(
+                    "  ~ {name:20}  Δcalls {call_delta:+} · Δfail {sign}{rate:.0}% (now {now:.0}%)",
+                    name = cur.name,
+                    rate = rate_delta * 100.0,
+                    now = cur.failure_rate * 100.0
+                ));
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        let _ = writeln!(
+            out,
+            "  no delta since last sync · {} tools tracked",
+            state.tool_health_entries.len()
+        );
+    } else {
+        for row in rows {
+            let _ = writeln!(out, "{row}");
+        }
+    }
+    out
 }
 
 /// Render either the local liquid reflection surface or a server `ReflectReport`
@@ -1154,6 +1227,63 @@ fn render_local_reflect_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_reflect_args_recognises_diff_focus() {
+        let (focus, question) = parse_reflect_args("diff");
+        assert_eq!(focus.as_deref(), Some("diff"));
+        assert_eq!(question, None);
+    }
+
+    #[test]
+    fn render_reflect_diff_reports_no_delta_on_fresh_session() {
+        let state = super::super::repl_state::ReplState::default();
+        let out = super::render_reflect_diff(&state);
+        assert!(out.contains("reflect diff"), "header present: {out}");
+        assert!(
+            out.contains("no delta since last sync"),
+            "fresh session should say no delta: {out}"
+        );
+    }
+
+    #[test]
+    fn render_reflect_diff_surfaces_new_and_drifting_tools() {
+        use astra_runtime::pipeline::persistence::ToolHealthEntry;
+        let mut state = super::super::repl_state::ReplState::default();
+        // Baseline had "grep" at 10 calls / 10% fail.
+        state.synced_tool_health_entries = vec![ToolHealthEntry {
+            name: "grep".into(),
+            total_calls: 10,
+            total_failures: 1,
+            failure_rate: 0.10,
+            last_updated_epoch: 0,
+            recent_outcomes: vec![],
+        }];
+        // Now grep has drifted up, and "glob" is new.
+        state.tool_health_entries = vec![
+            ToolHealthEntry {
+                name: "grep".into(),
+                total_calls: 14,
+                total_failures: 5,
+                failure_rate: 0.36,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+            ToolHealthEntry {
+                name: "glob".into(),
+                total_calls: 3,
+                total_failures: 0,
+                failure_rate: 0.0,
+                last_updated_epoch: 0,
+                recent_outcomes: vec![],
+            },
+        ];
+        let out = super::render_reflect_diff(&state);
+        assert!(out.contains("grep"), "drifting tool shown: {out}");
+        assert!(out.contains("glob"), "new tool shown: {out}");
+        assert!(out.contains("new"), "new marker: {out}");
+        assert!(out.contains("Δcalls +4"), "grep call delta surfaced: {out}");
+    }
 
     #[test]
     fn parse_reflect_args_splits_focus_and_question() {

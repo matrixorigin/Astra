@@ -99,6 +99,10 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(team_handlers::list_executions_handler),
         )
         .route(
+            "/teams/{name}/execute",
+            post(team_handlers::execute_team_handler),
+        )
+        .route(
             "/teams/{name}/snapshots",
             get(team_handlers::list_snapshots_handler).post(team_handlers::create_snapshot_handler),
         )

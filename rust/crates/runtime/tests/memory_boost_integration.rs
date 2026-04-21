@@ -217,6 +217,7 @@ fn full_pipeline_boost_improves_github_selection() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r_no = selector.select(&ctx_no).await;
@@ -231,6 +232,7 @@ fn full_pipeline_boost_improves_github_selection() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r_boost = selector.select(&ctx_boost).await;
@@ -282,6 +284,7 @@ fn full_pipeline_no_history_safe() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         selector.select(&ctx).await
@@ -351,6 +354,7 @@ fn full_pipeline_confidence_improves_with_history() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r_no = selector.select(&ctx_no).await;
@@ -365,6 +369,7 @@ fn full_pipeline_confidence_improves_with_history() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r_boost = selector.select(&ctx_boost).await;
@@ -549,6 +554,7 @@ fn cold_start_boost_improves_tool_selection() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r_no = selector.select(&ctx_no).await;
@@ -570,6 +576,7 @@ fn cold_start_boost_improves_tool_selection() {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r_boost = selector.select(&ctx_boost).await;

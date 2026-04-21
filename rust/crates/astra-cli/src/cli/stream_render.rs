@@ -1692,7 +1692,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut allowed = match decision {
             crate::permission_manager::PermissionDecision::Allow => true,
             crate::permission_manager::PermissionDecision::Deny(reason) => {
-                denied_output = Some(format!("Error: {reason}"));
+                denied_output = Some(crate::permission_manager::format_denied_message(&reason));
                 false
             }
             crate::permission_manager::PermissionDecision::NeedApproval {

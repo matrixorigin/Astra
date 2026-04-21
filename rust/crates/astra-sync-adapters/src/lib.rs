@@ -1183,6 +1183,7 @@ mod tests {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 100,
+            recent_outcomes: vec![],
         }]));
         LearningAdapter::new(entity_graph, pattern_library, calibrator, tool_health)
     }
@@ -1272,6 +1273,7 @@ mod tests {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 200,
+                recent_outcomes: vec![],
             }],
             active_canary: None,
         };

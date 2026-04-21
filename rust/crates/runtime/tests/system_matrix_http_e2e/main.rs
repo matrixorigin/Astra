@@ -58,6 +58,31 @@
 //!   `context_trace_signal` event written to `agent_events` with valid causal chain.
 //! - **`e2e_matrix_stream_multi_turn_persistence`** — two sequential `POST /chat/stream` to same
 //!   session → verify event counts increment, distinct causal chains, both runs completed.
+//! - **`e2e_matrix_team_crud_and_db`** — `POST/GET/DELETE /teams`, list + detail + empty executions,
+//!   upsert second `POST`, `team_definitions` SQL assertions (`user_id`, `name`, delete removes row).
+//! - **`e2e_matrix_team_snapshots_and_db`** — `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`,
+//!   `team_snapshots` SQL; cleans up team row after.
+//! - **`e2e_matrix_team_http_negative_paths`** — `GET /teams` without auth (401), unknown team GET/DELETE
+//!   (404), `POST /teams` empty members + duplicate roles → 400 (`validate_team`), invalid budget +
+//!   adversarial member-count validation.
+//! - **`e2e_matrix_team_http_db_fidelity`** — HTTP `GET /teams/{name}` matches `team_definitions`
+//!   JSON columns (`coordination`, `members_json`, `context_json`, `budget_json`, …); `GET /teams` count =
+//!   SQL `COUNT(*)`; snapshot `team_definition_json` + list fields vs DB; `GET .../executions?limit=`.
+//! - **`e2e_matrix_team_cross_user_isolation`** — second registered user cannot GET/DELETE another user's
+//!   team (404); team name absent from foreigner's list.
+//! - **`e2e_matrix_meta_health`** — `GET /` + `GET /health` (service metadata, DB connected, persist counters).
+//! - **`e2e_matrix_session_http_db`** — `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`).
+//! - **`e2e_matrix_evaluation_reads`** — evaluation GETs (`x-user-id`), optional agent seed for trust/SLO/
+//!   observability, plus learning health/signals.
+//! - **`e2e_matrix_context_decision_chain`** — `POST /events` → `/context` → `/decisions` + `ctx_snapshots` /
+//!   `ctx_decision_audits` SQL.
+//! - **`e2e_matrix_chat_route_models`** — `POST /chat/route` shape + `GET /models`.
+//! - **`e2e_matrix_branches_cost_estimate_http`** — `POST /branches/cost-estimate` (JWT, numeric
+//!   estimate fields); 401 without auth (no DDL branch ops).
+//! - **`e2e_matrix_delegate_http_boundaries`** — `POST /chat` → `run_id`; `GET .../delegations`;
+//!   `POST .../delegate` fails at validation (`400`) without executing sub-runs.
+//! - **`e2e_matrix_admin_tokens_smoke`** — `GET /admin/tokens`: `403` without `astra_admin`,
+//!   then `200` + JSON array after `grant_astra_admin_role`.
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -81,12 +106,25 @@
 //! parallelism (`make test` / `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS`).
 
 mod harness;
+mod journey_admin_smoke_matrix;
 mod journey_audit_cross_session;
+mod journey_branches_matrix;
+mod journey_chat_route_models_matrix;
+mod journey_context_decision_chain_matrix;
+mod journey_delegate_http_matrix;
+mod journey_evaluation_reads_matrix;
 mod journey_extended;
 mod journey_full;
+mod journey_meta_matrix;
 mod journey_remote_skills;
+mod journey_session_http_db_matrix;
 mod journey_stream_persistence;
 mod journey_tasks_runs;
+mod journey_team_crud_matrix;
+mod journey_team_data_fidelity_matrix;
+mod journey_team_http_negatives_matrix;
+mod journey_team_isolation_matrix;
+mod journey_team_snapshots_matrix;
 mod journey_trusted_moi;
 
 use harness::require_system_e2e_env;
@@ -251,4 +289,95 @@ async fn e2e_matrix_stream_context_trace_persistence() {
 async fn e2e_matrix_stream_multi_turn_persistence() {
     require_system_e2e_env();
     journey_stream_persistence::run_stream_multi_turn_persistence().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_team_crud_and_db() {
+    require_system_e2e_env();
+    journey_team_crud_matrix::run_team_crud_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_team_snapshots_and_db() {
+    require_system_e2e_env();
+    journey_team_snapshots_matrix::run_team_snapshots_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_team_http_negative_paths() {
+    require_system_e2e_env();
+    journey_team_http_negatives_matrix::run_team_http_negative_paths().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_team_http_db_fidelity() {
+    require_system_e2e_env();
+    journey_team_data_fidelity_matrix::run_team_http_db_fidelity().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_team_cross_user_isolation() {
+    require_system_e2e_env();
+    journey_team_isolation_matrix::run_team_cross_user_isolation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_meta_health() {
+    require_system_e2e_env();
+    journey_meta_matrix::run_meta_root_and_health().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_session_http_db() {
+    require_system_e2e_env();
+    journey_session_http_db_matrix::run_session_http_matches_agent_sessions_row().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_evaluation_reads() {
+    require_system_e2e_env();
+    journey_evaluation_reads_matrix::run_evaluation_read_http_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_context_decision_chain() {
+    require_system_e2e_env();
+    journey_context_decision_chain_matrix::run_context_decision_chain_db().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_chat_route_models() {
+    require_system_e2e_env();
+    journey_chat_route_models_matrix::run_chat_route_and_models_smoke().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_branches_cost_estimate_http() {
+    require_system_e2e_env();
+    journey_branches_matrix::run_branches_cost_estimate_http().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_delegate_http_boundaries() {
+    require_system_e2e_env();
+    journey_delegate_http_matrix::run_delegate_http_boundaries().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_admin_tokens_smoke() {
+    require_system_e2e_env();
+    journey_admin_smoke_matrix::run_admin_tokens_smoke().await;
 }

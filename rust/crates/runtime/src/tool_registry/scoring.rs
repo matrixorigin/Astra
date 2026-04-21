@@ -296,6 +296,7 @@ fn tool_relevance_score(
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     co_occurrence: &HashMap<String, f64>,
     file_context: &[String],
+    outcome_bias: &HashMap<String, f64>,
 ) -> f64 {
     use crate::pipeline::routing::DomainHint;
 
@@ -443,6 +444,16 @@ fn tool_relevance_score(
     // a tiebreaker, not an override.
     score += file_context_tool_boost(tool.name, file_context);
 
+    // ── Phase 7: Outcome-memory bias ──
+    // Persistent per-tool outcome signal from `ToolHealthTracker`. Recent
+    // identical-signature failures push the score down; recent successes
+    // push it up. Bounded to ±0.10 so it can tip ties but never overpower
+    // textual/intent signals. The hard-block for repeated identical
+    // failures lives at execution time (`headless_tool_pipeline::policy`).
+    if let Some(&bias) = outcome_bias.get(tool.name) {
+        score += bias.clamp(-0.10, 0.10);
+    }
+
     // ── Soft ceiling ──
     // Hard clamp at 1.0 hides rank differences when multiple tools exceed 1.0
     // (e.g., text=0.40 + trigger=0.25 + intent=0.25 + scope=0.10 + recency=0.30 = 1.30).
@@ -457,7 +468,16 @@ fn tool_relevance_score(
 /// Pre-filter: rank dynamic tools by relevance and filter by minimum score threshold.
 /// Returns (catalog_index, score) pairs for dynamic tools, sorted by descending score.
 pub fn pre_filter_dynamic(state: &ConversationState, query: &str) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(state, query, None, None, &[], &HashMap::new(), &[])
+    pre_filter_dynamic_core(
+        state,
+        query,
+        None,
+        None,
+        &[],
+        &HashMap::new(),
+        &[],
+        &HashMap::new(),
+    )
 }
 
 /// Like [`pre_filter_dynamic`] but accepts an optional quality tracker to boost/penalize
@@ -475,6 +495,7 @@ pub fn pre_filter_dynamic_with_quality(
         &[],
         &HashMap::new(),
         &[],
+        &HashMap::new(),
     )
 }
 
@@ -494,6 +515,7 @@ pub fn pre_filter_dynamic_calibrated(
         &[],
         &HashMap::new(),
         &[],
+        &HashMap::new(),
     )
 }
 
@@ -515,6 +537,7 @@ pub fn pre_filter_dynamic_with_memory(
         memory_domain_hints,
         &HashMap::new(),
         &[],
+        &HashMap::new(),
     )
 }
 
@@ -548,6 +571,7 @@ pub fn pre_filter_dynamic_with_pressure(
         budget_pressure,
         &HashMap::new(),
         &[],
+        &HashMap::new(),
     )
 }
 
@@ -572,6 +596,7 @@ pub fn pre_filter_dynamic_with_cooccurrence(
         budget_pressure,
         co_occurrence,
         &[],
+        &HashMap::new(),
     )
 }
 
@@ -597,10 +622,40 @@ pub fn pre_filter_dynamic_with_file_context(
         budget_pressure,
         co_occurrence,
         file_context,
+        &HashMap::new(),
     )
 }
 
-/// Internal: pressure + co-occurrence + file-context combined.
+/// Pre-filter including outcome-memory bias. When `outcome_bias` is non-empty,
+/// each catalog tool gets an additive score adjustment (±0.10) derived from
+/// recent per-signature success/failure evidence (see
+/// [`crate::turn::tool_health::ToolHealthTracker::outcome_bias_by_tool`]).
+#[allow(clippy::too_many_arguments)]
+pub fn pre_filter_dynamic_with_outcome_bias(
+    state: &ConversationState,
+    query: &str,
+    quality_tracker: Option<&ToolQualityTracker>,
+    calibrator: Option<&ConfidenceCalibrator>,
+    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
+    budget_pressure: f64,
+    co_occurrence: &HashMap<String, f64>,
+    file_context: &[String],
+    outcome_bias: &HashMap<String, f64>,
+) -> Vec<(usize, f64)> {
+    pre_filter_dynamic_with_pressure_and_cooccurrence(
+        state,
+        query,
+        quality_tracker,
+        calibrator,
+        memory_domain_hints,
+        budget_pressure,
+        co_occurrence,
+        file_context,
+        outcome_bias,
+    )
+}
+
+/// Internal: pressure + co-occurrence + file-context + outcome bias.
 #[allow(clippy::too_many_arguments)]
 fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     state: &ConversationState,
@@ -611,6 +666,7 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     budget_pressure: f64,
     co_occurrence: &HashMap<String, f64>,
     file_context: &[String],
+    outcome_bias: &HashMap<String, f64>,
 ) -> Vec<(usize, f64)> {
     let mut result = pre_filter_dynamic_core(
         state,
@@ -620,6 +676,7 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
         memory_domain_hints,
         co_occurrence,
         file_context,
+        outcome_bias,
     );
 
     if budget_pressure > 0.01 {
@@ -641,6 +698,7 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
 }
 
 /// Core pre-filter implementation.
+#[allow(clippy::too_many_arguments)]
 fn pre_filter_dynamic_core(
     state: &ConversationState,
     query: &str,
@@ -649,6 +707,7 @@ fn pre_filter_dynamic_core(
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     co_occurrence: &HashMap<String, f64>,
     file_context: &[String],
+    outcome_bias: &HashMap<String, f64>,
 ) -> Vec<(usize, f64)> {
     // Short-circuit: pure conversational queries don't need dynamic tools.
     if state.is_conversational && !state.is_fetch && !state.is_mutate && !state.is_analytical {
@@ -673,6 +732,7 @@ fn pre_filter_dynamic_core(
                 memory_domain_hints,
                 co_occurrence,
                 file_context,
+                outcome_bias,
             );
             if let Some(tracker) = quality_tracker {
                 score *= tracker.boost_factor(tool.name);
@@ -1239,6 +1299,103 @@ mod tests {
         assert!(
             results.is_empty(),
             "conversational queries should return empty dynamic tools"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // outcome_bias
+    // ──────────────────────────────────────────────────────────
+
+    /// Helper: find the score assigned to a specific tool name in a ranked result.
+    fn score_for(results: &[(usize, f64)], tool_name: &str) -> Option<f64> {
+        results.iter().find_map(|(idx, score)| {
+            if TOOL_CATALOG[*idx].name == tool_name {
+                Some(*score)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn outcome_bias_demotes_failing_tool() {
+        let state = ConversationState::default();
+        let query = "grep search for a pattern in the codebase";
+        let empty = HashMap::new();
+
+        let baseline = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &empty,
+            &[],
+            &empty,
+        );
+        let base_score = score_for(&baseline, "grep").expect("grep should rank");
+
+        let mut penalty = HashMap::new();
+        penalty.insert("grep".to_string(), -0.16);
+        let biased = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &empty,
+            &[],
+            &penalty,
+        );
+        let biased_score = score_for(&biased, "grep").expect("grep should still rank");
+
+        assert!(
+            biased_score < base_score,
+            "negative outcome bias should lower score: {biased_score} vs {base_score}"
+        );
+        // Scoring applies an inner clamp of ±0.10.
+        assert!((base_score - biased_score - 0.10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn outcome_bias_promotes_successful_tool() {
+        let state = ConversationState::default();
+        let query = "grep search for a pattern in the codebase";
+        let empty = HashMap::new();
+
+        let baseline = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &empty,
+            &[],
+            &empty,
+        );
+        let base_score = score_for(&baseline, "grep").expect("grep should rank");
+
+        let mut boost = HashMap::new();
+        boost.insert("grep".to_string(), 0.10);
+        let biased = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &empty,
+            &[],
+            &boost,
+        );
+        let biased_score = score_for(&biased, "grep").expect("grep should still rank");
+
+        assert!(
+            biased_score > base_score,
+            "positive outcome bias should raise score: {biased_score} vs {base_score}"
         );
     }
 }

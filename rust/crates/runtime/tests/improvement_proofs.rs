@@ -3544,6 +3544,7 @@ mod learning_improves_selection {
                 memory_domain_hints: hints,
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3559,6 +3560,7 @@ mod learning_improves_selection {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -5545,6 +5547,7 @@ mod hardening_proofs {
                     total_failures: 15,
                     failure_rate: 0.15,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
                 ToolHealthEntry {
                     name: "read_file".to_string(),
@@ -5552,6 +5555,7 @@ mod hardening_proofs {
                     total_failures: 1,
                     failure_rate: 0.02,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
             ],
             active_canary: None,
@@ -5574,6 +5578,7 @@ mod hardening_proofs {
             total_failures: 8,
             failure_rate: 0.8,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
         let health = ToolHealthTracker::from_entries(&entries);
         let guard = TurnGuard::with_health(health);
@@ -7425,6 +7430,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 2,
                 failure_rate: 0.2,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "grep".to_string(),
@@ -7432,6 +7438,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
         ];
         let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
@@ -7450,6 +7457,15 @@ mod learning_sync_cloud_proofs {
             total_failures: 3,
             failure_rate: 0.3,
             last_updated_epoch: 0,
+            recent_outcomes: vec![astra_pipeline::ToolOutcomeCacheEntry {
+                signature: r#"bash:{"command":"pwd"}"#.to_string(),
+                outcomes: vec![astra_pipeline::ToolOutcome {
+                    success: true,
+                    latency_ms: 9,
+                    result_hash: 42,
+                    at_epoch: 100,
+                }],
+            }],
         }];
         let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -7458,6 +7474,12 @@ mod learning_sync_cloud_proofs {
         assert_eq!(restored.tool_health[0].name, "bash");
         assert_eq!(restored.tool_health[0].total_calls, 10);
         assert_eq!(restored.tool_health[0].total_failures, 3);
+        assert_eq!(restored.tool_health[0].recent_outcomes.len(), 1);
+        assert_eq!(
+            restored.tool_health[0].recent_outcomes[0].signature,
+            r#"bash:{"command":"pwd"}"#
+        );
+        assert_eq!(restored.tool_health[0].recent_outcomes[0].outcomes.len(), 1);
     }
 
     #[test]
@@ -7471,6 +7493,7 @@ mod learning_sync_cloud_proofs {
             total_failures: 1,
             failure_rate: 0.05,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         // Cloud: bash updated at epoch 500 (older), grep is cloud-only
         let cloud = vec![
@@ -7480,6 +7503,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 5,
                 failure_rate: 0.5,
                 last_updated_epoch: 500,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "grep".to_string(),
@@ -7487,6 +7511,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 800,
+                recent_outcomes: vec![],
             },
         ];
 
@@ -7537,6 +7562,7 @@ mod health_dashboard_proofs {
                 total_failures: 5,
                 failure_rate: 0.25,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "grep".into(),
@@ -7544,6 +7570,7 @@ mod health_dashboard_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);
@@ -7718,6 +7745,7 @@ mod timestamp_merge_proofs {
             total_failures: 2,
             failure_rate: 0.4,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7725,6 +7753,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.067,
             last_updated_epoch: 2000, // newer
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
@@ -7744,6 +7773,7 @@ mod timestamp_merge_proofs {
             total_failures: 0,
             failure_rate: 0.0,
             last_updated_epoch: 3000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7751,6 +7781,7 @@ mod timestamp_merge_proofs {
             total_failures: 5,
             failure_rate: 0.5,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7767,6 +7798,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.2,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7774,6 +7806,7 @@ mod timestamp_merge_proofs {
             total_failures: 2,
             failure_rate: 0.1,
             last_updated_epoch: 1000, // same epoch
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7789,6 +7822,7 @@ mod timestamp_merge_proofs {
             total_failures: 3,
             failure_rate: 0.3,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7796,6 +7830,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7812,6 +7847,7 @@ mod timestamp_merge_proofs {
             total_failures: 2,
             failure_rate: 0.2,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7819,6 +7855,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.125,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7835,6 +7872,7 @@ mod timestamp_merge_proofs {
             total_failures: 0,
             failure_rate: 0.0,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![
             ToolHealthEntry {
@@ -7843,6 +7881,7 @@ mod timestamp_merge_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 500,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "read_file".into(),
@@ -7850,6 +7889,7 @@ mod timestamp_merge_proofs {
                 total_failures: 1,
                 failure_rate: 0.33,
                 last_updated_epoch: 800,
+                recent_outcomes: vec![],
             },
         ];
 
@@ -7867,6 +7907,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, cloud_only) = merge_tool_health(&[], &cloud);
@@ -7883,6 +7924,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &[]);
@@ -8168,6 +8210,7 @@ mod turnguard_e2e_proofs {
                 total_failures: 7,
                 failure_rate: 0.7,
                 last_updated_epoch: 1000,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "bash".into(),
@@ -8175,6 +8218,7 @@ mod turnguard_e2e_proofs {
                 total_failures: 2,
                 failure_rate: 0.1,
                 last_updated_epoch: 1000,
+                recent_outcomes: vec![],
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);
@@ -8869,6 +8913,7 @@ mod co_occurrence_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_with = selector.select(&ctx_with_recent).await;
@@ -8884,6 +8929,7 @@ mod co_occurrence_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_without = selector.select(&ctx_without_recent).await;
@@ -9030,10 +9076,179 @@ mod file_context_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec!["typescript".to_string()],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
         assert!(!result.failed, "selection with file_context should succeed");
         assert!(!result.tool_names.is_empty(), "should select tools");
+    }
+}
+
+/// Cross-turn cognition: tuning/learning ON vs OFF.
+///
+/// Proves that the outcome-memory → selector-bias wiring produces a
+/// measurable, deterministic change in tool ranking after a simulated
+/// turn-1 failure. With learning OFF (empty bias) the failing tool keeps
+/// the same rank; with learning ON (bias derived from ToolHealthTracker)
+/// the score drops and — when another in-pool tool is close — the rank
+/// changes. This is the benchmark for "tuning actually helps".
+mod cross_turn_cognition {
+    use astra_runtime::tool_registry::{
+        ConversationState, TOOL_CATALOG, pre_filter_dynamic_with_outcome_bias,
+    };
+    use astra_turn_core::tool_health::{ToolHealthTracker, ToolOutcome};
+    use std::collections::HashMap;
+
+    fn score_of(ranking: &[(usize, f64)], name: &str) -> Option<f64> {
+        ranking.iter().find_map(|(idx, score)| {
+            if TOOL_CATALOG[*idx].name == name {
+                Some(*score)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn proof_tuning_on_demotes_failing_tool_next_turn() {
+        let query = "grep the codebase for the foo pattern";
+        let state = ConversationState::from_message_with_context(query, 1, &[]);
+
+        // Turn-1 ranking with no outcome memory (learning OFF).
+        let off_bias: HashMap<String, f64> = HashMap::new();
+        let off_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &off_bias,
+        );
+        assert!(
+            !off_ranking.is_empty(),
+            "baseline ranking should not be empty"
+        );
+        let top_off_idx = off_ranking[0].0;
+        let top_off_name = TOOL_CATALOG[top_off_idx].name.to_string();
+        let top_off_score = off_ranking[0].1;
+
+        // Simulate turn-1: the top-ranked tool was invoked twice with
+        // distinct signatures and failed both times.
+        let mut health = ToolHealthTracker::new();
+        for i in 0..2 {
+            let sig = format!(r#"{top_off_name}:{{"q":"{i}"}}"#);
+            health.record_outcome(&sig, ToolOutcome::new(false, 5, "err"));
+        }
+        let on_bias = health.outcome_bias_by_tool(3600);
+        assert!(
+            on_bias.get(&top_off_name).copied().unwrap_or(0.0) < 0.0,
+            "outcome bias for failing tool must be negative, got {on_bias:?}"
+        );
+
+        // Turn-2 ranking with learning ON.
+        let on_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &on_bias,
+        );
+
+        // Proof 1: the failing tool's score dropped.
+        let on_score_for_failing =
+            score_of(&on_ranking, &top_off_name).expect("failing tool still in pool");
+        assert!(
+            on_score_for_failing < top_off_score,
+            "tuning ON must lower the score of the failing tool: off={top_off_score} on={on_score_for_failing}"
+        );
+
+        // Proof 2: the failing tool's rank index did not improve.
+        let off_rank = off_ranking
+            .iter()
+            .position(|(idx, _)| TOOL_CATALOG[*idx].name == top_off_name)
+            .expect("tool present in off ranking");
+        let on_rank = on_ranking
+            .iter()
+            .position(|(idx, _)| TOOL_CATALOG[*idx].name == top_off_name)
+            .expect("tool present in on ranking");
+        assert!(
+            on_rank >= off_rank,
+            "tuning ON must not improve the failing tool's rank: off_rank={off_rank} on_rank={on_rank}"
+        );
+
+        // Proof 3: OFF baseline is stable under repeated calls (no hidden
+        // side-effect) — re-running the OFF ranking yields the same top.
+        let off_again = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &off_bias,
+        );
+        assert_eq!(
+            off_again[0].0, top_off_idx,
+            "OFF baseline must be deterministic turn-to-turn"
+        );
+    }
+
+    #[test]
+    fn proof_tuning_on_rewards_successful_tool_next_turn() {
+        let query = "grep the codebase for the foo pattern";
+        let state = ConversationState::from_message_with_context(query, 1, &[]);
+
+        let off_bias: HashMap<String, f64> = HashMap::new();
+        let off_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &off_bias,
+        );
+        let top_name = TOOL_CATALOG[off_ranking[0].0].name.to_string();
+        let off_score = off_ranking[0].1;
+
+        let mut health = ToolHealthTracker::new();
+        for i in 0..2 {
+            let sig = format!(r#"{top_name}:{{"q":"{i}"}}"#);
+            health.record_outcome(&sig, ToolOutcome::new(true, 5, "ok"));
+        }
+        let on_bias = health.outcome_bias_by_tool(3600);
+        assert!(
+            on_bias.get(&top_name).copied().unwrap_or(0.0) > 0.0,
+            "successful tool must earn positive bias, got {on_bias:?}"
+        );
+
+        let on_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state,
+            query,
+            None,
+            None,
+            &[],
+            0.0,
+            &HashMap::new(),
+            &[],
+            &on_bias,
+        );
+        let on_score = score_of(&on_ranking, &top_name).expect("tool present");
+        assert!(
+            on_score > off_score,
+            "tuning ON must raise the score of the successful tool: off={off_score} on={on_score}"
+        );
     }
 }

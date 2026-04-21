@@ -341,6 +341,7 @@ pub(super) async fn try_cloud_pull_preferences(state: &mut ReplState) -> Vec<Str
                                         total_failures: 0,
                                         failure_rate: 0.0,
                                         last_updated_epoch: 0,
+                                        recent_outcomes: vec![],
                                     });
                                 }
                             }

@@ -593,6 +593,19 @@ pub async fn grant_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
     );
 }
 
+/// Remove the `astra_admin` role from `user_id` if present (admin smoke tests start non-admin).
+pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
+    sqlx::query(
+        "DELETE ur FROM auth_user_roles ur \
+         INNER JOIN auth_roles r ON ur.role_id = r.role_id \
+         WHERE ur.user_id = ? AND r.role_name = 'astra_admin'",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("revoke_astra_admin_role delete");
+}
+
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
     match current_auth_mode() {
