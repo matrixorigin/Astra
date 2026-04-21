@@ -795,7 +795,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             TurnExecutionControl::Return(outcome) => return Ok(outcome),
         };
 
-        match execute_tool_phase(
+        let tool_phase_control = execute_tool_phase(
             host,
             state,
             turn_index,
@@ -808,8 +808,15 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 turn_result,
             },
         )
-        .await?
-        {
+        .await?;
+
+        // Drain evolution signals / trigger auto-reflection on the production
+        // agentic loop path. Previously this was only reached via tests, which
+        // caused `reflect` / auto-tuning capabilities to appear regressed at
+        // runtime.
+        maybe_trigger_auto_reflection(host, state).await;
+
+        match tool_phase_control {
             TurnToolPhaseControl::ContinueLoop => continue,
             TurnToolPhaseControl::Return(outcome) => return Ok(outcome),
         }
@@ -837,12 +844,12 @@ pub(crate) mod tests {
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
         pub(crate) valid_tools: HashSet<String>,
-        emitted_lines: Vec<String>,
+        pub(crate) emitted_lines: Vec<String>,
         quiet: bool,
         pub(crate) injected_schemas: Vec<Value>,
         reflection_text: Option<String>,
         reflection_error: Option<String>,
-        last_reflection_prompt: Option<String>,
+        pub(crate) last_reflection_prompt: Option<String>,
         pub(crate) rendered_final_text: Vec<String>,
     }
 
@@ -867,7 +874,7 @@ pub(crate) mod tests {
             self
         }
 
-        fn with_reflection_text(mut self, text: &str) -> Self {
+        pub(crate) fn with_reflection_text(mut self, text: &str) -> Self {
             self.reflection_text = Some(text.to_string());
             self
         }
@@ -6441,6 +6448,78 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(host.emitted_lines.iter().any(|line| {
             line.contains("processed 1 proposal(s): 0 auto-applied, 0 canary-started, 1 queued")
         }));
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_injects_pipeline_diagnosis_into_prompt() {
+        // Seed runtime signals that the pipeline stage bridge recognises as a
+        // `ToolFailures` category, and assert the structured diagnosis is
+        // wired into the LLM reflection prompt via `recent_tactical_actions`.
+        let reflection_response = r#"{"proposals": [], "summary": "noop"}"#;
+        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
+        let mut state = make_state();
+
+        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
+        state.evolution_service = Some(evo.clone());
+
+        // Repeated failures on the same tool → FailureCategory::ToolFailures.
+        let fail_rec = |err: &str| ToolCallRecord {
+            name: "flaky_http".into(),
+            ok: false,
+            ms: 1,
+            error: Some(err.into()),
+            ..Default::default()
+        };
+        state.stall.tool_call_records = vec![
+            fail_rec("500"),
+            fail_rec("500"),
+            fail_rec("timeout"),
+        ];
+
+        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
+            state.pending_reflection_signals.push(
+                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                    tool_chain: vec![format!("tool_{i}")],
+                    stall_count: 3,
+                    turn_id: format!("t{i}"),
+                },
+            );
+        }
+
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
+
+        let prompt = host
+            .last_reflection_prompt
+            .as_deref()
+            .expect("reflection prompt captured");
+        assert!(
+            prompt.contains("pipeline-diagnose"),
+            "expected pipeline-diagnose label in reflection prompt, got: {}",
+            prompt
+        );
+        assert!(
+            prompt.contains("ToolFailures"),
+            "expected ToolFailures category in prompt, got: {}",
+            prompt
+        );
+        assert!(
+            prompt.contains("flaky_http"),
+            "expected failing tool name in prompt, got: {}",
+            prompt
+        );
+        // Strategy delta should have been applied to runtime state too.
+        assert!(
+            state.restricted_tools.contains("flaky_http"),
+            "expected flaky_http in restricted_tools, got: {:?}",
+            state.restricted_tools
+        );
+        assert!(
+            host.emitted_lines
+                .iter()
+                .any(|line| line.contains("Pipeline strategy applied") && line.contains("flaky_http")),
+            "expected strategy-applied log line, got lines: {:?}",
+            host.emitted_lines
+        );
     }
 
     #[tokio::test]

@@ -208,33 +208,43 @@ impl CloudLlmJudge {
         .await;
     }
 
-    /// Call the LLM API and parse the response score.
-    async fn call_llm(&self, prompt: &str, context: &str) -> Result<f64, String> {
-        let system_msg = serde_json::json!({
-            "role": "system",
-            "content": "You are a verification judge running on the cloud. Evaluate whether \
-                        an acceptance criterion is met based on the provided context. \
-                        Respond with ONLY a JSON object: \
-                        {\"score\": <0.0-1.0>, \"reason\": \"<brief explanation>\"}. \
-                        Score 1.0 = fully met, 0.0 = not met at all."
-        });
-        let user_msg = serde_json::json!({
-            "role": "user",
-            "content": format!(
-                "Criterion: {prompt}\n\nContext:\n{context}\n\n\
-                 Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
-            )
-        });
-
+    /// Generic chat-completion helper shared by the judge scoring path and
+    /// by out-of-crate skill-improvement LLM rewrites.
+    ///
+    /// Security invariants enforced here (do NOT remove without justification):
+    /// - **URL scheme allow-list** — only `http://` and `https://` schemes are
+    ///   accepted, blocking accidental `file://` / `data://` / ssh-url use.
+    /// - **Hard request timeout** (30s) — bounds request duration so a hung
+    ///   upstream cannot wedge the caller indefinitely.
+    /// - **Response size cap** (1 MiB) — prevents adversarial or malfunctioning
+    ///   upstreams from exhausting memory via unbounded streams.
+    /// - **Error-body truncation** (≤200 chars) — limits how much upstream
+    ///   content bleeds into surfaced error strings / logs.
+    ///
+    /// NOTE: The `pub` visibility is required because consumers live in other
+    /// crates (e.g. astra-cli's skill-improvement adapter). Treat this as an
+    /// internal seam — prefer wrapping new callers in a purpose-built trait
+    /// (e.g. `SkillImproveLlm`) rather than widening direct usage.
+    #[doc(hidden)]
+    pub async fn chat_completion(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<String, String> {
         let body = serde_json::json!({
             "model": self.model,
-            "messages": [system_msg, user_msg],
-            "max_tokens": 200,
-            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
         });
 
+        // URL scheme allow-list — reject non-HTTP(S) schemes.
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        // Validate URL has a proper protocol to prevent SSRF / malformed requests.
         let url_lower = url.trim().to_lowercase();
         if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
             return Err(format!(
@@ -248,6 +258,7 @@ impl CloudLlmJudge {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
+            // Hard per-request timeout to bound tail latency.
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
@@ -255,8 +266,8 @@ impl CloudLlmJudge {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // Limit error body read to 4 KB to prevent OOM from malicious upstream.
             let bytes = resp.bytes().await.unwrap_or_default();
+            // Truncate upstream error body before it reaches logs.
             let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
             return Err(format!(
                 "Cloud LLM API error {status}: {}",
@@ -264,11 +275,12 @@ impl CloudLlmJudge {
             ));
         }
 
-        // Limit response body to 1 MB to prevent OOM from oversized responses.
         let body_bytes = resp
             .bytes()
             .await
             .map_err(|e| format!("Cloud LLM response read failed: {e}"))?;
+        // Response size cap — reject bodies larger than 1 MiB to avoid
+        // unbounded memory growth from a malfunctioning or hostile upstream.
         if body_bytes.len() > 1_048_576 {
             return Err(format!(
                 "Cloud LLM response too large: {} bytes (limit 1MB)",
@@ -278,11 +290,25 @@ impl CloudLlmJudge {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("Cloud LLM response parse failed: {e}"))?;
 
-        let content = json["choices"][0]["message"]["content"]
+        Ok(json["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string())
+    }
 
-        parse_judge_score(content)
+    /// Call the LLM API and parse the response score.
+    async fn call_llm(&self, prompt: &str, context: &str) -> Result<f64, String> {
+        let system = "You are a verification judge running on the cloud. Evaluate whether \
+            an acceptance criterion is met based on the provided context. \
+            Respond with ONLY a JSON object: \
+            {\"score\": <0.0-1.0>, \"reason\": \"<brief explanation>\"}. \
+            Score 1.0 = fully met, 0.0 = not met at all.";
+        let user = format!(
+            "Criterion: {prompt}\n\nContext:\n{context}\n\n\
+             Evaluate and respond with {{\"score\": <0.0-1.0>, \"reason\": \"...\"}}."
+        );
+        let content = self.chat_completion(system, &user, 200, 0.1).await?;
+        parse_judge_score(&content)
     }
 }
 

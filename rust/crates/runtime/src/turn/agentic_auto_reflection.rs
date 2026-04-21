@@ -539,6 +539,33 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         state.pending_reflection_signals.extend(llm_signals);
     }
 
+    // Inject rule-based pipeline diagnosis (stages::reflect + stages::evaluate)
+    // into the tactical-actions context so the LLM reflection prompt sees a
+    // structured summary of the runtime's failure mode. Only emit when the
+    // diagnosis is non-trivial — avoids noise on healthy loops.
+    let diag = crate::turn::agentic_stage_bridge::diagnose_from_loop_state(state);
+    if diag.failure_category != astra_pipeline::stages::reflect::FailureCategory::General {
+        state
+            .recent_tactical_actions
+            .push(diag.tactical_action_label());
+        if state.recent_tactical_actions.len() > MAX_RECENT_TACTICAL_ACTIONS {
+            let overflow = state.recent_tactical_actions.len() - MAX_RECENT_TACTICAL_ACTIONS;
+            state.recent_tactical_actions.drain(..overflow);
+        }
+
+        // Apply the rule-based strategy delta to the runtime state: block
+        // persistently-failing tools so subsequent tool selection excludes
+        // them. Report the applied summary via the headless log channel.
+        let applied =
+            crate::turn::agentic_stage_bridge::apply_strategy_delta(state, &diag.strategy);
+        if !applied.is_noop() {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!("Pipeline strategy applied: {}", applied.summary()),
+            );
+        }
+    }
+
     if state.pending_reflection_signals.len() < AUTO_REFLECTION_SIGNAL_THRESHOLD {
         return;
     }

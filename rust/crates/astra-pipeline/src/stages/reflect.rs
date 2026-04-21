@@ -42,7 +42,7 @@ pub enum FailureCategory {
 /// Analyze TurnState to determine failure category and generate diagnosis.
 ///
 /// Returns: (category, what_happened, what_to_try)
-fn diagnose(state: &TurnState) -> (FailureCategory, String, String) {
+pub fn diagnose(state: &TurnState) -> (FailureCategory, String, String) {
     // Priority 1: Check for repeatedly failing tools
     let failing_tools: Vec<&String> = state
         .tool_failures
@@ -91,7 +91,7 @@ fn diagnose(state: &TurnState) -> (FailureCategory, String, String) {
 }
 
 /// Compute strategy adjustments based on the failure category.
-fn compute_strategy_delta(state: &TurnState, category: FailureCategory) -> StrategyDelta {
+pub fn compute_strategy_delta(state: &TurnState, category: FailureCategory) -> StrategyDelta {
     let mut delta = StrategyDelta::default();
 
     match category {

@@ -159,6 +159,31 @@ pub(super) fn detect_correction_signal(message: &str) -> bool {
     CORRECTION_PATTERNS.iter().any(|p| msg_lower.contains(p))
 }
 
+/// Emit an `EvolutionSignal::UserCorrection` (if evolution service is wired)
+/// from the current conversation context. Extracted from `run_chat_turn` for
+/// unit-testability; production code path is unchanged.
+async fn emit_user_correction_signal(state: &ReplState, correction_text: &str) {
+    let Some(evo) = state.evolution_service.as_ref() else {
+        return;
+    };
+    let prior_assistant_text = state
+        .history
+        .last()
+        .map(|(_u, a)| a.clone())
+        .unwrap_or_default();
+    let skill_context = state.recent_tools.last().cloned();
+    let turn_id = format!("turn-{}", state.turn);
+    evo.add_signal(
+        astra_runtime::evolution::types::EvolutionSignal::UserCorrection {
+            correction_text: correction_text.to_string(),
+            prior_assistant_text,
+            skill_context,
+            turn_id,
+        },
+    )
+    .await;
+}
+
 // ─── Relevance-scored history pruning ───────────────────────────────────────
 
 /// Lightweight tokenizer for relevance scoring: lowercase, split on
@@ -318,7 +343,7 @@ pub(super) async fn handle_chat_input(
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success(state, ctx.selector, ctx.profile, &line, result, turn_start);
+                apply_turn_success_async(state, ctx.selector, ctx.profile, &line, result, turn_start).await;
                 return Ok(());
             }
             Err(failure) => {
@@ -358,14 +383,14 @@ pub(super) async fn handle_chat_input(
                         }
                         TurnAttempt::Completed(result) => match *result {
                             Ok(result) => {
-                                apply_turn_success(
+                                apply_turn_success_async(
                                     state,
                                     ctx.selector,
                                     ctx.profile,
                                     &line,
                                     result,
                                     turn_start,
-                                );
+                                ).await;
                                 return Ok(());
                             }
                             Err(retry_failure) => {
@@ -404,14 +429,14 @@ pub(super) async fn handle_chat_input(
                                 }
                                 TurnAttempt::Completed(result) => match *result {
                                     Ok(result) => {
-                                        apply_turn_success(
+                                        apply_turn_success_async(
                                             state,
                                             ctx.selector,
                                             ctx.profile,
                                             &line,
                                             result,
                                             turn_start,
-                                        );
+                                        ).await;
                                         return Ok(());
                                     }
                                     Err(retry_failure) => {
@@ -1061,6 +1086,12 @@ async fn run_chat_turn(
     if detect_correction_signal(message) {
         let correction_turn = state.history.len() as u32;
         state.drift_user_corrections.push(correction_turn);
+
+        // Also emit an EvolutionSignal::UserCorrection so the evolution
+        // service / auto-reflection pipeline can learn from it. Previously
+        // only drift_user_corrections was recorded and no signal was ever
+        // produced for user corrections in the production path.
+        emit_user_correction_signal(state, message).await;
     }
 
     // Create a cancellation token that can interrupt SSE streaming mid-flight.
@@ -1553,7 +1584,36 @@ fn record_selector_turn_outcome(
     );
 }
 
+/// Test-only sync variant of `apply_turn_success`. Production code paths must
+/// use [`apply_turn_success_async`] so the LLM-driven skill-improvement path
+/// can await its network call. This wrapper keeps the existing synchronous
+/// test fixtures working without pulling a tokio runtime into every assertion.
+#[cfg(test)]
 fn apply_turn_success(
+    state: &mut ReplState,
+    selector: &dyn tool_selector::ToolSelector,
+    profile: Option<&str>,
+    line: &str,
+    result: StreamResult,
+    turn_start: Instant,
+) {
+    apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+    check_skill_improvement_inner(state);
+}
+
+async fn apply_turn_success_async(
+    state: &mut ReplState,
+    selector: &dyn tool_selector::ToolSelector,
+    profile: Option<&str>,
+    line: &str,
+    result: StreamResult,
+    turn_start: Instant,
+) {
+    apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+    check_skill_improvement_async(state).await;
+}
+
+fn apply_turn_success_sync(
     state: &mut ReplState,
     selector: &dyn tool_selector::ToolSelector,
     profile: Option<&str>,
@@ -1645,9 +1705,6 @@ fn apply_turn_success(
         .and_then(|i| state.history.get(i))
         .map(|(_, resp)| resp.as_str());
     record_selector_turn_outcome(selector, line, &result, &learning_snap, prev_assistant_text);
-
-    // ── Skill auto-improvement check ─────────────────────────────────────
-    check_skill_improvement(state, line, &result);
 
     // ── Post-turn status line ────────────────────────────────────────────
     print_turn_status_line(state, &result, turn_start);
@@ -1810,10 +1867,262 @@ fn print_context_window_warning(budget_pressure: f64) {
 }
 
 /// Check if the skill improvement tracker should trigger analysis.
+/// Minimal async-capable chat completion abstraction so the skill-improvement
+/// LLM path can be unit-tested without real HTTP.
+#[async_trait::async_trait]
+pub(crate) trait SkillImproveLlm: Send + Sync {
+    async fn complete(&self, system: &str, user: &str) -> Result<String, String>;
+}
+
+/// Adapter that exposes [`astra_services::CloudLlmJudge`] as [`SkillImproveLlm`].
+pub(crate) struct CloudJudgeLlm(pub std::sync::Arc<astra_services::CloudLlmJudge>);
+
+#[async_trait::async_trait]
+impl SkillImproveLlm for CloudJudgeLlm {
+    async fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+        self.0.chat_completion(system, user, 2048, 0.2).await
+    }
+}
+
+/// Async variant of `check_skill_improvement_inner` with an optional LLM-driven
+/// rewrite path.
+///
+/// Flow:
+/// 1. If the auto-tuning tracker says it is not time, return.
+/// 2. Collect eligible filesystem skills + recent user corrections.
+/// 3. If no corrections, mark analyzed and return (quiet no-op).
+/// 4. If an LLM is available and succeeds, apply the LLM-rewritten SKILL.md
+///    and record a structured proposal.
+/// 5. Otherwise fall back to the heuristic append ("Recent user feedback"
+///    section) via [`check_skill_improvement_inner`].
+async fn check_skill_improvement_async(state: &mut ReplState) {
+    let llm: Option<Box<dyn SkillImproveLlm>> = state
+        .matrix_runtime
+        .as_ref()
+        .and_then(|rt| rt.create_cloud_llm_judge())
+        .map(|judge| {
+            let boxed: Box<dyn SkillImproveLlm> =
+                Box::new(CloudJudgeLlm(std::sync::Arc::new(judge)));
+            boxed
+        });
+
+    if let Some(llm) = llm {
+        match try_llm_skill_improvement(state, llm.as_ref()).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                astra_core::agent_debug!(
+                    "skill",
+                    "LLM skill-improvement failed, falling back to heuristic: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    check_skill_improvement_inner(state);
+}
+
+/// LLM-driven skill-improvement core.
+///
+/// Return codes:
+/// - `Ok(true)`  — the LLM path handled this turn. The caller must NOT run the
+///   heuristic fallback. This covers both successful SKILL.md rewrites and
+///   deliberate no-ops (no filesystem skills, no queued corrections, empty or
+///   structurally-invalid LLM responses).
+/// - `Err(_)`    — an unexpected error occurred; the caller should log it and
+///   run the heuristic fallback.
+///
+/// The shape of `Result<bool, _>` is retained so future versions can reintroduce
+/// an `Ok(false)` "inapplicable, please retry via heuristic" path without a
+/// breaking signature change. At the moment no code path returns `Ok(false)`.
+pub(crate) async fn try_llm_skill_improvement(
+    state: &mut ReplState,
+    llm: &dyn SkillImproveLlm,
+) -> Result<bool, String> {
+    if !state.skill_improvement_tracker.should_analyze(state.turn) {
+        return Ok(true);
+    }
+
+    let registry = state.unified_skill_registry.clone();
+    let manifests = registry.all_manifests();
+    let filesystem_skills: Vec<_> = manifests
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.source,
+                astra_runtime::skills::manifest::SkillSourceKind::Local
+            )
+        })
+        .collect();
+    if filesystem_skills.is_empty() {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return Ok(true);
+    }
+
+    let recent: Vec<astra_runtime::skills::improvement::RecentMessage> = state
+        .history
+        .iter()
+        .rev()
+        .take(astra_runtime::skills::improvement::TURN_BATCH_SIZE as usize)
+        .rev()
+        .flat_map(|(user, assistant)| {
+            vec![
+                astra_runtime::skills::improvement::RecentMessage {
+                    role: "user".into(),
+                    content: user.clone(),
+                },
+                astra_runtime::skills::improvement::RecentMessage {
+                    role: "assistant".into(),
+                    content: assistant.clone(),
+                },
+            ]
+        })
+        .collect();
+
+    if recent.is_empty() {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return Ok(true);
+    }
+
+    let has_correction = recent
+        .iter()
+        .any(|m| m.role == "user" && detect_correction_signal(&m.content));
+    if !has_correction {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return Ok(true);
+    }
+
+    let target = filesystem_skills
+        .iter()
+        .find(|m| state.recent_tools.iter().any(|t| t.contains(&m.name)))
+        .copied()
+        .or_else(|| filesystem_skills.first().copied())
+        .ok_or_else(|| "no target skill".to_string())?;
+
+    let loaded = registry.get_loaded_skill(&target.name);
+    let skill_dir = loaded
+        .as_ref()
+        .and_then(|s| s.skill_dir.clone())
+        .ok_or_else(|| format!("skill {} has no on-disk directory", target.name))?;
+    let skill_md = skill_dir.join("SKILL.md");
+    let current_content = std::fs::read_to_string(&skill_md)
+        .map_err(|e| format!("failed to read {}: {}", skill_md.display(), e))?;
+
+    // Step 1: analysis — detect structured improvements.
+    let (analysis_system, analysis_user) =
+        astra_runtime::skills::improvement::build_analysis_prompt(
+            &target.name,
+            &current_content,
+            &recent,
+        );
+    let analysis_resp = llm.complete(&analysis_system, &analysis_user).await?;
+    let improvements =
+        astra_runtime::skills::improvement::parse_improvements(&analysis_resp);
+    if improvements.is_empty() {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return Ok(true);
+    }
+
+    // Step 2: rewrite — apply improvements into a new SKILL.md.
+    let rewrite_prompt =
+        astra_runtime::skills::improvement::build_rewrite_prompt(&current_content, &improvements);
+    let rewrite_system =
+        "You are editing a skill definition file. Output only the <updated_file> block.";
+    let rewrite_resp = llm.complete(rewrite_system, &rewrite_prompt).await?;
+    let new_content =
+        astra_runtime::skills::improvement::extract_updated_content(&rewrite_resp)
+            .ok_or_else(|| "LLM response missing <updated_file> block".to_string())?;
+
+    astra_runtime::skills::improvement::apply_improvement(&skill_md, &new_content)
+        .map_err(|e| format!("failed to write {}: {}", skill_md.display(), e))?;
+
+    let proposal = astra_runtime::skills::improvement::ImprovementProposal {
+        skill_name: target.name.clone(),
+        skill_path: skill_md.clone(),
+        improvements: improvements.clone(),
+    };
+    state.skill_improvement_tracker.propose(proposal);
+    eprintln!(
+        "  {}",
+        format!(
+            "✓ applied {} LLM-generated improvement(s) to skill '{}' ({})",
+            improvements.len(),
+            target.name,
+            skill_md.display()
+        )
+        .dim()
+    );
+    state.skill_improvement_tracker.mark_analyzed(state.turn);
+    Ok(true)
+}
+
+/// Periodically detect user corrections in conversation history and turn them
+/// into skill-improvement proposals.
 ///
 /// After every N user turns (TURN_BATCH_SIZE), checks whether the recent conversation
 /// contains corrections or improvements for any active filesystem skill.
 fn check_skill_improvement(state: &mut ReplState, _line: &str, _result: &StreamResult) {
+    check_skill_improvement_inner(state);
+}
+
+/// Trim the content so that at most `keep` `## Recent user feedback` sections
+/// remain (the most-recent ones). A "section" is delimited by any top-level
+/// `## ` heading. This prevents unbounded growth when corrections fire
+/// repeatedly across long sessions.
+fn trim_feedback_sections(content: &str, keep: usize) -> String {
+    const HEADING: &str = "## Recent user feedback";
+    if content.matches(HEADING).count() <= keep {
+        return content.to_string();
+    }
+
+    // Collect byte-offsets of every `## ` heading — we only need line starts.
+    let mut section_starts: Vec<usize> = Vec::new();
+    let mut pos = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("## ") {
+            section_starts.push(pos);
+        }
+        pos += line.len();
+    }
+    section_starts.push(content.len());
+
+    // Walk sections in order. Collect all feedback-section (start, end) pairs.
+    let mut feedback_ranges: Vec<(usize, usize)> = Vec::new();
+    for w in section_starts.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        if content[s..e].trim_start().starts_with(HEADING) {
+            feedback_ranges.push((s, e));
+        }
+    }
+
+    if feedback_ranges.len() <= keep {
+        return content.to_string();
+    }
+
+    // Drop the oldest (total - keep) ranges.
+    let drop_count = feedback_ranges.len() - keep;
+    let drop_set: std::collections::BTreeSet<(usize, usize)> =
+        feedback_ranges.iter().take(drop_count).cloned().collect();
+
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for (s, e) in &drop_set {
+        if cursor < *s {
+            out.push_str(&content[cursor..*s]);
+        }
+        cursor = *e;
+    }
+    if cursor < content.len() {
+        out.push_str(&content[cursor..]);
+    }
+    out
+}
+
+/// Body of `check_skill_improvement`, extracted so it can be unit-tested
+/// without requiring a full `StreamResult`.
+fn check_skill_improvement_inner(state: &mut ReplState) {
     if !state.skill_improvement_tracker.should_analyze(state.turn) {
         return;
     }
@@ -1862,16 +2171,150 @@ fn check_skill_improvement(state: &mut ReplState, _line: &str, _result: &StreamR
         return;
     }
 
-    // Log that analysis is due — actual LLM analysis deferred to future iteration.
-    // The prompt builders (build_analysis_prompt, build_rewrite_prompt) are ready
-    // in astra_runtime::skills::improvement, but calling LLM from here requires
-    // async context + API key plumbing that's better handled via a dedicated
-    // background task or post-turn hook.
-    astra_core::agent_debug!(
-        "skill",
-        "improvement check: {} filesystem skill(s) eligible, {} recent messages — analysis ready",
-        filesystem_skills.len(),
-        recent.len(),
+    // Heuristic closed-loop skill improvement:
+    // 1. Find recent user corrections in history.
+    // 2. Pick the most-recent filesystem skill (by name match in recent_tools
+    //    or first-eligible if none matches).
+    // 3. Append a "Recent user feedback" section to SKILL.md.
+    // 4. Record the proposal on the tracker.
+    //
+    // This is a safe, LLM-free closed loop that ensures corrections survive
+    // across sessions. The LLM-based rewrite path (build_analysis_prompt /
+    // build_rewrite_prompt) is a follow-up (P1) running from a dedicated
+    // async background task.
+
+    let corrections: Vec<String> = recent
+        .iter()
+        .filter(|m| m.role == "user" && detect_correction_signal(&m.content))
+        .map(|m| m.content.clone())
+        .collect();
+
+    if corrections.is_empty() {
+        astra_core::agent_debug!(
+            "skill",
+            "improvement check: {} filesystem skill(s) eligible, no user corrections in last {} messages",
+            filesystem_skills.len(),
+            recent.len(),
+        );
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
+
+    // Prefer a filesystem skill whose name appears in recent_tools; otherwise
+    // fall back to the first eligible filesystem skill.
+    let target = filesystem_skills
+        .iter()
+        .find(|m| state.recent_tools.iter().any(|t| t.contains(&m.name)))
+        .copied()
+        .or_else(|| filesystem_skills.first().copied());
+    let Some(target) = target else {
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    };
+
+    let loaded = registry.get_loaded_skill(&target.name);
+    let skill_dir = loaded.as_ref().and_then(|s| s.skill_dir.clone());
+    let Some(skill_dir) = skill_dir else {
+        astra_core::agent_debug!(
+            "skill",
+            "improvement check: skill {} has no on-disk directory — skipping",
+            target.name,
+        );
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    };
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        astra_core::agent_debug!(
+            "skill",
+            "improvement check: {} not found — skipping",
+            skill_md.display(),
+        );
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
+
+    let improvements: Vec<astra_runtime::skills::improvement::SkillImprovement> = corrections
+        .iter()
+        .map(|c| {
+            let snippet: String = c.chars().take(240).collect();
+            astra_runtime::skills::improvement::SkillImprovement {
+                section: "Recent user feedback".into(),
+                change: format!("User correction: {}", snippet),
+                reason: "Detected correction pattern in user message".into(),
+            }
+        })
+        .collect();
+
+    let proposal = astra_runtime::skills::improvement::ImprovementProposal {
+        skill_name: target.name.clone(),
+        skill_path: skill_md.clone(),
+        improvements: improvements.clone(),
+    };
+
+    // Append feedback to SKILL.md with dedup + section cap so the file doesn't
+    // grow unboundedly from repeated corrections:
+    //   - drop any bullet whose text already appears verbatim in the file;
+    //   - keep at most MAX_FEEDBACK_SECTIONS most-recent "Recent user feedback"
+    //     blocks — older ones are trimmed.
+    const MAX_FEEDBACK_SECTIONS: usize = 5;
+    let existing = std::fs::read_to_string(&skill_md).unwrap_or_default();
+
+    let novel_changes: Vec<&str> = improvements
+        .iter()
+        .map(|imp| imp.change.as_str())
+        .filter(|change| !existing.contains(change))
+        .collect();
+
+    if novel_changes.is_empty() {
+        astra_core::agent_debug!(
+            "skill",
+            "improvement check: all {} corrections already recorded in {} — skipping append",
+            improvements.len(),
+            skill_md.display(),
+        );
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut appended = String::new();
+    appended.push_str("\n\n## Recent user feedback\n");
+    appended.push_str(&format!("<!-- auto-recorded at t={} -->\n", now));
+    for change in &novel_changes {
+        appended.push_str(&format!("- {}\n", change));
+    }
+
+    // Trim oldest feedback sections if we'd exceed the cap after appending.
+    let trimmed_existing = trim_feedback_sections(&existing, MAX_FEEDBACK_SECTIONS - 1);
+    let new_content = format!("{}{}", trimmed_existing.trim_end(), appended);
+    if let Err(e) = astra_runtime::skills::improvement::apply_improvement(&skill_md, &new_content) {
+        eprintln!(
+            "  {}",
+            format!(
+                "skill improvement: failed to write {}: {}",
+                skill_md.display(),
+                e
+            )
+            .yellow()
+        );
+        state.skill_improvement_tracker.mark_analyzed(state.turn);
+        return;
+    }
+
+    state.skill_improvement_tracker.propose(proposal);
+    eprintln!(
+        "  {}",
+        format!(
+            "✓ recorded {} user correction(s) into skill '{}' ({})",
+            improvements.len(),
+            target.name,
+            skill_md.display()
+        )
+        .dim()
     );
 
     state.skill_improvement_tracker.mark_analyzed(state.turn);
@@ -4350,5 +4793,405 @@ mod tests {
             classify_turn_error("connection timeout"),
             ErrorKind::Network
         );
+    }
+
+    // ─── E2E: skill improvement closed loop ─────────────────────────────
+    // Seeds a tempdir filesystem skill, injects a user correction into
+    // ReplState.history, and calls `check_skill_improvement_inner` to verify:
+    //   1. SKILL.md on disk now contains a "Recent user feedback" section.
+    //   2. ImprovementTracker.pending_proposal is populated.
+    //   3. Tracker advanced past `should_analyze`.
+    #[tokio::test]
+    async fn skill_improvement_records_correction_on_filesystem_skill() {
+        // 1. Build tempdir skills root: <tmp>/my-skill/SKILL.md
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_md,
+            "---\nname: my-skill\ndescription: test skill\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal instructions.\n",
+        )
+        .unwrap();
+
+        // 2. Build a registry backed by a LocalSkillProvider pointing at tmp.
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        // Pre-load so skill_dir is populated on the cached LoadedSkill.
+        registry.load("my-skill").await.unwrap();
+        assert_eq!(registry.len(), 1);
+
+        // 3. Wire up a ReplState with the registry, a correction message
+        //    in history, and a turn count past the batch threshold.
+        let mut state = ReplState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "no, that's wrong — please do it differently next time".to_string(),
+                "(previous assistant response)".to_string(),
+            )],
+            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            recent_tools: vec!["my-skill".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            state
+                .skill_improvement_tracker
+                .should_analyze(state.turn)
+        );
+
+        // 4. Run the closed loop.
+        check_skill_improvement_inner(&mut state);
+
+        // 5a. SKILL.md should now contain the auto-recorded feedback.
+        let updated = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            updated.contains("Recent user feedback"),
+            "SKILL.md should contain feedback section:\n{}",
+            updated
+        );
+        assert!(
+            updated.contains("User correction:"),
+            "SKILL.md should quote the user correction:\n{}",
+            updated
+        );
+        assert!(
+            updated.contains("Original instructions."),
+            "SKILL.md must preserve original content:\n{}",
+            updated
+        );
+
+        // 5b. The tracker should hold the pending proposal for UI surfacing.
+        let pending = state
+            .skill_improvement_tracker
+            .take_proposal()
+            .expect("pending proposal should be recorded");
+        assert_eq!(pending.skill_name, "my-skill");
+        assert_eq!(pending.skill_path, skill_md);
+        assert!(!pending.improvements.is_empty());
+
+        // 5c. Tracker advanced past should_analyze.
+        assert!(
+            !state
+                .skill_improvement_tracker
+                .should_analyze(state.turn),
+            "tracker must advance last_analyzed_count"
+        );
+    }
+
+    // Regression guard: when there are no corrections, the loop must NOT
+    // touch SKILL.md and must NOT record a proposal.
+    #[tokio::test]
+    async fn skill_improvement_noop_without_correction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        let original = "---\nname: my-skill\ndescription: test skill\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
+        std::fs::write(&skill_md, original).unwrap();
+
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        registry.load("my-skill").await.unwrap();
+
+        let mut state = ReplState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "hello, please add a feature".to_string(),
+                "sure thing".to_string(),
+            )],
+            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            ..Default::default()
+        };
+
+        check_skill_improvement_inner(&mut state);
+
+        let unchanged = std::fs::read_to_string(&skill_md).unwrap();
+        assert_eq!(unchanged, original, "SKILL.md must not be modified");
+        assert!(state.skill_improvement_tracker.pending_proposal.is_none());
+    }
+
+    // ─── E2E: user correction → EvolutionSignal::UserCorrection emission ───
+    #[tokio::test]
+    async fn emit_user_correction_pushes_signal_to_evolution_service() {
+        let evo = std::sync::Arc::new(astra_runtime::evolution::service::EvolutionService::new());
+        let state = ReplState {
+            evolution_service: Some(evo.clone()),
+            history: vec![(
+                "write a function".to_string(),
+                "here is the function".to_string(),
+            )],
+            recent_tools: vec!["filesystem".to_string()],
+            turn: 3,
+            ..Default::default()
+        };
+
+        emit_user_correction_signal(&state, "no, that's wrong, do it differently").await;
+
+        let (_fast, llm_routed) = evo.flush().await;
+        // UserCorrection is LLM-routed by needs_llm (contains skill_context).
+        let found = llm_routed.iter().any(|s| {
+            matches!(
+                s,
+                astra_runtime::evolution::types::EvolutionSignal::UserCorrection {
+                    skill_context: Some(sc),
+                    correction_text,
+                    prior_assistant_text,
+                    turn_id,
+                } if sc == "filesystem"
+                    && correction_text.starts_with("no, that's wrong")
+                    && prior_assistant_text == "here is the function"
+                    && turn_id == "turn-3"
+            )
+        });
+        assert!(
+            found,
+            "UserCorrection signal not found in flushed llm_routed: {:?}",
+            llm_routed
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_user_correction_noop_without_evolution_service() {
+        let state = ReplState {
+            evolution_service: None,
+            history: vec![("u".to_string(), "a".to_string())],
+            ..Default::default()
+        };
+        // Must not panic.
+        emit_user_correction_signal(&state, "no, that's wrong").await;
+    }
+
+    // ─── E2E: LLM-driven skill improvement ───────────────────────────────
+    //
+    // Seeds a tempdir skill, injects a correction + a fake LLM that returns
+    // structured improvements and a rewritten SKILL.md, then exercises the
+    // production closed loop via `try_llm_skill_improvement`.
+    //
+    // Verifies:
+    //   * LLM-rewritten content replaces the original SKILL.md body.
+    //   * Structured `ImprovementProposal` (from parsed JSON) lands in tracker.
+    //   * Tracker advances past `should_analyze`.
+
+    struct FakeLlm {
+        responses: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SkillImproveLlm for FakeLlm {
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String, String> {
+            let mut r = self.responses.lock().unwrap();
+            if r.is_empty() {
+                Err("no canned response".into())
+            } else {
+                Ok(r.remove(0))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_skill_improvement_rewrites_skill_md_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        let original = "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal instructions.\n";
+        std::fs::write(&skill_md, original).unwrap();
+
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        registry.load("my-skill").await.unwrap();
+
+        let mut state = ReplState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "no, don't greet twice — skip the greeting on follow-ups".to_string(),
+                "Hello again!".to_string(),
+            )],
+            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            recent_tools: vec!["my-skill".to_string()],
+            ..Default::default()
+        };
+
+        // Canned LLM responses: first = analysis JSON, second = rewritten file.
+        let analysis = r#"[
+          {"section": "greeting", "change": "skip greeting on follow-ups", "reason": "user said don't greet twice"}
+        ]"#;
+        let rewritten = "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal instructions.\nSkip greeting on follow-up turns per user preference.\n";
+        let wrapped_rewrite = format!("<updated_file>\n{}\n</updated_file>", rewritten);
+
+        let llm = FakeLlm {
+            responses: std::sync::Mutex::new(vec![
+                analysis.to_string(),
+                wrapped_rewrite,
+            ]),
+        };
+
+        let ok = try_llm_skill_improvement(&mut state, &llm)
+            .await
+            .expect("LLM path should succeed");
+        assert!(ok, "LLM path should report handled=true");
+
+        let updated = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            updated.contains("Skip greeting on follow-up turns"),
+            "SKILL.md should contain LLM-rewritten body:\n{}",
+            updated
+        );
+        assert!(
+            updated.contains("name: my-skill"),
+            "frontmatter must be preserved:\n{}",
+            updated
+        );
+
+        let pending = state
+            .skill_improvement_tracker
+            .take_proposal()
+            .expect("structured proposal should land in tracker");
+        assert_eq!(pending.skill_name, "my-skill");
+        assert_eq!(pending.improvements.len(), 1);
+        assert_eq!(pending.improvements[0].section, "greeting");
+
+        assert!(
+            !state
+                .skill_improvement_tracker
+                .should_analyze(state.turn),
+            "tracker must advance"
+        );
+    }
+
+    // When LLM returns empty improvements array, the loop should no-op
+    // (not rewrite SKILL.md) but still mark analyzed.
+    #[tokio::test]
+    async fn llm_skill_improvement_empty_response_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        let original = "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
+        std::fs::write(&skill_md, original).unwrap();
+
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        registry.load("my-skill").await.unwrap();
+
+        let mut state = ReplState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "no, that's wrong".to_string(),
+                "sorry".to_string(),
+            )],
+            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            recent_tools: vec!["my-skill".to_string()],
+            ..Default::default()
+        };
+
+        let llm = FakeLlm {
+            responses: std::sync::Mutex::new(vec!["[]".to_string()]),
+        };
+
+        let ok = try_llm_skill_improvement(&mut state, &llm).await.unwrap();
+        assert!(ok);
+
+        assert_eq!(
+            std::fs::read_to_string(&skill_md).unwrap(),
+            original,
+            "SKILL.md must be unchanged on empty improvements"
+        );
+        assert!(state.skill_improvement_tracker.take_proposal().is_none());
+    }
+
+    /// Verify that when the LLM path errors out, the caller falls back to
+    /// the heuristic: SKILL.md receives the "Recent user feedback" section
+    /// and the tracker gets a heuristic-shaped proposal.
+    #[tokio::test]
+    async fn llm_error_falls_back_to_heuristic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        let original =
+            "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
+        std::fs::write(&skill_md, original).unwrap();
+
+        let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_runtime::skills::LocalSkillProvider::with_paths(vec![tmp.path().to_path_buf()]),
+        ));
+        registry.discover_all().await.unwrap();
+        registry.load("my-skill").await.unwrap();
+
+        let mut state = ReplState {
+            unified_skill_registry: std::sync::Arc::new(registry),
+            history: vec![(
+                "no, that's wrong, do it differently".to_string(),
+                "sorry".to_string(),
+            )],
+            turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
+            recent_tools: vec!["my-skill".to_string()],
+            ..Default::default()
+        };
+
+        let llm = FakeLlm {
+            // Empty canned responses → the fake returns Err on first call,
+            // mimicking a cloud LLM outage.
+            responses: std::sync::Mutex::new(vec![]),
+        };
+
+        let result = try_llm_skill_improvement(&mut state, &llm).await;
+        assert!(
+            result.is_err(),
+            "expected LLM path to return Err, got: {:?}",
+            result
+        );
+
+        // Simulate the caller's fallback to the heuristic.
+        check_skill_improvement_inner(&mut state);
+
+        let updated = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            updated.contains("## Recent user feedback"),
+            "heuristic fallback should have appended feedback section; got: {}",
+            updated
+        );
+        assert!(
+            updated.contains("no, that's wrong"),
+            "feedback section should contain correction snippet; got: {}",
+            updated
+        );
+    }
+
+    #[test]
+    fn trim_feedback_sections_caps_at_keep() {
+        let content = "# Body\ncontent\n\n## Recent user feedback\n- a\n\n\
+                       ## Recent user feedback\n- b\n\n## Recent user feedback\n- c\n\n\
+                       ## Recent user feedback\n- d\n";
+        // keep=2 → only the two most-recent sections (c, d) should remain.
+        let trimmed = trim_feedback_sections(content, 2);
+        assert_eq!(trimmed.matches("## Recent user feedback").count(), 2);
+        assert!(!trimmed.contains("- a"));
+        assert!(!trimmed.contains("- b"));
+        assert!(trimmed.contains("- c"));
+        assert!(trimmed.contains("- d"));
+        // Non-feedback content preserved.
+        assert!(trimmed.contains("# Body"));
+    }
+
+    #[test]
+    fn trim_feedback_sections_noop_when_within_cap() {
+        let content = "# Body\n\n## Recent user feedback\n- only\n";
+        let trimmed = trim_feedback_sections(content, 5);
+        assert_eq!(trimmed, content);
     }
 }
