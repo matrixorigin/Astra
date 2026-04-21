@@ -43,6 +43,27 @@ pub struct SelfModel {
     pub recent_signals: Vec<SignalSummary>,
     /// Constraints and safety bounds.
     pub constraints: ConstraintSet,
+    /// Rolling-stats guardrail state (auto-tuned reflection threshold,
+    /// recent failure rate). `None` when no tuner signal is available
+    /// at snapshot time — keeps legacy tests / constructors unchanged.
+    #[serde(default)]
+    pub guardrail: Option<GuardrailView>,
+    /// P3.1: most recent applied strategy-delta rendered as a structured
+    /// before/after diff. `None` when the last reflection was a noop.
+    #[serde(default)]
+    pub skill_diff: Option<crate::turn::agentic_stage_bridge::SkillDiffEntry>,
+}
+
+/// Compact view of the guardrail auto-tuner, surfaced to the agent via
+/// the self-awareness prompt section so Astra can see how its own
+/// sensitivity has been tuned.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GuardrailView {
+    pub reflection_threshold: u32,
+    pub last_delta: i32,
+    /// None until MIN_SAMPLES turns have been observed.
+    pub recent_fail_rate: Option<f32>,
+    pub turns_observed: u32,
 }
 
 /// Summary of agent capabilities.
@@ -60,6 +81,16 @@ pub struct CapabilityView {
     pub pinned_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
+    /// Tools currently boosted by the last auto-reflection strategy delta.
+    /// These are subtracted from any per-turn restricted set so the LLM sees
+    /// them even when general deprioritization would hide them.
+    #[serde(default)]
+    pub boosted_tools: Vec<String>,
+    /// Whether the next tool-visibility assembly will consume a one-shot
+    /// `widen_selection` request from the pipeline (skipping the
+    /// deprioritized→restricted merge).
+    #[serde(default)]
+    pub widen_selection_pending: bool,
 }
 
 /// Per-tool health summary.
@@ -193,6 +224,56 @@ impl SelfModel {
         recent_signals: &[FeedbackSignal],
         _config: &RuntimeConfig,
     ) -> Self {
+        Self::snapshot_with_strategy(
+            tool_names,
+            pinned_tools,
+            manual_deprioritized_tools,
+            skills,
+            tool_health,
+            turn_number,
+            latest_budget,
+            scenario,
+            active_experiment,
+            session_elapsed_secs,
+            correction_count,
+            compression_count,
+            session_goal,
+            plan_goal,
+            tracked_goal,
+            goal_progress,
+            milestones,
+            recent_signals,
+            _config,
+            None,
+        )
+    }
+
+    /// Same as [`Self::snapshot`] but also incorporates the most recent
+    /// pipeline [`StrategyApplication`] so the rendered self-awareness section
+    /// surfaces `boosted_tools` / `widen_selection_pending` to the agent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_with_strategy(
+        tool_names: &[&str],
+        pinned_tools: &[String],
+        manual_deprioritized_tools: &[String],
+        skills: &[String],
+        tool_health: Option<&ToolHealthTracker>,
+        turn_number: u32,
+        latest_budget: Option<&TokenBudgetTrace>,
+        scenario: Option<&Scenario>,
+        active_experiment: Option<&str>,
+        session_elapsed_secs: u64,
+        correction_count: usize,
+        compression_count: usize,
+        session_goal: Option<&str>,
+        plan_goal: Option<&str>,
+        tracked_goal: Option<&str>,
+        goal_progress: Option<&GoalProgress>,
+        milestones: Option<&[Milestone]>,
+        recent_signals: &[FeedbackSignal],
+        _config: &RuntimeConfig,
+        last_strategy: Option<&crate::turn::agentic_stage_bridge::StrategyApplication>,
+    ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
         let mut deprioritized = Vec::new();
@@ -224,6 +305,21 @@ impl SelfModel {
         }
         deprioritized.sort();
 
+        let (boosted_tools, widen_selection_pending) = match last_strategy {
+            Some(app) => {
+                let mut boosted: Vec<String> = app
+                    .newly_boosted
+                    .iter()
+                    .chain(app.already_boosted.iter())
+                    .cloned()
+                    .collect();
+                boosted.sort();
+                boosted.dedup();
+                (boosted, app.widen_requested)
+            }
+            None => (Vec::new(), false),
+        };
+
         let capabilities = CapabilityView {
             total_tools: tool_names.len(),
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
@@ -231,6 +327,8 @@ impl SelfModel {
             deprioritized_tools: deprioritized,
             pinned_tools: pinned_tools.to_vec(),
             skills: skills.to_vec(),
+            boosted_tools,
+            widen_selection_pending,
         };
 
         // ── Execution state ──
@@ -301,7 +399,25 @@ impl SelfModel {
             goals,
             recent_signals: signal_summaries,
             constraints: ConstraintSet::default(),
+            guardrail: None,
+            skill_diff: last_strategy.and_then(|app| app.diff_entry.clone()),
         }
+    }
+
+    /// Attach a guardrail view (called by edge_tools after `snapshot_with_strategy`).
+    pub fn with_guardrail(mut self, g: GuardrailView) -> Self {
+        self.guardrail = Some(g);
+        self
+    }
+
+    /// Attach an explicit skill-diff entry. Useful for tests and for callers
+    /// that want to inject a diff independently of `last_strategy`.
+    pub fn with_skill_diff(
+        mut self,
+        diff: crate::turn::agentic_stage_bridge::SkillDiffEntry,
+    ) -> Self {
+        self.skill_diff = Some(diff);
+        self
     }
 }
 
@@ -405,6 +521,53 @@ impl SelfModel {
                 "Deprioritized tools: {} (repeated failures — try alternatives)",
                 self.capabilities.deprioritized_tools.join(", ")
             );
+        }
+
+        // ── Strategy signals from last auto-reflection ──
+        if !self.capabilities.boosted_tools.is_empty() {
+            let _ = writeln!(
+                s,
+                "Boosted tools: {} (auto-reflection added these — prefer when the task fits)",
+                self.capabilities.boosted_tools.join(", ")
+            );
+        }
+        if self.capabilities.widen_selection_pending {
+            s.push_str(
+                "Tool selection: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
+            );
+        }
+        // P3.1: surface the structured before/after diff of the most recent
+        // strategy-delta application so the agent can audit its own tuning.
+        if let Some(diff) = &self.skill_diff {
+            let _ = writeln!(s, "Strategy diff: {}", diff.summary_line());
+        }
+
+        // ── Guardrail auto-tuning state (rolling stats → bounded Δ) ──
+        if let Some(g) = &self.guardrail {
+            let delta_tag = match g.last_delta.cmp(&0) {
+                std::cmp::Ordering::Less => " (tuned down → reacting faster)",
+                std::cmp::Ordering::Greater => " (tuned up → backing off)",
+                std::cmp::Ordering::Equal => "",
+            };
+            match g.recent_fail_rate {
+                Some(rate) => {
+                    let _ = writeln!(
+                        s,
+                        "Guardrail: reflection triggers after {} signals{} · recent fail-rate {:.0}% over {} turns",
+                        g.reflection_threshold,
+                        delta_tag,
+                        rate * 100.0,
+                        g.turns_observed
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "Guardrail: reflection triggers after {} signals{} · warming up ({} turns observed)",
+                        g.reflection_threshold, delta_tag, g.turns_observed,
+                    );
+                }
+            }
         }
 
         // ── Recent signals ──
@@ -973,5 +1136,239 @@ mod tests {
         assert!((c.config_drift_ceiling - 0.30).abs() < f64::EPSILON);
         assert_eq!(c.min_tool_pool_size, 5);
         assert!((c.token_reserve_fraction - 0.20).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_with_strategy_renders_boosted_and_widen() {
+        let config = RuntimeConfig::default();
+        let app = crate::turn::agentic_stage_bridge::StrategyApplication {
+            newly_blocked: vec![],
+            already_blocked: vec![],
+            widen_requested: true,
+            newly_boosted: vec!["read_file".into(), "grep".into()],
+            already_boosted: vec!["bash".into()],
+            diff_entry: None,
+        };
+        let model = SelfModel::snapshot_with_strategy(
+            &["bash", "read_file", "grep"],
+            &[],
+            &[],
+            &[],
+            None,
+            3,
+            None,
+            None,
+            None,
+            10,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+            Some(&app),
+        );
+        assert_eq!(
+            model.capabilities.boosted_tools,
+            vec!["bash", "grep", "read_file"]
+        );
+        assert!(model.capabilities.widen_selection_pending);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Boosted tools: bash, grep, read_file"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("widened for next turn"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_skill_diff_renders_strategy_diff_line() {
+        use crate::turn::agentic_stage_bridge::{DiffSnapshot, SkillDiffEntry};
+        let config = RuntimeConfig::default();
+        let diff = SkillDiffEntry {
+            skill: "pipeline.tool_selection".to_string(),
+            before: DiffSnapshot::default(),
+            after: DiffSnapshot {
+                blocked_tools: vec!["flaky_http".to_string()],
+                boosted_tools: vec![],
+                widen_pending: true,
+            },
+            reason: "auto-reflection".to_string(),
+        };
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            1,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_skill_diff(diff);
+        let rendered = model.to_system_prompt_section();
+        assert!(rendered.contains("Strategy diff:"), "got: {rendered}");
+        assert!(rendered.contains("flaky_http"), "got: {rendered}");
+        assert!(rendered.contains("+widen"), "got: {rendered}");
+    }
+
+    #[test]
+    fn snapshot_without_strategy_omits_boost_and_widen_lines() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            1,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+        assert!(model.capabilities.boosted_tools.is_empty());
+        assert!(!model.capabilities.widen_selection_pending);
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
+        assert!(
+            !rendered.contains("widened for next turn"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn snapshot_without_guardrail_omits_line() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            10,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+        assert!(model.guardrail.is_none());
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Guardrail:"), "got: {rendered}");
+    }
+
+    #[test]
+    fn snapshot_with_guardrail_renders_threshold_line() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            6,
+            None,
+            None,
+            None,
+            60,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_guardrail(GuardrailView {
+            reflection_threshold: 2,
+            last_delta: -1,
+            recent_fail_rate: Some(0.5),
+            turns_observed: 10,
+        });
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Guardrail: reflection triggers after 2 signals"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("reacting faster"),
+            "delta tag missing: {rendered}"
+        );
+        assert!(rendered.contains("50% over 10 turns"), "got: {rendered}");
+    }
+
+    #[test]
+    fn snapshot_with_guardrail_warming_up_renders_no_rate() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            2,
+            None,
+            None,
+            None,
+            20,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_guardrail(GuardrailView {
+            reflection_threshold: 3,
+            last_delta: 0,
+            recent_fail_rate: None,
+            turns_observed: 2,
+        });
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("warming up (2 turns observed)"),
+            "got: {rendered}"
+        );
+        assert!(!rendered.contains("%"), "got: {rendered}");
     }
 }

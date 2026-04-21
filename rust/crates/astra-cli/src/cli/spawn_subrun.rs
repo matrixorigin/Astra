@@ -209,6 +209,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
+            boosted_tools: HashSet::new(),
+            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(

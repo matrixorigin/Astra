@@ -263,7 +263,7 @@ pub(super) async fn handle_slash_command(
         }
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
-        | "/version" | "/rewind" | "/turn" | "/report" => {
+        | "/version" | "/whoami" | "/rewind" | "/turn" | "/report" => {
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 

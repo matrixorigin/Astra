@@ -161,6 +161,8 @@ mod tests {
             current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
+            boosted_tools: HashSet::new(),
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),

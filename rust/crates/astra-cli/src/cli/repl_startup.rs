@@ -350,6 +350,28 @@ pub(crate) async fn complete_repl_startup(
     }
     tracer.phase("multi_agent_runtime");
 
+    // ── Self-brief (passive self-awareness) ─────────────────────────────
+    // Print a one-line identity summary so the user can see, at startup,
+    // what agent version / model / session / skills are live.
+    {
+        let version = env!("CARGO_PKG_VERSION");
+        let model = state.model.as_deref().unwrap_or("<unset>");
+        let session = state
+            .session_id
+            .as_deref()
+            .map(|s| truncate_str(s, 12))
+            .unwrap_or_else(|| "<new>".to_string());
+        let skills = state.unified_skill_registry.len();
+        eprintln!(
+            "  {} {}",
+            theme::icon_ok(),
+            format!(
+                "astra v{version} · model={model} · session={session} · {skills} skills · auto-reflect on · /whoami for details"
+            )
+            .dim()
+        );
+    }
+
     Ok(ReplStartupArtifacts {
         selector,
         pipeline_modules,

@@ -406,42 +406,39 @@ mod divergence_detection {
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
-    // ── Exploring patterns ──
+    // ── Exploring semantics removed under P2.5 ──
+    // (Under new signature-diversity assessment, "Exploring" is no longer
+    // an injection-triggering state and distinct-sig rounds are Healthy.)
 
     #[test]
-    fn exploring_one_round() {
+    fn diverse_rounds_are_healthy() {
         let sigs = make_sigs(&[&["write_file"], &["bash"]]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(1)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
-    fn exploring_two_rounds() {
-        // With MAX_EXPLORATION_ROUNDS=3, two consecutive exploration-only tail rounds → Exploring(2)
+    fn diverse_three_rounds_still_healthy() {
         let sigs = make_sigs(&[&["write_file"], &["bash"], &["read_file"]]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(2)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     // ── Diverging patterns (the bad path) ──
+    // P2.5: Diverging fires only on exact signature repetition across the
+    // full rolling window, NOT on diverse exploration tools.
 
     #[test]
-    fn diverging_three_rounds() {
-        // 3 consecutive exploration rounds → Diverging(3) at default MAX_EXPLORATION_ROUNDS
-        let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(
+    fn diverging_exact_repeat_three_rounds() {
+        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
+        assert!(matches!(
             detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(3)
-        );
+            DivergenceStatus::Diverging(_)
+        ));
     }
 
     #[test]
-    fn diverging_classic_pattern() {
-        // 5 exploration rounds → Diverging(5), hits threshold
+    fn diverging_mixed_tool_names_healthy() {
+        // Previously this was "classic Diverging" (all from whitelist).
+        // Now: diverse sigs → Healthy (real work).
         let sigs = make_sigs(&[
             &["bash"],
             &["bash"],
@@ -449,15 +446,11 @@ mod divergence_detection {
             &["read_file"],
             &["grep"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(5)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
-    fn diverging_at_threshold() {
-        // 8 exploration rounds → Diverging(8), well past threshold
+    fn long_diverse_session_is_healthy() {
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -468,50 +461,39 @@ mod divergence_detection {
             &["list_dir"],
             &["read_file"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(8)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
-    fn diverging_multi_exploration_per_round() {
-        // 3 consecutive exploration-only rounds (multi-tool counts as one round) → Diverging(3)
-        let sigs = make_sigs(&[
-            &["bash", "grep"],
-            &["list_dir", "glob"],
-            &["read_file", "bash"],
-        ]);
-        assert_eq!(
+    fn diverging_exact_multi_tool_repeat() {
+        // Repeating the SAME sig-set across rounds (genuine loop) → Diverging.
+        let sigs = make_sigs(&[&["bash", "grep"], &["bash", "grep"], &["bash", "grep"]]);
+        assert!(matches!(
             detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(3)
-        );
+            DivergenceStatus::Diverging(_)
+        ));
     }
 
     // ── Reset behavior ──
 
     #[test]
-    fn reset_by_productive_tool() {
-        // Deep divergence resets when a productive tool is used;
-        // 2 exploration rounds after reset → Exploring(2) (below MAX_EXPLORATION_ROUNDS=3)
+    fn productive_tool_changes_sig_to_healthy() {
+        // After a productive call, the signature set changes; new window
+        // becomes diverse → Healthy (no injection).
         let sigs = make_sigs(&[
             &["bash"],
             &["bash"],
             &["bash"],
-            &["bash"],         // 4 exploration
-            &["memory_store"], // productive → reset
             &["bash"],
-            &["bash"], // 2 more exploration → Exploring(2)
+            &["memory_store"],
+            &["bash"],
+            &["bash"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(2)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
     fn reset_mixed_round_with_productive() {
-        // A round with BOTH exploration and productive tools is NOT exploration-only
         let sigs = make_sigs(&[&["bash"], &["bash"], &["bash", "write_file"]]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
@@ -520,8 +502,13 @@ mod divergence_detection {
 
     #[test]
     fn correction_prompt_exists_and_is_meaningful() {
-        assert!(DIVERGENCE_CORRECTION.contains("exploring"));
-        assert!(DIVERGENCE_CORRECTION.contains("STOP"));
+        // P2.5 rewrote this as a task-type-agnostic template. Key markers:
+        // it identifies a repetition loop and instructs a change in action.
+        assert!(
+            DIVERGENCE_CORRECTION.contains("same tool calls")
+                || DIVERGENCE_CORRECTION.contains("same arguments")
+                || DIVERGENCE_CORRECTION.contains("progress")
+        );
         assert!(
             DIVERGENCE_CORRECTION.len() > 100,
             "Correction prompt should be substantial"

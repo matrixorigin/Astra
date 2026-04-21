@@ -1678,21 +1678,14 @@ mod non_happy_path {
     // ── B.2: Divergence Detection ──
 
     #[test]
-    fn divergence_detects_exploration_spiral() {
-        let sigs = make_sigs(&[
-            &["bash"],
-            &["list_dir"],
-            &["read_file"],
-            &["grep"],
-            &["glob"],
-            &["bash"],
-            &["list_dir"],
-            &["read_file"],
-        ]);
+    fn divergence_detects_exact_repeat_loop() {
+        // P2.5: divergence is defined by signature repetition, not by
+        // which tools appear. Genuine exact-repeat loop → Diverging.
+        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"], &["bash"], &["bash"]]);
         let status = detect_divergence(&sigs).unwrap();
         assert!(
             matches!(status, DivergenceStatus::Diverging(_)),
-            "Pure exploration (8 rounds) should be flagged as diverging"
+            "Exact sig repetition across window should be diverging; got {status:?}"
         );
     }
 
@@ -1707,9 +1700,11 @@ mod non_happy_path {
     }
 
     #[test]
-    fn divergence_and_stall_are_independent() {
-        let stall_sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        let diverge_sigs = make_sigs(&[
+    fn divergence_and_stall_agree_on_loops() {
+        // P2.5 unified both detectors around signature diversity: a genuine
+        // exact-repeat loop trips both. Diverse exploration trips neither.
+        let loop_sigs = make_sigs(&[&["bash"], &["bash"], &["bash"], &["bash"], &["bash"]]);
+        let diverse_sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
             &["read_file"],
@@ -1721,19 +1716,24 @@ mod non_happy_path {
         ]);
 
         assert!(
-            detect_server_stall(&stall_sigs, 3).unwrap(),
-            "Should detect stall"
-        );
-        assert!(
-            !detect_server_stall(&diverge_sigs, 3).unwrap(),
-            "Not stall — tools differ"
+            detect_server_stall(&loop_sigs, 3).unwrap(),
+            "Exact-repeat triggers stall"
         );
         assert!(
             matches!(
-                detect_divergence(&diverge_sigs).unwrap(),
+                detect_divergence(&loop_sigs).unwrap(),
                 DivergenceStatus::Diverging(_)
             ),
-            "Should detect divergence — all exploration (8 rounds)"
+            "Exact-repeat triggers divergence"
+        );
+        assert!(
+            !detect_server_stall(&diverse_sigs, 3).unwrap(),
+            "Diverse rounds are not stall"
+        );
+        assert_eq!(
+            detect_divergence(&diverse_sigs).unwrap(),
+            DivergenceStatus::Healthy,
+            "Diverse rounds are healthy"
         );
     }
 
@@ -3193,52 +3193,39 @@ mod stall_enforcement_proofs {
     }
 
     #[test]
-    fn stall_detection_with_divergence_is_orthogonal() {
-        // Stall detection and divergence detection should fire independently
+    fn stall_detection_and_divergence_both_flag_loops() {
+        // P2.5: stall and divergence now share the signature-diversity
+        // judgment; both flag exact-repeat loops, and neither flags
+        // legitimate diverse exploration.
         use std::collections::BTreeSet;
 
-        // Case 1: stall (same tool+args repeated) — not divergence
-        let stall_sigs: Vec<BTreeSet<String>> = (0..3)
+        // Case 1: exact sig repetition trips BOTH stall and divergence.
+        let loop_sigs: Vec<BTreeSet<String>> = (0..5)
             .map(|_| {
                 let mut s = BTreeSet::new();
                 s.insert("github_list_prs:{\"repo\":\"test\"}".to_string());
                 s
             })
             .collect();
-        assert!(detect_server_stall(&stall_sigs, 2).unwrap());
-        assert_eq!(
-            detect_divergence(&stall_sigs).unwrap(),
-            DivergenceStatus::Healthy
-        ); // not exploration tools
+        assert!(detect_server_stall(&loop_sigs, 2).unwrap());
+        assert!(matches!(
+            detect_divergence(&loop_sigs).unwrap(),
+            DivergenceStatus::Diverging(_)
+        ));
 
-        // Case 2: divergence (exploration tools only) — not stall
-        let div_sigs: Vec<BTreeSet<String>> = vec![
-            {
+        // Case 2: diverse exploration trips NEITHER (real work).
+        let diverse_sigs: Vec<BTreeSet<String>> = ["bash", "list_dir", "read_file", "grep"]
+            .iter()
+            .map(|t| {
                 let mut s = BTreeSet::new();
-                s.insert("bash:{}".to_string());
+                s.insert(format!("{t}:{{}}"));
                 s
-            },
-            {
-                let mut s = BTreeSet::new();
-                s.insert("list_dir:{}".to_string());
-                s
-            },
-            {
-                let mut s = BTreeSet::new();
-                s.insert("read_file:{}".to_string());
-                s
-            },
-            {
-                let mut s = BTreeSet::new();
-                s.insert("grep:{}".to_string());
-                s
-            },
-        ];
-        assert!(!detect_server_stall(&div_sigs, 2).unwrap()); // different tools each turn
-        // `MAX_EXPLORATION_ROUNDS` is 3: four consecutive exploration-only rounds are Diverging.
+            })
+            .collect();
+        assert!(!detect_server_stall(&diverse_sigs, 2).unwrap());
         assert_eq!(
-            detect_divergence(&div_sigs).unwrap(),
-            DivergenceStatus::Diverging(4)
+            detect_divergence(&diverse_sigs).unwrap(),
+            DivergenceStatus::Healthy
         );
     }
 }
@@ -8060,46 +8047,51 @@ mod turnguard_e2e_proofs {
     fn divergence_resets_on_productive_tool() {
         let mut guard = TurnGuard::new();
 
-        // Turn 1: exploration-only (bash)
+        // Turn 1: single exploration round — no injection expected.
         guard.record_tool_calls(&[tc("bash", r#"{"command":"ls"}"#)]);
         guard.record_tool_result("bash", "file1.rs");
         let v1 = guard.evaluate();
-        let has_divergence = v1.injections.iter().any(|m| m.contains("exploring"));
         assert!(
-            !has_divergence,
-            "1 exploration round should not trigger divergence"
+            !v1.injections.iter().any(|m| m.contains("same tool calls")),
+            "1 round should not trigger divergence"
         );
 
-        // Turn 2: productive tool breaks the streak
-        guard.record_tool_calls(&[tc("memory_store", r#"{"content":"fact"}"#)]);
-        guard.record_tool_result("memory_store", r#"{"stored": true}"#);
-        let v2 = guard.evaluate();
+        // Turns 2-9: diverse exploration across many rounds — P2.5 no
+        // longer flags this as divergence (no whitelist heuristic).
+        let rounds = [
+            ("memory_store", r#"{"content":"fact"}"#),
+            ("read_file", r#"{"path":"a.rs"}"#),
+            ("grep", r#"{"pattern":"todo"}"#),
+            ("bash", r#"{"command":"find . -name *.rs"}"#),
+            ("list_dir", r#"{"path":"src"}"#),
+            ("glob", r#"{"pattern":"*.toml"}"#),
+            ("read_file", r#"{"path":"Cargo.toml"}"#),
+            ("grep", r#"{"pattern":"fn "}"#),
+        ];
+        for (tool, args) in rounds {
+            guard.record_tool_calls(&[tc(tool, args)]);
+            guard.record_tool_result(tool, "ok");
+        }
+        let v = guard.evaluate();
         assert!(
-            !v2.injections.iter().any(|m| m.contains("exploring")),
-            "Productive tool resets divergence"
+            !v.injections.iter().any(|m| m.contains("same tool calls")),
+            "Diverse exploration must not trigger divergence under P2.5: {:?}",
+            v.injections
         );
 
-        // Turns 3-9: eight consecutive exploration rounds → Diverging
-        guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
-        guard.record_tool_result("read_file", "fn main(){}");
-        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"todo"}"#)]);
-        guard.record_tool_result("grep", "[]");
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
-        guard.record_tool_result("bash", "lib.rs");
-        guard.record_tool_calls(&[tc("list_dir", r#"{"path":"src"}"#)]);
-        guard.record_tool_result("list_dir", "main.rs");
-        guard.record_tool_calls(&[tc("glob", r#"{"pattern":"*.toml"}"#)]);
-        guard.record_tool_result("glob", "Cargo.toml");
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"wc -l src/*.rs"}"#)]);
-        guard.record_tool_result("bash", "42 src/main.rs");
-        guard.record_tool_calls(&[tc("read_file", r#"{"path":"Cargo.toml"}"#)]);
-        guard.record_tool_result("read_file", "[package]");
-        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"fn "}"#)]);
-        guard.record_tool_result("grep", "src/main.rs:1:fn main");
-        let v9 = guard.evaluate();
+        // Now loop an exact call 5 times → should trip divergence.
+        let mut guard2 = TurnGuard::new();
+        for _ in 0..5 {
+            guard2.record_tool_calls(&[tc("bash", r#"{"command":"ls"}"#)]);
+        }
+        let v_loop = guard2.evaluate();
         assert!(
-            v9.injections.iter().any(|m| m.contains("exploring")),
-            "8 consecutive exploration rounds → divergence correction"
+            v_loop
+                .injections
+                .iter()
+                .any(|m| m.contains("same tool calls") || m.contains("same arguments")),
+            "Exact-sig loop should trigger divergence: {:?}",
+            v_loop.injections
         );
     }
 
@@ -8137,42 +8129,30 @@ mod turnguard_e2e_proofs {
     fn cache_waste_and_divergence_combined_in_single_verdict() {
         let mut guard = TurnGuard::new();
 
-        // Exploration turns with cache hits — need 8 consecutive for divergence
+        // Duplicate cache hits → cache-waste warning.
         guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
         guard.record_tool_result("read_file", "fn main(){}");
         guard.record_cache_hit("read_file");
         guard.record_cache_hit("read_file");
-        guard.record_cache_hit("read_file"); // 3 cache hits → wasteful
+        guard.record_cache_hit("read_file");
 
-        guard.record_tool_calls(&[tc("glob", r#"{"pattern":"*.rs"}"#)]);
-        guard.record_tool_result("glob", "[]");
-
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.toml"}"#)]);
-        guard.record_tool_result("bash", "Cargo.toml");
-
-        guard.record_tool_calls(&[tc("list_dir", r#"{"path":"src"}"#)]);
-        guard.record_tool_result("list_dir", "main.rs");
-
-        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"fn main"}"#)]);
-        guard.record_tool_result("grep", "main.rs:1");
-
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"wc -l *.rs"}"#)]);
-        guard.record_tool_result("bash", "42");
-
-        guard.record_tool_calls(&[tc("read_file", r#"{"path":"b.rs"}"#)]);
-        guard.record_tool_result("read_file", "pub fn lib(){}");
-
-        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"pub fn"}"#)]);
-        guard.record_tool_result("grep", "b.rs:1");
-        // 8 consecutive exploration rounds → Diverging
+        // Exact-sig loop via repeated identical `read_file` call →
+        // triggers divergence under P2.5.
+        for _ in 0..5 {
+            guard.record_tool_calls(&[tc("read_file", r#"{"path":"a.rs"}"#)]);
+            guard.record_tool_result("read_file", "fn main(){}");
+        }
 
         let verdict = guard.evaluate();
         let msgs = verdict.injections.join("\n");
         assert!(
             msgs.contains("Duplicate calls"),
-            "Should warn about cache waste"
+            "Should warn about cache waste: {msgs}"
         );
-        assert!(msgs.contains("exploring"), "Should warn about divergence");
+        assert!(
+            msgs.contains("same tool calls") || msgs.contains("same arguments"),
+            "Should warn about divergence (loop): {msgs}"
+        );
         assert!(verdict.severity >= VerdictSeverity::Warning);
     }
 

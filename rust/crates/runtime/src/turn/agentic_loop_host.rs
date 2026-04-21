@@ -399,6 +399,16 @@ pub struct StallTrackingState {
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
+    /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
+    /// threshold. Observes per-turn outcomes and adjusts the threshold by
+    /// ±1 (bounded to `[MIN, MAX]`) so Astra reacts faster when failures
+    /// cluster and backs off when things are stable.
+    pub guardrail_tuner: crate::guardrail_tuning::GuardrailTuner,
+    /// Cursor into `tool_call_records` marking the boundary already
+    /// observed by the guardrail tuner. Turn N sees records
+    /// `tool_call_records[cursor..]`; after observation the cursor is
+    /// advanced to `len()`.
+    pub guardrail_tuner_records_cursor: usize,
 }
 
 /// Inter-agent messaging state for the agentic loop.
@@ -499,6 +509,18 @@ pub struct AgenticLoopState {
     pub current_round_index: u32,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
+    /// Positive allowlist bias populated by pipeline `add_tools` strategy.
+    /// Tools listed here are guaranteed NOT to be filtered out by the effective
+    /// restriction set on the current turn (they still have to be advertised
+    /// by the edge catalogue). This is additive and persists until manually
+    /// cleared; the bridge prunes it naturally when a later diagnosis drops the
+    /// tool from its recommendation.
+    pub boosted_tools: HashSet<String>,
+    /// One-shot flag set by pipeline `widen_selection` strategy. When true,
+    /// the upcoming tool-visibility assembly skips the deprioritized → restricted
+    /// merge for this turn so the LLM sees the full catalogue again. The flag
+    /// is consumed (reset to false) on use.
+    pub widen_selection_pending: bool,
     pub step_recorder: StepRecorder,
 
     // ── Dedup + caching ──
@@ -1079,6 +1101,8 @@ pub(crate) mod tests {
             current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
+            boosted_tools: HashSet::new(),
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
@@ -6462,6 +6486,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
         state.evolution_service = Some(evo.clone());
 
+        // Attach an observability session so the auto-reflection bridge can
+        // publish last_strategy_application → surfaced by SelfModel rendering.
+        let obs_session = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::observability_integration::ObservabilitySession::new_simple("sess-e2e"),
+        ));
+        state.telemetry.observability_session = Some(obs_session.clone());
+
         // Repeated failures on the same tool → FailureCategory::ToolFailures.
         let fail_rec = |err: &str| ToolCallRecord {
             name: "flaky_http".into(),
@@ -6516,6 +6547,87 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     && line.contains("flaky_http")),
             "expected strategy-applied log line, got lines: {:?}",
             host.emitted_lines
+        );
+        // ToolFailures diagnosis also sets widen_selection → the one-shot flag
+        // should be pending until the next visible_turn_tools call consumes it.
+        assert!(
+            state.widen_selection_pending,
+            "expected widen_selection_pending = true after bridge applied strategy"
+        );
+        // Passive self-awareness loop: the bridge publishes StrategyApplication
+        // onto the observability session, and SelfModel rendering surfaces it
+        // to the agent on the next turn.
+        let obs_guard = obs_session.read().expect("obs session read");
+        let applied = obs_guard
+            .last_strategy_application
+            .as_ref()
+            .expect("expected last_strategy_application published on obs session");
+        assert!(applied.widen_requested, "widen should be recorded");
+        assert!(
+            applied.newly_blocked.iter().any(|t| t == "flaky_http"),
+            "flaky_http should be recorded as newly_blocked"
+        );
+        let self_model = crate::self_model::SelfModel::snapshot_with_strategy(
+            &["bash", "read_file"],
+            &[],
+            &[],
+            &[],
+            None,
+            (state.max_turns - state.remaining_turns) as u32,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &obs_guard.config,
+            Some(applied),
+        );
+        let rendered = self_model.to_system_prompt_section();
+        assert!(
+            rendered.contains("widened for next turn"),
+            "expected widen signal in self-awareness section, got: {rendered}"
+        );
+        // P3.1: structured skill-diff carries before/after snapshots, is
+        // published on StrategyApplication, and is surfaced verbatim in the
+        // self-awareness section so the agent can audit its own tuning.
+        let diff = applied
+            .diff_entry
+            .as_ref()
+            .expect("expected SkillDiffEntry populated after non-noop apply");
+        assert_eq!(diff.skill, "pipeline.tool_selection");
+        assert_eq!(diff.reason, "auto-reflection");
+        assert!(
+            !diff
+                .before
+                .blocked_tools
+                .contains(&"flaky_http".to_string()),
+            "before snapshot must predate the block, got: {:?}",
+            diff.before.blocked_tools
+        );
+        assert!(
+            diff.after.blocked_tools.contains(&"flaky_http".to_string()),
+            "after snapshot must contain the newly-blocked tool, got: {:?}",
+            diff.after.blocked_tools
+        );
+        assert!(!diff.before.widen_pending && diff.after.widen_pending);
+        assert!(
+            rendered.contains("Strategy diff:"),
+            "expected `Strategy diff:` line, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("flaky_http"),
+            "expected blocked tool name in strategy diff, got: {rendered}"
+        );
+        assert!(
+            self_model.skill_diff.is_some(),
+            "expected SelfModel.skill_diff populated from applied.diff_entry"
         );
     }
 

@@ -1476,12 +1476,24 @@ fn commit_turn_journal_workspace_and_sidecars(
 
         // Log stall events to journal (use state.turn for user turn, not internal loop turn)
         for (stall_type, _) in &result.stall_events {
+            // Confidence: sig_stall is exact-repetition (full name+args match
+            // across stall_window rounds) → conf 1.0. Anything else is a
+            // heuristic signal with lower confidence; skip emission entirely
+            // when confidence would be zero to avoid polluting downstream
+            // reflection / auto-tuning pipelines with no-op stall signals.
+            let confidence: f64 = match stall_type.as_str() {
+                "sig_stall" => 1.0,
+                _ => 0.0,
+            };
+            if confidence == 0.0 {
+                continue;
+            }
             let stall_event = session_journal::JournalEvent::stall_detected(
                 state.session_id.as_deref(),
                 state.turn,
                 stall_type,
                 0, // nudge_count not tracked per-event; stall_type conveys severity
-                0.0,
+                confidence,
                 &[],
             );
             let _ = journal.append(&stall_event);

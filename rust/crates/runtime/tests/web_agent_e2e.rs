@@ -4336,23 +4336,30 @@ async fn analysis_turn_injects_divergence_correction_after_five_exploration_roun
         &app,
         json!({
             "message": "review 最新的commit",
-            "max_candidates": 8,
+            // Each repeated identical sig triggers a Warning verdict (−2
+            // remaining_turns per round once the stall window fills). 5
+            // repeats + 1 final text round → budget must absorb ≥3 penalties
+            // plus 6 normal decrements.
+            "max_candidates": 14,
             "context": {
+                // P2.5 progress-aware semantics: divergence fires only when
+                // the *same* (tool, args) signature repeats across the full
+                // stall window. Five identical grep calls exercise that path.
                 "test_llm_rounds": [
                     {
                         "tool_calls": [tool_call("tc-analysis-r1", "grep", json!({"pattern": "TODO", "path": "src/"}))]
                     },
                     {
-                        "tool_calls": [tool_call("tc-analysis-r2", "list_dir", json!({"path": "src/"}))]
+                        "tool_calls": [tool_call("tc-analysis-r2", "grep", json!({"pattern": "TODO", "path": "src/"}))]
                     },
                     {
-                        "tool_calls": [tool_call("tc-analysis-r3", "read_file", json!({"path": "src/lib.rs"}))]
+                        "tool_calls": [tool_call("tc-analysis-r3", "grep", json!({"pattern": "TODO", "path": "src/"}))]
                     },
                     {
-                        "tool_calls": [tool_call("tc-analysis-r4", "glob", json!({"pattern": "src/**/*.rs"}))]
+                        "tool_calls": [tool_call("tc-analysis-r4", "grep", json!({"pattern": "TODO", "path": "src/"}))]
                     },
                     {
-                        "tool_calls": [tool_call("tc-analysis-r5", "grep", json!({"pattern": "FIXME", "path": "src/"}))]
+                        "tool_calls": [tool_call("tc-analysis-r5", "grep", json!({"pattern": "TODO", "path": "src/"}))]
                     },
                     { "full_text": "Done reviewing." }
                 ],
@@ -4375,24 +4382,22 @@ async fn analysis_turn_injects_divergence_correction_after_five_exploration_roun
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r2"));
-    let status = post_tool_result(&app, "tc-analysis-r2", "lib.rs\nmod.rs", "success").await;
+    let status = post_tool_result(&app, "tc-analysis-r2", "src/lib.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r3"));
-    let status = post_tool_result(&app, "tc-analysis-r3", "pub fn check() {}", "success").await;
+    let status = post_tool_result(&app, "tc-analysis-r3", "src/lib.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r4"));
-    let status =
-        post_tool_result(&app, "tc-analysis-r4", "src/lib.rs\nsrc/mod.rs", "success").await;
+    let status = post_tool_result(&app, "tc-analysis-r4", "src/lib.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r5"));
-    let status =
-        post_tool_result(&app, "tc-analysis-r5", "src/lib.rs:20:// FIXME", "success").await;
+    let status = post_tool_result(&app, "tc-analysis-r5", "src/lib.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)

@@ -1129,9 +1129,22 @@ impl ServerAgenticLoopHost {
     /// CLI's deny-at-assembly behavior.
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
-        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        if std::mem::take(&mut state.widen_selection_pending) {
+            // Pipeline-requested widen: skip health-based deprioritization
+            // merge for this turn so the full catalogue is re-exposed.
+        } else {
+            merge_deprioritized_tools_into_restricted(
+                &state.turn_guard,
+                &mut state.restricted_tools,
+            );
+        }
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(self.effective_allowlist_restrictions(state));
+        // Boosted tools are never hidden, even if they landed in the restricted
+        // set earlier (e.g., via stall-based deprioritization).
+        for boosted in &state.boosted_tools {
+            effective_restricted.remove(boosted);
+        }
         let visible = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible(&visible);
         visible
@@ -1526,11 +1539,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        if std::mem::take(&mut state.widen_selection_pending) {
+            // Pipeline-requested widen: skip deprioritized-merge for this turn.
+        } else {
+            merge_deprioritized_tools_into_restricted(
+                &state.turn_guard,
+                &mut state.restricted_tools,
+            );
+        }
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(self.effective_allowlist_restrictions(state));
         let interaction_mode = self.turn_interaction_mode();
         effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
+        for boosted in &state.boosted_tools {
+            effective_restricted.remove(boosted);
+        }
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         self.sync_valid_tools_to_visible(&visible_tools);
 
@@ -2704,6 +2727,8 @@ mod tests {
             current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
+            boosted_tools: HashSet::new(),
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),

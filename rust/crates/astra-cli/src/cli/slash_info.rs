@@ -1564,6 +1564,12 @@ pub(super) async fn handle_info_command(
                 return Ok(());
             }
 
+            // /context cognition — cognitive runtime flags
+            if sub_cmd == "cognition" || sub_cmd == "cog" {
+                print_cognition_view(state);
+                return Ok(());
+            }
+
             let sep = "─".repeat(38);
             eprintln!("\n  {}", format!("─── Context Window {sep}").bold().cyan());
 
@@ -1881,6 +1887,10 @@ pub(super) async fn handle_info_command(
 
         "/version" => {
             eprintln!("{}", "  astra version 0.1.0 (Rust)".bold());
+        }
+
+        "/whoami" => {
+            print_whoami(state);
         }
 
         "/rewind" => {
@@ -2230,6 +2240,113 @@ fn describe_context_pressure(
     }
 }
 
+// ─── Self-awareness / cognition renderers ─────────────────────────────────
+
+/// Compact self-awareness summary printed on `/whoami`.
+///
+/// Returns the rendered string so both the handler and tests can consume it
+/// without relying on stderr capture.
+pub(super) fn render_whoami(state: &ReplState) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let sep = "─".repeat(38);
+    let _ = writeln!(out, "\n  ─── whoami {sep}");
+
+    let version = env!("CARGO_PKG_VERSION");
+    let session = state.session_id.as_deref().unwrap_or("<none>");
+    let model = state.model.as_deref().unwrap_or("<unset>");
+    let skills = state.unified_skill_registry.len();
+    let pending = state
+        .skill_improvement_tracker
+        .pending_proposal
+        .as_ref()
+        .map(|p| p.skill_name.as_str());
+    let recent_tools = if state.recent_tools.is_empty() {
+        "<none>".to_string()
+    } else {
+        state
+            .recent_tools
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let _ = writeln!(out, "  version        : {version}");
+    let _ = writeln!(out, "  model          : {model}");
+    let _ = writeln!(out, "  session_id     : {session}");
+    let _ = writeln!(out, "  turn           : {}", state.turn);
+    let _ = writeln!(out, "  exchanges      : {}", state.history.len());
+    let _ = writeln!(out, "  skills_loaded  : {skills}");
+    let _ = writeln!(out, "  auto_reflection: on");
+    match pending {
+        Some(name) => {
+            let _ = writeln!(out, "  pending_improve: {name}");
+        }
+        None => {
+            let _ = writeln!(out, "  pending_improve: <none>");
+        }
+    }
+    let _ = writeln!(out, "  recent_tools   : {recent_tools}");
+    out
+}
+
+fn print_whoami(state: &ReplState) {
+    eprint!("{}", render_whoami(state));
+}
+
+/// Compact cognition-state view, printed on `/context cognition`.
+pub(super) fn render_cognition(state: &ReplState) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let sep = "─".repeat(30);
+    let _ = writeln!(out, "\n  ─── Cognition {sep}");
+
+    let recent_tools = if state.recent_tools.is_empty() {
+        "<none>".to_string()
+    } else {
+        state
+            .recent_tools
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let pending = state
+        .skill_improvement_tracker
+        .pending_proposal
+        .as_ref()
+        .map(|p| {
+            format!(
+                "{} ({} change{})",
+                p.skill_name,
+                p.improvements.len(),
+                if p.improvements.len() == 1 { "" } else { "s" }
+            )
+        })
+        .unwrap_or_else(|| "<none>".to_string());
+
+    let _ = writeln!(out, "  recent_tools     : {recent_tools}");
+    let _ = writeln!(out, "  pending_proposal : {pending}");
+    let _ = writeln!(
+        out,
+        "  skills_registered: {}",
+        state.unified_skill_registry.len()
+    );
+    let _ = writeln!(out, "  turn             : {}", state.turn);
+    let _ = writeln!(
+        out,
+        "  note             : boosted_tools/widen_selection_pending are applied per-turn on the server loop; inspect per-turn via /turn trace or runtime logs."
+    );
+    out
+}
+
+fn print_cognition_view(state: &ReplState) {
+    eprint!("{}", render_cognition(state));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2412,5 +2529,50 @@ mod tests {
         let (_, label, hint) = describe_context_pressure(90.0, 0.95);
         assert_eq!(label, "Near compaction");
         assert!(hint.contains("summarized or compressed"));
+    }
+
+    #[test]
+    fn render_whoami_includes_identity_and_skills() {
+        let mut state = ReplState::default();
+        state.session_id = Some("sess-abc".to_string());
+        state.model = Some("gpt-5".to_string());
+        state.turn = 3;
+        state.history.push(("hi".into(), "hello".into()));
+        let out = super::render_whoami(&state);
+        assert!(out.contains("session_id     : sess-abc"), "got: {out}");
+        assert!(out.contains("model          : gpt-5"), "got: {out}");
+        assert!(out.contains("turn           : 3"), "got: {out}");
+        assert!(out.contains("exchanges      : 1"), "got: {out}");
+        assert!(out.contains("skills_loaded"), "got: {out}");
+        assert!(out.contains("auto_reflection: on"), "got: {out}");
+        assert!(out.contains("pending_improve: <none>"), "got: {out}");
+    }
+
+    #[test]
+    fn render_whoami_surfaces_pending_improvement_proposal() {
+        let mut state = ReplState::default();
+        state.session_id = Some("s".into());
+        state.skill_improvement_tracker.propose(
+            astra_runtime::skills::improvement::ImprovementProposal {
+                skill_name: "git-flow".into(),
+                skill_path: std::path::PathBuf::from("/tmp/git-flow"),
+                improvements: vec![],
+            },
+        );
+        let out = super::render_whoami(&state);
+        assert!(out.contains("pending_improve: git-flow"), "got: {out}");
+    }
+
+    #[test]
+    fn render_cognition_reports_recent_tools_and_proposal_counts() {
+        let mut state = ReplState::default();
+        state.recent_tools = vec!["bash".into(), "read_file".into()];
+        let out = super::render_cognition(&state);
+        assert!(
+            out.contains("recent_tools     : bash, read_file"),
+            "got: {out}"
+        );
+        assert!(out.contains("pending_proposal : <none>"), "got: {out}");
+        assert!(out.contains("skills_registered"), "got: {out}");
     }
 }

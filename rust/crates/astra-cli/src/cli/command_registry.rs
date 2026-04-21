@@ -583,7 +583,13 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Context window / budget summary",
         CommandGroup::Observability,
     )
-    .with_subcommands(&[("breakdown", "Per-component token breakdown for last turn")]),
+    .with_subcommands(&[
+        ("breakdown", "Per-component token breakdown for last turn"),
+        (
+            "cognition",
+            "Cognitive runtime flags (boosted/widen, recent tools, pending proposal)",
+        ),
+    ]),
     CommandMeta::new(
         "/rewind",
         "Rewind conversation to an earlier turn",
@@ -591,6 +597,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_arg_hint("<turn>"),
     CommandMeta::new("/version", "Version info", CommandGroup::Observability),
+    CommandMeta::new(
+        "/whoami",
+        "Agent self-awareness: identity, session, skills, pending proposals",
+        CommandGroup::Observability,
+    ),
     CommandMeta::new(
         "/experiment",
         "A/B testing: list, start, stop, analyze experiments",

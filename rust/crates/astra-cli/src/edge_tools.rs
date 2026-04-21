@@ -1531,15 +1531,15 @@ impl ToolExecutor {
             .map(|gt| gt.milestones().to_vec());
         let milestone_slice = milestones.as_deref();
 
-        Some(astra_runtime::self_model::SelfModel::snapshot(
+        let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
             &pinned_tools,
             &deprioritized_tools,
-            &[],  // skills — not accessible from ToolExecutor
-            None, // tool health — lives on TurnGuard, not here
+            &[],
+            None,
             session.turn_number,
             latest_budget,
-            None, // scenario — requires ScenarioDetector state
+            None,
             session.active_experiment_id.as_deref(),
             elapsed,
             session.user_corrections.len(),
@@ -1549,9 +1549,14 @@ impl ToolExecutor {
             goal_text,
             goal_progress.as_ref(),
             milestone_slice,
-            &[], // recent signals — accessible via ObservabilityHub, not session
+            &[],
             &session.config,
-        ))
+            session.last_strategy_application.as_ref(),
+        );
+        if let Some(g) = session.last_guardrail_view.clone() {
+            snapshot = snapshot.with_guardrail(g);
+        }
+        Some(snapshot)
     }
 }
 
