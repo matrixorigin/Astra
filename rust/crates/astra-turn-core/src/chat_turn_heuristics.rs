@@ -12,8 +12,6 @@ use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_BUDGET: usize = 5;
-const ANALYSIS_STALL_WINDOW: usize = 4;
-const ANALYSIS_EXPLORATION_ROUND_BUDGET: usize = 8;
 
 const MUTATING_TERMS: &[&str] = &[
     "fix",
@@ -124,8 +122,8 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
             allow_factual_retry: true,
-            exploration_round_budget: ANALYSIS_EXPLORATION_ROUND_BUDGET,
-            stall_window: ANALYSIS_STALL_WINDOW,
+            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
+            stall_window: DEFAULT_STALL_WINDOW,
         }
     } else if has_mutating {
         // Mutating without analysis context
@@ -488,15 +486,15 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_profile_relaxes_analysis_loops() {
+    fn task_execution_profile_keeps_analysis_read_only_without_extra_loop_budget() {
         let profile = infer_task_execution_profile("review 最新的commit");
         assert!(!profile.mutates_workspace);
         assert!(!profile.verification_required);
         assert!(profile.allow_factual_retry);
-        assert_eq!(profile.stall_window, ANALYSIS_STALL_WINDOW);
+        assert_eq!(profile.stall_window, DEFAULT_STALL_WINDOW);
         assert_eq!(
             profile.exploration_round_budget,
-            ANALYSIS_EXPLORATION_ROUND_BUDGET
+            DEFAULT_EXPLORATION_ROUND_BUDGET
         );
 
         let profile = infer_task_execution_profile("implement the feature");

@@ -862,6 +862,37 @@ mod tests {
         assert!(!v.force_stop);
     }
 
+    #[test]
+    fn analysis_profile_diverges_after_five_exploration_rounds() {
+        let profile =
+            crate::chat_turn_heuristics::infer_task_execution_profile("review 最新的commit");
+        let mut guard = TurnGuard::with_profile(profile);
+
+        let rounds = [
+            ("grep", r#"{"pattern":"TODO","path":"src/"}"#),
+            ("list_dir", r#"{"path":"src/"}"#),
+            ("read_file", r#"{"path":"src/lib.rs"}"#),
+            ("glob", r#"{"pattern":"src/**/*.rs"}"#),
+            ("grep", r#"{"pattern":"FIXME","path":"src/"}"#),
+        ];
+        for (tool, args) in rounds {
+            guard.record_tool_calls(&[make_tool_call(tool, args)]);
+            guard.record_tool_result(tool, "ok");
+        }
+
+        let verdict = guard.evaluate();
+        assert!(verdict.is_diverging);
+        assert!(!verdict.stall_detected);
+        assert_eq!(verdict.severity, VerdictSeverity::Warning);
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|message| message.contains("STOP exploring")),
+            "analysis turns should get divergence correction after five exploration rounds"
+        );
+    }
+
     /// Verify stall_detected and is_diverging fields are accurate.
     #[test]
     fn verdict_fields_reflect_actual_state() {

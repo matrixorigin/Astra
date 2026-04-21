@@ -14,11 +14,12 @@ use std::sync::OnceLock;
 
 use astra_runtime::{
     AgenticRunLifecycleService, AppState, AuthLoginRequestData, AuthRefreshRequestData,
-    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
-    FernetTokenEncryptor, HealthChecker, MatrixOneSettings, ServiceInfo, SessionActivityRecord,
-    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
+    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, DIVERGENCE_CORRECTION,
+    ErrorResponse, FernetTokenEncryptor, HealthChecker, MatrixOneSettings, ServiceInfo,
+    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData, TurnHookDbPersistPlan,
+    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnToolEventPersistPlan,
+    TurnToolEventWriter, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
@@ -4197,6 +4198,111 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]
             .is_boolean(),
         "context_meta should expose the parallel_feedback flag"
+    );
+}
+
+#[tokio::test]
+async fn analysis_turn_injects_divergence_correction_after_five_exploration_rounds() {
+    let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
+
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "review 最新的commit",
+            "max_candidates": 8,
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc-analysis-r1", "grep", json!({"pattern": "TODO", "path": "src/"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-analysis-r2", "list_dir", json!({"path": "src/"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-analysis-r3", "read_file", json!({"path": "src/lib.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-analysis-r4", "glob", json!({"pattern": "src/**/*.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-analysis-r5", "grep", json!({"pattern": "FIXME", "path": "src/"}))]
+                    },
+                    { "full_text": "Done reviewing." }
+                ],
+                "edge_tools": [
+                    tool_schema("grep"),
+                    tool_schema("list_dir"),
+                    tool_schema("read_file"),
+                    tool_schema("glob")
+                ]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r1"));
+    let status = post_tool_result(&app, "tc-analysis-r1", "src/lib.rs:12:// TODO", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r2"));
+    let status = post_tool_result(&app, "tc-analysis-r2", "lib.rs\nmod.rs", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r3"));
+    let status = post_tool_result(&app, "tc-analysis-r3", "pub fn check() {}", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r4"));
+    let status =
+        post_tool_result(&app, "tc-analysis-r4", "src/lib.rs\nsrc/mod.rs", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-analysis-r5"));
+    let status =
+        post_tool_result(&app, "tc-analysis-r5", "src/lib.rs:20:// FIXME", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+    assert!(
+        find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some("Done reviewing.")),
+        "expected final text after divergence correction"
+    );
+
+    let ow = observer_worker.clone();
+    poll_until(
+        move || {
+            let ow = ow.clone();
+            async move { !ow.requests.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "observer should fire once for the completed turn"
+    );
+    let injected_correction = requests[0]
+        .messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .any(|content| content.contains(DIVERGENCE_CORRECTION.trim()));
+    assert!(
+        injected_correction,
+        "analysis turn should carry divergence correction into the final observer payload"
     );
 }
 
