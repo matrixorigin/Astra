@@ -93,7 +93,7 @@ pub(crate) async fn stream_chat_sse(
     let show_early_hint = !p.render_policy.suppress_text()
         && std::io::IsTerminal::is_terminal(&std::io::stderr())
         && p.plan_assemble_line_release.is_none();
-    let early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
+    let mut early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
         Some(crate::effects::Spinner::start_immediate(
             "Preparing…".to_string(),
         ))
@@ -199,19 +199,49 @@ pub(crate) async fn stream_chat_sse(
     let mut prefetch_task_type: Option<String> = None;
     let mut prefetch_body_bytes: Option<usize> = None;
     if !p.plan_only_chat && !p.is_plan_subtask {
-        if let Some(ctx) =
-            crate::context_prefetch::prefetch_context_for_message(p.message, &project_root).await
-        {
-            prefetch_task_type = Some(ctx.task_type.to_string());
-            prefetch_body_bytes = Some(ctx.body.len());
-            astra_core::agent_info!(
-                "prefetch",
-                "injected task_type={} body_bytes={}",
-                ctx.task_type,
-                ctx.body.len()
-            );
-            crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
-            prefetch_injected = true;
+        // Detect task type first (cheap, synchronous) before touching the spinner.
+        if let Some(task_type) = astra_runtime::prompts::detect_task_type(p.message) {
+            // Stop the generic "Preparing…" spinner and show a task-specific one.
+            if let Some(s) = early_spinner.take() {
+                s.stop_clear();
+            }
+            let fetch_spinner = if show_early_hint {
+                Some(crate::effects::Spinner::start_immediate(format!(
+                    "Fetching {task_type} context…"
+                )))
+            } else {
+                None
+            };
+            if let Some(ctx) =
+                crate::context_prefetch::prefetch_context_for_message(p.message, &project_root)
+                    .await
+            {
+                prefetch_task_type = Some(ctx.task_type.to_string());
+                prefetch_body_bytes = Some(ctx.body.len());
+                astra_core::agent_info!(
+                    "prefetch",
+                    "injected task_type={} body_bytes={}",
+                    ctx.task_type,
+                    ctx.body.len()
+                );
+                if let Some(s) = fetch_spinner {
+                    s.stop_clear();
+                }
+                if show_early_hint {
+                    let size_str = if ctx.body.len() >= 1024 {
+                        format!("{:.1}KB", ctx.body.len() as f64 / 1024.0)
+                    } else {
+                        format!("{}B", ctx.body.len())
+                    };
+                    eprintln!("  {} context ready ({})", crate::theme::icon_ok(), size_str);
+                }
+                crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
+                prefetch_injected = true;
+            } else {
+                if let Some(s) = fetch_spinner {
+                    s.stop_clear();
+                }
+            }
         }
     }
 
