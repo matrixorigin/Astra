@@ -9084,3 +9084,139 @@ mod file_context_scoring_proofs {
         assert!(!result.tool_names.is_empty(), "should select tools");
     }
 }
+
+/// Cross-turn cognition: tuning/learning ON vs OFF.
+///
+/// Proves that the outcome-memory → selector-bias wiring produces a
+/// measurable, deterministic change in tool ranking after a simulated
+/// turn-1 failure. With learning OFF (empty bias) the failing tool keeps
+/// the same rank; with learning ON (bias derived from ToolHealthTracker)
+/// the score drops and — when another in-pool tool is close — the rank
+/// changes. This is the benchmark for "tuning actually helps".
+mod cross_turn_cognition {
+    use astra_runtime::tool_registry::{
+        ConversationState, TOOL_CATALOG, pre_filter_dynamic_with_outcome_bias,
+    };
+    use astra_turn_core::tool_health::{ToolHealthTracker, ToolOutcome};
+    use std::collections::HashMap;
+
+    fn score_of(ranking: &[(usize, f64)], name: &str) -> Option<f64> {
+        ranking.iter().find_map(|(idx, score)| {
+            if TOOL_CATALOG[*idx].name == name {
+                Some(*score)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn proof_tuning_on_demotes_failing_tool_next_turn() {
+        let query = "grep the codebase for the foo pattern";
+        let state = ConversationState::from_message_with_context(query, 1, &[]);
+
+        // Turn-1 ranking with no outcome memory (learning OFF).
+        let off_bias: HashMap<String, f64> = HashMap::new();
+        let off_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &off_bias,
+        );
+        assert!(
+            !off_ranking.is_empty(),
+            "baseline ranking should not be empty"
+        );
+        let top_off_idx = off_ranking[0].0;
+        let top_off_name = TOOL_CATALOG[top_off_idx].name.to_string();
+        let top_off_score = off_ranking[0].1;
+
+        // Simulate turn-1: the top-ranked tool was invoked twice with
+        // distinct signatures and failed both times.
+        let mut health = ToolHealthTracker::new();
+        for i in 0..2 {
+            let sig = format!(r#"{top_off_name}:{{"q":"{i}"}}"#);
+            health.record_outcome(&sig, ToolOutcome::new(false, 5, "err"));
+        }
+        let on_bias = health.outcome_bias_by_tool(3600);
+        assert!(
+            on_bias
+                .get(&top_off_name)
+                .copied()
+                .unwrap_or(0.0)
+                < 0.0,
+            "outcome bias for failing tool must be negative, got {on_bias:?}"
+        );
+
+        // Turn-2 ranking with learning ON.
+        let on_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &on_bias,
+        );
+
+        // Proof 1: the failing tool's score dropped.
+        let on_score_for_failing = score_of(&on_ranking, &top_off_name)
+            .expect("failing tool still in pool");
+        assert!(
+            on_score_for_failing < top_off_score,
+            "tuning ON must lower the score of the failing tool: off={top_off_score} on={on_score_for_failing}"
+        );
+
+        // Proof 2: the failing tool's rank index did not improve.
+        let off_rank = off_ranking
+            .iter()
+            .position(|(idx, _)| TOOL_CATALOG[*idx].name == top_off_name)
+            .expect("tool present in off ranking");
+        let on_rank = on_ranking
+            .iter()
+            .position(|(idx, _)| TOOL_CATALOG[*idx].name == top_off_name)
+            .expect("tool present in on ranking");
+        assert!(
+            on_rank >= off_rank,
+            "tuning ON must not improve the failing tool's rank: off_rank={off_rank} on_rank={on_rank}"
+        );
+
+        // Proof 3: OFF baseline is stable under repeated calls (no hidden
+        // side-effect) — re-running the OFF ranking yields the same top.
+        let off_again = pre_filter_dynamic_with_outcome_bias(
+            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &off_bias,
+        );
+        assert_eq!(
+            off_again[0].0, top_off_idx,
+            "OFF baseline must be deterministic turn-to-turn"
+        );
+    }
+
+    #[test]
+    fn proof_tuning_on_rewards_successful_tool_next_turn() {
+        let query = "grep the codebase for the foo pattern";
+        let state = ConversationState::from_message_with_context(query, 1, &[]);
+
+        let off_bias: HashMap<String, f64> = HashMap::new();
+        let off_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &off_bias,
+        );
+        let top_name = TOOL_CATALOG[off_ranking[0].0].name.to_string();
+        let off_score = off_ranking[0].1;
+
+        let mut health = ToolHealthTracker::new();
+        for i in 0..2 {
+            let sig = format!(r#"{top_name}:{{"q":"{i}"}}"#);
+            health.record_outcome(&sig, ToolOutcome::new(true, 5, "ok"));
+        }
+        let on_bias = health.outcome_bias_by_tool(3600);
+        assert!(
+            on_bias
+                .get(&top_name)
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0,
+            "successful tool must earn positive bias, got {on_bias:?}"
+        );
+
+        let on_ranking = pre_filter_dynamic_with_outcome_bias(
+            &state, query, None, None, &[], 0.0, &HashMap::new(), &[], &on_bias,
+        );
+        let on_score = score_of(&on_ranking, &top_name).expect("tool present");
+        assert!(
+            on_score > off_score,
+            "tuning ON must raise the score of the successful tool: off={off_score} on={on_score}"
+        );
+    }
+}
