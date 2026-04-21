@@ -358,12 +358,12 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 
 // ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
 pub use super::prompt_cache::PromptCacheConfig;
+#[cfg(test)]
+pub(crate) use super::prompt_cache::build_system_message;
 pub(crate) use super::prompt_cache::{
     add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
     build_system_message_with_dynamic_sections,
 };
-#[cfg(test)]
-pub(crate) use super::prompt_cache::build_system_message;
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {
@@ -2512,35 +2512,95 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             ),
             prompts::PromptSection::dynamic(
-                format!(
-                    "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. Follow their formatting rules strictly.",
-                    active_skill_names.join(", ")
-                ),
+                "skill payload".to_string(),
                 prompts::PromptTokenBucket::UserPreferences,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        active_output_skills: !active_skill_names.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             prompts::PromptSection::dynamic(
-                format!("\n\n## Learned Runtime Context\n{learned_context_text}"),
+                "learned context payload".to_string(),
                 prompts::PromptTokenBucket::UserPreferences,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        learned_runtime_context: !learned_context_text.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             prompts::PromptSection::dynamic(
-                memory_signal_hint.to_string(),
+                "memory signal payload".to_string(),
                 prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        memory_signal_detected: !memory_signal_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             prompts::PromptSection::dynamic(
-                implicit_feedback_hint.to_string(),
+                "implicit feedback payload".to_string(),
                 prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        implicit_feedback: !implicit_feedback_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             prompts::PromptSection::dynamic(
-                feedback_rules_hint.to_string(),
+                "feedback rules payload".to_string(),
                 prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             prompts::PromptSection::dynamic(
-                self_awareness_hint.to_string(),
+                "self awareness payload".to_string(),
                 prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        self_awareness: !self_awareness_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
             prompts::PromptSection::dynamic(
-                session_anchor.to_string(),
+                "session anchor payload".to_string(),
                 prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        session_anchor: !session_anchor.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             ),
         ];
         let (_, _, prompt_sections) = build_system_message_with_dynamic_sections(
@@ -2550,24 +2610,7 @@ mod tests {
             Some("implementation"),
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
-        let breakdown = prompts::build_system_prompt_trace_with_signals(
-            &prompt_sections,
-            vec![],
-            vec![],
-            crate::turn::context_assembly_trace::PromptTraceSignals {
-                context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
-                    active_output_skills: !active_skill_names.is_empty(),
-                    learned_runtime_context: !learned_context_text.is_empty(),
-                    memory_signal_detected: !memory_signal_hint.is_empty(),
-                    self_awareness: !self_awareness_hint.is_empty(),
-                    implicit_feedback: !implicit_feedback_hint.is_empty(),
-                    learned_feedback_rules: !feedback_rules_hint.is_empty(),
-                    session_anchor: !session_anchor.is_empty(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
 
         assert!(breakdown.context_signals.active_output_skills);
         assert!(breakdown.context_signals.learned_runtime_context);

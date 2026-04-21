@@ -856,20 +856,6 @@ pub fn build_system_prompt_trace(
     skills_injected: Vec<SkillInjection>,
     repository_memories: Vec<MemoryInjection>,
 ) -> SystemPromptBreakdown {
-    build_system_prompt_trace_with_signals(
-        sections,
-        skills_injected,
-        repository_memories,
-        PromptTraceSignals::default(),
-    )
-}
-
-pub fn build_system_prompt_trace_with_signals(
-    sections: &[PromptSection],
-    skills_injected: Vec<SkillInjection>,
-    repository_memories: Vec<MemoryInjection>,
-    extra_signals: PromptTraceSignals,
-) -> SystemPromptBreakdown {
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
     let mut user_preferences_tokens = 0u32;
@@ -880,50 +866,6 @@ pub fn build_system_prompt_trace_with_signals(
     for section in sections {
         let tokens = estimate_section_tokens(&section.text);
         total_tokens += tokens;
-        let text = &section.text;
-        if section.trace_signals == PromptTraceSignals::default() {
-            if text.contains("## ⚡ Round Budget Warning")
-                || text.contains("## 🚨 Round Limit Reached")
-            {
-                guidance_signals.round_budget_warning = true;
-            }
-            if text.contains("## Synthesize Or Batch Now") {
-                guidance_signals.synthesize_or_batch = true;
-            }
-            if text.contains("✓ Previous round:") {
-                guidance_signals.parallel_feedback = true;
-            }
-            if text.contains("## Active Output Skills") {
-                context_signals.active_output_skills = true;
-            }
-            if text.contains("## Learned Runtime Context") {
-                context_signals.learned_runtime_context = true;
-            }
-            if text.contains("⚡ MEMORY SIGNAL DETECTED") {
-                context_signals.memory_signal_detected = true;
-            }
-            if text.contains("## System Prompt Override") {
-                context_signals.system_prompt_override = true;
-            }
-            if text.contains("## Effort Level") {
-                context_signals.effort_hint = true;
-            }
-            if text.contains("## Agent Type") {
-                context_signals.agent_type_hint = true;
-            }
-            if text.contains("## Self-Awareness") {
-                context_signals.self_awareness = true;
-            }
-            if text.contains("[Session Feedback]") {
-                context_signals.implicit_feedback = true;
-            }
-            if text.contains("[Learned Feedback Rules]") {
-                context_signals.learned_feedback_rules = true;
-            }
-            if text.contains("[session-anchor]") {
-                context_signals.session_anchor = true;
-            }
-        }
         context_signals.active_output_skills |=
             section.trace_signals.context_signals.active_output_skills;
         context_signals.learned_runtime_context |= section
@@ -963,21 +905,6 @@ pub fn build_system_prompt_trace_with_signals(
     // Add memory tokens
     let memory_tokens: u32 = repository_memories.iter().map(|m| m.tokens).sum();
     total_tokens += memory_tokens;
-
-    context_signals.active_output_skills |= extra_signals.context_signals.active_output_skills;
-    context_signals.learned_runtime_context |=
-        extra_signals.context_signals.learned_runtime_context;
-    context_signals.memory_signal_detected |= extra_signals.context_signals.memory_signal_detected;
-    context_signals.system_prompt_override |= extra_signals.context_signals.system_prompt_override;
-    context_signals.effort_hint |= extra_signals.context_signals.effort_hint;
-    context_signals.agent_type_hint |= extra_signals.context_signals.agent_type_hint;
-    context_signals.self_awareness |= extra_signals.context_signals.self_awareness;
-    context_signals.implicit_feedback |= extra_signals.context_signals.implicit_feedback;
-    context_signals.learned_feedback_rules |= extra_signals.context_signals.learned_feedback_rules;
-    context_signals.session_anchor |= extra_signals.context_signals.session_anchor;
-    guidance_signals.round_budget_warning |= extra_signals.guidance_signals.round_budget_warning;
-    guidance_signals.synthesize_or_batch |= extra_signals.guidance_signals.synthesize_or_batch;
-    guidance_signals.parallel_feedback |= extra_signals.guidance_signals.parallel_feedback;
 
     SystemPromptBreakdown {
         base_persona_tokens,
@@ -2738,17 +2665,24 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_trace_records_guidance_signals() {
-        let sections = vec![PromptSection::dynamic(
-            tool_round_guidance(
-                &[
-                    serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
-                    serde_json::json!({"role": "tool", "content": "README.md"}),
-                ],
-                ROUND_BUDGET_THRESHOLD,
+    fn build_system_prompt_trace_records_guidance_signals_from_section_metadata() {
+        let (guidance, guidance_signals) = tool_round_guidance_trace_with(
+            &[
+                serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+                serde_json::json!({"role": "tool", "content": "README.md"}),
+            ],
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+        let sections = vec![
+            PromptSection::dynamic(guidance, PromptTokenBucket::Environment).with_trace_signals(
+                PromptTraceSignals {
+                    guidance_signals,
+                    ..Default::default()
+                },
             ),
-            PromptTokenBucket::Environment,
-        )];
+        ];
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
         assert!(breakdown.guidance_signals.round_budget_warning);
@@ -2779,20 +2713,28 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_trace_records_dynamic_context_signals() {
-        let sections = vec![PromptSection::dynamic(
-            "\n\n## Active Output Skills\nconcise\n\
-                   \n\n## Learned Runtime Context\nmatrixorigin => github\n\
-                   \n\n## Effort Level\nhigh\n\
-                   \n\n## Agent Type\nreviewer\n\
-                   \n\n⚡ MEMORY SIGNAL DETECTED: category=\"preference\", namespace=\"user.preferences\"\n\
-                   \n\n## Self-Awareness\nworking set stable\n\
-                   \n\n[Session Feedback] The user expressed dissatisfaction.\n\
-                   \n\n[Learned Feedback Rules]\n- prefer batching\n\
-                   \n\n[session-anchor] Review the timeout path. Currently: validating. 2/3 steps."
-                .to_string(),
-            PromptTokenBucket::Environment,
-        )];
+    fn build_system_prompt_trace_records_context_signals_from_section_metadata() {
+        let sections = vec![
+            PromptSection::dynamic(
+                "arbitrary dynamic payload without legacy markers".to_string(),
+                PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(PromptTraceSignals {
+                context_signals: PromptContextSignals {
+                    active_output_skills: true,
+                    learned_runtime_context: true,
+                    memory_signal_detected: true,
+                    effort_hint: true,
+                    agent_type_hint: true,
+                    self_awareness: true,
+                    implicit_feedback: true,
+                    learned_feedback_rules: true,
+                    session_anchor: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        ];
 
         let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
         assert!(breakdown.context_signals.active_output_skills);
@@ -2838,24 +2780,39 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_trace_applies_explicit_signal_overrides() {
-        let breakdown = build_system_prompt_trace_with_signals(
+    fn build_system_prompt_trace_ignores_unannotated_legacy_markers() {
+        let breakdown = build_system_prompt_trace(
             &[PromptSection::dynamic(
-                "cwd: /tmp".to_string(),
+                "\n\n## System Prompt Override\nlegacy override\n\n## ⚡ Round Budget Warning"
+                    .to_string(),
                 PromptTokenBucket::Environment,
             )],
             vec![],
             vec![],
-            PromptTraceSignals {
-                context_signals: PromptContextSignals {
-                    system_prompt_override: true,
-                    ..Default::default()
-                },
-                guidance_signals: PromptGuidanceSignals {
-                    round_budget_warning: true,
-                    ..Default::default()
-                },
-            },
+        );
+
+        assert!(!breakdown.context_signals.system_prompt_override);
+        assert!(!breakdown.guidance_signals.round_budget_warning);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_uses_explicit_section_signals() {
+        let breakdown = build_system_prompt_trace(
+            &[
+                PromptSection::dynamic("cwd: /tmp".to_string(), PromptTokenBucket::Environment)
+                    .with_trace_signals(PromptTraceSignals {
+                        context_signals: PromptContextSignals {
+                            system_prompt_override: true,
+                            ..Default::default()
+                        },
+                        guidance_signals: PromptGuidanceSignals {
+                            round_budget_warning: true,
+                            ..Default::default()
+                        },
+                    }),
+            ],
+            vec![],
+            vec![],
         );
 
         assert!(breakdown.context_signals.system_prompt_override);
