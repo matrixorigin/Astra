@@ -151,7 +151,12 @@ async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<St
     .await
     .unwrap_or_default();
 
-    let diff = run_git(project_root, &["show", "--format=", &commit], MAX_DIFF_BYTES).await?;
+    let diff = run_git(
+        project_root,
+        &["show", "--format=", &commit],
+        MAX_DIFF_BYTES,
+    )
+    .await?;
 
     let mut ctx = String::with_capacity(log.len() + stat.len() + diff.len() + 200);
     ctx.push_str("## Latest Commit\n\n```\n");
@@ -742,7 +747,8 @@ mod tests {
     #[tokio::test]
     async fn prefetch_commit_review_invalid_hash_returns_none() {
         let root = test_project_root();
-        let ctx = prefetch_context_for_message("review deadbeefdeadbeefdeadbeef00000000000", &root).await;
+        let ctx =
+            prefetch_context_for_message("review deadbeefdeadbeefdeadbeef00000000000", &root).await;
         assert!(
             ctx.is_none(),
             "invalid hash should return None so model calls git tools itself"

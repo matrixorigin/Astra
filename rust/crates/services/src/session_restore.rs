@@ -721,7 +721,10 @@ fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
         && let Some(event) = events.get(idx)
     {
         if let Some(tools_used) = event.tools_used.as_ref() {
-            append_unique_tools(&mut summary.recent_tools, tools_used.iter().map(String::as_str));
+            append_unique_tools(
+                &mut summary.recent_tools,
+                tools_used.iter().map(String::as_str),
+            );
         }
         if summary.recent_tools.is_empty()
             && let Some(tool_calls) = event.tool_calls.as_ref()
@@ -818,12 +821,14 @@ impl SessionRestoreService for HybridRestoreService {
 
             return Ok(Some(RestoredSession {
                 session_id: session_id.to_string(),
-                turn_count: local_journal
-                    .as_ref()
-                    .map_or(ws.turn_count, |summary| ws.turn_count.max(summary.turn_count)),
-                total_tokens_in: local_journal.as_ref().map_or(ws.total_tokens_in, |summary| {
-                    ws.total_tokens_in.max(summary.total_tokens_in)
+                turn_count: local_journal.as_ref().map_or(ws.turn_count, |summary| {
+                    ws.turn_count.max(summary.turn_count)
                 }),
+                total_tokens_in: local_journal
+                    .as_ref()
+                    .map_or(ws.total_tokens_in, |summary| {
+                        ws.total_tokens_in.max(summary.total_tokens_in)
+                    }),
                 total_tokens_out: local_journal
                     .as_ref()
                     .map_or(ws.total_tokens_out, |summary| {
@@ -1734,8 +1739,8 @@ pub fn extract_plan_from_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_workspace;
     use crate::session_journal::JournalDirGuard;
+    use crate::session_workspace;
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");

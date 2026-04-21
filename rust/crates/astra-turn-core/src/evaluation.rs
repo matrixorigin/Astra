@@ -766,8 +766,14 @@ mod tests {
         // The persisted turn_evaluation surfaced repeat loops for read_file and
         // git_show, while distinct grep queries stayed healthy.
         let records = vec![
-            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
-            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
             record(
                 "read_file",
                 r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
@@ -783,15 +789,28 @@ mod tests {
             record("grep", r#"/factual retry/ in rust/crates/runtime/src"#),
             record("grep", r#"/ContinueLoop/ in rust/crates/runtime/src"#),
             record("grep", r#"/TPM/ in rust/crates/runtime/src"#),
-            record("read_file", r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#),
-            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
-            record("git_show", r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
             record("grep", r#"/turn_evaluation/ in rust/crates/runtime/src"#),
         ];
 
         let eval = evaluate_tool_call_records(
             "review b273c589a73799070a71f4cfc6d55349b534d8d1",
-            &["git_show".to_string(), "read_file".to_string(), "grep".to_string()],
+            &[
+                "git_show".to_string(),
+                "read_file".to_string(),
+                "grep".to_string(),
+            ],
             &records,
             0,
             false,
@@ -799,7 +818,10 @@ mod tests {
             true,
         );
 
-        assert!(eval.success, "real-session loop still completed successfully");
+        assert!(
+            eval.success,
+            "real-session loop still completed successfully"
+        );
         assert_eq!(eval.quality, 0.5);
         assert_eq!(eval.confidence, 0.7);
         assert!(
@@ -830,7 +852,11 @@ mod tests {
             Some(1),
             "cli_repl",
             "review b273c589a73799070a71f4cfc6d55349b534d8d1",
-            &["git_show".to_string(), "read_file".to_string(), "grep".to_string()],
+            &[
+                "git_show".to_string(),
+                "read_file".to_string(),
+                "grep".to_string(),
+            ],
             &records,
             0,
             false,

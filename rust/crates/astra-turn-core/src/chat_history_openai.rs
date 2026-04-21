@@ -144,13 +144,17 @@ mod tests {
 
     #[test]
     fn strip_prefetched_context_from_history() {
-        let user_with_ctx = "review commit\n\n<prefetched_context>\nguidance\n\ndiff here\n</prefetched_context>";
+        let user_with_ctx =
+            "review commit\n\n<prefetched_context>\nguidance\n\ndiff here\n</prefetched_context>";
         let m = openai_messages_from_repl_history(
             &[(user_with_ctx.into(), "looks good".into())],
             "next question",
         );
         let hist_content = m[0]["content"].as_str().unwrap();
-        assert!(!hist_content.contains("<prefetched_context>"), "history should not contain prefetched context");
+        assert!(
+            !hist_content.contains("<prefetched_context>"),
+            "history should not contain prefetched context"
+        );
         assert_eq!(hist_content, "review commit");
     }
 
@@ -159,7 +163,12 @@ mod tests {
         // Current user message is NOT stripped — it's the active turn.
         let current = "review\n\n<prefetched_context>\nfresh diff\n</prefetched_context>";
         let m = openai_messages_from_repl_history(&[], current);
-        assert!(m[0]["content"].as_str().unwrap().contains("<prefetched_context>"));
+        assert!(
+            m[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<prefetched_context>")
+        );
     }
 
     #[test]
@@ -174,9 +183,12 @@ mod tests {
     fn multi_turn_prefetch_stripped_from_all_history_turns() {
         // Simulate 3 turns: T1 had prefetch, T2 had prefetch, T3 is current with prefetch.
         // Only T3 (current) should keep its prefetch.
-        let t1_user = "review latest\n\n<prefetched_context>\nold diff from T1\n</prefetched_context>";
-        let t2_user = "review branch\n\n<prefetched_context>\nbranch diff from T2\n</prefetched_context>";
-        let t3_current = "review HEAD\n\n<prefetched_context>\nfresh diff from T3\n</prefetched_context>";
+        let t1_user =
+            "review latest\n\n<prefetched_context>\nold diff from T1\n</prefetched_context>";
+        let t2_user =
+            "review branch\n\n<prefetched_context>\nbranch diff from T2\n</prefetched_context>";
+        let t3_current =
+            "review HEAD\n\n<prefetched_context>\nfresh diff from T3\n</prefetched_context>";
 
         let m = openai_messages_from_repl_history(
             &[
@@ -195,8 +207,18 @@ mod tests {
         assert!(!m[2]["content"].as_str().unwrap().contains("branch diff"));
 
         // T3 current: preserved
-        assert!(m[4]["content"].as_str().unwrap().contains("<prefetched_context>"));
-        assert!(m[4]["content"].as_str().unwrap().contains("fresh diff from T3"));
+        assert!(
+            m[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<prefetched_context>")
+        );
+        assert!(
+            m[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("fresh diff from T3")
+        );
     }
 
     #[test]
@@ -205,7 +227,10 @@ mod tests {
         let m = openai_messages_from_repl_history(
             &[
                 ("plain question".into(), "plain answer".into()),
-                ("review\n\n<prefetched_context>\ndiff\n</prefetched_context>".into(), "review done".into()),
+                (
+                    "review\n\n<prefetched_context>\ndiff\n</prefetched_context>".into(),
+                    "review done".into(),
+                ),
             ],
             "follow up",
         );
@@ -220,10 +245,7 @@ mod tests {
         // Unhappy: user typed literal "<prefetched_context>" without closing tag.
         // Should NOT strip anything — no matching close tag.
         let weird = "user said \n\n<prefetched_context> but never closed it";
-        let m = openai_messages_from_repl_history(
-            &[(weird.into(), "ok".into())],
-            "next",
-        );
+        let m = openai_messages_from_repl_history(&[(weird.into(), "ok".into())], "next");
         assert_eq!(m[0]["content"].as_str().unwrap(), weird);
     }
 
@@ -238,7 +260,10 @@ mod tests {
     fn strip_prefetched_context_large_diff_fully_removed() {
         // Simulate a real-world large diff injection (~4KB).
         let big_diff = "x".repeat(4000);
-        let user = format!("review abc1234\n\n<prefetched_context>\nguidance\n\n{}\n</prefetched_context>", big_diff);
+        let user = format!(
+            "review abc1234\n\n<prefetched_context>\nguidance\n\n{}\n</prefetched_context>",
+            big_diff
+        );
         let stripped = strip_prefetched_context(&user);
         assert_eq!(stripped, "review abc1234");
         assert!(!stripped.contains("xxxx"));
@@ -247,7 +272,8 @@ mod tests {
     #[test]
     fn strip_prefetched_context_text_after_block_preserved() {
         // Edge: user appended text after the closing tag (shouldn't happen, but be safe).
-        let user = "review\n\n<prefetched_context>\ndiff\n</prefetched_context>\nPS: also check tests";
+        let user =
+            "review\n\n<prefetched_context>\ndiff\n</prefetched_context>\nPS: also check tests";
         let stripped = strip_prefetched_context(user);
         assert_eq!(stripped, "review\nPS: also check tests");
         assert!(!stripped.contains("diff"));

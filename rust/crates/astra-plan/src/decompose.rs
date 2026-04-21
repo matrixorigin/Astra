@@ -724,45 +724,48 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
         if let Some(arr) = obj.get("subtasks").and_then(|v| v.as_array())
             && arr.iter().any(|v| v.is_string())
         {
-                let coerced: Vec<serde_json::Value> = arr
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        if let Some(s) = v.as_str() {
-                            let id = format!("subtask-{}", i + 1);
-                            serde_json::json!({
-                                "id": id,
-                                "title": s,
-                                "description": s,
-                                "depends_on": [],
-                                "effort": "small",
-                                "files": [],
-                                "acceptance_checks": []
-                            })
-                        } else {
-                            v.clone()
-                        }
-                    })
-                    .collect();
-                let coerced_obj = serde_json::json!({ "subtasks": coerced });
-                let coerced_str = coerced_obj.to_string();
-                let parsed: PlanResponse = serde_json::from_str(&coerced_str)
-                    .map_err(|e| format!("Invalid plan JSON after coercion: {e}"))?;
-                let subtasks = parsed
-                    .subtasks
-                    .into_iter()
-                    .map(|st| SubtaskPlan {
-                        id: st.id,
-                        title: st.title,
-                        description: st.description,
-                        depends_on: st.depends_on.unwrap_or_default(),
-                        status: TaskStatus::Pending,
-                        effort: st.effort,
-                        files: st.files.unwrap_or_default(),
-                        acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
-                    })
-                    .collect();
-                return Ok(TaskPlan { subtasks, notes: None });
+            let coerced: Vec<serde_json::Value> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if let Some(s) = v.as_str() {
+                        let id = format!("subtask-{}", i + 1);
+                        serde_json::json!({
+                            "id": id,
+                            "title": s,
+                            "description": s,
+                            "depends_on": [],
+                            "effort": "small",
+                            "files": [],
+                            "acceptance_checks": []
+                        })
+                    } else {
+                        v.clone()
+                    }
+                })
+                .collect();
+            let coerced_obj = serde_json::json!({ "subtasks": coerced });
+            let coerced_str = coerced_obj.to_string();
+            let parsed: PlanResponse = serde_json::from_str(&coerced_str)
+                .map_err(|e| format!("Invalid plan JSON after coercion: {e}"))?;
+            let subtasks = parsed
+                .subtasks
+                .into_iter()
+                .map(|st| SubtaskPlan {
+                    id: st.id,
+                    title: st.title,
+                    description: st.description,
+                    depends_on: st.depends_on.unwrap_or_default(),
+                    status: TaskStatus::Pending,
+                    effort: st.effort,
+                    files: st.files.unwrap_or_default(),
+                    acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
+                })
+                .collect();
+            return Ok(TaskPlan {
+                subtasks,
+                notes: None,
+            });
         }
     } else if parsed_value.is_array() {
         // This might be a clarification question array - caller should handle this
@@ -4612,10 +4615,12 @@ Done!"#;
     #[test]
     fn parse_plan_response_string_array_subtasks_coerced() {
         // Model returns subtasks as string array instead of object array.
-        let result = parse_plan_response(
-            r#"{"subtasks": ["Add CSS styles", "Add JS interactions"]}"#,
+        let result =
+            parse_plan_response(r#"{"subtasks": ["Add CSS styles", "Add JS interactions"]}"#);
+        assert!(
+            result.is_ok(),
+            "string-array subtasks should be coerced, not rejected"
         );
-        assert!(result.is_ok(), "string-array subtasks should be coerced, not rejected");
         let plan = result.unwrap();
         assert_eq!(plan.subtasks.len(), 2);
         assert_eq!(plan.subtasks[0].title, "Add CSS styles");
@@ -4627,12 +4632,14 @@ Done!"#;
     #[test]
     fn parse_plan_response_mixed_array_subtasks_coerced() {
         // Mixed: some strings, some objects — strings get coerced.
-        let result = parse_plan_response(r#"{
+        let result = parse_plan_response(
+            r#"{
             "subtasks": [
                 "Add CSS styles",
                 {"id": "js-step", "title": "Add JS", "depends_on": [], "acceptance_checks": []}
             ]
-        }"#);
+        }"#,
+        );
         assert!(result.is_ok(), "mixed array should be coerced");
         let plan = result.unwrap();
         assert_eq!(plan.subtasks.len(), 2);

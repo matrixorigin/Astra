@@ -755,7 +755,10 @@ mod tests {
                 group.round == Some(2)
                     && group.parallel
                     && group.call_count == 4
-                    && group.tools.iter().any(|tool| tool.contains("run_lifecycle.rs"))
+                    && group
+                        .tools
+                        .iter()
+                        .any(|tool| tool.contains("run_lifecycle.rs"))
             }),
             "digest should preserve the large round-2 batch from the real session"
         );

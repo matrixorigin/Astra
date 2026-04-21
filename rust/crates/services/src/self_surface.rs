@@ -2413,8 +2413,7 @@ mod tests {
         );
         assert!(
             snapshot.recent_steps.iter().any(|step| {
-                step.event_type == "turn_evaluation"
-                    && step.summary.contains("q=0.50, conf=0.70")
+                step.event_type == "turn_evaluation" && step.summary.contains("q=0.50, conf=0.70")
             }),
             "turn evaluation summary should be visible in recent steps"
         );

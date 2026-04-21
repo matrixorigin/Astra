@@ -1845,13 +1845,19 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         // Simulate emit_event sending it.
-        tx.send(PlanUpdate::JournalEvent(Box::new(events.into_iter().next().unwrap()))).unwrap();
+        tx.send(PlanUpdate::JournalEvent(Box::new(
+            events.into_iter().next().unwrap(),
+        )))
+        .unwrap();
 
         let update = rx.try_recv().unwrap();
         let PlanUpdate::JournalEvent(received) = update else {
             panic!("expected JournalEvent");
         };
-        assert_eq!(received.event_type, astra_services::session_journal::JournalEventType::LlmRound);
+        assert_eq!(
+            received.event_type,
+            astra_services::session_journal::JournalEventType::LlmRound
+        );
         assert_eq!(received.turn, Some(2));
         assert_eq!(received.tokens_in, Some(1000));
         assert_eq!(received.ttft_ms, Some(2100));
@@ -1885,9 +1891,18 @@ mod tests {
         }
         // Then emit the turn summary.
         let turn_evt = session_journal::JournalEvent::turn(
-            Some("sess-1"), 3, Some("qwen-turbo"), "prompt", "response", 2, 1000, 40, 2000,
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            "response",
+            2,
+            1000,
+            40,
+            2000,
         );
-        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt))).unwrap();
+        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt)))
+            .unwrap();
 
         // Drain and verify order: llm_round, llm_round, turn.
         let mut received_types = Vec::new();
@@ -1897,9 +1912,18 @@ mod tests {
             }
         }
         assert_eq!(received_types.len(), 3);
-        assert_eq!(received_types[0], astra_services::session_journal::JournalEventType::LlmRound);
-        assert_eq!(received_types[1], astra_services::session_journal::JournalEventType::LlmRound);
-        assert_eq!(received_types[2], astra_services::session_journal::JournalEventType::Turn);
+        assert_eq!(
+            received_types[0],
+            astra_services::session_journal::JournalEventType::LlmRound
+        );
+        assert_eq!(
+            received_types[1],
+            astra_services::session_journal::JournalEventType::LlmRound
+        );
+        assert_eq!(
+            received_types[2],
+            astra_services::session_journal::JournalEventType::Turn
+        );
     }
 
     /// Verify that llm_round events emitted by plan executor carry plan_subtask_id.

@@ -813,15 +813,24 @@ mod tests {
         let block = sse("tool_call_start", ",\"id\":\"call-1\",\"name\":\"bash\"");
         let mut f = ChatTurnSseFramer::new();
         let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(f.ttft_ms.is_some(), "ttft must be set when first SSE event is tool_call_start");
+        assert!(
+            f.ttft_ms.is_some(),
+            "ttft must be set when first SSE event is tool_call_start"
+        );
     }
 
     #[test]
     fn framer_ttft_on_tool_call_block() {
-        let block = sse("tool_call", ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"}");
+        let block = sse(
+            "tool_call",
+            ",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":\"{}\"}",
+        );
         let mut f = ChatTurnSseFramer::new();
         let _ = f.push_lossy_bytes(block.as_bytes());
-        assert!(f.ttft_ms.is_some(), "ttft must be set when first SSE event is tool_call");
+        assert!(
+            f.ttft_ms.is_some(),
+            "ttft must be set when first SSE event is tool_call"
+        );
     }
 
     #[test]
