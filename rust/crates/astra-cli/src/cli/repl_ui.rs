@@ -903,6 +903,19 @@ fn slash_inline_hint(line: &str) -> Option<String> {
     None
 }
 
+fn should_execute_slash_picker_on_enter(current: &str, selected_cmd: &str) -> bool {
+    if current == selected_cmd || current == format!("{selected_cmd} ") {
+        return true;
+    }
+
+    // `/model` opens an interactive chooser when invoked without args, so once the
+    // picker has uniquely narrowed to `/model`, Enter should run it instead of only
+    // filling in the command text.
+    selected_cmd == "/model"
+        && current.starts_with('/')
+        && selected_cmd.starts_with(current.trim_end())
+}
+
 pub(super) fn prompt_inline_hint(line: &str) -> Option<String> {
     if line.is_empty()
         && !is_slash_picker_active()
@@ -1927,7 +1940,7 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let selected = get_slash_picker_selected();
 
                 if let Some((cmd, _)) = rows.get(selected) {
-                    if current == *cmd || current == format!("{cmd} ") {
+                    if should_execute_slash_picker_on_enter(current, cmd) {
                         // Exact match — execute immediately.
                         clear_slash_overlay();
                         set_slash_pending_execute(Some(cmd.to_string()));
@@ -2824,6 +2837,20 @@ mod tests {
         // Drain any leftover from other tests
         let _ = take_slash_pending_execute();
         assert_eq!(take_slash_pending_execute(), None);
+    }
+
+    #[test]
+    fn model_picker_enter_executes_on_prefix() {
+        assert!(should_execute_slash_picker_on_enter("/mo", "/model"));
+        assert!(should_execute_slash_picker_on_enter("/mode", "/model"));
+        assert!(should_execute_slash_picker_on_enter("/model", "/model"));
+    }
+
+    #[test]
+    fn non_model_picker_enter_still_requires_exact_match() {
+        assert!(!should_execute_slash_picker_on_enter("/sk", "/skill"));
+        assert!(!should_execute_slash_picker_on_enter("/sess", "/session"));
+        assert!(should_execute_slash_picker_on_enter("/skill", "/skill"));
     }
 
     // ── Print group reorganization ───────────────────────────────────────
