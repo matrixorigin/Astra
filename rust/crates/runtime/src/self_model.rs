@@ -544,9 +544,7 @@ impl SelfModel {
                     let _ = writeln!(
                         s,
                         "Guardrail: reflection triggers after {} signals{} · warming up ({} turns observed)",
-                        g.reflection_threshold,
-                        delta_tag,
-                        g.turns_observed,
+                        g.reflection_threshold, delta_tag, g.turns_observed,
                     );
                 }
             }
@@ -1196,7 +1194,10 @@ mod tests {
         assert!(!model.capabilities.widen_selection_pending);
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
-        assert!(!rendered.contains("widened for next turn"), "got: {rendered}");
+        assert!(
+            !rendered.contains("widened for next turn"),
+            "got: {rendered}"
+        );
     }
 
     #[test]

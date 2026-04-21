@@ -1133,7 +1133,10 @@ impl ServerAgenticLoopHost {
             // Pipeline-requested widen: skip health-based deprioritization
             // merge for this turn so the full catalogue is re-exposed.
         } else {
-            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+            merge_deprioritized_tools_into_restricted(
+                &state.turn_guard,
+                &mut state.restricted_tools,
+            );
         }
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(self.effective_allowlist_restrictions(state));
@@ -1539,7 +1542,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if std::mem::take(&mut state.widen_selection_pending) {
             // Pipeline-requested widen: skip deprioritized-merge for this turn.
         } else {
-            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+            merge_deprioritized_tools_into_restricted(
+                &state.turn_guard,
+                &mut state.restricted_tools,
+            );
         }
         let mut effective_restricted = state.restricted_tools.clone();
         effective_restricted.extend(self.effective_allowlist_restrictions(state));

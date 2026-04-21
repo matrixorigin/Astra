@@ -585,7 +585,10 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(&[
         ("breakdown", "Per-component token breakdown for last turn"),
-        ("cognition", "Cognitive runtime flags (boosted/widen, recent tools, pending proposal)"),
+        (
+            "cognition",
+            "Cognitive runtime flags (boosted/widen, recent tools, pending proposal)",
+        ),
     ]),
     CommandMeta::new(
         "/rewind",

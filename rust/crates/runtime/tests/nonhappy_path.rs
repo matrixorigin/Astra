@@ -849,42 +849,54 @@ mod chat_stream_turnguard_e2e {
 
     // ── Divergence scenarios ──
 
-    /// 8+ rounds of exploration-only tools → DIVERGENCE_CORRECTION injected.
+    /// P2.5: exact-signature loop → DIVERGENCE_CORRECTION injected.
     #[test]
     fn exploration_divergence_triggers_correction() {
         let mut guard = TurnGuard::new();
 
-        // All exploration tools: bash, read_file, grep, list_dir, glob (8 rounds)
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
-        guard.record_tool_result("bash", "src/main.rs\nsrc/lib.rs");
-
-        guard.record_tool_calls(&[tc("read_file", r#"{"path":"src/main.rs"}"#)]);
-        guard.record_tool_result("read_file", "fn main() {}");
-
-        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"TODO"}"#)]);
-        guard.record_tool_result("grep", "src/lib.rs:10: // TODO fix this");
-
-        guard.record_tool_calls(&[tc("list_dir", r#"{"path":"src"}"#)]);
-        guard.record_tool_result("list_dir", "main.rs\nlib.rs");
-
-        guard.record_tool_calls(&[tc("glob", r#"{"pattern":"**/*.toml"}"#)]);
-        guard.record_tool_result("glob", "Cargo.toml");
-
-        guard.record_tool_calls(&[tc("bash", r#"{"command":"wc -l src/*.rs"}"#)]);
-        guard.record_tool_result("bash", "42 src/main.rs");
-
-        guard.record_tool_calls(&[tc("read_file", r#"{"path":"src/lib.rs"}"#)]);
-        guard.record_tool_result("read_file", "pub fn lib() {}");
-
-        guard.record_tool_calls(&[tc("grep", r#"{"pattern":"fn "}"#)]);
-        guard.record_tool_result("grep", "src/main.rs:1: fn main()");
+        // Genuine loop: same tool + identical args repeated 5 times.
+        for _ in 0..5 {
+            guard.record_tool_calls(&[tc("bash", r#"{"command":"find . -name *.rs"}"#)]);
+            guard.record_tool_result("bash", "src/main.rs\nsrc/lib.rs");
+        }
 
         let v = guard.evaluate();
         assert!(
-            v.injections.iter().any(|m| m.contains("exploring")),
-            "divergence correction should mention exploration"
+            v.injections
+                .iter()
+                .any(|m| m.contains("same tool calls") || m.contains("same arguments")),
+            "divergence correction should fire on exact-sig loop: {:?}",
+            v.injections
         );
         assert!(v.severity >= VerdictSeverity::Warning);
+    }
+
+    /// P2.5: diverse exploration tools across many rounds → Healthy.
+    #[test]
+    fn diverse_exploration_does_not_trigger_correction() {
+        let mut guard = TurnGuard::new();
+        let rounds = [
+            ("bash", r#"{"command":"find . -name *.rs"}"#),
+            ("read_file", r#"{"path":"src/main.rs"}"#),
+            ("grep", r#"{"pattern":"TODO"}"#),
+            ("list_dir", r#"{"path":"src"}"#),
+            ("glob", r#"{"pattern":"**/*.toml"}"#),
+            ("bash", r#"{"command":"wc -l src/*.rs"}"#),
+            ("read_file", r#"{"path":"src/lib.rs"}"#),
+            ("grep", r#"{"pattern":"fn "}"#),
+        ];
+        for (tool, args) in rounds {
+            guard.record_tool_calls(&[tc(tool, args)]);
+            guard.record_tool_result(tool, "ok");
+        }
+        let v = guard.evaluate();
+        assert!(
+            !v.injections
+                .iter()
+                .any(|m| m.contains("same tool calls") || m.contains("STOP exploring")),
+            "diverse exploration must NOT trigger divergence: {:?}",
+            v.injections
+        );
     }
 
     /// Productive tool breaks divergence streak.
@@ -903,7 +915,10 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("write_file", r#"{"ok":true}"#);
 
         let v = guard.evaluate();
-        let has_divergence = v.injections.iter().any(|m| m.contains("exploring"));
+        let has_divergence = v
+            .injections
+            .iter()
+            .any(|m| m.contains("same tool calls") || m.contains("STOP exploring"));
         assert!(!has_divergence, "productive tool should break divergence");
     }
 

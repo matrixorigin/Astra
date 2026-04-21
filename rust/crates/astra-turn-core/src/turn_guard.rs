@@ -648,19 +648,45 @@ mod tests {
     #[test]
     fn divergence_triggers_correction() {
         let mut guard = TurnGuard::new();
-        // 8 rounds of exploration-only tools (hits MAX_EXPLORATION_ROUNDS=8)
-        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"foo"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("grep", r#"{"pattern":"bar"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("list_dir", r#"{"path":"src"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("glob", r#"{"pattern":"*.rs"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"find ."}"#)]);
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"bar"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("grep", r#"{"pattern":"baz"}"#)]);
+        // New semantics: divergence correction fires on exact signature
+        // repetition over the exploration budget window (5 rounds default).
+        for _ in 0..5 {
+            guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
+        }
 
         let verdict = guard.evaluate();
-        assert!(verdict.injections.iter().any(|m| m.contains("exploring")));
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("same tool calls") || m.contains("same arguments")),
+            "injections: {:?}",
+            verdict.injections
+        );
         assert!(verdict.is_diverging);
+    }
+
+    /// Regression for session bc74b214-3e2e turn-2: distinct
+    /// exploration-tool calls across rounds must NOT inject a correction.
+    /// The old whitelist heuristic false-positived here.
+    #[test]
+    fn diverse_exploration_does_not_trigger_correction() {
+        let mut guard = TurnGuard::new();
+        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls src"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"a.rs"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("grep", r#"{"pattern":"foo"}"#)]);
+        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"b.rs"}"#)]);
+
+        let verdict = guard.evaluate();
+        assert!(!verdict.is_diverging, "unexpectedly diverging");
+        assert!(
+            !verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("same tool calls") || m.contains("STOP exploring")),
+            "unexpected correction injection: {:?}",
+            verdict.injections
+        );
     }
 
     #[test]
@@ -863,7 +889,11 @@ mod tests {
     }
 
     #[test]
-    fn analysis_profile_diverges_after_five_exploration_rounds() {
+    fn analysis_profile_diverse_rounds_are_healthy() {
+        // New semantics: a review/analysis task using five DISTINCT
+        // exploration rounds is legitimate work, not divergence. The
+        // whitelist heuristic that previously false-positived here has
+        // been removed in favor of signature-diversity based detection.
         let profile =
             crate::chat_turn_heuristics::infer_task_execution_profile("review 最新的commit");
         let mut guard = TurnGuard::with_profile(profile);
@@ -881,15 +911,18 @@ mod tests {
         }
 
         let verdict = guard.evaluate();
-        assert!(verdict.is_diverging);
-        assert!(!verdict.stall_detected);
-        assert_eq!(verdict.severity, VerdictSeverity::Warning);
         assert!(
-            verdict
+            !verdict.is_diverging,
+            "review pattern should not be flagged"
+        );
+        assert!(!verdict.stall_detected);
+        assert!(
+            !verdict
                 .injections
                 .iter()
-                .any(|message| message.contains("STOP exploring")),
-            "analysis turns should get divergence correction after five exploration rounds"
+                .any(|m| m.contains("same tool calls")),
+            "unexpected correction: {:?}",
+            verdict.injections
         );
     }
 
@@ -898,16 +931,22 @@ mod tests {
     fn verdict_fields_reflect_actual_state() {
         let mut guard = TurnGuard::new();
 
-        // Trigger stall (same call 3x, SERVER_STALL_WINDOW=3)
+        // Trigger stall AND divergence (same sig repeated — the unified
+        // progress-aware detection treats a genuine loop identically for
+        // both detectors once enough history accumulates).
         let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
+        for _ in 0..5 {
+            guard.record_tool_calls(&calls);
+        }
         let v = guard.evaluate();
         assert!(v.stall_detected);
-        assert!(!v.is_diverging); // stall detected, not divergence
+        // With new unified progress-aware semantics, exact sig repeat
+        // flips BOTH stall_detected and is_diverging — they now represent
+        // the same underlying condition (genuine loop).
+        assert!(v.is_diverging);
 
-        // Fresh guard: trigger divergence (8 exploration rounds, all different)
+        // Fresh guard: 8 DISTINCT exploration rounds — under new
+        // semantics this is Healthy (novelty high), not Diverging.
         let mut guard2 = TurnGuard::new();
         let tools = [
             "bash",
@@ -923,7 +962,10 @@ mod tests {
             guard2.record_tool_calls(&[make_tool_call(tool, &format!(r#"{{"arg":"val{}"}}"#, i))]);
         }
         let v2 = guard2.evaluate();
-        assert!(v2.is_diverging);
+        assert!(
+            !v2.is_diverging,
+            "diverse rounds must not be flagged as diverging"
+        );
     }
 
     /// force_stop requires Critical escalation. With coupled nudge+error

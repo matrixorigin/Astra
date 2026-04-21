@@ -2264,7 +2264,13 @@ pub(super) fn render_whoami(state: &ReplState) -> String {
     let recent_tools = if state.recent_tools.is_empty() {
         "<none>".to_string()
     } else {
-        state.recent_tools.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        state
+            .recent_tools
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let _ = writeln!(out, "  version        : {version}");
@@ -2300,18 +2306,35 @@ pub(super) fn render_cognition(state: &ReplState) -> String {
     let recent_tools = if state.recent_tools.is_empty() {
         "<none>".to_string()
     } else {
-        state.recent_tools.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
+        state
+            .recent_tools
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let pending = state
         .skill_improvement_tracker
         .pending_proposal
         .as_ref()
-        .map(|p| format!("{} ({} change{})", p.skill_name, p.improvements.len(), if p.improvements.len() == 1 { "" } else { "s" }))
+        .map(|p| {
+            format!(
+                "{} ({} change{})",
+                p.skill_name,
+                p.improvements.len(),
+                if p.improvements.len() == 1 { "" } else { "s" }
+            )
+        })
         .unwrap_or_else(|| "<none>".to_string());
 
     let _ = writeln!(out, "  recent_tools     : {recent_tools}");
     let _ = writeln!(out, "  pending_proposal : {pending}");
-    let _ = writeln!(out, "  skills_registered: {}", state.unified_skill_registry.len());
+    let _ = writeln!(
+        out,
+        "  skills_registered: {}",
+        state.unified_skill_registry.len()
+    );
     let _ = writeln!(out, "  turn             : {}", state.turn);
     let _ = writeln!(
         out,
@@ -2545,7 +2568,10 @@ mod tests {
         let mut state = ReplState::default();
         state.recent_tools = vec!["bash".into(), "read_file".into()];
         let out = super::render_cognition(&state);
-        assert!(out.contains("recent_tools     : bash, read_file"), "got: {out}");
+        assert!(
+            out.contains("recent_tools     : bash, read_file"),
+            "got: {out}"
+        );
         assert!(out.contains("pending_proposal : <none>"), "got: {out}");
         assert!(out.contains("skills_registered"), "got: {out}");
     }

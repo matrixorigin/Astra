@@ -130,8 +130,7 @@ pub struct ObservabilitySession {
     /// auto-reflection system just adjusted (blocked/boosted/widen).
     ///
     /// Reset lazily — it lingers until the next `apply_strategy_delta` call.
-    pub last_strategy_application:
-        Option<crate::turn::agentic_stage_bridge::StrategyApplication>,
+    pub last_strategy_application: Option<crate::turn::agentic_stage_bridge::StrategyApplication>,
 
     /// Most recent [`GuardrailView`] snapshot published by the auto-reflection
     /// path after tuning the reflection threshold. Surfaced into the SelfModel

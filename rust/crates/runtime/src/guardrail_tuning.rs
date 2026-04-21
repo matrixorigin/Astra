@@ -116,8 +116,10 @@ impl GuardrailTuner {
         };
         if delta != 0 {
             let next = self.threshold as i32 + delta;
-            self.threshold =
-                next.clamp(MIN_REFLECTION_THRESHOLD as i32, MAX_REFLECTION_THRESHOLD as i32) as u32;
+            self.threshold = next.clamp(
+                MIN_REFLECTION_THRESHOLD as i32,
+                MAX_REFLECTION_THRESHOLD as i32,
+            ) as u32;
             self.last_delta = delta;
             Some(delta)
         } else {

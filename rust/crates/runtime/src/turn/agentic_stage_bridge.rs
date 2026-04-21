@@ -119,9 +119,7 @@ pub struct StrategyApplication {
 
 impl StrategyApplication {
     pub fn is_noop(&self) -> bool {
-        self.newly_blocked.is_empty()
-            && !self.widen_requested
-            && self.newly_boosted.is_empty()
+        self.newly_blocked.is_empty() && !self.widen_requested && self.newly_boosted.is_empty()
     }
 
     pub fn summary(&self) -> String {

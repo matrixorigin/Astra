@@ -161,7 +161,28 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
     (sig_set, name_set)
 }
 
-/// True when the last `window` rounds have **identical** tool-name sets (name-only stall in CLI loop).
+/// True when the last `window` rounds have **identical** tool-call signatures
+/// (name + args). This is the CLI-loop equivalent of [`detect_server_stall`].
+///
+/// The older `detect_cli_tool_name_stall` variant looked only at tool-name
+/// sets, which misfired for legitimate patterns like three consecutive
+/// `read_file` calls with different paths. The signature-based version is
+/// the general fix: progress comes from *arguments changing*, not from
+/// avoiding any particular tool.
+pub fn detect_cli_tool_sig_stall(
+    turn_sigs: &[BTreeSet<String>],
+    window: usize,
+) -> Result<bool, StallDetectionError> {
+    detect_server_stall(turn_sigs, window)
+}
+
+/// Deprecated: retained for backward compatibility. Prefer
+/// [`detect_cli_tool_sig_stall`] which keys on full signatures (name+args).
+/// Set-of-names equality misfires when the same tool is called with
+/// different arguments across rounds.
+#[deprecated(
+    note = "use detect_cli_tool_sig_stall — name-only equality is prone to false positives"
+)]
 pub fn detect_cli_tool_name_stall(
     turn_tool_names: &[HashSet<String>],
     window: usize,
@@ -192,12 +213,6 @@ pub enum DivergenceStatus {
 pub struct RewardHackingAssessment {
     pub risk: f64,
     pub flags: Vec<String>,
-}
-
-fn tool_names_from_sigs(sigs: &BTreeSet<String>) -> Vec<String> {
-    sigs.iter()
-        .filter_map(|sig| sig.split(':').next().map(String::from))
-        .collect()
 }
 
 fn max_duplicate_count(values: &[String]) -> usize {
@@ -353,8 +368,92 @@ Stop repeating cheap actions that do not advance the task.",
     message
 }
 
-/// Detect if the agent is diverging: last N rounds used ONLY exploration tools
-/// (bash, list_dir, read_file, grep, glob) with no productive tool calls.
+/// Progress assessment across recent rounds, based on tool-call signature
+/// **diversity** rather than a hand-picked "exploration" whitelist.
+///
+/// - `NoProgress`  — last `window` rounds are literally the same call set
+///   (identical signatures). This is the only state that warrants injecting
+///   a correction; it's the real "stuck in a loop" condition.
+/// - `LowNovelty(rate)` — distinct-signature rate over the last `window`
+///   rounds is below `NOVELTY_FLOOR`. The agent is covering narrow ground
+///   but NOT literally repeating itself; worth surfacing as a hint, but
+///   not worth interrupting legitimate review / debug / analysis flows.
+/// - `Healthy` — enough novelty, or not enough history to judge.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProgressStatus {
+    Healthy,
+    LowNovelty(f32),
+    NoProgress,
+}
+
+/// Floor below which signature novelty is considered "low". Chosen so
+/// that two-tool rotation with distinct args per call scores above it,
+/// while 3 rounds of a single repeated tool scores below.
+pub const NOVELTY_FLOOR: f32 = 0.34;
+
+/// Total number of individual tool-call signatures across the last
+/// `window` rounds. Used as the denominator for novelty rate.
+fn total_sig_count(rounds: &[BTreeSet<String>]) -> usize {
+    rounds.iter().map(|r| r.len()).sum()
+}
+
+/// Union of all signatures across the last `window` rounds.
+fn distinct_sig_count(rounds: &[BTreeSet<String>]) -> usize {
+    let mut seen = BTreeSet::new();
+    for r in rounds {
+        for s in r {
+            seen.insert(s.clone());
+        }
+    }
+    seen.len()
+}
+
+/// General-purpose progress assessment. Task-type agnostic: it does NOT
+/// judge by which tools are used, only by whether the signature stream
+/// is repeating or stagnating.
+pub fn assess_progress(
+    tool_sigs: &[BTreeSet<String>],
+    window: usize,
+) -> Result<ProgressStatus, StallDetectionError> {
+    if window == 0 {
+        return Err(StallDetectionError::InvalidWindowOrBudget(0));
+    }
+    if tool_sigs.len() < window {
+        return Ok(ProgressStatus::Healthy);
+    }
+    let recent = &tool_sigs[tool_sigs.len() - window..];
+
+    // Rounds with no tool calls don't count as progress signal either way.
+    if recent.iter().any(|r| r.is_empty()) {
+        return Ok(ProgressStatus::Healthy);
+    }
+
+    // Exact-repetition: every round has the same signature set.
+    if recent.iter().all(|r| r == &recent[0]) {
+        return Ok(ProgressStatus::NoProgress);
+    }
+
+    let total = total_sig_count(recent);
+    let distinct = distinct_sig_count(recent);
+    if total == 0 {
+        return Ok(ProgressStatus::Healthy);
+    }
+    let novelty = distinct as f32 / total as f32;
+    if novelty < NOVELTY_FLOOR {
+        Ok(ProgressStatus::LowNovelty(novelty))
+    } else {
+        Ok(ProgressStatus::Healthy)
+    }
+}
+
+/// Legacy wrapper kept for backward compatibility with existing call sites
+/// (TurnGuard). Now delegates to [`assess_progress`]: only `NoProgress`
+/// flips to `Diverging` (the single state that warrants injecting a
+/// correction). `LowNovelty` maps to `Exploring` (surfaced as a hint,
+/// not a correction), and `Healthy` maps to `Healthy`.
+///
+/// The `exploration_round_budget` parameter is retained as the window
+/// size so callers that tuned the round count continue to work.
 pub fn detect_divergence(
     tool_sigs: &[BTreeSet<String>],
 ) -> Result<DivergenceStatus, StallDetectionError> {
@@ -365,44 +464,26 @@ pub fn detect_divergence_with_budget(
     tool_sigs: &[BTreeSet<String>],
     exploration_round_budget: usize,
 ) -> Result<DivergenceStatus, StallDetectionError> {
-    if exploration_round_budget == 0 {
-        return Err(StallDetectionError::InvalidWindowOrBudget(0));
-    }
-    if tool_sigs.is_empty() {
-        return Ok(DivergenceStatus::Healthy);
-    }
-
-    let mut consecutive_exploration = 0;
-    for sigs in tool_sigs.iter().rev() {
-        let names = tool_names_from_sigs(sigs);
-        if names.is_empty() {
-            break;
+    match assess_progress(tool_sigs, exploration_round_budget)? {
+        ProgressStatus::Healthy => Ok(DivergenceStatus::Healthy),
+        ProgressStatus::LowNovelty(_) => {
+            // Report as Exploring (hint-only); callers should NOT inject
+            // a correction — the agent may be doing legitimate analysis.
+            Ok(DivergenceStatus::Exploring(exploration_round_budget))
         }
-        let all_exploration = names
-            .iter()
-            .all(|n| EXPLORATION_TOOLS.contains(&n.as_str()));
-        if all_exploration {
-            consecutive_exploration += 1;
-        } else {
-            break;
-        }
+        ProgressStatus::NoProgress => Ok(DivergenceStatus::Diverging(exploration_round_budget)),
     }
-
-    Ok(match consecutive_exploration {
-        0 => DivergenceStatus::Healthy,
-        n if n >= exploration_round_budget => DivergenceStatus::Diverging(n),
-        n => DivergenceStatus::Exploring(n),
-    })
 }
 
-/// Correction prompt injected when divergence is detected.
+/// Correction prompt injected when true no-progress is detected. The
+/// text is intentionally task-agnostic — it does **not** recommend any
+/// specific tool, because the right next action is task-dependent. The
+/// agent is trusted to pick it based on context.
 pub const DIVERGENCE_CORRECTION: &str = "\
-⚠ You have been exploring (bash/find/list_dir/read_file) for multiple rounds \
-without using a specific tool to accomplish the task. This wastes tokens. \
-STOP exploring and either:\n\
-1. Use a specific tool (memory_store, github_list_prs, etc.) to accomplish the user's request, OR\n\
-2. Tell the user what you found and ask for clarification.\n\
-Do NOT continue with bash/find/read_file unless you have a specific file path to examine.";
+⚠ The last few rounds produced the same tool calls with the same arguments — \
+no new information is being gathered. Stop repeating. \
+Either synthesize what you already have and respond to the user, \
+or take a different action (a different tool, or the same tool with different arguments).";
 
 // ─── Structured reflection nudge ────────────────────────────────────────────
 
@@ -725,6 +806,7 @@ pub fn detect_intent_drift(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::tool_registry_state::word_boundary_match;
@@ -813,6 +895,110 @@ mod tests {
         assert!(!detect_cli_tool_name_stall(&v, SERVER_STALL_WINDOW).unwrap());
     }
 
+    // ── assess_progress (general progress-aware stall) ──
+
+    fn sig_set(s: &[&str]) -> BTreeSet<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn assess_progress_healthy_when_insufficient_history() {
+        let rounds = vec![sig_set(&["read_file:a"])];
+        assert_eq!(
+            assess_progress(&rounds, 3).unwrap(),
+            ProgressStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn assess_progress_no_progress_on_exact_repeat() {
+        let r = sig_set(&["bash:"]);
+        let rounds = vec![r.clone(), r.clone(), r];
+        assert_eq!(
+            assess_progress(&rounds, 3).unwrap(),
+            ProgressStatus::NoProgress
+        );
+    }
+
+    /// Regression: the real review-task pattern from session
+    /// bc74b214-3e2e — three consecutive distinct `read_file` calls.
+    /// Must be classified as Healthy, NOT LowNovelty / NoProgress, so
+    /// no DIVERGENCE_CORRECTION is injected for legitimate exploration.
+    #[test]
+    fn assess_progress_healthy_on_distinct_reads() {
+        let rounds = vec![
+            sig_set(&["read_file:a"]),
+            sig_set(&["read_file:b"]),
+            sig_set(&["read_file:c"]),
+        ];
+        assert_eq!(
+            assess_progress(&rounds, 3).unwrap(),
+            ProgressStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn assess_progress_low_novelty_on_narrow_rotation() {
+        // Two signatures alternating — 2 distinct / 6 total ≈ 0.33 < floor.
+        let a = sig_set(&["bash:x", "read_file:y"]);
+        let b = sig_set(&["bash:x", "read_file:y"]);
+        let c = sig_set(&["bash:x", "read_file:y"]);
+        // NOTE: these are IDENTICAL, so this actually hits NoProgress.
+        let rounds = vec![a, b, c];
+        assert_eq!(
+            assess_progress(&rounds, 3).unwrap(),
+            ProgressStatus::NoProgress
+        );
+    }
+
+    #[test]
+    fn assess_progress_healthy_on_diverse_multi_tool_review() {
+        let rounds = vec![
+            sig_set(&["grep:pat1", "read_file:a"]),
+            sig_set(&["grep:pat2", "read_file:b"]),
+            sig_set(&["list_dir:/x", "read_file:c"]),
+        ];
+        assert_eq!(
+            assess_progress(&rounds, 3).unwrap(),
+            ProgressStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn assess_progress_invalid_window() {
+        assert!(matches!(
+            assess_progress(&[], 0),
+            Err(StallDetectionError::InvalidWindowOrBudget(0))
+        ));
+    }
+
+    /// Regression: `detect_divergence` must NOT flip to Diverging on the
+    /// real review pattern (3 rounds of distinct read_file calls). This
+    /// was the root cause of the false-positive "Stall correction
+    /// injected" in session bc74b214-3e2e turn 2.
+    #[test]
+    fn detect_divergence_review_pattern_is_not_diverging() {
+        let rounds = vec![
+            sig_set(&["read_file:a"]),
+            sig_set(&["read_file:b"]),
+            sig_set(&["read_file:c"]),
+        ];
+        assert_eq!(
+            detect_divergence(&rounds).unwrap(),
+            DivergenceStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn detect_divergence_exact_repeat_is_diverging() {
+        let r = sig_set(&["bash:"]);
+        let rounds = vec![r.clone(), r.clone(), r];
+        assert!(matches!(
+            detect_divergence(&rounds).unwrap(),
+            DivergenceStatus::Diverging(_)
+        ));
+    }
+
     // ── Divergence detection ──
 
     #[test]
@@ -826,48 +1012,20 @@ mod tests {
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
-    #[test]
-    fn divergence_exploring_one() {
-        let sigs = make_sigs(&[&["bash"], &["github_list_prs"], &["bash"]]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(1)
-        );
-    }
+    // ─── New progress-aware semantics ───────────────────────────────
+    // Prior tests encoded the whitelist-based "3 exploration rounds =
+    // diverging" heuristic. Under the new progress-aware judge, mixed
+    // distinct-signature rounds are Healthy; only exact signature
+    // repetition (genuine loops) promotes to Diverging.
 
     #[test]
-    fn divergence_exploring_two() {
-        // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
-        let sigs = make_sigs(&[&["github_list_prs"], &["bash"], &["list_dir"]]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(2)
-        );
-    }
-
-    #[test]
-    fn divergence_exploring_three() {
-        // 3 consecutive exploration rounds → Diverging (hits threshold of 3)
+    fn divergence_diverse_rounds_are_healthy() {
+        // The old false-positive pattern: 3+ rounds of distinct exploration
+        // tool calls. Under progress-aware detection these are Healthy
+        // because each round contributes a new signature (distinct_sigs / total > floor).
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(3)
-        );
-    }
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
 
-    #[test]
-    fn divergence_exploring_four() {
-        // 4 consecutive exploration rounds → Diverging (past threshold of 3)
-        let sigs = make_sigs(&[&["bash"], &["list_dir"], &["grep"], &["read_file"]]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(4)
-        );
-    }
-
-    #[test]
-    fn divergence_detected_at_five() {
-        // 5 consecutive exploration rounds → Diverging (hits threshold)
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -875,54 +1033,40 @@ mod tests {
             &["read_file"],
             &["glob"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(5)
-        );
-    }
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
 
-    #[test]
-    fn divergence_detected_at_eight() {
-        // 8 consecutive exploration rounds → Diverging (well past threshold)
         let sigs = make_sigs(&[
-            &["bash"],
-            &["list_dir"],
-            &["grep"],
-            &["read_file"],
-            &["glob"],
-            &["bash"],
-            &["list_dir"],
-            &["grep"],
+            &["bash", "grep"],
+            &["list_dir", "read_file"],
+            &["bash", "glob"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(8)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
-    fn divergence_detected_nine() {
+    fn divergence_exact_repeat_is_diverging() {
+        let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
+        assert!(matches!(
+            detect_divergence(&sigs).unwrap(),
+            DivergenceStatus::Diverging(_)
+        ));
+    }
+
+    #[test]
+    fn divergence_exact_multi_tool_repeat_is_diverging() {
         let sigs = make_sigs(&[
-            &["bash"],
-            &["list_dir"],
-            &["grep"],
-            &["read_file"],
-            &["glob"],
-            &["bash"],
-            &["list_dir"],
-            &["grep"],
-            &["read_file"],
+            &["bash", "read_file"],
+            &["bash", "read_file"],
+            &["bash", "read_file"],
         ]);
-        assert_eq!(
+        assert!(matches!(
             detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(9)
-        );
+            DivergenceStatus::Diverging(_)
+        ));
     }
 
     #[test]
-    fn divergence_reset_by_productive() {
-        // Productive tool in the middle resets the counter;
-        // only 2 exploration rounds at the end → Exploring(2) (below threshold of 5)
+    fn divergence_productive_call_diverse_remains_healthy() {
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
@@ -930,10 +1074,7 @@ mod tests {
             &["bash"],
             &["list_dir"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(2)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
@@ -942,52 +1083,19 @@ mod tests {
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
+    /// Regression for session bc74b214-3e2e turn-2 false positive:
+    /// a normal code-analysis pattern (grep/read_file/grep/grep etc.)
+    /// with differing tool *presence* per round must NOT flip to Diverging.
+    /// The previous whitelist-based detector misfired here.
     #[test]
-    fn divergence_multi_tool_exploration_only() {
-        // 3 rounds of multi-tool exploration → Diverging(3), hits threshold of 3
+    fn normal_code_analysis_is_healthy() {
         let sigs = make_sigs(&[
-            &["bash", "grep"],
-            &["list_dir", "read_file"],
-            &["bash", "glob"],
+            &["grep", "grep"],
+            &["read_file"],
+            &["grep"],
+            &["grep", "grep"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(3)
-        );
-    }
-
-    #[test]
-    fn divergence_multi_tool_exploration_at_threshold() {
-        // 5 rounds of multi-tool exploration → Diverging(5)
-        let sigs = make_sigs(&[
-            &["bash", "grep"],
-            &["list_dir", "read_file"],
-            &["bash", "glob"],
-            &["grep", "read_file"],
-            &["bash", "list_dir"],
-        ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(5)
-        );
-    }
-
-    /// Regression test for session f9903b97: grep→read_file→grep→grep is
-    /// a normal code analysis pattern, but 4 consecutive exploration-only
-    /// rounds now exceed the lowered threshold of 3.
-    #[test]
-    fn normal_code_analysis_diverges_after_four() {
-        let sigs = make_sigs(&[
-            &["grep", "grep"], // round 0: search
-            &["read_file"],    // round 1: read result
-            &["grep"],         // round 2: refine search
-            &["grep", "grep"], // round 3: more search
-        ]);
-        // 4 consecutive exploration rounds → Diverging(4) with threshold=3
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Diverging(4)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
@@ -1725,38 +1833,43 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn divergence_with_budget_2_triggers_at_2() {
+    fn divergence_with_budget_2_triggers_at_exact_repeat() {
+        // New semantics: window=2 budget, both rounds identical sig → Diverging.
+        let sigs = make_sigs(&[&["bash"], &["bash"]]);
+        assert!(matches!(
+            detect_divergence_with_budget(&sigs, 2).unwrap(),
+            DivergenceStatus::Diverging(_)
+        ));
+    }
+
+    #[test]
+    fn divergence_with_budget_2_distinct_rounds_healthy() {
+        // New semantics: two distinct rounds within budget=2 → Healthy
+        // (novelty = 2/2 = 100%).
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
             detect_divergence_with_budget(&sigs, 2).unwrap(),
-            DivergenceStatus::Diverging(2)
+            DivergenceStatus::Healthy
         );
     }
 
     #[test]
-    fn divergence_with_budget_2_exploring_at_1() {
-        let sigs = make_sigs(&[&["github_list_prs"], &["bash"]]);
-        assert_eq!(
-            detect_divergence_with_budget(&sigs, 2).unwrap(),
-            DivergenceStatus::Exploring(1)
-        );
-    }
-
-    #[test]
-    fn divergence_with_budget_1_triggers_immediately() {
+    fn divergence_with_budget_1_single_round_diverging() {
+        // window=1 → a single round trivially equals itself → Diverging.
         let sigs = make_sigs(&[&["bash"]]);
-        assert_eq!(
+        assert!(matches!(
             detect_divergence_with_budget(&sigs, 1).unwrap(),
-            DivergenceStatus::Diverging(1)
-        );
+            DivergenceStatus::Diverging(_)
+        ));
     }
 
     #[test]
-    fn divergence_with_budget_larger_than_history() {
+    fn divergence_with_budget_larger_than_history_is_healthy() {
+        // Not enough history to judge → Healthy (new semantics).
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
             detect_divergence_with_budget(&sigs, 10).unwrap(),
-            DivergenceStatus::Exploring(2)
+            DivergenceStatus::Healthy
         );
     }
 
@@ -1777,31 +1890,27 @@ mod tests {
     }
 
     #[test]
-    fn divergence_empty_sig_set_breaks_chain() {
-        // An empty sig set in the middle should break the consecutive chain
+    fn divergence_empty_sig_set_round_in_window_is_healthy() {
+        // An empty sig set means the agent produced no tool calls that
+        // round — can't judge progress from that. New semantics: Healthy.
         let mut sigs = make_sigs(&[&["bash"], &["read_file"]]);
-        sigs.push(BTreeSet::new()); // empty round
+        sigs.push(BTreeSet::new());
         sigs.extend(make_sigs(&[&["bash"]]));
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(1)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     #[test]
-    fn divergence_non_exploration_tool_breaks_chain() {
-        // A single productive tool among exploration breaks the chain
+    fn divergence_mixed_productive_and_exploration_healthy() {
+        // Any mix of distinct signatures → Healthy, regardless of which
+        // tools are "productive" vs "exploratory" (no whitelist in new logic).
         let sigs = make_sigs(&[
             &["bash"],
             &["read_file"],
-            &["write_file"], // productive!
+            &["write_file"],
             &["bash"],
             &["grep"],
         ]);
-        assert_eq!(
-            detect_divergence(&sigs).unwrap(),
-            DivergenceStatus::Exploring(2)
-        );
+        assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
     // ══════════════════════════════════════════════════════════════════════
