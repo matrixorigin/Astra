@@ -811,31 +811,33 @@ impl ServerAgenticLoopHost {
             profile_parts.push(format!("git_branch: {branch}"));
         }
 
-        let skill_hint = self
+        let active_skill_names: Vec<&str> = self
             .edge_profile
             .get("active_skills")
             .and_then(Value::as_array)
-            .map(|arr| {
-                let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                if names.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
-                         Follow their formatting rules strictly.",
-                        names.join(", ")
-                    )
-                }
-            })
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let skill_hint = if active_skill_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
+                 Follow their formatting rules strictly.",
+                active_skill_names.join(", ")
+            )
+        };
 
-        let learned_context_hint = self
+        let learned_context_text = self
             .edge_profile
             .get("learned_context_hint")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
             .unwrap_or_default();
+        let learned_context_hint = if learned_context_text.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## Learned Runtime Context\n{learned_context_text}")
+        };
 
         let task_type = self
             .edge_profile
@@ -913,7 +915,12 @@ impl ServerAgenticLoopHost {
             vec![],
             vec![],
             crate::turn::context_assembly_trace::PromptContextSignals {
+                active_output_skills: !active_skill_names.is_empty(),
+                learned_runtime_context: !learned_context_text.is_empty(),
+                memory_signal_detected: !memory_signal_hint.is_empty(),
                 system_prompt_override: !system_override.is_empty(),
+                effort_hint: state.skills.effort.is_some(),
+                agent_type_hint: state.skills.agent_type.is_some(),
                 ..Default::default()
             },
         );

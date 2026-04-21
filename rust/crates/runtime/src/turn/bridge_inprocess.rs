@@ -728,23 +728,21 @@ impl InProcessChatTurnBridge {
                 }
             };
             // Read active skill hints from edge_profile (injected by CLI)
-            let skill_hint = edge_profile
+            let active_skill_names: Vec<&str> = edge_profile
                 .get("active_skills")
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                    if names.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "\n\n## Active Output Skills\n\
-                             The user has enabled these output constraints: {}. \
-                             Follow their formatting rules strictly.",
-                            names.join(", ")
-                        )
-                    }
-                })
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
+            let skill_hint = if active_skill_names.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\n## Active Output Skills\n\
+                     The user has enabled these output constraints: {}. \
+                     Follow their formatting rules strictly.",
+                    active_skill_names.join(", ")
+                )
+            };
             // ── Extract user query for signal detection ──
             let user_content_for_signal = messages
                 .iter()
@@ -753,12 +751,16 @@ impl InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let learned_context_hint = edge_profile
+            let learned_context_text = edge_profile
                 .get("learned_context_hint")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
                 .unwrap_or_default();
+            let learned_context_hint = if learned_context_text.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n## Learned Runtime Context\n{learned_context_text}")
+            };
             let task_type = edge_profile
                 .get("selection_task_type")
                 .and_then(Value::as_str)
@@ -1176,8 +1178,20 @@ impl InProcessChatTurnBridge {
                                 content_preview: line.chars().take(100).collect(),
                             }
                         }).collect();
-                    let breakdown = prompts::build_system_prompt_trace(
-                        &prompt_sections, skill_injections, memory_injections,
+                    let breakdown = prompts::build_system_prompt_trace_with_context_signals(
+                        &prompt_sections,
+                        skill_injections,
+                        memory_injections,
+                        crate::turn::context_assembly_trace::PromptContextSignals {
+                            active_output_skills: !active_skill_names.is_empty(),
+                            learned_runtime_context: !learned_context_text.is_empty(),
+                            memory_signal_detected: !memory_signal_hint.is_empty(),
+                            self_awareness: !self_awareness_hint.is_empty(),
+                            implicit_feedback: !implicit_feedback_hint.is_empty(),
+                            learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                            session_anchor: !session_anchor.is_empty(),
+                            ..Default::default()
+                        },
                     );
                     yield render_sse(&json!({
                         "type": "context_meta",
@@ -1186,6 +1200,7 @@ impl InProcessChatTurnBridge {
                             "base_persona_tokens": breakdown.base_persona_tokens,
                             "environment_tokens": breakdown.environment_tokens,
                             "user_preferences_tokens": breakdown.user_preferences_tokens,
+                            "context_signals": breakdown.context_signals,
                             "guidance_signals": breakdown.guidance_signals,
                             "skills_injected": breakdown.skills_injected,
                             "repository_memories": breakdown.repository_memories,
