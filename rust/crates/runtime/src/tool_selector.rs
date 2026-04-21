@@ -828,7 +828,7 @@ fn build_catalog_summary() -> String {
 const TOOL_SELECT_SYSTEM: &str = "\
 You are a tool selector. Given the user's query and context, decide which tools are needed.
 Return ONLY a JSON array of tool names. Select 1-5 items total. Do not explain.
-Pinned tools (bash, read_file, write_file, str_replace, list_dir, grep, glob) are always available — do NOT include them.
+Pinned tools (bash, read_file, str_replace, memory_store) are always available — do NOT include them.
 Only select from the dynamic tools listed below. The list is executable registry tools only — never output Agent Skill names (skills use the separate `skill` tool in the main agent loop).";
 
 fn build_tool_select_prompt(
@@ -3720,6 +3720,29 @@ mod tests {
         assert!(
             result.tool_names.contains(&"str_replace".to_string()),
             "file edit query should include str_replace (pinned): {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_select_new_file_query_includes_write_file() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx = SelectionContext {
+            query: "create a new file called main.rs",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 300,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            previous_confidence_fallback: None,
+        };
+        let result = selector.select(&ctx).await;
+        assert!(
+            result.tool_names.contains(&"write_file".to_string()),
+            "new-file query should still include write_file after unpinning: {:?}",
             result.tool_names
         );
     }

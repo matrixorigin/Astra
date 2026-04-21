@@ -9895,6 +9895,158 @@ async fn golden_session_continuity() {
     assert_eq!(core.len(), 2, "2 rounds persisted");
 }
 
+/// Golden: attachment-style low-information follow-up stays scoped across `/chat/turn`.
+#[tokio::test]
+async fn golden_low_information_followup_attachment_repairs_in_scope() {
+    init_env();
+    let cap = AllCaptures::default();
+    let app = build_test_app(cap.clone());
+
+    let sid = "golden-followup-attachment-sess";
+    let review_one = "## Review: `f49aa28b`\nIndentation issue and unnecessary JSON round-trip.";
+    let review_two = "## Review: `aa1f419b` — P5 git timeout, P6 compression protection\nTwo independent fixes in one commit. Let me review each.\nP5 still has a thread leak on timeout; terminate the child before returning.";
+    let attachment = "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
+Latest assistant summary:\n\
+## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
+Two independent fixes in one commit. Let me review each.\n\
+P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
+[User follow-up]\n修复?";
+
+    let (st1, _) = chat_turn(
+        &app,
+        json!({
+            "session_id": sid,
+            "messages": [{ "role": "user", "content": "review f49aa28beedb75c838db442950b7076e590008ad" }],
+            "edge_tools": [],
+            "round_index": 0,
+            "test_llm_rounds": [{ "full_text": review_one }]
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+
+    let (st2, _) = chat_turn(
+        &app,
+        json!({
+            "session_id": sid,
+            "messages": [
+                { "role": "user", "content": "review f49aa28beedb75c838db442950b7076e590008ad" },
+                { "role": "assistant", "content": review_one },
+                { "role": "user", "content": "review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b" }
+            ],
+            "edge_tools": [],
+            "round_index": 1,
+            "test_llm_rounds": [{ "full_text": review_two }]
+        }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+
+    let (st3, raw3) = chat_turn(
+        &app,
+        json!({
+            "session_id": sid,
+            "messages": [
+                { "role": "user", "content": "review f49aa28beedb75c838db442950b7076e590008ad" },
+                { "role": "assistant", "content": review_one },
+                { "role": "user", "content": "review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b" },
+                { "role": "assistant", "content": review_two },
+                { "role": "user", "content": attachment }
+            ],
+            "edge_tools": [tool_schema("str_replace")],
+            "round_index": 2,
+            "test_llm_rounds": [{
+                "tool_calls": [tool_call("tc-followup-fix", "str_replace", json!({"path": "rust/crates/astra-tools/src/git_gix.rs"}))]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+    let ev3 = parse_sse_events(&raw3);
+    assert_eq!(
+        events_of_type(&ev3, "turn_complete")[0]["has_tool_calls"].as_bool(),
+        Some(true)
+    );
+
+    let (st4, raw4) = chat_turn(
+        &app,
+        json!({
+            "session_id": sid,
+            "messages": [
+                { "role": "user", "content": "review f49aa28beedb75c838db442950b7076e590008ad" },
+                { "role": "assistant", "content": review_one },
+                { "role": "user", "content": "review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b" },
+                { "role": "assistant", "content": review_two },
+                { "role": "user", "content": attachment },
+                { "role": "assistant", "content": "", "tool_calls": [
+                    tool_call("tc-followup-fix", "str_replace", json!({"path": "rust/crates/astra-tools/src/git_gix.rs"}))
+                ]},
+                { "role": "tool", "tool_call_id": "tc-followup-fix", "content": "updated helper" }
+            ],
+            "edge_tools": [tool_schema("str_replace")],
+            "tool_results": [{ "tool_call_id": "tc-followup-fix", "content": "updated helper" }],
+            "round_index": 3,
+            "test_llm_rounds": [{
+                "full_text": "Patched the timeout path in scope."
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(st4, StatusCode::OK);
+    let ev4 = parse_sse_events(&raw4);
+    let full_text: String = events_of_type(&ev4, "text_delta")
+        .iter()
+        .filter_map(|e| e.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(full_text.contains("Patched the timeout path in scope."));
+
+    cap.wait_persist_idle().await;
+
+    let core = cap.core_plans.lock().await;
+    assert_eq!(core.len(), 4, "all four bridge turns should persist");
+    let followup_plan = &core[2];
+    let user_query = followup_plan
+        .user_query_event
+        .as_ref()
+        .expect("follow-up user query should persist");
+    assert!(user_query.content.contains("[Active task attachment]"));
+    assert!(
+        user_query
+            .content
+            .contains("aa1f419bc040003f5de8cdfa6b414225ade82e2b")
+    );
+    assert!(user_query.content.contains("[User follow-up]\n修复?"));
+
+    let continuation_plan = &core[3];
+    assert!(
+        continuation_plan.user_query_event.is_none(),
+        "continuation call should not duplicate user_query persistence"
+    );
+    assert!(
+        continuation_plan
+            .llm_response_event
+            .as_ref()
+            .is_some_and(|event| event.content.contains("Patched the timeout path in scope."))
+    );
+
+    let tools = cap.tool_plans.lock().await;
+    let tool_names: Vec<_> = tools
+        .iter()
+        .flat_map(|plan| plan.events.iter())
+        .filter_map(|event| event.metadata.as_ref())
+        .filter_map(|meta| meta.get("tool_name"))
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        tool_names.iter().any(|name| *name == "str_replace"),
+        "expected persisted str_replace tool event"
+    );
+}
+
 /// Golden: Error tool result — LLM recovers gracefully.
 #[tokio::test]
 async fn golden_error_recovery_tool_result() {

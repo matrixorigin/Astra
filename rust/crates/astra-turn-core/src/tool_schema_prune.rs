@@ -12,7 +12,7 @@ use crate::tool_registry_report::SelectionReport;
 /// - `CompactHistory` tier: truncate descriptions + strip property descriptions
 /// - `AggressivePrune` tier: truncate + remove optional parameters
 pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
-    match tier {
+    let pruned = match tier {
         CompactionTier::Normal => tools.to_vec(),
         CompactionTier::TrimSchemas => tools
             .iter()
@@ -59,7 +59,8 @@ pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
                 t
             })
             .collect(),
-    }
+    };
+    pruned.into_iter().map(compact_always_on_schema).collect()
 }
 
 /// Drop OpenAI-style tool definitions whose `function.name` is in `excluded` (e.g. stall-restricted tools).
@@ -140,6 +141,38 @@ fn strip_property_descriptions(func: &mut Value) {
             }
         }
     }
+}
+
+fn compact_always_on_schema(mut tool: Value) -> Value {
+    if schema_tool_name(&tool) != Some("memory_store") {
+        return tool;
+    }
+
+    if let Some(func) = tool.get_mut("function") {
+        if let Some(obj) = func.as_object_mut() {
+            obj.insert(
+                "description".to_string(),
+                json!("Store durable user memory for future turns/sessions."),
+            );
+        }
+
+        if let Some(props) = func
+            .get_mut("parameters")
+            .and_then(|p| p.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        {
+            props.remove("trust_tier");
+            props.remove("session_id");
+
+            for key in ["content", "memory_type"] {
+                if let Some(prop) = props.get_mut(key).and_then(Value::as_object_mut) {
+                    prop.remove("description");
+                }
+            }
+        }
+    }
+
+    tool
 }
 
 /// Extract the function name from a tool schema `{"function":{"name":"…"}}`.
@@ -257,6 +290,45 @@ mod tests {
             result[0]["function"]["parameters"]["properties"]
                 .get("timeout")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn prune_normal_tier_compacts_memory_store_baseline() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "memory_store",
+                "description": "Store a new memory. Use when user shares a fact, preference, decision, or anything worth remembering for future sessions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "Memory content to store"},
+                        "memory_type": {"type": "string", "description": "Type: semantic (default), profile, procedural, working"},
+                        "trust_tier": {"type": "string", "description": "Confidence tier"},
+                        "session_id": {"type": "string", "description": "Session ID for grouping"}
+                    },
+                    "required": ["content"]
+                }
+            }
+        })];
+
+        let result = prune_tool_schemas(&tools, CompactionTier::Normal);
+        let func = &result[0]["function"];
+        assert_eq!(
+            func["description"].as_str(),
+            Some("Store durable user memory for future turns/sessions.")
+        );
+        let props = func["parameters"]["properties"]
+            .as_object()
+            .expect("memory_store properties");
+        assert!(props.contains_key("content"));
+        assert!(props.contains_key("memory_type"));
+        assert!(!props.contains_key("trust_tier"));
+        assert!(!props.contains_key("session_id"));
+        assert!(
+            props["content"].get("description").is_none(),
+            "content description should be stripped"
         );
     }
 

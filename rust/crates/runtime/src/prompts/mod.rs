@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn memory_rules_include_negative_examples() {
-        let p = build_main_system_prompt(&["memory_store"], "", 1.0, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
         assert!(
             p.contains("SKIP:"),
             "should have negative guidance (SKIP list)"

@@ -190,10 +190,40 @@ fn self_model_section(tool_names: &[&str]) -> String {
     format!("\n## Self-Model\nTools: {}\n", tool_names.join(", "))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryPromptMode {
+    None,
+    Minimal,
+    Full,
+}
+
+fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMode {
+    let has_memory_store = tool_names.contains(&"memory_store");
+    let has_memory_ops = tool_names.iter().any(|name| {
+        matches!(
+            *name,
+            "memory_search" | "memory_correct" | "memory_purge" | "memory_profile"
+        )
+    });
+    let has_user_memories = profile_desc.contains("## User Memories");
+
+    if !has_memory_store && !has_memory_ops {
+        MemoryPromptMode::None
+    } else if has_memory_ops || has_user_memories {
+        MemoryPromptMode::Full
+    } else {
+        MemoryPromptMode::Minimal
+    }
+}
+
 /// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
 /// Session-scoped — depends on which tools are selected.
-fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> String {
-    let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
+fn tool_conditional_section(
+    tool_names: &[&str],
+    profile_desc: &str,
+    selection_confidence: f64,
+) -> String {
+    let memory_mode = memory_prompt_mode(tool_names, profile_desc);
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
     let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
     let has_spawn_agent = tool_names.contains(&"spawn_agent");
@@ -337,15 +367,18 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
             );
         }
     }
-    if has_memory {
+    if memory_mode != MemoryPromptMode::None {
         s.push_str(
             "\n## Memory Rules (check BEFORE reasoning about tools)\n\
              ### Triggers: 关注|跟踪|留意|记住|感兴趣|follow|watch|track|interested|prefer|remember\n\
              When user expresses tracking, interest, or preference → call memory_store IMMEDIATELY.\n\
-             Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
-             Example: \"我关注matrixorigin\" → store \"[@pref/active] user follows matrixorigin\"\n\
              - Do NOT ask whether to store — just store, then confirm.\n\
-             - Do NOT explore codebase for interest expressions.\n\
+             - Do NOT explore codebase for interest expressions.\n",
+        );
+        if memory_mode == MemoryPromptMode::Full {
+            s.push_str(
+                "             Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
+             Example: \"我关注matrixorigin\" → store \"[@pref/active] user follows matrixorigin\"\n\
              - '## User Memories' (when present) = user context — check it BEFORE calling any tool.\n\
              - If User Memories has a repo mapping, USE that exact repo.\n\
              ### What to STORE: preferences, conventions, decisions, tracking interests.\n\
@@ -353,10 +386,11 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
              ### Deduplication: before storing, consider if similar memory already exists. Use memory_correct to update instead of creating duplicates.\n\
              ### Negative preferences: \"不喜欢\", \"别用\", \"don't want\", \"stop using\" → store as [@pref/negative]. Respect in future tool/approach selection.\n\
              ### Staleness: if a stored memory seems outdated (e.g., old repo URL, changed preference), correct it with memory_correct rather than storing a new one.\n",
-        );
-        s.push_str(
-            "         - **Memory precedence**: check '## User Memories' → search → store/correct\n",
-        );
+            );
+            s.push_str(
+                "         - **Memory precedence**: check '## User Memories' → search → store/correct\n",
+            );
+        }
     }
     if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
         s.push_str(
@@ -647,7 +681,7 @@ pub fn build_system_prompt_sections_with_style(
         scope: CacheScope::Session,
     });
 
-    let tool_cond = tool_conditional_section(tool_names, selection_confidence);
+    let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
         sections.push(PromptSection {
             text: tool_cond,
@@ -1390,6 +1424,16 @@ mod tests {
     }
 
     #[test]
+    fn prompt_memory_store_only_uses_minimal_rules() {
+        let p = build_main_system_prompt(&["memory_store"], "", 0.5, None);
+        assert!(p.contains("Memory Rules"));
+        assert!(p.contains("memory_store IMMEDIATELY"));
+        assert!(!p.contains("Deduplication"));
+        assert!(!p.contains("Negative preferences"));
+        assert!(!p.contains("Memory precedence"));
+    }
+
+    #[test]
     fn prompt_no_memory_rules_without_memory_tools() {
         let p = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
         assert!(!p.contains("Memory Rules"));
@@ -1715,6 +1759,18 @@ mod tests {
         assert!(p.contains("Negative preferences"));
         assert!(p.contains("不喜欢"));
         assert!(p.contains("Staleness"));
+    }
+
+    #[test]
+    fn prompt_user_memories_upgrade_memory_rules_to_full() {
+        let p = build_main_system_prompt(
+            &["memory_store"],
+            "\n## User Memories\nprefers Rust\n",
+            0.5,
+            None,
+        );
+        assert!(p.contains("Deduplication"));
+        assert!(p.contains("Memory precedence"));
     }
 
     // ── Task type count invariant ──

@@ -4,7 +4,11 @@ use crate::pipeline::routing::DomainHint;
 use crate::tool_registry::ToolRegistry;
 use crate::tool_selector::SelectionContext;
 
-/// `follow_up_tool_round`: first user turn vs mid-loop (`tool_results` non-empty) — doubles schema budget.
+/// `_follow_up_tool_round`: first user turn vs mid-loop (`tool_results` non-empty).
+///
+/// Follow-up rounds no longer widen the schema budget automatically: invoked tools
+/// are re-pinned separately, so doubling the selector budget just bloats exposed
+/// schemas without improving continuation quality.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn build_agentic_tool_selection_context<'a>(
@@ -17,7 +21,7 @@ pub fn build_agentic_tool_selection_context<'a>(
     memory_domain_hints: Vec<DomainHint>,
     restricted_tools: Vec<String>,
     file_context: Vec<String>,
-    follow_up_tool_round: bool,
+    _follow_up_tool_round: bool,
     tool_budget_override: Option<u32>,
     previous_confidence_fallback: Option<crate::turn::confidence_contract::ConfidenceFallback>,
 ) -> SelectionContext<'a> {
@@ -25,7 +29,7 @@ pub fn build_agentic_tool_selection_context<'a>(
     let base = tool_budget_override
         .filter(|&b| b > 0)
         .unwrap_or_else(|| registry.default_budget());
-    let budget_tokens = if follow_up_tool_round { base * 2 } else { base };
+    let budget_tokens = base;
     SelectionContext {
         query,
         turn_count,
@@ -46,7 +50,7 @@ mod tests {
     use crate::tool_registry::ToolRegistry;
 
     #[test]
-    fn follow_up_doubles_budget_token_field() {
+    fn follow_up_keeps_same_budget_token_field() {
         let reg = ToolRegistry::new(vec![]);
         let ctx_a = build_agentic_tool_selection_context(
             "hi",
@@ -76,7 +80,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(ctx_b.budget_tokens, ctx_a.budget_tokens * 2);
+        assert_eq!(ctx_b.budget_tokens, ctx_a.budget_tokens);
         assert_eq!(ctx_a.turn_count, 1);
     }
 
@@ -136,7 +140,7 @@ mod tests {
         );
         assert_eq!(ctx_zero.budget_tokens, default_budget);
 
-        // Follow-up round doubles the override
+        // Follow-up round keeps the same override budget
         let ctx_followup = build_agentic_tool_selection_context(
             "hi",
             0,
@@ -151,6 +155,6 @@ mod tests {
             Some(1200),
             None,
         );
-        assert_eq!(ctx_followup.budget_tokens, 2400);
+        assert_eq!(ctx_followup.budget_tokens, 1200);
     }
 }

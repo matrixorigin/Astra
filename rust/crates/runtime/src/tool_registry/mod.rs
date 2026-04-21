@@ -72,12 +72,12 @@ mod tests {
 
     #[test]
     fn catalog_has_8_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 8);
+        assert_eq!(ToolRegistry::pinned_count(), 4);
     }
 
     #[test]
     fn catalog_has_35_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 35);
+        assert_eq!(ToolRegistry::dynamic_count(), 39);
     }
 
     #[test]
@@ -89,12 +89,12 @@ mod tests {
             .collect();
         assert!(pinned.contains(&"bash"));
         assert!(pinned.contains(&"read_file"));
-        assert!(pinned.contains(&"write_file"));
         assert!(pinned.contains(&"str_replace"));
-        assert!(pinned.contains(&"list_dir"));
-        assert!(pinned.contains(&"grep"));
-        assert!(pinned.contains(&"glob"));
         assert!(pinned.contains(&"memory_store"));
+        assert!(!pinned.contains(&"write_file"));
+        assert!(!pinned.contains(&"list_dir"));
+        assert!(!pinned.contains(&"grep"));
+        assert!(!pinned.contains(&"glob"));
         // memory_search is dynamic — selected only when query involves recall
         assert!(!pinned.contains(&"memory_search"));
     }
