@@ -6594,6 +6594,41 @@ print(json.dumps({'context': 'user said: ' + msg}))
             rendered.contains("widened for next turn"),
             "expected widen signal in self-awareness section, got: {rendered}"
         );
+        // P3.1: structured skill-diff carries before/after snapshots, is
+        // published on StrategyApplication, and is surfaced verbatim in the
+        // self-awareness section so the agent can audit its own tuning.
+        let diff = applied
+            .diff_entry
+            .as_ref()
+            .expect("expected SkillDiffEntry populated after non-noop apply");
+        assert_eq!(diff.skill, "pipeline.tool_selection");
+        assert_eq!(diff.reason, "auto-reflection");
+        assert!(
+            !diff
+                .before
+                .blocked_tools
+                .contains(&"flaky_http".to_string()),
+            "before snapshot must predate the block, got: {:?}",
+            diff.before.blocked_tools
+        );
+        assert!(
+            diff.after.blocked_tools.contains(&"flaky_http".to_string()),
+            "after snapshot must contain the newly-blocked tool, got: {:?}",
+            diff.after.blocked_tools
+        );
+        assert!(!diff.before.widen_pending && diff.after.widen_pending);
+        assert!(
+            rendered.contains("Strategy diff:"),
+            "expected `Strategy diff:` line, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("flaky_http"),
+            "expected blocked tool name in strategy diff, got: {rendered}"
+        );
+        assert!(
+            self_model.skill_diff.is_some(),
+            "expected SelfModel.skill_diff populated from applied.diff_entry"
+        );
     }
 
     #[tokio::test]

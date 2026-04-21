@@ -115,6 +115,79 @@ pub struct StrategyApplication {
     pub newly_boosted: Vec<String>,
     /// Tools already present in `state.boosted_tools`.
     pub already_boosted: Vec<String>,
+    /// Optional rich before/after snapshot of the affected skill surfaces.
+    /// `None` on noop; populated when the application produced at least one
+    /// newly-boosted/blocked entry or toggled widen_selection. P3.1.
+    pub diff_entry: Option<SkillDiffEntry>,
+}
+
+/// P3.1: a before/after snapshot of a "skill" surface that a strategy-delta
+/// application materially changed. Lightweight, stable-ordered, JSON-ready.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkillDiffEntry {
+    /// Logical subsystem whose configuration changed. Current only value is
+    /// `"pipeline.tool_selection"` but kept as `String` for forward-compat.
+    pub skill: String,
+    pub before: DiffSnapshot,
+    pub after: DiffSnapshot,
+    /// Human-readable reason for the change (e.g. `"auto-reflection"`).
+    pub reason: String,
+}
+
+/// Stable, sorted view of the three surfaces a strategy-delta can mutate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiffSnapshot {
+    pub blocked_tools: Vec<String>,
+    pub boosted_tools: Vec<String>,
+    pub widen_pending: bool,
+}
+
+impl DiffSnapshot {
+    fn from_state(state: &AgenticLoopState) -> Self {
+        let mut blocked: Vec<String> = state.restricted_tools.iter().cloned().collect();
+        blocked.sort();
+        let mut boosted: Vec<String> = state.boosted_tools.iter().cloned().collect();
+        boosted.sort();
+        Self {
+            blocked_tools: blocked,
+            boosted_tools: boosted,
+            widen_pending: state.widen_selection_pending,
+        }
+    }
+}
+
+impl SkillDiffEntry {
+    /// Compact single-line rendering for prompts and slash views.
+    pub fn summary_line(&self) -> String {
+        let mut parts = Vec::new();
+        let added_blocked: Vec<&String> = self
+            .after
+            .blocked_tools
+            .iter()
+            .filter(|t| !self.before.blocked_tools.contains(t))
+            .collect();
+        if !added_blocked.is_empty() {
+            parts.push(format!("+blocked={added_blocked:?}"));
+        }
+        let added_boosted: Vec<&String> = self
+            .after
+            .boosted_tools
+            .iter()
+            .filter(|t| !self.before.boosted_tools.contains(t))
+            .collect();
+        if !added_boosted.is_empty() {
+            parts.push(format!("+boosted={added_boosted:?}"));
+        }
+        if !self.before.widen_pending && self.after.widen_pending {
+            parts.push("+widen".to_string());
+        }
+        let change = if parts.is_empty() {
+            "noop".to_string()
+        } else {
+            parts.join(" ")
+        };
+        format!("{} ({}) — {}", self.skill, self.reason, change)
+    }
 }
 
 impl StrategyApplication {
@@ -163,6 +236,17 @@ pub fn apply_strategy_delta(
     state: &mut AgenticLoopState,
     strategy: &StrategyDelta,
 ) -> StrategyApplication {
+    apply_strategy_delta_with_reason(state, strategy, "auto-reflection")
+}
+
+/// Variant that records a [`SkillDiffEntry`] with a caller-supplied `reason`
+/// so the rendered diff sentence is self-explanatory.
+pub fn apply_strategy_delta_with_reason(
+    state: &mut AgenticLoopState,
+    strategy: &StrategyDelta,
+    reason: &str,
+) -> StrategyApplication {
+    let before = DiffSnapshot::from_state(state);
     let mut app = StrategyApplication {
         widen_requested: strategy.widen_selection,
         ..Default::default()
@@ -188,6 +272,15 @@ pub fn apply_strategy_delta(
     app.already_blocked.sort();
     app.newly_boosted.sort();
     app.already_boosted.sort();
+    let after = DiffSnapshot::from_state(state);
+    if !app.is_noop() {
+        app.diff_entry = Some(SkillDiffEntry {
+            skill: "pipeline.tool_selection".to_string(),
+            before,
+            after,
+            reason: reason.to_string(),
+        });
+    }
     app
 }
 
@@ -274,6 +367,7 @@ mod tests {
             widen_requested: true,
             newly_boosted: vec!["grep".to_string(), "read".to_string()],
             already_boosted: vec!["ls".to_string()],
+            diff_entry: None,
         };
         assert!(!app.is_noop());
         let s = app.summary();
@@ -285,5 +379,40 @@ mod tests {
         let noop = StrategyApplication::default();
         assert!(noop.is_noop());
         assert_eq!(noop.summary(), "noop");
+    }
+
+    #[test]
+    fn skill_diff_entry_summary_line_renders_additions() {
+        let entry = SkillDiffEntry {
+            skill: "pipeline.tool_selection".to_string(),
+            before: DiffSnapshot {
+                blocked_tools: vec!["old".to_string()],
+                boosted_tools: vec![],
+                widen_pending: false,
+            },
+            after: DiffSnapshot {
+                blocked_tools: vec!["flaky_http".to_string(), "old".to_string()],
+                boosted_tools: vec!["grep".to_string()],
+                widen_pending: true,
+            },
+            reason: "auto-reflection".to_string(),
+        };
+        let line = entry.summary_line();
+        assert!(line.contains("pipeline.tool_selection"), "line: {line}");
+        assert!(line.contains("auto-reflection"), "line: {line}");
+        assert!(line.contains("+blocked=[\"flaky_http\"]"), "line: {line}");
+        assert!(line.contains("+boosted=[\"grep\"]"), "line: {line}");
+        assert!(line.contains("+widen"), "line: {line}");
+    }
+
+    #[test]
+    fn skill_diff_entry_summary_line_noop_is_marked() {
+        let entry = SkillDiffEntry {
+            skill: "pipeline.tool_selection".to_string(),
+            before: DiffSnapshot::default(),
+            after: DiffSnapshot::default(),
+            reason: "auto-reflection".to_string(),
+        };
+        assert!(entry.summary_line().contains("noop"));
     }
 }

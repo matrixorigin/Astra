@@ -48,6 +48,10 @@ pub struct SelfModel {
     /// at snapshot time — keeps legacy tests / constructors unchanged.
     #[serde(default)]
     pub guardrail: Option<GuardrailView>,
+    /// P3.1: most recent applied strategy-delta rendered as a structured
+    /// before/after diff. `None` when the last reflection was a noop.
+    #[serde(default)]
+    pub skill_diff: Option<crate::turn::agentic_stage_bridge::SkillDiffEntry>,
 }
 
 /// Compact view of the guardrail auto-tuner, surfaced to the agent via
@@ -396,12 +400,23 @@ impl SelfModel {
             recent_signals: signal_summaries,
             constraints: ConstraintSet::default(),
             guardrail: None,
+            skill_diff: last_strategy.and_then(|app| app.diff_entry.clone()),
         }
     }
 
     /// Attach a guardrail view (called by edge_tools after `snapshot_with_strategy`).
     pub fn with_guardrail(mut self, g: GuardrailView) -> Self {
         self.guardrail = Some(g);
+        self
+    }
+
+    /// Attach an explicit skill-diff entry. Useful for tests and for callers
+    /// that want to inject a diff independently of `last_strategy`.
+    pub fn with_skill_diff(
+        mut self,
+        diff: crate::turn::agentic_stage_bridge::SkillDiffEntry,
+    ) -> Self {
+        self.skill_diff = Some(diff);
         self
     }
 }
@@ -520,6 +535,11 @@ impl SelfModel {
             s.push_str(
                 "Tool selection: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
             );
+        }
+        // P3.1: surface the structured before/after diff of the most recent
+        // strategy-delta application so the agent can audit its own tuning.
+        if let Some(diff) = &self.skill_diff {
+            let _ = writeln!(s, "Strategy diff: {}", diff.summary_line());
         }
 
         // ── Guardrail auto-tuning state (rolling stats → bounded Δ) ──
@@ -1127,6 +1147,7 @@ mod tests {
             widen_requested: true,
             newly_boosted: vec!["read_file".into(), "grep".into()],
             already_boosted: vec!["bash".into()],
+            diff_entry: None,
         };
         let model = SelfModel::snapshot_with_strategy(
             &["bash", "read_file", "grep"],
@@ -1164,6 +1185,48 @@ mod tests {
             rendered.contains("widened for next turn"),
             "got: {rendered}"
         );
+    }
+
+    #[test]
+    fn snapshot_with_skill_diff_renders_strategy_diff_line() {
+        use crate::turn::agentic_stage_bridge::{DiffSnapshot, SkillDiffEntry};
+        let config = RuntimeConfig::default();
+        let diff = SkillDiffEntry {
+            skill: "pipeline.tool_selection".to_string(),
+            before: DiffSnapshot::default(),
+            after: DiffSnapshot {
+                blocked_tools: vec!["flaky_http".to_string()],
+                boosted_tools: vec![],
+                widen_pending: true,
+            },
+            reason: "auto-reflection".to_string(),
+        };
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            1,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_skill_diff(diff);
+        let rendered = model.to_system_prompt_section();
+        assert!(rendered.contains("Strategy diff:"), "got: {rendered}");
+        assert!(rendered.contains("flaky_http"), "got: {rendered}");
+        assert!(rendered.contains("+widen"), "got: {rendered}");
     }
 
     #[test]
