@@ -725,6 +725,61 @@ struct MockToolScenario {
     expected_query_fragments: Vec<&'static str>,
 }
 
+async fn execute_mock_tool_turn(
+    app: &Router,
+    payload: Value,
+    case_name: &str,
+    steps: &[MockToolScenarioStep],
+    final_text: &str,
+) -> Vec<Value> {
+    let resp = chat_stream_start(app, payload).await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    for step in steps {
+        if step.requires_approval {
+            let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
+            assert_eq!(
+                approval["request_id"].as_str(),
+                Some(step.request_id),
+                "{}: approval should match {}",
+                case_name,
+                step.request_id
+            );
+            let status = post_approval_respond(app, step.request_id, "allow").await;
+            assert_eq!(status, StatusCode::OK, "{}: approval accepted", case_name);
+        }
+
+        let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+        assert_eq!(
+            request["request_id"].as_str(),
+            Some(step.request_id),
+            "{}: tool_request should match {}",
+            case_name,
+            step.request_id
+        );
+        let status = post_tool_result(app, step.request_id, step.result_output, "success").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}: tool result accepted",
+            case_name
+        );
+    }
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+    assert!(
+        find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some(final_text)),
+        "{}: expected final text",
+        case_name
+    );
+    events
+}
+
 async fn run_mock_tool_scenario(case: MockToolScenario) {
     let (app, hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
     let edge_tools: Vec<Value> = case
@@ -787,7 +842,7 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
         .map(|step| tool_call(step.request_id, step.tool_name, step.args.clone()))
         .collect();
 
-    let resp = chat_stream_start(
+    let _events = execute_mock_tool_turn(
         &app,
         json!({
             "message": &case.message,
@@ -799,52 +854,11 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
                 "edge_tools": edge_tools
             }
         }),
+        case.name,
+        &case.steps,
+        case.final_text,
     )
     .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    for step in &case.steps {
-        if step.requires_approval {
-            let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
-            assert_eq!(
-                approval["request_id"].as_str(),
-                Some(step.request_id),
-                "{}: approval should match {}",
-                case.name,
-                step.request_id
-            );
-            let status = post_approval_respond(&app, step.request_id, "allow").await;
-            assert_eq!(status, StatusCode::OK, "{}: approval accepted", case.name);
-        }
-
-        let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-        assert_eq!(
-            request["request_id"].as_str(),
-            Some(step.request_id),
-            "{}: tool_request should match {}",
-            case.name,
-            step.request_id
-        );
-        let status = post_tool_result(&app, step.request_id, step.result_output, "success").await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}: tool result accepted",
-            case.name
-        );
-    }
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(
-        find_events(&events, "text_delta")
-            .iter()
-            .any(|event| event["content"].as_str() == Some(case.final_text)),
-        "{}: expected final text",
-        case.name
-    );
 
     let hw = hook_writer.clone();
     poll_until(
@@ -3936,6 +3950,151 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
     for case in cases {
         run_mock_tool_scenario(case).await;
     }
+}
+
+#[tokio::test]
+async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
+    let (app, hook_writer, observer_worker, tool_writer) = build_test_app_with_hooks();
+    let sid = format!("memory-state-{}", uuid::Uuid::new_v4());
+
+    let store_events = execute_mock_tool_turn(
+        &app,
+        json!({
+            "session_id": &sid,
+            "message": "记住我喜欢 Rust",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call(
+                            "tc-memory-store",
+                            "memory_store",
+                            json!({"content": "User likes Rust"})
+                        )]
+                    },
+                    { "full_text": "我记住了你的偏好。" }
+                ],
+                "edge_tools": [tool_schema("memory_store")]
+            }
+        }),
+        "memory_store_turn",
+        &[MockToolScenarioStep {
+            request_id: "tc-memory-store",
+            tool_name: "memory_store",
+            args: json!({"content": "User likes Rust"}),
+            result_output: "memory stored",
+            requires_approval: false,
+        }],
+        "我记住了你的偏好。",
+    )
+    .await;
+    assert_eq!(
+        find_event(&store_events, "session_info").and_then(|event| event["session_id"].as_str()),
+        Some(sid.as_str())
+    );
+
+    let search_events = execute_mock_tool_turn(
+        &app,
+        json!({
+            "session_id": &sid,
+            "message": "我刚才让你记住了什么?",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call(
+                            "tc-memory-search",
+                            "memory_search",
+                            json!({"query": "latest remembered preference"})
+                        )]
+                    },
+                    { "full_text": "你刚才让我记住你喜欢 Rust。" }
+                ],
+                "edge_tools": [tool_schema("memory_search")]
+            }
+        }),
+        "memory_search_turn",
+        &[MockToolScenarioStep {
+            request_id: "tc-memory-search",
+            tool_name: "memory_search",
+            args: json!({"query": "latest remembered preference"}),
+            result_output: "User likes Rust",
+            requires_approval: false,
+        }],
+        "你刚才让我记住你喜欢 Rust。",
+    )
+    .await;
+    assert_eq!(
+        find_event(&search_events, "session_info").and_then(|event| event["session_id"].as_str()),
+        Some(sid.as_str())
+    );
+
+    let hw = hook_writer.clone();
+    let ow = observer_worker.clone();
+    let tw = tool_writer.clone();
+    poll_until(
+        move || {
+            let hw = hw.clone();
+            let ow = ow.clone();
+            let tw = tw.clone();
+            async move {
+                hw.plans.lock().await.len() >= 2
+                    && ow.requests.lock().await.len() >= 2
+                    && tw.plans.lock().await.len() >= 2
+            }
+        },
+        5,
+    )
+    .await;
+
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(requests.len(), 2, "expected one observer call per turn");
+    assert_eq!(requests[0].session_id, sid);
+    assert_eq!(requests[1].session_id, sid);
+    assert!(requests[0].turn_count >= 1);
+    assert!(requests[1].turn_count >= requests[0].turn_count);
+    drop(requests);
+
+    let hook_plans = hook_writer.plans.lock().await;
+    assert_eq!(hook_plans.len(), 2, "expected one hook persist per turn");
+    let store_skill = hook_plans[0]
+        .skill_selection
+        .as_ref()
+        .expect("store turn skill selection");
+    assert!(
+        store_skill
+            .selected_skills
+            .contains(&"memory_store".to_string())
+    );
+    assert!(store_skill.user_query.contains("记住我喜欢 Rust"));
+    let search_skill = hook_plans[1]
+        .skill_selection
+        .as_ref()
+        .expect("search turn skill selection");
+    assert!(
+        search_skill
+            .selected_skills
+            .contains(&"memory_search".to_string())
+    );
+    assert!(search_skill.user_query.contains("我刚才让你记住了什么?"));
+    drop(hook_plans);
+
+    let tool_plans = tool_writer.plans.lock().await;
+    assert_eq!(
+        tool_plans.len(),
+        2,
+        "expected one tool-event persist per turn"
+    );
+    let first_tool_name = tool_plans[0].events[0]
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("tool_name"))
+        .and_then(Value::as_str);
+    assert_eq!(first_tool_name, Some("memory_store"));
+    let second_tool_name = tool_plans[1].events[0]
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("tool_name"))
+        .and_then(Value::as_str);
+    assert_eq!(second_tool_name, Some("memory_search"));
 }
 
 #[tokio::test]

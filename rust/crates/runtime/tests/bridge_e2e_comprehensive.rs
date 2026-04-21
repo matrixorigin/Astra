@@ -696,6 +696,46 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
             expect_user_query_event: true,
             expected_skill_selection: vec!["str_replace"],
         },
+        BridgeTurnScenario {
+            name: "memory_store_tool_selection",
+            payload: json!({
+                "agent_id": "matrix-memory-store",
+                "messages": [{ "role": "user", "content": "记住我喜欢 Rust" }],
+                "edge_tools": [tool_schema("memory_store"), tool_schema("memory_search")],
+                "explain": true,
+                "test_llm_rounds": [{
+                    "tool_calls": [tool_call("tc-matrix-memory-store", "memory_store", json!({"content": "User likes Rust"}))],
+                    "usage": { "prompt": 650, "completion": 35, "total": 685 }
+                }]
+            }),
+            expected_text: None,
+            expect_explain: true,
+            expected_tools_available_min: Some(2),
+            expected_tools_selected_min: Some(1),
+            expected_tool_event_names: vec!["memory_store"],
+            expect_user_query_event: true,
+            expected_skill_selection: vec!["memory_store"],
+        },
+        BridgeTurnScenario {
+            name: "memory_search_tool_selection",
+            payload: json!({
+                "agent_id": "matrix-memory-search",
+                "messages": [{ "role": "user", "content": "我之前说过我喜欢什么语言?" }],
+                "edge_tools": [tool_schema("memory_store"), tool_schema("memory_search")],
+                "explain": true,
+                "test_llm_rounds": [{
+                    "tool_calls": [tool_call("tc-matrix-memory-search", "memory_search", json!({"query": "preferred language"}))],
+                    "usage": { "prompt": 640, "completion": 35, "total": 675 }
+                }]
+            }),
+            expected_text: None,
+            expect_explain: true,
+            expected_tools_available_min: Some(2),
+            expected_tools_selected_min: Some(1),
+            expected_tool_event_names: vec!["memory_search"],
+            expect_user_query_event: true,
+            expected_skill_selection: vec!["memory_search"],
+        },
     ];
 
     for case in cases {
