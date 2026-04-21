@@ -890,19 +890,15 @@ impl InProcessChatTurnBridge {
 
             // ── Round budget directive: encourage synthesis after several rounds ──
             let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
-            let round_budget_hint = prompts::round_budget_directive_with(
+            let tool_round_guidance = prompts::tool_round_guidance_with(
+                &messages,
                 round_index,
                 tool_cfg.effective_round_budget_warning(),
                 tool_cfg.effective_round_budget_limit(),
             );
-            let synthesize_or_batch_hint =
-                prompts::synthesize_or_batch_directive(&messages, round_index);
-
-            // ── B4: Parallel execution feedback — positive reinforcement for batching ──
-            let parallel_feedback = prompts::parallel_execution_feedback(&messages);
 
             // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor + round budget + parallel feedback)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}{round_budget_hint}{synthesize_or_batch_hint}{parallel_feedback}");
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}{tool_round_guidance}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
@@ -2287,6 +2283,47 @@ mod tests {
         assert!(
             dyn_text.contains("[Learned Feedback Rules]"),
             "dynamic message should contain feedback rules"
+        );
+    }
+
+    #[test]
+    fn build_system_message_openai_keeps_late_round_guidance_in_dynamic_message() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect the project"}),
+            json!({"role": "tool", "content": "Cargo.toml"}),
+            json!({"role": "tool", "content": "README.md"}),
+        ];
+        let guidance = prompts::tool_round_guidance(&messages, prompts::ROUND_BUDGET_THRESHOLD);
+
+        let (primary, dynamic, _) = build_system_message(
+            &["read_file", "list_dir"],
+            &guidance,
+            0.8,
+            Some("implementation"),
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+
+        let primary_text = primary
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = dynamic
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            !primary_text.contains("Synthesize Or Batch Now"),
+            "stable primary message must not contain late-round dynamic guidance"
+        );
+        assert!(
+            dynamic_text.contains("Synthesize Or Batch Now"),
+            "dynamic message should include the late-round synthesis nudge"
+        );
+        assert!(
+            dynamic_text.contains("2 tools executed in parallel"),
+            "dynamic message should keep batching feedback"
         );
     }
 

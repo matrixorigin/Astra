@@ -873,20 +873,17 @@ impl ServerAgenticLoopHost {
             .unwrap_or_default();
 
         let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
-        let round_budget_hint = crate::prompts::round_budget_directive_with(
+        let tool_round_guidance = crate::prompts::tool_round_guidance_with(
+            &state.messages,
             state.current_round_index,
             tool_cfg.effective_round_budget_warning(),
             tool_cfg.effective_round_budget_limit(),
         );
-        let synthesize_or_batch_hint =
-            crate::prompts::synthesize_or_batch_directive(&state.messages, state.current_round_index);
-        let parallel_feedback = crate::prompts::parallel_execution_feedback(&state.messages);
 
         // All dynamic per-turn content (not cached)
-        let full_dynamic =
-            format!(
-                "{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}{round_budget_hint}{synthesize_or_batch_hint}{parallel_feedback}"
-            );
+        let full_dynamic = format!(
+            "{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}{tool_round_guidance}"
+        );
 
         // Build structured system messages with Anthropic cache annotations.
         // Stable sections (Global/Session) get cache_control; dynamic content does not.
@@ -1048,10 +1045,9 @@ impl ServerAgenticLoopHost {
             tool_cfg.effective_round_budget_warning(),
             tool_cfg.effective_round_budget_limit(),
         );
-        let full_dynamic =
-            format!(
-                "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}"
-            );
+        let full_dynamic = format!(
+            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}"
+        );
 
         cached_system_prompt(
             &tool_names,
@@ -1979,6 +1975,62 @@ mod tests {
         assert!(
             prompt.contains("MEMORY SIGNAL DETECTED"),
             "should detect memory store signal"
+        );
+    }
+
+    #[test]
+    fn build_system_messages_cached_includes_late_round_guidance_in_dynamic_prompt() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let mut state = create_test_state();
+        state.current_round_index = crate::prompts::ROUND_BUDGET_THRESHOLD;
+        state.messages = vec![
+            json!({"role": "user", "content": "inspect the project"}),
+            json!({"role": "tool", "content": "Cargo.toml"}),
+            json!({"role": "tool", "content": "README.md"}),
+        ];
+
+        let (system_messages, plain) = host.build_system_messages_cached(
+            "inspect the project",
+            &host.edge_tools,
+            &state,
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
+        );
+
+        assert!(
+            plain.contains("Synthesize Or Batch Now"),
+            "plain prompt should include the late-round synthesis nudge"
+        );
+        assert!(
+            plain.contains("2 tools executed in parallel"),
+            "plain prompt should preserve batching feedback"
+        );
+
+        let primary = system_messages.first().expect("primary system message");
+        let dynamic = system_messages.last().expect("dynamic system message");
+        let primary_text = primary
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = dynamic
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            !primary_text.contains("Synthesize Or Batch Now"),
+            "late-round guidance must stay out of the stable cached prefix"
+        );
+        assert!(
+            dynamic_text.contains("Synthesize Or Batch Now"),
+            "late-round guidance should live in the dynamic prompt message"
         );
     }
 

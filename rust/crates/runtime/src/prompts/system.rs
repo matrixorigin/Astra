@@ -1161,6 +1161,32 @@ pub fn synthesize_or_batch_directive(messages: &[serde_json::Value], round_index
     )
 }
 
+/// Combined late-round guidance block used by bridge/server dynamic prompt
+/// assembly. Keeps the policy centralized so both paths surface the same
+/// round-budget, synthesis, and batching nudges.
+pub fn tool_round_guidance_with(
+    messages: &[serde_json::Value],
+    round_index: u32,
+    warning: u32,
+    limit: u32,
+) -> String {
+    format!(
+        "{}{}{}",
+        round_budget_directive_with(round_index, warning, limit),
+        synthesize_or_batch_directive(messages, round_index),
+        parallel_execution_feedback(messages)
+    )
+}
+
+pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> String {
+    tool_round_guidance_with(
+        messages,
+        round_index,
+        ROUND_BUDGET_THRESHOLD,
+        ROUND_BUDGET_HARD_LIMIT,
+    )
+}
+
 /// Parallel execution feedback — injected into dynamic prompt when the previous
 /// round had multiple tool results, indicating the LLM successfully batched.
 ///
@@ -2548,6 +2574,51 @@ mod tests {
         assert_eq!(
             bd.total_tokens,
             bd.base_persona_tokens + bd.environment_tokens + bd.user_preferences_tokens
+        );
+    }
+
+    #[test]
+    fn synthesize_or_batch_directive_requires_late_round_and_trailing_tools() {
+        let early = synthesize_or_batch_directive(
+            &[serde_json::json!({"role": "tool", "content": "a"})],
+            ROUND_BUDGET_THRESHOLD - 1,
+        );
+        assert!(early.is_empty(), "early rounds should not get the nudge");
+
+        let no_trailing_tools = synthesize_or_batch_directive(
+            &[serde_json::json!({"role": "assistant", "content": "done"})],
+            ROUND_BUDGET_THRESHOLD,
+        );
+        assert!(
+            no_trailing_tools.is_empty(),
+            "non-tool endings should not get the nudge"
+        );
+    }
+
+    #[test]
+    fn tool_round_guidance_combines_budget_synthesis_and_parallel_feedback() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect the repo"}),
+            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+            serde_json::json!({"role": "tool", "content": "README.md"}),
+        ];
+
+        let guidance = tool_round_guidance(&messages, ROUND_BUDGET_THRESHOLD);
+        assert!(
+            guidance.contains("Round Budget Warning"),
+            "guidance should include the round-budget warning"
+        );
+        assert!(
+            guidance.contains("Synthesize Or Batch Now"),
+            "guidance should include the late-round synthesis nudge"
+        );
+        assert!(
+            guidance.contains("2 tool result(s)"),
+            "guidance should mention trailing tool results"
+        );
+        assert!(
+            guidance.contains("2 tools executed in parallel"),
+            "guidance should preserve parallel batching feedback"
         );
     }
 }
