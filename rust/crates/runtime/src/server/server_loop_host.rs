@@ -2124,6 +2124,10 @@ mod tests {
         assert!(breakdown.context_signals.system_prompt_override);
         assert!(breakdown.context_signals.effort_hint);
         assert!(breakdown.context_signals.agent_type_hint);
+        assert!(!breakdown.context_signals.self_awareness);
+        assert!(!breakdown.context_signals.implicit_feedback);
+        assert!(!breakdown.context_signals.learned_feedback_rules);
+        assert!(!breakdown.context_signals.session_anchor);
     }
 
     #[test]

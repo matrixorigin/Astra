@@ -2383,6 +2383,57 @@ mod tests {
     }
 
     #[test]
+    fn build_system_message_records_bridge_context_signals() {
+        let active_skill_names = vec!["concise"];
+        let learned_context_text = "matrixorigin => github";
+        let memory_signal_hint =
+            "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"preference\", namespace=\"prefs\".";
+        let implicit_feedback_hint =
+            "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
+        let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
+        let self_awareness_hint =
+            "\n\n## Self-Awareness\nCurrent task: review runtime prompt assembly.";
+        let session_anchor = "\n\n## Session Anchor\nOriginal task: optimize prompt tracing.";
+        let dynamic_desc = format!(
+            "\n\n# Project Profile\ncwd: /test\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. Follow their formatting rules strictly.\n\n## Learned Runtime Context\n{learned_context_text}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}",
+            active_skill_names.join(", ")
+        );
+        let (_, _, prompt_sections) = build_system_message(
+            &["bash", "read_file"],
+            &dynamic_desc,
+            0.8,
+            Some("implementation"),
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+        let breakdown = prompts::build_system_prompt_trace_with_context_signals(
+            &prompt_sections,
+            vec![],
+            vec![],
+            crate::turn::context_assembly_trace::PromptContextSignals {
+                active_output_skills: !active_skill_names.is_empty(),
+                learned_runtime_context: !learned_context_text.is_empty(),
+                memory_signal_detected: !memory_signal_hint.is_empty(),
+                self_awareness: !self_awareness_hint.is_empty(),
+                implicit_feedback: !implicit_feedback_hint.is_empty(),
+                learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                session_anchor: !session_anchor.is_empty(),
+                ..Default::default()
+            },
+        );
+
+        assert!(breakdown.context_signals.active_output_skills);
+        assert!(breakdown.context_signals.learned_runtime_context);
+        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(breakdown.context_signals.self_awareness);
+        assert!(breakdown.context_signals.implicit_feedback);
+        assert!(breakdown.context_signals.learned_feedback_rules);
+        assert!(breakdown.context_signals.session_anchor);
+        assert!(!breakdown.context_signals.system_prompt_override);
+        assert!(!breakdown.context_signals.effort_hint);
+        assert!(!breakdown.context_signals.agent_type_hint);
+    }
+
+    #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {

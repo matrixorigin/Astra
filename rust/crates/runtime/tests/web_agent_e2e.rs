@@ -4076,6 +4076,60 @@ async fn context_meta_exposes_memory_signal_context_flag() {
     );
 }
 
+#[tokio::test]
+async fn context_meta_exposes_builder_supplied_context_signals() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "remember that I prefer dark mode",
+            "context": {
+                "edge_profile": {
+                    "active_skills": ["concise"],
+                    "learned_context_hint": "matrixorigin => github",
+                    "system_prompt_override": "You are operating under a delegated reviewer contract."
+                },
+                "test_llm_rounds": [{ "full_text": "Stored." }]
+            }
+        }),
+    )
+    .await;
+
+    let context_meta = find_events(&events, "context_meta")
+        .into_iter()
+        .find(|event| {
+            event["system_prompt_breakdown"]["context_signals"]["system_prompt_override"].as_bool()
+                == Some(true)
+        })
+        .expect("builder-supplied context_meta event");
+
+    let context_signals = &context_meta["system_prompt_breakdown"]["context_signals"];
+    assert_eq!(
+        context_signals["active_output_skills"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        context_signals["learned_runtime_context"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        context_signals["memory_signal_detected"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        context_signals["system_prompt_override"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(context_signals["self_awareness"].as_bool(), Some(false));
+    assert_eq!(context_signals["implicit_feedback"].as_bool(), Some(false));
+    assert_eq!(
+        context_signals["learned_feedback_rules"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(context_signals["session_anchor"].as_bool(), Some(false));
+}
+
 /// Low-information repair follow-up stays scoped when the caller provides an active-task attachment.
 #[tokio::test]
 async fn low_information_followup_attachment_drives_repair_turn() {
