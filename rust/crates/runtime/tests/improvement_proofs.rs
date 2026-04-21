@@ -3544,6 +3544,7 @@ mod learning_improves_selection {
                 memory_domain_hints: hints,
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3559,6 +3560,7 @@ mod learning_improves_selection {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -5545,6 +5547,7 @@ mod hardening_proofs {
                     total_failures: 15,
                     failure_rate: 0.15,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
                 ToolHealthEntry {
                     name: "read_file".to_string(),
@@ -5552,6 +5555,7 @@ mod hardening_proofs {
                     total_failures: 1,
                     failure_rate: 0.02,
                     last_updated_epoch: 0,
+                    recent_outcomes: vec![],
                 },
             ],
             active_canary: None,
@@ -5574,6 +5578,7 @@ mod hardening_proofs {
             total_failures: 8,
             failure_rate: 0.8,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
         let health = ToolHealthTracker::from_entries(&entries);
         let guard = TurnGuard::with_health(health);
@@ -7425,6 +7430,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 2,
                 failure_rate: 0.2,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "grep".to_string(),
@@ -7432,6 +7438,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
         ];
         let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
@@ -7450,6 +7457,15 @@ mod learning_sync_cloud_proofs {
             total_failures: 3,
             failure_rate: 0.3,
             last_updated_epoch: 0,
+            recent_outcomes: vec![astra_pipeline::ToolOutcomeCacheEntry {
+                signature: r#"bash:{"command":"pwd"}"#.to_string(),
+                outcomes: vec![astra_pipeline::ToolOutcome {
+                    success: true,
+                    latency_ms: 9,
+                    result_hash: 42,
+                    at_epoch: 100,
+                }],
+            }],
         }];
         let snapshot = export_from_modules_with_health(&eg, &pl, &cal, &health);
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -7458,6 +7474,12 @@ mod learning_sync_cloud_proofs {
         assert_eq!(restored.tool_health[0].name, "bash");
         assert_eq!(restored.tool_health[0].total_calls, 10);
         assert_eq!(restored.tool_health[0].total_failures, 3);
+        assert_eq!(restored.tool_health[0].recent_outcomes.len(), 1);
+        assert_eq!(
+            restored.tool_health[0].recent_outcomes[0].signature,
+            r#"bash:{"command":"pwd"}"#
+        );
+        assert_eq!(restored.tool_health[0].recent_outcomes[0].outcomes.len(), 1);
     }
 
     #[test]
@@ -7471,6 +7493,7 @@ mod learning_sync_cloud_proofs {
             total_failures: 1,
             failure_rate: 0.05,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         // Cloud: bash updated at epoch 500 (older), grep is cloud-only
         let cloud = vec![
@@ -7480,6 +7503,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 5,
                 failure_rate: 0.5,
                 last_updated_epoch: 500,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "grep".to_string(),
@@ -7487,6 +7511,7 @@ mod learning_sync_cloud_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 800,
+                recent_outcomes: vec![],
             },
         ];
 
@@ -7537,6 +7562,7 @@ mod health_dashboard_proofs {
                 total_failures: 5,
                 failure_rate: 0.25,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "grep".into(),
@@ -7544,6 +7570,7 @@ mod health_dashboard_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);
@@ -7718,6 +7745,7 @@ mod timestamp_merge_proofs {
             total_failures: 2,
             failure_rate: 0.4,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7725,6 +7753,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.067,
             last_updated_epoch: 2000, // newer
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
@@ -7744,6 +7773,7 @@ mod timestamp_merge_proofs {
             total_failures: 0,
             failure_rate: 0.0,
             last_updated_epoch: 3000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7751,6 +7781,7 @@ mod timestamp_merge_proofs {
             total_failures: 5,
             failure_rate: 0.5,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7767,6 +7798,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.2,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7774,6 +7806,7 @@ mod timestamp_merge_proofs {
             total_failures: 2,
             failure_rate: 0.1,
             last_updated_epoch: 1000, // same epoch
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7789,6 +7822,7 @@ mod timestamp_merge_proofs {
             total_failures: 3,
             failure_rate: 0.3,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7796,6 +7830,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7812,6 +7847,7 @@ mod timestamp_merge_proofs {
             total_failures: 2,
             failure_rate: 0.2,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![ToolHealthEntry {
             name: "bash".into(),
@@ -7819,6 +7855,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.125,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
@@ -7835,6 +7872,7 @@ mod timestamp_merge_proofs {
             total_failures: 0,
             failure_rate: 0.0,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
         let cloud = vec![
             ToolHealthEntry {
@@ -7843,6 +7881,7 @@ mod timestamp_merge_proofs {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 500,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "read_file".into(),
@@ -7850,6 +7889,7 @@ mod timestamp_merge_proofs {
                 total_failures: 1,
                 failure_rate: 0.33,
                 last_updated_epoch: 800,
+                recent_outcomes: vec![],
             },
         ];
 
@@ -7867,6 +7907,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, cloud_only) = merge_tool_health(&[], &cloud);
@@ -7883,6 +7924,7 @@ mod timestamp_merge_proofs {
             total_failures: 1,
             failure_rate: 0.1,
             last_updated_epoch: 1000,
+            recent_outcomes: vec![],
         }];
 
         let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &[]);
@@ -8168,6 +8210,7 @@ mod turnguard_e2e_proofs {
                 total_failures: 7,
                 failure_rate: 0.7,
                 last_updated_epoch: 1000,
+                recent_outcomes: vec![],
             },
             ToolHealthEntry {
                 name: "bash".into(),
@@ -8175,6 +8218,7 @@ mod turnguard_e2e_proofs {
                 total_failures: 2,
                 failure_rate: 0.1,
                 last_updated_epoch: 1000,
+                recent_outcomes: vec![],
             },
         ];
         let tracker = ToolHealthTracker::from_entries(&entries);
@@ -8869,6 +8913,7 @@ mod co_occurrence_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_with = selector.select(&ctx_with_recent).await;
@@ -8884,6 +8929,7 @@ mod co_occurrence_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_without = selector.select(&ctx_without_recent).await;
@@ -9030,6 +9076,7 @@ mod file_context_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec!["typescript".to_string()],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;

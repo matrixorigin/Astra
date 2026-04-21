@@ -314,10 +314,11 @@ pub(super) async fn handle_chat_input(
 
     // Consume one-shot resume guidance before building the effective line.
     let resume_guidance = state.resume_guidance.take();
+    // P3.3 — pending plan-resume digest. Kept until the user sends an
+    // explicit resume-like line, then consumed once.
+    let plan_resume_digest = consume_plan_resume_if_matches(state, &line);
     let mut effective_line = build_effective_line(&line, state);
-    if let Some(guidance) = resume_guidance {
-        effective_line = format!("{guidance}\n\n{effective_line}");
-    }
+    effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
     let turn_start = Instant::now();
 
     maybe_auto_compact(state, &ctx, token, &effective_line).await?;
@@ -472,6 +473,26 @@ pub(super) async fn handle_chat_input(
     }
 
     Ok(())
+}
+
+pub(super) fn consume_plan_resume_if_matches(state: &mut ReplState, line: &str) -> Option<String> {
+    astra_runtime::plan::plan_resume::message_signals_resume(line)
+        .then(|| state.pending_plan_resume_digest.take())
+        .flatten()
+}
+
+fn apply_resume_context(
+    mut effective_line: String,
+    resume_guidance: Option<String>,
+    plan_resume_digest: Option<String>,
+) -> String {
+    if let Some(guidance) = resume_guidance {
+        effective_line = format!("{guidance}\n\n{effective_line}");
+    }
+    if let Some(digest) = plan_resume_digest {
+        effective_line = format!("@resume-plan\n{digest}\n\n{effective_line}");
+    }
+    effective_line
 }
 
 pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
@@ -3768,6 +3789,43 @@ mod tests {
         let effective_no_goal = build_effective_line("sure", &state_no_goal);
         assert!(effective_no_goal.contains("[Active task attachment]"));
         assert!(!effective_no_goal.contains("Session goal:"));
+    }
+
+    #[test]
+    fn consume_plan_resume_if_matches_requires_resume_signal() {
+        let mut state = ReplState {
+            pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
+            ..ReplState::default()
+        };
+
+        assert!(consume_plan_resume_if_matches(&mut state, "tell me a joke").is_none());
+        assert_eq!(
+            state.pending_plan_resume_digest.as_deref(),
+            Some("[plan-resume] goal=\"Fix auth\"")
+        );
+    }
+
+    #[test]
+    fn consume_plan_resume_if_matches_consumes_digest_on_explicit_tag() {
+        let mut state = ReplState {
+            pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
+            ..ReplState::default()
+        };
+
+        let digest = consume_plan_resume_if_matches(&mut state, "please @resume-plan");
+        assert_eq!(digest.as_deref(), Some("[plan-resume] goal=\"Fix auth\""));
+        assert!(state.pending_plan_resume_digest.is_none());
+    }
+
+    #[test]
+    fn apply_resume_context_injects_implicit_resume_tag_and_digest() {
+        let effective = apply_resume_context(
+            "continue".to_string(),
+            None,
+            Some("[plan-resume] goal=\"Fix auth\"".to_string()),
+        );
+        assert!(effective.starts_with("@resume-plan\n[plan-resume]"));
+        assert!(effective.ends_with("\n\ncontinue"));
     }
 
     #[test]

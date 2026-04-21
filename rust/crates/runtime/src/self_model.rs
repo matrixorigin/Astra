@@ -91,6 +91,10 @@ pub struct CapabilityView {
     /// deprioritized→restricted merge).
     #[serde(default)]
     pub widen_selection_pending: bool,
+    /// Compact recent signature-level execution memory surfaced back to the
+    /// model so it can avoid blindly repeating identical tool calls.
+    #[serde(default)]
+    pub outcome_memory: Vec<OutcomeMemoryHint>,
 }
 
 /// Per-tool health summary.
@@ -102,6 +106,14 @@ pub struct ToolHealthSummary {
     pub deprioritized: bool,
     pub consecutive_failures: usize,
     pub rehabilitation_count: usize,
+}
+
+/// Compact signature-level execution memory hint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeMemoryHint {
+    pub tool_name: String,
+    pub signature: String,
+    pub success: bool,
 }
 
 /// Current execution state.
@@ -277,6 +289,7 @@ impl SelfModel {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
         let mut deprioritized = Vec::new();
+        let mut outcome_memory = Vec::new();
 
         if let Some(health) = tool_health {
             for (name, h) in health.all() {
@@ -296,6 +309,15 @@ impl SelfModel {
             }
             // Sort by name for stability
             tool_health_summaries.sort_by(|a, b| a.name.cmp(&b.name));
+            outcome_memory = health
+                .latest_outcomes(4)
+                .into_iter()
+                .map(|hint| OutcomeMemoryHint {
+                    tool_name: hint.tool_name,
+                    signature: hint.signature,
+                    success: hint.success,
+                })
+                .collect();
         }
 
         for tool in manual_deprioritized_tools {
@@ -329,6 +351,7 @@ impl SelfModel {
             skills: skills.to_vec(),
             boosted_tools,
             widen_selection_pending,
+            outcome_memory,
         };
 
         // ── Execution state ──
@@ -448,6 +471,14 @@ fn goal_tracking_status(effective_goal: Option<&str>, tracked_goal: Option<&str>
     }
 }
 
+fn render_outcome_memory_hint(hint: &OutcomeMemoryHint) -> String {
+    format!(
+        "{} {}",
+        if hint.success { "ok" } else { "fail" },
+        truncate_str(&hint.signature, 56)
+    )
+}
+
 // ─── System Prompt Rendering ────────────────────────────────────────────────
 
 impl SelfModel {
@@ -521,6 +552,44 @@ impl SelfModel {
                 "Deprioritized tools: {} (repeated failures — try alternatives)",
                 self.capabilities.deprioritized_tools.join(", ")
             );
+        }
+        if !self.capabilities.outcome_memory.is_empty() {
+            let failures: Vec<String> = self
+                .capabilities
+                .outcome_memory
+                .iter()
+                .filter(|hint| !hint.success)
+                .take(2)
+                .map(render_outcome_memory_hint)
+                .collect();
+            let successes: Vec<String> = self
+                .capabilities
+                .outcome_memory
+                .iter()
+                .filter(|hint| hint.success)
+                .take(2)
+                .map(render_outcome_memory_hint)
+                .collect();
+            let mut parts = Vec::new();
+            if !failures.is_empty() {
+                parts.push(format!(
+                    "recent identical failures: {}",
+                    failures.join("; ")
+                ));
+            }
+            if !successes.is_empty() {
+                parts.push(format!(
+                    "recent identical successes: {}",
+                    successes.join("; ")
+                ));
+            }
+            if !parts.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "Outcome memory: {}. Reuse or retry only if the context truly changed.",
+                    parts.join(" | ")
+                );
+            }
         }
 
         // ── Strategy signals from last auto-reflection ──
@@ -710,6 +779,16 @@ impl SelfModel {
                 "- Active skills: {}",
                 self.capabilities.skills.join(", ")
             );
+        }
+        if !self.capabilities.outcome_memory.is_empty() {
+            let rendered: Vec<String> = self
+                .capabilities
+                .outcome_memory
+                .iter()
+                .take(4)
+                .map(render_outcome_memory_hint)
+                .collect();
+            let _ = writeln!(s, "- Outcome memory: {}", rendered.join("; "));
         }
 
         // ── Tool health (only tools with issues) ──
@@ -976,6 +1055,71 @@ mod tests {
         );
         assert_eq!(model.capabilities.deprioritized_tools, vec!["web_search"]);
         assert_eq!(model.capabilities.tool_health.len(), 2);
+    }
+
+    #[test]
+    fn system_prompt_section_surfaces_outcome_memory() {
+        let config = RuntimeConfig::default();
+        let mut health = ToolHealthTracker::new();
+        health.record_outcome(
+            r#"bash:{"command":"pwd"}"#,
+            crate::turn::tool_health::ToolOutcome {
+                success: true,
+                latency_ms: 9,
+                result_hash: 11,
+                at_epoch: 10,
+            },
+        );
+        health.record_outcome(
+            r#"grep:{"pattern":"TODO"}"#,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 12,
+                result_hash: 22,
+                at_epoch: 20,
+            },
+        );
+
+        let model = SelfModel::snapshot(
+            &["bash", "grep"],
+            &[],
+            &[],
+            &[],
+            Some(&health),
+            2,
+            None,
+            None,
+            None,
+            10,
+            0,
+            0,
+            Some("Inspect duplicate work"),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+
+        let section = model.to_system_prompt_section();
+        assert!(section.contains("Outcome memory:"), "got: {section}");
+        assert!(
+            section.contains("recent identical failures"),
+            "got: {section}"
+        );
+        assert!(
+            section.contains("recent identical successes"),
+            "got: {section}"
+        );
+        assert!(
+            section.contains(r#"grep:{"pattern":"TODO"}"#),
+            "got: {section}"
+        );
+        assert!(
+            section.contains(r#"bash:{"command":"pwd"}"#),
+            "got: {section}"
+        );
     }
 
     #[test]

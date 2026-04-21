@@ -4544,6 +4544,7 @@ fn blocked_tool_health_entry(
         total_failures: 0,
         failure_rate: 0.0,
         last_updated_epoch: 0,
+        recent_outcomes: vec![],
     }
 }
 

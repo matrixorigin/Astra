@@ -2861,6 +2861,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -2876,6 +2877,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -2902,6 +2904,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -2928,6 +2931,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec!["github_ci_status".to_string()],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -2955,6 +2959,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec!["git_log".to_string(), "git_diff".to_string()],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -2982,6 +2987,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -2998,6 +3004,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![DomainHint::GitHub],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3028,6 +3035,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![DomainHint::Database],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3058,6 +3066,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3084,6 +3093,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3111,6 +3121,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3135,6 +3146,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3160,6 +3172,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3187,6 +3200,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec!["github_ci_status".to_string()],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3216,6 +3230,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![DomainHint::GitHub],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3243,6 +3258,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3257,6 +3273,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;
@@ -3282,6 +3299,7 @@ mod pipeline_integration {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             })
             .await;

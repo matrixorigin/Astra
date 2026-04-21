@@ -212,6 +212,7 @@ async fn slash_health_with_entries_does_not_crash() {
                 total_failures: 3,
                 failure_rate: 0.2,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
             astra_runtime::pipeline::persistence::ToolHealthEntry {
                 name: "grep".into(),
@@ -219,6 +220,7 @@ async fn slash_health_with_entries_does_not_crash() {
                 total_failures: 0,
                 failure_rate: 0.0,
                 last_updated_epoch: 0,
+                recent_outcomes: vec![],
             },
         ],
         ..Default::default()
@@ -242,6 +244,7 @@ async fn slash_health_detail_mode() {
             total_failures: 5,
             failure_rate: 0.5,
             last_updated_epoch: 0,
+            recent_outcomes: vec![],
         }],
         ..Default::default()
     };

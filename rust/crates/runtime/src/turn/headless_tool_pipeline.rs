@@ -1161,6 +1161,280 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_slot_blocks_recent_identical_failures_from_outcome_memory() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls.push(json!({
+            "id": "call-grep-0",
+            "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
+        }));
+        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+            "grep",
+            &json!({"pattern":"headless"}),
+        );
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        harness.turn_guard.health.record_outcome(
+            &sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: 1,
+                at_epoch: now_epoch,
+            },
+        );
+        harness.turn_guard.health.record_outcome(
+            &sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 12,
+                result_hash: 2,
+                at_epoch: now_epoch,
+            },
+        );
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("Outcome memory blocked"),
+            "expected blocked outcome-memory advisory in tool result"
+        );
+    }
+
+    #[test]
+    fn validate_slot_allows_retry_when_recent_success_exists() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls.push(json!({
+            "id": "call-grep-0",
+            "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
+        }));
+        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+            "grep",
+            &json!({"pattern":"headless"}),
+        );
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        harness.turn_guard.health.record_outcome(
+            &sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: 1,
+                at_epoch: now_epoch,
+            },
+        );
+        harness.turn_guard.health.record_outcome(
+            &sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: true,
+                latency_ms: 8,
+                result_hash: 2,
+                at_epoch: now_epoch,
+            },
+        );
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(
+            matches!(result, HeadlessPipelineStage::Continue(_)),
+            "recent success should keep the tool callable"
+        );
+    }
+
+    #[test]
+    fn cross_session_restored_outcome_memory_blocks_repeated_failure() {
+        let sig = crate::turn::tool_result_semantics::tool_dedup_signature(
+            "grep",
+            &json!({"pattern":"headless"}),
+        );
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut session_one_guard = TurnGuard::new();
+        session_one_guard.health.record_failure("grep");
+        session_one_guard.health.record_failure("grep");
+        session_one_guard.health.record_outcome(
+            &sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: 1,
+                at_epoch: now_epoch,
+            },
+        );
+        session_one_guard.health.record_outcome(
+            &sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 12,
+                result_hash: 2,
+                at_epoch: now_epoch,
+            },
+        );
+
+        let exported = session_one_guard.health.export();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].recent_outcomes.len(), 1);
+
+        let restored = crate::turn::tool_health::ToolHealthTracker::from_entries(&exported);
+        let mut harness = PipelineHarness::new();
+        harness.turn_guard = TurnGuard::with_health(restored);
+        harness.tool_calls.push(json!({
+            "id": "call-grep-0",
+            "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
+        }));
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("Outcome memory blocked"),
+            "restored identical failure history should block the next-session retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_outcome_memory_reduces_recovery_executions_vs_blind_retry() {
+        async fn run_recovery_turn(
+            restored: Option<crate::turn::tool_health::ToolHealthTracker>,
+        ) -> (u32, usize, usize) {
+            let mut harness = PipelineHarness::new();
+            harness.valid_tool_names.insert("outline".to_string());
+            harness.tool_calls.push(json!({
+                "id": "call-outline-0",
+                "function": { "name": "outline", "arguments": "{}" }
+            }));
+            if let Some(health) = restored {
+                harness.turn_guard = TurnGuard::with_health(health);
+            }
+            let before_outline_calls = harness
+                .turn_guard
+                .health
+                .get("outline")
+                .map(|h| h.total_calls)
+                .unwrap_or(0);
+            let dir = tempfile::TempDir::new().unwrap();
+            let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            );
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+
+            match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::Continue(validated) => {
+                    let permitted = match pipeline.permit_execution(validated).await {
+                        HeadlessPipelineStage::Continue(p) => p,
+                        _ => panic!("expected permitted outline execution"),
+                    };
+                    let executed = pipeline.execute_execution(permitted).await;
+                    pipeline.record_execution(executed).await;
+                }
+                HeadlessPipelineStage::ShortCircuit => {}
+                HeadlessPipelineStage::AbortRound => panic!("unexpected abort"),
+            }
+
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+                HeadlessPipelineStage::Continue(v) => v,
+                _ => panic!("expected Continue for grep fallback"),
+            };
+            let permitted = match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::Continue(p) => p,
+                _ => panic!("expected Continue for grep fallback"),
+            };
+            let executed = pipeline.execute_execution(permitted).await;
+            assert!(!executed.is_err, "grep fallback should succeed");
+            pipeline.record_execution(executed).await;
+
+            let after_outline_calls = pipeline
+                .ctx
+                .turn_guard
+                .health
+                .get("outline")
+                .map(|h| h.total_calls)
+                .unwrap_or(0);
+            let grep_calls = pipeline
+                .ctx
+                .turn_guard
+                .health
+                .get("grep")
+                .map(|h| h.total_calls)
+                .unwrap_or(0);
+            (
+                pipeline.executed_this_turn,
+                after_outline_calls.saturating_sub(before_outline_calls),
+                grep_calls,
+            )
+        }
+
+        let blind_retry = run_recovery_turn(None).await;
+
+        let mut prior_guard = TurnGuard::new();
+        let outline_sig =
+            crate::turn::tool_result_semantics::tool_dedup_signature("outline", &json!({}));
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        prior_guard.health.record_failure("outline");
+        prior_guard.health.record_failure("outline");
+        prior_guard.health.record_outcome(
+            &outline_sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 10,
+                result_hash: 1,
+                at_epoch: now_epoch,
+            },
+        );
+        prior_guard.health.record_outcome(
+            &outline_sig,
+            crate::turn::tool_health::ToolOutcome {
+                success: false,
+                latency_ms: 11,
+                result_hash: 2,
+                at_epoch: now_epoch,
+            },
+        );
+        let restored =
+            crate::turn::tool_health::ToolHealthTracker::from_entries(&prior_guard.health.export());
+        let memory_guided = run_recovery_turn(Some(restored)).await;
+
+        assert_eq!(blind_retry.2, 1, "blind retry still reaches grep success");
+        assert_eq!(
+            memory_guided.2, 1,
+            "memory-guided path still reaches grep success"
+        );
+        assert_eq!(
+            blind_retry.1, 1,
+            "blind retry incurs one fresh outline failure"
+        );
+        assert_eq!(
+            memory_guided.1, 0,
+            "restored failure memory should prevent another outline execution"
+        );
+        assert!(
+            memory_guided.0 < blind_retry.0,
+            "memory-guided recovery should use fewer actual tool executions: blind={:?}, memory={:?}",
+            blind_retry,
+            memory_guided
+        );
+    }
+
     #[tokio::test]
     async fn unknown_tool_failure_not_reset_by_valid_tool_success() {
         let mut harness = PipelineHarness::new();

@@ -496,6 +496,7 @@ pub(crate) fn initialize_repl_state(
 ) -> ReplState {
     let mut state = ReplState::default();
     state.pending_recovery = detect_pending_recovery_session(profile);
+    state.pending_plan_resume_digest = detect_pending_plan_resume_digest();
     if let Some(m) = initial_model {
         state.model = Some(m.to_string());
     }
@@ -547,6 +548,87 @@ fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> 
     let session_id = resumable_last_session_id(cli_profile)?;
     let workspace = astra_services::session_workspace::read_workspace(&session_id).ok()?;
     workspace_matches_current_project(&workspace).then_some(session_id)
+}
+
+/// P3.3 — if a persisted plan_state.json exists for the active user, load it
+/// and compute a compact resume digest. The digest is a one-shot hint: it is
+/// only injected into the next turn's system prompt when the user message
+/// signals resume intent, and cleared thereafter.
+fn detect_pending_plan_resume_digest() -> Option<String> {
+    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+    if !path.exists() {
+        return None;
+    }
+    match astra_runtime::plan_decompose::PlanModeState::load_with_recovery(&path) {
+        Ok(state) => astra_runtime::plan::plan_resume::plan_resume_digest(&state),
+        Err(err) => {
+            eprintln!("  ⚠ plan_state.json present but unreadable: {err}");
+            None
+        }
+    }
+}
+
+const PLAN_RESUME_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn plan_context_is_stale(
+    modified: std::time::SystemTime,
+    now: std::time::SystemTime,
+    stale_after: std::time::Duration,
+) -> bool {
+    now.duration_since(modified)
+        .map(|elapsed| elapsed >= stale_after)
+        .unwrap_or(false)
+}
+
+fn should_refresh_pending_plan_context(path: &std::path::Path) -> bool {
+    path.metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .is_some_and(|modified| {
+            plan_context_is_stale(
+                modified,
+                std::time::SystemTime::now(),
+                PLAN_RESUME_STALE_AFTER,
+            )
+        })
+}
+
+pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut ReplState) -> bool {
+    if state.plan_mode.is_some()
+        || state.executing_plan.is_some()
+        || state.plan_handle.is_some()
+        || state.pending_plan_resume_digest.is_none()
+        || !line.contains("@resume-plan")
+    {
+        return false;
+    }
+
+    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+    if !path.exists() {
+        state.pending_plan_resume_digest = None;
+        return false;
+    }
+
+    match astra_runtime::plan_decompose::PlanModeState::load_with_recovery(&path) {
+        Ok(mut plan_state) => {
+            if should_refresh_pending_plan_context(&path) {
+                let project_root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                plan_state.context = astra_runtime::plan_decompose::analyze_project(&project_root);
+                let _ = plan_state.save_with_backup(&path);
+            }
+
+            state.pending_plan_resume_digest = None;
+            state.chat_plan_only = false;
+            state.plan_mode = Some(plan_state);
+            true
+        }
+        Err(err) => {
+            eprintln!("  ⚠ failed to restore saved plan mode: {err}");
+            state.pending_plan_resume_digest = None;
+            false
+        }
+    }
 }
 
 fn workspace_matches_current_project(
@@ -884,6 +966,34 @@ mod tests {
     use crate::cli_utils::{CredentialsFile, Profile};
     use crate::tests::isolate_credentials;
     use tempfile::tempdir;
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempdir().unwrap();
@@ -1354,6 +1464,94 @@ mod tests {
         assert_eq!(state.pending_recovery, None);
         assert!(state.history.is_empty());
         assert_eq!(state.turn, 0);
+    }
+
+    #[test]
+    fn initialize_repl_state_detects_pending_plan_resume_digest() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+            "Fix auth middleware".to_string(),
+            Default::default(),
+        );
+        plan_state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "t1".into(),
+                title: "Patch token validation".into(),
+                status: astra_services::task_orchestrator::TaskStatus::InProgress,
+                ..Default::default()
+            });
+        plan_state
+            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .unwrap();
+
+        let state = initialize_repl_state(None, Some("gpt-5"));
+        let digest = state.pending_plan_resume_digest.expect("resume digest");
+        assert!(digest.contains("Fix auth middleware"), "{digest}");
+        assert!(digest.contains("Patch token validation"), "{digest}");
+    }
+
+    #[test]
+    fn maybe_restore_pending_plan_mode_activates_saved_plan() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+            "Ship plan resume".to_string(),
+            Default::default(),
+        );
+        plan_state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "t1".into(),
+                title: "Wire implicit resume".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        plan_state
+            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .unwrap();
+
+        let mut state = ReplState {
+            pending_plan_resume_digest: Some("[plan-resume] goal=\"Ship plan resume\"".into()),
+            ..ReplState::default()
+        };
+        assert!(maybe_restore_pending_plan_mode(
+            "please @resume-plan",
+            &mut state
+        ));
+        assert!(state.pending_plan_resume_digest.is_none());
+        assert_eq!(
+            state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
+            Some("Ship plan resume")
+        );
+    }
+
+    #[test]
+    fn plan_context_is_stale_respects_threshold() {
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        let fresh = now - std::time::Duration::from_secs(60);
+        let stale = now - std::time::Duration::from_secs(31 * 60);
+        assert!(!plan_context_is_stale(
+            fresh,
+            now,
+            std::time::Duration::from_secs(30 * 60)
+        ));
+        assert!(plan_context_is_stale(
+            stale,
+            now,
+            std::time::Duration::from_secs(30 * 60)
+        ));
     }
 
     // ── Session display logic ──────────────────────────────────────────────

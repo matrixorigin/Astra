@@ -22,6 +22,9 @@ use super::*;
 use crate::turn::edge_prompt_context::make_args_preview;
 use crate::turn::tool_result_semantics::tool_dedup_signature;
 
+const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
+const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
+
 fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
     quiet: bool,
@@ -137,7 +140,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.consecutive_empty_name = 0;
 
         let call_sig = tool_dedup_signature(&slot.name, &slot.args);
-        let count = self.ctx.call_counts.entry(call_sig).or_insert(0);
+        let count = self.ctx.call_counts.entry(call_sig.clone()).or_insert(0);
         *count += 1;
         if *count > self.ctx.max_identical_calls {
             let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
@@ -245,6 +248,34 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 slot.name,
                 slot.id,
                 prev_turn + 1,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        if let Some(failure_count) =
+            should_block_from_outcome_memory(&self.ctx.turn_guard.health, &call_sig)
+        {
+            let err_msg = format!(
+                "blocked_tool: Outcome memory blocked '{}' with identical arguments: \
+                 this canonical call failed {} recent time(s) with no intervening success. \
+                 Change the arguments, use a different tool, or explain why a retry is necessary.",
+                slot.name, failure_count
+            );
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &slot.id,
+                    name: &slot.name,
+                    args: &slot.args,
+                    err_msg: err_msg.clone(),
+                    journal_reason: err_msg.clone(),
+                    early_exit_ms: 0,
+                    status_line: Some(format!("  ⚠ Outcome-memory block: {}", slot.name)),
+                },
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
             );
             return HeadlessPipelineStage::ShortCircuit;
         }
@@ -416,4 +447,32 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             idem_key,
         })
     }
+}
+
+fn should_block_from_outcome_memory(
+    health: &crate::turn::tool_health::ToolHealthTracker,
+    call_sig: &str,
+) -> Option<usize> {
+    let history = health.outcome_history(call_sig)?;
+    let recent: Vec<_> = history
+        .iter()
+        .rev()
+        .take(OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW)
+        .collect();
+    if recent.len() < OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW
+        || recent.iter().any(|outcome| outcome.success)
+    {
+        return None;
+    }
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let newest = recent.first()?;
+    if newest.at_epoch == 0
+        || now_epoch.saturating_sub(newest.at_epoch) > OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS
+    {
+        return None;
+    }
+    Some(recent.len())
 }

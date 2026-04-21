@@ -30,4 +30,6 @@ pub mod tool_health_types;
 
 pub use pattern::PatternAction;
 pub use routing::{CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label};
-pub use tool_health_types::ToolHealthEntry;
+pub use tool_health_types::{
+    TOOL_OUTCOME_RING_CAPACITY, ToolHealthEntry, ToolOutcome, ToolOutcomeCacheEntry,
+};

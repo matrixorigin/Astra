@@ -1677,6 +1677,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let res = selector.select(&sel_ctx).await;
@@ -1698,6 +1699,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let res = selector.select(&sel_ctx).await;

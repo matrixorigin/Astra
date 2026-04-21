@@ -430,6 +430,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
     merge_deprioritized_tools_into_restricted(ctx.turn_guard, ctx.restricted_tools);
     let restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
+    // Per-tool selector bias derived from recent outcome memory. Bounded ±0.10
+    // in the scoring pipeline so it nudges ties without overriding strong text
+    // signals (hard exclusions remain in `restricted_vec`). 3600s window keeps
+    // bias responsive within a session but lets stale evidence age out.
+    let outcome_bias = ctx.turn_guard.health.outcome_bias_by_tool(3600);
 
     ctx.step_recorder.record_perceive(
         semantic_query_str,
@@ -470,6 +475,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             memory_domain_hints.clone(),
             restricted_vec.clone(),
             ctx.file_context.to_vec(),
+            outcome_bias.clone(),
             false,
             ctx.tool_budget_override,
             ctx.previous_confidence_fallback.clone(),
@@ -526,6 +532,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             memory_domain_hints,
             restricted_vec,
             ctx.file_context.to_vec(),
+            outcome_bias,
             true,
             ctx.tool_budget_override,
             ctx.previous_confidence_fallback.clone(),

@@ -84,6 +84,12 @@ pub struct SelectionContext<'a> {
     /// e.g., ["rust"] from Cargo.toml, ["typescript"] from tsconfig.json.
     /// Boosts tools relevant to the detected project type.
     pub file_context: Vec<String>,
+    /// Per-tool selector bias derived from recent outcome memory
+    /// (`ToolHealthTracker::outcome_bias_by_tool`). Positive entries mildly
+    /// boost a tool's score; negative entries soft-deprioritize it. Bounded
+    /// to ±0.10 in the scoring pipeline so it never overrides strong
+    /// textual/intent signals — use `restricted_tools` for hard exclusions.
+    pub outcome_bias: std::collections::HashMap<String, f64>,
     /// Fallback action from the previous turn's confidence diagnosis.
     /// When `Some(Broaden)`, the selector should relax budget constraints
     /// and include more candidate tools.
@@ -715,6 +721,7 @@ impl ToolSelector for TfIdfSelector {
             ctx.budget_pressure,
             &co_occurrence,
             &ctx.file_context,
+            &ctx.outcome_bias,
         );
         drop(tracker_guard);
 
@@ -1677,6 +1684,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -1701,6 +1709,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -1863,6 +1872,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         }
     }
@@ -2008,6 +2018,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2066,6 +2077,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2170,6 +2182,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -2258,6 +2271,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -2333,6 +2347,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2368,6 +2383,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2392,6 +2408,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_no_boost = selector.select(&ctx_no_boost).await;
@@ -2407,6 +2424,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_boosted = selector.select(&ctx_boosted).await;
@@ -2444,6 +2462,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2465,6 +2484,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let ctx_empty = SelectionContext {
@@ -2477,6 +2497,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r1 = selector.select(&ctx_none).await;
@@ -2501,6 +2522,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let ctx_irrelevant = SelectionContext {
@@ -2513,6 +2535,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r1 = selector.select(&ctx_no_boost).await;
@@ -2542,6 +2565,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2566,6 +2590,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2591,6 +2616,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2611,6 +2637,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2635,6 +2662,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -2655,6 +2683,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r1 = selector.select(&ctx_no_boost).await;
@@ -2674,6 +2703,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r2 = selector.select(&ctx_boosted).await;
@@ -2698,6 +2728,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let ctx_with_hint = SelectionContext {
@@ -2710,6 +2741,7 @@ mod tests {
             memory_domain_hints: vec![DomainHint::GitHub],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r1 = selector.select(&ctx_no_hint).await;
@@ -2735,6 +2767,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let ctx_code = SelectionContext {
@@ -2747,6 +2780,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec!["rust".into()],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let r1 = selector.select(&ctx_plain).await;
@@ -2797,6 +2831,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -2845,6 +2880,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -3035,6 +3071,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -3064,6 +3101,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -3143,6 +3181,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -3203,6 +3242,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
 
@@ -3309,6 +3349,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_normal = selector.select(&ctx_normal).await;
@@ -3324,6 +3365,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_pressure = selector.select(&ctx_pressure).await;
@@ -3349,6 +3391,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3371,6 +3414,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_neg = selector.select(&ctx_neg).await;
@@ -3386,6 +3430,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_over = selector.select(&ctx_over).await;
@@ -3411,6 +3456,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_no_hint = selector.select(&ctx_no_hint).await;
@@ -3426,6 +3472,7 @@ mod tests {
             memory_domain_hints: vec![DomainHint::GitHub],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_hint = selector.select(&ctx_hint).await;
@@ -3465,6 +3512,7 @@ mod tests {
             memory_domain_hints: vec![DomainHint::Git],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3490,6 +3538,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_none = selector.select(&ctx_none).await;
@@ -3513,6 +3562,7 @@ mod tests {
             memory_domain_hints: vec![DomainHint::GitHub],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3542,6 +3592,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_open = selector.select(&ctx_open).await;
@@ -3564,6 +3615,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec!["github_list_prs".to_string()],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result_restricted = selector.select(&ctx_restricted).await;
@@ -3595,6 +3647,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3635,6 +3688,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3660,6 +3714,7 @@ mod tests {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             };
             let result = selector.select(&ctx).await;
@@ -3694,6 +3749,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3724,6 +3780,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3748,6 +3805,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
             previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
@@ -3779,6 +3837,7 @@ mod tests {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                outcome_bias: std::collections::HashMap::new(),
                 previous_confidence_fallback: None,
             };
             let result = selector.select(&ctx).await;
