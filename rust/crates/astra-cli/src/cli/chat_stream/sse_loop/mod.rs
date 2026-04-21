@@ -510,6 +510,8 @@ pub(crate) async fn stream_chat_sse(
         current_round_index: 0,
         turn_guard,
         restricted_tools: initial_restricted,
+        boosted_tools: HashSet::new(),
+        widen_selection_pending: false,
         step_recorder,
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(

@@ -499,6 +499,18 @@ pub struct AgenticLoopState {
     pub current_round_index: u32,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
+    /// Positive allowlist bias populated by pipeline `add_tools` strategy.
+    /// Tools listed here are guaranteed NOT to be filtered out by the effective
+    /// restriction set on the current turn (they still have to be advertised
+    /// by the edge catalogue). This is additive and persists until manually
+    /// cleared; the bridge prunes it naturally when a later diagnosis drops the
+    /// tool from its recommendation.
+    pub boosted_tools: HashSet<String>,
+    /// One-shot flag set by pipeline `widen_selection` strategy. When true,
+    /// the upcoming tool-visibility assembly skips the deprioritized → restricted
+    /// merge for this turn so the LLM sees the full catalogue again. The flag
+    /// is consumed (reset to false) on use.
+    pub widen_selection_pending: bool,
     pub step_recorder: StepRecorder,
 
     // ── Dedup + caching ──
@@ -1079,6 +1091,8 @@ pub(crate) mod tests {
             current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
+            boosted_tools: HashSet::new(),
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
@@ -6516,6 +6530,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     && line.contains("flaky_http")),
             "expected strategy-applied log line, got lines: {:?}",
             host.emitted_lines
+        );
+        // ToolFailures diagnosis also sets widen_selection → the one-shot flag
+        // should be pending until the next visible_turn_tools call consumes it.
+        assert!(
+            state.widen_selection_pending,
+            "expected widen_selection_pending = true after bridge applied strategy"
         );
     }
 

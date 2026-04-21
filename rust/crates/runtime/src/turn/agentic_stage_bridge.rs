@@ -108,13 +108,20 @@ pub struct StrategyApplication {
     pub newly_blocked: Vec<String>,
     /// Tools already present (no-op inserts).
     pub already_blocked: Vec<String>,
-    /// Whether `widen_selection` was requested by the strategy.
+    /// Whether `widen_selection` was requested by the strategy (and thus the
+    /// one-shot `state.widen_selection_pending` flag was set).
     pub widen_requested: bool,
+    /// Tools newly added to `state.boosted_tools`.
+    pub newly_boosted: Vec<String>,
+    /// Tools already present in `state.boosted_tools`.
+    pub already_boosted: Vec<String>,
 }
 
 impl StrategyApplication {
     pub fn is_noop(&self) -> bool {
-        self.newly_blocked.is_empty() && !self.widen_requested
+        self.newly_blocked.is_empty()
+            && !self.widen_requested
+            && self.newly_boosted.is_empty()
     }
 
     pub fn summary(&self) -> String {
@@ -124,6 +131,12 @@ impl StrategyApplication {
         }
         if !self.already_blocked.is_empty() {
             parts.push(format!("already_blocked={:?}", self.already_blocked));
+        }
+        if !self.newly_boosted.is_empty() {
+            parts.push(format!("boosted={:?}", self.newly_boosted));
+        }
+        if !self.already_boosted.is_empty() {
+            parts.push(format!("already_boosted={:?}", self.already_boosted));
         }
         if self.widen_requested {
             parts.push("widen_selection=true".to_string());
@@ -139,14 +152,15 @@ impl StrategyApplication {
 /// Apply a pipeline [`StrategyDelta`] to the runtime [`AgenticLoopState`]:
 /// - `block_tools` → inserted into `state.restricted_tools` (the runtime's
 ///   canonical block-list consulted by tool selection and execution policy).
-/// - `widen_selection` → reported in the returned summary for observability;
-///   the tool-selection path reads `restricted_tools` directly, so widening
-///   here effectively means "nothing additional is blocked beyond the newly
-///   added names".
-/// - `add_tools` and `inject_context` are intentionally not applied here:
-///   the runtime has no positive-allowlist channel equivalent to
-///   `TurnState::add_tools`, and injection is already handled textually via
-///   the tactical-action label emitted by [`PipelineDiagnosis`].
+/// - `add_tools` → inserted into `state.boosted_tools` (positive allowlist
+///   that the tool-visibility pipeline removes from the effective restriction
+///   set so the LLM always sees them when advertised by the edge catalogue).
+/// - `widen_selection` → sets the one-shot `state.widen_selection_pending`
+///   flag. The next tool-visibility assembly consumes it and skips the
+///   deprioritized → restricted merge so the full catalogue is re-exposed.
+/// - `inject_context` is intentionally not applied here: context injection is
+///   delivered textually via the tactical-action label emitted by
+///   [`PipelineDiagnosis`].
 pub fn apply_strategy_delta(
     state: &mut AgenticLoopState,
     strategy: &StrategyDelta,
@@ -162,8 +176,20 @@ pub fn apply_strategy_delta(
             app.already_blocked.push(tool.clone());
         }
     }
+    for tool in &strategy.add_tools {
+        if state.boosted_tools.insert(tool.clone()) {
+            app.newly_boosted.push(tool.clone());
+        } else {
+            app.already_boosted.push(tool.clone());
+        }
+    }
+    if strategy.widen_selection {
+        state.widen_selection_pending = true;
+    }
     app.newly_blocked.sort();
     app.already_blocked.sort();
+    app.newly_boosted.sort();
+    app.already_boosted.sort();
     app
 }
 
@@ -239,5 +265,27 @@ mod tests {
                 .block_tools
                 .contains(&"flaky_http".to_string())
         );
+    }
+
+    #[test]
+    fn strategy_application_summary_reflects_widen_and_boost() {
+        // Pure logic test on StrategyApplication (no AgenticLoopState needed).
+        let app = StrategyApplication {
+            newly_blocked: vec!["a".to_string()],
+            already_blocked: vec![],
+            widen_requested: true,
+            newly_boosted: vec!["grep".to_string(), "read".to_string()],
+            already_boosted: vec!["ls".to_string()],
+        };
+        assert!(!app.is_noop());
+        let s = app.summary();
+        assert!(s.contains("blocked=[\"a\"]"), "summary: {s}");
+        assert!(s.contains("boosted=[\"grep\", \"read\"]"), "summary: {s}");
+        assert!(s.contains("already_boosted=[\"ls\"]"), "summary: {s}");
+        assert!(s.contains("widen_selection=true"), "summary: {s}");
+
+        let noop = StrategyApplication::default();
+        assert!(noop.is_noop());
+        assert_eq!(noop.summary(), "noop");
     }
 }
