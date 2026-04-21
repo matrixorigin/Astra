@@ -672,6 +672,70 @@ fn recent_tools_from_context_trace(
     tools
 }
 
+#[derive(Debug, Clone, Default)]
+struct LocalJournalSummary {
+    turn_count: u32,
+    total_tokens_in: u64,
+    total_tokens_out: u64,
+    recent_tools: Vec<String>,
+    model: Option<String>,
+    last_status: String,
+}
+
+fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
+    let (events, _, _) = crate::session_journal::read_journal_for_digest(session_id).ok()?;
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut summary = LocalJournalSummary {
+        last_status: "local".to_string(),
+        ..Default::default()
+    };
+    let mut latest_turn_index: Option<usize> = None;
+
+    for (idx, event) in events.iter().enumerate() {
+        match event.event_type {
+            crate::session_journal::JournalEventType::Turn => {
+                summary.turn_count += 1;
+                summary.total_tokens_in += event.tokens_in.unwrap_or(0);
+                summary.total_tokens_out += event.tokens_out.unwrap_or(0);
+                if event.model.is_some() {
+                    summary.model = event.model.clone();
+                }
+                latest_turn_index = Some(idx);
+            }
+            crate::session_journal::JournalEventType::SessionStart => {
+                if summary.model.is_none() {
+                    summary.model = event.model.clone();
+                }
+            }
+            crate::session_journal::JournalEventType::SessionEnd => {
+                summary.last_status = "completed".to_string();
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(idx) = latest_turn_index
+        && let Some(event) = events.get(idx)
+    {
+        if let Some(tools_used) = event.tools_used.as_ref() {
+            append_unique_tools(&mut summary.recent_tools, tools_used.iter().map(String::as_str));
+        }
+        if summary.recent_tools.is_empty()
+            && let Some(tool_calls) = event.tool_calls.as_ref()
+        {
+            append_unique_tools(
+                &mut summary.recent_tools,
+                tool_calls.iter().map(|call| call.name.as_str()),
+            );
+        }
+    }
+
+    Some(summary)
+}
+
 fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
     if let Some(heavy) = root.get("Heavy") {
         return Some(heavy);
@@ -724,6 +788,7 @@ pub fn parse_cloud_heavy_checkpoint_state(state_json: &str) -> Option<CloudHeavy
 impl SessionRestoreService for HybridRestoreService {
     async fn restore_session(&self, session_id: &str) -> Result<Option<RestoredSession>, String> {
         // Step 1: Try local workspace metadata first
+        let local_journal = summarize_local_journal(session_id);
         if let Some(ws) = self.restore_local_workspace(session_id) {
             let mut recent_tools = if self.pool.is_some() {
                 self.restore_recent_tools(session_id)
@@ -734,6 +799,11 @@ impl SessionRestoreService for HybridRestoreService {
             };
             if recent_tools.is_empty() {
                 recent_tools = recent_tools_from_context_trace(ws.last_context_trace.as_ref());
+            }
+            if recent_tools.is_empty()
+                && let Some(summary) = local_journal.as_ref()
+            {
+                recent_tools = summary.recent_tools.clone();
             }
 
             // Try local learning file
@@ -748,9 +818,17 @@ impl SessionRestoreService for HybridRestoreService {
 
             return Ok(Some(RestoredSession {
                 session_id: session_id.to_string(),
-                turn_count: ws.turn_count,
-                total_tokens_in: ws.total_tokens_in,
-                total_tokens_out: ws.total_tokens_out,
+                turn_count: local_journal
+                    .as_ref()
+                    .map_or(ws.turn_count, |summary| ws.turn_count.max(summary.turn_count)),
+                total_tokens_in: local_journal.as_ref().map_or(ws.total_tokens_in, |summary| {
+                    ws.total_tokens_in.max(summary.total_tokens_in)
+                }),
+                total_tokens_out: local_journal
+                    .as_ref()
+                    .map_or(ws.total_tokens_out, |summary| {
+                        ws.total_tokens_out.max(summary.total_tokens_out)
+                    }),
                 recent_tools,
                 learning_snapshot_json: learning,
                 checkpoint_count: ckpt_count,
@@ -766,6 +844,30 @@ impl SessionRestoreService for HybridRestoreService {
                 contract_json: ws.contract_json,
                 plan_corrections: ws.plan_corrections,
                 last_context_trace: ws.last_context_trace,
+                ..Default::default()
+            }));
+        }
+
+        if let Some(summary) = local_journal {
+            let learning = self
+                .restore_learning("local", "default")
+                .await
+                .unwrap_or(None);
+            let ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+
+            return Ok(Some(RestoredSession {
+                session_id: session_id.to_string(),
+                turn_count: summary.turn_count,
+                total_tokens_in: summary.total_tokens_in,
+                total_tokens_out: summary.total_tokens_out,
+                recent_tools: summary.recent_tools,
+                learning_snapshot_json: learning,
+                checkpoint_count: ckpt_count,
+                last_status: summary.last_status,
+                model: summary.model,
+                restored_from_cloud: false,
                 ..Default::default()
             }));
         }
@@ -1633,6 +1735,10 @@ pub fn extract_plan_from_metadata(
 mod tests {
     use super::*;
     use crate::session_workspace;
+    use crate::session_journal::JournalDirGuard;
+
+    const REAL_SESSION_0AC769_FIXTURE: &str =
+        include_str!("../fixtures/real_session_0ac769_min.jsonl");
 
     // ── RestoredSession ──
 
@@ -1738,6 +1844,61 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_restore_falls_back_to_real_session_journal_without_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        std::fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let restored = svc
+            .restore_session(sid)
+            .await
+            .unwrap()
+            .expect("journal-only session should restore");
+
+        assert_eq!(restored.session_id, sid);
+        assert_eq!(restored.turn_count, 1);
+        assert_eq!(restored.total_tokens_in, 33_659);
+        assert_eq!(restored.total_tokens_out, 2_855);
+        assert_eq!(restored.recent_tools, vec!["git_show", "read_file", "grep"]);
+        assert_eq!(restored.model.as_deref(), Some("glm-5.1"));
+        assert_eq!(restored.last_status, "completed");
+        assert!(!restored.restored_from_cloud);
+    }
+
+    #[tokio::test]
+    async fn local_restore_uses_real_session_journal_tools_when_workspace_has_no_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        std::fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .unwrap();
+
+        let ws = session_workspace::WorkspaceMetadata::with_context(sid, "glm-5.1", "/repo", None);
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let svc = HybridRestoreService::local_only();
+        let restored = svc
+            .restore_session(sid)
+            .await
+            .unwrap()
+            .expect("workspace-backed session should restore");
+
+        assert_eq!(restored.recent_tools, vec!["git_show", "read_file", "grep"]);
+        assert_eq!(restored.turn_count, 1);
+        assert_eq!(restored.total_tokens_in, 33_659);
+        assert_eq!(restored.total_tokens_out, 2_855);
     }
 
     // ── Restored session field coverage ──
