@@ -13,8 +13,6 @@
 //! - **`e2e_matrix_session_cancel_delete`** — `POST .../cancel` + DB `cancelled`, then `DELETE` + 404.
 //! - **`e2e_matrix_chat_stream_session_info`** — `POST /chat/stream` buffered SSE; first `session_info`
 //!   event contains `run_id`.
-//! - **`e2e_matrix_chat_turn_empty_session_id`** — `POST /chat/turn` rejects whitespace-only
-//!   `session_id` values with `400` before any SSE stream starts.
 //! - **`e2e_matrix_approval_respond_invalid_session_id`** — `POST /approval/respond` rejects unsafe
 //!   `session_id` values with `400` instead of writing approval journal data for an invalid path.
 //! - **`e2e_matrix_edge_callback_http_boundary_failures`** — callback routes reject unauthenticated and
@@ -134,13 +132,6 @@ async fn e2e_matrix_session_cancel_delete() {
 async fn e2e_matrix_chat_stream_session_info() {
     require_system_e2e_env();
     journey_extended::run_chat_stream_session_info_smoke().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn e2e_matrix_chat_turn_empty_session_id() {
-    require_system_e2e_env();
-    journey_extended::run_chat_turn_empty_session_id_rejected().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

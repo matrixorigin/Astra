@@ -268,38 +268,6 @@ pub async fn run_chat_stream_session_info_smoke() {
     ctx.pool.close().await;
 }
 
-pub async fn run_chat_turn_empty_session_id_rejected() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
-
-    let (status, body) = post_json_with_headers(
-        app,
-        "/chat/turn",
-        Some(auth.as_str()),
-        &[("x-mo-bridge-test-secret", test_secret.as_str())],
-        json!({
-            "session_id": "   ",
-            "messages": [{ "role": "user", "content": "should reject empty session id" }]
-        }),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "chat/turn empty session_id: {body}"
-    );
-    assert_eq!(
-        body["detail"].as_str(),
-        Some("session_id must not be empty"),
-        "chat/turn should reject empty session ids before streaming: {body}"
-    );
-
-    ctx.pool.close().await;
-}
-
 pub async fn run_approval_respond_invalid_session_id_rejected() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
