@@ -3489,6 +3489,8 @@ mod tests {
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
+    const REAL_SESSION_1D21375_FIXTURE: &str =
+        include_str!("../fixtures/real_session_1d21375_min.jsonl");
 
     fn base_tool_record(name: &str, ok: bool, preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
@@ -3527,7 +3529,11 @@ mod tests {
             .iter()
             .filter(|event| event.event_type == JournalEventType::LlmRound)
             .collect();
-        assert_eq!(llm_rounds.len(), 7, "fixture should preserve the 7-round loop");
+        assert_eq!(
+            llm_rounds.len(),
+            7,
+            "fixture should preserve the 7-round loop"
+        );
 
         let turn = events
             .iter()
@@ -3565,6 +3571,90 @@ mod tests {
             repeat_tools,
             std::collections::BTreeSet::from(["git_show", "read_file"])
         );
+    }
+
+    #[test]
+    fn real_session_followup_fixture_preserves_low_information_repair_pathology() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "1d21375d-18f5-4e53-9145-1fa197b564dd";
+        std::fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_1D21375_FIXTURE,
+        )
+        .unwrap();
+
+        let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(non_empty_lines, 31);
+        assert_eq!(malformed_lines, 0);
+        assert_eq!(events.len(), 31);
+
+        let llm_rounds = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::LlmRound)
+            .count();
+        assert_eq!(
+            llm_rounds, 19,
+            "fixture should preserve the 19-round session"
+        );
+
+        let turn = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == JournalEventType::Turn)
+            .expect("turn event");
+        assert_eq!(turn.turn, Some(3));
+        assert_eq!(turn.user_input.as_deref(), Some("修复?"));
+        assert_eq!(turn.tool_count, Some(16));
+        assert_eq!(turn.llm_rounds, Some(17));
+        assert_eq!(turn.tokens_in, Some(285_235));
+        assert_eq!(turn.tokens_out, Some(4_624));
+        assert_eq!(
+            turn.tool_calls.as_ref().map(Vec::len),
+            Some(16),
+            "fixture should preserve the serial repair spiral"
+        );
+
+        let context = events
+            .iter()
+            .find(|event| {
+                event.event_type == JournalEventType::ContextAssemblyRecorded
+                    && event.turn == Some(3)
+            })
+            .expect("turn 3 context record");
+        let token_budget = &context
+            .context_assembly_trace
+            .as_ref()
+            .expect("context trace")["token_budget"];
+        assert_eq!(token_budget["user_message_tokens"], 3);
+        assert_eq!(token_budget["tool_schema_tokens"], 4_663);
+        assert_eq!(token_budget["system_prompt_tokens"], 3_829);
+        assert_eq!(token_budget["compression_triggered"], false);
+
+        let stall_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::StallDetected)
+            .count();
+        let verdict_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::TurnGuardVerdict)
+            .count();
+        assert_eq!(stall_count, 1);
+        assert_eq!(verdict_count, 1);
+
+        let eval = events
+            .iter()
+            .find(|event| {
+                event.event_type == JournalEventType::TurnEvaluation && event.turn == Some(3)
+            })
+            .expect("turn 3 evaluation");
+        let metadata = eval.metadata.as_ref().expect("turn evaluation metadata");
+        assert_eq!(metadata["quality"], 0.2);
+        assert_eq!(metadata["confidence"], 0.7);
+        assert_eq!(metadata["stall_count"], 1);
+        assert_eq!(metadata["success"], false);
+        assert_eq!(metadata["tool_call_count"], 16);
+        assert_eq!(metadata["verdict_warning"], true);
     }
 
     #[test]

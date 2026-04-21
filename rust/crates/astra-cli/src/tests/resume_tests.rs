@@ -47,6 +47,9 @@ impl Drop for EnvVarGuard {
 
 use astra_services::TaskService as _;
 
+const REAL_SESSION_1D21375_FIXTURE: &str =
+    include_str!("../../../services/fixtures/real_session_1d21375_min.jsonl");
+
 #[tokio::test]
 async fn find_task_by_id_prefix() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -534,6 +537,144 @@ async fn crash_recovery_short_continue_restores_and_replays_context_online() {
     assert!(state.resume_guidance.is_none());
 }
 
+#[tokio::test]
+async fn crash_recovery_low_information_repair_followup_rebuilds_attachment() {
+    let _creds = isolate_credentials();
+    let temp = tempfile::tempdir().unwrap();
+    let _sessions = session_journal::JournalDirGuard::new(temp.path());
+    let sid = "1d21375d-18f5-4e53-9145-1fa197b564dd".to_string();
+    let current_cwd = std::env::current_dir().unwrap();
+    let current_cwd_str = current_cwd.display().to_string();
+    let current_git_root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    std::fs::write(
+        temp.path().join(format!("{sid}.jsonl")),
+        REAL_SESSION_1D21375_FIXTURE,
+    )
+    .unwrap();
+
+    let mut ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
+        &sid,
+        "qwen3.6-plus",
+        &current_cwd_str,
+        Some("main"),
+    );
+    ws.git_root = current_git_root;
+    ws.turn_count = 3;
+    ws.total_tokens_in = 311262;
+    ws.total_tokens_out = 6995;
+    astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+    let mut creds = CredentialsFile::default();
+    creds.profiles.insert(
+        "default".to_string(),
+        Profile {
+            last_session_id: Some(sid.clone()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&creds).unwrap();
+
+    let mut state = repl_runtime::initialize_repl_state(None, Some("qwen3.6-plus"));
+    assert_eq!(state.pending_recovery.as_deref(), Some(sid.as_str()));
+
+    #[derive(Clone)]
+    struct MockState {
+        requests: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    let mock_state = MockState {
+        requests: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let recovered_session_id = "repair-recovery-session".to_string();
+    let app =
+        Router::new()
+            .route(
+                "/sessions",
+                post({
+                    let recovered_session_id = recovered_session_id.clone();
+                    move || {
+                        let recovered_session_id = recovered_session_id.clone();
+                        async move {
+                            axum::Json(serde_json::json!({ "session_id": recovered_session_id }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/chat/turn",
+                post({
+                    let mock_state = mock_state.clone();
+                    let sid = sid.clone();
+                    let recovered_session_id = recovered_session_id.clone();
+                    move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let mock_state = mock_state.clone();
+                        let sid = sid.clone();
+                        let recovered_session_id = recovered_session_id.clone();
+                        async move {
+                            mock_state.requests.lock().await.push(body.clone());
+                            if body.get("session_id").and_then(serde_json::Value::as_str)
+                                == Some(sid.as_str())
+                            {
+                                (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({ "error": "session not found" })),
+                                )
+                                    .into_response()
+                            } else {
+                                (
+                                    [("content-type", "text/event-stream")],
+                                    sse_text_response("Patched.", &recovered_session_id),
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }
+                }),
+            );
+
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+        edge_tools::all_tool_schemas(),
+    ));
+
+    handle_chat_input(
+        "修复?".to_string(),
+        Some("fake-token"),
+        &mut state,
+        ReplTurnContext {
+            api: &api,
+            profile: None,
+            selector: &selector,
+        },
+    )
+    .await
+    .unwrap();
+
+    let requests = mock_state.requests.lock().await.clone();
+    let resumed = requests
+        .iter()
+        .find(|req| req.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str()))
+        .expect("expected first recovered request to target stale session id");
+    let resumed_text = resumed.to_string();
+    assert!(resumed_text.contains("[Active task attachment]"));
+    assert!(resumed_text.contains("review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b"));
+    assert!(resumed_text.contains("Two independent fixes in one commit. Let me review each."));
+    assert!(resumed_text.contains("thread leak on timeout"));
+    assert!(resumed_text.contains("[User follow-up]\\n修复?"));
+    assert_eq!(state.pending_recovery, None);
+    assert_eq!(
+        state.session_id.as_deref(),
+        Some(recovered_session_id.as_str())
+    );
+}
+
 // ── Learning snapshot restoration ────────────────────────────────────────
 
 #[tokio::test]
@@ -666,13 +807,18 @@ async fn resume_handles_malformed_workspace_yaml() {
     std::fs::create_dir_all(&ws_dir).unwrap();
     std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
 
-    // Should return None for malformed workspace
+    // Malformed workspace now falls back to journal-only local restore.
     let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let result = svc.restore_session(&sid).await.unwrap();
-    assert!(
-        result.is_none(),
-        "malformed workspace.yaml should cause restore to return None"
-    );
+    let result = svc
+        .restore_session(&sid)
+        .await
+        .unwrap()
+        .expect("malformed workspace should still restore from journal");
+    assert_eq!(result.session_id, sid);
+    assert_eq!(result.turn_count, 0);
+    assert_eq!(result.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(result.last_status, "local");
+    assert!(!result.restored_from_cloud);
 }
 
 #[tokio::test]
@@ -680,7 +826,7 @@ async fn resume_handles_missing_workspace() {
     let _creds = isolate_credentials();
     use astra_services::session_restore::SessionRestoreService;
 
-    // Only journal, no workspace → should fall back to cloud (which returns None)
+    // Only journal, no workspace → local journal-only restore should still work.
     let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
     let writer = session_journal::JournalWriter::new(&sid).unwrap();
     writer
@@ -692,11 +838,16 @@ async fn resume_handles_missing_workspace() {
     drop(writer);
 
     let svc = astra_services::session_restore::HybridRestoreService::local_only();
-    let result = svc.restore_session(&sid).await.unwrap();
-    assert!(
-        result.is_none(),
-        "session without workspace.yaml should return None"
-    );
+    let result = svc
+        .restore_session(&sid)
+        .await
+        .unwrap()
+        .expect("journal-only session should restore");
+    assert_eq!(result.session_id, sid);
+    assert_eq!(result.turn_count, 0);
+    assert_eq!(result.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(result.last_status, "local");
+    assert!(!result.restored_from_cloud);
 }
 
 // ── Integration: full resume flow simulation ─────────────────────────────

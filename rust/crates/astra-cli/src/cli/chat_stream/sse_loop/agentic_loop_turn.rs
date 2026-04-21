@@ -4,6 +4,7 @@
 //! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
 //! `fetch_chat_turn_sse` for use by [`super::cli_loop_host::CliAgenticLoopHost`].
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -103,6 +104,76 @@ fn message_has_tool_calls(m: &Value) -> bool {
     m.get("tool_calls")
         .and_then(Value::as_array)
         .is_some_and(|calls| !calls.is_empty())
+}
+
+fn semantic_query_from_message(message: &str) -> Cow<'_, str> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with("[Active task attachment]") {
+        return Cow::Borrowed(message);
+    }
+
+    let mut latest_task = None;
+    let mut assistant_summary = Vec::new();
+    let mut followup = Vec::new();
+    let mut in_summary = false;
+    let mut in_followup = false;
+
+    for line in trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(rest) = line.strip_prefix("Latest user task: ") {
+            latest_task = Some(rest.to_string());
+            in_summary = false;
+            in_followup = false;
+            continue;
+        }
+        if line == "Latest assistant summary:" {
+            in_summary = true;
+            in_followup = false;
+            continue;
+        }
+        if line == "[User follow-up]" {
+            in_summary = false;
+            in_followup = true;
+            continue;
+        }
+        if line.starts_with("Recent tools: ") || line.starts_with("Artifact: ") {
+            in_summary = false;
+            in_followup = false;
+            continue;
+        }
+        if in_summary && assistant_summary.len() < 3 {
+            assistant_summary.push(line.to_string());
+        } else if in_followup {
+            followup.push(line.to_string());
+        }
+    }
+
+    let mut parts = Vec::new();
+    if let Some(task) = latest_task {
+        parts.push(format!("Task: {task}"));
+    }
+    if !assistant_summary.is_empty() {
+        parts.push(format!(
+            "Assistant summary: {}",
+            assistant_summary.join(" ")
+        ));
+    }
+    if !followup.is_empty() {
+        parts.push(format!("Follow-up: {}", followup.join(" ")));
+    }
+
+    if parts.is_empty() {
+        Cow::Borrowed(message)
+    } else {
+        Cow::Owned(parts.join("\n"))
+    }
+}
+
+fn should_skip_memory_boost(message: &str, history: &[(String, String)]) -> bool {
+    !history.is_empty() && matches!(semantic_query_from_message(message), Cow::Owned(_))
 }
 
 fn retained_history_messages(messages: &[Value]) -> &[Value] {
@@ -289,47 +360,64 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         budget_pressure_for_chat_turn(ctx.messages, ctx.model, schema_tokens as usize)
     };
 
-    let mut boost_terms =
-        astra_runtime::turn::retrieval::extract_boost_terms_from_pairs(ctx.history, ctx.message);
+    let semantic_query = semantic_query_from_message(ctx.message);
+    let semantic_query_str = semantic_query.as_ref();
+    let mut boost_terms = astra_runtime::turn::retrieval::extract_boost_terms_from_pairs(
+        ctx.history,
+        semantic_query_str,
+    );
     {
-        let mem_start = Instant::now();
-        let memory_hits = ctx.executor.memory_boost_search(ctx.message, 5).await;
-        let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
-        record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
-
-        // Always record memory retrieval trace, even when no hits (for observability)
-        let memory_contents: Vec<String> = memory_hits.iter().map(|h| h.content.clone()).collect();
-        let ranked = if memory_contents.is_empty() {
-            Vec::new()
-        } else {
-            astra_runtime::turn::retrieval::rank_memory_results(ctx.message, &memory_contents)
-        };
-        if let Some(collector) = ctx.telem.trace_collector {
-            collector.record_memory_retrieval(
-                ctx.message,
-                memory_contents.len() as u32,
-                &ranked,
-                mem_latency_ms,
-            );
-        }
-
-        if !memory_hits.is_empty() {
-            for content in &memory_contents {
-                for repo in extract_repos_from_memory(content) {
-                    ctx.executor.add_preferred_repo(&repo);
-                }
+        if should_skip_memory_boost(ctx.message, ctx.history) {
+            if let Some(collector) = ctx.telem.trace_collector {
+                collector.record_memory_retrieval(semantic_query_str, 0, &[], 0);
             }
-            astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
-                &mut boost_terms,
-                ctx.message,
-                &ranked,
-            );
-            // Send "useful" feedback for retrieved memories (fire-and-forget)
-            let feedback_ids: Vec<String> = memory_hits
-                .iter()
-                .filter_map(|h| h.memory_id.clone())
-                .collect();
-            ctx.executor.memory_feedback_useful(feedback_ids);
+        } else {
+            let mem_start = Instant::now();
+            let memory_hits = ctx
+                .executor
+                .memory_boost_search(semantic_query_str, 5)
+                .await;
+            let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
+            record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
+
+            // Always record memory retrieval trace, even when no hits (for observability)
+            let memory_contents: Vec<String> =
+                memory_hits.iter().map(|h| h.content.clone()).collect();
+            let ranked = if memory_contents.is_empty() {
+                Vec::new()
+            } else {
+                astra_runtime::turn::retrieval::rank_memory_results(
+                    semantic_query_str,
+                    &memory_contents,
+                )
+            };
+            if let Some(collector) = ctx.telem.trace_collector {
+                collector.record_memory_retrieval(
+                    semantic_query_str,
+                    memory_contents.len() as u32,
+                    &ranked,
+                    mem_latency_ms,
+                );
+            }
+
+            if !memory_hits.is_empty() {
+                for content in &memory_contents {
+                    for repo in extract_repos_from_memory(content) {
+                        ctx.executor.add_preferred_repo(&repo);
+                    }
+                }
+                astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
+                    &mut boost_terms,
+                    semantic_query_str,
+                    &ranked,
+                );
+                // Send "useful" feedback for retrieved memories (fire-and-forget)
+                let feedback_ids: Vec<String> = memory_hits
+                    .iter()
+                    .filter_map(|h| h.memory_id.clone())
+                    .collect();
+                ctx.executor.memory_feedback_useful(feedback_ids);
+            }
         }
     }
     log_chat_turn_timing_phase(timing, "memory_boost_search", &mut mark);
@@ -341,13 +429,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let restricted_vec: Vec<String> = ctx.restricted_tools.iter().cloned().collect();
 
     ctx.step_recorder.record_perceive(
-        ctx.message,
+        semantic_query_str,
         &[],
         &domain_hints_debug_strings(&memory_domain_hints),
         &boost_terms,
     );
 
-    let learned_context = ctx.selector.learned_context(ctx.message, ctx.recent_tools);
+    let learned_context = ctx
+        .selector
+        .learned_context(semantic_query_str, ctx.recent_tools);
     let learned_context_hint = learned_context.prompt_fragment();
     let learned_task_type = learned_context.task_archetype_payload_token();
 
@@ -368,7 +458,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Scanning context…");
         let sel_ctx = build_agentic_tool_selection_context(
-            ctx.message,
+            semantic_query_str,
             ctx.history.len(),
             ctx.recent_tools,
             ctx.registry,
@@ -424,7 +514,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     } else {
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Continuing…");
         let sel_ctx = build_agentic_tool_selection_context(
-            ctx.message,
+            semantic_query_str,
             ctx.history.len(),
             ctx.recent_tools,
             ctx.registry,
@@ -1076,6 +1166,50 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "system");
         assert!(!turns[0].has_tool_calls);
+    }
+
+    #[test]
+    fn semantic_query_from_attachment_compacts_wrapper_text() {
+        let message = "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+Latest user task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b\n\
+Latest assistant summary:\n\
+## Review: `aa1f419b` — P5 git timeout, P6 compression protection\n\
+Two independent fixes in one commit. Let me review each.\n\
+P5 still has a thread leak on timeout; terminate the child before returning.\n\n\
+[User follow-up]\n修复?";
+        let semantic = super::semantic_query_from_message(message);
+        let semantic = semantic.as_ref();
+
+        assert!(semantic.contains("Task: review 这个: aa1f419bc040003f5de8cdfa6b414225ade82e2b"));
+        assert!(semantic.contains("Assistant summary: ## Review: `aa1f419b`"));
+        assert!(semantic.contains("Follow-up: 修复?"));
+        assert!(!semantic.contains("[Active task attachment]"));
+        assert!(!semantic.contains("Treat brief follow-ups"));
+    }
+
+    #[test]
+    fn plain_message_keeps_borrowed_semantic_query() {
+        let semantic = super::semantic_query_from_message("fix the timeout path");
+        assert!(matches!(semantic, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(semantic.as_ref(), "fix the timeout path");
+    }
+
+    #[test]
+    fn active_task_attachment_skips_memory_boost_once_history_exists() {
+        let history = vec![(
+            "review 这个: aa1f419b".to_string(),
+            "Need to fix timeout.".to_string(),
+        )];
+        let attachment = "[Active task attachment]\nLatest user task: review 这个: aa1f419b\nLatest assistant summary:\nNeed to fix timeout.\n\n[User follow-up]\n修复?";
+        assert!(super::should_skip_memory_boost(attachment, &history));
+        assert!(!super::should_skip_memory_boost(attachment, &[]));
+        assert!(!super::should_skip_memory_boost(
+            "fix the timeout path",
+            &history
+        ));
     }
 
     #[test]

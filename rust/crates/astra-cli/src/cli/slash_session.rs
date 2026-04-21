@@ -4766,6 +4766,7 @@ async fn apply_restored_session(
             .find(|e| e.event_type == session_journal::JournalEventType::Turn)
             .cloned();
     }
+    repl_turn::rebuild_continuation_anchor_from_state(state);
 
     if let Some(ref json) = restored.executing_plan_json {
         state.executing_plan = serde_json::from_str(json).ok();
