@@ -343,7 +343,15 @@ pub(super) async fn handle_chat_input(
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success_async(state, ctx.selector, ctx.profile, &line, result, turn_start).await;
+                apply_turn_success_async(
+                    state,
+                    ctx.selector,
+                    ctx.profile,
+                    &line,
+                    result,
+                    turn_start,
+                )
+                .await;
                 return Ok(());
             }
             Err(failure) => {
@@ -390,7 +398,8 @@ pub(super) async fn handle_chat_input(
                                     &line,
                                     result,
                                     turn_start,
-                                ).await;
+                                )
+                                .await;
                                 return Ok(());
                             }
                             Err(retry_failure) => {
@@ -436,7 +445,8 @@ pub(super) async fn handle_chat_input(
                                             &line,
                                             result,
                                             turn_start,
-                                        ).await;
+                                        )
+                                        .await;
                                         return Ok(());
                                     }
                                     Err(retry_failure) => {
@@ -2017,8 +2027,7 @@ pub(crate) async fn try_llm_skill_improvement(
             &recent,
         );
     let analysis_resp = llm.complete(&analysis_system, &analysis_user).await?;
-    let improvements =
-        astra_runtime::skills::improvement::parse_improvements(&analysis_resp);
+    let improvements = astra_runtime::skills::improvement::parse_improvements(&analysis_resp);
     if improvements.is_empty() {
         state.skill_improvement_tracker.mark_analyzed(state.turn);
         return Ok(true);
@@ -2030,9 +2039,8 @@ pub(crate) async fn try_llm_skill_improvement(
     let rewrite_system =
         "You are editing a skill definition file. Output only the <updated_file> block.";
     let rewrite_resp = llm.complete(rewrite_system, &rewrite_prompt).await?;
-    let new_content =
-        astra_runtime::skills::improvement::extract_updated_content(&rewrite_resp)
-            .ok_or_else(|| "LLM response missing <updated_file> block".to_string())?;
+    let new_content = astra_runtime::skills::improvement::extract_updated_content(&rewrite_resp)
+        .ok_or_else(|| "LLM response missing <updated_file> block".to_string())?;
 
     astra_runtime::skills::improvement::apply_improvement(&skill_md, &new_content)
         .map_err(|e| format!("failed to write {}: {}", skill_md.display(), e))?;
@@ -4836,11 +4844,7 @@ mod tests {
             recent_tools: vec!["my-skill".to_string()],
             ..Default::default()
         };
-        assert!(
-            state
-                .skill_improvement_tracker
-                .should_analyze(state.turn)
-        );
+        assert!(state.skill_improvement_tracker.should_analyze(state.turn));
 
         // 4. Run the closed loop.
         check_skill_improvement_inner(&mut state);
@@ -4874,9 +4878,7 @@ mod tests {
 
         // 5c. Tracker advanced past should_analyze.
         assert!(
-            !state
-                .skill_improvement_tracker
-                .should_analyze(state.turn),
+            !state.skill_improvement_tracker.should_analyze(state.turn),
             "tracker must advance last_analyzed_count"
         );
     }
@@ -5029,10 +5031,7 @@ mod tests {
         let wrapped_rewrite = format!("<updated_file>\n{}\n</updated_file>", rewritten);
 
         let llm = FakeLlm {
-            responses: std::sync::Mutex::new(vec![
-                analysis.to_string(),
-                wrapped_rewrite,
-            ]),
+            responses: std::sync::Mutex::new(vec![analysis.to_string(), wrapped_rewrite]),
         };
 
         let ok = try_llm_skill_improvement(&mut state, &llm)
@@ -5061,9 +5060,7 @@ mod tests {
         assert_eq!(pending.improvements[0].section, "greeting");
 
         assert!(
-            !state
-                .skill_improvement_tracker
-                .should_analyze(state.turn),
+            !state.skill_improvement_tracker.should_analyze(state.turn),
             "tracker must advance"
         );
     }
@@ -5088,10 +5085,7 @@ mod tests {
 
         let mut state = ReplState {
             unified_skill_registry: std::sync::Arc::new(registry),
-            history: vec![(
-                "no, that's wrong".to_string(),
-                "sorry".to_string(),
-            )],
+            history: vec![("no, that's wrong".to_string(), "sorry".to_string())],
             turn: astra_runtime::skills::improvement::TURN_BATCH_SIZE + 1,
             recent_tools: vec!["my-skill".to_string()],
             ..Default::default()
@@ -5121,8 +5115,7 @@ mod tests {
         let skill_dir = tmp.path().join("my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let skill_md = skill_dir.join("SKILL.md");
-        let original =
-            "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
+        let original = "---\nname: my-skill\ndescription: test\nversion: \"0.1.0\"\n---\n\n# Body\nOriginal.\n";
         std::fs::write(&skill_md, original).unwrap();
 
         let mut registry = astra_runtime::skills::UnifiedSkillRegistry::new();
