@@ -2632,32 +2632,24 @@ mod tests {
 
     #[test]
     fn build_system_prompt_trace_guidance_signals_only() {
-        use crate::turn::context_assembly_trace::{
-            PromptContextSignals, PromptGuidanceSignals, PromptTraceSignals,
-        };
-        let (_, _, prompt_sections) = build_system_message(
-            &["bash"],
-            "dynamic",
-            0.5,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-        );
-        let breakdown = prompts::build_system_prompt_trace_with_signals(
-            &prompt_sections,
-            vec![],
-            vec![],
-            PromptTraceSignals {
-                context_signals: PromptContextSignals::default(),
+        use crate::prompts::{CacheScope, PromptSection, PromptTokenBucket};
+        use crate::turn::context_assembly_trace::{PromptGuidanceSignals, PromptTraceSignals};
+
+        let section = PromptSection {
+            text: "round budget warning".to_string(),
+            scope: CacheScope::None,
+            token_bucket: PromptTokenBucket::Environment,
+            trace_signals: PromptTraceSignals {
                 guidance_signals: PromptGuidanceSignals {
                     round_budget_warning: true,
                     synthesize_or_batch: true,
                     parallel_feedback: false,
                 },
+                ..Default::default()
             },
-        );
-        // context signals untouched
+        };
+        let breakdown = prompts::build_system_prompt_trace(&[section], vec![], vec![]);
         assert!(!breakdown.context_signals.active_output_skills);
-        // guidance signals propagated
         assert!(breakdown.guidance_signals.round_budget_warning);
         assert!(breakdown.guidance_signals.synthesize_or_batch);
         assert!(!breakdown.guidance_signals.parallel_feedback);
