@@ -3989,12 +3989,14 @@ async fn context_meta_exposes_late_round_guidance_signals() {
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r3"));
-    let status = post_tool_result(&app, "tc-guidance-r3", "src/main.rs:12:// TODO", "success").await;
+    let status =
+        post_tool_result(&app, "tc-guidance-r3", "src/main.rs:12:// TODO", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r4a"));
-    let status = post_tool_result(&app, "tc-guidance-r4a", "src/lib.rs:5:// FIXME", "success").await;
+    let status =
+        post_tool_result(&app, "tc-guidance-r4a", "src/lib.rs:5:// FIXME", "success").await;
     assert_eq!(status, StatusCode::OK);
 
     let request = wait_for_sse(&mut rx, "tool_request", 5).await;
@@ -4036,6 +4038,41 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]
             .is_boolean(),
         "context_meta should expose the parallel_feedback flag"
+    );
+}
+
+#[tokio::test]
+async fn context_meta_exposes_memory_signal_context_flag() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "remember that I prefer dark mode",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "Stored." }]
+            }
+        }),
+    )
+    .await;
+
+    let context_meta = find_events(&events, "context_meta")
+        .into_iter()
+        .find(|event| {
+            event["system_prompt_breakdown"]["context_signals"]["memory_signal_detected"].as_bool()
+                == Some(true)
+        })
+        .expect("memory-signal context_meta event");
+
+    assert_eq!(
+        context_meta["system_prompt_breakdown"]["context_signals"]["memory_signal_detected"]
+            .as_bool(),
+        Some(true)
+    );
+    assert!(
+        context_meta["system_prompt_breakdown"]["context_signals"]["active_output_skills"]
+            .is_boolean(),
+        "context_meta should expose the other context flags as structured booleans"
     );
 }
 

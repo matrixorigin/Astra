@@ -829,7 +829,8 @@ pub fn apply_overrides(sections: &mut [PromptSection], overrides: &PromptOverrid
 // ── System Prompt Tracing ─────────────────────────────────────────────────────
 
 use crate::turn::context_assembly_trace::{
-    MemoryInjection, PromptGuidanceSignals, SkillInjection, SystemPromptBreakdown,
+    MemoryInjection, PromptContextSignals, PromptGuidanceSignals, SkillInjection,
+    SystemPromptBreakdown,
 };
 
 /// Build a trace breakdown from prompt sections.
@@ -846,6 +847,7 @@ pub fn build_system_prompt_trace(
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
     let mut user_preferences_tokens = 0u32;
+    let mut context_signals = PromptContextSignals::default();
     let mut guidance_signals = PromptGuidanceSignals::default();
     let mut total_tokens = 0u32;
 
@@ -862,6 +864,33 @@ pub fn build_system_prompt_trace(
         }
         if text.contains("✓ Previous round:") {
             guidance_signals.parallel_feedback = true;
+        }
+        if text.contains("## Active Output Skills") {
+            context_signals.active_output_skills = true;
+        }
+        if text.contains("## Learned Runtime Context") {
+            context_signals.learned_runtime_context = true;
+        }
+        if text.contains("⚡ MEMORY SIGNAL DETECTED") {
+            context_signals.memory_signal_detected = true;
+        }
+        if text.contains("## Effort Level") {
+            context_signals.effort_hint = true;
+        }
+        if text.contains("## Agent Type") {
+            context_signals.agent_type_hint = true;
+        }
+        if text.contains("## Self-Awareness") {
+            context_signals.self_awareness = true;
+        }
+        if text.contains("[Session Feedback]") {
+            context_signals.implicit_feedback = true;
+        }
+        if text.contains("[Learned Feedback Rules]") {
+            context_signals.learned_feedback_rules = true;
+        }
+        if text.contains("[session-anchor]") {
+            context_signals.session_anchor = true;
         }
 
         match section.scope {
@@ -910,6 +939,7 @@ pub fn build_system_prompt_trace(
         environment_tokens,
         repository_memories,
         user_preferences_tokens,
+        context_signals,
         guidance_signals,
         total_tokens,
     }
@@ -2653,5 +2683,33 @@ mod tests {
         assert!(breakdown.guidance_signals.round_budget_warning);
         assert!(breakdown.guidance_signals.synthesize_or_batch);
         assert!(breakdown.guidance_signals.parallel_feedback);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_records_dynamic_context_signals() {
+        let sections = vec![PromptSection {
+            text: "\n\n## Active Output Skills\nconcise\n\
+                   \n\n## Learned Runtime Context\nmatrixorigin => github\n\
+                   \n\n## Effort Level\nhigh\n\
+                   \n\n## Agent Type\nreviewer\n\
+                   \n\n⚡ MEMORY SIGNAL DETECTED: category=\"preference\", namespace=\"user.preferences\"\n\
+                   \n\n## Self-Awareness\nworking set stable\n\
+                   \n\n[Session Feedback] The user expressed dissatisfaction.\n\
+                   \n\n[Learned Feedback Rules]\n- prefer batching\n\
+                   \n\n[session-anchor] Review the timeout path. Currently: validating. 2/3 steps."
+                .to_string(),
+            scope: CacheScope::None,
+        }];
+
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        assert!(breakdown.context_signals.active_output_skills);
+        assert!(breakdown.context_signals.learned_runtime_context);
+        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(breakdown.context_signals.effort_hint);
+        assert!(breakdown.context_signals.agent_type_hint);
+        assert!(breakdown.context_signals.self_awareness);
+        assert!(breakdown.context_signals.implicit_feedback);
+        assert!(breakdown.context_signals.learned_feedback_rules);
+        assert!(breakdown.context_signals.session_anchor);
     }
 }

@@ -2070,6 +2070,43 @@ mod tests {
     }
 
     #[test]
+    fn build_system_messages_cached_records_dynamic_context_signals() {
+        let mut profile = Map::new();
+        profile.insert("active_skills".to_string(), json!(["concise"]));
+        profile.insert(
+            "learned_context_hint".to_string(),
+            json!("matrixorigin => github"),
+        );
+
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(profile)
+        .build();
+
+        let mut state = create_test_state();
+        state.skills.effort = Some(crate::skills::manifest::EffortLevel::High);
+        state.skills.agent_type = Some("reviewer".to_string());
+
+        let (_, _, breakdown) = host.build_system_messages_cached(
+            "remember that I prefer dark mode",
+            &host.edge_tools,
+            &state,
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
+        );
+
+        assert!(breakdown.context_signals.active_output_skills);
+        assert!(breakdown.context_signals.learned_runtime_context);
+        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(breakdown.context_signals.effort_hint);
+        assert!(breakdown.context_signals.agent_type_hint);
+    }
+
+    #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
             full_text: "Hello world".to_string(),

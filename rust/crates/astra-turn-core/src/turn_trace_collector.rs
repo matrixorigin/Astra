@@ -454,6 +454,7 @@ mod tests {
             base_persona_tokens: 8000,
             environment_tokens: 300,
             user_preferences_tokens: 100,
+            context_signals: Default::default(),
             guidance_signals: Default::default(),
             skills_injected: vec![SkillInjection {
                 skill_name: "review".into(),
