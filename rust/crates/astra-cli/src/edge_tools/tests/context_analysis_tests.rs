@@ -14,6 +14,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
             base_persona_tokens: 500,
             environment_tokens: 200,
             user_preferences_tokens: 100,
+            guidance_signals: Default::default(),
             skills_injected: vec![SkillInjection {
                 skill_name: "code-review".to_string(),
                 skill_version: Some("1.0".to_string()),

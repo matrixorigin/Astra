@@ -727,7 +727,11 @@ struct MockToolScenario {
 
 async fn run_mock_tool_scenario(case: MockToolScenario) {
     let (app, hook_writer, _observer, tool_writer) = build_test_app_with_hooks();
-    let edge_tools: Vec<Value> = case.edge_tools.iter().map(|tool| tool_schema(tool)).collect();
+    let edge_tools: Vec<Value> = case
+        .edge_tools
+        .iter()
+        .map(|tool| tool_schema(tool))
+        .collect();
 
     if case.steps.is_empty() {
         let events = chat_stream_collect(
@@ -822,7 +826,12 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
             step.request_id
         );
         let status = post_tool_result(&app, step.request_id, step.result_output, "success").await;
-        assert_eq!(status, StatusCode::OK, "{}: tool result accepted", case.name);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}: tool result accepted",
+            case.name
+        );
     }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -849,10 +858,7 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
 
     let plans = hook_writer.plans.lock().await;
     let plan = plans.last().expect("tool hook plan");
-    let audit = plan
-        .decision_audit
-        .as_ref()
-        .expect("tool decision audit");
+    let audit = plan.decision_audit.as_ref().expect("tool decision audit");
     assert_eq!(
         audit.decision_type, "tool_selection",
         "{}: tool case should persist tool_selection",
@@ -3930,6 +3936,107 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
     for case in cases {
         run_mock_tool_scenario(case).await;
     }
+}
+
+#[tokio::test]
+async fn context_meta_exposes_late_round_guidance_signals() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "inspect the project files",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r1", "read_file", json!({"path": "README.md"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r2", "list_dir", json!({"path": "."}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r3", "grep", json!({"pattern": "TODO", "path": "."}))]
+                    },
+                    {
+                        "tool_calls": [
+                            tool_call("tc-guidance-r4a", "grep", json!({"pattern": "FIXME", "path": "."})),
+                            tool_call("tc-guidance-r4b", "glob", json!({"pattern": "**/*.rs"}))
+                        ]
+                    },
+                    { "full_text": "Done." }
+                ],
+                "edge_tools": [
+                    tool_schema("read_file"),
+                    tool_schema("list_dir"),
+                    tool_schema("grep"),
+                    tool_schema("glob")
+                ]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r1"));
+    let status = post_tool_result(&app, "tc-guidance-r1", "README contents", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r2"));
+    let status = post_tool_result(&app, "tc-guidance-r2", "src\nREADME.md", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r3"));
+    let status = post_tool_result(&app, "tc-guidance-r3", "src/main.rs:12:// TODO", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r4a"));
+    let status = post_tool_result(&app, "tc-guidance-r4a", "src/lib.rs:5:// FIXME", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r4b"));
+    let status = post_tool_result(&app, "tc-guidance-r4b", "src/main.rs", "success").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+
+    let late_round_context = find_events(&events, "context_meta")
+        .into_iter()
+        .find(|event| {
+            event["system_prompt_breakdown"]["guidance_signals"]["synthesize_or_batch"].as_bool()
+                == Some(true)
+        })
+        .expect("late-round context_meta event");
+
+    assert!(
+        late_round_context["system_prompt_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "context_meta should expose prompt token estimates"
+    );
+    assert_eq!(
+        late_round_context["system_prompt_breakdown"]["guidance_signals"]["round_budget_warning"]
+            .as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        late_round_context["system_prompt_breakdown"]["guidance_signals"]["synthesize_or_batch"]
+            .as_bool(),
+        Some(true)
+    );
+    assert!(
+        late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]
+            .is_boolean(),
+        "context_meta should expose the parallel_feedback flag"
+    );
 }
 
 /// Low-information repair follow-up stays scoped when the caller provides an active-task attachment.

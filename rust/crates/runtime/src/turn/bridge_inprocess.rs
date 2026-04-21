@@ -1186,6 +1186,7 @@ impl InProcessChatTurnBridge {
                             "base_persona_tokens": breakdown.base_persona_tokens,
                             "environment_tokens": breakdown.environment_tokens,
                             "user_preferences_tokens": breakdown.user_preferences_tokens,
+                            "guidance_signals": breakdown.guidance_signals,
                             "skills_injected": breakdown.skills_injected,
                             "repository_memories": breakdown.repository_memories,
                             "total_tokens": breakdown.total_tokens,

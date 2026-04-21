@@ -828,7 +828,9 @@ pub fn apply_overrides(sections: &mut [PromptSection], overrides: &PromptOverrid
 
 // ── System Prompt Tracing ─────────────────────────────────────────────────────
 
-use crate::turn::context_assembly_trace::{MemoryInjection, SkillInjection, SystemPromptBreakdown};
+use crate::turn::context_assembly_trace::{
+    MemoryInjection, PromptGuidanceSignals, SkillInjection, SystemPromptBreakdown,
+};
 
 /// Build a trace breakdown from prompt sections.
 ///
@@ -844,11 +846,23 @@ pub fn build_system_prompt_trace(
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
     let mut user_preferences_tokens = 0u32;
+    let mut guidance_signals = PromptGuidanceSignals::default();
     let mut total_tokens = 0u32;
 
     for section in sections {
         let tokens = estimate_section_tokens(&section.text);
         total_tokens += tokens;
+        let text = &section.text;
+        if text.contains("## ⚡ Round Budget Warning") || text.contains("## 🚨 Round Limit Reached")
+        {
+            guidance_signals.round_budget_warning = true;
+        }
+        if text.contains("## Synthesize Or Batch Now") {
+            guidance_signals.synthesize_or_batch = true;
+        }
+        if text.contains("✓ Previous round:") {
+            guidance_signals.parallel_feedback = true;
+        }
 
         match section.scope {
             CacheScope::Global => {
@@ -863,7 +877,6 @@ pub fn build_system_prompt_trace(
             CacheScope::None => {
                 // Dynamic sections = profile, environment, preferences
                 // Try to categorize based on content markers
-                let text = &section.text;
                 if text.contains("cwd:")
                     || text.contains("git_branch:")
                     || text.contains("## Environment")
@@ -897,6 +910,7 @@ pub fn build_system_prompt_trace(
         environment_tokens,
         repository_memories,
         user_preferences_tokens,
+        guidance_signals,
         total_tokens,
     }
 }
@@ -2620,5 +2634,24 @@ mod tests {
             guidance.contains("2 tools executed in parallel"),
             "guidance should preserve parallel batching feedback"
         );
+    }
+
+    #[test]
+    fn build_system_prompt_trace_records_guidance_signals() {
+        let sections = vec![PromptSection {
+            text: tool_round_guidance(
+                &[
+                    serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+                    serde_json::json!({"role": "tool", "content": "README.md"}),
+                ],
+                ROUND_BUDGET_THRESHOLD,
+            ),
+            scope: CacheScope::None,
+        }];
+
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        assert!(breakdown.guidance_signals.round_budget_warning);
+        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(breakdown.guidance_signals.parallel_feedback);
     }
 }

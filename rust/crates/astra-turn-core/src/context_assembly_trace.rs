@@ -91,8 +91,18 @@ pub struct SystemPromptBreakdown {
     pub repository_memories: Vec<MemoryInjection>,
     /// User preferences/settings tokens.
     pub user_preferences_tokens: u32,
+    /// Structured late-round guidance signals present in the dynamic prompt.
+    #[serde(default)]
+    pub guidance_signals: PromptGuidanceSignals,
     /// Total system prompt tokens.
     pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptGuidanceSignals {
+    pub round_budget_warning: bool,
+    pub synthesize_or_batch: bool,
+    pub parallel_feedback: bool,
 }
 
 /// A skill that was injected into the system prompt.

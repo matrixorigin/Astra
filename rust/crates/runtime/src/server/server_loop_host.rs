@@ -515,6 +515,14 @@ impl ServerAgenticLoopHost {
         round: &Value,
         turn_started: Instant,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        let (_, _, system_prompt_breakdown) = self.build_system_messages_cached(
+            &state.message,
+            &self.edge_tools.clone(),
+            state,
+            &PromptCacheConfig::default(),
+        );
+        self.emit_context_meta(&system_prompt_breakdown);
+
         let (full_text, reasoning, tool_calls, usage) =
             crate::turn::bridge_e2e_hooks::parse_llm_round(round);
 
@@ -558,6 +566,8 @@ impl ServerAgenticLoopHost {
             prompt_tokens: prompt,
             completion_tokens: completion,
             has_usage: true,
+            system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
+            system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
             ..Default::default()
         };
 
@@ -779,7 +789,11 @@ impl ServerAgenticLoopHost {
         tools: &[Value],
         state: &AgenticLoopState,
         cache_cfg: &PromptCacheConfig,
-    ) -> (Vec<Value>, String) {
+    ) -> (
+        Vec<Value>,
+        String,
+        crate::turn::context_assembly_trace::SystemPromptBreakdown,
+    ) {
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|t| {
@@ -887,13 +901,14 @@ impl ServerAgenticLoopHost {
 
         // Build structured system messages with Anthropic cache annotations.
         // Stable sections (Global/Session) get cache_control; dynamic content does not.
-        let (sys_msg, dynamic_msg, _sections) = build_system_message(
+        let (sys_msg, dynamic_msg, sections) = build_system_message(
             &tool_names,
             &full_dynamic,
             self.selection_confidence,
             task_type,
             cache_cfg,
         );
+        let breakdown = crate::prompts::build_system_prompt_trace(&sections, vec![], vec![]);
         let mut system_messages = vec![sys_msg];
         if let Some(dm) = dynamic_msg {
             system_messages.push(dm);
@@ -907,7 +922,18 @@ impl ServerAgenticLoopHost {
             task_type,
         );
 
-        (system_messages, plain)
+        (system_messages, plain, breakdown)
+    }
+
+    fn emit_context_meta(
+        &mut self,
+        breakdown: &crate::turn::context_assembly_trace::SystemPromptBreakdown,
+    ) {
+        self.emit_event(json!({
+            "type": "context_meta",
+            "system_prompt_tokens": breakdown.total_tokens,
+            "system_prompt_breakdown": breakdown,
+        }));
     }
 
     /// Compute the tool schemas visible for the current turn after applying
@@ -1379,8 +1405,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider doesn't change within a turn).
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
 
-        let (system_messages, system_prompt_plain) =
+        let (system_messages, system_prompt_plain, system_prompt_breakdown) =
             self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
+        self.emit_context_meta(&system_prompt_breakdown);
 
         let llm_messages = self
             .build_llm_messages(
@@ -1454,6 +1481,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
                     let accum = ChatTurnSseAccum {
                         error_message: Some(e.message.clone()),
+                        system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
+                        system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown)
+                            .ok(),
                         ..Default::default()
                     };
                     let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
@@ -1518,7 +1548,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 6. Build turn result ────────────────────────────────────────
         let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
-        let accum = Self::result_to_accum(&result);
+        let mut accum = Self::result_to_accum(&result);
+        accum.system_prompt_tokens = Some(system_prompt_breakdown.total_tokens);
+        accum.system_prompt_breakdown = serde_json::to_value(&system_prompt_breakdown).ok();
 
         Ok(HostTurnResult {
             accum,
@@ -1997,7 +2029,7 @@ mod tests {
             json!({"role": "tool", "content": "README.md"}),
         ];
 
-        let (system_messages, plain) = host.build_system_messages_cached(
+        let (system_messages, plain, breakdown) = host.build_system_messages_cached(
             "inspect the project",
             &host.edge_tools,
             &state,
@@ -2032,6 +2064,9 @@ mod tests {
             dynamic_text.contains("Synthesize Or Batch Now"),
             "late-round guidance should live in the dynamic prompt message"
         );
+        assert!(breakdown.guidance_signals.round_budget_warning);
+        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(breakdown.guidance_signals.parallel_feedback);
     }
 
     #[test]
