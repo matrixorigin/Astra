@@ -160,6 +160,12 @@ pub(super) struct PermissionSettings {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Hard-boundary opt-in: allow Auto mode to bypass approval for sensitive
+    /// file paths (e.g. `.git/`, `.ssh/`, shell configs). Default `false` —
+    /// even in Auto mode, sensitive-path writes require explicit approval
+    /// unless the user sets this to `true` at project or user scope.
+    #[serde(default)]
+    pub allow_sensitive_path_writes: bool,
 }
 
 impl PermissionSettings {
@@ -1409,15 +1415,31 @@ impl PermissionManager {
             }
         }
 
-        // Step 5: Dangerous file path — respects Auto mode (user explicitly opted in).
+        // Step 5: Dangerous file path — respects Auto mode only when the user
+        // has explicitly opted in via `allow_sensitive_path_writes` (hard
+        // boundary: default strict even in Auto, so "模型绝不能越过" holds
+        // unless the operator has flipped the opt-in).
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             match self.mode {
                 PermissionMode::Auto => {
-                    astra_core::agent_warn!(
-                        "permission",
-                        "Auto mode allowed write to sensitive path: tool={name} warning={warning}"
-                    );
-                    return PermissionDecision::Allow;
+                    let opted_in = self.settings.allow_sensitive_path_writes
+                        || self.user_settings.allow_sensitive_path_writes;
+                    if opted_in {
+                        astra_core::agent_warn!(
+                            "permission",
+                            "Auto mode allowed write to sensitive path (opt-in): tool={name} warning={warning}"
+                        );
+                        return PermissionDecision::Allow;
+                    }
+                    let (header, detail) = Self::format_tool_display(name, args);
+                    return PermissionDecision::NeedApproval {
+                        tool: name.to_string(),
+                        header,
+                        detail,
+                        reason: format!(
+                            "{warning} (Auto mode is strict for sensitive paths; set allow_sensitive_path_writes=true in .kiro/permissions.json to opt in)"
+                        ),
+                    };
                 }
                 PermissionMode::Deny => {
                     return PermissionDecision::Deny("Sensitive path (deny mode)".into());
@@ -2316,15 +2338,24 @@ mod tests {
 
     #[test]
     fn session_override_cannot_bypass_dangerous_path() {
-        // In Auto mode, dangerous-path writes are allowed because the user
-        // explicitly opted in to unattended execution.
+        // Hard boundary: Auto mode is strict on sensitive paths by default,
+        // even with a session override — operator must flip the explicit
+        // `allow_sensitive_path_writes` opt-in to proceed unattended.
         let mut pm = PermissionManager::new(true);
         pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "Auto mode should allow dangerous path writes: got {decision:?}"
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "Auto mode must require approval for sensitive paths by default: got {decision:?}"
+        );
+
+        // Opt-in unlocks it.
+        pm.settings.allow_sensitive_path_writes = true;
+        let decision2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision2, PermissionDecision::Allow),
+            "opt-in should unlock Auto mode sensitive writes: got {decision2:?}"
         );
     }
 
@@ -2478,6 +2509,7 @@ mod tests {
         let settings = PermissionSettings {
             allow: vec!["Bash(cargo:*)".to_string()],
             deny: vec!["Bash(rm:*)".to_string()],
+            allow_sensitive_path_writes: false,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         fs::write(&path, json).unwrap();
@@ -3089,6 +3121,32 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(options, built_options);
+    }
+
+    #[test]
+    fn auto_mode_strict_on_sensitive_path_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        // Target .ssh/id_rsa — sensitive by DANGEROUS_FILE_PATHS rule.
+        let args = serde_json::json!({"path": ".ssh/id_rsa", "content": "x"});
+        let d = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d, PermissionDecision::NeedApproval { .. }),
+            "Auto mode must be strict on sensitive paths by default, got {d:?}"
+        );
+
+        // Non-sensitive path still auto-allowed.
+        let safe = serde_json::json!({"path": "src/foo.rs", "content": "x"});
+        let d2 = pm.check_nonblocking("write_file", &safe);
+        assert!(matches!(d2, PermissionDecision::Allow));
+
+        // Opt-in via project settings flips it to Allow.
+        pm.settings.allow_sensitive_path_writes = true;
+        let d3 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d3, PermissionDecision::Allow),
+            "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
+        );
     }
 
     // ── check_nonblocking after set_mode(Auto) ───────────────────────────────
