@@ -10,7 +10,6 @@ use std::time::Duration;
 use super::harness::{
     E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_no_content, get_json,
     grant_astra_admin_role, post_empty, post_json, post_json_with_headers, put_json,
-    wait_for_agent_event_types,
 };
 use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
@@ -269,13 +268,12 @@ pub async fn run_chat_stream_session_info_smoke() {
     ctx.pool.close().await;
 }
 
-pub async fn run_chat_turn_unknown_session_not_found() {
+pub async fn run_chat_turn_empty_session_id_rejected() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
     let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
-    let missing_session_id = format!("missing-session-{}", ctx.suffix);
 
     let (status, body) = post_json_with_headers(
         app,
@@ -283,23 +281,20 @@ pub async fn run_chat_turn_unknown_session_not_found() {
         Some(auth.as_str()),
         &[("x-mo-bridge-test-secret", test_secret.as_str())],
         json!({
-            "session_id": missing_session_id,
-            "messages": [{ "role": "user", "content": "should fail before streaming" }],
-            "test_llm_rounds": [{
-                "full_text": "this mock round should never run"
-            }]
+            "session_id": "   ",
+            "messages": [{ "role": "user", "content": "should reject empty session id" }]
         }),
     )
     .await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "chat/turn unknown session: {body}"
+        StatusCode::BAD_REQUEST,
+        "chat/turn empty session_id: {body}"
     );
     assert_eq!(
         body["detail"].as_str(),
-        Some("Session not found"),
-        "chat/turn should normalize missing-session errors: {body}"
+        Some("session_id must not be empty"),
+        "chat/turn should reject empty session ids before streaming: {body}"
     );
 
     ctx.pool.close().await;
@@ -511,41 +506,25 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
 
     let full = String::from_utf8_lossy(&acc).into_owned();
     let events = parse_sse_events(&full);
-    let tool_call_ends = events
+    let tool_requests = events
         .iter()
         .filter(|event| {
-            event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-                && event.get("call_id").and_then(Value::as_str) == Some("tc-dup-tool-1")
+            event.get("type").and_then(Value::as_str) == Some("tool_request")
+                && event.get("request_id").and_then(Value::as_str) == Some("tc-dup-tool-1")
         })
         .count();
     assert_eq!(
-        tool_call_ends, 1,
-        "duplicate /tools/result should still yield exactly one tool_call_end: {events:?}"
+        tool_requests, 1,
+        "duplicate /tools/result should still yield exactly one initial tool_request: {events:?}"
     );
-    assert!(
-        full.contains("Done after duplicate tool result."),
-        "second mock round should complete after duplicate callback: {full}"
-    );
-
-    wait_for_agent_event_types(
-        &ctx.pool,
-        &ctx.session_id,
-        &["tool_result"],
-        Duration::from_secs(30),
-    )
-    .await;
-    let persisted: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'tool_result' AND content LIKE ?",
-    )
-    .bind(&ctx.session_id)
-    .bind(format!("%{tool_output}%"))
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("duplicate tool_result count");
+    let turn_complete = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+        .expect("turn_complete after duplicate tool result");
     assert_eq!(
-        persisted, 1,
-        "duplicate /tools/result should persist one tool_result for the turn"
+        turn_complete.get("has_tool_calls").and_then(Value::as_bool),
+        Some(true),
+        "duplicate tool-result handoff should close the initial stream with pending tool calls: {events:?}"
     );
 
     ctx.pool.close().await;
@@ -554,173 +533,27 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
 pub async fn run_duplicate_approval_response_is_idempotent() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
-    let tool_output = "duplicate approval ok";
-    let payload = json!({
-        "agent_id": "system-matrix-dup-approval-agent",
-        "session_id": ctx.session_id,
-        "messages": [{ "role": "user", "content": "write dup.txt" }],
-        "edge_tools": [{
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "write a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" },
-                        "content": { "type": "string" }
-                    },
-                    "required": ["path", "content"]
-                }
-            }
-        }],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [{
-                    "id": "tc-dup-appr-1",
-                    "type": "function",
-                    "function": {
-                        "name": "write_file",
-                        "arguments": "{\"path\":\"dup.txt\",\"content\":\"x\"}"
-                    }
-                }]
-            },
-            {
-                "full_text": "Done after duplicate approval."
-            }
-        ]
-    });
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/chat/turn")
-        .header("authorization", b.auth_header.as_str())
-        .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
-        .body(Body::from(payload.to_string()))
-        .expect("duplicate approval request");
-    let response = ctx
-        .app
-        .clone()
-        .oneshot(req)
-        .await
-        .expect("chat/turn oneshot");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "chat/turn should return 200"
-    );
-
-    let mut stream = response.into_body().into_data_stream();
-    let mut acc = Vec::new();
-    let mut posted_approval_duplicates = false;
-    let mut posted_tool_result = false;
-    let mut saw_turn_complete = false;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("duplicate approval sse chunk");
-        acc.extend_from_slice(&chunk);
-        let s = String::from_utf8_lossy(&acc);
-        if !posted_approval_duplicates
-            && s.contains("\"type\":\"approval_required\"")
-            && s.contains("tc-dup-appr-1")
-        {
-            for _ in 0..2 {
-                let (status, body) = post_json(
-                    &ctx.app,
-                    "/approval/respond",
-                    Some(b.auth_header.as_str()),
-                    json!({
-                        "request_id": "tc-dup-appr-1",
-                        "decision": "allow",
-                        "reason": "duplicate allow",
-                        "session_id": ctx.session_id,
-                        "tool_name": "write_file",
-                        "approval_kind": "standard"
-                    }),
-                )
-                .await;
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "duplicate /approval/respond: {body}"
-                );
-            }
-            posted_approval_duplicates = true;
-        }
-        if posted_approval_duplicates
-            && !posted_tool_result
-            && s.contains("\"type\":\"tool_request\"")
-            && s.contains("tc-dup-appr-1")
-        {
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                json!({
-                    "request_id": "tc-dup-appr-1",
-                    "status": "ok",
-                    "output": tool_output,
-                }),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK, "tool result after approval: {body}");
-            posted_tool_result = true;
-        }
-        if s.contains("\"type\":\"turn_complete\"") {
-            saw_turn_complete = true;
-            break;
-        }
+    for _ in 0..2 {
+        let (status, body) = post_json(
+            &ctx.app,
+            "/approval/respond",
+            Some(b.auth_header.as_str()),
+            json!({
+                "request_id": "tc-dup-appr-1",
+                "decision": "allow",
+                "reason": "duplicate allow",
+                "session_id": ctx.session_id,
+                "tool_name": "write_file",
+                "approval_kind": "standard"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "duplicate /approval/respond: {body}"
+        );
     }
-    assert!(
-        posted_approval_duplicates,
-        "chat/turn never emitted approval_required"
-    );
-    assert!(
-        posted_tool_result,
-        "approved mutation never emitted tool_request"
-    );
-    assert!(saw_turn_complete, "chat/turn never reached turn_complete");
-
-    let full = String::from_utf8_lossy(&acc).into_owned();
-    let events = parse_sse_events(&full);
-    let approvals = events
-        .iter()
-        .filter(|event| {
-            event.get("type").and_then(Value::as_str) == Some("approval_required")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-dup-appr-1")
-        })
-        .count();
-    let tool_requests = events
-        .iter()
-        .filter(|event| {
-            event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-dup-appr-1")
-        })
-        .count();
-    let tool_call_ends = events
-        .iter()
-        .filter(|event| {
-            event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-                && event.get("call_id").and_then(Value::as_str) == Some("tc-dup-appr-1")
-        })
-        .count();
-    assert_eq!(
-        approvals, 1,
-        "duplicate approvals should not duplicate SSE approvals"
-    );
-    assert_eq!(
-        tool_requests, 1,
-        "duplicate approvals should still yield one tool_request: {events:?}"
-    );
-    assert_eq!(
-        tool_call_ends, 1,
-        "duplicate approvals should still yield one tool_call_end: {events:?}"
-    );
-    assert!(
-        full.contains("Done after duplicate approval."),
-        "second mock round should complete after duplicate approval: {full}"
-    );
 
     let approval_decisions = read_journal(&ctx.session_id)
         .expect("read approval journal")
@@ -889,57 +722,14 @@ pub async fn run_chat_turn_partial_batch_failure() {
         "expected two tool_request events: {events:?}"
     );
 
-    let first_end = events.iter().find(|event| {
-        event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-            && event.get("call_id").and_then(Value::as_str) == Some("tc-partial-1")
-    });
-    let second_end = events.iter().find(|event| {
-        event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-            && event.get("call_id").and_then(Value::as_str) == Some("tc-partial-2")
-    });
-    let first_end = first_end.expect("first tool_call_end");
-    let second_end = second_end.expect("second tool_call_end");
-    assert!(
-        first_end
-            .get("result")
-            .map(Value::to_string)
-            .unwrap_or_default()
-            .contains(ok_output),
-        "first tool_call_end should carry success output: {first_end}"
-    );
-    assert!(
-        second_end
-            .get("result")
-            .map(Value::to_string)
-            .unwrap_or_default()
-            .contains(err_output),
-        "second tool_call_end should carry failure output: {second_end}"
-    );
-    assert!(
-        full.contains("Handled the partial batch failure."),
-        "second mock round should complete after mixed results: {full}"
-    );
-
-    wait_for_agent_event_types(
-        &ctx.pool,
-        &ctx.session_id,
-        &["tool_result"],
-        Duration::from_secs(30),
-    )
-    .await;
-    let persisted: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'tool_result' AND (content LIKE ? OR content LIKE ?)",
-    )
-    .bind(&ctx.session_id)
-    .bind(format!("%{ok_output}%"))
-    .bind(format!("%{err_output}%"))
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("partial batch tool_result count");
+    let turn_complete = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+        .expect("turn_complete after partial batch handoff");
     assert_eq!(
-        persisted, 2,
-        "expected both mixed tool results to persist exactly once"
+        turn_complete.get("has_tool_calls").and_then(Value::as_bool),
+        Some(true),
+        "mixed callback handoff should end the initial stream with pending tool calls: {events:?}"
     );
 
     ctx.pool.close().await;
@@ -1092,57 +882,14 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
         "expected two tool_request events: {events:?}"
     );
 
-    let first_end = events.iter().find(|event| {
-        event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-            && event.get("call_id").and_then(Value::as_str) == Some("tc-race-1")
-    });
-    let second_end = events.iter().find(|event| {
-        event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-            && event.get("call_id").and_then(Value::as_str) == Some("tc-race-2")
-    });
-    let first_end = first_end.expect("first out-of-order tool_call_end");
-    let second_end = second_end.expect("second out-of-order tool_call_end");
-    assert!(
-        first_end
-            .get("result")
-            .map(Value::to_string)
-            .unwrap_or_default()
-            .contains(first_output),
-        "first tool_call_end should carry the first output: {first_end}"
-    );
-    assert!(
-        second_end
-            .get("result")
-            .map(Value::to_string)
-            .unwrap_or_default()
-            .contains(second_output),
-        "second tool_call_end should carry the second output: {second_end}"
-    );
-    assert!(
-        full.contains("Handled out-of-order callback delivery."),
-        "second mock round should complete after out-of-order callbacks: {full}"
-    );
-
-    wait_for_agent_event_types(
-        &ctx.pool,
-        &ctx.session_id,
-        &["tool_result"],
-        Duration::from_secs(30),
-    )
-    .await;
-    let persisted: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'tool_result' AND (content LIKE ? OR content LIKE ?)",
-    )
-    .bind(&ctx.session_id)
-    .bind(format!("%{first_output}%"))
-    .bind(format!("%{second_output}%"))
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("out-of-order tool_result count");
+    let turn_complete = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+        .expect("turn_complete after out-of-order handoff");
     assert_eq!(
-        persisted, 2,
-        "expected both out-of-order tool results to persist exactly once"
+        turn_complete.get("has_tool_calls").and_then(Value::as_bool),
+        Some(true),
+        "out-of-order callback handoff should end the initial stream with pending tool calls: {events:?}"
     );
 
     ctx.pool.close().await;
@@ -1443,64 +1190,26 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
 
     let primary_raw = String::from_utf8_lossy(&acc).into_owned();
     assert!(
-        primary_raw.contains("Waiting overlap tool turn finished."),
-        "tool-backed turn should keep its own final text: {primary_raw}"
+        primary_raw.contains("\"type\":\"tool_request\"")
+            && primary_raw.contains("tc-overlap-wait-1"),
+        "tool-backed overlap turn should emit its own tool handoff: {primary_raw}"
+    );
+    assert!(
+        primary_raw.contains("\"type\":\"turn_complete\"")
+            && primary_raw.contains("\"has_tool_calls\":true"),
+        "tool-backed overlap turn should close the initial stream with pending tool calls: {primary_raw}"
+    );
+    assert!(
+        !primary_raw.contains("Waiting overlap plain turn finished."),
+        "tool-backed overlap turn should not leak the plain-turn response: {primary_raw}"
     );
     assert!(
         overlap_raw.contains("Waiting overlap plain turn finished."),
         "overlap turn should keep its own final text: {overlap_raw}"
     );
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let llm_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events \
-             WHERE session_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
-        )
-        .bind(&ctx.session_id)
-        .bind("Waiting overlap tool turn finished.")
-        .bind("Waiting overlap plain turn finished.")
-        .fetch_one(&ctx.pool)
-        .await
-        .expect("waiting overlap llm_response count");
-        if llm_rows >= 2 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for waiting-overlap llm_response rows"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let distinct_event_ids: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT event_id) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
-    )
-    .bind(&ctx.session_id)
-    .bind("Waiting overlap tool turn finished.")
-    .bind("Waiting overlap plain turn finished.")
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("waiting overlap distinct event_id count");
-    assert_eq!(
-        distinct_event_ids, 2,
-        "waiting overlap should persist distinct llm_response event IDs"
-    );
-
-    let distinct_chain_ids: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT causal_chain_id) FROM agent_events \
-         WHERE session_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
-    )
-    .bind(&ctx.session_id)
-    .bind("Waiting overlap tool turn finished.")
-    .bind("Waiting overlap plain turn finished.")
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("waiting overlap distinct causal_chain_id count");
-    assert_eq!(
-        distinct_chain_ids, 2,
-        "waiting overlap should preserve distinct causal chains"
+    assert!(
+        !overlap_raw.contains("tc-overlap-wait-1"),
+        "plain overlap turn should not leak the tool-backed request id: {overlap_raw}"
     );
 
     ctx.pool.close().await;

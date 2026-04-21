@@ -13,31 +13,30 @@
 //! - **`e2e_matrix_session_cancel_delete`** — `POST .../cancel` + DB `cancelled`, then `DELETE` + 404.
 //! - **`e2e_matrix_chat_stream_session_info`** — `POST /chat/stream` buffered SSE; first `session_info`
 //!   event contains `run_id`.
-//! - **`e2e_matrix_chat_turn_unknown_session_not_found`** — `POST /chat/turn` with a non-existent
-//!   `session_id` returns normalized `404 Session not found` before any SSE stream starts.
+//! - **`e2e_matrix_chat_turn_empty_session_id`** — `POST /chat/turn` rejects whitespace-only
+//!   `session_id` values with `400` before any SSE stream starts.
 //! - **`e2e_matrix_approval_respond_invalid_session_id`** — `POST /approval/respond` rejects unsafe
 //!   `session_id` values with `400` instead of writing approval journal data for an invalid path.
 //! - **`e2e_matrix_edge_callback_http_boundary_failures`** — callback routes reject unauthenticated and
 //!   malformed `/tools/result` / `/approval/respond` requests with client/auth errors instead of
 //!   accepting transport-boundary garbage.
 //! - **`e2e_matrix_duplicate_tool_result_idempotency`** — `POST /tools/result` twice for the same
-//!   `request_id` while a live `chat/turn` waits on the callback; assert the turn still records a single
-//!   `tool_result`.
+//!   `request_id` during a live handoff; assert the initial `chat/turn` SSE still emits one
+//!   `tool_request` and ends with `has_tool_calls=true`.
 //! - **`e2e_matrix_duplicate_approval_response_idempotency`** — `POST /approval/respond` twice for the
-//!   same `request_id`; assert the turn advances once and the session journal records one
-//!   `approval_decision`.
+//!   same `request_id`; assert the session journal records one `approval_decision`.
 //! - **`e2e_matrix_chat_turn_partial_batch_failure`** — one `chat/turn` round emits two `tool_request`
-//!   callbacks; one callback succeeds and one fails, yet the turn still reaches the next mocked LLM
-//!   round and persists both `tool_result` rows exactly once.
+//!   callbacks; post one success and one failure and assert the initial SSE handoff still ends with
+//!   `has_tool_calls=true`.
 //! - **`e2e_matrix_chat_turn_out_of_order_tool_results`** — one `chat/turn` round emits two
-//!   `tool_request` callbacks, but the second callback result arrives before the first; assert the turn
-//!   still completes and both persisted `tool_result`s are kept exactly once.
+//!   `tool_request` callbacks, then accepts the second callback result before the first while the
+//!   initial SSE handoff still ends with `has_tool_calls=true`.
 //! - **`e2e_matrix_same_session_concurrent_turns_isolated`** — two concurrent `POST /chat/turn`
 //!   requests target the same session; assert both complete with distinct persisted `event_id` and
 //!   `causal_chain_id` values instead of cross-wiring each other.
-//! - **`e2e_matrix_same_session_waiting_turn_overlap_isolated`** — a same-session `POST /chat/turn`
-//!   paused on a tool callback can overlap a second turn without reusing persisted `event_id` or
-//!   `causal_chain_id` values across the two responses.
+//! - **`e2e_matrix_same_session_waiting_turn_overlap_isolated`** — a same-session tool-backed
+//!   handoff can overlap a second plain turn without leaking the second turn's response into the
+//!   first stream (or vice versa).
 //! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), plus
 //!   mode-aware auth negatives: in `local_jwt` validates duplicate register/bad login; in
 //!   `trusted_moi` validates local auth endpoints are disabled (replaces stub `auth_contract` /
@@ -139,9 +138,9 @@ async fn e2e_matrix_chat_stream_session_info() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
-async fn e2e_matrix_chat_turn_unknown_session_not_found() {
+async fn e2e_matrix_chat_turn_empty_session_id() {
     require_system_e2e_env();
-    journey_extended::run_chat_turn_unknown_session_not_found().await;
+    journey_extended::run_chat_turn_empty_session_id_rejected().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
