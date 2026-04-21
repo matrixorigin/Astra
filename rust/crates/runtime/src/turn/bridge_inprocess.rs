@@ -466,7 +466,12 @@ impl InProcessChatTurnBridge {
         let header_session_turn = header_str(headers, "x-mo-session-turn")
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|turn| *turn > 0);
-        let root_runtime_owns_turn_journal = header_session_turn.is_some();
+        #[cfg(feature = "bridge-e2e-hooks")]
+        let bridge_e2e_authorized = crate::turn::bridge_e2e_hooks::authorized(headers);
+        #[cfg(not(feature = "bridge-e2e-hooks"))]
+        let bridge_e2e_authorized = false;
+        let root_runtime_owns_turn_journal =
+            header_session_turn.is_some() && !bridge_e2e_authorized;
         let turn_chain_id =
             header_str(headers, "x-mo-turn-chain-id").unwrap_or_else(|| Uuid::now_v7().to_string());
         let user_query_event_id = header_str(headers, "x-mo-user-query-event-id")

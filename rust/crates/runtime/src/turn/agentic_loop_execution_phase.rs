@@ -366,35 +366,6 @@ pub(crate) fn observe_turn_end_without_tools(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use super::*;
-    use crate::observability_integration::ObservabilityHub;
-    use crate::turn::agentic_loop_host::tests::make_state;
-
-    #[test]
-    fn observe_turn_end_without_tools_records_outer_session_turn() {
-        let mut state = make_state();
-        state.session_turn = 6;
-        state.max_turns = 20;
-        state.remaining_turns = 4;
-        let hub = ObservabilityHub::new();
-        let session = hub.start_session("u1", "s1");
-        state.telemetry.observability_hub = Some(Arc::new(hub));
-        state.telemetry.observability_session = Some(session.clone());
-
-        let turn_start_time = Instant::now() - Duration::from_millis(25);
-        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
-
-        let guard = session.read().unwrap();
-        assert_eq!(guard.turn_timings.len(), 1);
-        assert_eq!(guard.turn_timings[0].turn, 6);
-    }
-}
-
 fn emit_subrun_text_preview<H: AgenticLoopHost>(
     host: &mut H,
     state: &AgenticLoopState,
@@ -638,5 +609,34 @@ fn record_tool_selection(
             state.telemetry.all_tools_used.len() as u32,
             state.telemetry.first_selector_ms.unwrap_or(0),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::observability_integration::ObservabilityHub;
+    use crate::turn::agentic_loop_host::tests::make_state;
+
+    #[test]
+    fn observe_turn_end_without_tools_records_outer_session_turn() {
+        let mut state = make_state();
+        state.session_turn = 6;
+        state.max_turns = 20;
+        state.remaining_turns = 4;
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_hub = Some(Arc::new(hub));
+        state.telemetry.observability_session = Some(session.clone());
+
+        let turn_start_time = Instant::now() - Duration::from_millis(25);
+        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.turn_timings.len(), 1);
+        assert_eq!(guard.turn_timings[0].turn, 6);
     }
 }

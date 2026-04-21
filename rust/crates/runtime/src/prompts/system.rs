@@ -447,45 +447,33 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               first tool call — wait for tool results.\n\
               \n\
               ### Process\n\
-              1. **Get the diff**: Determine what type of review this is:\n\
+              1. **Get the diff**:\n\
                  - **Working-tree / staged changes**: call git_status + git_diff in ONE parallel turn.\n\
                  - **Specific commit review**: call git_log + git_show (or git_diff with ref) in ONE parallel turn.\n\
                  - **Efficient alternative**: use bash with `git log -1 --format='%H %s' && git diff HEAD~1` for a single-tool compound fetch.\n\
               ONLY use git_diff with `path` if the output shows \"[truncated]\". \
               The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
-               2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
-               Treat the diff as primary evidence — do NOT switch into a whole-repo or file-by-file crawl unless the diff leaves a specific unresolved question.\n\
+               2. **Identify scope**: list changed files and classify them (logic, test, config, formatting).\n\
+               Treat the diff as primary evidence — avoid whole-repo or file-by-file crawls unless a specific risk remains.\n\
                3. **Read targeted context**: for files with non-trivial logic changes, call read_file with \
                start_line/end_line for ~30 lines around the change, or outline=true for large files. \
-               Default budget: no more than 3 read_file calls for the review; only exceed that when a concrete unresolved risk still remains. \
+               Default budget: no more than 3 read_file calls for the review; only exceed that when an unresolved risk remains. \
                NEVER read_file on a whole large file — if it fails with 'too large', retry with line ranges or outline=true.\n\
                4. **Evaluate**: correctness → security → edge cases → performance → test coverage. Skip pure style nits.\n\
                5. **If a read_file fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
               \n\
-              ### Output Format\n\
-              Summary:\n\
-              - 1–3 bullets: what the change does and overall risk level.\n\
-              \n\
-              Findings:\n\
-              - 0–5 findings, only material issues. Each: file:line, what's wrong, suggested fix.\n\
-              - If no material issues, say \"None\".\n\
-              - Group by severity: 🔴 must-fix, 🟡 should-fix, 💡 suggestion.\n\
-              \n\
-              Verification:\n\
-              - State what you checked (files read, diff shape, risk areas inspected).\n\
-              - If any file could not be read, say so explicitly.\n\
-              \n\
-              Verdict:\n\
-              - LGTM or Needs changes, with one sentence.\n\
-              - NEVER say LGTM if you had read_file errors on logic-changed files.\n\
+              ### Output\n\
+              - Summary: 1–3 bullets on the change and risk.\n\
+              - Findings: 0–5 material issues only; label must-fix/should-fix/suggestion, cite file:line, and give the fix. If none, say \"None\".\n\
+              - Verification: say what you checked and what you could not verify\n\
+              - Verdict: LGTM or Needs changes. NEVER say LGTM if you had read_file errors on logic-changed files.\n\
               \n\
               ### Anti-patterns (NEVER do these)\n\
                - Do NOT write a review summary in the same response where you call git_diff.\n\
                - Do NOT say \"tests look good\" without reading at least one test file.\n\
                - Do NOT call git_log in one turn, wait, then call git_show — call BOTH in the first turn.\n\
                - Do NOT keep calling read_file without a new, explicit risk question to resolve.\n\
-               - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
-               - Do NOT claim full confidence when evidence is incomplete.\n"
+               - Do NOT output XML-like tags or claim full confidence when evidence is incomplete.\n"
         }
         Some("debugging") => {
             "\n## Debugging Strategy\n\
