@@ -1279,19 +1279,13 @@ pub fn tool_round_guidance_trace_with(
     limit: u32,
 ) -> (String, PromptGuidanceSignals) {
     let round_budget_warning = round_index >= warning;
-    let synthesize_or_batch = round_index >= ROUND_BUDGET_THRESHOLD
-        && messages
-            .iter()
-            .rev()
-            .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-            .count()
-            > 0;
-    let parallel_feedback = messages
+    let trailing_tool_count = messages
         .iter()
         .rev()
         .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .count()
-        > 1;
+        .count();
+    let synthesize_or_batch = round_index >= ROUND_BUDGET_THRESHOLD && trailing_tool_count > 0;
+    let parallel_feedback = trailing_tool_count > 1;
 
     (
         format!(

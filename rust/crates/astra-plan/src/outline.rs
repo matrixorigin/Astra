@@ -26,9 +26,17 @@ pub struct OutlinePhase {
     pub id: String,
     pub title: String,
     pub description: String,
+    #[serde(
+        default = "default_one",
+        deserialize_with = "crate::decompose::deserialize_coerced_usize"
+    )]
     pub estimated_subtasks: usize,
     #[serde(default)]
     pub key_files: Vec<String>,
+}
+
+fn default_one() -> usize {
+    1
 }
 
 /// Build the outline prompt — asks for 2-4 phases, not full subtasks.
@@ -357,5 +365,45 @@ mod tests {
         assert!(display.contains("medium"));
         assert!(display.contains("Setup"));
         assert!(display.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn parse_outline_coerces_string_estimated_subtasks() {
+        // Models sometimes emit a tech-stack description instead of an integer.
+        let json = r#"{
+            "phases": [
+                {
+                    "id": "phase-1",
+                    "title": "Create page",
+                    "description": "Build the login page",
+                    "estimated_subtasks": "Plain HTML/CSS with vanilla JS",
+                    "key_files": ["tmp/login.html"]
+                }
+            ],
+            "total_effort": "small",
+            "questions": []
+        }"#;
+        let result = parse_outline_response(json);
+        assert!(result.is_ok(), "should coerce string to usize: {result:?}");
+        assert_eq!(result.unwrap().phases[0].estimated_subtasks, 1);
+    }
+
+    #[test]
+    fn parse_outline_coerces_numeric_string_estimated_subtasks() {
+        let json = r#"{
+            "phases": [{"id":"p1","title":"T","description":"D","estimated_subtasks":"3","key_files":[]}],
+            "total_effort": "small"
+        }"#;
+        let result = parse_outline_response(json);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap().phases[0].estimated_subtasks, 3);
+    }
+
+    #[test]
+    fn parse_outline_missing_estimated_subtasks_defaults_to_1() {
+        let json = r#"{"phases":[{"id":"p1","title":"T","description":"D","key_files":[]}],"total_effort":"small"}"#;
+        let result = parse_outline_response(json);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap().phases[0].estimated_subtasks, 1);
     }
 }

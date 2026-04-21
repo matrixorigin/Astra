@@ -751,16 +751,8 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
             let subtasks = parsed
                 .subtasks
                 .into_iter()
-                .map(|st| SubtaskPlan {
-                    id: st.id,
-                    title: st.title,
-                    description: st.description,
-                    depends_on: st.depends_on.unwrap_or_default(),
-                    status: TaskStatus::Pending,
-                    effort: st.effort,
-                    files: st.files.unwrap_or_default(),
-                    acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
-                })
+                .enumerate()
+                .map(|(i, st)| normalize_subtask(i, st))
                 .collect();
             return Ok(TaskPlan {
                 subtasks,
@@ -794,16 +786,8 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
     let subtasks = parsed
         .subtasks
         .into_iter()
-        .map(|st| SubtaskPlan {
-            id: st.id,
-            title: st.title,
-            description: st.description,
-            depends_on: st.depends_on.unwrap_or_default(),
-            status: TaskStatus::Pending,
-            effort: st.effort,
-            files: st.files.unwrap_or_default(),
-            acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
-        })
+        .enumerate()
+        .map(|(i, st)| normalize_subtask(i, st))
         .collect();
 
     Ok(TaskPlan {
@@ -820,8 +804,10 @@ struct PlanResponse {
 
 #[derive(Deserialize)]
 struct SubtaskResponse {
-    id: String,
-    title: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     description: Option<String>,
     depends_on: Option<Vec<String>>,
     effort: Option<String>,
@@ -832,6 +818,21 @@ struct SubtaskResponse {
 
 /// Try-parse each raw JSON value into a `VerifierKind`, skipping entries that
 /// fail (unknown/hallucinated kind) and filtering out shell-execution variants
+/// Convert a raw `SubtaskResponse` (from LLM JSON) into a `SubtaskPlan`, filling in
+/// fallback `id` / `title` when the model omitted or nulled them.
+fn normalize_subtask(i: usize, st: SubtaskResponse) -> SubtaskPlan {
+    SubtaskPlan {
+        id: st.id.unwrap_or_else(|| format!("subtask-{}", i + 1)),
+        title: st.title.unwrap_or_else(|| format!("Subtask {}", i + 1)),
+        description: st.description,
+        depends_on: st.depends_on.unwrap_or_default(),
+        status: TaskStatus::Pending,
+        effort: st.effort,
+        files: st.files.unwrap_or_default(),
+        acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
+    }
+}
+
 /// (`Command`, `CommandOutput`) that could be an RCE vector from LLM output.
 fn parse_acceptance_checks(
     raw: Vec<serde_json::Value>,
@@ -2106,16 +2107,47 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 // ─── Clarification Questions ─────────────────────────────────────────────────
 
+/// Deserialize an optional usize that models sometimes emit as a JSON string (e.g. `"0"`).
+fn deserialize_optional_usize<'de, D>(de: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => Ok(n.as_u64().map(|v| v as usize)),
+        serde_json::Value::String(s) => Ok(s.trim().parse::<usize>().ok()),
+        _ => Ok(None),
+    }
+}
+
+/// Deserialize a required usize that models sometimes emit as a string or omit entirely.
+/// Defaults to 1 on missing, non-numeric string, or unexpected type.
+pub(crate) fn deserialize_coerced_usize<'de, D>(de: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as usize,
+        serde_json::Value::String(s) => s.trim().parse::<usize>().unwrap_or(1),
+        _ => 1,
+    })
+}
+
 /// A clarification question with multiple choice options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClarificationQuestion {
     /// The question text
     pub question: String,
     /// Available options (1-indexed for user)
+    #[serde(default)]
     pub options: Vec<String>,
-    /// Optional default option (0-indexed)
+    /// Optional default option (0-indexed); models sometimes emit a string — coerced on parse.
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub default: Option<usize>,
     /// Category of clarification (scope, approach, behavior, etc.)
+    #[serde(default)]
     pub category: ClarificationCategory,
 }
 
@@ -2134,6 +2166,9 @@ pub enum ClarificationCategory {
     Technical,
     /// Confirmation: yes/no confirmation
     Confirmation,
+    /// Catch-all for any other category string the LLM may emit.
+    #[serde(other)]
+    Other,
 }
 
 /// Format a clarification question for CLI display.
@@ -2147,6 +2182,7 @@ pub fn format_clarification_question(q: &ClarificationQuestion) -> String {
         ClarificationCategory::Behavior => "⚙️ ",
         ClarificationCategory::Technical => "🔧",
         ClarificationCategory::Confirmation => "❓",
+        ClarificationCategory::Other => "💬",
     };
 
     out.push_str(&format!("  {} {}\n", icon, q.question));

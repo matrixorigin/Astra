@@ -2581,9 +2581,44 @@ mod tests {
         assert!(!breakdown.context_signals.agent_type_hint);
         assert!(breakdown.environment_tokens > 0);
         assert!(breakdown.user_preferences_tokens > 0);
+        // guidance_signals default to false — guard against accidental default changes
+        assert!(!breakdown.guidance_signals.round_budget_warning);
+        assert!(!breakdown.guidance_signals.synthesize_or_batch);
+        assert!(!breakdown.guidance_signals.parallel_feedback);
     }
 
     #[test]
+    fn build_system_prompt_trace_guidance_signals_only() {
+        use crate::turn::context_assembly_trace::{
+            PromptContextSignals, PromptGuidanceSignals, PromptTraceSignals,
+        };
+        let (_, _, prompt_sections) = build_system_message(
+            &["bash"],
+            "dynamic",
+            0.5,
+            None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+        let breakdown = prompts::build_system_prompt_trace_with_signals(
+            &prompt_sections,
+            vec![],
+            vec![],
+            PromptTraceSignals {
+                context_signals: PromptContextSignals::default(),
+                guidance_signals: PromptGuidanceSignals {
+                    round_budget_warning: true,
+                    synthesize_or_batch: true,
+                    parallel_feedback: false,
+                },
+            },
+        );
+        // context signals untouched
+        assert!(!breakdown.context_signals.active_output_skills);
+        // guidance signals propagated
+        assert!(breakdown.guidance_signals.round_budget_warning);
+        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(!breakdown.guidance_signals.parallel_feedback);
+    }
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {

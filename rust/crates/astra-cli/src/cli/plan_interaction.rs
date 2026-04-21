@@ -13,7 +13,7 @@ use astra_services::session_journal;
 use crossterm::style::Stylize;
 
 /// Default timeouts for plan LLM calls.
-const PLAN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PLAN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const PLAN_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const PLAN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
@@ -470,6 +470,7 @@ pub(super) fn eprint_clarification_question(
         astra_runtime::plan_decompose::ClarificationCategory::Behavior => "⚙️ ",
         astra_runtime::plan_decompose::ClarificationCategory::Technical => "🔧",
         astra_runtime::plan_decompose::ClarificationCategory::Confirmation => "❓",
+        astra_runtime::plan_decompose::ClarificationCategory::Other => "💬",
     };
 
     eprintln!("  {} {}", icon, q.question.as_str().bold().cyan());
@@ -2277,6 +2278,7 @@ fn ask_clarification_interactive(q: &plan::ClarificationQuestion) -> Option<Stri
         plan::ClarificationCategory::Behavior => "⚙️ ",
         plan::ClarificationCategory::Technical => "🔧",
         plan::ClarificationCategory::Confirmation => "❓",
+        plan::ClarificationCategory::Other => "💬",
     };
 
     let mut options = q.options.clone();
