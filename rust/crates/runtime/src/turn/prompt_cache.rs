@@ -93,6 +93,7 @@ pub(crate) fn section_cache_key(
 ///   `dynamic` holds a second system message with the per-turn profile/hints, or `None`
 ///   if there is nothing dynamic. This split enables OpenAI's automatic prefix caching:
 ///   the stable message stays identical across turns so the provider can reuse the KV cache.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_system_message(
     tool_names: &[&str],
     profile_desc: &str,

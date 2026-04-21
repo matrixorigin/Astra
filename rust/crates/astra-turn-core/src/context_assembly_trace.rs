@@ -101,14 +101,14 @@ pub struct SystemPromptBreakdown {
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptGuidanceSignals {
     pub round_budget_warning: bool,
     pub synthesize_or_batch: bool,
     pub parallel_feedback: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptContextSignals {
     pub active_output_skills: bool,
     pub learned_runtime_context: bool,
@@ -122,7 +122,7 @@ pub struct PromptContextSignals {
     pub session_anchor: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptTraceSignals {
     #[serde(default)]
     pub context_signals: PromptContextSignals,

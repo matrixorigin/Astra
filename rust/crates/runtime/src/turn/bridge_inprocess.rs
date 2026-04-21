@@ -359,9 +359,11 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 // ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
 pub use super::prompt_cache::PromptCacheConfig;
 pub(crate) use super::prompt_cache::{
-    add_message_cache_breakpoint, annotate_tool_schemas_for_caching, build_system_message,
+    add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
     build_system_message_with_dynamic_sections,
 };
+#[cfg(test)]
+pub(crate) use super::prompt_cache::build_system_message;
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {
@@ -906,52 +908,121 @@ impl InProcessChatTurnBridge {
                 ));
             }
             if !skill_hint.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    skill_hint.clone(),
-                    prompts::PromptTokenBucket::UserPreferences,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        skill_hint.clone(),
+                        prompts::PromptTokenBucket::UserPreferences,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            active_output_skills: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !learned_context_hint.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    learned_context_hint.clone(),
-                    prompts::PromptTokenBucket::UserPreferences,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        learned_context_hint.clone(),
+                        prompts::PromptTokenBucket::UserPreferences,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            learned_runtime_context: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !memory_signal_hint.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    memory_signal_hint.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        memory_signal_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            memory_signal_detected: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !implicit_feedback_hint.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    implicit_feedback_hint.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        implicit_feedback_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            implicit_feedback: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !feedback_rules_hint.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    feedback_rules_hint.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        feedback_rules_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            learned_feedback_rules: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !self_awareness_hint.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    self_awareness_hint.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        self_awareness_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            self_awareness: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !session_anchor.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    session_anchor.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        session_anchor.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            session_anchor: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
             }
             if !tool_round_guidance.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    tool_round_guidance.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        tool_round_guidance.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        guidance_signals,
+                        ..Default::default()
+                    }),
+                );
             }
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
@@ -1229,23 +1300,10 @@ impl InProcessChatTurnBridge {
                                 content_preview: line.chars().take(100).collect(),
                             }
                         }).collect();
-                    let breakdown = prompts::build_system_prompt_trace_with_signals(
+                    let breakdown = prompts::build_system_prompt_trace(
                         &prompt_sections,
                         skill_injections,
                         memory_injections,
-                        crate::turn::context_assembly_trace::PromptTraceSignals {
-                            context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
-                                active_output_skills: !active_skill_names.is_empty(),
-                                learned_runtime_context: !learned_context_text.is_empty(),
-                                memory_signal_detected: !memory_signal_hint.is_empty(),
-                                self_awareness: !self_awareness_hint.is_empty(),
-                                implicit_feedback: !implicit_feedback_hint.is_empty(),
-                                learned_feedback_rules: !feedback_rules_hint.is_empty(),
-                                session_anchor: !session_anchor.is_empty(),
-                                ..Default::default()
-                            },
-                            guidance_signals,
-                        },
                     );
                     yield render_sse(&json!({
                         "type": "context_meta",

@@ -39,6 +39,7 @@ pub struct PromptSection {
     pub text: String,
     pub scope: CacheScope,
     pub token_bucket: PromptTokenBucket,
+    pub trace_signals: PromptTraceSignals,
 }
 
 impl PromptSection {
@@ -47,6 +48,7 @@ impl PromptSection {
             text: text.into(),
             scope,
             token_bucket: PromptTokenBucket::BasePersona,
+            trace_signals: PromptTraceSignals::default(),
         }
     }
 
@@ -55,7 +57,13 @@ impl PromptSection {
             text: text.into(),
             scope: CacheScope::None,
             token_bucket,
+            trace_signals: PromptTraceSignals::default(),
         }
+    }
+
+    pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
+        self.trace_signals = trace_signals;
+        self
     }
 }
 
@@ -736,7 +744,15 @@ pub fn self_awareness_prompt_section(
     if text.trim().len() <= "## Self-Awareness".len() + 5 {
         return None;
     }
-    Some(PromptSection::dynamic(text, PromptTokenBucket::Environment))
+    Some(PromptSection::dynamic(text, PromptTokenBucket::Environment)).map(|section| {
+        section.with_trace_signals(PromptTraceSignals {
+            context_signals: PromptContextSignals {
+                self_awareness: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    })
 }
 
 /// Flatten sections into a single string (backward-compatible convenience).
@@ -865,46 +881,73 @@ pub fn build_system_prompt_trace_with_signals(
         let tokens = estimate_section_tokens(&section.text);
         total_tokens += tokens;
         let text = &section.text;
-        if text.contains("## ⚡ Round Budget Warning") || text.contains("## 🚨 Round Limit Reached")
-        {
-            guidance_signals.round_budget_warning = true;
+        if section.trace_signals == PromptTraceSignals::default() {
+            if text.contains("## ⚡ Round Budget Warning")
+                || text.contains("## 🚨 Round Limit Reached")
+            {
+                guidance_signals.round_budget_warning = true;
+            }
+            if text.contains("## Synthesize Or Batch Now") {
+                guidance_signals.synthesize_or_batch = true;
+            }
+            if text.contains("✓ Previous round:") {
+                guidance_signals.parallel_feedback = true;
+            }
+            if text.contains("## Active Output Skills") {
+                context_signals.active_output_skills = true;
+            }
+            if text.contains("## Learned Runtime Context") {
+                context_signals.learned_runtime_context = true;
+            }
+            if text.contains("⚡ MEMORY SIGNAL DETECTED") {
+                context_signals.memory_signal_detected = true;
+            }
+            if text.contains("## System Prompt Override") {
+                context_signals.system_prompt_override = true;
+            }
+            if text.contains("## Effort Level") {
+                context_signals.effort_hint = true;
+            }
+            if text.contains("## Agent Type") {
+                context_signals.agent_type_hint = true;
+            }
+            if text.contains("## Self-Awareness") {
+                context_signals.self_awareness = true;
+            }
+            if text.contains("[Session Feedback]") {
+                context_signals.implicit_feedback = true;
+            }
+            if text.contains("[Learned Feedback Rules]") {
+                context_signals.learned_feedback_rules = true;
+            }
+            if text.contains("[session-anchor]") {
+                context_signals.session_anchor = true;
+            }
         }
-        if text.contains("## Synthesize Or Batch Now") {
-            guidance_signals.synthesize_or_batch = true;
-        }
-        if text.contains("✓ Previous round:") {
-            guidance_signals.parallel_feedback = true;
-        }
-        if text.contains("## Active Output Skills") {
-            context_signals.active_output_skills = true;
-        }
-        if text.contains("## Learned Runtime Context") {
-            context_signals.learned_runtime_context = true;
-        }
-        if text.contains("⚡ MEMORY SIGNAL DETECTED") {
-            context_signals.memory_signal_detected = true;
-        }
-        if text.contains("## System Prompt Override") {
-            context_signals.system_prompt_override = true;
-        }
-        if text.contains("## Effort Level") {
-            context_signals.effort_hint = true;
-        }
-        if text.contains("## Agent Type") {
-            context_signals.agent_type_hint = true;
-        }
-        if text.contains("## Self-Awareness") {
-            context_signals.self_awareness = true;
-        }
-        if text.contains("[Session Feedback]") {
-            context_signals.implicit_feedback = true;
-        }
-        if text.contains("[Learned Feedback Rules]") {
-            context_signals.learned_feedback_rules = true;
-        }
-        if text.contains("[session-anchor]") {
-            context_signals.session_anchor = true;
-        }
+        context_signals.active_output_skills |=
+            section.trace_signals.context_signals.active_output_skills;
+        context_signals.learned_runtime_context |= section
+            .trace_signals
+            .context_signals
+            .learned_runtime_context;
+        context_signals.memory_signal_detected |=
+            section.trace_signals.context_signals.memory_signal_detected;
+        context_signals.system_prompt_override |=
+            section.trace_signals.context_signals.system_prompt_override;
+        context_signals.effort_hint |= section.trace_signals.context_signals.effort_hint;
+        context_signals.agent_type_hint |= section.trace_signals.context_signals.agent_type_hint;
+        context_signals.self_awareness |= section.trace_signals.context_signals.self_awareness;
+        context_signals.implicit_feedback |=
+            section.trace_signals.context_signals.implicit_feedback;
+        context_signals.learned_feedback_rules |=
+            section.trace_signals.context_signals.learned_feedback_rules;
+        context_signals.session_anchor |= section.trace_signals.context_signals.session_anchor;
+        guidance_signals.round_budget_warning |=
+            section.trace_signals.guidance_signals.round_budget_warning;
+        guidance_signals.synthesize_or_batch |=
+            section.trace_signals.guidance_signals.synthesize_or_batch;
+        guidance_signals.parallel_feedback |=
+            section.trace_signals.guidance_signals.parallel_feedback;
 
         match section.token_bucket {
             PromptTokenBucket::BasePersona => base_persona_tokens += tokens,

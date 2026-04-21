@@ -904,40 +904,109 @@ impl ServerAgenticLoopHost {
             ));
         }
         if !skill_hint.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                skill_hint.clone(),
-                crate::prompts::PromptTokenBucket::UserPreferences,
-            ));
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    skill_hint.clone(),
+                    crate::prompts::PromptTokenBucket::UserPreferences,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                active_output_skills: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
         }
         if !learned_context_hint.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                learned_context_hint.clone(),
-                crate::prompts::PromptTokenBucket::UserPreferences,
-            ));
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    learned_context_hint.clone(),
+                    crate::prompts::PromptTokenBucket::UserPreferences,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                learned_runtime_context: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
         }
         if !extra_dynamic.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                extra_dynamic.clone(),
-                crate::prompts::PromptTokenBucket::Environment,
-            ));
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    extra_dynamic.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                effort_hint: state.skills.effort.is_some(),
+                                agent_type_hint: state.skills.agent_type.is_some(),
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
         }
         if !memory_signal_hint.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                memory_signal_hint.clone(),
-                crate::prompts::PromptTokenBucket::Environment,
-            ));
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    memory_signal_hint.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                memory_signal_detected: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
         }
         if !system_override.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                system_override.clone(),
-                crate::prompts::PromptTokenBucket::Environment,
-            ));
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    system_override.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                system_prompt_override: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
         }
         if !tool_round_guidance.is_empty() {
-            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
-                tool_round_guidance.clone(),
-                crate::prompts::PromptTokenBucket::Environment,
-            ));
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    tool_round_guidance.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        guidance_signals,
+                        ..Default::default()
+                    },
+                ),
+            );
         }
         let full_dynamic = crate::prompts::sections_to_string(&dynamic_sections);
 
@@ -950,23 +1019,7 @@ impl ServerAgenticLoopHost {
             task_type,
             cache_cfg,
         );
-        let breakdown = crate::prompts::build_system_prompt_trace_with_signals(
-            &sections,
-            vec![],
-            vec![],
-            crate::turn::context_assembly_trace::PromptTraceSignals {
-                context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
-                    active_output_skills: !active_skill_names.is_empty(),
-                    learned_runtime_context: !learned_context_text.is_empty(),
-                    memory_signal_detected: !memory_signal_hint.is_empty(),
-                    system_prompt_override: !system_override.is_empty(),
-                    effort_hint: state.skills.effort.is_some(),
-                    agent_type_hint: state.skills.agent_type.is_some(),
-                    ..Default::default()
-                },
-                guidance_signals,
-            },
-        );
+        let breakdown = crate::prompts::build_system_prompt_trace(&sections, vec![], vec![]);
         let mut system_messages = vec![sys_msg];
         if let Some(dm) = dynamic_msg {
             system_messages.push(dm);
