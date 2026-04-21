@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::harness::{
     E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_no_content, get_json,
-    grant_astra_admin_role, post_empty, post_json, post_json_with_headers, put_json,
+    grant_astra_admin_role, post_empty, post_json, put_json,
 };
 use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
