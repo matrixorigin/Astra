@@ -132,6 +132,11 @@ pub struct ObservabilitySession {
     /// Reset lazily — it lingers until the next `apply_strategy_delta` call.
     pub last_strategy_application:
         Option<crate::turn::agentic_stage_bridge::StrategyApplication>,
+
+    /// Most recent [`GuardrailView`] snapshot published by the auto-reflection
+    /// path after tuning the reflection threshold. Surfaced into the SelfModel
+    /// so the agent passively "knows" how sensitive it currently is.
+    pub last_guardrail_view: Option<crate::self_model::GuardrailView>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +249,7 @@ impl ObservabilitySession {
             last_token_budget_change_turn: None,
             previous_turn_user_cancelled: false,
             last_strategy_application: None,
+            last_guardrail_view: None,
         }
     }
 
@@ -278,6 +284,7 @@ impl ObservabilitySession {
             last_token_budget_change_turn: None,
             previous_turn_user_cancelled: false,
             last_strategy_application: None,
+            last_guardrail_view: None,
         }
     }
 

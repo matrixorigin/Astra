@@ -43,6 +43,23 @@ pub struct SelfModel {
     pub recent_signals: Vec<SignalSummary>,
     /// Constraints and safety bounds.
     pub constraints: ConstraintSet,
+    /// Rolling-stats guardrail state (auto-tuned reflection threshold,
+    /// recent failure rate). `None` when no tuner signal is available
+    /// at snapshot time — keeps legacy tests / constructors unchanged.
+    #[serde(default)]
+    pub guardrail: Option<GuardrailView>,
+}
+
+/// Compact view of the guardrail auto-tuner, surfaced to the agent via
+/// the self-awareness prompt section so Astra can see how its own
+/// sensitivity has been tuned.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GuardrailView {
+    pub reflection_threshold: u32,
+    pub last_delta: i32,
+    /// None until MIN_SAMPLES turns have been observed.
+    pub recent_fail_rate: Option<f32>,
+    pub turns_observed: u32,
 }
 
 /// Summary of agent capabilities.
@@ -378,7 +395,14 @@ impl SelfModel {
             goals,
             recent_signals: signal_summaries,
             constraints: ConstraintSet::default(),
+            guardrail: None,
         }
+    }
+
+    /// Attach a guardrail view (called by edge_tools after `snapshot_with_strategy`).
+    pub fn with_guardrail(mut self, g: GuardrailView) -> Self {
+        self.guardrail = Some(g);
+        self
     }
 }
 
@@ -496,6 +520,36 @@ impl SelfModel {
             s.push_str(
                 "Tool selection: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
             );
+        }
+
+        // ── Guardrail auto-tuning state (rolling stats → bounded Δ) ──
+        if let Some(g) = &self.guardrail {
+            let delta_tag = match g.last_delta.cmp(&0) {
+                std::cmp::Ordering::Less => " (tuned down → reacting faster)",
+                std::cmp::Ordering::Greater => " (tuned up → backing off)",
+                std::cmp::Ordering::Equal => "",
+            };
+            match g.recent_fail_rate {
+                Some(rate) => {
+                    let _ = writeln!(
+                        s,
+                        "Guardrail: reflection triggers after {} signals{} · recent fail-rate {:.0}% over {} turns",
+                        g.reflection_threshold,
+                        delta_tag,
+                        rate * 100.0,
+                        g.turns_observed
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "Guardrail: reflection triggers after {} signals{} · warming up ({} turns observed)",
+                        g.reflection_threshold,
+                        delta_tag,
+                        g.turns_observed,
+                    );
+                }
+            }
         }
 
         // ── Recent signals ──
@@ -1143,5 +1197,114 @@ mod tests {
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
         assert!(!rendered.contains("widened for next turn"), "got: {rendered}");
+    }
+
+    #[test]
+    fn snapshot_without_guardrail_omits_line() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+            None,
+            None,
+            None,
+            10,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        );
+        assert!(model.guardrail.is_none());
+        let rendered = model.to_system_prompt_section();
+        assert!(!rendered.contains("Guardrail:"), "got: {rendered}");
+    }
+
+    #[test]
+    fn snapshot_with_guardrail_renders_threshold_line() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            6,
+            None,
+            None,
+            None,
+            60,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_guardrail(GuardrailView {
+            reflection_threshold: 2,
+            last_delta: -1,
+            recent_fail_rate: Some(0.5),
+            turns_observed: 10,
+        });
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("Guardrail: reflection triggers after 2 signals"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("reacting faster"),
+            "delta tag missing: {rendered}"
+        );
+        assert!(rendered.contains("50% over 10 turns"), "got: {rendered}");
+    }
+
+    #[test]
+    fn snapshot_with_guardrail_warming_up_renders_no_rate() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            2,
+            None,
+            None,
+            None,
+            20,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &config,
+        )
+        .with_guardrail(GuardrailView {
+            reflection_threshold: 3,
+            last_delta: 0,
+            recent_fail_rate: None,
+            turns_observed: 2,
+        });
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            rendered.contains("warming up (2 turns observed)"),
+            "got: {rendered}"
+        );
+        assert!(!rendered.contains("%"), "got: {rendered}");
     }
 }

@@ -89,6 +89,7 @@ pub mod plan_decompose;
 pub mod prompts;
 pub mod runtime_config;
 pub mod runtime_promotion_signals;
+pub mod guardrail_tuning;
 pub mod memoria_insights;
 pub mod self_model;
 pub mod server;

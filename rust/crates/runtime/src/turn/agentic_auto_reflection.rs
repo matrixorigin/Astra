@@ -18,6 +18,7 @@ use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult,
 };
 
+#[allow(dead_code)]
 pub(crate) const AUTO_REFLECTION_SIGNAL_THRESHOLD: usize = 3;
 const AUTO_REFLECTION_MAX_OUTPUT_TOKENS: usize = 1200;
 const AUTO_REFLECTION_TOOL_WINDOW: usize = 24;
@@ -576,7 +577,34 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         }
     }
 
-    if state.pending_reflection_signals.len() < AUTO_REFLECTION_SIGNAL_THRESHOLD {
+    // ── Guardrail auto-tuning: observe this turn's tool outcomes and
+    //    possibly adjust the reflection threshold before reading it.
+    {
+        let cursor = state.stall.guardrail_tuner_records_cursor;
+        let records = &state.stall.tool_call_records;
+        if records.len() > cursor {
+            let had_failure = records[cursor..].iter().any(|r| !r.ok);
+            state.stall.guardrail_tuner_records_cursor = records.len();
+            state.stall.guardrail_tuner.record_turn_outcome(had_failure);
+        }
+        // Publish current guardrail view onto the observability session so
+        // the next SelfModel rendering surfaces it to the agent.
+        if let Some(obs) = state.telemetry.observability_session.as_ref()
+            && let Ok(mut session) = obs.write()
+        {
+            let t = &state.stall.guardrail_tuner;
+            session.last_guardrail_view = Some(crate::self_model::GuardrailView {
+                reflection_threshold: t.reflection_threshold(),
+                last_delta: t.last_delta(),
+                recent_fail_rate: t.recent_fail_rate(),
+                turns_observed: t.turns_seen(),
+            });
+        }
+    }
+
+    if (state.pending_reflection_signals.len() as u32)
+        < state.stall.guardrail_tuner.reflection_threshold()
+    {
         return;
     }
 

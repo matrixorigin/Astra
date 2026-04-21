@@ -399,6 +399,16 @@ pub struct StallTrackingState {
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
+    /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
+    /// threshold. Observes per-turn outcomes and adjusts the threshold by
+    /// ±1 (bounded to `[MIN, MAX]`) so Astra reacts faster when failures
+    /// cluster and backs off when things are stable.
+    pub guardrail_tuner: crate::guardrail_tuning::GuardrailTuner,
+    /// Cursor into `tool_call_records` marking the boundary already
+    /// observed by the guardrail tuner. Turn N sees records
+    /// `tool_call_records[cursor..]`; after observation the cursor is
+    /// advanced to `len()`.
+    pub guardrail_tuner_records_cursor: usize,
 }
 
 /// Inter-agent messaging state for the agentic loop.

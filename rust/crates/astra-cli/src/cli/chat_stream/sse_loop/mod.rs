@@ -534,6 +534,8 @@ pub(crate) async fn stream_chat_sse(
             tool_call_records: Vec::new(),
             forced_factual_retry: false,
             nudge_count: 0,
+            guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
+            guardrail_tuner_records_cursor: 0,
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),
