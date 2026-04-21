@@ -527,21 +527,17 @@ fn render_verifier_failure_hint(
         return None;
     }
     let mut out = String::with_capacity(256);
-    out.push_str(
-        "⚠ Acceptance checks failed — address these before the next attempt:\n",
-    );
+    out.push_str("⚠ Acceptance checks failed — address these before the next attempt:\n");
     for r in failed.iter().take(5) {
-        let detail = r
-            .error
-            .as_deref()
-            .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| {
-                if r.evidence.is_empty() {
+        let detail =
+            r.error
+                .as_deref()
+                .filter(|e| !e.is_empty())
+                .unwrap_or(if r.evidence.is_empty() {
                     "<no evidence captured>"
                 } else {
                     r.evidence.as_str()
-                }
-            });
+                });
         let expected = if r.expected.is_empty() {
             "passes".to_string()
         } else {
@@ -1918,9 +1914,7 @@ mod tests {
 
     #[test]
     fn render_verifier_failure_hint_none_when_all_passed() {
-        use astra_services::verification::{
-            SubtaskVerificationReport, VerificationResult,
-        };
+        use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
         let report = SubtaskVerificationReport {
             subtask_id: "s1".into(),
             all_required_passed: true,
@@ -1939,9 +1933,7 @@ mod tests {
 
     #[test]
     fn render_verifier_failure_hint_surfaces_criterion_details() {
-        use astra_services::verification::{
-            SubtaskVerificationReport, VerificationResult,
-        };
+        use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
         let report = SubtaskVerificationReport {
             subtask_id: "s1".into(),
             all_required_passed: false,
@@ -1990,9 +1982,7 @@ mod tests {
 
     #[test]
     fn render_verifier_failure_hint_falls_back_to_evidence_when_no_error() {
-        use astra_services::verification::{
-            SubtaskVerificationReport, VerificationResult,
-        };
+        use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
         let report = SubtaskVerificationReport {
             subtask_id: "s1".into(),
             all_required_passed: false,
