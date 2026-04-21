@@ -12,7 +12,9 @@ use astra_runtime::{
         LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
     },
 };
-use astra_services::session_journal::{JournalDirGuard, find_latest_approval_decision};
+use astra_services::session_journal::{
+    JournalDirGuard, JournalEventType, find_latest_approval_decision, read_journal,
+};
 use async_trait::async_trait;
 use axum::{
     Router, body,
@@ -211,6 +213,83 @@ async fn post_approval_respond_journals_when_ledger_is_full() {
     assert_eq!(found.reason.as_deref(), Some("policy"));
     assert_eq!(found.tool_name.as_deref(), Some("write_file"));
     assert_eq!(found.approval_kind.as_deref(), Some("standard"));
+}
+
+#[test]
+fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal_dir = temp.path().to_path_buf();
+    let (app, ledger) = e2e_app();
+    let payload = json!({
+        "request_id": "ap-concurrent-dup",
+        "decision": "allow",
+        "reason": "duplicate allow",
+        "session_id": "sess-concurrent-dup",
+        "tool_name": "write_file",
+        "approval_kind": "standard"
+    });
+
+    std::thread::scope(|scope| {
+        let first_app = app.clone();
+        let first_dir = journal_dir.clone();
+        let first_payload = payload.clone();
+        let first = scope.spawn(move || {
+            let _guard = JournalDirGuard::new(&first_dir);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(post_json(first_app, "/approval/respond", first_payload))
+        });
+
+        let second_app = app.clone();
+        let second_dir = journal_dir.clone();
+        let second_payload = payload.clone();
+        let second = scope.spawn(move || {
+            let _guard = JournalDirGuard::new(&second_dir);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(post_json(second_app, "/approval/respond", second_payload))
+        });
+
+        let (first_status, first_body) = first.join().unwrap();
+        let (second_status, second_body) = second.join().unwrap();
+        assert_eq!(
+            first_status,
+            StatusCode::OK,
+            "first duplicate approval: {first_body}"
+        );
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "second duplicate approval: {second_body}"
+        );
+    });
+
+    let _guard = JournalDirGuard::new(&journal_dir);
+    let approval_decisions = read_journal("sess-concurrent-dup")
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
+        .filter(|event| {
+            event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("approval"))
+                .and_then(|approval| approval.get("request_id"))
+                .and_then(|request_id| request_id.as_str())
+                == Some("ap-concurrent-dup")
+        })
+        .count();
+    assert_eq!(
+        approval_decisions, 1,
+        "concurrent duplicate approvals should record one approval decision"
+    );
+
+    let key = approval_callback_key("e2e-user", "ap-concurrent-dup");
+    assert!(ledger.blocking_lock().contains_key(&key));
 }
 
 #[tokio::test]

@@ -105,6 +105,8 @@ pub(super) async fn post_approval_respond_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
+    let key = approval_callback_key(&user.user_id, &body.request_id);
+    let mut lock = state.edge_callback_ledger.lock().await;
     if let Some(session_id) = body.session_id.as_deref() {
         validate_session_id(session_id)
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
@@ -159,8 +161,6 @@ pub(super) async fn post_approval_respond_handler(
                 })?;
         }
     }
-    let key = approval_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
     let ledger_enqueued = insert_approval_ledger_entry(
         &mut lock,
         key,
