@@ -6470,11 +6470,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             error: Some(err.into()),
             ..Default::default()
         };
-        state.stall.tool_call_records = vec![
-            fail_rec("500"),
-            fail_rec("500"),
-            fail_rec("timeout"),
-        ];
+        state.stall.tool_call_records = vec![fail_rec("500"), fail_rec("500"), fail_rec("timeout")];
 
         for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
             state.pending_reflection_signals.push(
@@ -6516,7 +6512,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(
             host.emitted_lines
                 .iter()
-                .any(|line| line.contains("Pipeline strategy applied") && line.contains("flaky_http")),
+                .any(|line| line.contains("Pipeline strategy applied")
+                    && line.contains("flaky_http")),
             "expected strategy-applied log line, got lines: {:?}",
             host.emitted_lines
         );
