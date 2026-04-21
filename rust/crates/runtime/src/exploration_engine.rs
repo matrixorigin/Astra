@@ -14,6 +14,7 @@ use crate::ab_testing::{
 use crate::adaptive_baselines::{AdaptiveBaselineRollback, AdaptiveBaselineStore};
 use crate::pipeline::pattern::{ExplorationOpportunity, ExplorationReason, PatternLibrary};
 use crate::pipeline::routing::{DomainHint, TaskType, domain_hint_to_label};
+use astra_turn_core::tool_health::ToolHealthTracker;
 
 /// Result of concluding a mature experiment.
 #[deprecated(
@@ -75,6 +76,23 @@ impl ExplorationEngine {
         pattern_library: &PatternLibrary,
         store: &ExperimentStore,
     ) -> Vec<Experiment> {
+        self.check_and_create_experiments_with_health(pattern_library, store, None)
+    }
+
+    /// Like [`check_and_create_experiments`] but also consumes recent
+    /// `ToolHealthTracker` outcome evidence. When a tool's failure rate over
+    /// its cached outcomes is high (≥0.5 over ≥3 samples), a synthetic
+    /// opportunity is added so the exploration pipeline can probe an
+    /// alternative treatment. Keeps ExplorationOpportunity generic — the
+    /// source tool name is attached via `known_tools` and the reason is
+    /// `LowSuccess`. Opportunities already covered by active experiments are
+    /// skipped.
+    pub fn check_and_create_experiments_with_health(
+        &self,
+        pattern_library: &PatternLibrary,
+        store: &ExperimentStore,
+        health: Option<&ToolHealthTracker>,
+    ) -> Vec<Experiment> {
         let active = store
             .list()
             .into_iter()
@@ -85,6 +103,20 @@ impl ExplorationEngine {
         }
 
         let mut opportunities = pattern_library.exploration_opportunities();
+        if let Some(tracker) = health {
+            for (tool_name, fail_rate, samples) in tracker.high_failure_tools(3, 0.5) {
+                // Confidence from outcome evidence: lower is more urgent.
+                let confidence = (1.0 - fail_rate).clamp(0.0, 0.49);
+                opportunities.push(ExplorationOpportunity {
+                    task_type: TaskType::Compound,
+                    domain: None,
+                    confidence,
+                    reason: ExplorationReason::LowSuccess,
+                    known_tools: vec![tool_name],
+                    pattern_count: samples as usize,
+                });
+            }
+        }
         opportunities.sort_by(|a, b| {
             a.confidence
                 .partial_cmp(&b.confidence)
@@ -300,6 +332,38 @@ mod tests {
             None,
         );
         library
+    }
+
+    #[test]
+    fn health_tracker_contributes_opportunities() {
+        use astra_turn_core::tool_health::{ToolHealthTracker, ToolOutcome};
+        let library = PatternLibrary::default();
+        let store = ExperimentStore::new();
+        let engine = ExplorationEngine::new(0.5, 3, 5);
+
+        let mut health = ToolHealthTracker::new();
+        // 3 consecutive failures for "bash" with distinct signatures.
+        for i in 0..3 {
+            health.record_outcome(
+                &format!(r#"bash:{{"cmd":"{i}"}}"#),
+                ToolOutcome::new(false, 5, "err"),
+            );
+        }
+
+        // Without health: empty library yields no opportunities.
+        let without = engine.check_and_create_experiments(&library, &store);
+        assert!(without.is_empty());
+
+        // With health: bash's high fail rate synthesizes an opportunity.
+        let with = engine.check_and_create_experiments_with_health(
+            &library,
+            &store,
+            Some(&health),
+        );
+        assert!(
+            !with.is_empty(),
+            "health tracker with failing tool should produce an experiment"
+        );
     }
 
     #[test]

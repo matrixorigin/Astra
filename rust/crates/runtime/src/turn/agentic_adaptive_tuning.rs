@@ -1117,11 +1117,18 @@ pub(crate) fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     drop(session_guard);
 
     let exploration = crate::exploration_engine::ExplorationEngine::default();
+    // A′: ground experiments in recent tool outcome evidence (generic — any
+    // tool with ≥0.5 fail-rate over ≥3 cached outcomes becomes an opportunity).
+    let health = &state.turn_guard.health;
     let created = match hub.pattern_library() {
         Some(pattern_library) => match pattern_library.lock() {
             Ok(pattern_library) => {
                 let experiments = hub.experiments();
-                exploration.check_and_create_experiments(&pattern_library, &experiments)
+                exploration.check_and_create_experiments_with_health(
+                    &pattern_library,
+                    &experiments,
+                    Some(health),
+                )
             }
             Err(err) => {
                 eprintln!("[adaptive-exec] failed to lock pattern library: {err}");

@@ -674,6 +674,55 @@ impl ToolHealthTracker {
         bias
     }
 
+    /// Per-tool failure rates aggregated over the full outcome cache (not
+    /// just newest entries). Returns `(tool_name, fail_rate, total_samples)`
+    /// for tools with `total_samples >= min_samples` and
+    /// `fail_rate >= min_fail_rate`.
+    ///
+    /// Used by the exploration engine to ground experiments in recent
+    /// outcome evidence (generic — no per-tool hardcoding).
+    #[must_use]
+    pub fn high_failure_tools(
+        &self,
+        min_samples: u32,
+        min_fail_rate: f64,
+    ) -> Vec<(String, f64, u32)> {
+        let mut agg: HashMap<String, (u32, u32)> = HashMap::new(); // (fails, total)
+        for (signature, ring) in &self.outcome_cache {
+            let tool_name = signature
+                .split_once(':')
+                .map(|(name, _)| name.to_string())
+                .unwrap_or_else(|| signature.clone());
+            let entry = agg.entry(tool_name).or_default();
+            for outcome in ring {
+                entry.1 += 1;
+                if !outcome.success {
+                    entry.0 += 1;
+                }
+            }
+        }
+        let mut out: Vec<(String, f64, u32)> = agg
+            .into_iter()
+            .filter_map(|(name, (fails, total))| {
+                if total < min_samples {
+                    return None;
+                }
+                let rate = fails as f64 / total as f64;
+                if rate < min_fail_rate {
+                    return None;
+                }
+                Some((name, rate, total))
+            })
+            .collect();
+        // Sort by fail_rate descending, then samples descending.
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.2.cmp(&a.2))
+        });
+        out
+    }
+
     /// Latest known outcomes across signatures, newest first.
     #[must_use]
     pub fn latest_outcomes(&self, limit: usize) -> Vec<RecentOutcomeHint> {
@@ -1446,6 +1495,40 @@ mod tests {
         );
         let bias = tracker.outcome_bias_by_tool(3600);
         assert!(bias.is_empty());
+    }
+
+    #[test]
+    fn high_failure_tools_surfaces_repeated_fails() {
+        let mut tracker = ToolHealthTracker::new();
+        // bash: 3 fails out of 3 → 100% fail.
+        for i in 0..3 {
+            tracker.record_outcome(
+                &format!(r#"bash:{{"command":"a{i}"}}"#),
+                ToolOutcome::new(false, 10, "err"),
+            );
+        }
+        // grep: 1 fail out of 4 → 25% fail.
+        tracker.record_outcome(r#"grep:{"p":"x"}"#, ToolOutcome::new(false, 5, "err"));
+        for i in 0..3 {
+            tracker.record_outcome(
+                &format!(r#"grep:{{"p":"y{i}"}}"#),
+                ToolOutcome::new(true, 5, "ok"),
+            );
+        }
+        let high = tracker.high_failure_tools(3, 0.5);
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].0, "bash");
+        assert!((high[0].1 - 1.0).abs() < 1e-6);
+        assert_eq!(high[0].2, 3);
+    }
+
+    #[test]
+    fn high_failure_tools_filters_by_min_samples() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_outcome(r#"bash:{}"#, ToolOutcome::new(false, 1, "e"));
+        // Only 1 sample < min_samples=3.
+        let high = tracker.high_failure_tools(3, 0.5);
+        assert!(high.is_empty());
     }
 
     #[test]
