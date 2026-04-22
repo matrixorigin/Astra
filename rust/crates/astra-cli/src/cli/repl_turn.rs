@@ -25,6 +25,22 @@ pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::
     enqueue_ingestion(state, event);
 }
 
+/// Map a runtime stall event's `stall_type` string to the journal confidence.
+///
+/// - `sig_stall` (exact-repetition signature stall): confidence 1.0.
+/// - `skill_lockout[:<name>]` (skill re-entry hard lockout, reentry ≥ 3):
+///   confidence 1.0 — the runtime has already blocked the call, so the
+///   signal is deterministic.
+/// - Anything else: 0.0 (heuristic; emission is skipped to avoid polluting
+///   downstream reflection / auto-tuning pipelines with no-op stalls).
+fn stall_type_confidence(stall_type: &str) -> f64 {
+    match stall_type {
+        "sig_stall" => 1.0,
+        s if s.starts_with("skill_lockout") => 1.0,
+        _ => 0.0,
+    }
+}
+
 /// Pull a few Memoria hits after compact so the shortened context keeps **session-relevant**
 /// recall (keeps session-relevant context as an anchor after compaction).
 const COMPACT_ANCHOR_QUERY_MAX: usize = 220;
@@ -1499,19 +1515,7 @@ fn commit_turn_journal_workspace_and_sidecars(
 
         // Log stall events to journal (use state.turn for user turn, not internal loop turn)
         for (stall_type, _) in &result.stall_events {
-            // Confidence: sig_stall is exact-repetition (full name+args match
-            // across stall_window rounds) → conf 1.0. Anything else is a
-            // heuristic signal with lower confidence; skip emission entirely
-            // when confidence would be zero to avoid polluting downstream
-            // reflection / auto-tuning pipelines with no-op stall signals.
-            let confidence: f64 = match stall_type.as_str() {
-                "sig_stall" => 1.0,
-                // Skill hard lockout (reentry >= 3) is a deterministic signal
-                // — the runtime already blocked a repeated skill invocation, so
-                // we record it with full confidence for downstream analytics.
-                s if s.starts_with("skill_lockout") => 1.0,
-                _ => 0.0,
-            };
+            let confidence = stall_type_confidence(stall_type);
             if confidence == 0.0 {
                 continue;
             }
@@ -5262,5 +5266,29 @@ mod tests {
         let content = "# Body\n\n## Recent user feedback\n- only\n";
         let trimmed = trim_feedback_sections(content, 5);
         assert_eq!(trimmed, content);
+    }
+
+    #[test]
+    fn stall_type_confidence_maps_known_signals() {
+        // Deterministic signals → full confidence.
+        assert_eq!(super::stall_type_confidence("sig_stall"), 1.0);
+        assert_eq!(super::stall_type_confidence("skill_lockout"), 1.0);
+        assert_eq!(
+            super::stall_type_confidence("skill_lockout:review-changes"),
+            1.0
+        );
+        assert_eq!(
+            super::stall_type_confidence("skill_lockout:any-other-skill"),
+            1.0
+        );
+
+        // Heuristic / unknown types must stay at 0.0 so journal write-through
+        // skips emission (avoids polluting downstream reflection pipelines).
+        assert_eq!(super::stall_type_confidence("repetition_stall"), 0.0);
+        assert_eq!(super::stall_type_confidence("name_stall"), 0.0);
+        assert_eq!(super::stall_type_confidence(""), 0.0);
+        assert_eq!(super::stall_type_confidence("unknown_type"), 0.0);
+        // Near-miss must not match — prefix is literal.
+        assert_eq!(super::stall_type_confidence("skill_lockou"), 0.0);
     }
 }
