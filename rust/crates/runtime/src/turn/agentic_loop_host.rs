@@ -852,6 +852,104 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
 // ─── CTX_ helpers ────────────────────────────────────────────────────────────
 
+/// Derive a sensible OpenAI-protocol `finish_reason` when upstream didn't
+/// supply one. Observed in the wild: qwen-turbo frequently omits
+/// `finish_reason` on tool-call rounds (72/92 rounds null in a production
+/// session), which tripped up journal analysers and learning signals that
+/// used the field to distinguish tool-call rounds from stops.
+///
+/// Rule follows the OpenAI Chat Completions spec:
+/// * upstream value wins when present (we don't lie about "length"-truncated
+///   responses — that would suppress the output-token escalation at
+///   `server_loop_host.rs:1715`);
+/// * absent + tool_calls present → `"tool_calls"`;
+/// * absent + no tool_calls → `"stop"`.
+///
+/// This is a pure function to keep it trivially testable. Callers that need
+/// to record a journal event can use it without mutating the upstream
+/// `LlmCallResult`.
+pub(crate) fn synthesise_finish_reason(
+    upstream: Option<&str>,
+    has_tool_calls: bool,
+) -> &'static str {
+    match upstream {
+        Some("stop") => "stop",
+        Some("length") => "length",
+        Some("tool_calls") => "tool_calls",
+        Some("content_filter") => "content_filter",
+        Some("function_call") => "function_call",
+        // Unknown / other upstream string: we can't return it borrowed as
+        // `&'static`, but at the journal layer callers already have the
+        // original String when needed. Any caller that feeds a non-None
+        // upstream here is using this helper *as a default* — so fall
+        // through to the rules below for deterministic output.
+        Some(_) => {
+            if has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+        None => {
+            if has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod synthesise_finish_reason_tests {
+    use super::synthesise_finish_reason;
+
+    #[test]
+    fn none_plus_tool_calls_becomes_tool_calls() {
+        assert_eq!(synthesise_finish_reason(None, true), "tool_calls");
+    }
+
+    #[test]
+    fn none_without_tool_calls_becomes_stop() {
+        assert_eq!(synthesise_finish_reason(None, false), "stop");
+    }
+
+    #[test]
+    fn upstream_length_is_preserved() {
+        // Critical: "length" is the signal that triggers max_output_tokens
+        // escalation in server_loop_host. We must never clobber it.
+        assert_eq!(synthesise_finish_reason(Some("length"), false), "length");
+        assert_eq!(synthesise_finish_reason(Some("length"), true), "length");
+    }
+
+    #[test]
+    fn upstream_known_values_are_preserved() {
+        assert_eq!(synthesise_finish_reason(Some("stop"), true), "stop");
+        assert_eq!(
+            synthesise_finish_reason(Some("tool_calls"), false),
+            "tool_calls"
+        );
+        assert_eq!(
+            synthesise_finish_reason(Some("content_filter"), false),
+            "content_filter"
+        );
+    }
+
+    #[test]
+    fn unknown_upstream_falls_back_to_rule() {
+        // Unknown reasons (forward-compatibility): treat as if absent so
+        // downstream consumers see consistent semantics.
+        assert_eq!(
+            synthesise_finish_reason(Some("something_new"), true),
+            "tool_calls"
+        );
+        assert_eq!(
+            synthesise_finish_reason(Some("something_new"), false),
+            "stop"
+        );
+    }
+}
+
 /// Extract repository name from a git remote URL.
 #[cfg(test)]
 pub(crate) mod tests {
