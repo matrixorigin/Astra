@@ -752,12 +752,15 @@ impl ServerAgenticLoopHost {
                     Value::String(s) => serde_json::from_str(s).unwrap_or(args.clone()),
                     _ => args.clone(),
                 };
-                let is_cacheable = astra_turn_core::parallel_tool_exec::is_read_only_tool(&tool_name);
+                let is_cacheable =
+                    astra_turn_core::parallel_tool_exec::is_read_only_tool(&tool_name);
                 let sig = if is_cacheable {
-                    Some(astra_turn_core::tool_result_dedup::CallSignature::from_args(
-                        &tool_name,
-                        &args_for_sig,
-                    ))
+                    Some(
+                        astra_turn_core::tool_result_dedup::CallSignature::from_args(
+                            &tool_name,
+                            &args_for_sig,
+                        ),
+                    )
                 } else {
                     None
                 };
@@ -770,37 +773,40 @@ impl ServerAgenticLoopHost {
                         .and_then(|mut g| g.lookup(s))
                 });
 
-                let (delivery_output, delivery_sse_maps, duration_ms): (String, Vec<Map<String, Value>>, u64) =
-                    if let Some(cached_output) = cached {
-                        (cached_output, Vec::new(), 0)
-                    } else {
-                        let delivery = wait_tool_result_ledger_for_tool(
-                            &self.edge_callback_ledger,
-                            &self.user_id,
-                            tc,
-                            ledger_wait,
-                        )
-                        .await;
-                        let duration_ms = started.elapsed().as_millis() as u64;
-                        let sse_maps = delivery.sse_maps.clone();
-                        let output = delivery
-                            .tool_messages
-                            .first()
-                            .and_then(|m| m.get("content"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        // Record successful read-only results only.
-                        if let Some(sig_ref) = sig.as_ref() {
-                            let is_err = output.contains("status=error");
-                            if !is_err {
-                                if let Ok(mut guard) = self.tool_result_cache.lock() {
-                                    guard.record(sig_ref.clone(), output.clone());
-                                }
+                let (delivery_output, delivery_sse_maps, duration_ms): (
+                    String,
+                    Vec<Map<String, Value>>,
+                    u64,
+                ) = if let Some(cached_output) = cached {
+                    (cached_output, Vec::new(), 0)
+                } else {
+                    let delivery = wait_tool_result_ledger_for_tool(
+                        &self.edge_callback_ledger,
+                        &self.user_id,
+                        tc,
+                        ledger_wait,
+                    )
+                    .await;
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let sse_maps = delivery.sse_maps.clone();
+                    let output = delivery
+                        .tool_messages
+                        .first()
+                        .and_then(|m| m.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    // Record successful read-only results only.
+                    if let Some(sig_ref) = sig.as_ref() {
+                        let is_err = output.contains("status=error");
+                        if !is_err {
+                            if let Ok(mut guard) = self.tool_result_cache.lock() {
+                                guard.record(sig_ref.clone(), output.clone());
                             }
                         }
-                        (output, sse_maps, duration_ms)
-                    };
+                    }
+                    (output, sse_maps, duration_ms)
+                };
 
                 for m in delivery_sse_maps {
                     self.emit_event(Value::Object(m));

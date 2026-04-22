@@ -1156,11 +1156,9 @@ mod tests {
             .iter()
             .filter(|m| {
                 m.get("role").and_then(|r| r.as_str()) == Some("user")
-                    && m.get("content")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|s| {
-                            s.contains("## ⚡ Round Budget") || s.contains("## ⚠ Round Budget")
-                        })
+                    && m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
+                        s.contains("## ⚡ Round Budget") || s.contains("## ⚠ Round Budget")
+                    })
             })
             .count();
 

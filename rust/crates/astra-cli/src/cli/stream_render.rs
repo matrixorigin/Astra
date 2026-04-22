@@ -2659,8 +2659,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 outcome.output.clone(),
                             )
                             .with_call_id(&request_id);
-                            let post = astra_runtime::turn::tool_hooks::global_run_post(&post_ctx)
-                                .await;
+                            let post =
+                                astra_runtime::turn::tool_hooks::global_run_post(&post_ctx).await;
                             if post.final_output != outcome.output {
                                 return (
                                     crate::edge_tools::ToolExecutionOutcome {

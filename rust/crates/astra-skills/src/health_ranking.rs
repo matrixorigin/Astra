@@ -127,8 +127,7 @@ pub fn sort_by_health_rank<S: AsRef<str> + Clone>(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let reordered: Vec<(String, Vec<S>)> =
-        indices.iter().map(|&i| skills[i].clone()).collect();
+    let reordered: Vec<(String, Vec<S>)> = indices.iter().map(|&i| skills[i].clone()).collect();
     let scores_reordered: Vec<(String, f64)> = indices
         .iter()
         .map(|&i| (skills[i].0.clone(), scores[i]))

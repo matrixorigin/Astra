@@ -508,7 +508,11 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
-        assert_eq!(after_calls.load(Ordering::SeqCst), 0, "later hook must not run");
+        assert_eq!(
+            after_calls.load(Ordering::SeqCst),
+            0,
+            "later hook must not run"
+        );
     }
 
     #[tokio::test]
@@ -519,11 +523,8 @@ mod tests {
             out: "REDACTED".into(),
         }))
         .await;
-        let ctx = ToolHookContext::post(
-            "read_file",
-            json!({"path": "creds"}),
-            "super secret".into(),
-        );
+        let ctx =
+            ToolHookContext::post("read_file", json!({"path": "creds"}), "super secret".into());
         let outcome = reg.run_post(&ctx).await;
         assert_eq!(outcome.final_output, "REDACTED");
         assert_eq!(outcome.mutating_hook_ids, vec!["redactor"]);
@@ -783,7 +784,11 @@ mod tests {
             self.id_
         }
         fn phases(&self) -> &[HookPhase] {
-            &[HookPhase::PreTool, HookPhase::PostTool, HookPhase::PostToolFailure]
+            &[
+                HookPhase::PreTool,
+                HookPhase::PostTool,
+                HookPhase::PostToolFailure,
+            ]
         }
         async fn run(&self, _phase: HookPhase, _ctx: &ToolHookContext) -> HookDecision {
             HookDecision::Continue

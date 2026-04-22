@@ -411,8 +411,8 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_or_compute_miss_then_hit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let cache = new_shared_cache(8, None);
         let sig = CallSignature::from_args("read_file", &json!({"path": "a"}));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -451,20 +451,18 @@ mod tests {
         let sig = CallSignature::from_args("grep", &json!({"q": "TODO"}));
 
         let mut ran = 0;
-        let (out1, hit1) =
-            lookup_or_compute_sync(&cache, &sig, || {
-                ran += 1;
-                "fresh".to_string()
-            });
+        let (out1, hit1) = lookup_or_compute_sync(&cache, &sig, || {
+            ran += 1;
+            "fresh".to_string()
+        });
         assert!(!hit1);
         assert_eq!(out1, "fresh");
         assert_eq!(ran, 1);
 
-        let (out2, hit2) =
-            lookup_or_compute_sync(&cache, &sig, || {
-                ran += 1;
-                "SHOULD_NOT_RUN".to_string()
-            });
+        let (out2, hit2) = lookup_or_compute_sync(&cache, &sig, || {
+            ran += 1;
+            "SHOULD_NOT_RUN".to_string()
+        });
         assert!(hit2);
         assert_eq!(out2, "fresh");
         assert_eq!(ran, 1, "closure ran on hit");

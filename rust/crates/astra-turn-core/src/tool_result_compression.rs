@@ -55,11 +55,7 @@ const ERROR_TAIL_LINES: usize = 10;
 
 /// Top-level entry point. If `content` already fits the budget, it is
 /// returned unchanged. Otherwise a type-aware compressor is selected.
-pub fn compress_result_for_context(
-    tool_name: &str,
-    content: &str,
-    budget_chars: usize,
-) -> String {
+pub fn compress_result_for_context(tool_name: &str, content: &str, budget_chars: usize) -> String {
     if content.len() <= budget_chars {
         return content.to_string();
     }
@@ -300,8 +296,10 @@ mod tests {
 
     #[test]
     fn error_payload_preserves_top_and_tail_frames() {
-        let mut lines: Vec<String> =
-            vec!["Error: something failed".into(), "Traceback (most recent call last):".into()];
+        let mut lines: Vec<String> = vec![
+            "Error: something failed".into(),
+            "Traceback (most recent call last):".into(),
+        ];
         for i in 0..80 {
             lines.push(format!("  frame {i}: at somewhere"));
         }
@@ -342,14 +340,20 @@ mod tests {
     #[test]
     fn is_line_listing_requires_many_lines() {
         assert!(!is_line_listing("a\nb\nc"));
-        let many = (0..100).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let many = (0..100)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(is_line_listing(&many));
     }
 
     #[test]
     fn looks_like_error_triggers_on_keywords() {
         assert!(looks_like_error("bash", "panic: oops"));
-        assert!(looks_like_error("bash", "Traceback (most recent call last)"));
+        assert!(looks_like_error(
+            "bash",
+            "Traceback (most recent call last)"
+        ));
         assert!(looks_like_error("bash", "Exception: foo"));
         assert!(!looks_like_error("bash", "all good"));
     }

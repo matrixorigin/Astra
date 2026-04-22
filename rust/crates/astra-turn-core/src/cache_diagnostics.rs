@@ -217,13 +217,8 @@ impl CacheBreakDetector {
             }
             if let Some(dir) = self.diff_dir.clone() {
                 self.diff_seq = self.diff_seq.wrapping_add(1);
-                let _ = write_diff_artifact(
-                    &dir,
-                    self.diff_seq,
-                    self.previous.as_ref(),
-                    &current,
-                    evt,
-                );
+                let _ =
+                    write_diff_artifact(&dir, self.diff_seq, self.previous.as_ref(), &current, evt);
             }
         } else if self.previous.is_some() {
             self.stats.cache_hits += 1;
@@ -342,8 +337,7 @@ impl CacheBreakDetector {
                 } => {
                     let parts: Vec<String> = [
                         (!added.is_empty()).then(|| format!("added: {}", added.join(", "))),
-                        (!removed.is_empty())
-                            .then(|| format!("removed: {}", removed.join(", "))),
+                        (!removed.is_empty()).then(|| format!("removed: {}", removed.join(", "))),
                         (!changed.is_empty())
                             .then(|| format!("schema changed: {}", changed.join(", "))),
                     ]

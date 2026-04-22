@@ -56,9 +56,7 @@ impl RecentArgHints {
             return None;
         }
         let mut out = String::new();
-        out.push_str(
-            "Recent working context (reuse these argument values when applicable):\n",
-        );
+        out.push_str("Recent working context (reuse these argument values when applicable):\n");
         if !self.paths.is_empty() {
             out.push_str("  paths:\n");
             for p in &self.paths {
@@ -108,9 +106,7 @@ where
                 }
             }
         }
-        if hints.paths.len() >= MAX_RECENT_PATHS
-            && hints.commands.len() >= MAX_RECENT_COMMANDS
-        {
+        if hints.paths.len() >= MAX_RECENT_PATHS && hints.commands.len() >= MAX_RECENT_COMMANDS {
             break;
         }
     }
@@ -166,10 +162,7 @@ pub fn extract_recent_tool_calls_from_messages(messages: &[Value]) -> Vec<(Strin
 #[must_use]
 pub fn prompt_block_from_messages(messages: &[Value]) -> Option<String> {
     let calls = extract_recent_tool_calls_from_messages(messages);
-    let borrowed: Vec<(&str, &Value)> = calls
-        .iter()
-        .map(|(n, v)| (n.as_str(), v))
-        .collect();
+    let borrowed: Vec<(&str, &Value)> = calls.iter().map(|(n, v)| (n.as_str(), v)).collect();
     let hints = build_recent_arg_hints(borrowed);
     hints.render_prompt_block()
 }
@@ -221,8 +214,7 @@ mod tests {
         let values: Vec<Value> = (0..(MAX_RECENT_PATHS + 3))
             .map(|i| json!({"path": format!("f{i}.rs")}))
             .collect();
-        let calls: Vec<(&str, &Value)> =
-            values.iter().map(|v| ("read_file", v)).collect();
+        let calls: Vec<(&str, &Value)> = values.iter().map(|v| ("read_file", v)).collect();
         let hints = build_recent_arg_hints(calls);
         assert_eq!(hints.paths.len(), MAX_RECENT_PATHS);
         assert_eq!(hints.paths[0], "f0.rs");

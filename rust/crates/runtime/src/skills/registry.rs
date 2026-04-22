@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use astra_skills::health_ranking::{rank_multiplier, HealthRankingInputs};
+use astra_skills::health_ranking::{HealthRankingInputs, rank_multiplier};
 use astra_skills::providers::mcp::McpSkillProvider;
 use astra_skills::quality::SkillQualityTracker;
 
@@ -144,11 +144,7 @@ impl UnifiedSkillRegistry {
         // deprioritized skills are truncated first when the metadata budget is
         // exhausted. The sort is stable w.r.t. insertion order within a bucket
         // when no health data changes its rank.
-        let health_snapshot = self
-            .health_inputs
-            .read()
-            .ok()
-            .and_then(|g| g.clone());
+        let health_snapshot = self.health_inputs.read().ok().and_then(|g| g.clone());
         if let Some(h) = health_snapshot.as_ref() {
             let q_ref = h.skill_quality.as_deref();
             let inputs = HealthRankingInputs {
@@ -159,8 +155,7 @@ impl UnifiedSkillRegistry {
             let ranks: HashMap<String, f64> = all_manifests
                 .iter()
                 .map(|m| {
-                    let tools: Vec<&str> =
-                        m.allowed_tools.iter().map(|s| s.as_str()).collect();
+                    let tools: Vec<&str> = m.allowed_tools.iter().map(|s| s.as_str()).collect();
                     (m.name.clone(), rank_multiplier(&m.name, &tools, &inputs))
                 })
                 .collect();
@@ -1472,8 +1467,14 @@ Shared MCP.
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
-                (mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled), "a".into()),
-                (mk_skill("beta", &["stable"], SkillSourceKind::Bundled), "b".into()),
+                (
+                    mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled),
+                    "a".into(),
+                ),
+                (
+                    mk_skill("beta", &["stable"], SkillSourceKind::Bundled),
+                    "b".into(),
+                ),
             ],
         }));
         let registered = registry.discover_all().await.unwrap();
@@ -1485,8 +1486,14 @@ Shared MCP.
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
-                (mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled), "a".into()),
-                (mk_skill("beta", &["stable"], SkillSourceKind::Bundled), "b".into()),
+                (
+                    mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled),
+                    "a".into(),
+                ),
+                (
+                    mk_skill("beta", &["stable"], SkillSourceKind::Bundled),
+                    "b".into(),
+                ),
             ],
         }));
 
@@ -1508,8 +1515,14 @@ Shared MCP.
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
-                (mk_skill("shell_skill", &["bash"], SkillSourceKind::Bundled), "s".into()),
-                (mk_skill("read_skill", &["read_file"], SkillSourceKind::Bundled), "r".into()),
+                (
+                    mk_skill("shell_skill", &["bash"], SkillSourceKind::Bundled),
+                    "s".into(),
+                ),
+                (
+                    mk_skill("read_skill", &["read_file"], SkillSourceKind::Bundled),
+                    "r".into(),
+                ),
             ],
         }));
 
@@ -1522,7 +1535,10 @@ Shared MCP.
         });
 
         let registered = registry.discover_all().await.unwrap();
-        assert_eq!(registered, vec!["read_skill".to_string(), "shell_skill".to_string()]);
+        assert_eq!(
+            registered,
+            vec!["read_skill".to_string(), "shell_skill".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1532,8 +1548,14 @@ Shared MCP.
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
-                (mk_skill("broken_local", &["flaky"], SkillSourceKind::Local), "l".into()),
-                (mk_skill("healthy_db", &["stable"], SkillSourceKind::Database), "d".into()),
+                (
+                    mk_skill("broken_local", &["flaky"], SkillSourceKind::Local),
+                    "l".into(),
+                ),
+                (
+                    mk_skill("healthy_db", &["stable"], SkillSourceKind::Database),
+                    "d".into(),
+                ),
             ],
         }));
         let mut rates = HashMap::new();
@@ -1559,8 +1581,14 @@ Shared MCP.
         let mut registry = UnifiedSkillRegistry::new().with_budget(20);
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
-                (mk_skill("alpha_broken", &["flaky"], SkillSourceKind::Bundled), "a".into()),
-                (mk_skill("beta_ok", &["stable"], SkillSourceKind::Bundled), "b".into()),
+                (
+                    mk_skill("alpha_broken", &["flaky"], SkillSourceKind::Bundled),
+                    "a".into(),
+                ),
+                (
+                    mk_skill("beta_ok", &["stable"], SkillSourceKind::Bundled),
+                    "b".into(),
+                ),
             ],
         }));
         let mut rates = HashMap::new();
@@ -1585,8 +1613,14 @@ Shared MCP.
         let mut registry = UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(StubProvider {
             skills: vec![
-                (mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled), "a".into()),
-                (mk_skill("beta", &["stable"], SkillSourceKind::Bundled), "b".into()),
+                (
+                    mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled),
+                    "a".into(),
+                ),
+                (
+                    mk_skill("beta", &["stable"], SkillSourceKind::Bundled),
+                    "b".into(),
+                ),
             ],
         }));
         let mut rates = HashMap::new();

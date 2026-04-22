@@ -286,10 +286,7 @@ mod tests {
     #[test]
     fn bootstrap_default_unknown_tool_falls_through() {
         let r = ConcurrencySafetyRegistry::bootstrap_default();
-        assert_eq!(
-            r.classify("brand_new_mcp_tool"),
-            ConcurrencySafety::Unknown
-        );
+        assert_eq!(r.classify("brand_new_mcp_tool"), ConcurrencySafety::Unknown);
     }
 
     #[test]
