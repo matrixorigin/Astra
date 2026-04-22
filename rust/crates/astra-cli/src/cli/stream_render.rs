@@ -1454,13 +1454,22 @@ impl CliSseStreamHost<'_> {
         let Some(exec) = self.streaming_tool_exec.as_ref() else {
             return std::collections::HashMap::new();
         };
-        let speculative = exec.wait_all().await;
+        // Use `merge_speculative` (not raw `wait_all`) so per-call-id hit
+        // counters and saved-ms metrics are updated for observability.
+        let ids: Vec<String> = conc_reqs
+            .iter()
+            .map(|(_, r)| r.request_id.clone())
+            .collect();
+        let (done, _needed) = exec.merge_speculative(&ids).await;
         let mut out = std::collections::HashMap::new();
-        for (_, req) in conc_reqs {
-            if let Some(r) = speculative.get(&req.request_id) {
-                out.insert(req.request_id.clone(), (r.content.clone(), r.success));
-            }
+        for r in done {
+            out.insert(r.call_id.clone(), (r.content.clone(), r.success));
         }
+        // Emit a structured metrics event once per batch merge so log
+        // aggregators / ObservabilityHub can track speculation effectiveness
+        // over time. Target: `astra::streaming_speculation::metrics`.
+        exec.emit_metrics_log(self.executor.active_session_id().as_deref())
+            .await;
         out
     }
 }
