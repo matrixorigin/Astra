@@ -1,0 +1,26 @@
+name: parallel_tool_batching
+description: "并发只读工具批处理：同一条用户请求引发多个只读工具调用，验证 agent_events 中记录多条 tool_call，且最终响应综合了并发结果"
+requires: [llm]
+
+turns:
+  - user: "请同时查一下当前工作目录的文件列表、和 README.md 的前 20 行，然后简要汇总。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=2"
+      llm_judge:
+        criteria: "回复应同时提到目录文件列表与 README 的内容摘要，说明并发的多个只读工具结果被综合利用，不应只报告其中一项"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid AND event_type = 'tool_call'"
+        assert:
+          count: ">=2"
