@@ -1058,6 +1058,14 @@ fn truncate_for_audit(text: &str, max_chars: usize) -> String {
 /// PatternLibrary / EntityGraph / ProgressiveCalibrator can learn across
 /// sessions.  This mirrors what the bridge path does via
 /// `PipelineLearningWriter.record_outcome()` in `side_effects.rs`.
+///
+/// Correction detection: the server agentic loop previously hardcoded
+/// `was_corrected=false`, which left the ProgressiveCalibrator's three-axis
+/// formula `threshold = 0.70 - 0×0.15 - 0×0.10 - 0×0.10 = 0.70` frozen. This
+/// function now runs implicit-feedback detection on the user's turn against
+/// the most recent assistant message pulled from `state.messages`, matching
+/// the CLI/bridge behavior (`repl_turn.rs::record_selector_turn_outcome`,
+/// `bridge_inprocess.rs::build_turn_hook_args`).
 async fn record_server_loop_learning_outcome(
     writer: &dyn TurnLearningWriter,
     user_message: &str,
@@ -1065,13 +1073,19 @@ async fn record_server_loop_learning_outcome(
     success: bool,
 ) {
     let tools_used: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    let prev_assistant_text = extract_prev_assistant_text(&state.messages);
+    let signal = astra_turn_types::detect_implicit_feedback_signal(
+        user_message,
+        prev_assistant_text.as_deref(),
+    );
+    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
     let outcome = TurnLearningOutcome {
         query: user_message.to_string(),
         tools_selected: tools_used.clone(),
         tools_used,
         success,
         quality: if success { 0.7 } else { 0.2 },
-        was_corrected: false,
+        was_corrected,
         task_type_label: None,
         domain_hint_label: None,
         user_feedback_score: None,
@@ -1083,6 +1097,41 @@ async fn record_server_loop_learning_outcome(
     if let Err(e) = writer.record_outcome(outcome).await {
         astra_core::agent_error!("server-loop", "failed to record learning outcome: {e}");
     }
+}
+
+/// Walk `messages` (chronological) and return the content of the latest
+/// assistant entry, if any. Used by implicit-feedback detection so the
+/// "user said `that's wrong` after the assistant answered `X`" pattern can
+/// score higher confidence.
+fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "assistant" {
+            continue;
+        }
+        if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
+            let mut buf = String::new();
+            for part in arr {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(t);
+                }
+            }
+            let trimmed = buf.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 // ─── Run State ──────────────────────────────────────────────────────────────
@@ -3186,6 +3235,88 @@ impl SubRunExecutor for ServerSubRunExecutor {
 mod tests {
     use super::*;
     use astra_services::session_journal::{JournalEventType, ToolCallRecord};
+
+    // ── extract_prev_assistant_text + implicit feedback wiring ──
+
+    #[test]
+    fn extract_prev_assistant_text_picks_latest_assistant_string() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "first answer"}),
+            serde_json::json!({"role": "user", "content": "follow up"}),
+            serde_json::json!({"role": "assistant", "content": "latest answer"}),
+        ];
+        assert_eq!(
+            extract_prev_assistant_text(&messages).as_deref(),
+            Some("latest answer")
+        );
+    }
+
+    #[test]
+    fn extract_prev_assistant_text_handles_content_parts_array() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"},
+                ],
+            }),
+        ];
+        assert_eq!(
+            extract_prev_assistant_text(&messages).as_deref(),
+            Some("part one\npart two")
+        );
+    }
+
+    #[test]
+    fn extract_prev_assistant_text_returns_none_when_no_assistant_turn() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        assert!(extract_prev_assistant_text(&messages).is_none());
+    }
+
+    #[test]
+    fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": "real answer"}),
+            serde_json::json!({"role": "user", "content": "ok"}),
+            serde_json::json!({"role": "assistant", "content": "   "}),
+        ];
+        assert_eq!(
+            extract_prev_assistant_text(&messages).as_deref(),
+            Some("real answer")
+        );
+    }
+
+    #[test]
+    fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
+        // Sanity-check that the detect_implicit_feedback_signal contract used in
+        // record_server_loop_learning_outcome produces a "correction" signal
+        // for the Chinese-language corrections listed in routing::detect_correction.
+        let signal = astra_turn_types::detect_implicit_feedback_signal(
+            "不对，你搞错了",
+            Some("previous assistant reply"),
+        );
+        assert!(
+            matches!(signal.signal_type.as_str(), "correction" | "frustration"),
+            "expected correction/frustration, got {:?}",
+            signal.signal_type
+        );
+    }
+
+    #[test]
+    fn neutral_user_turn_does_not_flag_was_corrected() {
+        let signal = astra_turn_types::detect_implicit_feedback_signal(
+            "再列一下 docs 目录",
+            Some("previous assistant reply"),
+        );
+        assert!(
+            !matches!(signal.signal_type.as_str(), "correction" | "frustration"),
+            "expected non-correction, got {:?}",
+            signal.signal_type
+        );
+    }
 
     /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
     fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
