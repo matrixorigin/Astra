@@ -1531,15 +1531,28 @@ impl ToolExecutor {
             .map(|gt| gt.milestones().to_vec());
         let milestone_slice = milestones.as_deref();
 
+        let skills_slice: &[String] = &session.cached_skill_names;
+        let tool_health_tracker = if session.last_tool_health_export.is_empty() {
+            None
+        } else {
+            Some(
+                astra_runtime::turn::tool_health::ToolHealthTracker::from_entries(
+                    &session.last_tool_health_export,
+                ),
+            )
+        };
+        let scenario_opt = session.active_scenario.as_ref();
+        let signals_slice: &[_] = &session.last_feedback_signals;
+
         let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
             &pinned_tools,
             &deprioritized_tools,
-            &[],
-            None,
+            skills_slice,
+            tool_health_tracker.as_ref(),
             session.turn_number,
             latest_budget,
-            None,
+            scenario_opt,
             None,
             elapsed,
             session.user_corrections.len(),
@@ -1549,7 +1562,7 @@ impl ToolExecutor {
             goal_text,
             goal_progress.as_ref(),
             milestone_slice,
-            &[],
+            signals_slice,
             &session.config,
             session.last_strategy_application.as_ref(),
         );

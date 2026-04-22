@@ -295,6 +295,9 @@ struct PrepareChatTurnRequest<'a> {
     /// Snapshot of session-wide recent `(tool, reason)` rejections for
     /// SelfModel Gap 3 surface.
     recent_rejections: Vec<(String, String)>,
+    /// Optional shared observability hub, forwarded from the SSE fetch request
+    /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
+    observability_hub: Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -688,6 +691,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     },
                 )
                 .collect();
+
+            // Publish the four SelfModel inputs that were previously hard-coded
+            // to empty at `build_self_model_snapshot`.
+            // TODO: surface real skill names once the active-skill registry is
+            // reachable here; for now we mirror `all_selected_skills` which
+            // tracks skills actually chosen this session.
+            let skills = ctx.telem.all_selected_skills.clone();
+            let tool_health_entries = ctx.turn_guard.health.export();
+            let scenario = session.current_scenario();
+            let recent_signals = ctx
+                .observability_hub
+                .as_ref()
+                .map(|hub| hub.tuning().recent_signals())
+                .unwrap_or_default();
+            session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
@@ -874,6 +892,12 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     pub round_index: u32,
+    /// Optional shared observability hub for reading the auto-tuning feedback
+    /// window when publishing SelfModel inputs. Threaded through so the
+    /// per-turn ingest can attach `recent_signals` to the session without
+    /// needing a global singleton.
+    pub observability_hub:
+        Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 }
 struct ChatTurnSseFetchUi {
     timing: bool,
@@ -995,6 +1019,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_cache,
         previous_confidence_fallback,
         round_index,
+        observability_hub,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -1043,6 +1068,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             round_index,
             denial_pressure: perm_manager.denial_pressure(),
             recent_rejections: perm_manager.recent_rejections(),
+            observability_hub,
         },
     )
     .await?;

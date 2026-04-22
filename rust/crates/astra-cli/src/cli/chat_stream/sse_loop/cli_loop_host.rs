@@ -240,6 +240,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 .as_ref()
                 .map(|d| d.fallback.clone()),
             round_index: state.current_round_index,
+            observability_hub: state.telemetry.observability_hub.as_ref(),
         })
         .await;
 
