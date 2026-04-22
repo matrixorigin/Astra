@@ -1417,7 +1417,23 @@ impl PermissionManager {
     /// Same 6-step logic as `check()` but returns `NeedApproval` instead of
     /// blocking on `prompt_approval()`. The caller (execute_tool) can then
     /// route the approval request through an async channel to the REPL.
+    ///
+    /// Wraps `check_nonblocking_inner` to uniformly record every system-driven
+    /// `Deny` into `recent_rejections` so Gap 3 surfaces all refusal reasons
+    /// to the SelfModel (not just user-declined approvals).
     pub(super) fn check_nonblocking(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> PermissionDecision {
+        let decision = self.check_nonblocking_inner(name, args);
+        if let PermissionDecision::Deny(reason) = &decision {
+            self.record_rejection(name, reason);
+        }
+        decision
+    }
+
+    fn check_nonblocking_inner(
         &mut self,
         name: &str,
         args: &serde_json::Value,
@@ -2449,6 +2465,49 @@ mod tests {
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "Prompt mode should require approval for explicit tools, got: {decision:?}"
         );
+    }
+
+    // ── Gap 3: system-driven denials auto-record into recent_rejections ──────
+
+    #[test]
+    fn deny_mode_denial_recorded_in_recent_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let args = serde_json::json!({"path": "note.txt", "content": "hi"});
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Deny(_)),
+            "expected Deny, got {decision:?}"
+        );
+        let recs = pm.recent_rejections();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].0, "write_file");
+        assert!(
+            recs[0].1.to_lowercase().contains("deny") || recs[0].1.to_lowercase().contains("mode"),
+            "reason should mention deny/mode: {}",
+            recs[0].1
+        );
+    }
+
+    #[test]
+    fn dangerous_command_denial_recorded_in_recent_rejections() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"command": "sudo rm -rf /"});
+        let decision = pm.check_nonblocking("bash", &args);
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        let recs = pm.recent_rejections();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].0, "bash");
+        assert!(recs[0].1.to_lowercase().contains("dangerous"));
+    }
+
+    #[test]
+    fn need_approval_does_not_record_rejection() {
+        let mut pm = PermissionManager::new(false);
+        let args = serde_json::json!({"message": "ship it"});
+        let decision = pm.check_nonblocking("git_commit", &args);
+        assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
+        assert!(pm.recent_rejections().is_empty());
     }
 
     // ── Security: session overrides cannot bypass safety checks ──────────────
