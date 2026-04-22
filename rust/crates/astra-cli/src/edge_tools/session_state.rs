@@ -313,9 +313,9 @@ impl ToolExecutor {
                 let current_deprioritized = deprioritized.clone();
                 *pinned = previous_pinned_tools.clone();
                 *deprioritized = previous_deprioritized_tools.clone();
-                if let Some(session_id) = self.active_session_id.as_deref()
+                if let Some(session_id) = self.active_session_id()
                     && let Err(error) = crate::self_command::persist_tool_preferences(
-                        session_id,
+                        &session_id,
                         &pinned,
                         &deprioritized,
                     )
@@ -334,9 +334,9 @@ impl ToolExecutor {
                 snapshot,
             } => {
                 self.restore_observability_snapshot(snapshot)?;
-                if let Some(session_id) = self.active_session_id.as_deref() {
+                if let Some(session_id) = self.active_session_id() {
                     crate::self_command::persist_config_override(
-                        session_id,
+                        &session_id,
                         path,
                         old_value.clone(),
                     )
@@ -352,14 +352,14 @@ impl ToolExecutor {
                 snapshot,
             } => {
                 self.restore_observability_snapshot(snapshot)?;
-                if let Some(session_id) = self.active_session_id.as_deref() {
+                if let Some(session_id) = self.active_session_id() {
                     match previous_goal.as_deref() {
-                        Some(goal) => crate::self_command::persist_goal_override(session_id, goal)
+                        Some(goal) => crate::self_command::persist_goal_override(&session_id, goal)
                             .map(|_| ())
                             .map_err(|error| {
                                 format!("failed to persist restored goal override: {error}")
                             })?,
-                        None => clear_persisted_goal_override(session_id)?,
+                        None => clear_persisted_goal_override(&session_id)?,
                     }
                 }
                 Ok(())

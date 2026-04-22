@@ -54,7 +54,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
     pub project_root: PathBuf,
-    pub executor: ToolExecutor,
+    pub executor: Arc<ToolExecutor>,
     pub selector: &'a dyn ToolSelector,
     pub registry: ToolRegistry,
     pub all_schemas: Vec<Value>,
@@ -158,11 +158,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
         // Propagate skill sandbox policy to the tool executor for this turn.
         // Saved/restored so it doesn't persist after the skill deactivates.
-        let prev_sandbox = self.executor.sandbox_policy.take();
+        let prev_sandbox = self.executor.sandbox_policy.write().unwrap().take();
         if let Some(ref policy) = state.skills.sandbox_policy {
-            self.executor.sandbox_policy = Some(policy.clone());
+            *self.executor.sandbox_policy.write().unwrap() = Some(policy.clone());
         } else {
-            self.executor.sandbox_policy = prev_sandbox.clone();
+            *self.executor.sandbox_policy.write().unwrap() = prev_sandbox.clone();
         }
         self.executor.set_send_message_context(
             state
@@ -192,7 +192,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             history: self.history,
             recent_tools: self.recent_tools,
             project_root: self.project_root.as_path(),
-            executor: &mut self.executor,
+            executor: Arc::clone(&self.executor),
             selector: self.selector,
             registry: &self.registry,
             messages: state.messages.as_slice(),
@@ -254,7 +254,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         }
 
         // Restore previous sandbox policy after the turn.
-        self.executor.sandbox_policy = prev_sandbox;
+        *self.executor.sandbox_policy.write().unwrap() = prev_sandbox;
 
         // Sync latest approval overrides into state for checkpoint persistence.
         state.approval_overrides = self.perm_manager.export_session_overrides();
@@ -324,7 +324,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 api: self.api,
                 token: self.token,
                 executor_id: "auto-reflection",
-                executor: &mut self.executor,
+                executor: Arc::clone(&self.executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: Some(self.perm_manager),
                 cancel_token: state.cancellation.token.as_deref(),

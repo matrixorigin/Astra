@@ -2839,7 +2839,8 @@ impl ToolExecutor {
         harden_command: bool,
     ) -> Result<std::process::Output, String> {
         let effective_command = if harden_command {
-            if let Some(ref policy) = self.sandbox_policy {
+            let sp_guard = self.sandbox_policy.read().unwrap();
+            if let Some(ref policy) = *sp_guard {
                 if !matches!(policy.mode, SandboxMode::Permissive) {
                     wrap_command_with_limits(policy, command)
                 } else {
@@ -2872,12 +2873,15 @@ impl ToolExecutor {
         }
 
         // Apply sandbox environment filtering
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
-            && let Err(e) = sandbox_command(policy, &mut child_cmd)
         {
-            eprintln!("[sandbox] failed to apply policy: {e}");
-            return Err(format!("Error: sandbox policy application failed: {e}"));
+            let sp_guard = self.sandbox_policy.read().unwrap();
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+                && let Err(e) = sandbox_command(policy, &mut child_cmd)
+            {
+                eprintln!("[sandbox] failed to apply policy: {e}");
+                return Err(format!("Error: sandbox policy application failed: {e}"));
+            }
         }
 
         let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
@@ -3114,11 +3118,14 @@ impl ToolExecutor {
         // and reject the command if any path escapes the project boundary.
         // This closes the loophole where read_file is blocked by the sandbox
         // but `cat /outside/path` bypasses it.
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
         {
-            if let Some(msg) = check_bash_path_boundary(policy, command) {
-                return msg;
+            let sp_guard = self.sandbox_policy.read().unwrap();
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+            {
+                if let Some(msg) = check_bash_path_boundary(policy, command) {
+                    return msg;
+                }
             }
         }
 
@@ -3250,11 +3257,14 @@ impl ToolExecutor {
         };
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
 
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
         {
-            if let Some(msg) = check_powershell_path_boundary(policy, command) {
-                return msg;
+            let sp_guard = self.sandbox_policy.read().unwrap();
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+            {
+                if let Some(msg) = check_powershell_path_boundary(policy, command) {
+                    return msg;
+                }
             }
         }
 
@@ -3606,11 +3616,14 @@ impl ToolExecutor {
         .current_dir(&self.project_root);
 
         // Apply sandbox environment filtering (same as bash)
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
-            && let Err(e) = sandbox_command(policy, &mut cmd)
         {
-            return format!("Error: sandbox policy application failed: {e}");
+            let sp_guard = self.sandbox_policy.read().unwrap();
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+                && let Err(e) = sandbox_command(policy, &mut cmd)
+            {
+                return format!("Error: sandbox policy application failed: {e}");
+            }
         }
 
         // Use timeout_secs + 5s buffer for our wrapper (curl has its own --max-time)
@@ -4366,8 +4379,8 @@ mod tests {
     fn resolve_checked_with_permissive_sandbox_allows_all() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
-        executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
+        let executor = ToolExecutor::new(dir.path());
+        *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
         let result = executor.resolve_checked("/etc/passwd");
         assert!(result.is_ok(), "should allow with permissive: {result:?}");
     }
@@ -4388,8 +4401,8 @@ mod tests {
     fn resolve_checked_boundary_violation_has_sandbox_denied_prefix() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
-        executor.sandbox_policy = Some(SandboxPolicy::for_project(dir.path()));
+        let executor = ToolExecutor::new(dir.path());
+        *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::for_project(dir.path()));
         let err = executor.resolve_checked("/etc/passwd").unwrap_err();
         assert!(
             err.starts_with(super::SANDBOX_DENIED_PREFIX),

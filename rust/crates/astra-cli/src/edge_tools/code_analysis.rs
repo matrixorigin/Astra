@@ -32,10 +32,13 @@ impl ToolExecutor {
         };
 
         // Sandbox check
-        if let Some(ref policy) = self.sandbox_policy
-            && let Err(e) = validate_path(policy, path_str)
         {
-            return format!("Sandbox: path blocked: {e}");
+            let sp_guard = self.sandbox_policy.read().unwrap();
+            if let Some(ref policy) = *sp_guard
+                && let Err(e) = validate_path(policy, path_str)
+            {
+                return format!("Sandbox: path blocked: {e}");
+            }
         }
 
         if !path.exists() {

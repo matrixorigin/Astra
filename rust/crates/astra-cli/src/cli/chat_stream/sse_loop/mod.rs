@@ -392,7 +392,7 @@ pub(crate) async fn stream_chat_sse(
         history: p.history,
         recent_tools: p.recent_tools,
         project_root: project_root.clone(),
-        executor,
+        executor: std::sync::Arc::new(executor),
         selector: p.selector,
         registry,
         all_schemas,

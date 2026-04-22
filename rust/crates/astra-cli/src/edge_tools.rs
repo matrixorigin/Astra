@@ -326,7 +326,10 @@ pub struct ToolExecutor {
     /// Shared async GitHub client for edge tools.
     pub github_client: Client,
     /// Security sandbox policy for tool execution (None = Permissive/legacy).
-    pub sandbox_policy: Option<SandboxPolicy>,
+    ///
+    /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
+    /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
+    pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
     /// Preferred repos for disambiguation (owner/repo format, lowercased).
     /// Populated from: git remote origin, recent tool results, memory.
     /// When a bare repo name like "memoria" matches multiple GitHub repos,
@@ -402,7 +405,7 @@ pub struct ToolExecutor {
     /// Agent ID for context sharing attribution.
     pub agent_id: Option<String>,
     /// Optional messaging context for the `send_message` tool.
-    pub send_message_context: Option<agent_messaging::SendMessageRuntimeContext>,
+    pub send_message_context: std::sync::Mutex<Option<agent_messaging::SendMessageRuntimeContext>>,
     /// Optional observability session for context analysis tools.
     /// Provides access to per-turn context assembly traces, timing data,
     /// drift detection, and decision explanations.
@@ -413,7 +416,7 @@ pub struct ToolExecutor {
     >,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
-    active_session_id: Option<String>,
+    active_session_id: std::sync::Mutex<Option<String>>,
     /// Self-modification pinned tool preferences (manual override hints).
     self_mod_pinned_tools: std::sync::Mutex<Vec<String>>,
     /// Self-modification deprioritized tool preferences (manual override hints).
@@ -442,7 +445,7 @@ impl ToolExecutor {
                 .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            sandbox_policy: Some(sandbox),
+            sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
@@ -478,9 +481,9 @@ impl ToolExecutor {
             spawn_context: None,
             context_cache: None,
             agent_id: None,
-            send_message_context: None,
+            send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
-            active_session_id: None,
+            active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
@@ -518,10 +521,12 @@ impl ToolExecutor {
 
     /// Set or clear the messaging context for inter-agent communication.
     pub fn set_send_message_context(
-        &mut self,
+        &self,
         ctx: Option<agent_messaging::SendMessageRuntimeContext>,
     ) {
-        self.send_message_context = ctx;
+        if let Ok(mut guard) = self.send_message_context.lock() {
+            *guard = ctx;
+        }
     }
 
     /// Set the observability session for context analysis tools.
@@ -535,12 +540,12 @@ impl ToolExecutor {
         self
     }
 
-    pub fn with_active_session_id(mut self, session_id: impl Into<String>) -> Self {
+    pub fn with_active_session_id(self, session_id: impl Into<String>) -> Self {
         self.set_active_session_id(session_id);
         self
     }
 
-    pub fn set_active_session_id(&mut self, session_id: impl Into<String>) {
+    pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
         if let Ok(ws) = astra_services::session_workspace::read_workspace(&session_id) {
             if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
@@ -550,11 +555,13 @@ impl ToolExecutor {
                 *deprioritized = ws.deprioritized_tools.clone();
             }
         }
-        self.active_session_id = Some(session_id);
+        if let Ok(mut guard) = self.active_session_id.lock() {
+            *guard = Some(session_id);
+        }
     }
 
-    pub(crate) fn active_session_id(&self) -> Option<&str> {
-        self.active_session_id.as_deref()
+    pub(crate) fn active_session_id(&self) -> Option<String> {
+        self.active_session_id.lock().ok().and_then(|g| g.clone())
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
@@ -747,9 +754,11 @@ impl ToolExecutor {
 
     /// Expand the sandbox boundary to include an additional directory.
     /// Called when the user approves access to a path outside the project.
-    pub fn expand_sandbox_path(&mut self, dir: PathBuf) {
-        if let Some(ref mut policy) = self.sandbox_policy {
-            policy.allowed_paths.push(dir);
+    pub fn expand_sandbox_path(&self, dir: PathBuf) {
+        if let Ok(mut guard) = self.sandbox_policy.write() {
+            if let Some(ref mut policy) = *guard {
+                policy.allowed_paths.push(dir);
+            }
         }
     }
 
@@ -872,8 +881,10 @@ impl ToolExecutor {
 
     /// Configure security sandbox for tool execution.
     #[allow(dead_code)] // Public builder API for library consumers
-    pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
-        self.sandbox_policy = Some(policy);
+    pub fn with_sandbox(self, policy: SandboxPolicy) -> Self {
+        if let Ok(mut guard) = self.sandbox_policy.write() {
+            *guard = Some(policy);
+        }
         self
     }
 
@@ -1015,14 +1026,10 @@ impl ToolExecutor {
                     let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
                     let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
                     let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
-                    if let Some(session_id) = self
-                        .active_session_id
-                        .as_deref()
-                        .filter(|id| !id.is_empty())
-                    {
+                    if let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) {
                         let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
                         match crate::self_command::render_reflect_surface_for_session(
-                            session_id,
+                            &session_id,
                             limit,
                             Some(focus),
                             Some(question),
@@ -1082,11 +1089,12 @@ impl ToolExecutor {
                 "tool_search" => self.tool_search(args),
                 "web_search" => self.web_search(args),
                 "send_message" => {
-                    agent_messaging::handle_send_message_tool(
-                        args,
-                        self.send_message_context.as_ref(),
-                    )
-                    .await
+                    let ctx = self
+                        .send_message_context
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
                 }
                 "spawn_agent" => {
                     agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
@@ -1386,10 +1394,10 @@ impl ToolExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or("all");
 
-        if let Some(session_id) = self.active_session_id.as_deref()
+        if let Some(session_id) = self.active_session_id()
             && let Some(surface) = crate::self_command::agent_info_surface_alias(dimension)
         {
-            return crate::self_command::render_surface_for_session(session_id, surface, 20)
+            return crate::self_command::render_surface_for_session(&session_id, surface, 20)
                 .await
                 .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string());
         }

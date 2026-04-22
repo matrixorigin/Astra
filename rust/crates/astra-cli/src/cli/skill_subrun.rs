@@ -57,7 +57,7 @@ pub(crate) struct SubRunHost {
     pub(crate) token: String,
     pub(crate) model: Option<String>,
     pub(crate) project_root: PathBuf,
-    pub(crate) executor: edge_tools::ToolExecutor,
+    pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
     pub(crate) valid_tool_names: HashSet<String>,
     pub(crate) perm_manager: PermissionManager,
@@ -233,7 +233,7 @@ impl AgenticLoopHost for SubRunHost {
             api: &self.api,
             token: &self.token,
             executor_id: "subrun",
-            executor: &mut self.executor,
+            executor: std::sync::Arc::clone(&self.executor),
             render_policy: RenderPolicy::Silent,
             perm_manager: Some(&mut self.perm_manager),
             cancel_token: self.cancel_token.as_ref().map(|t| t.as_ref()),
@@ -405,10 +405,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let perm_manager =
             PermissionManager::with_project_mode(self.permission_mode, &self.project_root);
 
-        let mut executor = edge_tools::ToolExecutor::new(&self.project_root)
+        let executor = edge_tools::ToolExecutor::new(&self.project_root)
             .with_cloud(self.api.api_origin(), &self.token);
         if let Some(session_id) = self.active_session_id.as_deref() {
-            executor = executor.with_active_session_id(session_id.to_string());
+            executor.set_active_session_id(session_id.to_string());
         }
 
         let mut host = SubRunHost {
@@ -416,7 +416,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             token: self.token.clone(),
             model: effective_model,
             project_root: self.project_root.clone(),
-            executor,
+            executor: std::sync::Arc::new(executor),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
@@ -620,7 +620,7 @@ mod tests {
             token: String::new(),
             model: None,
             project_root: root.clone(),
-            executor: edge_tools::ToolExecutor::new(&root),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
@@ -645,7 +645,7 @@ mod tests {
             token: String::new(),
             model: None,
             project_root: root.clone(),
-            executor: edge_tools::ToolExecutor::new(&root),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
@@ -669,7 +669,7 @@ mod tests {
             token: String::new(),
             model: None,
             project_root: root.clone(),
-            executor: edge_tools::ToolExecutor::new(&root),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),

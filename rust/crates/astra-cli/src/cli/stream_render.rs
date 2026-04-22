@@ -178,7 +178,7 @@ pub(super) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
-    pub executor: &'a mut crate::edge_tools::ToolExecutor,
+    pub executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     pub render_policy: RenderPolicy,
     pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     /// Optional cancellation token to abort SSE stream on auth failure.
@@ -215,7 +215,7 @@ struct CliSseStreamHost<'a> {
     api: &'a astra_thin_client::ThinClient,
     token: &'a str,
     executor_id: &'a str,
-    executor: &'a mut crate::edge_tools::ToolExecutor,
+    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     render_policy: RenderPolicy,
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
@@ -824,7 +824,7 @@ impl<'a> CliSseStreamHost<'a> {
         let Some(session_id) = self.executor.active_session_id() else {
             return;
         };
-        let Ok(writer) = JournalWriter::new(session_id) else {
+        let Ok(writer) = JournalWriter::new(&session_id) else {
             return;
         };
         let _ = writer.append(&event);
@@ -841,7 +841,7 @@ impl<'a> CliSseStreamHost<'a> {
             return;
         };
         self.append_session_journal_event(JournalEvent::execution_boundary_opened(
-            Some(session_id),
+            Some(&session_id),
             turn_index,
             boundary_kind,
             transaction_id,
@@ -860,7 +860,7 @@ impl<'a> CliSseStreamHost<'a> {
             return;
         };
         self.append_session_journal_event(JournalEvent::execution_boundary_committed(
-            Some(session_id),
+            Some(&session_id),
             turn_index,
             boundary_kind,
             transaction_id,
@@ -883,7 +883,7 @@ impl<'a> CliSseStreamHost<'a> {
             return;
         };
         self.append_session_journal_event(JournalEvent::execution_boundary_aborted(
-            Some(session_id),
+            Some(&session_id),
             turn_index,
             boundary_kind,
             transaction_id,
@@ -1474,7 +1474,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_session_id(&mut self, session_id: &str) {
-        if self.executor.active_session_id() != Some(session_id) {
+        if self.executor.active_session_id().as_deref() != Some(session_id) {
             self.executor.set_active_session_id(session_id.to_string());
         }
     }
@@ -2525,7 +2525,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // from saturating edge I/O or exhausting file descriptors.
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
         // a tool failure instead of aborting the whole batch/turn.
-        let executor: &crate::edge_tools::ToolExecutor = &*self.executor;
+        let executor: &crate::edge_tools::ToolExecutor = &self.executor;
         let sem = Arc::new(tokio::sync::Semaphore::new(
             astra_runtime::turn::parallel_tool_exec::MAX_CONCURRENT_TOOL_EXECUTIONS,
         ));
@@ -7402,7 +7402,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7413,7 +7413,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -7493,7 +7493,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = tempdir().expect("tempdir");
         let victim = temp.path().join("txn.txt");
         std::fs::write(&victim, "hello\n").expect("seed file");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7504,7 +7504,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -7580,7 +7580,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
             r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#,
         )
         .expect("seed notebook");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7592,7 +7592,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -7672,7 +7672,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = init_temp_git_repo();
         let tracked = temp.path().join("tracked.txt");
         std::fs::write(&tracked, "working tree\n").expect("modify tracked file");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7683,7 +7683,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -7756,7 +7756,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = init_temp_git_repo();
         let tracked = temp.path().join("tracked.txt");
         std::fs::write(&tracked, "committed in txn\n").expect("modify tracked file");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7767,7 +7767,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -7838,7 +7838,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7849,7 +7849,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -7929,8 +7929,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = tempdir().expect("tempdir");
         let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
         let session_id = "tx-boundary-commit";
-        let mut executor =
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
+        );
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -7941,7 +7942,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8006,8 +8007,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = tempdir().expect("tempdir");
         let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
         let session_id = "tx-boundary-abort";
-        let mut executor =
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
+        );
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8018,7 +8020,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8104,7 +8106,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8115,7 +8117,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8191,7 +8193,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8202,7 +8204,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8289,7 +8291,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = tempdir().expect("tempdir");
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -8297,7 +8299,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8350,7 +8352,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = init_temp_git_repo();
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -8358,7 +8360,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8407,7 +8409,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = init_temp_git_repo();
         let tracked = temp.path().join("tracked.txt");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -8415,7 +8417,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8462,7 +8464,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8473,7 +8475,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8551,7 +8553,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8562,7 +8564,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8608,7 +8610,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         std::fs::write(temp.path().join("keep.txt"), "keep me\n").expect("seed");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8619,7 +8621,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8701,8 +8703,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
         std::fs::write(temp.path().join("ok.txt"), "hello\n").expect("seed file");
         let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
         let session_id = "turn-boundary-commit";
-        let mut executor =
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
+        );
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8713,7 +8716,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8775,8 +8778,9 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = tempdir().expect("tempdir");
         let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
         let session_id = "turn-boundary-abort";
-        let mut executor =
-            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
+        );
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8787,7 +8791,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8868,7 +8872,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8879,7 +8883,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
@@ -8954,7 +8958,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -8965,7 +8969,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 api: &api,
                 token: "tok",
                 executor_id: "edge-test",
-                executor: &mut executor,
+                executor: std::sync::Arc::clone(&executor),
                 render_policy: RenderPolicy::Silent,
                 perm_manager: None,
                 cancel_token: None,
