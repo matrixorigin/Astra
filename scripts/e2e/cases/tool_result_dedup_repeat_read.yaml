@@ -1,0 +1,30 @@
+name: tool_result_dedup_repeat_read
+description: "工具结果去重 (gap #4) 基线守护：多轮对同一文件的重复只读调用应返回一致内容且不报错。当 SharedResultCache 在 cloud_tool_delivery 接入后，同键调用可命中缓存；接入前，本用例充当回归守护，确保重复读不会退化。"
+requires: [llm]
+
+turns:
+  - user: "读一下 README.md 的前 5 行。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=1"
+
+  - user: "再读一次 README.md 的前 5 行，确认一下刚才的内容。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "两轮回复中 README.md 前 5 行的内容应一致。不应出现第二轮突然给出不同首行的情况。"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true

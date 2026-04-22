@@ -719,6 +719,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             }
         }
     }
+    // ─── Recent-argument hints (gap #5): surface just-used paths + commands ───
+    if let Some(hints_text) =
+        astra_runtime::recent_arg_hints::prompt_block_from_messages(ctx.messages)
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert("recent_arg_hints_text".to_string(), json!(hints_text));
+    }
     // ─── Memoria insights: inject recall digest into edge_profile ───
     if let Some(ref insights) = memoria_insights_text
         && let Some(root) = payload.as_object_mut()

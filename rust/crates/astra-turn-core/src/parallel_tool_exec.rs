@@ -71,9 +71,23 @@ static READ_ONLY_TOOLS: &[&str] = &[
     "find_references",
 ];
 
-/// Classify a tool call as read-only or mutating.
+/// Classify a tool call as read-only or mutating. Consults the canonical
+/// static list first; for names not in the list, falls back to the
+/// process-wide [`crate::concurrency_safety`] registry so MCP / dynamic
+/// tools that have declared `ConcurrencySafety::ReadOnly` are recognized
+/// by the parallel dispatcher.
 pub fn is_read_only_tool(tool_name: &str) -> bool {
-    READ_ONLY_TOOLS.contains(&tool_name)
+    if READ_ONLY_TOOLS.contains(&tool_name) {
+        return true;
+    }
+    crate::concurrency_safety::global_is_parallelizable(tool_name)
+}
+
+/// Iterate the canonical read-only tool names. Provided so the
+/// [`crate::concurrency_safety`] registry can seed itself from the same
+/// authoritative list.
+pub fn read_only_tool_names() -> impl Iterator<Item = &'static str> {
+    READ_ONLY_TOOLS.iter().copied()
 }
 
 /// Partition tool calls into (read_only, mutating) groups, preserving

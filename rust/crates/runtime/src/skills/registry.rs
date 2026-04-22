@@ -3,10 +3,12 @@
 //! Skills are merged from all providers with priority-ordered resolution:
 //! local > bundled > database > mcp > plugin.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use astra_skills::health_ranking::{rank_multiplier, HealthRankingInputs};
 use astra_skills::providers::mcp::McpSkillProvider;
+use astra_skills::quality::SkillQualityTracker;
 
 use super::activation::ConditionalSkillTracker;
 use super::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
@@ -22,6 +24,20 @@ struct CachedSkill {
 
 // ── UnifiedSkillRegistry ─────────────────────────────────────────────────────
 
+/// Owned, turn-scoped signal bundle used to re-rank skills before the
+/// metadata budget filter in [`UnifiedSkillRegistry::discover_all`]. All
+/// fields are optional — missing data falls back to neutral behavior
+/// (boost `1.0`).
+#[derive(Default, Debug, Clone)]
+pub struct SkillHealthInputs {
+    /// Per-tool recent failure rate in `[0.0, 1.0]`.
+    pub tool_failure_rates: HashMap<String, f64>,
+    /// Tools flagged as low-confidence by the observability hub.
+    pub deprioritized_tools: HashSet<String>,
+    /// Optional per-skill quality tracker used as the base multiplier.
+    pub skill_quality: Option<Arc<SkillQualityTracker>>,
+}
+
 /// Aggregates skills from multiple providers with priority-ordered resolution.
 pub struct UnifiedSkillRegistry {
     providers: Vec<Box<dyn SkillProvider>>,
@@ -32,6 +48,12 @@ pub struct UnifiedSkillRegistry {
     metadata_budget: u32,
     /// Shared MCP provider for dynamic skill registration from MCP connections.
     mcp_provider: Arc<McpSkillProvider>,
+    /// Optional health signals used to reorder skills before budget filtering.
+    ///
+    /// When `Some`, `discover_all` stable-sorts within each source-priority
+    /// bucket so skills backed by unhealthy / deprioritized tools are the
+    /// first to be truncated when the metadata budget is exhausted.
+    health_inputs: RwLock<Option<SkillHealthInputs>>,
 }
 
 impl UnifiedSkillRegistry {
@@ -44,12 +66,33 @@ impl UnifiedSkillRegistry {
             conditional_tracker: RwLock::new(ConditionalSkillTracker::new()),
             metadata_budget: 10_000,
             mcp_provider: mcp,
+            health_inputs: RwLock::new(None),
         }
     }
 
     pub fn with_budget(mut self, budget: u32) -> Self {
         self.metadata_budget = budget;
         self
+    }
+
+    /// Update the turn-scoped health signals used to reorder skills within
+    /// each source-priority bucket before the metadata-budget filter runs.
+    ///
+    /// Callers typically refresh this once per turn from the observability
+    /// hub and tool-health tracker, then call [`Self::discover_all`]. When
+    /// no signals are registered, discovery behaves exactly as before.
+    pub fn update_health_inputs(&self, inputs: SkillHealthInputs) {
+        if let Ok(mut slot) = self.health_inputs.write() {
+            *slot = Some(inputs);
+        }
+    }
+
+    /// Clear any previously registered health signals. Subsequent
+    /// [`Self::discover_all`] calls will not reorder skills.
+    pub fn clear_health_inputs(&self) {
+        if let Ok(mut slot) = self.health_inputs.write() {
+            *slot = None;
+        }
     }
 
     /// Add a skill provider.
@@ -96,8 +139,43 @@ impl UnifiedSkillRegistry {
             }
         }
 
-        // Sort by source priority so higher-priority sources win on name collisions
-        all_manifests.sort_by_key(|m| Self::source_priority(&m.source));
+        // Sort by source priority so higher-priority sources win on name collisions.
+        // When health inputs are registered, use a secondary key so unhealthy or
+        // deprioritized skills are truncated first when the metadata budget is
+        // exhausted. The sort is stable w.r.t. insertion order within a bucket
+        // when no health data changes its rank.
+        let health_snapshot = self
+            .health_inputs
+            .read()
+            .ok()
+            .and_then(|g| g.clone());
+        if let Some(h) = health_snapshot.as_ref() {
+            let q_ref = h.skill_quality.as_deref();
+            let inputs = HealthRankingInputs {
+                tool_failure_rates: &h.tool_failure_rates,
+                deprioritized_tools: &h.deprioritized_tools,
+                skill_quality: q_ref,
+            };
+            let ranks: HashMap<String, f64> = all_manifests
+                .iter()
+                .map(|m| {
+                    let tools: Vec<&str> =
+                        m.allowed_tools.iter().map(|s| s.as_str()).collect();
+                    (m.name.clone(), rank_multiplier(&m.name, &tools, &inputs))
+                })
+                .collect();
+            all_manifests.sort_by(|a, b| {
+                let pa = Self::source_priority(&a.source);
+                let pb = Self::source_priority(&b.source);
+                pa.cmp(&pb).then_with(|| {
+                    let ra = ranks.get(&a.name).copied().unwrap_or(1.0);
+                    let rb = ranks.get(&b.name).copied().unwrap_or(1.0);
+                    rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+        } else {
+            all_manifests.sort_by_key(|m| Self::source_priority(&m.source));
+        }
 
         let mut cache = self
             .cache
@@ -1375,5 +1453,154 @@ Shared MCP.
         let names = registry.discover_all().await.unwrap();
         assert_eq!(names.len(), 2);
         // First-registered alias wins — alpha owns "shared-alias"
+    }
+
+    // ── Health-aware ordering tests (gap #6) ─────────────────────────────
+
+    fn mk_skill(name: &str, tools: &[&str], source: SkillSourceKind) -> SkillManifest {
+        SkillManifest {
+            name: name.into(),
+            description: format!("desc for {name}"),
+            source,
+            allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn health_inputs_absent_preserves_source_priority_order() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled), "a".into()),
+                (mk_skill("beta", &["stable"], SkillSourceKind::Bundled), "b".into()),
+            ],
+        }));
+        let registered = registry.discover_all().await.unwrap();
+        assert_eq!(registered, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn health_inputs_push_broken_skills_last_within_bucket() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled), "a".into()),
+                (mk_skill("beta", &["stable"], SkillSourceKind::Bundled), "b".into()),
+            ],
+        }));
+
+        let mut rates = HashMap::new();
+        rates.insert("flaky".to_string(), 0.9);
+        rates.insert("stable".to_string(), 0.0);
+        registry.update_health_inputs(SkillHealthInputs {
+            tool_failure_rates: rates,
+            deprioritized_tools: HashSet::new(),
+            skill_quality: None,
+        });
+
+        let registered = registry.discover_all().await.unwrap();
+        assert_eq!(registered, vec!["beta".to_string(), "alpha".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn deprioritized_tool_set_forces_low_rank() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (mk_skill("shell_skill", &["bash"], SkillSourceKind::Bundled), "s".into()),
+                (mk_skill("read_skill", &["read_file"], SkillSourceKind::Bundled), "r".into()),
+            ],
+        }));
+
+        let mut dep = HashSet::new();
+        dep.insert("bash".to_string());
+        registry.update_health_inputs(SkillHealthInputs {
+            tool_failure_rates: HashMap::new(), // bash "looks healthy" by rate
+            deprioritized_tools: dep,
+            skill_quality: None,
+        });
+
+        let registered = registry.discover_all().await.unwrap();
+        assert_eq!(registered, vec!["read_skill".to_string(), "shell_skill".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn source_priority_dominates_over_health_rank() {
+        // A broken Local skill should still outrank a healthy Database skill
+        // because source priority is the primary sort key.
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (mk_skill("broken_local", &["flaky"], SkillSourceKind::Local), "l".into()),
+                (mk_skill("healthy_db", &["stable"], SkillSourceKind::Database), "d".into()),
+            ],
+        }));
+        let mut rates = HashMap::new();
+        rates.insert("flaky".to_string(), 0.95);
+        rates.insert("stable".to_string(), 0.0);
+        registry.update_health_inputs(SkillHealthInputs {
+            tool_failure_rates: rates,
+            deprioritized_tools: HashSet::new(),
+            skill_quality: None,
+        });
+        let registered = registry.discover_all().await.unwrap();
+        assert_eq!(
+            registered,
+            vec!["broken_local".to_string(), "healthy_db".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_drops_broken_skill_first_under_pressure() {
+        // Two equally-sized skills in the same bucket; budget fits only one.
+        // With health signals marking `alpha` as broken, `beta` should be the
+        // survivor even though insertion order puts alpha first.
+        let mut registry = UnifiedSkillRegistry::new().with_budget(20);
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (mk_skill("alpha_broken", &["flaky"], SkillSourceKind::Bundled), "a".into()),
+                (mk_skill("beta_ok", &["stable"], SkillSourceKind::Bundled), "b".into()),
+            ],
+        }));
+        let mut rates = HashMap::new();
+        rates.insert("flaky".to_string(), 0.9);
+        registry.update_health_inputs(SkillHealthInputs {
+            tool_failure_rates: rates,
+            deprioritized_tools: HashSet::new(),
+            skill_quality: None,
+        });
+        let registered = registry.discover_all().await.unwrap();
+        // Budget is tight; at least one of the two should make it, and under
+        // a health-aware sort the healthy one is kept over the broken one.
+        assert!(
+            registered.contains(&"beta_ok".to_string()),
+            "healthy skill must survive budget pressure, got {:?}",
+            registered
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_health_inputs_restores_default_behavior() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![
+                (mk_skill("alpha", &["flaky"], SkillSourceKind::Bundled), "a".into()),
+                (mk_skill("beta", &["stable"], SkillSourceKind::Bundled), "b".into()),
+            ],
+        }));
+        let mut rates = HashMap::new();
+        rates.insert("flaky".to_string(), 0.9);
+        registry.update_health_inputs(SkillHealthInputs {
+            tool_failure_rates: rates,
+            deprioritized_tools: HashSet::new(),
+            skill_quality: None,
+        });
+        let with_health = registry.discover_all().await.unwrap();
+        assert_eq!(with_health[0], "beta");
+
+        registry.clear_health_inputs();
+        let without_health = registry.discover_all().await.unwrap();
+        assert_eq!(without_health[0], "alpha");
     }
 }

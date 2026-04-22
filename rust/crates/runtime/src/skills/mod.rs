@@ -60,7 +60,7 @@ pub use astra_skills::version::{Dependency, DependencyResolver, Version, Version
 pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
 pub use astra_skills::providers::DatabaseSkillProvider;
 pub use astra_skills::verify::SkillVerifier;
-pub use registry::{SharedSkillRegistry, UnifiedSkillRegistry, UnifiedSkillResolver};
+pub use registry::{SharedSkillRegistry, SkillHealthInputs, UnifiedSkillRegistry, UnifiedSkillResolver};
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.
 /// Useful in tests and server contexts where no local skill providers apply.

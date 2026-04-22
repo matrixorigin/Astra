@@ -97,6 +97,10 @@ pub mod user_profile;
 
 pub use astra_core::*;
 
+// Re-export turn-core modules that CLI / edge paths reach into. Keeps astra-cli
+// from needing a direct astra-turn-core dependency.
+pub use astra_turn_core::recent_arg_hints;
+
 // ── Re-exports: service layer (via astra_services) ────────────────────────
 
 pub use astra_services::{

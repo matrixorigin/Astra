@@ -1,0 +1,46 @@
+name: arg_hints_reuse
+description: "最近工具调用提示 (gap #5)：多轮会话中，读取过的文件路径应作为 recent_arg_hints 注入到提示，减少模型重新猜测参数的概率。验证 agent 在第二轮复用第一轮引用过的文件时，能直接命中而不乱猜路径。"
+requires: [llm]
+
+turns:
+  - user: "读一下 README.md 的前 15 行，简要概括项目是做什么的。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应包含对 README.md 的简要概括"
+        pass_threshold: 0.6
+
+  - user: "再把 Makefile 的前 10 行给我读一下。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=2"
+      llm_judge:
+        criteria: "回复应包含 Makefile 前几行的实际内容，路径不应被改成 ./Makefile.txt、makefile 等错误变体"
+        pass_threshold: 0.6
+
+  - user: "对比一下你刚才读过的那两个文件分别都讲了什么？"
+    checks:
+      rules:
+        - response_contains_any: ["README", "Makefile"]
+      llm_judge:
+        criteria: "回复应同时引用 README.md 和 Makefile 的事实内容，体现出 agent 记得此前两轮的调用参数，而非重新捏造路径"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid AND event_type = 'tool_call'"
+        assert:
+          count: ">=2"
