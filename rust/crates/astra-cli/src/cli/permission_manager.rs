@@ -293,6 +293,9 @@ pub(super) struct PermissionManager {
     cached_user_deny: Vec<PermissionRule>,
     /// Permissions inherited from parent agent (if this is a child agent).
     inherited: Option<astra_runtime::orchestration::InheritedPermissions>,
+    /// Gap 3: ring of the most recent `(tool, reason)` rejections for the
+    /// SelfModel surface. Newest at the back, capped at ~5 entries.
+    recent_rejections: std::collections::VecDeque<(String, String)>,
 }
 
 impl PermissionManager {
@@ -303,6 +306,37 @@ impl PermissionManager {
     /// Return the current permission mode (for propagation to sub-runs).
     pub(super) fn mode(&self) -> PermissionMode {
         self.mode
+    }
+
+    /// Snapshot of cumulative denial pressure for the SelfModel surface.
+    /// Returns `(total_denials, max_total)` from the session-scoped
+    /// [`DenialTracker`]. Surfaced to the agent via `SelfModel` so it can
+    /// self-regulate (narrow scope / ask user) before the hard
+    /// fallback-to-user threshold actually fires.
+    pub(super) fn denial_pressure(&self) -> (u32, u32) {
+        (
+            self.denial_tracker.total_denials(),
+            self.denial_tracker.limits().max_total,
+        )
+    }
+
+    /// Gap 3: snapshot of recent `(tool, reason)` rejections for the
+    /// SelfModel surface. Newest at the back; caller clones.
+    pub(super) fn recent_rejections(&self) -> Vec<(String, String)> {
+        self.recent_rejections.iter().cloned().collect()
+    }
+
+    /// Gap 3: record a user/system rejection with a short reason. Dedups
+    /// `(tool, reason)` pairs and trims to a bounded buffer.
+    pub(super) fn record_rejection(&mut self, tool: &str, reason: &str) {
+        const MAX: usize = 5;
+        self.recent_rejections
+            .retain(|(t, r)| !(t == tool && r == reason));
+        self.recent_rejections
+            .push_back((tool.to_string(), reason.to_string()));
+        while self.recent_rejections.len() > MAX {
+            self.recent_rejections.pop_front();
+        }
     }
 
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
@@ -345,6 +379,7 @@ impl PermissionManager {
             session_overrides:
                 astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+            recent_rejections: std::collections::VecDeque::new(),
             settings: PermissionSettings::default(),
             project_root: None,
             cached_allow: Vec::new(),
@@ -380,6 +415,7 @@ impl PermissionManager {
             session_overrides:
                 astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+            recent_rejections: std::collections::VecDeque::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -416,6 +452,7 @@ impl PermissionManager {
             session_overrides:
                 astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
             denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
+            recent_rejections: std::collections::VecDeque::new(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -1141,6 +1178,7 @@ impl PermissionManager {
                 };
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
+                self.record_rejection(tool, "user skipped for session");
                 eprintln!("  {}", format!("  ✗ {tool}: skipped for session").dim());
                 ApprovalDecision::Deny
             }
@@ -1362,11 +1400,13 @@ impl PermissionManager {
             's' => {
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
+                self.record_rejection(name, "user skipped for session");
                 eprintln!("  {}", format!("  ✗ {name}: skipped for session").dim());
                 false
             }
             _ => {
                 self.denial_tracker.record(&fp, false);
+                self.record_rejection(name, "user declined approval");
                 false
             }
         }
@@ -1377,7 +1417,23 @@ impl PermissionManager {
     /// Same 6-step logic as `check()` but returns `NeedApproval` instead of
     /// blocking on `prompt_approval()`. The caller (execute_tool) can then
     /// route the approval request through an async channel to the REPL.
+    ///
+    /// Wraps `check_nonblocking_inner` to uniformly record every system-driven
+    /// `Deny` into `recent_rejections` so Gap 3 surfaces all refusal reasons
+    /// to the SelfModel (not just user-declined approvals).
     pub(super) fn check_nonblocking(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> PermissionDecision {
+        let decision = self.check_nonblocking_inner(name, args);
+        if let PermissionDecision::Deny(reason) = &decision {
+            self.record_rejection(name, reason);
+        }
+        decision
+    }
+
+    fn check_nonblocking_inner(
         &mut self,
         name: &str,
         args: &serde_json::Value,
@@ -1614,6 +1670,7 @@ impl PermissionManager {
         self.session_overrides.insert(fp.clone(), allowed);
         if !allowed {
             self.denial_tracker.record(&fp, false);
+            self.record_rejection(name, "session override: deny");
         }
     }
 
@@ -2408,6 +2465,49 @@ mod tests {
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "Prompt mode should require approval for explicit tools, got: {decision:?}"
         );
+    }
+
+    // ── Gap 3: system-driven denials auto-record into recent_rejections ──────
+
+    #[test]
+    fn deny_mode_denial_recorded_in_recent_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let args = serde_json::json!({"path": "note.txt", "content": "hi"});
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Deny(_)),
+            "expected Deny, got {decision:?}"
+        );
+        let recs = pm.recent_rejections();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].0, "write_file");
+        assert!(
+            recs[0].1.to_lowercase().contains("deny") || recs[0].1.to_lowercase().contains("mode"),
+            "reason should mention deny/mode: {}",
+            recs[0].1
+        );
+    }
+
+    #[test]
+    fn dangerous_command_denial_recorded_in_recent_rejections() {
+        let mut pm = PermissionManager::new(true);
+        let args = serde_json::json!({"command": "sudo rm -rf /"});
+        let decision = pm.check_nonblocking("bash", &args);
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        let recs = pm.recent_rejections();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].0, "bash");
+        assert!(recs[0].1.to_lowercase().contains("dangerous"));
+    }
+
+    #[test]
+    fn need_approval_does_not_record_rejection() {
+        let mut pm = PermissionManager::new(false);
+        let args = serde_json::json!({"message": "ship it"});
+        let decision = pm.check_nonblocking("git_commit", &args);
+        assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
+        assert!(pm.recent_rejections().is_empty());
     }
 
     // ── Security: session overrides cannot bypass safety checks ──────────────

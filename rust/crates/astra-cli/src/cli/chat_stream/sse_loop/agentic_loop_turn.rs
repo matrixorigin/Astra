@@ -288,6 +288,13 @@ struct PrepareChatTurnRequest<'a> {
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     round_index: u32,
+    /// Snapshot of session-wide denial pressure (current, max_total) taken at
+    /// call time. Published to the observability session so SelfModel can
+    /// render it in the system prompt.
+    denial_pressure: (u32, u32),
+    /// Snapshot of session-wide recent `(tool, reason)` rejections for
+    /// SelfModel Gap 3 surface.
+    recent_rejections: Vec<(String, String)>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -651,6 +658,38 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
 
     // ─── SelfModel: inject self-awareness text into edge_profile ───
+    // Publish fresh denial-pressure + per-tool outcome bias + recent
+    // rejections to the observability session so SelfModel can render the
+    // cumulative signals back to the agent.
+    {
+        let (current, max_total) = ctx.denial_pressure;
+        let bias: std::collections::BTreeMap<String, f64> = ctx
+            .turn_guard
+            .health
+            .outcome_bias_by_tool(3600)
+            .into_iter()
+            .filter(|(_, v)| v.abs() >= 0.005)
+            .collect();
+        if let Some(session_lock) = &ctx.executor.observability_session
+            && let Ok(mut session) = session_lock.write()
+        {
+            session.last_denial_pressure = Some(astra_runtime::self_model::DenialPressureView {
+                total_denials: current,
+                max_total,
+            });
+            session.set_outcome_bias(bias);
+            session.recent_rejections = ctx
+                .recent_rejections
+                .iter()
+                .map(
+                    |(tool, reason)| astra_runtime::self_model::RejectionSummary {
+                        tool: tool.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .collect();
+        }
+    }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
         let text = self_model.to_system_prompt_section();
         if text.len() > 30 {
@@ -1002,6 +1041,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             turn_policy,
             previous_confidence_fallback,
             round_index,
+            denial_pressure: perm_manager.denial_pressure(),
+            recent_rejections: perm_manager.recent_rejections(),
         },
     )
     .await?;
