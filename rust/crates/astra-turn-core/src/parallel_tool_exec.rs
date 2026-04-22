@@ -23,6 +23,11 @@ use tokio::sync::Semaphore;
 /// Maximum number of read-only tools that can execute concurrently.
 pub const MAX_CONCURRENT_READ_ONLY: usize = 10;
 
+/// Alias used by the CLI-side batch path (`stream_render::execute_tools_batch`).
+/// Kept equal to [`MAX_CONCURRENT_READ_ONLY`] so the in-turn cap matches
+/// claude-code semantics (10) across both speculative and batched paths.
+pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = MAX_CONCURRENT_READ_ONLY;
+
 // ───────────────────────────── Tool Classification ──────────────────────
 
 /// Read-only tool names that are safe for parallel execution.

@@ -2499,20 +2499,31 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             ui_indices.push(tool_idx);
         }
 
-        // ── Phase 2: Concurrent execution (join_all + panic isolation) ──
+        // ── Phase 2: Concurrent execution (semaphore-capped + panic isolation) ──
         // `ToolExecutor::execute_with_metadata` takes `&self` and is `Sync`; we run all
-        // tool futures concurrently on the current runtime via `join_all` so the shared
-        // `&ToolExecutor` stays sound without `unsafe impl Send` around raw pointers.
+        // tool futures concurrently on the current runtime via `join_all`, each future
+        // gated by a shared semaphore so at most `MAX_CONCURRENT_TOOL_EXECUTIONS` (10)
+        // run simultaneously. This matches claude-code / parallel_tool_exec semantics and
+        // prevents unbounded fan-out on large read-only batches (e.g., 30+ grep calls)
+        // from saturating edge I/O or exhausting file descriptors.
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
         // a tool failure instead of aborting the whole batch/turn.
         let executor: &crate::edge_tools::ToolExecutor = &*self.executor;
+        let sem = Arc::new(tokio::sync::Semaphore::new(
+            astra_runtime::turn::parallel_tool_exec::MAX_CONCURRENT_TOOL_EXECUTIONS,
+        ));
         let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
             conc_reqs
                 .iter()
                 .map(|(_, req)| {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
+                    let sem = sem.clone();
                     async move {
+                        // Acquire a permit before executing. Semaphore is never closed
+                        // (it lives only for this batch), so acquire() won't fail; the
+                        // `ok()` fallback is defensive.
+                        let _permit = sem.acquire_owned().await.ok();
                         catch_tool_execution_panic(executor.execute_with_metadata(&tool, &args))
                             .await
                     }
