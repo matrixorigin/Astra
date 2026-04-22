@@ -487,7 +487,10 @@ fn is_credential_error(msg: &str) -> bool {
 /// successful. Returning `plan_failed` in those cases lets consumers
 /// distinguish the two outcomes without changing the 100% progress_pct
 /// semantics callers already expect.
-fn plan_completion_action(global_passed: bool, any_subtask_verification_failed: bool) -> &'static str {
+fn plan_completion_action(
+    global_passed: bool,
+    any_subtask_verification_failed: bool,
+) -> &'static str {
     if !global_passed || any_subtask_verification_failed {
         "plan_failed"
     } else {
@@ -505,7 +508,10 @@ fn has_any_unresolved_verification_failure(
     use astra_services::durable_task::SubtaskStage;
     use astra_services::task_orchestrator::TaskStatus;
 
-    if subtasks.iter().any(|s| matches!(s.status, TaskStatus::Failed)) {
+    if subtasks
+        .iter()
+        .any(|s| matches!(s.status, TaskStatus::Failed))
+    {
         return true;
     }
     durable.is_some_and(|d| {

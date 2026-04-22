@@ -4925,9 +4925,7 @@ mod tests {
         let cmd = "cat > page.html << 'EOF'\n<html></html>\nEOF\ncat > /etc/passwd";
         let result = check_bash_path_boundary(&policy, cmd);
         assert!(
-            result
-                .as_deref()
-                .is_some_and(|m| m.contains("/etc/passwd")),
+            result.as_deref().is_some_and(|m| m.contains("/etc/passwd")),
             "redirection after heredoc body should still be caught: {result:?}"
         );
     }
