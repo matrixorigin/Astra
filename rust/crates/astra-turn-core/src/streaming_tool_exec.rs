@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
@@ -63,6 +64,63 @@ pub fn should_speculate(tool_name: &str, perm_decision: Option<&PermissionDecisi
 /// Maximum speculative executions during streaming.
 const MAX_SPECULATIVE: usize = 5;
 
+/// Runtime counters describing how often speculative execution fired and
+/// how much wall-clock was saved. Exposed via [`StreamingToolExecutor::snapshot`].
+///
+/// Consumers (CLI session-end logger, ObservabilityHub) can aggregate across
+/// sessions or emit a single structured event per turn/session.
+///
+/// Fields are monotonic over the executor's lifetime unless [`StreamingToolExecutor::reset_metrics`]
+/// is called. `wasted` is derived, not stored: `wasted = started - hit - discarded - inflight`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StreamingSpeculationMetrics {
+    /// Number of `on_tool_block` invocations that actually spawned a speculative future.
+    pub started: u64,
+    /// Number of speculative results successfully merged back into a real tool_call batch.
+    pub hit: u64,
+    /// Number of speculative results dropped because Step 3 (skill/delegation) intercepted.
+    pub discarded: u64,
+    /// Number of speculative futures still in-flight at the time of this snapshot.
+    pub inflight: u64,
+    /// Sum of per-hit execution durations (ms). Approximates the wall-clock time
+    /// the tool's I/O overlapped with LLM streaming — an upper bound on savings.
+    pub total_saved_ms: u64,
+}
+
+impl StreamingSpeculationMetrics {
+    /// Estimate of "wasted" speculations: started but neither hit nor discarded
+    /// nor still in flight. Typically indicates a read-only tool whose call_id
+    /// never appeared in the post-stream batch (e.g., Step 3 replaced it with
+    /// a different tool call without calling `discard`).
+    pub fn wasted(&self) -> u64 {
+        self.started
+            .saturating_sub(self.hit)
+            .saturating_sub(self.discarded)
+            .saturating_sub(self.inflight)
+    }
+
+    /// Hit rate (0.0–1.0): fraction of started speculations that translated
+    /// into real wall-clock savings. Returns 0.0 if nothing has been started.
+    pub fn hit_rate(&self) -> f64 {
+        if self.started == 0 {
+            0.0
+        } else {
+            self.hit as f64 / self.started as f64
+        }
+    }
+}
+
+#[derive(Default)]
+struct InnerMetrics {
+    started: u64,
+    hit: u64,
+    discarded: u64,
+    total_saved_ms: u64,
+    /// call_id → (start_instant, duration on completion)
+    started_at: HashMap<String, Instant>,
+    completed_ms: HashMap<String, u64>,
+}
+
 /// Tracks in-flight speculative tool executions during SSE streaming.
 pub struct StreamingToolExecutor {
     executor: ToolExecutorFn,
@@ -71,6 +129,7 @@ pub struct StreamingToolExecutor {
     inflight: Arc<Mutex<HashMap<String, JoinHandle<ToolExecResult>>>>,
     /// call_id → completed results (ready for harvest)
     completed: Arc<Mutex<HashMap<String, ToolExecResult>>>,
+    metrics: Arc<Mutex<InnerMetrics>>,
 }
 
 impl StreamingToolExecutor {
@@ -80,6 +139,7 @@ impl StreamingToolExecutor {
             semaphore: Arc::new(Semaphore::new(MAX_SPECULATIVE)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Mutex::new(InnerMetrics::default())),
         }
     }
 
@@ -100,11 +160,13 @@ impl StreamingToolExecutor {
         let sem = self.semaphore.clone();
         let exec = self.executor.clone();
         let completed = self.completed.clone();
+        let metrics = self.metrics.clone();
         let cid = call_id.clone();
 
         // Insert a placeholder into inflight BEFORE spawning to avoid race
         // where the task completes before the handle is recorded.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let started_at = Instant::now();
         let handle = tokio::spawn(async move {
             // Wait until handle is registered in inflight map
             let _ = rx.await;
@@ -132,10 +194,23 @@ impl StreamingToolExecutor {
                 success,
             };
 
+            // Record duration for metrics before moving result.
+            {
+                let mut m = metrics.lock().await;
+                let elapsed_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                m.completed_ms.insert(cid.clone(), elapsed_ms);
+            }
+
             // Move to completed map
             completed.lock().await.insert(cid, result.clone());
             result
         });
+
+        {
+            let mut m = self.metrics.lock().await;
+            m.started = m.started.saturating_add(1);
+            m.started_at.insert(call_id.clone(), started_at);
+        }
 
         self.inflight.lock().await.insert(call_id, handle);
         // Signal task to proceed now that handle is in the map
@@ -154,10 +229,20 @@ impl StreamingToolExecutor {
     /// Discard a speculative result (e.g., when Step 3 intercepts the tool call).
     /// Cancels the in-flight task if still running.
     pub async fn discard(&self, call_id: &str) {
+        let mut aborted = false;
         if let Some(handle) = self.inflight.lock().await.remove(call_id) {
             handle.abort();
+            aborted = true;
         }
-        self.completed.lock().await.remove(call_id);
+        if self.completed.lock().await.remove(call_id).is_some() {
+            aborted = true;
+        }
+        if aborted {
+            let mut m = self.metrics.lock().await;
+            m.discarded = m.discarded.saturating_add(1);
+            m.started_at.remove(call_id);
+            m.completed_ms.remove(call_id);
+        }
     }
 
     /// Wait for all in-flight speculative executions to complete.
@@ -203,6 +288,13 @@ impl StreamingToolExecutor {
         for cid in tool_call_ids {
             if let Some(result) = speculative.get(cid) {
                 done.push(result.clone());
+                // Account this call_id as a hit.
+                let mut m = self.metrics.lock().await;
+                m.hit = m.hit.saturating_add(1);
+                if let Some(ms) = m.completed_ms.remove(cid) {
+                    m.total_saved_ms = m.total_saved_ms.saturating_add(ms);
+                }
+                m.started_at.remove(cid);
             } else {
                 needed.push(cid.clone());
             }
@@ -214,6 +306,48 @@ impl StreamingToolExecutor {
     /// Number of currently in-flight speculative executions.
     pub async fn inflight_count(&self) -> usize {
         self.inflight.lock().await.len()
+    }
+
+    /// Take a metrics snapshot. Does not reset counters.
+    pub async fn snapshot(&self) -> StreamingSpeculationMetrics {
+        let inflight = self.inflight.lock().await.len() as u64;
+        let m = self.metrics.lock().await;
+        StreamingSpeculationMetrics {
+            started: m.started,
+            hit: m.hit,
+            discarded: m.discarded,
+            inflight,
+            total_saved_ms: m.total_saved_ms,
+        }
+    }
+
+    /// Reset all counters to zero. Used at session boundaries when per-session
+    /// aggregation is desired.
+    pub async fn reset_metrics(&self) {
+        let mut m = self.metrics.lock().await;
+        *m = InnerMetrics::default();
+    }
+
+    /// Emit the current metrics snapshot as a structured `tracing::info!`
+    /// event on target `astra::streaming_speculation::metrics`. Intended to
+    /// be called once at session/turn end by the host.
+    ///
+    /// The event fields are stable so downstream log aggregators and the
+    /// ObservabilityHub can pick them up without parsing prose.
+    pub async fn emit_metrics_log(&self, session_id: Option<&str>) {
+        let snap = self.snapshot().await;
+        tracing::info!(
+            target: "astra::streaming_speculation::metrics",
+            session_id = session_id.unwrap_or(""),
+            started = snap.started,
+            hit = snap.hit,
+            discarded = snap.discarded,
+            inflight = snap.inflight,
+            wasted = snap.wasted(),
+            total_saved_ms = snap.total_saved_ms,
+            hit_rate = snap.hit_rate(),
+            "streaming speculation metrics"
+        );
     }
 }
 
@@ -383,5 +517,92 @@ mod tests {
             "write_file",
             Some(&PermissionDecision::approve())
         ));
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_hit_and_saved_ms() {
+        let exec = StreamingToolExecutor::new(make_slow_executor(80));
+
+        // Two read-only speculations.
+        exec.on_tool_block(
+            "c1".into(),
+            "read_file".into(),
+            tool_block("read_file", "c1"),
+            0,
+        )
+        .await;
+        exec.on_tool_block("c2".into(), "grep".into(), tool_block("grep", "c2"), 1)
+            .await;
+
+        let snap_before = exec.snapshot().await;
+        assert_eq!(snap_before.started, 2);
+        assert_eq!(snap_before.hit, 0);
+
+        // Merge: c1 becomes a hit, c2 is listed but we also claim c3 which has
+        // no speculation.
+        let (done, needed) = exec.merge_speculative(&["c1".into(), "c3".into()]).await;
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].call_id, "c1");
+        assert_eq!(needed, vec!["c3"]);
+
+        let snap = exec.snapshot().await;
+        assert_eq!(snap.started, 2);
+        assert_eq!(snap.hit, 1);
+        assert_eq!(snap.discarded, 0);
+        assert_eq!(snap.inflight, 0);
+        // c2 was started but not merged and not discarded → wasted.
+        assert_eq!(snap.wasted(), 1);
+        // Saved ≥ tool duration (80ms) since the speculative future fully completed.
+        assert!(
+            snap.total_saved_ms >= 70,
+            "saved_ms={}",
+            snap.total_saved_ms
+        );
+        assert!((snap.hit_rate() - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_discard() {
+        let exec = StreamingToolExecutor::new(make_slow_executor(200));
+
+        exec.on_tool_block(
+            "c1".into(),
+            "read_file".into(),
+            tool_block("read_file", "c1"),
+            0,
+        )
+        .await;
+        exec.discard("c1").await;
+
+        // Discarding a second time with no entry must not double-count.
+        exec.discard("c1").await;
+
+        let snap = exec.snapshot().await;
+        assert_eq!(snap.started, 1);
+        assert_eq!(snap.hit, 0);
+        assert_eq!(snap.discarded, 1);
+        assert_eq!(snap.wasted(), 0);
+        assert_eq!(snap.total_saved_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_reset_clears_counters() {
+        let exec = StreamingToolExecutor::new(make_fast_executor());
+
+        exec.on_tool_block(
+            "c1".into(),
+            "read_file".into(),
+            tool_block("read_file", "c1"),
+            0,
+        )
+        .await;
+        let (_done, _) = exec.merge_speculative(&["c1".into()]).await;
+
+        let before = exec.snapshot().await;
+        assert!(before.started >= 1 && before.hit >= 1);
+
+        exec.reset_metrics().await;
+        let after = exec.snapshot().await;
+        assert_eq!(after, StreamingSpeculationMetrics::default());
     }
 }
