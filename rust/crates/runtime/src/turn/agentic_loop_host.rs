@@ -853,6 +853,96 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 // ─── CTX_ helpers ────────────────────────────────────────────────────────────
 
 /// Extract repository name from a git remote URL.
+/// **Test-only.** Build a minimal [`AgenticLoopState`] suitable for driving
+/// the mock-LLM path in integration tests (feature `bridge-e2e-hooks`).
+///
+/// All fields use safe defaults; tests should mutate the returned state
+/// directly (e.g. push into `messages`, set `llm_rounds_completed`).
+#[cfg(feature = "bridge-e2e-hooks")]
+pub fn make_test_loop_state() -> AgenticLoopState {
+    AgenticLoopState {
+        messages: Vec::new(),
+        tool_results: Vec::new(),
+        current_session_id: None,
+        current_run_id: None,
+        recursion_depth: 0,
+        final_text: String::new(),
+        total_prompt: 0,
+        total_completion: 0,
+        total_cache_read: 0,
+        total_cache_creation: 0,
+        total_tool_calls: 0,
+        total_evidence_tool_calls: 0,
+        has_any_usage: false,
+        max_turns: 10,
+        remaining_turns: 10,
+        current_round_index: 0,
+        llm_rounds_completed: 0,
+        turn_guard: TurnGuard::new(),
+        restricted_tools: HashSet::new(),
+        boosted_tools: HashSet::new(),
+        widen_selection_pending: false,
+        step_recorder: StepRecorder::new("test-session", "test-task"),
+        idempotency_cache: InMemoryIdempotencyCache::new(),
+        semantic_dedup: SemanticDedup::new(0.95),
+        call_counts: HashMap::new(),
+        max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .effective_max_identical_calls(),
+        max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .effective_max_tools_per_turn(),
+        stall: Default::default(),
+        telemetry: Default::default(),
+        skills: SkillState {
+            quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+            improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+            ..Default::default()
+        },
+        hooks: Default::default(),
+        messaging: Default::default(),
+        cancellation: Default::default(),
+        error_recovery: Default::default(),
+        message: "test query".to_string(),
+        recent_tools: Vec::new(),
+        task_profile: TaskExecutionProfile::default(),
+        last_turn_policy: TurnInteractionPolicy::default(),
+        api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+        api_token: String::new(),
+        delegation_engine: None,
+        project_context: None,
+        checkpoint_gate: None,
+        evolution_service: None,
+        rate_limit_cooldown: Default::default(),
+        data_snapshot_provider: None,
+        last_composite_snapshot: None,
+        last_measured_prompt_tokens: None,
+        consecutive_context_window_errors: 0,
+        compaction_effectiveness: Default::default(),
+        max_turn_input_tokens: 0,
+        budget_wrapup_injected: false,
+        skill_produced_output: false,
+        max_cumulative_tokens: 0,
+        thinking_budget_tokens: None,
+        recent_file_reads: Vec::new(),
+        permission_context: None,
+        permission_handler: None,
+        tactical_adapter: None,
+        step_signal_collector: None,
+        tool_budget_override: None,
+        pending_reflection_signals: Vec::new(),
+        recent_tactical_actions: Vec::new(),
+        server_tool_executor: None,
+        interruption: None,
+        session_facts: Default::default(),
+        approval_overrides: None,
+        confidence_trend: Default::default(),
+        last_confidence_diagnosis: None,
+        session_turn: 0,
+        turn_event_buffer: None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
