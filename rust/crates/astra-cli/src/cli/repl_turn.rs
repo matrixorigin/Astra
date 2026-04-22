@@ -1506,6 +1506,10 @@ fn commit_turn_journal_workspace_and_sidecars(
             // reflection / auto-tuning pipelines with no-op stall signals.
             let confidence: f64 = match stall_type.as_str() {
                 "sig_stall" => 1.0,
+                // Skill hard lockout (reentry >= 3) is a deterministic signal
+                // — the runtime already blocked a repeated skill invocation, so
+                // we record it with full confidence for downstream analytics.
+                s if s.starts_with("skill_lockout") => 1.0,
                 _ => 0.0,
             };
             if confidence == 0.0 {

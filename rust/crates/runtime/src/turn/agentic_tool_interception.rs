@@ -265,6 +265,12 @@ pub(crate) fn dedup_skill_calls(
                 let reentry = prev.reentry_count;
                 let invoked_at = prev.invoked_at_turn;
                 let locked_out = reentry >= 3;
+                if locked_out {
+                    state
+                        .stall
+                        .events
+                        .push((format!("skill_lockout:{name}"), 1));
+                }
                 let message = if locked_out {
                     format!(
                         "BLOCKED: Skill '{}' is locked out for this turn after {} re-entries. \
@@ -884,6 +890,12 @@ mod tests {
         assert!(meta3.locked_out);
         assert_eq!(meta3.reentry_count, 3);
         assert_eq!(state.skills.invoked["review-changes"].reentry_count, 3);
+        assert_eq!(
+            state.stall.events.len(),
+            1,
+            "lockout should push exactly one stall event"
+        );
+        assert_eq!(state.stall.events[0].0, "skill_lockout:review-changes");
 
         // 4th re-entry: still BLOCKED, counter keeps climbing.
         let (dedup4, _) = super::dedup_skill_calls(&mut state, &[make_call("c4")]);
@@ -891,5 +903,10 @@ mod tests {
         assert!(res4.result.starts_with("BLOCKED:"));
         assert!(meta4.locked_out);
         assert_eq!(meta4.reentry_count, 4);
+        assert_eq!(
+            state.stall.events.len(),
+            2,
+            "every locked-out call pushes a fresh stall signal"
+        );
     }
 }
