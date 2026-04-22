@@ -830,6 +830,39 @@ impl ObservabilityHub {
         self.tuning_engine.record_feedback(signal);
     }
 
+    /// Record a batch of streaming speculative tool execution metrics.
+    ///
+    /// Forwards the cumulative counters into the
+    /// [`astra_learning::auto_tuning::AutoTuningEngine`] so that speculation
+    /// hit rate can be tracked across a session and used to auto-gate
+    /// `ASTRA_STREAMING_TOOL_EXEC` via
+    /// [`AutoTuningEngine::should_disable_streaming_speculation`].
+    ///
+    /// Also emits a structured `tracing::info!` event on target
+    /// `astra::streaming_speculation::metrics` for downstream log consumers.
+    pub fn record_streaming_speculation_metrics(
+        &self,
+        metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
+    ) {
+        self.tuning_engine.record_streaming_speculation(
+            metrics.started,
+            metrics.hit,
+            metrics.discarded,
+            metrics.total_saved_ms,
+        );
+        tracing::info!(
+            target: "astra::streaming_speculation::metrics",
+            started = metrics.started,
+            hit = metrics.hit,
+            discarded = metrics.discarded,
+            inflight = metrics.inflight,
+            wasted = metrics.wasted(),
+            total_saved_ms = metrics.total_saved_ms,
+            hit_rate = metrics.hit_rate(),
+            "hub.record_streaming_speculation_metrics"
+        );
+    }
+
     fn signal_with_session_context(
         &self,
         session_id: &str,
@@ -1673,5 +1706,27 @@ mod tests {
         assert_eq!(s.outcome_bias.get("bash"), Some(&0.25));
         s.set_outcome_bias(std::collections::BTreeMap::new());
         assert!(s.outcome_bias.is_empty());
+    }
+
+    #[test]
+    fn hub_forwards_streaming_speculation_metrics() {
+        use astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics;
+
+        let hub = ObservabilityHub::new();
+        let metrics = StreamingSpeculationMetrics {
+            started: 8,
+            hit: 4,
+            discarded: 1,
+            inflight: 0,
+            total_saved_ms: 240,
+        };
+        hub.record_streaming_speculation_metrics(&metrics);
+
+        let stats = hub.tuning().streaming_speculation_stats();
+        assert_eq!(stats.started, 8);
+        assert_eq!(stats.hit, 4);
+        assert_eq!(stats.discarded, 1);
+        assert_eq!(stats.total_saved_ms, 240);
+        assert!((stats.hit_rate() - 0.5).abs() < 1e-9);
     }
 }

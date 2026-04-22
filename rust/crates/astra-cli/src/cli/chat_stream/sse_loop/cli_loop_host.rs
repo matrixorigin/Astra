@@ -334,6 +334,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut self.tool_cache,
+                observability_hub: None,
             }),
             0,
             state.cancellation.token.as_deref(),

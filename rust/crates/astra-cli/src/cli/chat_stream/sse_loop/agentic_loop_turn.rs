@@ -1104,6 +1104,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_continuation,
         turn_rollback_on_failure: is_plan_subtask,
         tool_cache,
+        observability_hub: observability_hub.cloned(),
     };
 
     let sse_mark = Instant::now();

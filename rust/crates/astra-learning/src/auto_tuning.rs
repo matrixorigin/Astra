@@ -631,6 +631,43 @@ pub struct RuleExecution {
     pub rolled_back: bool,
 }
 
+/// Aggregate statistics for streaming speculative tool execution.
+///
+/// Accumulated across all batches a session reports to the engine. Used by
+/// [`AutoTuningEngine::should_disable_streaming_speculation`] to decide when
+/// speculation's hit rate has dropped below a useful threshold.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamingSpeculationStats {
+    /// Total speculations spawned across all reports.
+    pub started: u64,
+    /// Total hits (merged back into real batches).
+    pub hit: u64,
+    /// Total discards (Step 3 interception).
+    pub discarded: u64,
+    /// Sum of per-hit overlap durations in ms.
+    pub total_saved_ms: u64,
+    /// Number of report batches merged into this aggregate.
+    pub reports: u64,
+}
+
+impl StreamingSpeculationStats {
+    /// Hit rate (0.0–1.0). Returns 0.0 if no speculations have started.
+    pub fn hit_rate(&self) -> f64 {
+        if self.started == 0 {
+            0.0
+        } else {
+            self.hit as f64 / self.started as f64
+        }
+    }
+}
+
+/// Default minimum samples required before auto-tuning will recommend
+/// disabling speculation. Prevents early-session noise from flipping the
+/// flag after 1–2 misses.
+pub const STREAMING_SPEC_MIN_SAMPLES: u64 = 20;
+/// Default hit-rate threshold below which speculation is recommended disabled.
+pub const STREAMING_SPEC_HIT_RATE_FLOOR: f64 = 0.10;
+
 /// The main auto-tuning engine.
 pub struct AutoTuningEngine {
     /// Evolution rules.
@@ -645,6 +682,8 @@ pub struct AutoTuningEngine {
     enabled: RwLock<bool>,
     /// Optional path for persisting aggregator state across restarts.
     storage_path: Option<PathBuf>,
+    /// Aggregate streaming-speculation stats reported by the host.
+    streaming_spec: RwLock<StreamingSpeculationStats>,
 }
 
 impl Default for AutoTuningEngine {
@@ -663,6 +702,7 @@ impl AutoTuningEngine {
             last_triggered: RwLock::new(HashMap::new()),
             enabled: RwLock::new(true),
             storage_path: None,
+            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
         }
     }
 
@@ -686,7 +726,52 @@ impl AutoTuningEngine {
             last_triggered: RwLock::new(HashMap::new()),
             enabled: RwLock::new(true),
             storage_path: Some(path),
+            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
         }
+    }
+
+    /// Record one batch of streaming-speculation metrics. Deltas are added
+    /// into a running aggregate accessible via [`Self::streaming_speculation_stats`].
+    ///
+    /// Callers typically pass per-batch snapshots (cumulative counters read
+    /// at the end of each tool batch). The engine does not care whether the
+    /// values are deltas or absolutes — it simply sums.
+    pub fn record_streaming_speculation(
+        &self,
+        started: u64,
+        hit: u64,
+        discarded: u64,
+        total_saved_ms: u64,
+    ) {
+        let mut stats = self.streaming_spec.write_or_recover();
+        stats.started = stats.started.saturating_add(started);
+        stats.hit = stats.hit.saturating_add(hit);
+        stats.discarded = stats.discarded.saturating_add(discarded);
+        stats.total_saved_ms = stats.total_saved_ms.saturating_add(total_saved_ms);
+        stats.reports = stats.reports.saturating_add(1);
+    }
+
+    /// Read a snapshot of the aggregated streaming-speculation stats.
+    pub fn streaming_speculation_stats(&self) -> StreamingSpeculationStats {
+        self.streaming_spec.read_or_recover().clone()
+    }
+
+    /// Reset aggregated streaming-speculation stats. Used at session boundaries.
+    pub fn reset_streaming_speculation_stats(&self) {
+        *self.streaming_spec.write_or_recover() = StreamingSpeculationStats::default();
+    }
+
+    /// Recommend whether speculation should be disabled based on accumulated
+    /// hit rate. Returns `true` only when at least
+    /// [`STREAMING_SPEC_MIN_SAMPLES`] speculations have been recorded AND the
+    /// hit rate is below [`STREAMING_SPEC_HIT_RATE_FLOOR`].
+    ///
+    /// Callers should gate the `ASTRA_STREAMING_TOOL_EXEC` runtime flag on
+    /// the inverse of this method (or expose it via a slash command / UI).
+    pub fn should_disable_streaming_speculation(&self) -> bool {
+        let stats = self.streaming_spec.read_or_recover();
+        stats.started >= STREAMING_SPEC_MIN_SAMPLES
+            && stats.hit_rate() < STREAMING_SPEC_HIT_RATE_FLOOR
     }
 
     /// Add an evolution rule.
@@ -2416,5 +2501,45 @@ mod tests {
         let stats = OutcomeStats::default();
         assert_eq!(stats.total(), 0);
         assert!((stats.success_rate() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn streaming_speculation_aggregates_and_resets() {
+        let engine = AutoTuningEngine::new();
+        engine.record_streaming_speculation(10, 5, 1, 120);
+        engine.record_streaming_speculation(4, 2, 0, 30);
+
+        let stats = engine.streaming_speculation_stats();
+        assert_eq!(stats.started, 14);
+        assert_eq!(stats.hit, 7);
+        assert_eq!(stats.discarded, 1);
+        assert_eq!(stats.total_saved_ms, 150);
+        assert_eq!(stats.reports, 2);
+        assert!((stats.hit_rate() - 0.5).abs() < 1e-9);
+
+        engine.reset_streaming_speculation_stats();
+        assert_eq!(
+            engine.streaming_speculation_stats(),
+            StreamingSpeculationStats::default()
+        );
+    }
+
+    #[test]
+    fn streaming_speculation_disable_threshold() {
+        let engine = AutoTuningEngine::new();
+
+        // Below min-samples: never recommend disabling even if rate is 0.
+        engine.record_streaming_speculation(5, 0, 0, 0);
+        assert!(!engine.should_disable_streaming_speculation());
+
+        // Meets min-samples, above floor: keep enabled.
+        engine.reset_streaming_speculation_stats();
+        engine.record_streaming_speculation(25, 20, 0, 500);
+        assert!(!engine.should_disable_streaming_speculation());
+
+        // Meets min-samples, below floor: recommend disabling.
+        engine.reset_streaming_speculation_stats();
+        engine.record_streaming_speculation(25, 1, 0, 5);
+        assert!(engine.should_disable_streaming_speculation());
     }
 }
