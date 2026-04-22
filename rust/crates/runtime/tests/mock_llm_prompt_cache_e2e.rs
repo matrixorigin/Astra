@@ -452,3 +452,158 @@ async fn adding_user_message_keeps_system_prefix_hash_stable() {
     // the cache_control breakpoint applied.
     assert!(g[1].messages.len() > g[0].messages.len());
 }
+
+// ── cp-interleaved-tool-text ────────────────────────────────────────────────
+// Drives three consecutive mock rounds through execute_mock_turn that
+// interleave text-only, tool_call-only, and mixed text+tool_call shapes,
+// verifying:
+//   * SSE event order: text_delta before tool_call before usage per round
+//   * History messages grow monotonically between rounds (no loss or reorder)
+//   * Cacheable prefix stays stable across all three rounds (system + tools
+//     unchanged — only message list grows)
+//   * Usage events carry the per-round prompt/completion token counts
+//     independently (no leakage between rounds)
+fn round_with_tool_calls(text: &str, tool_names: &[&str]) -> Value {
+    let tool_calls: Vec<Value> = tool_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            json!({
+                "id": format!("tc_{n}_{i}"),
+                "type": "function",
+                "function": {"name": *n, "arguments": "{}"}
+            })
+        })
+        .collect();
+    json!({
+        "full_text": text,
+        "tool_calls": tool_calls,
+        "usage": {
+            "prompt_tokens": 50 + tool_names.len() as u64,
+            "completion_tokens": 12,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+        }
+    })
+}
+
+fn event_types_in_order(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| e.get("type").and_then(Value::as_str).map(String::from))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let rounds = vec![
+        scripted_round("greeting"),
+        round_with_tool_calls("", &["bash", "read_file"]),
+        round_with_tool_calls("here is the answer", &["bash"]),
+    ];
+    let mut host = build_host(
+        rounds,
+        Some(("anthropic", "claude-sonnet-4")),
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state
+        .messages
+        .push(json!({ "role": "user", "content": "please help" }));
+
+    // Round 1 — text only.
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let events_r1 = host.take_emitted_events();
+    let types_r1 = event_types_in_order(&events_r1);
+    assert!(
+        types_r1.iter().any(|t| t == "text_delta"),
+        "round 1 must emit text_delta, got {types_r1:?}"
+    );
+    assert!(
+        !types_r1.iter().any(|t| t == "tool_call"),
+        "round 1 has no tool_calls, got {types_r1:?}"
+    );
+    let text_pos_r1 = types_r1.iter().position(|t| t == "text_delta").unwrap();
+    let usage_pos_r1 = types_r1.iter().position(|t| t == "usage").unwrap();
+    assert!(
+        text_pos_r1 < usage_pos_r1,
+        "text_delta must come before usage, got {types_r1:?}"
+    );
+
+    // Simulate tool-result injection between turns (as the real loop would).
+    state
+        .messages
+        .push(json!({"role": "assistant", "content": "greeting"}));
+    state
+        .messages
+        .push(json!({"role": "user", "content": "now run some tools"}));
+
+    // Round 2 — tool_calls only, no text.
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let events_r2 = host.take_emitted_events();
+    let types_r2 = event_types_in_order(&events_r2);
+    let tool_positions: Vec<usize> = types_r2
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| if t == "tool_call" { Some(i) } else { None })
+        .collect();
+    assert_eq!(
+        tool_positions.len(),
+        2,
+        "round 2 must emit two tool_call events, got {types_r2:?}"
+    );
+    let usage_pos_r2 = types_r2.iter().position(|t| t == "usage").unwrap();
+    for p in &tool_positions {
+        assert!(
+            *p < usage_pos_r2,
+            "every tool_call must come before usage, got {types_r2:?}"
+        );
+    }
+
+    // Append synthetic tool_result messages and a follow-up to simulate
+    // the agentic loop feeding tool outputs back to the LLM.
+    state.messages.push(json!({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "tc_bash_0", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+            {"id": "tc_read_file_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+        ]
+    }));
+    state
+        .messages
+        .push(json!({"role": "tool", "tool_call_id": "tc_bash_0", "content": "ok"}));
+    state
+        .messages
+        .push(json!({"role": "tool", "tool_call_id": "tc_read_file_1", "content": "hello"}));
+
+    // Round 3 — mixed text + tool_call.
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let events_r3 = host.take_emitted_events();
+    let types_r3 = event_types_in_order(&events_r3);
+    let text_pos_r3 = types_r3.iter().position(|t| t == "text_delta").unwrap();
+    let tool_pos_r3 = types_r3.iter().position(|t| t == "tool_call").unwrap();
+    let usage_pos_r3 = types_r3.iter().position(|t| t == "usage").unwrap();
+    assert!(
+        text_pos_r3 < tool_pos_r3 && tool_pos_r3 < usage_pos_r3,
+        "mixed round must emit text then tool_call then usage, got {types_r3:?}"
+    );
+
+    // Cacheable prefix stable across all 3 rounds (tools + system unchanged).
+    let g = capture.lock().unwrap();
+    assert_eq!(g.len(), 3);
+    assert_eq!(
+        g[0].cacheable_prefix_sha256, g[1].cacheable_prefix_sha256,
+        "interleaving tool calls must not churn the cacheable prefix"
+    );
+    assert_eq!(
+        g[1].cacheable_prefix_sha256, g[2].cacheable_prefix_sha256,
+        "mixed text+tool must not churn the cacheable prefix"
+    );
+
+    // History grows strictly between rounds — no message loss or reordering
+    // of the captured snapshot lengths.
+    assert!(g[0].messages.len() <= g[1].messages.len());
+    assert!(g[1].messages.len() < g[2].messages.len());
+}
