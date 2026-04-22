@@ -1,5 +1,55 @@
 import type { StreamEvent, ConnectionState, SSEClientOptions } from './types';
 
+/** Read Axum-style `{ detail }` or common `{ message, error }` from a failed fetch body. */
+export async function readHttpErrorMessage(response: Response): Promise<string> {
+  const statusLine = `${response.status} ${response.statusText}`.trim();
+  try {
+    const text = await response.text();
+    if (!text?.trim()) return statusLine;
+    try {
+      const j = JSON.parse(text) as { detail?: string; message?: string; error?: string | { message?: string } };
+      if (typeof j.detail === 'string' && j.detail) return j.detail;
+      if (typeof j.message === 'string' && j.message) return j.message;
+      if (typeof j.error === 'string' && j.error) return j.error;
+      if (j.error && typeof j.error === 'object' && typeof j.error.message === 'string') {
+        return j.error.message;
+      }
+    } catch {
+      return text;
+    }
+    return text;
+  } catch {
+    return statusLine;
+  }
+}
+
+/**
+ * Parse a complete SSE response body (one or more `data: {json}\\n\\n` blocks) into stream events.
+ * Used for buffered endpoints such as `GET /chat/runs/{id}/stream`.
+ */
+export function parseSseDataEvents(raw: string): StreamEvent[] {
+  const events: StreamEvent[] = [];
+  const blocks = raw.split(/\n\n+/);
+  for (const block of blocks) {
+    const lines = block.split('\n').filter((l) => l.length > 0);
+    let data = '';
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        data += line.slice(6);
+      } else if (line.startsWith('data:')) {
+        data += line.slice(5).trimStart();
+      }
+    }
+    if (!data.trim()) continue;
+    try {
+      events.push(JSON.parse(data) as StreamEvent);
+    } catch {
+      // skip malformed
+    }
+  }
+  return events;
+}
+
 /**
  * Fetch-based SSE client with automatic retry and custom auth headers.
  *
@@ -52,7 +102,8 @@ export class SSEClient {
       });
 
       if (!response.ok) {
-        throw new Error(`SSE connection failed: ${response.status} ${response.statusText}`);
+        const detail = await readHttpErrorMessage(response);
+        throw new Error(detail);
       }
       if (!response.body) {
         throw new Error('SSE response has no body');

@@ -91,6 +91,35 @@ describe('useAstraChat', () => {
     expect(result.current.messages[1].streaming).toBe(true);
   });
 
+  test('sendMessage passes allowSkills, allowTools, and skillSearch to streamChat', () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, []);
+
+    const skillSearch = { dynamicSurface: true, minCatalogSize: 8, surfaceCap: 14 };
+    const { result } = renderHook(() =>
+      useAstraChat({
+        client,
+        allowSkills: ['s1'],
+        allowTools: ['bash'],
+        skillSearch,
+      }),
+    );
+
+    act(() => {
+      result.current.sendMessage('Hello');
+    });
+
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    const req = streamChatMock.mock.calls[0][0] as {
+      allowSkills?: string[];
+      allowTools?: string[];
+      skillSearch?: typeof skillSearch;
+    };
+    expect(req.allowSkills).toEqual(['s1']);
+    expect(req.allowTools).toEqual(['bash']);
+    expect(req.skillSearch).toEqual(skillSearch);
+  });
+
   test('processes session_info event', () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [

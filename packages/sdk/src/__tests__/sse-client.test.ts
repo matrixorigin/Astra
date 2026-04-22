@@ -1,4 +1,4 @@
-import { SSEClient } from '../sse-client';
+import { SSEClient, parseSseDataEvents } from '../sse-client';
 import type { StreamEvent, ConnectionState } from '../types';
 
 // ─── Mock Fetch + ReadableStream ────────────────────────────────────
@@ -350,5 +350,19 @@ describe('SSEClient — AbortSignal', () => {
 
     await client.connect();
     expect(events).toHaveLength(0);
+  });
+});
+
+// ─── parseSseDataEvents ─────────────────────────────────────────────
+
+describe('parseSseDataEvents', () => {
+  test('parses multiple SSE blocks', () => {
+    const raw =
+      'data: {"type":"session_info","session_id":"s1","run_id":"r1"}\n\n' +
+      'data: {"type":"text_delta","content":"hi"}\n\n';
+    const events = parseSseDataEvents(raw);
+    expect(events).toHaveLength(2);
+    expect(events[0].type).toBe('session_info');
+    expect(events[1]).toMatchObject({ type: 'text_delta', content: 'hi' });
   });
 });

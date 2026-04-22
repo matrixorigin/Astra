@@ -22,10 +22,11 @@
     "dist"
   ],
   "scripts": {
+    "prepare": "npm run build",
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "jest"
+    "test": "jest --config jest.config.mjs"
   },
   "peerDependencies": {
     "react": ">=18.0.0"

@@ -11,8 +11,13 @@ import type {
   TokenUsage,
 } from '@/lib/workspace/types';
 import type { StreamEvent } from '@/lib/streaming/types';
+import { chatRequestToWire } from '@astra/sdk';
 import { SSEClient } from '@/lib/streaming/sse-client';
 import { suggestFollowupPrompt } from '@/lib/workspace/followup-suggestion';
+import {
+  formatRunErrorBubbleText,
+  streamEndedWithNoAssistantMarkdown,
+} from '@/lib/workspace/format-run-error-bubble';
 
 let nextId = 0;
 function uid(): string {
@@ -34,6 +39,7 @@ type UseChatStreamReturn = WorkspaceState & {
   stop: () => void;
   reset: () => void;
   connectionState: ConnectionState;
+  dismissError: () => void;
 };
 
 /**
@@ -253,12 +259,17 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
                 }),
             );
           }
+          const noAssistantText = !accumulatedTextRef.current.trim();
           setMessages((prev) =>
             prev.map((m) =>
               m.id === id
                 ? {
                     ...m,
                     streaming: false,
+                    content:
+                      !hadError && noAssistantText && !m.content?.trim()
+                        ? streamEndedWithNoAssistantMarkdown
+                        : m.content,
                     toolCalls:
                       finalTools.length > 0 ? finalTools : undefined,
                   }
@@ -274,10 +285,30 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
 
         case 'error': {
           sawErrorEventRef.current = true;
-          setError(event.message);
+          const errorLine =
+            event.code && event.message ? `${event.code}: ${event.message}` : event.message;
+          setError(errorLine);
           setIsStreaming(false);
           setConnectionState('error');
           setFollowupSuggestion(null);
+          {
+            const id = assistantIdRef.current;
+            if (id) {
+              // Must not require m.streaming: the server may emit turn_complete before error,
+              // which clears streaming and would leave the bubble empty.
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === id && m.role === 'assistant'
+                    ? {
+                        ...m,
+                        streaming: false,
+                        content: formatRunErrorBubbleText(errorLine, m.content),
+                      }
+                    : m,
+                ),
+              );
+            }
+          }
           break;
         }
 
@@ -352,12 +383,17 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       const client = new SSEClient({
         url: `/api/backend/chat/stream`,
         method: 'POST',
-        body: JSON.stringify({
-          message: content,
-          session_id: sessionId,
-          agent_id: config.agentId ?? undefined,
-          model: config.model ?? undefined,
-        }),
+        body: JSON.stringify(
+          chatRequestToWire({
+            message: content,
+            sessionId: sessionId ?? undefined,
+            agentId: config.agentId,
+            model: config.model,
+            allowSkills: config.allowSkills,
+            allowTools: config.allowTools,
+            skillSearch: config.skillSearch,
+          }),
+        ),
         onEvent: processEvent,
         onStateChange: (state) => {
           if (state === 'error') {
@@ -375,9 +411,27 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       sseClientRef.current = client;
       client.connect().catch((err) => {
         if (err instanceof DOMException && err.name === 'AbortError') return;
-        setError(err instanceof Error ? err.message : 'Unknown streaming error');
+        const msg = err instanceof Error ? err.message : 'Unknown streaming error';
+        setError(msg);
         setIsStreaming(false);
         setConnectionState('error');
+        const id = assistantIdRef.current;
+        if (id) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === id && m.role === 'assistant'
+                ? {
+                    ...m,
+                    streaming: false,
+                    content: formatRunErrorBubbleText(
+                      `Request did not return a live stream. ${msg}`,
+                      m.content,
+                    ),
+                  }
+                : m,
+            ),
+          );
+        }
       });
     },
     [isStreaming, sessionId, config, processEvent],
@@ -403,6 +457,10 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     toolCallMapRef.current.clear();
   }, [config.sessionId]);
 
+  const dismissError = useCallback(() => {
+    setError(null);
+  }, []);
+
   return {
     sessionId,
     runId,
@@ -418,5 +476,6 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     sendMessage,
     stop,
     reset,
+    dismissError,
   };
 }

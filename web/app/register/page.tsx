@@ -2,16 +2,29 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useActionState } from 'react';
+import { useActionState, useEffect } from 'react';
 import { registerAction } from '@/lib/auth/actions';
 
 export default function RegisterPage() {
   const router = useRouter();
   const [state, formAction, isPending] = useActionState(registerAction, { ok: false });
 
+  useEffect(() => {
+    if (state.ok) {
+      router.push('/overview');
+    }
+  }, [state.ok, router]);
+
   if (state.ok) {
-    router.push('/overview');
-    return null;
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 p-4">
+        <div className="w-full max-w-sm">
+          <p className="text-center text-sm text-slate-400" role="status">
+            Account created. Redirecting…
+          </p>
+        </div>
+      </div>
+    );
   }
 
   return (

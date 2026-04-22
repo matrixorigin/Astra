@@ -275,7 +275,11 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         {
           message: content,
           sessionId: sessionId ?? undefined,
+          agentId: config.agentId,
           model: config.model,
+          allowSkills: config.allowSkills,
+          allowTools: config.allowTools,
+          skillSearch: config.skillSearch,
         },
         {
           onEvent: processEvent,
@@ -290,7 +294,16 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         sseClient.close();
       });
     },
-    [config.client, config.model, sessionId, processEvent],
+    [
+      config.client,
+      config.agentId,
+      config.model,
+      config.allowSkills,
+      config.allowTools,
+      config.skillSearch,
+      sessionId,
+      processEvent,
+    ],
   );
 
   const stop = useCallback(() => {
