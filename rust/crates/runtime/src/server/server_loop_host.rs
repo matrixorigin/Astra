@@ -183,6 +183,169 @@ async fn resolve_llm_model_for_turn(
     })
 }
 
+/// Test-only snapshot of the materials a single turn of the mock LLM path
+/// assembles before it would call a real provider. Captures enough to
+/// assert on prompt-cache annotations, schema changes, and stable prefix
+/// byte-equality across turns without involving the network.
+#[cfg(feature = "bridge-e2e-hooks")]
+#[derive(Debug, Clone)]
+pub struct CapturedLlmRequest {
+    /// 0-based turn index (counts mock-LLM rounds actually executed).
+    pub turn_index: usize,
+    /// Provider id used for cache config (e.g. `"anthropic"` or `"openai"`).
+    pub provider: String,
+    /// Model id used for cache config (e.g. `"claude-sonnet-4"`).
+    pub model: String,
+    /// Whether `PromptCacheConfig` was computing annotations on this turn.
+    pub cache_enabled: bool,
+    /// Whether Anthropic-style cache_control blocks were emitted.
+    pub is_anthropic: bool,
+    /// The primary structured system message (with cache_control blocks for
+    /// Anthropic, or just the stable prefix text for OpenAI-compatible).
+    pub system_primary: Value,
+    /// The optional per-turn dynamic system message (OpenAI split only).
+    pub system_dynamic: Option<Value>,
+    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching`.
+    pub tools: Vec<Value>,
+    /// Conversation messages after `add_message_cache_breakpoint` was applied
+    /// (for Anthropic) or a clone of `state.messages` (otherwise).
+    pub messages: Vec<Value>,
+    /// Number of `cache_control` blocks present in `system_primary` content.
+    pub system_cache_control_count: usize,
+    /// Whether the last tool schema carries a `cache_control` marker.
+    pub last_tool_has_cache_control: bool,
+    /// Whether the last non-system message carries a `cache_control` marker.
+    pub last_message_has_cache_control: bool,
+    /// SHA256 hex of the cacheable prefix (for OpenAI: `system_primary.content`
+    /// as text; for Anthropic: the concatenated text of all blocks up to and
+    /// including the last cache_control breakpoint).
+    pub cacheable_prefix_sha256: String,
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn value_has_cache_control(v: &Value) -> bool {
+    v.get("cache_control")
+        .map(|cc| !cc.is_null())
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn count_system_cache_control(primary: &Value) -> usize {
+    let Some(content) = primary.get("content") else {
+        return 0;
+    };
+    match content {
+        Value::Array(blocks) => blocks.iter().filter(|b| value_has_cache_control(b)).count(),
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
+    let Some(content) = system_primary.get("content") else {
+        return String::new();
+    };
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
+    if is_anthropic {
+        // Concatenate text up to and including the last block carrying
+        // `cache_control` (the full cacheable prefix per Anthropic semantics).
+        let last_break = blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, b)| value_has_cache_control(b))
+            .map(|(i, _)| i);
+        match last_break {
+            Some(idx) => blocks
+                .iter()
+                .take(idx + 1)
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+            None => String::new(),
+        }
+    } else {
+        blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+#[allow(clippy::too_many_arguments)]
+fn build_captured_llm_request(
+    turn_index: usize,
+    provider: String,
+    model: String,
+    cache_cfg: &PromptCacheConfig,
+    system_msgs: &[Value],
+    tools: &[Value],
+    messages: &[Value],
+    breakdown: &crate::turn::context_assembly_trace::SystemPromptBreakdown,
+) -> CapturedLlmRequest {
+    let _ = breakdown; // retained in case future assertions want it
+    // Identify primary + dynamic system slots.
+    let primary = system_msgs.first().cloned().unwrap_or_else(|| json!({}));
+    let dynamic = system_msgs.get(1).cloned();
+    let system_cache_control_count = count_system_cache_control(&primary);
+    let last_tool_has_cache_control = tools
+        .last()
+        .map(|t| {
+            value_has_cache_control(t)
+                || t.get("cache_control").is_some()
+                || t.get("function")
+                    .map(|f| value_has_cache_control(f))
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let last_message_has_cache_control = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .map(|m| {
+            if value_has_cache_control(m) {
+                return true;
+            }
+            if let Some(arr) = m.get("content").and_then(Value::as_array) {
+                return arr.iter().any(value_has_cache_control);
+            }
+            false
+        })
+        .unwrap_or(false);
+    let prefix = cacheable_prefix_text(&primary, cache_cfg.is_anthropic);
+    let cacheable_prefix_sha256 = sha256_hex(&prefix);
+    CapturedLlmRequest {
+        turn_index,
+        provider,
+        model,
+        cache_enabled: cache_cfg.cache_enabled,
+        is_anthropic: cache_cfg.is_anthropic,
+        system_primary: primary,
+        system_dynamic: dynamic,
+        tools: tools.to_vec(),
+        messages: messages.to_vec(),
+        system_cache_control_count,
+        last_tool_has_cache_control,
+        last_message_has_cache_control,
+        cacheable_prefix_sha256,
+    }
+}
+
 /// Server-side host for the runtime agentic loop.
 ///
 /// Each turn:
@@ -246,6 +409,14 @@ pub struct ServerAgenticLoopHost {
     test_llm_rounds: std::collections::VecDeque<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds_wired: bool,
+    /// Optional provider hint for the mock path, so cache_control annotations
+    /// are exercised as if talking to anthropic/openai/etc. Default (None)
+    /// leaves `PromptCacheConfig::default()` behavior (annotations off).
+    #[cfg(feature = "bridge-e2e-hooks")]
+    mock_provider: Option<(String, String)>,
+    /// Per-turn captured payloads for assertion in tests.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -268,6 +439,10 @@ pub struct ServerAgenticLoopHostBuilder {
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds_wired: bool,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    mock_provider: Option<(String, String)>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -296,6 +471,10 @@ impl ServerAgenticLoopHostBuilder {
             test_llm_rounds: Vec::new(),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds_wired: false,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            mock_provider: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            llm_request_capture: None,
         }
     }
 
@@ -365,6 +544,35 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    /// **Test-only.** Override the provider/model seen by the mock LLM path so
+    /// that `PromptCacheConfig::latch` produces the same annotations as real
+    /// calls. Use e.g. `("anthropic", "claude-sonnet-4")` to exercise
+    /// `cache_control` blocks end-to-end, or `("openai", "gpt-4o")` for the
+    /// stable-prefix / dynamic-system-message split.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_mock_provider(
+        mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.mock_provider = Some((provider.into(), model.into()));
+        self
+    }
+
+    /// **Test-only.** Attach an `Arc<Mutex<Vec<CapturedLlmRequest>>>`; every
+    /// invocation of `execute_mock_turn` appends a snapshot of the materials
+    /// that would be sent to a real LLM (system messages with cache_control
+    /// annotations, annotated tool schemas, message cache breakpoint if any,
+    /// cache config and a stable hash of the cacheable prefix).
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_llm_request_capture(
+        mut self,
+        capture: Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>,
+    ) -> Self {
+        self.llm_request_capture = Some(capture);
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
@@ -415,6 +623,10 @@ impl ServerAgenticLoopHostBuilder {
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds_wired: self.test_llm_rounds_wired,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            mock_provider: self.mock_provider,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            llm_request_capture: self.llm_request_capture,
         }
     }
 }
@@ -511,10 +723,41 @@ impl ServerAgenticLoopHost {
         self.client_cancel_token = Some(token);
     }
 
+    /// **Test-only.** Drive a single mock-LLM turn end-to-end without the
+    /// surrounding `run_agentic_loop_with_host` orchestration. Pops the next
+    /// scripted round from `test_llm_rounds`, runs the full system-prompt +
+    /// tool-schema + cache annotation pipeline, and appends a
+    /// [`CapturedLlmRequest`] if a capture hook was attached via
+    /// [`ServerAgenticLoopHostBuilder::with_llm_request_capture`].
+    ///
+    /// Returns the resulting [`HostTurnResult`]. Increments
+    /// `state.llm_rounds_completed` to mirror the real dispatch path so the
+    /// next turn observes the correct round index.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub async fn run_one_mock_turn_for_test(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        let round = self.test_llm_rounds.pop_front().unwrap_or_else(
+            || json!({ "full_text": "[mock rounds exhausted]", "tool_calls": [], "usage": {} }),
+        );
+        let started = Instant::now();
+        let result = self.execute_mock_turn(state, &round, started).await?;
+        state.llm_rounds_completed = state.llm_rounds_completed.saturating_add(1);
+        Ok(result)
+    }
+
     /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).
     ///
     /// Parses the round JSON (same shape as bridge e2e hooks), emits SSE events,
     /// and returns a `HostTurnResult` as if a real LLM responded.
+    /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).
+    ///
+    /// Parses the round JSON (same shape as bridge e2e hooks), builds the same
+    /// cache-annotated system messages, tool schemas and message list that a
+    /// real LLM call would receive, emits SSE events, optionally records a
+    /// [`CapturedLlmRequest`] for test assertion, and returns a [`HostTurnResult`]
+    /// as if a real LLM responded.
     #[cfg(feature = "bridge-e2e-hooks")]
     async fn execute_mock_turn(
         &mut self,
@@ -522,18 +765,30 @@ impl ServerAgenticLoopHost {
         round: &Value,
         turn_started: Instant,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-        let (_, _, system_prompt_breakdown) = self.build_system_messages_cached(
-            &state.message,
-            &self.edge_tools.clone(),
-            state,
-            &PromptCacheConfig::default(),
-        );
+        // Latch a cache config from the (optional) mock provider so that
+        // annotations exercised here mirror the real pipeline at the server
+        // loop host level — including Anthropic cache_control blocks and the
+        // OpenAI stable-prefix / dynamic split.
+        let cache_cfg = match &self.mock_provider {
+            Some((provider, model)) => PromptCacheConfig::latch(provider, model),
+            None => PromptCacheConfig::default(),
+        };
+
+        let edge_tools_snapshot = self.edge_tools.clone();
+        let (system_msgs, _system_plain, system_prompt_breakdown) = self
+            .build_system_messages_cached(&state.message, &edge_tools_snapshot, state, &cache_cfg);
         self.emit_context_meta(&system_prompt_breakdown);
+
+        // Replicate the real-path tool + message annotations so captured
+        // payloads reflect what a real provider would see.
+        let mut annotated_tools = edge_tools_snapshot.clone();
+        annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
+        let mut annotated_messages = state.messages.clone();
+        add_message_cache_breakpoint(&mut annotated_messages, &cache_cfg);
 
         let (full_text, reasoning, tool_calls, usage) =
             crate::turn::bridge_e2e_hooks::parse_llm_round(round);
 
-        // Emit SSE events matching real flow.
         if !reasoning.is_empty() {
             self.push_reasoning_events(&reasoning);
         }
@@ -551,13 +806,49 @@ impl ServerAgenticLoopHost {
             .get("completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(5);
+        // Accept both the flat naming (mock-friendly) and the Anthropic
+        // `*_input_tokens` variants so fixtures can model either provider.
+        let cache_read = usage
+            .get("cache_read_tokens")
+            .or_else(|| usage.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_tokens")
+            .or_else(|| usage.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         self.emit_event(json!({
             "type": "usage",
             "prompt_tokens": prompt,
             "completion_tokens": completion,
+            "cache_read_tokens": cache_read,
+            "cache_creation_tokens": cache_creation,
         }));
 
-        // Edge tool delivery via ledger (when streaming to web client).
+        // Record the captured request before tool delivery (so assertions see
+        // a deterministic view even if tool ledger introduces delays).
+        if let Some(cap) = &self.llm_request_capture {
+            let turn_index = state.llm_rounds_completed as usize;
+            let (provider, model) = self
+                .mock_provider
+                .clone()
+                .unwrap_or_else(|| (String::new(), String::new()));
+            let captured = build_captured_llm_request(
+                turn_index,
+                provider,
+                model,
+                &cache_cfg,
+                &system_msgs,
+                &annotated_tools,
+                &annotated_messages,
+                &system_prompt_breakdown,
+            );
+            if let Ok(mut guard) = cap.lock() {
+                guard.push(captured);
+            }
+        }
+
         let edge_tool_round =
             if !self.server_side_tools && self.event_tx.is_some() && !tool_calls.is_empty() {
                 self.deliver_edge_tools_via_ledger(&tool_calls).await
@@ -572,6 +863,8 @@ impl ServerAgenticLoopHost {
             has_tool_calls: !tool_calls.is_empty(),
             prompt_tokens: prompt,
             completion_tokens: completion,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
             has_usage: true,
             system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
             system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
@@ -3376,5 +3669,117 @@ mod tests {
             timestamp_epoch_ms: 3000,
         };
         assert!(super::progress_event_to_sse(&evt).is_none());
+    }
+
+    // ── Mock-LLM prompt-cache verification framework tests ──────────────────
+    //
+    // These exercise the pure helpers that assemble `CapturedLlmRequest` so we
+    // can trust the framework before layering E2E tests on top.
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn captured_request_counts_anthropic_cache_control_blocks() {
+        let primary = json!({
+            "role": "system",
+            "content": [
+                { "type": "text", "text": "stable global" },
+                { "type": "text", "text": "frozen middle", "cache_control": { "type": "ephemeral" } },
+                { "type": "text", "text": "dynamic tail" },
+            ]
+        });
+        assert_eq!(super::count_system_cache_control(&primary), 1);
+
+        let primary_openai = json!({ "role": "system", "content": "plain text" });
+        assert_eq!(super::count_system_cache_control(&primary_openai), 0);
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn captured_request_prefix_hash_for_anthropic_covers_only_up_to_breakpoint() {
+        let primary = json!({
+            "role": "system",
+            "content": [
+                { "type": "text", "text": "A" },
+                { "type": "text", "text": "B", "cache_control": { "type": "ephemeral" } },
+                { "type": "text", "text": "C" },
+            ]
+        });
+        // Prefix is "AB" (stops at last cache_control breakpoint).
+        let hex = super::sha256_hex("AB");
+        let prefix = super::cacheable_prefix_text(&primary, true);
+        assert_eq!(prefix, "AB");
+        assert_eq!(super::sha256_hex(&prefix), hex);
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn captured_request_prefix_hash_for_openai_concatenates_all_text() {
+        let primary = json!({
+            "role": "system",
+            "content": "stable prefix text"
+        });
+        let prefix = super::cacheable_prefix_text(&primary, false);
+        assert_eq!(prefix, "stable prefix text");
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn captured_request_openai_prefix_equal_across_turns_drives_cache_hit() {
+        // Two turns with identical stable system content → identical hash.
+        let p1 = json!({ "role": "system", "content": "SAME" });
+        let p2 = json!({ "role": "system", "content": "SAME" });
+        let h1 = super::sha256_hex(&super::cacheable_prefix_text(&p1, false));
+        let h2 = super::sha256_hex(&super::cacheable_prefix_text(&p2, false));
+        assert_eq!(h1, h2, "OpenAI stable-prefix hash must match byte-for-byte");
+
+        // A schema churn / content diff breaks the prefix hash.
+        let p3 = json!({ "role": "system", "content": "DIFFERENT" });
+        let h3 = super::sha256_hex(&super::cacheable_prefix_text(&p3, false));
+        assert_ne!(h1, h3, "Prefix change must invalidate cache key");
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[test]
+    fn captured_request_detects_last_tool_and_last_message_cache_markers() {
+        let tools = vec![
+            json!({ "type": "function", "function": { "name": "a" } }),
+            json!({
+                "type": "function",
+                "function": { "name": "b" },
+                "cache_control": { "type": "ephemeral" }
+            }),
+        ];
+        let messages = vec![
+            json!({ "role": "user", "content": "hello" }),
+            json!({
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "reply", "cache_control": { "type": "ephemeral" } }
+                ]
+            }),
+        ];
+        let cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let breakdown = crate::turn::context_assembly_trace::SystemPromptBreakdown::default();
+        let captured = super::build_captured_llm_request(
+            0,
+            "anthropic".to_string(),
+            "claude-sonnet-4".to_string(),
+            &cfg,
+            &[
+                json!({ "role": "system", "content": [{ "type": "text", "text": "x", "cache_control": { "type": "ephemeral" } }] }),
+            ],
+            &tools,
+            &messages,
+            &breakdown,
+        );
+        assert!(captured.last_tool_has_cache_control);
+        assert!(captured.last_message_has_cache_control);
+        assert_eq!(captured.system_cache_control_count, 1);
+        assert!(captured.is_anthropic);
+        assert!(captured.cache_enabled);
+        assert_eq!(captured.turn_index, 0);
     }
 }
