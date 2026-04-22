@@ -148,6 +148,11 @@ pub struct ObservabilitySession {
     /// Gap 6: per-tool outcome bias currently applied by the selector
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
     pub outcome_bias: std::collections::BTreeMap<String, f64>,
+
+    /// High-failure tools surfaced for SelfModel reasoning (name, fail_rate, samples).
+    /// Populated by the adaptive-tuning cycle; consumed by the SelfModel snapshot
+    /// builder. Replaced (not appended to) on each publish.
+    pub low_confidence_tools: Vec<(String, f64, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +250,7 @@ impl ObservabilitySession {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
+            low_confidence_tools: Vec::new(),
         }
     }
 
@@ -283,6 +289,7 @@ impl ObservabilitySession {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
+            low_confidence_tools: Vec::new(),
         }
     }
 
@@ -892,10 +899,19 @@ impl ObservabilityHub {
 
     // ─── Low-Confidence Tools (SelfModel Signal) ────────────────────────────
 
-    /// Replace the current high-failure tool list (doesn't append).
+    /// Replace the current high-failure tool list (doesn't append). Also
+    /// mirrors the value into each active session so downstream snapshot
+    /// builders (e.g. SelfModel) can read it via the session handle.
     pub fn record_low_confidence_tools(&self, entries: Vec<(String, f64, u32)>) {
         if let Ok(mut guard) = self.low_confidence_tools.lock() {
-            *guard = entries;
+            *guard = entries.clone();
+        }
+        if let Ok(sessions) = self.sessions.read() {
+            for session in sessions.values() {
+                if let Ok(mut guard) = session.write() {
+                    guard.low_confidence_tools = entries.clone();
+                }
+            }
         }
     }
 
@@ -1224,6 +1240,20 @@ mod tests {
         let hub = ObservabilityHub::new();
         let session = hub.start_session("user1", "session1");
         assert!(session.read().unwrap_or_else(|e| e.into_inner()).user_id == "user1");
+    }
+
+    #[test]
+    fn record_low_confidence_tools_replaces_and_propagates_to_sessions() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("user1", "sess1");
+        hub.record_low_confidence_tools(vec![("bash".to_string(), 0.3, 10)]);
+        hub.record_low_confidence_tools(vec![("write_file".to_string(), 0.75, 8)]);
+        let tools = hub.low_confidence_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "write_file");
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.low_confidence_tools.len(), 1);
+        assert_eq!(guard.low_confidence_tools[0].0, "write_file");
     }
 
     #[test]

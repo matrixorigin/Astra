@@ -851,9 +851,9 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use astra_core::confidence::ConfidenceInterval;
-    use astra_services::evaluation::types::ValueInterval;
-    use astra_services::session_audit::RuntimePromotionOutcome;
+    
+    
+    
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 

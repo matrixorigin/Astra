@@ -1311,7 +1311,7 @@ fn observe_gate_cancelled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::confidence::ConfidenceInterval;
+    
     use astra_services::session_journal::{
         JournalEvent, JournalEventType, JournalWriter, ToolCallRecord,
     };
