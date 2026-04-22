@@ -2546,4 +2546,95 @@ mod tests {
         }];
         assert!(!has_any_unresolved_verification_failure(&subtasks, None));
     }
+
+    // ─── Resume-loop / blocked-deps regression tests ──────────────────────
+    //
+    // These tests lock in the fixes from PR #216 for the deadlock where
+    // typing "继续" on a blocked-deps pause immediately re-paused with no
+    // diagnostic info. See bug write-up in the PR body; observed in session
+    // 26f73ee4-51a5-44e9-90c2-fc475b77f463.
+
+    /// The ChannelSink must parse the comma-separated blocked_ids string
+    /// the trait contract hands it, and forward it as a Vec<String> on
+    /// `PlanUpdate::PlanPaused`. Before the fix, the parameter was
+    /// underscore-prefixed and dropped on the floor, so the REPL monitor
+    /// could only show a count, not the actionable ids.
+    #[test]
+    fn channel_sink_plan_paused_forwards_blocked_ids() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.plan_paused(42, 3, Duration::from_secs(12), "step-4, step-5, step-6");
+
+        let update = rx.try_recv().expect("sink should have emitted");
+        match update {
+            PlanUpdate::PlanPaused {
+                pct,
+                remaining,
+                elapsed,
+                blocked_ids,
+            } => {
+                assert_eq!(pct, 42);
+                assert_eq!(remaining, 3);
+                assert_eq!(elapsed, Duration::from_secs(12));
+                assert_eq!(blocked_ids, vec!["step-4", "step-5", "step-6"]);
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+    }
+
+    /// Empty / whitespace-only blocked_ids must produce an empty vec, not
+    /// a vec containing the empty string (which would render as
+    /// "blocked by: " in the monitor).
+    #[test]
+    fn channel_sink_plan_paused_handles_empty_blocked() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.plan_paused(10, 0, Duration::from_secs(1), "");
+
+        match rx.try_recv().unwrap() {
+            PlanUpdate::PlanPaused { blocked_ids, .. } => {
+                assert!(blocked_ids.is_empty(), "got {:?}", blocked_ids);
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+
+        // Whitespace between commas must not produce empty entries.
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let sink2 = ChannelSink::new(tx2);
+        sink2.plan_paused(10, 1, Duration::from_secs(1), ",, step-1 ,,");
+        match rx2.try_recv().unwrap() {
+            PlanUpdate::PlanPaused { blocked_ids, .. } => {
+                assert_eq!(blocked_ids, vec!["step-1"]);
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+    }
+
+    /// `interrupted_pause` (Ctrl+C pause) has no dependency-blocking
+    /// concept — it must emit an empty blocked_ids and zero elapsed so
+    /// the monitor knows not to render a misleading "blocked by" line.
+    #[test]
+    fn channel_sink_interrupted_pause_emits_empty_blocked() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.interrupted_pause(55, 4);
+
+        match rx.try_recv().unwrap() {
+            PlanUpdate::PlanPaused {
+                pct,
+                remaining,
+                elapsed,
+                blocked_ids,
+            } => {
+                assert_eq!(pct, 55);
+                assert_eq!(remaining, 4);
+                assert_eq!(elapsed, Duration::ZERO);
+                assert!(
+                    blocked_ids.is_empty(),
+                    "interrupted pause must not claim blocked ids"
+                );
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+    }
 }

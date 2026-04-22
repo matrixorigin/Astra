@@ -1292,6 +1292,48 @@ mod tests {
         assert!(r1.confidence <= r0.confidence);
     }
 
+    /// Regression (2026-04-23, session 26f73ee4): three consecutive rounds
+    /// of `skill` calls with zero file mutations must trigger the
+    /// "exploration stall" diagnostic just like three `bash` / `grep` rounds
+    /// do. Before adding `skill`/`discover_skills` to the consultative
+    /// classifier, an agent could consult skills forever while narrating
+    /// implementation as markdown code blocks without ever tripping the
+    /// stall detector.
+    #[test]
+    fn reflection_triggers_on_skill_obsession() {
+        let sigs = make_sigs(&[&["skill"], &["skill"], &["skill"]]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(
+            reflection.what_happened.contains("skill"),
+            "expected 'skill' in diagnosis, got: {}",
+            reflection.what_happened
+        );
+        assert!(
+            reflection.confidence >= 0.7,
+            "skill-obsession must be classified as high-confidence \
+             exploration stall, got {}",
+            reflection.confidence
+        );
+        assert!(
+            reflection.avoid_tools.contains(&"skill".to_string()),
+            "avoid_tools should include `skill`, got: {:?}",
+            reflection.avoid_tools
+        );
+    }
+
+    /// `discover_skills` is the other consultative tool — same contract.
+    #[test]
+    fn reflection_triggers_on_discover_skills_loop() {
+        let sigs = make_sigs(&[
+            &["discover_skills"],
+            &["discover_skills"],
+            &["discover_skills"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(reflection.what_happened.contains("discover_skills"));
+        assert!(reflection.confidence >= 0.7);
+    }
+
     #[test]
     fn reflection_includes_error_tools() {
         let sigs = make_sigs(&[&["read_file"], &["bash"], &["read_file"]]);
