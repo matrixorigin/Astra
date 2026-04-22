@@ -859,7 +859,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             cache_read_tokens: turn_result.accum.cache_read_tokens,
             tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
             tool_call_names: tool_names,
-            finish_reason: None,
+            // Synthesise per OpenAI protocol when upstream leaves the field
+            // null (observed in the wild with qwen-turbo: 72/92 llm_rounds
+            // had no finish_reason in session 32c7c640). Reaching this code
+            // path means we *did* receive tool_calls, so `tool_calls` is the
+            // semantically correct value. Journal consumers (slash_debug,
+            // journal_digest, learning signals) can then distinguish genuine
+            // early-exit stops from tool-call rounds without heuristics.
+            finish_reason: Some(
+                super::agentic_loop_host::synthesise_finish_reason(
+                    None,
+                    !turn_result.accum.tool_calls.is_empty(),
+                )
+                .into(),
+            ),
             agentic_step: Some(agentic_step),
             source: Some("agentic_loop".into()),
             run_id,
