@@ -1106,9 +1106,15 @@ fn check_backslash_escaped_operator(command: &str) -> bool {
         .map(|s| s.as_str())
         .unwrap_or("");
     let base_is_find = base_command == "find";
-    // grep/sed use BRE `\|` alternation; egrep uses ERE `|`; fgrep is fixed-string
-    // (no regex). awk supports ERE `|`. None of these are shell-exploit patterns.
-    let base_is_regex_tool = matches!(base_command, "grep" | "egrep" | "fgrep" | "sed" | "awk");
+    // grep/sed use BRE `\|` alternation; egrep/rg use ERE `|`; fgrep is
+    // fixed-string (no regex). awk supports ERE `|`. ripgrep (`rg`) is the
+    // workflow-recommended search tool, and perl -e / perl -pe / perl -ne
+    // frequently carry the same escaped alternation. None of these are shell
+    // exploit patterns — they are regex-tool arguments.
+    let base_is_regex_tool = matches!(
+        base_command,
+        "grep" | "egrep" | "fgrep" | "rg" | "sed" | "awk" | "perl"
+    );
 
     for (idx, token) in tokens.iter().enumerate() {
         let Some(operator) = token_has_unquoted_escaped_operator(token) else {
@@ -1884,6 +1890,26 @@ mod tests {
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"grep -n fetch_spinner\|show_early_hint\|last_prefetch_hash file.rs"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_rg_escaped_alternation() {
+        // ripgrep is the workflow-recommended search tool; users commonly
+        // escape the `|` out of shell habit even though rg uses ERE.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"rg -n 'foo\|bar\|baz' rust/"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_perl_escaped_alternation() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"perl -ne 'print if /foo\|bar/' input.txt"#}),
         );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }

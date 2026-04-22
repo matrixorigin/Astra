@@ -2,7 +2,7 @@
 name: review-changes
 description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, specific commits, or GitHub PR URLs. Signal-driven analysis routing for efficient deep review."
 user_invocable: true
-when_to_use: "For deep, thorough, or comprehensive analysis of large diffs (>5 files or >200 lines changed). Triggered by: 'deep analysis', 'thorough check', 'comprehensive review', 'full audit'. NOT for quick or simple change inspection."
+when_to_use: "When the user asks to review code changes, commits, diffs, PRs, or GitHub PR URLs (e.g. 'review https://github.com/.../pull/123', 'review latest commit', 'review staged'). Scales automatically — small diffs get a quick path, larger diffs (>5 files or >200 lines) get a deeper multi-step review."
 arguments:
   - name: TARGET
     description: "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', 'pr:<number>', or a GitHub PR URL (e.g. 'https://github.com/owner/repo/pull/123'). Default: all uncommitted changes."

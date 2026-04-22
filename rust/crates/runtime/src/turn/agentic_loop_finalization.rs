@@ -1107,20 +1107,67 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         // The loop should have terminated before using all 20 tool rounds.
-        // With progressive penalties + cache-hit nudges, it should stop
-        // well before 20 rounds.
-        let rounds_used = host.rendered_final_text.len()
-            + state
-                .messages
-                .iter()
-                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-                .count();
+        // Use llm_rounds_completed directly — it is the authoritative count
+        // of attempted LLM calls (incremented once per execute_turn call,
+        // not influenced by render/tool-message bookkeeping). Combining
+        // render counts + tool-message counts is an indirect metric that
+        // can pass accidentally; `llm_rounds_completed` is what the
+        // progressive-penalty machinery is supposed to bound.
+        let llm_rounds = state.llm_rounds_completed;
 
         // We don't assert exact count (depends on penalty math), but it
         // must be significantly less than 20.
         assert!(
-            rounds_used < 18,
-            "progressive penalty should limit loop to fewer rounds, got {rounds_used} tool messages. outcome={outcome:?}"
+            llm_rounds < 18,
+            "progressive penalty should limit loop to fewer LLM rounds, got llm_rounds={llm_rounds}. outcome={outcome:?}"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Regression: round budget guidance is ephemeral — only one copy lives
+    // in state.messages at any time. Prior guidance must be stripped before
+    // the next one is appended, otherwise every late-round call accumulates
+    // a duplicate "Round Budget" user-message that wastes tokens.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn round_budget_guidance_is_ephemeral_not_accumulated() {
+        // Simulate 5 tool rounds (>> ROUND_BUDGET_THRESHOLD) so multiple
+        // injections occur. After the loop finishes, state.messages must
+        // contain AT MOST one "Round Budget" user message.
+        let mut results = Vec::new();
+        for _ in 0..5 {
+            results.push(edge_tool_result(
+                vec![make_edge_tool("read_file", "content")],
+                100,
+                20,
+                Some(10),
+            ));
+        }
+        results.push(text_result("Done", 100, 50, Some(10)));
+
+        let mut host = MockHost::new(results).with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        let guidance_count = state
+            .messages
+            .iter()
+            .filter(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| {
+                            s.contains("## ⚡ Round Budget") || s.contains("## ⚠ Round Budget")
+                        })
+            })
+            .count();
+
+        assert!(
+            guidance_count <= 1,
+            "round-budget guidance must be ephemeral (at most 1 copy in state.messages); \
+             found {guidance_count} copies"
         );
     }
 }
