@@ -197,6 +197,12 @@ pub(super) struct EdgeSseContext<'a> {
     pub turn_rollback_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut EdgeToolCache,
+    /// Optional ObservabilityHub for recording streaming-speculation metrics
+    /// (see `AutoTuningEngine::should_disable_streaming_speculation`). `None`
+    /// for tests and non-observable contexts; production supplies it from
+    /// `CliAgenticLoopHost`.
+    pub observability_hub:
+        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -268,6 +274,9 @@ struct CliSseStreamHost<'a> {
     /// batch phase.
     streaming_tool_exec:
         Option<std::sync::Arc<astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor>>,
+    /// Optional ObservabilityHub for streaming-speculation metric reporting.
+    observability_hub:
+        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +374,7 @@ impl<'a> CliSseStreamHost<'a> {
             turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
             streaming_tool_exec,
+            observability_hub: ctx.observability_hub,
         }
     }
 
@@ -1470,6 +1480,13 @@ impl CliSseStreamHost<'_> {
         // over time. Target: `astra::streaming_speculation::metrics`.
         exec.emit_metrics_log(self.executor.active_session_id().as_deref())
             .await;
+        if let Some(hub) = self.observability_hub.as_ref() {
+            let snap = exec.snapshot().await;
+            hub.record_streaming_speculation_metrics(&snap);
+            // Reset so each batch report is a delta; AutoTuningEngine sums
+            // incoming reports additively.
+            exec.reset_metrics().await;
+        }
         out
     }
 }
@@ -7541,6 +7558,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -7632,6 +7650,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -7720,6 +7739,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -7811,6 +7831,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -7895,6 +7916,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -7977,6 +7999,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8070,6 +8093,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8148,6 +8172,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8245,6 +8270,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8332,6 +8358,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8427,6 +8454,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8488,6 +8516,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8545,6 +8574,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8603,6 +8633,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8692,6 +8723,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8749,6 +8781,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8844,6 +8877,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -8919,6 +8953,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -9011,6 +9046,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
@@ -9097,6 +9133,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
+                observability_hub: None,
             },
             80,
             false,
