@@ -153,3 +153,108 @@ fn stats_accumulate_hits_and_misses_correctly() {
         "break must appear in recent_breaks history"
     );
 }
+
+// ── pc-ttl-expiry ─────────────────────────────────────────────────────────
+
+/// Build a snapshot at a specific wall-clock offset. `timestamp_secs` is pub,
+/// so we can construct deterministic gaps without sleeping.
+fn snap_at(system: &str, tools: &[Value], model: &str, timestamp_secs: u64) -> PromptStateSnapshot {
+    let mut s = PromptStateSnapshot::capture(system, tools, model, 10_000);
+    s.timestamp_secs = timestamp_secs;
+    s
+}
+
+#[test]
+fn ttl_expiry_classified_when_hashes_match_gap_long_and_cache_read_zero() {
+    let mut det = CacheBreakDetector::new();
+    let tools = vec![tool("bash", "A")];
+    det.record_turn(snap_at("SYS", &tools, "m", 1_000), None);
+
+    // 1 hour + 1 s later, same system / tools / model, but API reports ~0
+    // cache-read tokens. Should classify as TtlExpired.
+    let evt = det
+        .record_turn(snap_at("SYS", &tools, "m", 1_000 + 3_601), Some(0))
+        .expect("TTL-expiry scenario must produce a break event");
+
+    let gap = match evt.reason {
+        CacheBreakReason::TtlExpired { gap_seconds } => gap_seconds,
+        CacheBreakReason::Multiple(ref v) => v
+            .iter()
+            .find_map(|r| match r {
+                CacheBreakReason::TtlExpired { gap_seconds } => Some(*gap_seconds),
+                _ => None,
+            })
+            .expect("Multiple must contain TtlExpired"),
+        other => panic!("expected TtlExpired, got {other:?}"),
+    };
+    assert!(gap > 300, "gap must exceed 5-min threshold, got {gap}");
+    assert!(
+        evt.suggestion.is_some(),
+        "TtlExpired break must carry a remediation suggestion"
+    );
+}
+
+#[test]
+fn no_ttl_break_when_cache_read_tokens_are_healthy() {
+    let mut det = CacheBreakDetector::new();
+    let tools = vec![tool("bash", "A")];
+    det.record_turn(snap_at("SYS", &tools, "m", 0), None);
+
+    // Huge wall-clock gap, but API says cache_read > MIN_CACHE_MISS_TOKENS:
+    // the cache is *actually* still alive — must NOT classify TtlExpired.
+    assert!(
+        det.record_turn(snap_at("SYS", &tools, "m", 100_000), Some(5_000))
+            .is_none(),
+        "healthy cache_read_tokens must suppress TTL classification"
+    );
+}
+
+#[test]
+fn no_ttl_break_when_gap_is_below_five_minutes() {
+    let mut det = CacheBreakDetector::new();
+    let tools = vec![tool("bash", "A")];
+    det.record_turn(snap_at("SYS", &tools, "m", 1_000), None);
+    // 4-minute gap is below the 5-min TTL inference threshold.
+    assert!(
+        det.record_turn(snap_at("SYS", &tools, "m", 1_000 + 240), Some(0))
+            .is_none(),
+        "short gap must not be classified as TTL expiry"
+    );
+}
+
+#[test]
+fn explicit_structural_break_wins_over_ttl_inference() {
+    let mut det = CacheBreakDetector::new();
+    let tools = vec![tool("bash", "A")];
+    det.record_turn(snap_at("SYS A", &tools, "m", 0), None);
+
+    // Long gap AND system prompt changed. The structural reason must be
+    // reported; TTL inference is only a fallback when no other reason fires.
+    let evt = det
+        .record_turn(snap_at("SYS B", &tools, "m", 10_000), Some(0))
+        .expect("system change must produce an event");
+
+    let has_ttl = matches!(evt.reason, CacheBreakReason::TtlExpired { .. })
+        || matches!(&evt.reason, CacheBreakReason::Multiple(v) if v.iter().any(|r| matches!(r, CacheBreakReason::TtlExpired { .. })));
+    assert!(
+        !has_ttl,
+        "TTL inference must not fire when an explicit reason already exists, got {:?}",
+        evt.reason
+    );
+    assert!(matches_system(&evt.reason));
+}
+
+#[test]
+fn ttl_expiry_requires_cache_read_signal_from_api() {
+    // Without the API-provided cache_read_tokens we can't distinguish
+    // "cache still warm" from "cache expired" — the detector must stay
+    // silent rather than guess.
+    let mut det = CacheBreakDetector::new();
+    let tools = vec![tool("bash", "A")];
+    det.record_turn(snap_at("SYS", &tools, "m", 0), None);
+    assert!(
+        det.record_turn(snap_at("SYS", &tools, "m", 10_000), None)
+            .is_none(),
+        "missing cache_read signal must suppress TTL classification"
+    );
+}
