@@ -2409,8 +2409,8 @@ mod state_convergence {
         assert_eq!(graph.domain_for("mo_tables"), Some(DomainHint::Database));
 
         let lib = pl_a.lock().unwrap();
-        let github_suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
-        let db_suggestions = lib.suggest(TaskType::Mutate, Some(DomainHint::Database), 5);
+        let github_suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let db_suggestions = lib.top_patterns(TaskType::Mutate, Some(DomainHint::Database), 5);
         assert!(
             !github_suggestions.is_empty(),
             "should have GitHub patterns"
@@ -3662,7 +3662,7 @@ mod learning_improves_selection {
         merge_into_modules(&snapshot, &eg2, &pl2, &cal2);
 
         let lib = pl2.lock().unwrap();
-        let suggestions = lib.suggest(TaskType::Reasoning, Some(DomainHint::Git), 5);
+        let suggestions = lib.top_patterns(TaskType::Reasoning, Some(DomainHint::Git), 5);
         assert!(
             !suggestions.is_empty(),
             "session 2 should have pattern suggestions from session 1"
@@ -3743,7 +3743,7 @@ mod learning_improves_selection {
         );
 
         let lib = pl2.lock().unwrap();
-        let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
         assert!(
             !suggestions.is_empty(),
             "pattern suggestions survived roundtrip"
@@ -4677,7 +4677,7 @@ mod security_safety_gaps {
         assert!(!pref_keys::LANGUAGE.is_empty());
     }
 
-    /// PROOF: PatternLibrary.suggest() returns relevant patterns.
+    /// PROOF: PatternLibrary.top_patterns() returns relevant patterns.
     ///
     /// OLD: suggest() was only tested, never called in production.
     /// NEW: boost_terms_for() (which calls suggest internally) IS wired
@@ -4694,7 +4694,7 @@ mod security_safety_gaps {
         lib.record_outcome(&tools, TaskType::Code, None, true, 0.9, None);
         lib.record_outcome(&tools, TaskType::Code, None, true, 0.7, None);
 
-        let suggestions = lib.suggest(TaskType::Code, None, 5);
+        let suggestions = lib.top_patterns(TaskType::Code, None, 5);
         assert!(
             !suggestions.is_empty(),
             "should return at least one pattern"

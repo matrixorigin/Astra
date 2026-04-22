@@ -1,23 +1,20 @@
 //! Tool Chain Pattern Library — learns successful tool sequences for reuse.
 //!
 //! Records which tool combinations succeed or fail for each task type and domain,
-//! then suggests the best patterns for similar future queries.
+//! then ranks the best patterns for similar future queries.
 //!
-//! **Note**: The pattern recording and drift signals remain active, but the
-//! L3 adaptive suggestion/exploration layer is being deprecated in favor of
-//! `SelfModel` + LLM reasoning.
+//! **Note**: The L3 adaptive LLM-facing suggestion layer has been retired in favor
+//! of `SelfModel` + LLM reasoning. What remains (`top_patterns`, `boost_terms_for`,
+//! `blocked_tool_names`) are structural internal ranking helpers used by the
+//! TF-IDF router and learned-context prompt summaries — not model-facing
+//! suggestions.
 //!
 //! # Learning flow
 //!
 //! 1. User asks "show me PRs for matrixorigin" → routes to Fetch + GitHub
 //! 2. Agent uses [github_search, github_list_prs] → succeeds (quality 0.9)
 //! 3. Pattern recorded: signature="github_list_prs|github_search", task=Fetch, domain=GitHub
-//! 4. Next similar query → suggest() returns this pattern → boost these tools
-//!
-//! # Exploration
-//!
-//! To prevent pattern drift and discover new tools, `suggest_with_exploration()`
-//! uses epsilon-greedy: 10% chance to include a low-frequency or stale pattern.
+//! 4. Next similar query → `top_patterns()` returns this pattern → boost these tools
 //!
 //! # Integration
 //!
@@ -26,7 +23,7 @@
 //! library.record_outcome(&tools_used, TaskType::Fetch, Some(DomainHint::GitHub), true, 0.9, None);
 //!
 //! // At turn start (Plan):
-//! let suggestions = library.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 3);
+//! let top = library.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 3);
 //! let boost_terms = library.boost_terms_for(TaskType::Fetch, Some(DomainHint::GitHub));
 //! ```
 
@@ -47,8 +44,6 @@ pub enum PatternAction {
 const DECAY_GRACE_DAYS: u64 = 7;
 /// Half-life in days for exponential decay after grace period.
 const DECAY_HALF_LIFE_DAYS: f64 = 30.0;
-/// Probability of including an exploration pattern (epsilon-greedy).
-const EXPLORATION_EPSILON: f64 = 0.1;
 /// Window size for recent outcomes used in drift detection.
 const DRIFT_WINDOW_SIZE: usize = 10;
 /// Drift threshold: if recent success rate drops this much below historical, flag as drifting.
@@ -480,16 +475,17 @@ impl PatternLibrary {
         count
     }
 
-    /// Suggest best patterns for a task type + optional domain filter.
+    /// Top-ranked patterns for a task type + optional domain filter.
     ///
     /// Returns up to `limit` patterns sorted by time-decayed score (descending).
     /// If domain is Some, only returns patterns matching that domain.
     /// Stale patterns are ranked lower even if historically successful.
-    #[deprecated(
-        since = "0.9.0",
-        note = "Superseded by SelfModel + LLM reasoning. Keep pattern recording, but let the model reason over self-awareness instead of precomputed suggestions."
-    )]
-    pub fn suggest(
+    ///
+    /// This is an internal ranking helper used by TF-IDF boost terms,
+    /// learned-context prompt summaries, and task-level tool suggestions.
+    /// It is **not** a model-facing "suggestion" — the LLM reasons over
+    /// the `SelfModel` snapshot instead.
+    pub fn top_patterns(
         &self,
         task_type: TaskType,
         domain: Option<DomainHint>,
@@ -523,86 +519,19 @@ impl PatternLibrary {
         candidates
     }
 
-    /// Suggest patterns with epsilon-greedy exploration.
+    /// Top patterns with forced exploration (for testing).
     ///
-    /// With probability EXPLORATION_EPSILON (10%), includes a low-frequency or
-    /// stale pattern among the suggestions. This helps rediscover tools that
-    /// may have been deprecated due to time decay but are still valuable.
-    ///
-    /// Returns up to `limit` patterns, with the exploration slot (if triggered)
-    /// replacing the last regular suggestion.
-    #[deprecated(
-        since = "0.9.0",
-        note = "Superseded by SelfModel + LLM reasoning. Use self-awareness-driven exploration instead of epsilon-greedy pattern hints."
-    )]
-    pub fn suggest_with_exploration(
-        &self,
-        task_type: TaskType,
-        domain: Option<DomainHint>,
-        limit: usize,
-    ) -> Vec<&ToolChainPattern> {
-        let mut suggestions = self.suggest(task_type, domain, limit);
-
-        // Roll for exploration using timestamp-based pseudo-randomness
-        // Using nanos % 100 gives 0-99, so < 10 is ~10% probability
-        let roll = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() % 100)
-            .unwrap_or(50);
-        let should_explore = (roll as f64) < (EXPLORATION_EPSILON * 100.0);
-
-        if !should_explore || limit == 0 {
-            return suggestions;
-        }
-
-        // Find exploration candidates: patterns not in top suggestions, sorted by staleness
-        let top_sigs: std::collections::HashSet<_> =
-            suggestions.iter().map(|p| &p.signature).collect();
-
-        let keys = match self.type_index.get(&task_type) {
-            Some(keys) => keys,
-            None => return suggestions,
-        };
-
-        let mut exploration_candidates: Vec<&ToolChainPattern> = keys
-            .iter()
-            .filter_map(|k| self.patterns.get(k))
-            .filter(|p| !top_sigs.contains(&p.signature))
-            .filter(|p| match domain {
-                Some(d) => p.domain == Some(d) || p.domain.is_none(),
-                None => true,
-            })
-            .filter(|p| p.success_rate() >= 0.3) // Must have some success history
-            .collect();
-
-        if exploration_candidates.is_empty() {
-            return suggestions;
-        }
-
-        // Sort by staleness (oldest first) to prioritize rediscovery
-        exploration_candidates.sort_by_key(|a| a.last_used_at);
-
-        // Replace last suggestion with exploration pick
-        if suggestions.len() >= limit {
-            suggestions.pop();
-        }
-        suggestions.push(exploration_candidates[0]);
-
-        suggestions
-    }
-
-    /// Suggest patterns with forced exploration (for testing).
-    ///
-    /// Same as `suggest_with_exploration` but always triggers exploration
-    /// if exploration candidates exist.
+    /// Always triggers exploration if exploration candidates exist. Replaces
+    /// the epsilon-greedy `suggest_with_exploration` that was retired along
+    /// with the LLM-facing suggestion layer.
     #[cfg(test)]
-    pub fn suggest_with_forced_exploration(
+    pub fn top_patterns_with_forced_exploration(
         &self,
         task_type: TaskType,
         domain: Option<DomainHint>,
         limit: usize,
     ) -> Vec<&ToolChainPattern> {
-        let mut suggestions = self.suggest(task_type, domain, limit);
+        let mut suggestions = self.top_patterns(task_type, domain, limit);
 
         if limit == 0 {
             return suggestions;
@@ -646,7 +575,7 @@ impl PatternLibrary {
     /// Returns tool names from top patterns (success_rate > 0.5) for use as
     /// TF-IDF boost terms in routing.
     pub fn boost_terms_for(&self, task_type: TaskType, domain: Option<DomainHint>) -> Vec<String> {
-        let suggestions = self.suggest(task_type, domain, 3);
+        let suggestions = self.top_patterns(task_type, domain, 3);
         let mut terms: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -1268,7 +1197,7 @@ mod tests {
             lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
         }
 
-        let fetch_suggestions = lib.suggest(TaskType::Fetch, None, 5);
+        let fetch_suggestions = lib.top_patterns(TaskType::Fetch, None, 5);
         assert_eq!(fetch_suggestions.len(), 1);
         assert!(
             fetch_suggestions[0]
@@ -1276,7 +1205,7 @@ mod tests {
                 .contains(&"github_search".to_string())
         );
 
-        let code_suggestions = lib.suggest(TaskType::Code, None, 5);
+        let code_suggestions = lib.top_patterns(TaskType::Code, None, 5);
         assert_eq!(code_suggestions.len(), 1);
         assert!(code_suggestions[0].tools.contains(&"bash".to_string()));
     }
@@ -1305,11 +1234,11 @@ mod tests {
             );
         }
 
-        let github = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let github = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
         assert_eq!(github.len(), 1);
         assert!(github[0].tools.contains(&"github_api".to_string()));
 
-        let system = lib.suggest(TaskType::Fetch, Some(DomainHint::System), 5);
+        let system = lib.top_patterns(TaskType::Fetch, Some(DomainHint::System), 5);
         assert_eq!(system.len(), 1);
         assert!(system[0].tools.contains(&"bash".to_string()));
     }
@@ -1319,7 +1248,7 @@ mod tests {
         let mut lib = PatternLibrary::new();
         lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.9, None);
         // Only 1 observation → not suggested
-        assert!(lib.suggest(TaskType::Code, None, 5).is_empty());
+        assert!(lib.top_patterns(TaskType::Code, None, 5).is_empty());
     }
 
     #[test]
@@ -1369,7 +1298,7 @@ mod tests {
             );
         }
 
-        let suggestions = lib.suggest(TaskType::Fetch, None, 3);
+        let suggestions = lib.top_patterns(TaskType::Fetch, None, 3);
         assert!(suggestions.len() >= 2);
         // First should be pattern_a (highest score)
         assert!(suggestions[0].score() >= suggestions[1].score());
@@ -1391,14 +1320,14 @@ mod tests {
                 );
             }
         }
-        let suggestions = lib.suggest(TaskType::Code, None, 2);
+        let suggestions = lib.top_patterns(TaskType::Code, None, 2);
         assert_eq!(suggestions.len(), 2);
     }
 
     #[test]
     fn suggest_empty_for_unknown_type() {
         let lib = PatternLibrary::new();
-        assert!(lib.suggest(TaskType::Memory, None, 5).is_empty());
+        assert!(lib.top_patterns(TaskType::Memory, None, 5).is_empty());
     }
 
     // ── Boost terms ──
@@ -1499,7 +1428,7 @@ mod tests {
         lib2.merge(&exported);
         assert_eq!(lib2.len(), 1);
 
-        let suggestions = lib2.suggest(TaskType::Code, None, 5);
+        let suggestions = lib2.top_patterns(TaskType::Code, None, 5);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].success_count, 5);
     }
@@ -1549,7 +1478,7 @@ mod tests {
 
         // Phase 1: No patterns → no suggestions
         assert!(
-            lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 3)
+            lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 3)
                 .is_empty()
         );
 
@@ -1566,7 +1495,7 @@ mod tests {
         }
 
         // Phase 3: Suggestions now available
-        let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 3);
+        let suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 3);
         assert_eq!(suggestions.len(), 1);
         assert!(suggestions[0].score() > 0.8);
         assert_eq!(suggestions[0].tools.len(), 2);
@@ -1990,7 +1919,7 @@ mod tests {
             None,
         );
 
-        let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+        let suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 2);
 
         // Recent pattern should rank higher due to time decay
         if suggestions.len() >= 2 {
@@ -2053,14 +1982,14 @@ mod tests {
         }
 
         // Normal suggest should not include old_tool (decayed score too low)
-        let normal = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+        let normal = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 2);
         let has_old_in_normal = normal
             .iter()
             .any(|p| p.tools.contains(&"old_tool".to_string()));
 
         // Forced exploration should include old_tool
         let explored =
-            lib.suggest_with_forced_exploration(TaskType::Fetch, Some(DomainHint::GitHub), 2);
+            lib.top_patterns_with_forced_exploration(TaskType::Fetch, Some(DomainHint::GitHub), 2);
         let has_old_in_explored = explored
             .iter()
             .any(|p| p.tools.contains(&"old_tool".to_string()));
@@ -2101,7 +2030,7 @@ mod tests {
         }
 
         // Exploration should pick the oldest (old_60)
-        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 1);
+        let explored = lib.top_patterns_with_forced_exploration(TaskType::Fetch, None, 1);
         let picked = explored.iter().find(|p| {
             p.tools.contains(&"old_60".to_string()) || p.tools.contains(&"old_30".to_string())
         });
@@ -2153,11 +2082,11 @@ mod tests {
         }
 
         // Normal suggest returns top 2 by decayed_score (good_a and good_b)
-        let normal = lib.suggest(TaskType::Fetch, None, 2);
+        let normal = lib.top_patterns(TaskType::Fetch, None, 2);
         let has_bad_in_normal = normal.iter().any(|p| p.tools.contains(&"bad".to_string()));
 
         // Forced exploration: bad pattern excluded because success_rate < 0.3
-        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 2);
+        let explored = lib.top_patterns_with_forced_exploration(TaskType::Fetch, None, 2);
         let has_bad_in_explored = explored
             .iter()
             .any(|p| p.tools.contains(&"bad".to_string()));
@@ -2181,8 +2110,8 @@ mod tests {
             lib.record_outcome(&tools(&["only"]), TaskType::Fetch, None, true, 0.9, None);
         }
 
-        let normal = lib.suggest(TaskType::Fetch, None, 2);
-        let explored = lib.suggest_with_forced_exploration(TaskType::Fetch, None, 2);
+        let normal = lib.top_patterns(TaskType::Fetch, None, 2);
+        let explored = lib.top_patterns_with_forced_exploration(TaskType::Fetch, None, 2);
 
         // With no exploration candidates, both should return the same
         assert_eq!(normal.len(), explored.len());

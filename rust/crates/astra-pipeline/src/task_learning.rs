@@ -313,7 +313,7 @@ impl TaskLearningBridge for PipelineTaskLearningBridge {
         // Pattern-based suggestions: find top patterns for this task type
         if let Some(pl) = &self.pattern_library {
             let lib = pl.lock().unwrap_or_else(|e| e.into_inner());
-            let patterns = lib.suggest(tt, domain, 3);
+            let patterns = lib.top_patterns(tt, domain, 3);
             for pattern in patterns {
                 suggestions.extend(pattern.tools.iter().cloned());
             }
