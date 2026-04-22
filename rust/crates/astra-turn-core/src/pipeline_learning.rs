@@ -867,7 +867,7 @@ mod tests {
         }
 
         let l = lib.lock().unwrap();
-        let suggestions = l.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let suggestions = l.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
         assert!(
             !suggestions.is_empty(),
             "pattern library should have learned the tool chain"

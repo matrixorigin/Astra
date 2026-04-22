@@ -992,7 +992,7 @@ mod tests {
 
         // Verify pattern library has patterns from session 1
         let lib = pl2.lock().unwrap();
-        let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
         assert!(!suggestions.is_empty());
 
         // Verify calibrator has data from session 1
