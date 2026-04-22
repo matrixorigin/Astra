@@ -2751,7 +2751,20 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
         "\nPlease implement this change. Read the relevant files first, \
          make the changes, and verify they compile/pass tests.\n\
          Before referencing any project type, function, struct, or API in new code, \
-         confirm it exists using read_file, grep, or LSP tools. Do not assume symbol names.",
+         confirm it exists using read_file, grep, or LSP tools. Do not assume symbol names.\n\
+         \n\
+         IMPORTANT — how to produce code:\n\
+         - Emit actual file mutations as tool_calls: `write_file`, `str_replace`, \
+           `create_file`, or `bash` (for mkdir / scaffolding). DO NOT paste \
+           implementation code inside the assistant response as markdown code blocks \
+           — markdown is inert and does not modify the filesystem.\n\
+         - After writing any new file, confirm it exists (`read_file` or `bash ls`) \
+           before declaring the subtask done.\n\
+         - `skill` and `discover_skills` are advisory: consulting a skill does NOT \
+           satisfy the subtask. The subtask is only complete when concrete files \
+           have been written and any acceptance check passes.\n\
+         - Do not invoke `github_create_pr` (or any PR-creation skill) before you \
+           have actually written and committed the changes this subtask requires.",
     );
 
     prompt

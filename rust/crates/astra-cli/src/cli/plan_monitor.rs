@@ -386,15 +386,31 @@ fn display_plan_updates_live(
                 pct,
                 remaining,
                 elapsed,
+                blocked_ids,
             } => {
                 outcome = PlanMonitorOutcome::Paused;
-                (
-                    format!(
-                        "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
-                        format_duration_short(elapsed),
-                    ),
-                    PostSpinner::None,
-                )
+                // Surface blocked ids when the executor supplies them so the
+                // user can see *which* subtasks are gating progress instead
+                // of just a count. Empty blocked_ids means a Ctrl+C / normal
+                // interrupt pause where the full pending queue is "remaining".
+                let base = format!(
+                    "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
+                    format_duration_short(elapsed),
+                );
+                let msg = if blocked_ids.is_empty() {
+                    base
+                } else {
+                    // Cap to a reasonable number so a 50-subtask deadlock
+                    // doesn't overflow the terminal.
+                    let shown: Vec<String> = blocked_ids.iter().take(8).cloned().collect();
+                    let suffix = if blocked_ids.len() > shown.len() {
+                        format!(" (+{} more)", blocked_ids.len() - shown.len())
+                    } else {
+                        String::new()
+                    };
+                    format!("{base}\n    blocked by: {}{suffix}", shown.join(", "))
+                };
+                (msg, PostSpinner::None)
             }
             PlanUpdate::GlobalVerificationFailed => (
                 "  ⚠ Global verification failed".to_string(),
