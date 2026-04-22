@@ -143,6 +143,15 @@ pub struct TurnRow {
     pub selected_skills: Vec<String>,
     pub tool_calls_ok: u32,
     pub tool_calls_fail: u32,
+    /// Number of short-circuited skill re-entries in this turn (reentry_count ≥ 1).
+    /// Surfaces "model called `skill(X)` again after already loading X" waste.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub skill_reentry_calls: u32,
+    /// Number of skill calls that hit the per-turn hard lockout
+    /// (reentry_count ≥ 3 → BLOCKED). A non-zero value indicates the model
+    /// kept retrying past the STOP directive.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub skill_locked_out_calls: u32,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user_input_preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,6 +269,29 @@ fn tool_call_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u3
     (ok, fail)
 }
 
+/// Count skill re-entry short-circuits in a turn's tool-call record slice.
+/// Returns `(reentry_calls, locked_out_calls)`.
+fn skill_reentry_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u32, u32) {
+    let Some(calls) = calls else {
+        return (0, 0);
+    };
+    let mut reentry = 0u32;
+    let mut locked_out = 0u32;
+    for c in calls {
+        if c.skill_reentry_count.unwrap_or(0) > 0 {
+            reentry += 1;
+        }
+        if c.skill_locked_out == Some(true) {
+            locked_out += 1;
+        }
+    }
+    (reentry, locked_out)
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
     let meta = ev.metadata.as_ref();
     LlmRoundRow {
@@ -346,6 +378,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             JournalEventType::Turn => {
                 seq += 1;
                 let (ok_c, fail_c) = tool_call_counts(ev.tool_calls.as_ref());
+                let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
                 let effective_total = if ok_c + fail_c > 0 {
                     u64::from(ok_c + fail_c)
@@ -425,6 +458,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                         ev.tool_count.unwrap_or(0)
                     },
                     tool_calls_fail: fail_c,
+                    skill_reentry_calls: reentry_c,
+                    skill_locked_out_calls: locked_out_c,
                     user_input_preview,
                     budget_pressure: ev.budget_pressure,
                     llm_rounds: ev.llm_rounds,

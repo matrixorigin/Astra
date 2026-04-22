@@ -28,6 +28,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
+        short_circuit_meta,
     } = intercept_skill_calls(state, &post_send_tool_calls).await;
 
     for result in &skill_results {
@@ -37,12 +38,18 @@ pub(crate) async fn prepare_intercepted_tool_round(
             Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
             None => (None, None),
         };
+        let (skill_reentry_count, skill_locked_out) =
+            match short_circuit_meta.get(&result.tool_call_id) {
+                Some(meta) => (Some(meta.reentry_count), Some(meta.locked_out)),
+                None => (None, None),
+            };
         state.stall.tool_call_records.push(ToolCallRecord {
             name: result.tool_name.clone(),
             ok: !result.result.starts_with("Unknown skill")
                 && !result.result.starts_with("Invalid skill")
                 && !result.result.starts_with("Skipped:")
-                && !result.result.starts_with("Deferred:"),
+                && !result.result.starts_with("Deferred:")
+                && !result.result.starts_with("BLOCKED:"),
             ms: 0,
             error: None,
             input_bytes: None,
@@ -56,6 +63,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             result_full: Some(result.result.clone()),
             round,
             start_offset_ms,
+            skill_reentry_count,
+            skill_locked_out: skill_locked_out.filter(|v| *v),
             ..Default::default()
         });
     }
@@ -206,22 +215,40 @@ async fn intercept_send_message_calls(
 struct SkillInterceptionResult {
     results: Vec<crate::turn::skill_tool::InterceptedToolResult>,
     surgically_removed_ids: HashSet<String>,
+    /// Per-tool-call re-entry metadata for short-circuited skill calls, keyed
+    /// by `tool_call_id`. Callers can use this to stamp journal `ToolCallRecord`
+    /// entries with `skill_reentry_count` / `skill_locked_out`.
+    short_circuit_meta: HashMap<String, SkillShortCircuitMeta>,
+}
+
+/// Metadata about a short-circuited skill call, returned alongside the
+/// synthetic tool result so callers can stamp journal records with the
+/// per-skill re-entry count and lockout flag.
+pub(crate) struct SkillShortCircuitMeta {
+    pub reentry_count: u32,
+    pub locked_out: bool,
 }
 
 /// Short-circuit `skill(name=X)` calls when X has already been loaded this
-/// session. Returns `(dedup_results, fresh_tool_calls)` where dedup_results
-/// are synthetic results to splice back into the round and fresh_tool_calls
-/// is the remaining calls that need real dispatch. Increments a per-skill
-/// `reentry_count` and escalates the short-circuit message to a hard STOP
-/// directive after the second re-entry.
+/// session. Returns `(short_circuits, fresh_tool_calls)` where short_circuits
+/// pair synthetic results with their re-entry metadata and fresh_tool_calls
+/// are the calls needing real dispatch. Escalates:
+///   - reentry 1: passive "already loaded" message.
+///   - reentry 2: STOP directive ("do NOT call `skill` again this turn").
+///   - reentry ≥ 3: hard lockout — BLOCKED result; the skill is now considered
+///     locked out for the remainder of this turn and further calls continue to
+///     receive the BLOCKED response with `locked_out=true`.
 pub(crate) fn dedup_skill_calls(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
 ) -> (
-    Vec<crate::turn::skill_tool::InterceptedToolResult>,
+    Vec<(
+        crate::turn::skill_tool::InterceptedToolResult,
+        SkillShortCircuitMeta,
+    )>,
     Vec<Value>,
 ) {
-    let mut dedup_results = Vec::new();
+    let mut short_circuits = Vec::new();
     let mut fresh_tool_calls = Vec::new();
     for tc in tool_calls {
         if crate::turn::skill_tool::is_skill_call(tc) {
@@ -235,33 +262,49 @@ pub(crate) fn dedup_skill_calls(
                     .filter(|s| !s.is_empty())
                     .unwrap_or("unknown");
                 prev.reentry_count = prev.reentry_count.saturating_add(1);
-                let message = if prev.reentry_count >= 2 {
+                let reentry = prev.reentry_count;
+                let invoked_at = prev.invoked_at_turn;
+                let locked_out = reentry >= 3;
+                let message = if locked_out {
+                    format!(
+                        "BLOCKED: Skill '{}' is locked out for this turn after {} re-entries. \
+                         This call was NOT executed. Produce your final answer now using the \
+                         instructions already loaded (turn {}).",
+                        name, reentry, invoked_at,
+                    )
+                } else if reentry >= 2 {
                     format!(
                         "STOP: Skill '{}' is already loaded (turn {}, reentry={}). \
                          You have called `skill` with this name {} times. \
                          Do NOT call `skill` again for the remainder of this turn. \
                          Respond to the user directly from the evidence you already have.",
-                        name, prev.invoked_at_turn, prev.reentry_count, prev.reentry_count,
+                        name, invoked_at, reentry, reentry,
                     )
                 } else {
                     format!(
                         "Skill '{}' was already loaded (turn {}). \
                          Follow those instructions directly — do not re-invoke.",
-                        name, prev.invoked_at_turn
+                        name, invoked_at
                     )
                 };
-                dedup_results.push(crate::turn::skill_tool::InterceptedToolResult {
-                    tool_call_id: call_id.to_string(),
-                    tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
-                    result: message,
-                    verification_summary: None,
-                });
+                short_circuits.push((
+                    crate::turn::skill_tool::InterceptedToolResult {
+                        tool_call_id: call_id.to_string(),
+                        tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
+                        result: message,
+                        verification_summary: None,
+                    },
+                    SkillShortCircuitMeta {
+                        reentry_count: reentry,
+                        locked_out,
+                    },
+                ));
                 continue;
             }
         }
         fresh_tool_calls.push(tc.clone());
     }
-    (dedup_results, fresh_tool_calls)
+    (short_circuits, fresh_tool_calls)
 }
 
 async fn intercept_skill_calls(
@@ -272,6 +315,7 @@ async fn intercept_skill_calls(
         return SkillInterceptionResult {
             results: Vec::new(),
             surgically_removed_ids: HashSet::new(),
+            short_circuit_meta: HashMap::new(),
         };
     };
 
@@ -289,7 +333,13 @@ async fn intercept_skill_calls(
     );
     let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
 
-    let (dedup_results, fresh_tool_calls) = dedup_skill_calls(state, tool_calls);
+    let (dedup_pairs, fresh_tool_calls) = dedup_skill_calls(state, tool_calls);
+    let mut short_circuit_meta: HashMap<String, SkillShortCircuitMeta> = HashMap::new();
+    let mut dedup_results = Vec::with_capacity(dedup_pairs.len());
+    for (res, meta) in dedup_pairs {
+        short_circuit_meta.insert(res.tool_call_id.clone(), meta);
+        dedup_results.push(res);
+    }
 
     let (sr, remaining, activation) =
         crate::turn::skill_tool::partition_discover_and_execute_skills(
@@ -424,6 +474,7 @@ async fn intercept_skill_calls(
     SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
+        short_circuit_meta,
     }
 }
 
@@ -781,44 +832,64 @@ mod tests {
         };
 
         // 1st re-entry: passive wording.
-        let (dedup, fresh) = {
-            let (d, f) = super::dedup_skill_calls(&mut state, &[make_call("c1")]);
-            (d, f)
-        };
+        let (dedup, fresh) = super::dedup_skill_calls(&mut state, &[make_call("c1")]);
         assert!(
             fresh.is_empty(),
             "repeat skill call should be short-circuited"
         );
         assert_eq!(dedup.len(), 1);
+        let (res1, meta1) = &dedup[0];
         assert!(
-            dedup[0].result.contains("was already loaded"),
+            res1.result.contains("was already loaded"),
             "first re-entry uses passive wording, got: {}",
-            dedup[0].result
+            res1.result
         );
         assert!(
-            !dedup[0].result.starts_with("STOP"),
+            !res1.result.starts_with("STOP"),
             "first re-entry must not be STOP-level yet"
         );
+        assert_eq!(meta1.reentry_count, 1);
+        assert!(!meta1.locked_out);
         assert_eq!(state.skills.invoked["review-changes"].reentry_count, 1);
 
         // 2nd re-entry: escalates to STOP.
         let (dedup2, _) = super::dedup_skill_calls(&mut state, &[make_call("c2")]);
         assert_eq!(dedup2.len(), 1);
+        let (res2, meta2) = &dedup2[0];
         assert!(
-            dedup2[0].result.starts_with("STOP:"),
+            res2.result.starts_with("STOP:"),
             "second re-entry should escalate to STOP, got: {}",
-            dedup2[0].result
+            res2.result
         );
         assert!(
-            dedup2[0].result.contains("Do NOT call `skill` again"),
+            res2.result.contains("Do NOT call `skill` again"),
             "STOP message should be directive, got: {}",
-            dedup2[0].result
+            res2.result
+        );
+        assert_eq!(meta2.reentry_count, 2);
+        assert!(
+            !meta2.locked_out,
+            "reentry=2 is STOP but not yet locked out"
         );
         assert_eq!(state.skills.invoked["review-changes"].reentry_count, 2);
 
-        // 3rd re-entry: remains STOP-level.
+        // 3rd re-entry: hard lockout — BLOCKED + locked_out=true.
         let (dedup3, _) = super::dedup_skill_calls(&mut state, &[make_call("c3")]);
-        assert!(dedup3[0].result.starts_with("STOP:"));
+        let (res3, meta3) = &dedup3[0];
+        assert!(
+            res3.result.starts_with("BLOCKED:"),
+            "third re-entry should hit BLOCKED lockout, got: {}",
+            res3.result
+        );
+        assert!(meta3.locked_out);
+        assert_eq!(meta3.reentry_count, 3);
         assert_eq!(state.skills.invoked["review-changes"].reentry_count, 3);
+
+        // 4th re-entry: still BLOCKED, counter keeps climbing.
+        let (dedup4, _) = super::dedup_skill_calls(&mut state, &[make_call("c4")]);
+        let (res4, meta4) = &dedup4[0];
+        assert!(res4.result.starts_with("BLOCKED:"));
+        assert!(meta4.locked_out);
+        assert_eq!(meta4.reentry_count, 4);
     }
 }

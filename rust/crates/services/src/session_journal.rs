@@ -520,6 +520,17 @@ pub struct ToolCallRecord {
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_full: Option<String>,
+    /// When set, this record represents a short-circuited `skill(name=X)`
+    /// re-invocation. The value is the re-entry index (1 = first repeat call,
+    /// 2 = second, ...). Surfaces skill-loop inefficiencies in journal digests
+    /// without needing to grep `result_preview`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_reentry_count: Option<u32>,
+    /// When `true`, this short-circuited skill call was blocked by the per-turn
+    /// re-entry lockout (reentry_count ≥ 3). The executor refused to even
+    /// produce a follow-the-instructions stub and returned a BLOCKED result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_locked_out: Option<bool>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
