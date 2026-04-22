@@ -259,11 +259,56 @@ fn print_lsp_status_report(parsed: &serde_json::Value) {
     eprintln!();
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ReviewGitTarget<'a> {
     Head,
     WorkingTree,
+    /// Most recent N commits (e.g. "latest 2 commits", "last 3", "HEAD~3").
+    LastN(u32),
+    /// Arbitrary two-rev range (e.g. "main..HEAD", "v1.0..v1.1").
+    Range(&'a str),
     Rev(&'a str),
+}
+
+/// Match `latest N commits?` / `last N commits?` / `last-N` / `lastN`.
+fn parse_last_n_phrase(lower: &str) -> Option<u32> {
+    let s = lower.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // "HEAD~N" (no range).
+    if let Some(rest) = s.strip_prefix("head~") {
+        if !rest.contains("..")
+            && let Ok(n) = rest.parse::<u32>()
+            && n >= 1
+        {
+            return Some(n);
+        }
+    }
+    // "last-7" / "latest-3" style.
+    for prefix in ["last-", "latest-"] {
+        if let Some(rest) = s.strip_prefix(prefix)
+            && let Ok(n) = rest.parse::<u32>()
+            && n >= 1
+        {
+            return Some(n);
+        }
+    }
+    let mut parts = s.split_whitespace();
+    let kw = parts.next()?;
+    if !matches!(kw, "last" | "latest") {
+        return None;
+    }
+    let num = parts.next()?;
+    let n: u32 = num.parse().ok()?;
+    if n < 1 {
+        return None;
+    }
+    match parts.next() {
+        None => Some(n),
+        Some(word) if matches!(word, "commit" | "commits") && parts.next().is_none() => Some(n),
+        _ => None,
+    }
 }
 
 fn parse_review_git_target(arg: &str) -> ReviewGitTarget<'_> {
@@ -271,13 +316,27 @@ fn parse_review_git_target(arg: &str) -> ReviewGitTarget<'_> {
     if a.is_empty() {
         return ReviewGitTarget::Head;
     }
-    match a.to_ascii_lowercase().as_str() {
+    let lower = a.to_ascii_lowercase();
+    match lower.as_str() {
         "latest" | "latest commit" | "last" | "last commit" | "head" | "head commit" | "tip"
-        | "current commit" => ReviewGitTarget::Head,
+        | "current commit" => return ReviewGitTarget::Head,
         "working" | "working tree" | "worktree" | "working-tree" | "local" | "local changes"
-        | "dirty" | "wt" => ReviewGitTarget::WorkingTree,
-        _ => ReviewGitTarget::Rev(a),
+        | "dirty" | "wt" => return ReviewGitTarget::WorkingTree,
+        _ => {}
     }
+    if let Some(n) = parse_last_n_phrase(&lower) {
+        return ReviewGitTarget::LastN(n);
+    }
+    // Only treat as a range if both sides resolve to non-empty refs.
+    if let Some((l, r)) = a.split_once("..")
+        && !l.trim().is_empty()
+        && !r.trim().is_empty()
+        && !l.contains(char::is_whitespace)
+        && !r.contains(char::is_whitespace)
+    {
+        return ReviewGitTarget::Range(a);
+    }
+    ReviewGitTarget::Rev(a)
 }
 
 async fn prefetch_review_context(
@@ -288,6 +347,10 @@ async fn prefetch_review_context(
         ReviewGitTarget::Head => crate::context_prefetch::CodeReviewPrefetchTarget::Head,
         ReviewGitTarget::WorkingTree => {
             crate::context_prefetch::CodeReviewPrefetchTarget::WorkingTree
+        }
+        ReviewGitTarget::LastN(n) => crate::context_prefetch::CodeReviewPrefetchTarget::LastN(n),
+        ReviewGitTarget::Range(r) => {
+            crate::context_prefetch::CodeReviewPrefetchTarget::Range(r.to_string())
         }
         ReviewGitTarget::Rev(rev) => {
             crate::context_prefetch::CodeReviewPrefetchTarget::Rev(rev.to_string())
@@ -415,6 +478,8 @@ fn build_review_prompt(arg: &str) -> String {
     let target_line = match parse_review_git_target(arg) {
         ReviewGitTarget::Head => "HEAD".to_string(),
         ReviewGitTarget::WorkingTree => "WORKING_TREE".to_string(),
+        ReviewGitTarget::LastN(n) => format!("HEAD~{n}..HEAD (last {n} commits)"),
+        ReviewGitTarget::Range(r) => r.to_string(),
         ReviewGitTarget::Rev(r) => r.to_string(),
     };
     format!(
@@ -2447,6 +2512,84 @@ mod tests {
             parse_review_git_target("abc123"),
             ReviewGitTarget::Rev("abc123")
         );
+    }
+
+    #[test]
+    fn parse_review_git_target_recognizes_multi_commit() {
+        use super::{ReviewGitTarget, parse_review_git_target};
+        assert_eq!(
+            parse_review_git_target("latest 2 commits"),
+            ReviewGitTarget::LastN(2)
+        );
+        assert_eq!(
+            parse_review_git_target("last 3 commits"),
+            ReviewGitTarget::LastN(3)
+        );
+        assert_eq!(parse_review_git_target("Last 5"), ReviewGitTarget::LastN(5));
+        assert_eq!(parse_review_git_target("last-7"), ReviewGitTarget::LastN(7));
+        assert_eq!(parse_review_git_target("HEAD~4"), ReviewGitTarget::LastN(4));
+        assert_eq!(
+            parse_review_git_target("main..HEAD"),
+            ReviewGitTarget::Range("main..HEAD")
+        );
+        assert_eq!(
+            parse_review_git_target("v1.0..v1.1"),
+            ReviewGitTarget::Range("v1.0..v1.1")
+        );
+        // Bogus phrasing must still fall through to Rev, not silently match.
+        assert_eq!(
+            parse_review_git_target("latest wibble"),
+            ReviewGitTarget::Rev("latest wibble")
+        );
+    }
+
+    #[test]
+    fn build_review_prompt_describes_multi_commit_range() {
+        let prompt = super::build_review_prompt("latest 2 commits");
+        assert!(prompt.contains("HEAD~2..HEAD"));
+        assert!(prompt.contains("last 2 commits"));
+    }
+
+    #[tokio::test]
+    async fn prefetch_review_context_supports_last_n_commits() {
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.name", "Multi Review"]);
+        run_git(root, &["config", "user.email", "multi@test.local"]);
+        std::fs::write(root.join("a.txt"), "one\n").expect("write");
+        run_git(root, &["add", "a.txt"]);
+        run_git(root, &["commit", "-m", "commit one"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("write");
+        run_git(root, &["commit", "-am", "commit two"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("write");
+        run_git(root, &["commit", "-am", "commit three"]);
+
+        let ctx = super::prefetch_review_context("latest 2 commits", root)
+            .await
+            .expect("multi-commit prefetch should exist");
+        assert_eq!(ctx.task_type, "code_review");
+        assert!(ctx.body.contains("Latest 2 Commits"));
+        assert!(ctx.body.contains("HEAD~2..HEAD"));
+        assert!(ctx.body.contains("commit two"));
+        assert!(ctx.body.contains("commit three"));
+        // `commit one` is the base of HEAD~2..HEAD, so it must NOT leak into
+        // the per-commit list.
+        assert!(!ctx.body.contains("commit one"));
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub(crate) enum CodeReviewPrefetchTarget {
     Head,
     WorkingTree,
     Rev(String),
+    /// Most recent N commits (rendered as `HEAD~N..HEAD`).
+    LastN(u32),
+    /// Arbitrary two-rev range like `main..HEAD` or `v1..v2`.
+    Range(String),
     BranchDiff,
 }
 
@@ -94,6 +98,8 @@ pub(crate) async fn prefetch_context_for_code_review_target(
         CodeReviewPrefetchTarget::Rev(rev) => {
             prefetch_commit_review_ref(&rev, None, project_root).await
         }
+        CodeReviewPrefetchTarget::LastN(n) => prefetch_recent_commits(n, project_root).await,
+        CodeReviewPrefetchTarget::Range(range) => prefetch_rev_range(&range, project_root).await,
         CodeReviewPrefetchTarget::BranchDiff => prefetch_branch_diff(project_root).await,
     }?;
 
@@ -113,7 +119,11 @@ pub fn inject_prefetched_context(messages: &mut [Value], ctx: &PrefetchedContext
             "\
             The complete git context is provided below. You already have the full diff — \
             review it directly without calling git tools or the skill tool. \
-            Only use read_file if you need to see surrounding code not in the diff."
+            Do NOT call skill (including `review-changes`): the review budget is \
+            already enforced by the host. \
+            Use read_file at most 3 times, only to verify a specific finding \
+            (with outline=true or a small line range), never to read whole files. \
+            Output findings + a verdict; stop after one pass."
         }
         "exploration" => {
             "\
@@ -153,6 +163,8 @@ async fn prefetch_code_review_context(message: &str, project_root: &Path) -> Opt
     let lower = message.to_lowercase();
     let target = if let Some(hash) = extract_commit_hash(message) {
         CodeReviewPrefetchTarget::Rev(hash)
+    } else if let Some(n) = extract_last_n_from_message(&lower) {
+        CodeReviewPrefetchTarget::LastN(n)
     } else if mentions_commit(&lower) {
         CodeReviewPrefetchTarget::Head
     } else if mentions_pr(&lower) {
@@ -228,6 +240,100 @@ async fn prefetch_commit_review_ref(
     ctx.push_str("```\n\n## Changed Files\n\n```\n");
     ctx.push_str(&stat);
     ctx.push_str("```\n\n## Full Diff\n\n```diff\n");
+    ctx.push_str(&diff);
+    ctx.push_str("\n```\n");
+
+    Some(ctx)
+}
+
+/// Pre-fetch the last N commits as a unified review context
+/// (per-commit summary + aggregate diff across `HEAD~N..HEAD`).
+async fn prefetch_recent_commits(n: u32, project_root: &Path) -> Option<String> {
+    if n == 0 || !is_git_repo(project_root).await {
+        return None;
+    }
+    let n_str = n.to_string();
+    let range = format!("HEAD~{n}..HEAD");
+
+    // Per-commit one-liners.
+    let oneline = run_git(
+        project_root,
+        &[
+            "log",
+            "-n",
+            &n_str,
+            "--pretty=format:%h %ad %s",
+            "--date=short",
+        ],
+        MAX_LOG_BYTES,
+    )
+    .await?;
+
+    // Per-commit metadata (hash / author / date / subject / body).
+    let full = run_git(
+        project_root,
+        &[
+            "log",
+            "-n",
+            &n_str,
+            "--pretty=format:--- commit ---%n%H%n%an <%ae>%n%ai%n%s%n%n%b",
+        ],
+        MAX_LOG_BYTES.saturating_mul(2),
+    )
+    .await
+    .unwrap_or_default();
+
+    let stat = run_git(project_root, &["diff", "--stat", &range], MAX_LOG_BYTES)
+        .await
+        .unwrap_or_default();
+
+    let diff = run_git(project_root, &["diff", &range], MAX_DIFF_BYTES).await?;
+
+    let mut ctx = String::with_capacity(oneline.len() + full.len() + stat.len() + diff.len() + 400);
+    ctx.push_str(&format!(
+        "## Latest {n} Commits ({range})\n\n### Commits\n\n```\n"
+    ));
+    ctx.push_str(&oneline);
+    if !oneline.ends_with('\n') {
+        ctx.push('\n');
+    }
+    ctx.push_str("```\n\n### Commit Details\n\n```\n");
+    ctx.push_str(&full);
+    ctx.push_str("\n```\n\n### Changed Files\n\n```\n");
+    ctx.push_str(&stat);
+    ctx.push_str("```\n\n### Full Diff\n\n```diff\n");
+    ctx.push_str(&diff);
+    ctx.push_str("\n```\n");
+
+    Some(ctx)
+}
+
+/// Pre-fetch a two-rev range like `main..HEAD` or `v1..v2` as review context.
+async fn prefetch_rev_range(range: &str, project_root: &Path) -> Option<String> {
+    if !is_git_repo(project_root).await {
+        return None;
+    }
+    // Sanity check: git must resolve this range before we inject anything.
+    let oneline = run_git(project_root, &["log", "--oneline", range], MAX_LOG_BYTES).await?;
+    if oneline.trim().is_empty() {
+        return None;
+    }
+
+    let stat = run_git(project_root, &["diff", "--stat", range], MAX_LOG_BYTES)
+        .await
+        .unwrap_or_default();
+
+    let diff = run_git(project_root, &["diff", range], MAX_DIFF_BYTES).await?;
+
+    let mut ctx = String::with_capacity(oneline.len() + stat.len() + diff.len() + 300);
+    ctx.push_str(&format!("## Range Diff ({range})\n\n### Commits\n\n```\n"));
+    ctx.push_str(&oneline);
+    if !oneline.ends_with('\n') {
+        ctx.push('\n');
+    }
+    ctx.push_str("```\n\n### Changed Files\n\n```\n");
+    ctx.push_str(&stat);
+    ctx.push_str("```\n\n### Full Diff\n\n```diff\n");
     ctx.push_str(&diff);
     ctx.push_str("\n```\n");
 
@@ -681,6 +787,33 @@ fn mentions_local_changes(lower: &str) -> bool {
         || lower.contains("本地")
 }
 
+/// Detect "last/latest N commits" / "HEAD~N" phrasing for multi-commit review.
+fn extract_last_n_from_message(lower: &str) -> Option<u32> {
+    // "HEAD~N" standalone (don't swallow "HEAD~N..HEAD").
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '~' && c != '.') {
+        if let Some(rest) = token.strip_prefix("head~")
+            && !rest.contains("..")
+            && let Ok(n) = rest.parse::<u32>()
+            && n >= 1
+        {
+            return Some(n);
+        }
+    }
+    // "last N commits" / "latest N commits" / "last N"
+    let mut iter = lower.split_whitespace().peekable();
+    while let Some(w) = iter.next() {
+        if matches!(w, "last" | "latest" | "最近" | "最新") {
+            if let Some(num_tok) = iter.peek()
+                && let Ok(n) = num_tok.parse::<u32>()
+                && n >= 1
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1149,22 @@ mod tests {
         assert!(mentions_local_changes("review my changes"));
         assert!(mentions_local_changes("看看本地改动"));
         assert!(!mentions_local_changes("review the commit"));
+    }
+
+    #[test]
+    fn extract_last_n_handles_common_phrasing() {
+        assert_eq!(
+            extract_last_n_from_message("review latest 2 commits"),
+            Some(2)
+        );
+        assert_eq!(
+            extract_last_n_from_message("last 3 commits please"),
+            Some(3)
+        );
+        assert_eq!(extract_last_n_from_message("check head~5"), Some(5));
+        assert_eq!(extract_last_n_from_message("最新 2 提交"), Some(2));
+        assert_eq!(extract_last_n_from_message("review latest commit"), None);
+        assert_eq!(extract_last_n_from_message("review the commit"), None);
     }
 
     // ─── Helpers ─────────────────────────────────────────────────
