@@ -50,6 +50,23 @@ const EXPLORATION_TOOLS: &[&str] = &[
     "symbols",
 ];
 
+/// Tools that NEVER mutate the filesystem — they are purely consultative.
+/// A stream of repeated calls to these, without any interleaved mutating tool
+/// (`write_file`, `str_replace`, `create_file`, bash-with-side-effects, etc.),
+/// is diagnostic of an agent narrating implementation as prose instead of
+/// emitting real edits (observed in session 26f73ee4 where 12 `skill` calls
+/// produced 0 write_file/str_replace calls across an entire plan).
+///
+/// We keep this LIST SEPARATE from `EXPLORATION_TOOLS` because the two signals
+/// serve different detectors:
+///   * `EXPLORATION_TOOLS` drives single-round "all-exploration chain"
+///     detection (reward-hacking guard). Adding `skill` there would
+///     over-aggressively hard-block deferred follow-ups like `read_file`
+///     after a productive skill consultation — a legitimate pattern.
+///   * `CONSULTATIVE_TOOLS` drives the multi-round top-tool diagnostic below,
+///     where repetition across ≥3 rounds is the actual anti-pattern.
+const CONSULTATIVE_TOOLS: &[&str] = &["skill", "discover_skills"];
+
 /// Maximum consecutive exploration-only rounds before triggering correction.
 /// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
 /// read) and EdgeToolCache dedup, agents need fewer exploration rounds.
@@ -630,7 +647,13 @@ pub fn build_stall_reflection(
 }
 
 fn is_exploration_tool(name: &str) -> bool {
-    EXPLORATION_TOOLS.contains(&name)
+    // For the top-tool diagnostic in `build_stall_reflection`, treat
+    // consultative tools (skill/discover_skills) as exploration too so that
+    // an agent repeatedly calling `skill` without writing files triggers the
+    // same "stop exploring, take direct action" nudge that repeat `grep` /
+    // `read_file` triggers. This is scoped to the top-tool diagnostic and
+    // does NOT affect single-round reward-hacking chain classification.
+    EXPLORATION_TOOLS.contains(&name) || CONSULTATIVE_TOOLS.contains(&name)
 }
 
 /// Detect if the LLM ignored a previous stall nudge by using tools
@@ -1267,6 +1290,48 @@ mod tests {
         let r1 = build_stall_reflection(&sigs, &[], 1);
         // Second nudge should have lower confidence (escalation)
         assert!(r1.confidence <= r0.confidence);
+    }
+
+    /// Regression (2026-04-23, session 26f73ee4): three consecutive rounds
+    /// of `skill` calls with zero file mutations must trigger the
+    /// "exploration stall" diagnostic just like three `bash` / `grep` rounds
+    /// do. Before adding `skill`/`discover_skills` to the consultative
+    /// classifier, an agent could consult skills forever while narrating
+    /// implementation as markdown code blocks without ever tripping the
+    /// stall detector.
+    #[test]
+    fn reflection_triggers_on_skill_obsession() {
+        let sigs = make_sigs(&[&["skill"], &["skill"], &["skill"]]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(
+            reflection.what_happened.contains("skill"),
+            "expected 'skill' in diagnosis, got: {}",
+            reflection.what_happened
+        );
+        assert!(
+            reflection.confidence >= 0.7,
+            "skill-obsession must be classified as high-confidence \
+             exploration stall, got {}",
+            reflection.confidence
+        );
+        assert!(
+            reflection.avoid_tools.contains(&"skill".to_string()),
+            "avoid_tools should include `skill`, got: {:?}",
+            reflection.avoid_tools
+        );
+    }
+
+    /// `discover_skills` is the other consultative tool — same contract.
+    #[test]
+    fn reflection_triggers_on_discover_skills_loop() {
+        let sigs = make_sigs(&[
+            &["discover_skills"],
+            &["discover_skills"],
+            &["discover_skills"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(reflection.what_happened.contains("discover_skills"));
+        assert!(reflection.confidence >= 0.7);
     }
 
     #[test]
