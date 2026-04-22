@@ -12,6 +12,7 @@ use crate::prompts;
 use crate::skill_instructions;
 use crate::slash_team;
 use astra_runtime::plan_decompose;
+use astra_runtime::tool_registry;
 use astra_services::session_journal;
 
 /// Verbosity level for explain mode.
@@ -136,6 +137,10 @@ pub(crate) struct ReplState {
     pub tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
     pub synced_tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    /// Cross-session quality tracker shared with the tool selector so REPL
+    /// save path can export cumulative per-tool selection/quality counters.
+    pub tool_quality_tracker:
+        Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
     pub chat_plan_only: bool,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
@@ -369,6 +374,7 @@ impl Default for ReplState {
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
+            tool_quality_tracker: None,
             chat_plan_only: false,
             plan_mode: None,
             executing_plan: None,

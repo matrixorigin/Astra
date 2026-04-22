@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use astra_evolution::persistence::{self, LearningSnapshot, ToolHealthEntry};
+use astra_evolution::persistence::{
+    self, LearningSnapshot, ToolHealthEntry, ToolQualityPersistEntry,
+};
 use astra_pipeline::calibration::ProgressiveCalibrator;
 use astra_pipeline::entity::EntityGraph;
 use astra_pipeline::pattern::PatternLibrary;
@@ -70,6 +72,7 @@ impl LearningAdapter {
             + snapshot.patterns.len() as u32
             + if snapshot.calibration.is_some() { 1 } else { 0 }
             + snapshot.tool_health.len() as u32
+            + snapshot.tool_quality.len() as u32
     }
 }
 
@@ -250,6 +253,33 @@ impl DomainAdapter for LearningAdapter {
             }
         }
 
+        // Tool-quality entries are cumulative counters. Merging across devices
+        // should sum observations so neither side loses signal. If the same
+        // tool is present on both, pick the larger counters per field (max
+        // rather than sum) to avoid double-counting when both devices shared
+        // a common ancestor snapshot that was already merged previously.
+        let mut quality_map: std::collections::HashMap<String, ToolQualityPersistEntry> =
+            remote_snap
+                .tool_quality
+                .into_iter()
+                .map(|q| (q.name.clone(), q))
+                .collect();
+        for local_q in local_snap.tool_quality.drain(..) {
+            match quality_map.get_mut(&local_q.name) {
+                Some(existing) => {
+                    existing.entry.selections =
+                        existing.entry.selections.max(local_q.entry.selections);
+                    existing.entry.uses = existing.entry.uses.max(local_q.entry.uses);
+                    if local_q.entry.quality_sum > existing.entry.quality_sum {
+                        existing.entry.quality_sum = local_q.entry.quality_sum;
+                    }
+                }
+                None => {
+                    quality_map.insert(local_q.name.clone(), local_q);
+                }
+            }
+        }
+
         let merged = LearningSnapshot {
             version: 1,
             snapshot_epoch: std::time::SystemTime::now()
@@ -260,6 +290,7 @@ impl DomainAdapter for LearningAdapter {
             patterns: merged_patterns,
             calibration: remote_snap.calibration.or(local_snap.calibration),
             tool_health: health_map.into_values().collect(),
+            tool_quality: quality_map.into_values().collect(),
             // Active canaries are runtime-local rollback state. Keep them in the
             // local learning snapshot for restart recovery, but never merge or
             // sync them across devices.
@@ -1275,6 +1306,7 @@ mod tests {
                 last_updated_epoch: 200,
                 recent_outcomes: vec![],
             }],
+            tool_quality: Vec::new(),
             active_canary: None,
         };
         let data = serde_json::to_vec(&remote_snapshot).unwrap();

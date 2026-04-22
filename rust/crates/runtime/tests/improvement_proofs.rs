@@ -5558,6 +5558,7 @@ mod hardening_proofs {
                     recent_outcomes: vec![],
                 },
             ],
+            tool_quality: Vec::new(),
             active_canary: None,
         };
         save_snapshot_to(&path, &snapshot).unwrap();

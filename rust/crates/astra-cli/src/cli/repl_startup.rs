@@ -131,10 +131,28 @@ pub(crate) async fn complete_repl_startup(
     }
     tracer.phase("config_load");
 
-    // Session-scoped quality tracker: tools that work well get boosted over time
-    let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
-        tool_registry::ToolQualityTracker::new(),
-    ));
+    // Session-scoped quality tracker: tools that work well get boosted over time.
+    // Seed from prior session snapshot (if any) so boost factors don't reset.
+    let profile_name_for_quality = profile.unwrap_or("default");
+    let persisted_quality =
+        astra_runtime::pipeline::persistence::load_tool_quality(profile_name_for_quality);
+    let quality_tracker = {
+        let mut tracker = tool_registry::ToolQualityTracker::new();
+        if !persisted_quality.is_empty() {
+            tracker.merge(&persisted_quality);
+            eprintln!(
+                "{}",
+                format!(
+                    "  ✓ Restored tool quality ({} tools tracked)",
+                    persisted_quality.len()
+                )
+                .dim()
+            );
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(tracker))
+    };
+    let quality_tracker_for_save = quality_tracker.clone();
+    state.tool_quality_tracker = Some(quality_tracker_for_save);
     // Session-scoped confidence calibrator: thresholds adapt to correction rates
     let confidence_calibrator =
         std::sync::Arc::new(astra_runtime::turn::routing_metrics::ConfidenceCalibrator::default());
