@@ -150,6 +150,10 @@ pub struct InvokedSkill {
     pub content: String,
     /// Turn number when the skill was first invoked.
     pub invoked_at_turn: u32,
+    /// Number of times the model re-invoked this skill after the initial load.
+    /// Used to escalate the short-circuit message so repeated re-entry is
+    /// treated as a hard stop signal, not a passive dedup.
+    pub reentry_count: u32,
 }
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
@@ -2283,6 +2287,7 @@ mod tests {
                 name: "review-changes".into(),
                 content: "# Skill: review-changes".into(),
                 invoked_at_turn: 1,
+                reentry_count: 0,
             },
         )]);
 
@@ -2330,6 +2335,7 @@ mod tests {
                     name: "review-changes".into(),
                     content: "# Skill: review-changes".into(),
                     invoked_at_turn: 1,
+                    reentry_count: 0,
                 },
             ),
             (
@@ -2338,6 +2344,7 @@ mod tests {
                     name: "analyze-session".into(),
                     content: "# Skill: analyze-session".into(),
                     invoked_at_turn: 1,
+                    reentry_count: 0,
                 },
             ),
         ]);

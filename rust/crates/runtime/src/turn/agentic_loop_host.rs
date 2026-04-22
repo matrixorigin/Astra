@@ -2966,6 +2966,7 @@ pub(crate) mod tests {
                 name: "review-changes".into(),
                 content: "# Review\nDo a code review.".into(),
                 invoked_at_turn: 2,
+                reentry_count: 0,
             },
         );
 
