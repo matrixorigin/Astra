@@ -266,13 +266,8 @@ struct CliSseStreamHost<'a> {
     /// ends, results are harvested and merged so normal permission checks
     /// and journal/observability events still fire exactly once in the
     /// batch phase.
-    ///
-    /// NOTE: The actual background executor requires an `Arc<ToolExecutor>`;
-    /// the current host holds `&'a mut ToolExecutor` so the constructor of
-    /// this field is deferred (see Commit C in feat/self-model-parallel-batch-2026-04-21).
-    /// Infrastructure (trait hook, env gate, should_speculate) is in place
-    /// and exercised by tests at the sse_stream_host layer.
-    streaming_speculation_enabled: bool,
+    streaming_tool_exec:
+        Option<std::sync::Arc<astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor>>,
 }
 
 #[derive(Clone, Debug)]
@@ -347,6 +342,7 @@ impl<'a> CliSseStreamHost<'a> {
         // The thinking spinner and tool status lines still stream normally,
         // so the terminal is never blank during generation.
         let buffer_from_start = true;
+        let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -368,8 +364,7 @@ impl<'a> CliSseStreamHost<'a> {
             turn_rollback_boundary_emitted: false,
             turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
-            streaming_speculation_enabled:
-                astra_runtime::turn::streaming_tool_exec::streaming_tool_exec_enabled(),
+            streaming_tool_exec,
         }
     }
 
@@ -1444,6 +1439,32 @@ fn could_become_thinking_tag(partial: &str) -> bool {
         .any(|p| p.starts_with(partial) || partial.starts_with(p))
 }
 
+impl CliSseStreamHost<'_> {
+    /// D-9: Harvest speculative results for the upcoming concurrent batch.
+    ///
+    /// `wait_all()` is used so in-flight speculations finish before the
+    /// merge; the overall latency is still bounded by the stream itself
+    /// (the stream has already finished by the time this runs). Results
+    /// keyed by request_id are returned so the join_all closure can
+    /// short-circuit matching requests without re-executing.
+    async fn harvest_speculation_for_batch(
+        &self,
+        conc_reqs: &[(usize, &ToolBatchRequest)],
+    ) -> std::collections::HashMap<String, (String, bool)> {
+        let Some(exec) = self.streaming_tool_exec.as_ref() else {
+            return std::collections::HashMap::new();
+        };
+        let speculative = exec.wait_all().await;
+        let mut out = std::collections::HashMap::new();
+        for (_, req) in conc_reqs {
+            if let Some(r) = speculative.get(&req.request_id) {
+                out.insert(req.request_id.clone(), (r.content.clone(), r.success));
+            }
+        }
+        out
+    }
+}
+
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_before_sse_read_loop(&mut self) {
@@ -1830,6 +1851,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         dedup_key,
                     )
                 } else if let Some(resolver) = &self.skill_resolver {
+                    // D-9 dedup: discard any speculative execution tied to this call_id.
+                    if let Some(exec) = self.streaming_tool_exec.clone() {
+                        exec.discard(request_id).await;
+                    }
                     astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
@@ -1858,6 +1883,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // (partition_and_execute_delegations) where the delegation engine
                 // runs sub-agents. Return a deferred acknowledgment so the server
                 // sees a success (not an error) and the model doesn't give up.
+                //
+                // D-9 dedup guard: if a speculative execution was somehow started
+                // for this call_id, discard it so the delegation result wins.
+                if let Some(exec) = self.streaming_tool_exec.clone() {
+                    exec.discard(request_id).await;
+                }
                 "Delegation request acknowledged. The delegation engine will execute \
                  this request now, the parent agent will pause while sub-agents \
                  run and aggregate, and the summarized results will be injected \
@@ -2529,6 +2560,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let sem = Arc::new(tokio::sync::Semaphore::new(
             astra_runtime::turn::parallel_tool_exec::MAX_CONCURRENT_TOOL_EXECUTIONS,
         ));
+        // D-9: harvest speculative results from mid-stream execution.
+        // Matching request_ids skip the normal dispatch and reuse the
+        // speculative output. Journal/observability still fire exactly
+        // once from the post-execution pass below.
+        let speculative_by_id = self.harvest_speculation_for_batch(&conc_reqs).await;
         let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
             conc_reqs
                 .iter()
@@ -2536,7 +2572,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
                     let sem = sem.clone();
+                    let speculative = speculative_by_id.get(&req.request_id).cloned();
                     async move {
+                        if let Some((output, _ok)) = speculative {
+                            return (
+                                crate::edge_tools::ToolExecutionOutcome {
+                                    output,
+                                    tool_result_fields: None,
+                                },
+                                0u64,
+                            );
+                        }
                         // Acquire a permit before executing. Semaphore is never closed
                         // (it lives only for this batch), so acquire() won't fail; the
                         // `ok()` fallback is defensive.
@@ -2654,37 +2700,100 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .collect()
     }
 
-    async fn on_tool_call_complete(&mut self, _index: usize, tool_call: &Value) {
+    /// D-9: Harvest speculative results for the upcoming concurrent batch.
+    ///
+    /// `wait_all()` is used so in-flight speculations finish before the
+    /// merge; the overall latency is still bounded by the stream itself
+    /// (the stream has already finished by the time this runs). Results
+    /// keyed by request_id are returned so the join_all closure can
+    /// short-circuit matching requests without re-executing.
+    async fn on_tool_call_complete(&mut self, index: usize, tool_call: &Value) {
         // D-9 speculative streaming hook.
         //
-        // When `ASTRA_STREAMING_TOOL_EXEC=1` is set, we log that a read-only
-        // tool_use block was observed mid-stream and would be eligible for
-        // speculative execution. The full executor wiring (Arc<ToolExecutor>
-        // + background task spawning + harvest-before-batch merge) is
-        // staged but disabled pending a refactor of the host's
-        // `executor: &'a mut ToolExecutor` to a shared `Arc`. The trait hook,
-        // env gate, and `should_speculate` helper are in place and
-        // exercised by astra-turn-core integration tests at the
-        // sse_stream_host layer.
-        if !self.streaming_speculation_enabled {
+        // When `ASTRA_STREAMING_TOOL_EXEC=1` is set, a read-only tool_use
+        // block that completes mid-stream is dispatched to the shared
+        // `StreamingToolExecutor` so its I/O overlaps with the remaining
+        // SSE stream. Results are later harvested in `execute_tools_batch`
+        // and replace the normal dispatch for matching request_ids;
+        // permission / journal / observability events still fire exactly
+        // once from the batch phase.
+        let Some(exec) = self.streaming_tool_exec.clone() else {
             return;
-        }
+        };
         let tool_name = tool_call
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("");
-        if astra_runtime::turn::streaming_tool_exec::should_speculate(tool_name, None) {
-            // Emit an observability hint but do not mutate permissioning or
-            // tool_cache — speculation results must still flow through
-            // execute_tools_batch so journal events fire exactly once.
-            tracing::debug!(
-                target = "astra_cli::streaming_tool_exec",
-                tool = tool_name,
-                "speculative execution eligible (streaming hook)",
-            );
+            .unwrap_or("")
+            .to_string();
+        let call_id = tool_call
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if call_id.is_empty() {
+            return;
         }
+        if !astra_runtime::turn::streaming_tool_exec::should_speculate(&tool_name, None) {
+            return;
+        }
+        tracing::debug!(
+            target = "astra_cli::streaming_tool_exec",
+            tool = %tool_name,
+            call_id = %call_id,
+            "dispatching speculative execution"
+        );
+        let _ = exec
+            .on_tool_block(call_id, tool_name, tool_call.clone(), index)
+            .await;
     }
+}
+
+/// Build the speculative streaming tool executor when enabled via env.
+///
+/// The returned executor is a background dispatcher that drives the
+/// shared `Arc<ToolExecutor>` off-thread. Each speculative task invokes
+/// `execute_with_metadata(tool_name, args)` and returns the output +
+/// error flag, matching the `ToolExecutorFn` signature used in
+/// `parallel_tool_exec`.
+fn build_streaming_tool_exec(
+    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
+) -> Option<std::sync::Arc<astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor>> {
+    if !astra_runtime::turn::streaming_tool_exec::streaming_tool_exec_enabled() {
+        return None;
+    }
+    let fn_exec: astra_runtime::turn::parallel_tool_exec::ToolExecutorFn =
+        std::sync::Arc::new(move |tc: Value| {
+            let executor = std::sync::Arc::clone(&executor);
+            Box::pin(async move {
+                let call_id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args: Value = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .map(|a| match a {
+                        Value::String(s) => {
+                            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
+                        }
+                        other => other.clone(),
+                    })
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let outcome = executor.execute_with_metadata(&tool_name, &args).await;
+                (call_id, tool_name, outcome.output, true)
+            })
+        });
+    Some(std::sync::Arc::new(
+        astra_runtime::turn::streaming_tool_exec::StreamingToolExecutor::new(fn_exec),
+    ))
 }
 
 // ─── Turn result from one /chat/turn SSE stream ───────────────────────────────
