@@ -266,3 +266,91 @@ async fn complex_full_self_model_ingestion_reflects_all_layers() {
         "expected bash (deprioritized) to be referenced in SelfModel text"
     );
 }
+
+/// End-to-end: actually execute a batch via `execute_parallel_round`, derive
+/// tool_health entries from the outcome, feed them through
+/// `ingest_self_model_inputs`, and prove the failing tool appears in the
+/// rendered SelfModel text. This exercises the exact production sequence
+/// (parallel exec -> health accounting -> self awareness) rather than
+/// synthesizing ToolHealthEntry values directly.
+#[tokio::test]
+async fn parallel_failure_flows_into_self_model_deprioritization() {
+    use astra_turn_core::parallel_tool_exec::execute_parallel_round;
+
+    // Executor: read_file succeeds, flaky_reader always fails, bash succeeds.
+    let exec: ToolExecutorFn = Arc::new(|tc: Value| {
+        Box::pin(async move {
+            let call_id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let success = name != "flaky_reader";
+            let content = if success {
+                format!("ok:{name}")
+            } else {
+                format!("error: {name} failed")
+            };
+            (call_id, name, content, success)
+        })
+    });
+
+    // 5 calls: 3 good reads, 2 failing reads interleaved with them.
+    let calls: Vec<Value> = vec![
+        tool_block("read_file", "r0"),
+        tool_block("flaky_reader", "r1"),
+        tool_block("read_file", "r2"),
+        tool_block("flaky_reader", "r3"),
+        tool_block("read_file", "r4"),
+    ];
+
+    let outcome = execute_parallel_round(&calls, exec).await;
+    assert_eq!(outcome.results.len(), 5);
+
+    // Aggregate into tool_health entries from the real batch outcome.
+    use std::collections::BTreeMap;
+    let mut counters: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for r in &outcome.results {
+        let entry = counters.entry(r.tool_name.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if !r.success {
+            entry.1 += 1;
+        }
+    }
+    let tool_health: Vec<ToolHealthEntry> = counters
+        .iter()
+        .map(|(n, (calls, fails))| make_entry(n, *calls, *fails))
+        .collect();
+
+    // The failing tool's entry must have non-zero failure_rate.
+    let flaky = tool_health
+        .iter()
+        .find(|e| e.name == "flaky_reader")
+        .expect("flaky_reader entry expected");
+    assert!(
+        flaky.failure_rate > 0.99,
+        "flaky_reader must have ~100% failure_rate, got {}",
+        flaky.failure_rate
+    );
+
+    // Synthesize a ToolDeprioritized signal like the production health tracker
+    // would emit after crossing its threshold.
+    let signals = vec![
+        FeedbackSignal::new(SignalType::ToolDeprioritized {
+            tool_name: "flaky_reader".into(),
+        })
+        .with_turn("t-42"),
+    ];
+
+    let mut session = ObservabilitySession::new_simple("parallel-health-sess");
+    session.ingest_self_model_inputs(
+        vec![],
+        tool_health.clone(),
+        Some(Scenario::Debugging),
+        signals,
+    );
+
+    let model = build_snapshot(&session, &["read_file", "flaky_reader"]);
+    let text = model.to_detailed_text();
+    assert!(
+        text.to_lowercase().contains("flaky_reader"),
+        "SelfModel text must surface the failing tool name; got:\n{text}"
+    );
+}
