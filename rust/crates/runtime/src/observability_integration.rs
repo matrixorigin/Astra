@@ -153,6 +153,25 @@ pub struct ObservabilitySession {
     /// Populated by the adaptive-tuning cycle; consumed by the SelfModel snapshot
     /// builder. Replaced (not appended to) on each publish.
     pub low_confidence_tools: Vec<(String, f64, u32)>,
+
+    /// Scenario cached from the user profile for SelfModel rendering.
+    /// Mirrors `profile.current_scenario` so the snapshot builder can consume
+    /// it without reaching back through the profile store.
+    pub active_scenario: Option<Scenario>,
+
+    /// Skill names surfaced for SelfModel's `capabilities.skills` list.
+    /// Published per-turn by the agentic loop from the active skill source
+    /// (registry / selection log). Empty when no skill source is reachable.
+    pub cached_skill_names: Vec<String>,
+
+    /// Per-turn export of `ToolHealthTracker::export()` so SelfModel can
+    /// reconstruct summaries + deprioritized/outcome memory without holding
+    /// a reference to the live tracker.
+    pub last_tool_health_export: Vec<astra_pipeline::ToolHealthEntry>,
+
+    /// Recent `AutoTuningEngine` feedback signals mirrored onto the session so
+    /// SelfModel can render them. Bounded to the most recent 16 entries.
+    pub last_feedback_signals: Vec<FeedbackSignal>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +270,10 @@ impl ObservabilitySession {
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
+            active_scenario: None,
+            cached_skill_names: Vec::new(),
+            last_tool_health_export: Vec::new(),
+            last_feedback_signals: Vec::new(),
         }
     }
 
@@ -290,12 +313,41 @@ impl ObservabilitySession {
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
+            active_scenario: None,
+            cached_skill_names: Vec::new(),
+            last_tool_health_export: Vec::new(),
+            last_feedback_signals: Vec::new(),
         }
     }
 
     /// Get the current scenario (if detected).
     pub fn current_scenario(&self) -> Option<Scenario> {
         self.profile.current_scenario
+    }
+
+    /// Publish the four SelfModel inputs that were previously hard-coded to
+    /// empty at the `build_self_model_snapshot` call site. `recent_signals`
+    /// is bounded to the most recent 16 entries (tail-preserving) so the
+    /// SelfModel does not balloon when the tuning engine retains a long
+    /// window.
+    pub fn ingest_self_model_inputs(
+        &mut self,
+        skills: Vec<String>,
+        tool_health_entries: Vec<astra_pipeline::ToolHealthEntry>,
+        scenario: Option<Scenario>,
+        recent_signals: Vec<FeedbackSignal>,
+    ) {
+        const MAX_SIGNALS: usize = 16;
+        self.cached_skill_names = skills;
+        self.last_tool_health_export = tool_health_entries;
+        self.active_scenario = scenario;
+        let trimmed = if recent_signals.len() > MAX_SIGNALS {
+            let start = recent_signals.len() - MAX_SIGNALS;
+            recent_signals.into_iter().skip(start).collect()
+        } else {
+            recent_signals
+        };
+        self.last_feedback_signals = trimmed;
     }
 
     /// Record a context assembly trace.

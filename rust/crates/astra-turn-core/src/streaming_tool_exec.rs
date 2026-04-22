@@ -25,6 +25,40 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::parallel_tool_exec::{ToolExecResult, ToolExecutorFn, is_read_only_tool};
+use super::permission_types::PermissionDecision;
+
+/// Environment variable gating speculative streaming execution.
+/// Set to `1` to enable; default (unset) keeps pre-speculation behavior.
+pub const STREAMING_TOOL_EXEC_ENV: &str = "ASTRA_STREAMING_TOOL_EXEC";
+
+/// Returns true iff the env-gated streaming tool executor is enabled.
+pub fn streaming_tool_exec_enabled() -> bool {
+    std::env::var(STREAMING_TOOL_EXEC_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Decide whether a tool call is eligible for speculative execution mid-stream.
+///
+/// Speculative execution is only safe when:
+/// 1. The tool is classified read-only (no side-effects to undo), and
+/// 2. Permission decision is either unknown or `Approve`. If the permission
+///    layer has already pre-evaluated the call and returned `Deny` or
+///    `Escalate`, we must not run it — the user hasn't consented.
+///
+/// The host is expected to re-check permission at the batch-phase merge point
+/// so that observability/journal events fire exactly once regardless of
+/// whether speculation happened.
+pub fn should_speculate(tool_name: &str, perm_decision: Option<&PermissionDecision>) -> bool {
+    if !is_read_only_tool(tool_name) {
+        return false;
+    }
+    match perm_decision {
+        None => true, // unknown → assume auto-allowed for read-only
+        Some(PermissionDecision::Approve { .. }) => true,
+        Some(PermissionDecision::Deny { .. }) | Some(PermissionDecision::Escalate) => false,
+    }
+}
 
 /// Maximum speculative executions during streaming.
 const MAX_SPECULATIVE: usize = 5;
@@ -321,5 +355,33 @@ mod tests {
         // Second harvest should be empty
         let harvested2 = exec.harvest_completed().await;
         assert_eq!(harvested2.len(), 0);
+    }
+
+    #[test]
+    fn should_speculate_gates() {
+        // Read-only + unknown permission → speculate
+        assert!(should_speculate("read_file", None));
+        assert!(should_speculate("grep", None));
+        // Read-only + Approve → speculate
+        assert!(should_speculate(
+            "read_file",
+            Some(&PermissionDecision::approve())
+        ));
+        // Read-only + Deny → no speculation
+        assert!(!should_speculate(
+            "read_file",
+            Some(&PermissionDecision::deny("policy"))
+        ));
+        // Read-only + Escalate → no speculation
+        assert!(!should_speculate(
+            "read_file",
+            Some(&PermissionDecision::Escalate)
+        ));
+        // Non-read-only never speculates
+        assert!(!should_speculate("bash", None));
+        assert!(!should_speculate(
+            "write_file",
+            Some(&PermissionDecision::approve())
+        ));
     }
 }

@@ -147,6 +147,9 @@ fn parallel_and_efficiency_section() -> &'static str {
       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
+      ## Batching read-only tool calls\n\
+      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
+      Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
      - Use glob to narrow candidates before grep.\n\
