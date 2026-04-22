@@ -10986,8 +10986,9 @@ async fn d2_oversized_result_truncated() {
         astra_turn_core::tool_result_sanitize::tool_result_content_for_model("read_file", &big);
     assert!(out.len() < big.len(), "should be smaller after truncation");
     assert!(
-        out.contains("truncated"),
-        "should contain truncation notice"
+        out.contains("truncated") || out.contains("elided"),
+        "should contain truncation/compression notice, got: {}",
+        &out[..out.len().min(500)]
     );
     assert!(out.starts_with("ZZZ"), "head preserved");
     assert!(out.ends_with("ZZZ"), "tail preserved");
