@@ -1540,7 +1540,7 @@ impl ToolExecutor {
             session.turn_number,
             latest_budget,
             None,
-            session.active_experiment_id.as_deref(),
+            None,
             elapsed,
             session.user_corrections.len(),
             session.compressed_turns.len(),

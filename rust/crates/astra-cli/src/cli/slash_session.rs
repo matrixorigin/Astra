@@ -3042,13 +3042,6 @@ fn handle_session_adaptive(_arg: &str, state: &ReplState) {
                 .unwrap_or_else(|| "none".to_string());
             eprintln!("  {} Scenario: {}", "▸".cyan(), scenario.bold());
 
-            if let Some(exp) = &guard.active_experiment_id {
-                let var = guard.active_variant.as_deref().unwrap_or("?");
-                eprintln!("  {} Experiment: {} → variant {}", "▸".cyan(), exp, var);
-            } else {
-                eprintln!("  {} Experiment: {}", "▸".cyan(), "none".dim());
-            }
-
             eprintln!("  {} Config snapshot:", "▸".cyan(),);
             eprintln!(
                 "      token_budget.max_turn_input_tokens = {}",

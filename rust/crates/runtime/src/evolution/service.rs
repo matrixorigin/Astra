@@ -16,7 +16,6 @@ use super::types::{
 use crate::liquid::reflection::ReflectionEngine;
 use crate::pipeline::calibration::ProgressiveCalibrator;
 use crate::pipeline::pattern::PatternLibrary;
-use crate::runtime_promotion_signals::RuntimePromotionSignals;
 
 const MAX_APPLIED_LOG: usize = 100;
 const MAX_RECENT_CALIBRATION_DEDUP: usize = 32;
@@ -43,8 +42,6 @@ pub struct EvolutionService {
     calibrator: Option<Arc<std::sync::Mutex<ProgressiveCalibrator>>>,
     /// Optional durable store for skill evolution proposals and approved diffs.
     evolution_store: Option<Arc<EvolutionStore>>,
-    /// Optional preloaded promotion signals shared across runtime promotions.
-    runtime_promotion_signals: std::sync::RwLock<Option<RuntimePromotionSignals>>,
     /// Cached reflection engine (stateless — reusable across calls).
     reflection_engine: ReflectionEngine,
 }
@@ -105,7 +102,6 @@ impl EvolutionService {
             pattern_library: None,
             calibrator: None,
             evolution_store: None,
-            runtime_promotion_signals: std::sync::RwLock::new(None),
             reflection_engine: ReflectionEngine::new(),
         }
     }
@@ -129,13 +125,6 @@ impl EvolutionService {
     pub fn with_evolution_store(mut self, store: Arc<EvolutionStore>) -> Self {
         self.evolution_store = Some(store);
         self
-    }
-
-    pub fn set_runtime_promotion_signals(&self, signals: Option<RuntimePromotionSignals>) {
-        *self
-            .runtime_promotion_signals
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = signals;
     }
 
     /// Feed a tool result into the signal collector.
@@ -240,11 +229,6 @@ impl EvolutionService {
         &self,
         mut proposal: EvolutionProposal,
     ) -> Result<EvolutionProposal, String> {
-        let runtime_promotion_signals = self
-            .runtime_promotion_signals
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let verdict = match &proposal.axis {
             EvolutionAxis::Pattern { .. } => {
                 if let Some(pattern_library) = self.pattern_library.as_ref() {
@@ -256,7 +240,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: Some(&library),
                             calibrator: None,
-                            promotion_signals: runtime_promotion_signals.as_ref(),
+                            promotion_signals: None,
                         },
                     )?
                 } else {
@@ -265,7 +249,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: None,
                             calibrator: None,
-                            promotion_signals: runtime_promotion_signals.as_ref(),
+                            promotion_signals: None,
                         },
                     )?
                 }
@@ -282,7 +266,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: None,
                             calibrator: Some(&calibrator),
-                            promotion_signals: runtime_promotion_signals.as_ref(),
+                            promotion_signals: None,
                         },
                     )?
                 } else {
@@ -291,7 +275,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: None,
                             calibrator: None,
-                            promotion_signals: runtime_promotion_signals.as_ref(),
+                            promotion_signals: None,
                         },
                     )?
                 }
@@ -302,7 +286,7 @@ impl EvolutionService {
                     ProposalPromotionContext {
                         pattern_library: None,
                         calibrator: None,
-                        promotion_signals: runtime_promotion_signals.as_ref(),
+                        promotion_signals: None,
                     },
                 )?
             }
@@ -778,17 +762,12 @@ impl EvolutionService {
         proposal: &EvolutionProposal,
         snapshot: &CanaryExecutionSnapshot,
     ) -> Result<ProposalPromotionVerdict, String> {
-        let runtime_promotion_signals = self
-            .runtime_promotion_signals
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         evaluate_proposal_promotion(
             proposal,
             ProposalPromotionContext {
                 pattern_library: snapshot.pattern_library.as_ref(),
                 calibrator: snapshot.calibrator.as_ref(),
-                promotion_signals: runtime_promotion_signals.as_ref(),
+                promotion_signals: None,
             },
         )
     }
@@ -1018,8 +997,6 @@ mod tests {
     use crate::liquid::reflection::ReflectionContext;
     use crate::pipeline::calibration::ProgressiveCalibrator;
     use crate::pipeline::routing::{DomainHint, TaskType};
-    use astra_core::confidence::ConfidenceInterval;
-    use astra_services::evaluation::types::ValueInterval;
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {
         EvolutionSignal::ToolFailure {
@@ -1041,33 +1018,6 @@ mod tests {
         }
     }
 
-    fn promote_ready_runtime_signals() -> RuntimePromotionSignals {
-        RuntimePromotionSignals {
-            noise_filtered_quality: Some(ConfidenceInterval::new(0.82, 0.78, 0.86)),
-            latest_gate: Some(
-                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
-                    passed: true,
-                    score_delta: Some(ValueInterval::new(0.06, 0.04, 0.08)),
-                },
-            ),
-            calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
-            ..RuntimePromotionSignals::default()
-        }
-    }
-
-    fn rollback_ready_runtime_signals() -> RuntimePromotionSignals {
-        RuntimePromotionSignals {
-            noise_filtered_quality: Some(ConfidenceInterval::new(0.42, 0.39, 0.45)),
-            latest_gate: Some(
-                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
-                    passed: false,
-                    score_delta: Some(ValueInterval::new(-0.12, -0.16, -0.08)),
-                },
-            ),
-            calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
-            ..RuntimePromotionSignals::default()
-        }
-    }
 
     #[tokio::test]
     async fn flush_empty_returns_nothing() {
@@ -1758,89 +1708,6 @@ mod tests {
         assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
     }
 
-    #[tokio::test]
-    async fn flush_auto_promotes_active_canary_with_positive_runtime_signals() {
-        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
-        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
-        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
-        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
-
-        svc.ingest_reflection_response_detailed(llm, &ctx)
-            .await
-            .unwrap();
-        let active = svc.active_canaries().await;
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].status, ApprovalStatus::CanaryActive);
-        assert_eq!(
-            active[0]
-                .promotion_verdict
-                .as_ref()
-                .map(|verdict| verdict.recommendation),
-            Some(ProposalPromotionRecommendation::Canary)
-        );
-
-        svc.set_runtime_promotion_signals(Some(promote_ready_runtime_signals()));
-        let (auto, llm) = svc.flush().await;
-        assert!(auto.is_empty());
-        assert!(llm.is_empty());
-        assert!(svc.active_canaries().await.is_empty());
-
-        let applied = svc.applied().await;
-        assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0].status, ApprovalStatus::CanaryPromoted);
-        assert_eq!(
-            applied[0]
-                .promotion_verdict
-                .as_ref()
-                .map(|verdict| verdict.recommendation),
-            Some(ProposalPromotionRecommendation::Promote)
-        );
-        let resolved = svc.resolved_canaries().await;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].status, ApprovalStatus::CanaryPromoted);
-        let threshold =
-            calibrator
-                .lock()
-                .unwrap()
-                .calibrated_threshold("fetch", None, TaskType::Unknown);
-        assert!((threshold - 0.56).abs() < 0.01, "got {threshold}");
-    }
-
-    #[tokio::test]
-    async fn flush_auto_rolls_back_active_canary_with_negative_runtime_signals() {
-        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
-        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
-        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
-        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
-
-        svc.ingest_reflection_response_detailed(llm, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(svc.active_canaries().await.len(), 1);
-
-        svc.set_runtime_promotion_signals(Some(rollback_ready_runtime_signals()));
-        let (auto, llm) = svc.flush().await;
-        assert!(auto.is_empty());
-        assert!(llm.is_empty());
-        assert!(svc.active_canaries().await.is_empty());
-        assert!(svc.applied().await.is_empty());
-        let resolved = svc.resolved_canaries().await;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].status, ApprovalStatus::CanaryRolledBack);
-        assert_eq!(
-            resolved[0]
-                .promotion_verdict
-                .as_ref()
-                .map(|verdict| verdict.recommendation),
-            Some(ProposalPromotionRecommendation::Hold)
-        );
-        let threshold =
-            calibrator
-                .lock()
-                .unwrap()
-                .calibrated_threshold("fetch", None, TaskType::Unknown);
-        assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
-    }
 
     #[tokio::test]
     async fn second_canary_queues_while_one_is_active() {

@@ -234,21 +234,41 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         },
         None => None,
     };
-    let experiments = hub.experiments();
+    let experiments_unused = &();
+    let _ = experiments_unused;
 
     // Snapshot config before profile application for attribution.
     let old_config = session_guard.config.clone();
     let old_scenario = session_guard.profile.current_scenario;
 
-    let mut profile = crate::adaptive_execution_profile::select_adaptive_execution_profile(
-        &session_guard.config,
-        &routing,
-        &detector,
-        Some(hub.adaptive_baselines()),
-        pattern_library.as_deref(),
-        Some(&*experiments),
-        &user_id,
-    );
+    let mut profile =
+        crate::execution_profile::ExecutionProfile::from_base(session_guard.config.clone());
+
+    if let Some((scenario, confidence)) = detector.detect() {
+        profile.apply_scenario(scenario);
+        profile.confidence = profile.confidence.min(confidence.lower);
+    } else if let Some(scenario) = match routing.task_type {
+        crate::pipeline::routing::TaskType::Code
+        | crate::pipeline::routing::TaskType::Mutate => Some(crate::user_profile::Scenario::Implementation),
+        crate::pipeline::routing::TaskType::Reasoning
+        | crate::pipeline::routing::TaskType::Fetch => Some(crate::user_profile::Scenario::Exploration),
+        _ => None,
+    } {
+        profile.apply_scenario(scenario);
+    }
+
+    let mut boosts = routing.boost_terms.clone();
+    if let Some(library) = pattern_library.as_deref() {
+        boosts.extend(library.boost_terms_for(routing.task_type, routing.domain_hint));
+    }
+    if !boosts.is_empty() {
+        boosts.sort();
+        boosts.dedup();
+        profile.merge_boosts(boosts);
+    }
+
+    profile.confidence = profile.confidence.min(routing.confidence);
+    let _ = user_id;
 
     // ── Anti-flap: scenario change cooldown ──
     // Suppress scenario changes within cooldown period of the last change
@@ -278,16 +298,9 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     if let Some(scenario) = profile.scenario {
         session_guard.profile.set_scenario(scenario);
     }
-    if let Some(experiment_id) = &profile.experiment_id {
-        session_guard
-            .profile
-            .enroll_experiment(experiment_id.clone());
-    }
 
     carry_forward_tactical_runtime_mutations(state, &old_config, &mut profile.config);
 
-    session_guard.active_experiment_id = profile.experiment_id.clone();
-    session_guard.active_variant = profile.variant_id.clone();
     if !scenario_suppressed {
         session_guard.config = profile.config.clone();
     }
@@ -317,8 +330,6 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         .map(|s| format!("{s:?}"))
         .unwrap_or_default();
     let confidence = profile.confidence;
-    let experiment_id = profile.experiment_id.clone();
-    let variant_id = profile.variant_id.clone();
     let scenario_changed = profile.scenario != old_scenario;
     let adaptive_enabled = session_guard.config.context_window.adaptive;
     let turn_token_budget = session_guard.config.token_budget.max_turn_input_tokens as u64;
@@ -392,7 +403,6 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
 
     // Release session lock before writing journal.
     drop(session_guard);
-    drop(experiments);
     drop(pattern_library);
     sync_liquid_tactical_runtime(state, adaptive_enabled, turn_token_budget);
 
@@ -411,18 +421,9 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
             &scenario_name,
             confidence,
             config_changes,
-            experiment_id.as_deref(),
-            variant_id.as_deref(),
+            None,
+            None,
             baseline_applied,
-        );
-        write_session_journal_event(state, event);
-    }
-
-    // Emit separate experiment enrollment event if applicable.
-    if let (Some(exp_id), Some(var_id)) = (&experiment_id, &variant_id) {
-        let sid = state.current_session_id.as_deref();
-        let event = astra_services::session_journal::JournalEvent::adaptive_experiment_enrolled(
-            sid, turn, exp_id, var_id, exp_id,
         );
         write_session_journal_event(state, event);
     }
@@ -622,36 +623,6 @@ fn record_runtime_promotion_event(state: &mut AgenticLoopState, event: RuntimePr
     if !already_recorded {
         state.telemetry.promotion_events.push(event);
     }
-}
-
-fn record_adaptive_baseline_event(
-    state: &mut AgenticLoopState,
-    outcome: RuntimePromotionOutcome,
-    experiment_id: &str,
-    variant_id: &str,
-    verdict: &crate::adaptive_baselines::AdaptiveBaselinePromotionVerdict,
-) {
-    record_runtime_promotion_event(
-        state,
-        RuntimePromotionEventData {
-            controller: RuntimePromotionController::AdaptiveBaseline,
-            outcome,
-            recommendation: runtime_promotion_recommendation(verdict.recommendation),
-            subject_id: experiment_id.to_string(),
-            summary: format!(
-                "adaptive baseline winner '{variant_id}' for experiment '{experiment_id}'"
-            ),
-            turn: None,
-            confidence_score: verdict.confidence_score,
-            support_score: verdict.support_score,
-            safety_score: verdict.safety_score,
-            overall_score: verdict.overall_score,
-            blockers: verdict.blockers.clone(),
-            evidence: verdict.evidence.clone(),
-            rollback_hint: verdict.rollback_hint.clone(),
-            run_id: state.current_run_id.clone(),
-        },
-    );
 }
 
 fn record_evolution_proposal_event(
@@ -1116,133 +1087,10 @@ pub(crate) fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     }
     drop(session_guard);
 
-    let exploration = crate::exploration_engine::ExplorationEngine::default();
-    // A′: ground experiments in recent tool outcome evidence (generic — any
-    // tool with ≥0.5 fail-rate over ≥3 cached outcomes becomes an opportunity).
-    let health = &state.turn_guard.health;
-    let created = match hub.pattern_library() {
-        Some(pattern_library) => match pattern_library.lock() {
-            Ok(pattern_library) => {
-                let experiments = hub.experiments();
-                exploration.check_and_create_experiments_with_health(
-                    &pattern_library,
-                    &experiments,
-                    Some(health),
-                )
-            }
-            Err(err) => {
-                eprintln!("[adaptive-exec] failed to lock pattern library: {err}");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
-    if !created.is_empty() {
-        eprintln!(
-            "[adaptive-exec] created {} experiment(s): {:?}",
-            created.len(),
-            created.iter().map(|exp| &exp.id).collect::<Vec<_>>()
-        );
-    }
-
-    let concluded = {
-        let experiments = hub.experiments();
-        exploration.conclude_mature_experiments(&experiments)
-    };
-    if !concluded.is_empty() {
-        eprintln!(
-            "[adaptive-exec] concluded {} experiment(s): {:?}",
-            concluded.len(),
-            concluded
-                .iter()
-                .map(|c| (&c.experiment_id, &c.winner_variant_id))
-                .collect::<Vec<_>>()
-        );
-    }
-    let mut promoted = Vec::new();
-    let mut deferred = Vec::new();
-    for conclusion in &concluded {
-        let Some(winner_variant_id) = conclusion.winner_variant_id.as_deref() else {
-            continue;
-        };
-        match hub.promote_experiment_winner_with_signals(
-            &conclusion.experiment_id,
-            winner_variant_id,
-            state.telemetry.runtime_promotion_signals.as_ref(),
-        ) {
-            Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Promoted {
-                promotion,
-                verdict,
-            }) => {
-                record_adaptive_baseline_event(
-                    state,
-                    RuntimePromotionOutcome::Promoted,
-                    &conclusion.experiment_id,
-                    winner_variant_id,
-                    &verdict,
-                );
-                promoted.push(promotion);
-            }
-            Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Deferred(verdict)) => {
-                record_adaptive_baseline_event(
-                    state,
-                    RuntimePromotionOutcome::Deferred,
-                    &conclusion.experiment_id,
-                    winner_variant_id,
-                    &verdict,
-                );
-                deferred.push((
-                    conclusion.experiment_id.clone(),
-                    winner_variant_id.to_string(),
-                    verdict.recommendation,
-                    verdict.blockers,
-                ));
-            }
-            Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Skipped) => {}
-            Err(err) => eprintln!(
-                "[adaptive-exec] failed to promote winner for {}: {err}",
-                conclusion.experiment_id
-            ),
-        }
-    }
-    if !promoted.is_empty() {
-        eprintln!(
-            "[adaptive-exec] promoted {} adaptive baseline(s): {:?}",
-            promoted.len(),
-            promoted
-                .iter()
-                .map(|p| (&p.scope.task_type, &p.scope.domain, &p.variant_id))
-                .collect::<Vec<_>>()
-        );
-        for promotion in &promoted {
-            write_session_journal_event(
-                state,
-                astra_services::session_journal::JournalEvent::adaptive_baseline_promoted(
-                    state.current_session_id.as_deref(),
-                    &promotion.scope.task_type,
-                    promotion.scope.domain.as_deref(),
-                    &promotion.experiment_id,
-                    &promotion.variant_id,
-                    promotion.replaced_existing,
-                    &promotion.config_keys,
-                ),
-            );
-        }
-    }
-    if !deferred.is_empty() {
-        eprintln!(
-            "[adaptive-exec] deferred {} adaptive baseline promotion(s): {:?}",
-            deferred.len(),
-            deferred
-                .iter()
-                .map(|(experiment_id, variant_id, recommendation, blockers)| (
-                    experiment_id,
-                    variant_id,
-                    recommendation,
-                    blockers
-                ))
-                .collect::<Vec<_>>()
-        );
+    // Publish high-failure tools to ObservabilityHub for SelfModel reasoning.
+    let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
+    if !high_failure.is_empty() {
+        hub.record_low_confidence_tools(high_failure);
     }
 }
 
