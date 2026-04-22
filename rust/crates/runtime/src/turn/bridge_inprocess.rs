@@ -823,6 +823,14 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
+            // ── Recent tool-call arg hints (injected by CLI via edge_profile) ──
+            let recent_arg_hints_hint = edge_profile
+                .get("recent_arg_hints_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|text| format!("\n\n{text}"))
+                .unwrap_or_default();
+
             // ── Memory lifecycle: detect tracking/store signals in user input ──
             // Injects a priority hint into the system prompt so the LLM stores
             // the user's interest immediately rather than exploring the codebase.
@@ -1057,6 +1065,14 @@ impl InProcessChatTurnBridge {
                         },
                         ..Default::default()
                     }),
+                );
+            }
+            if !recent_arg_hints_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        recent_arg_hints_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    ),
                 );
             }
             if !session_anchor.is_empty() {

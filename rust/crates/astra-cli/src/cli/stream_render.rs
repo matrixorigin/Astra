@@ -2597,6 +2597,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .map(|(_, req)| {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
+                    let request_id = req.request_id.clone();
                     let sem = sem.clone();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
                     async move {
@@ -2609,12 +2610,68 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 0u64,
                             );
                         }
+                        // ── Pre-tool hooks (global registry, no-op when empty) ──
+                        // Rewrites to inputs from pre-hooks are honored; a Block
+                        // decision short-circuits execution with a synthesized
+                        // error output so the model sees the reason.
+                        let mut effective_args = args.clone();
+                        if astra_runtime::turn::tool_hooks::global_has_hooks().await {
+                            let pre_ctx = astra_runtime::turn::tool_hooks::ToolHookContext::pre(
+                                &tool,
+                                args.clone(),
+                            )
+                            .with_call_id(&request_id);
+                            match astra_runtime::turn::tool_hooks::global_run_pre(&pre_ctx).await {
+                                astra_runtime::turn::tool_hooks::PreHookOutcome::Proceed {
+                                    final_input,
+                                } => {
+                                    effective_args = final_input;
+                                }
+                                astra_runtime::turn::tool_hooks::PreHookOutcome::Blocked {
+                                    hook_id,
+                                    reason,
+                                } => {
+                                    return (
+                                        crate::edge_tools::ToolExecutionOutcome {
+                                            output: format!(
+                                                "Tool blocked by hook '{hook_id}': {reason}"
+                                            ),
+                                            tool_result_fields: None,
+                                        },
+                                        0u64,
+                                    );
+                                }
+                            }
+                        }
                         // Acquire a permit before executing. Semaphore is never closed
                         // (it lives only for this batch), so acquire() won't fail; the
                         // `ok()` fallback is defensive.
                         let _permit = sem.acquire_owned().await.ok();
-                        catch_tool_execution_panic(executor.execute_with_metadata(&tool, &args))
-                            .await
+                        let (outcome, dur) = catch_tool_execution_panic(
+                            executor.execute_with_metadata(&tool, &effective_args),
+                        )
+                        .await;
+                        // ── Post-tool hooks (rewrite output if any hook requests it) ──
+                        if astra_runtime::turn::tool_hooks::global_has_hooks().await {
+                            let post_ctx = astra_runtime::turn::tool_hooks::ToolHookContext::post(
+                                &tool,
+                                effective_args.clone(),
+                                outcome.output.clone(),
+                            )
+                            .with_call_id(&request_id);
+                            let post = astra_runtime::turn::tool_hooks::global_run_post(&post_ctx)
+                                .await;
+                            if post.final_output != outcome.output {
+                                return (
+                                    crate::edge_tools::ToolExecutionOutcome {
+                                        output: post.final_output,
+                                        tool_result_fields: outcome.tool_result_fields,
+                                    },
+                                    dur,
+                                );
+                            }
+                        }
+                        (outcome, dur)
                     }
                 })
                 .collect::<Vec<_>>(),

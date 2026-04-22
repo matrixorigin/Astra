@@ -1,0 +1,33 @@
+name: tool_result_compression
+description: "工具结果语义压缩 (gap #2)：当工具返回结果超过上下文预算时，应优先按 JSON/列表语义压缩并带有 'elided' 或 'truncated' 标记，而不是硬截断。验证 agent 在面对大输出时仍能给出连贯的结构化回答。"
+requires: [llm]
+
+turns:
+  - user: "列出 rust/crates 目录下所有的子目录（递归一层即可），并统计一共有多少个 crate。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应给出一个具体的 crate 数字（例如 '约 30 个' 或精确数字），且名字来自真实的目录列表；不应出现明显胡编的 crate 名"
+        pass_threshold: 0.6
+
+  - user: "在这些 crate 里找出名字含有 'turn' 的那个，读它的 Cargo.toml 的 [package] 段。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=2"
+      llm_judge:
+        criteria: "回复应准确定位到 astra-turn-core（或等价的含 'turn' 的 crate），并引用其 [package] 段内的字段（如 name、version）。这说明上一轮的大目录列表经过压缩后，关键条目仍被保留。"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
