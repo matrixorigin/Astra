@@ -892,12 +892,19 @@ async fn run_chat_repl(
         .await;
 
         let profile_name = profile.unwrap_or("default");
-        if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_with_health(
+        let tool_quality_entries = state
+            .tool_quality_tracker
+            .as_ref()
+            .and_then(|t| t.lock().ok().map(|g| g.export()))
+            .unwrap_or_default();
+        if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_full(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
             &state.tool_health_entries,
+            &tool_quality_entries,
+            None,
         ) {
             eprintln!(
                 "{}",

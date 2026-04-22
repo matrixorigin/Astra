@@ -89,12 +89,17 @@ pub struct LearningSnapshot {
     /// Persistent tool health data (cross-session error budgets).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_health: Vec<ToolHealthEntry>,
+    /// Per-tool quality/use tracking carried across sessions so selector
+    /// boost factors don't reset to neutral on every restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_quality: Vec<ToolQualityPersistEntry>,
     /// Active canary state needed to continue bounded promotion/rollback after restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_canary: Option<PersistedActiveCanary>,
 }
 
 pub use astra_pipeline::ToolHealthEntry;
+pub use astra_turn_core::tool_registry_report::{ToolQualityEntry, ToolQualityPersistEntry};
 
 /// Local-only sync metadata for cross-session delta sync bookkeeping.
 ///
@@ -117,6 +122,7 @@ impl Default for LearningSnapshot {
             patterns: Vec::new(),
             calibration: None,
             tool_health: Vec::new(),
+            tool_quality: Vec::new(),
             active_canary: None,
         }
     }
@@ -241,6 +247,29 @@ pub fn export_from_modules_with_health_and_canary(
     tool_health: &[ToolHealthEntry],
     active_canary: Option<PersistedActiveCanary>,
 ) -> LearningSnapshot {
+    export_from_modules_full(
+        entity_graph,
+        pattern_library,
+        calibrator,
+        tool_health,
+        &[],
+        active_canary,
+    )
+}
+
+/// Export all learning modules including per-tool quality entries.
+///
+/// Preferred entry point for callers that want to persist `ToolQualityTracker`
+/// state (CLI `main`). Existing callers can keep using the simpler variants
+/// which pass an empty quality slice.
+pub fn export_from_modules_full(
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+    tool_health: &[ToolHealthEntry],
+    tool_quality: &[ToolQualityPersistEntry],
+    active_canary: Option<PersistedActiveCanary>,
+) -> LearningSnapshot {
     let entities = entity_graph.lock().map(|g| g.export()).unwrap_or_default();
     let patterns = pattern_library
         .lock()
@@ -259,6 +288,7 @@ pub fn export_from_modules_with_health_and_canary(
         patterns,
         calibration,
         tool_health: tool_health.to_vec(),
+        tool_quality: tool_quality.to_vec(),
         active_canary,
     }
 }
@@ -424,11 +454,33 @@ pub fn save_learning_state_with_health_and_canary(
     tool_health: &[ToolHealthEntry],
     active_canary: Option<PersistedActiveCanary>,
 ) -> Result<(), String> {
-    let snapshot = export_from_modules_with_health_and_canary(
+    save_learning_state_full(
+        profile,
         entity_graph,
         pattern_library,
         calibrator,
         tool_health,
+        &[],
+        active_canary,
+    )
+}
+
+/// Save learning state including per-tool quality entries.
+pub fn save_learning_state_full(
+    profile: &str,
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+    tool_health: &[ToolHealthEntry],
+    tool_quality: &[ToolQualityPersistEntry],
+    active_canary: Option<PersistedActiveCanary>,
+) -> Result<(), String> {
+    let snapshot = export_from_modules_full(
+        entity_graph,
+        pattern_library,
+        calibrator,
+        tool_health,
+        tool_quality,
         active_canary,
     );
     // Only save if there's something to persist
@@ -436,6 +488,7 @@ pub fn save_learning_state_with_health_and_canary(
         && snapshot.patterns.is_empty()
         && snapshot.calibration.is_none()
         && snapshot.tool_health.is_empty()
+        && snapshot.tool_quality.is_empty()
         && snapshot.active_canary.is_none()
     {
         return Ok(());
@@ -465,6 +518,14 @@ pub fn load_learning_state(
 pub fn load_tool_health(profile: &str) -> Vec<ToolHealthEntry> {
     load_snapshot(profile)
         .map(|s| s.tool_health)
+        .unwrap_or_default()
+}
+
+/// Load per-tool quality entries from a profile's learning snapshot.
+/// Returns empty vec on missing/corrupt file (graceful degradation).
+pub fn load_tool_quality(profile: &str) -> Vec<ToolQualityPersistEntry> {
+    load_snapshot(profile)
+        .map(|s| s.tool_quality)
         .unwrap_or_default()
 }
 
@@ -783,6 +844,7 @@ mod tests {
             patterns: vec![],
             calibration: None,
             tool_health: Vec::new(),
+            tool_quality: Vec::new(),
             active_canary: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -1028,6 +1090,7 @@ mod tests {
                     recent_outcomes: vec![],
                 },
             ],
+            tool_quality: Vec::new(),
             active_canary: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -1035,6 +1098,61 @@ mod tests {
         assert_eq!(loaded.tool_health.len(), 2);
         assert_eq!(loaded.tool_health[0].name, "bash");
         assert!((loaded.tool_health[0].failure_rate - 0.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn tool_quality_roundtrip_in_snapshot() {
+        let snapshot = LearningSnapshot {
+            version: 1,
+            snapshot_epoch: 0,
+            entities: vec![],
+            patterns: vec![],
+            calibration: None,
+            tool_health: vec![],
+            tool_quality: vec![
+                ToolQualityPersistEntry {
+                    name: "bash".to_string(),
+                    entry: ToolQualityEntry {
+                        selections: 12,
+                        uses: 10,
+                        quality_sum: 8.4,
+                    },
+                },
+                ToolQualityPersistEntry {
+                    name: "grep".to_string(),
+                    entry: ToolQualityEntry {
+                        selections: 5,
+                        uses: 5,
+                        quality_sum: 4.2,
+                    },
+                },
+            ],
+            active_canary: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let loaded: LearningSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tool_quality.len(), 2);
+        assert_eq!(loaded.tool_quality[0].name, "bash");
+        assert_eq!(loaded.tool_quality[0].entry.selections, 12);
+        assert!((loaded.tool_quality[0].entry.quality_sum - 8.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tool_quality_empty_not_serialized() {
+        let snapshot = LearningSnapshot::default();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !json.contains("tool_quality"),
+            "empty tool_quality should be skipped in JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn tool_quality_backward_compatible_load() {
+        // Old snapshot without the field should still parse.
+        let legacy_json = r#"{"version":1,"snapshot_epoch":0,"entities":[],"patterns":[]}"#;
+        let loaded: LearningSnapshot = serde_json::from_str(legacy_json).unwrap();
+        assert!(loaded.tool_quality.is_empty());
     }
 
     #[test]
@@ -1046,6 +1164,7 @@ mod tests {
             patterns: vec![],
             calibration: None,
             tool_health: Vec::new(),
+            tool_quality: Vec::new(),
             active_canary: Some(PersistedActiveCanary {
                 proposal: crate::types::EvolutionProposal {
                     id: "canary-1".into(),
@@ -1126,6 +1245,7 @@ mod tests {
                 last_updated_epoch: 0,
                 recent_outcomes: vec![],
             }],
+            tool_quality: Vec::new(),
             active_canary: None,
         };
         save_snapshot_to(&path, &snapshot).unwrap();
