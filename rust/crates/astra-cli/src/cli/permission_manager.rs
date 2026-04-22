@@ -3406,4 +3406,201 @@ mod tests {
         let local_decision = pm.check_nonblocking("str_replace", &args);
         assert!(matches!(local_decision, PermissionDecision::Allow));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase H — Permission rule change mid-session in-flight race
+    //
+    // Audit gap 3.5: while a tool approval is "in flight" (the engine has
+    // already returned NeedApproval but the user has not responded), the rule
+    // set may mutate (e.g., via `/allow` or `/mode auto` or a settings reload).
+    // The invariants being pinned down here:
+    //   1. set_mode takes effect on the NEXT check only, never retroactively.
+    //   2. add_allow_rule mid-session is honored on the next check for the
+    //      same tool+args, with no further prompting.
+    //   3. Adding a deny rule after a NeedApproval was issued overrides that
+    //      pending approval on the next authoritative check (deny wins).
+    //   4. A session override recorded while one tool is in-flight does not
+    //      cross-contaminate a different tool's decision.
+    //   5. Flipping mode Auto→Deny mid-session does not retroactively revoke
+    //      decisions already taken, but does apply strictly going forward.
+    //   6. add_allow_rule is idempotent: the second call is a no-op.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn phase_h_set_mode_applies_only_to_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // First check in Prompt mode → NeedApproval.
+        let args = serde_json::json!({"path": "src/x.rs", "content": "x"});
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d1, PermissionDecision::NeedApproval { .. }),
+            "expected NeedApproval in Prompt mode, got {d1:?}",
+        );
+
+        // Mid-session: user types `/mode auto`. The decision for d1 (already
+        // returned) is not retroactively mutated — that's structurally true
+        // because PermissionDecision is a value type with no back-reference
+        // to the manager. What we pin down is that the NEXT check sees the
+        // new mode.
+        pm.set_mode(PermissionMode::Auto);
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Allow),
+            "next check after set_mode(Auto) must Allow, got {d2:?}",
+        );
+
+        // And the old decision object is untouched.
+        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+    }
+
+    #[test]
+    fn phase_h_add_allow_rule_applies_immediately_to_next_check() {
+        // Pick a tool that is NOT in the explicit-approval-required set
+        // (which would bypass allow rules by design). `str_replace` is
+        // bounded + reversible so it falls through to step 6 (allow rules).
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
+        let d1 = pm.check_nonblocking("str_replace", &args);
+        assert!(
+            matches!(d1, PermissionDecision::NeedApproval { .. }),
+            "expected NeedApproval before rule add, got {d1:?}",
+        );
+
+        pm.add_allow_rule("str_replace");
+
+        let d2 = pm.check_nonblocking("str_replace", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Allow),
+            "next str_replace check must Allow after add_allow_rule, got {d2:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_add_allow_rule_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.add_allow_rule("Bash(ls:*)");
+        let first = pm.settings.allow.clone();
+        pm.add_allow_rule("Bash(ls:*)");
+        let second = pm.settings.allow.clone();
+        assert_eq!(
+            first, second,
+            "add_allow_rule must dedup: {first:?} vs {second:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_deny_rule_added_mid_session_overrides_pending_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let args = serde_json::json!({"path": "secrets.env", "content": "x"});
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+
+        // Operator adds a deny rule mid-session.
+        pm.settings.deny.push("write_file".into());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Deny(_)),
+            "deny rule must win over pending NeedApproval, got {d2:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_session_override_for_one_tool_does_not_affect_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate user approving `bash ls` for the session (allow-once).
+        let bash_args = serde_json::json!({"command": "ls"});
+        let bash_fp = content_aware_fingerprint("bash", &bash_args);
+        pm.session_overrides.insert(bash_fp, true);
+
+        let d_bash = pm.check_nonblocking("bash", &bash_args);
+        assert!(
+            matches!(d_bash, PermissionDecision::Allow),
+            "bash must allow after session override, got {d_bash:?}",
+        );
+
+        // A completely different tool must NOT inherit that approval.
+        let write_args = serde_json::json!({"path": "a.txt", "content": "y"});
+        let d_write = pm.check_nonblocking("write_file", &write_args);
+        assert!(
+            matches!(d_write, PermissionDecision::NeedApproval { .. }),
+            "unrelated tool must still require approval, got {d_write:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_mode_flip_auto_to_deny_applies_to_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let args = serde_json::json!({"path": "src/a.rs", "content": "x"});
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d1, PermissionDecision::Allow),
+            "Auto mode must allow write_file, got {d1:?}",
+        );
+
+        pm.set_mode(PermissionMode::Deny);
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Deny(_)),
+            "Deny mode must reject write_file after flip, got {d2:?}",
+        );
+
+        // The earlier Allow decision is not retroactively mutated.
+        assert!(matches!(d1, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn phase_h_multiple_concurrent_in_flight_decisions_are_independent() {
+        // Simulates two parallel NeedApproval decisions issued back-to-back
+        // in Prompt mode. A mode change between them must only affect the
+        // second, not retroactively the first, and both PermissionDecision
+        // values are independent.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let a = serde_json::json!({"path": "a.txt", "content": "A"});
+        let b = serde_json::json!({"path": "b.txt", "content": "B"});
+
+        let da = pm.check_nonblocking("write_file", &a);
+        assert!(matches!(da, PermissionDecision::NeedApproval { .. }));
+
+        pm.set_mode(PermissionMode::Auto);
+
+        let db = pm.check_nonblocking("write_file", &b);
+        assert!(matches!(db, PermissionDecision::Allow));
+
+        // `da` object remains NeedApproval — it's a snapshot by value.
+        assert!(matches!(da, PermissionDecision::NeedApproval { .. }));
+    }
+
+    #[test]
+    fn phase_h_allow_rule_then_deny_rule_deny_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.add_allow_rule("Bash(rm:*)");
+        // Operator realizes mistake, adds a specific deny for dangerous rm.
+        pm.settings.deny.push("Bash(rm:*)".into());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let args = serde_json::json!({"command": "rm -rf /tmp/foo"});
+        let d = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(d, PermissionDecision::Deny(_)),
+            "deny rule must override prior allow rule, got {d:?}",
+        );
+    }
 }
