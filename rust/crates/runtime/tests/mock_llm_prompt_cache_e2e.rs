@@ -94,6 +94,7 @@ fn build_host(
 
 // ── pc-anthropic-hit-miss ────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn anthropic_cache_control_emitted_on_system_tools_and_messages() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![
@@ -146,6 +147,7 @@ async fn anthropic_cache_control_emitted_on_system_tools_and_messages() {
 
 // ── pc-openai-stable-prefix ──────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn openai_stable_prefix_byte_equal_across_turns() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![scripted_round("a"), scripted_round("b")];
@@ -179,6 +181,7 @@ async fn openai_stable_prefix_byte_equal_across_turns() {
 
 // ── pc-non-anthropic-noop ────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn non_anthropic_provider_does_not_annotate_tools() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![scripted_round("once")];
@@ -200,6 +203,7 @@ async fn non_anthropic_provider_does_not_annotate_tools() {
 // prefix cost. Exercises the schema-churn detection end-to-end via the
 // captured-request hash.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn schema_churn_changes_cacheable_prefix_hash() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![scripted_round("t1"), scripted_round("t2")];
@@ -230,18 +234,79 @@ async fn schema_churn_changes_cacheable_prefix_hash() {
     );
 }
 
-// ── pc-disabled-flag (covered by unit tests in prompt_cache.rs) ────────────
-// `MO_PROMPT_CACHE_DISABLED` effect on latching is exercised directly by
-// `prompt_cache::tests::latch_disabled_by_env`. We intentionally do NOT
-// duplicate it here because the integration harness runs tests in parallel
-// and process-wide env mutation would race against other cache-sensitive
-// tests in this file (observed: anthropic_cache_control_emitted_* flakes if
-// the env var leaks across threads).
+// ── pc-disabled-flag ─────────────────────────────────────────────────────────
+// `MO_PROMPT_CACHE_DISABLED=1` must be honoured end-to-end: even with an
+// Anthropic provider latched, no `cache_control` blocks may leak into the
+// system message or tool schemas, and `CapturedLlmRequest.cache_enabled`
+// must reflect the latched value. All cache-sensitive tests in this file
+// share the `prompt_cache_env` serial group to prevent env-var racing
+// (the flag is read at latch time on every turn).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn cache_disabled_env_suppresses_all_annotations_end_to_end() {
+    // RAII guard so the env var is cleared even on panic.
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED") };
+        }
+    }
+    unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1") };
+    let _guard = EnvGuard;
+
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let mut host = build_host(
+        vec![scripted_round("ok"), scripted_round("ok2")],
+        Some(("anthropic", "claude-sonnet-4")),
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state
+        .messages
+        .push(json!({ "role": "user", "content": "turn 1" }));
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    state
+        .messages
+        .push(json!({ "role": "assistant", "content": "ok" }));
+    state
+        .messages
+        .push(json!({ "role": "user", "content": "turn 2" }));
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    let g = capture.lock().unwrap();
+    assert_eq!(g.len(), 2, "two captured payloads");
+    for (i, c) in g.iter().enumerate() {
+        assert!(
+            !c.cache_enabled,
+            "turn {i}: cache_enabled must latch false when env disables it"
+        );
+        assert!(
+            c.is_anthropic,
+            "turn {i}: anthropic latching is independent of disable flag"
+        );
+        assert_eq!(
+            c.system_cache_control_count, 0,
+            "turn {i}: no cache_control blocks allowed when disabled (got {})",
+            c.system_cache_control_count
+        );
+        assert!(
+            !c.last_tool_has_cache_control,
+            "turn {i}: tool schemas must not carry cache_control when disabled",
+        );
+    }
+    // Prefix hash must still be stable across turns even without annotations —
+    // the disabled path cannot introduce non-determinism.
+    assert_eq!(
+        g[0].cacheable_prefix_sha256, g[1].cacheable_prefix_sha256,
+        "disabled cache must not churn the prefix hash"
+    );
+}
 
 // ── pc-global-scope-cross-session ────────────────────────────────────────────
 // Prefix hashes must match across independent host instances for the same
 // provider/tool catalogue — that's what enables caching across sessions.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn prefix_hash_stable_across_independent_host_instances() {
     let cap_a = Arc::new(Mutex::new(Vec::new()));
     let cap_b = Arc::new(Mutex::new(Vec::new()));
@@ -278,6 +343,7 @@ async fn prefix_hash_stable_across_independent_host_instances() {
 // usage dict flow through the accumulator. This is the signal surface real
 // callers use to detect cache hits.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn cache_token_metrics_pass_through_from_mock_usage() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![json!({
@@ -305,6 +371,7 @@ async fn cache_token_metrics_pass_through_from_mock_usage() {
 // simulate this by running two hosts with different tool catalogues and
 // asserting hash inequality.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn tool_catalogue_change_invalidates_cacheable_prefix() {
     let cap_a = Arc::new(Mutex::new(Vec::new()));
     let cap_b = Arc::new(Mutex::new(Vec::new()));
@@ -369,6 +436,7 @@ async fn tool_catalogue_change_invalidates_cacheable_prefix() {
 
 // ── pc-model-change-break: model field flows into captured provider ──────────
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn model_change_observable_in_captured_request() {
     let cap_a = Arc::new(Mutex::new(Vec::new()));
     let cap_b = Arc::new(Mutex::new(Vec::new()));
@@ -399,6 +467,7 @@ async fn model_change_observable_in_captured_request() {
 
 // ── pc-empty-messages-noop ──────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn empty_message_history_does_not_panic() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let mut host = build_host(
@@ -422,6 +491,7 @@ async fn empty_message_history_does_not_panic() {
 // ── pc-stable-across-neutral-add: adding a user message keeps tools+system
 // prefix hash stable (only messages change, not the cacheable prefix).
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn adding_user_message_keeps_system_prefix_hash_stable() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![scripted_round("t1"), scripted_round("t2")];
@@ -495,6 +565,7 @@ fn event_types_in_order(events: &[Value]) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
 async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![
