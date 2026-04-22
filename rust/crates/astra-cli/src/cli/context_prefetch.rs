@@ -31,6 +31,13 @@ pub struct PrefetchedContext {
     pub body: String,
 }
 
+pub(crate) enum CodeReviewPrefetchTarget {
+    Head,
+    WorkingTree,
+    Rev(String),
+    BranchDiff,
+}
+
 /// Detect the task type from the user message and, if applicable, pre-fetch
 /// context that eliminates the need for the LLM to call tools in early rounds.
 ///
@@ -72,6 +79,27 @@ pub async fn prefetch_context_for_message(
     Some(PrefetchedContext {
         task_type,
         body: body?,
+    })
+}
+
+pub(crate) async fn prefetch_context_for_code_review_target(
+    target: CodeReviewPrefetchTarget,
+    project_root: &Path,
+) -> Option<PrefetchedContext> {
+    let body = match target {
+        CodeReviewPrefetchTarget::Head => {
+            prefetch_commit_review_ref("HEAD", None, project_root).await
+        }
+        CodeReviewPrefetchTarget::WorkingTree => prefetch_working_changes(project_root).await,
+        CodeReviewPrefetchTarget::Rev(rev) => {
+            prefetch_commit_review_ref(&rev, None, project_root).await
+        }
+        CodeReviewPrefetchTarget::BranchDiff => prefetch_branch_diff(project_root).await,
+    }?;
+
+    Some(PrefetchedContext {
+        task_type: "code_review",
+        body,
     })
 }
 
@@ -122,28 +150,40 @@ pub fn inject_prefetched_context(messages: &mut [Value], ctx: &PrefetchedContext
 
 /// Pre-fetch git context for code review tasks.
 async fn prefetch_code_review_context(message: &str, project_root: &Path) -> Option<String> {
-    if !is_git_repo(project_root).await {
-        return None;
-    }
-
     let lower = message.to_lowercase();
-
-    // Explicit commit hash takes priority over keyword matching.
-    if extract_commit_hash(message).is_some() || mentions_commit(&lower) {
-        prefetch_commit_review(message, project_root).await
+    let target = if let Some(hash) = extract_commit_hash(message) {
+        CodeReviewPrefetchTarget::Rev(hash)
+    } else if mentions_commit(&lower) {
+        CodeReviewPrefetchTarget::Head
     } else if mentions_pr(&lower) {
-        prefetch_branch_diff(project_root).await
+        CodeReviewPrefetchTarget::BranchDiff
     } else if mentions_local_changes(&lower) {
-        prefetch_working_changes(project_root).await
+        CodeReviewPrefetchTarget::WorkingTree
     } else {
-        prefetch_commit_review(message, project_root).await
-    }
+        CodeReviewPrefetchTarget::Head
+    };
+
+    prefetch_context_for_code_review_target(target, project_root)
+        .await
+        .map(|ctx| ctx.body)
 }
 
 async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<String> {
     // If the user specified a commit hash, use it; otherwise default to HEAD.
     let requested = extract_commit_hash(message);
     let commit = requested.clone().unwrap_or_else(|| "HEAD".to_string());
+
+    prefetch_commit_review_ref(&commit, requested.as_deref(), project_root).await
+}
+
+async fn prefetch_commit_review_ref(
+    commit: &str,
+    requested_prefix: Option<&str>,
+    project_root: &Path,
+) -> Option<String> {
+    if !is_git_repo(project_root).await {
+        return None;
+    }
 
     let log = run_git(
         project_root,
@@ -160,9 +200,9 @@ async fn prefetch_commit_review(message: &str, project_root: &Path) -> Option<St
     // Validate: if user requested a specific hash, confirm git resolved it to
     // that commit. A mismatch means the hash is wrong or ambiguous — don't
     // inject stale/wrong context; let the model call git tools itself.
-    if let Some(ref req) = requested {
+    if let Some(req) = requested_prefix {
         let resolved = log.lines().next().unwrap_or("").trim();
-        if !resolved.starts_with(req.as_str()) {
+        if !resolved.starts_with(req) {
             return None;
         }
     }

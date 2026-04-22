@@ -2302,6 +2302,7 @@ mod tests {
                 ts: Utc::now().to_rfc3339(),
                 session_id: Some(session_id.to_string()),
                 turn: Some(2),
+                agentic_step: None,
                 model: Some("gpt-5.4".to_string()),
                 user_input: Some("continue".to_string()),
                 assistant_output: Some("done".to_string()),

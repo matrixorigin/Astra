@@ -10,6 +10,8 @@
 //! All slash command metadata should be defined here. Other modules (repl_ui, main.rs)
 //! should query this registry rather than maintaining their own static arrays.
 
+use crate::command_usage;
+
 /// Command groups for organizing the help palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandGroup {
@@ -733,30 +735,62 @@ pub fn resolve_command(input: &str) -> Result<&'static str, Vec<&'static str>> {
 
 /// Suggest commands similar to the input (for typo correction / fuzzy matching).
 pub fn suggest_commands(input: &str, limit: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, usize, &'static str)> = COMMANDS
+    let mut scored: Vec<(usize, bool, usize, &'static str)> = COMMANDS
         .iter()
-        .map(|m| (suggestion_score(m.name, input), m.name.len(), m.name))
-        .filter(|(score, _, _)| *score > 0)
+        .map(|m| {
+            (
+                suggestion_score(m.name, input).saturating_add(command_usage::usage_boost(m.name)),
+                m.is_alias,
+                m.name.len(),
+                m.name,
+            )
+        })
+        .filter(|(score, _, _, _)| *score > 0)
         .collect();
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(b.2))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(b.3))
     });
     scored
         .into_iter()
         .take(limit)
-        .map(|(_, _, cmd)| cmd)
+        .map(|(_, _, _, cmd)| cmd)
         .collect()
 }
 
 fn suggestion_score(command: &str, query: &str) -> usize {
-    let cmd_lower = command.to_ascii_lowercase();
-    let query_lower = query.to_ascii_lowercase();
+    let cmd_lower = command.trim_start_matches('/').to_ascii_lowercase();
+    let query_lower = query.trim_start_matches('/').to_ascii_lowercase();
+    if query_lower.is_empty() {
+        return 0;
+    }
+    if cmd_lower == query_lower {
+        return 20_000;
+    }
     if cmd_lower.starts_with(&query_lower) {
-        100 + (20_usize.saturating_sub(command.len()))
-    } else if cmd_lower.contains(&query_lower) {
-        50 + (20_usize.saturating_sub(command.len()))
+        return 10_000 + (100_usize.saturating_sub(cmd_lower.len().min(100)));
+    }
+    if cmd_lower.contains(&query_lower) {
+        return 5_000 + (100_usize.saturating_sub(cmd_lower.len().min(100)));
+    }
+
+    let mut query_chars = query_lower.chars().peekable();
+    let mut consecutive = 0usize;
+    let mut score = 0usize;
+    for ch in cmd_lower.chars() {
+        if query_chars.peek() == Some(&ch) {
+            query_chars.next();
+            consecutive += 1;
+            score += consecutive;
+        } else {
+            consecutive = 0;
+        }
+    }
+
+    if query_chars.peek().is_none() {
+        1_000 + score + (100_usize.saturating_sub(cmd_lower.len().min(100)))
     } else {
         0
     }
@@ -772,6 +806,8 @@ pub fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> 
         .collect();
     // Sort: non-aliases first, then aliases, then by name
     rows.sort_by(|(a_name, _), (b_name, _)| {
+        let a_usage = command_usage::usage_count(a_name);
+        let b_usage = command_usage::usage_count(b_name);
         let a_alias = COMMANDS
             .iter()
             .find(|m| m.name == *a_name)
@@ -780,7 +816,10 @@ pub fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> 
             .iter()
             .find(|m| m.name == *b_name)
             .is_some_and(|m| m.is_alias);
-        a_alias.cmp(&b_alias).then_with(|| a_name.cmp(b_name))
+        b_usage
+            .cmp(&a_usage)
+            .then_with(|| a_alias.cmp(&b_alias))
+            .then_with(|| a_name.cmp(b_name))
     });
     rows
 }
@@ -809,18 +848,29 @@ pub fn fuzzy_completion_candidates(
     partial: &str,
     score_fn: impl Fn(&str, &str) -> Option<usize>,
 ) -> Vec<(&'static str, &'static str)> {
-    let mut scored: Vec<(usize, bool, &'static str, &'static str)> = COMMANDS
+    let mut scored: Vec<(usize, u32, bool, &'static str, &'static str)> = COMMANDS
         .iter()
-        .filter_map(|m| score_fn(m.name, partial).map(|s| (s, m.is_alias, m.name, m.description)))
+        .filter_map(|m| {
+            score_fn(m.name, partial).map(|s| {
+                (
+                    s.saturating_add(command_usage::usage_boost(m.name)),
+                    command_usage::usage_count(m.name),
+                    m.is_alias,
+                    m.name,
+                    m.description,
+                )
+            })
+        })
         .collect();
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(b.2))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(b.3))
     });
     scored
         .into_iter()
-        .map(|(_, _, name, desc)| (name, desc))
+        .map(|(_, _, _, name, desc)| (name, desc))
         .collect()
 }
 
@@ -949,6 +999,32 @@ mod tests {
             suggestions.contains(&"/help"),
             "suggestions should include /help for prefix /hel"
         );
+    }
+
+    #[test]
+    fn suggest_finds_fuzzy_typo() {
+        let suggestions = suggest_commands("/hlp", 5);
+        assert!(
+            suggestions.contains(&"/help"),
+            "suggestions should include /help for typo /hlp"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn completion_candidates_prioritize_frequently_used_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        command_usage::set_test_dir(dir.path());
+        command_usage::reset_for_tests();
+        for _ in 0..6 {
+            command_usage::record_command_use("/session").unwrap();
+        }
+
+        let rows = completion_candidates("/");
+        assert_eq!(rows.first().map(|row| row.0), Some("/session"));
+
+        command_usage::clear_test_dir();
+        command_usage::reset_for_tests();
     }
 
     #[test]

@@ -605,6 +605,9 @@ pub struct JournalEvent {
     /// Turn number (1-based, for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
+    /// Internal agentic step within the outer session turn (0-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentic_step: Option<u32>,
     /// LLM model used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -932,6 +935,9 @@ pub struct LlmRoundRecord {
     pub tool_calls_returned: u32,
     pub tool_call_names: Vec<String>,
     pub finish_reason: Option<String>,
+    pub agentic_step: Option<u32>,
+    pub source: Option<String>,
+    pub run_id: Option<String>,
 }
 
 /// In-memory collector for fine-grained turn events.
@@ -987,6 +993,7 @@ impl TurnEventBuffer {
     pub fn record_llm_round(&mut self, r: LlmRoundRecord) {
         let mut evt = JournalEvent::base(JournalEventType::LlmRound, self.session_id.as_deref());
         evt.turn = Some(self.turn);
+        evt.agentic_step = r.agentic_step;
         evt.round = Some(self.round);
         evt.offset_ms = Some(self.offset_ms().saturating_sub(r.duration_ms));
         evt.ttft_ms = r.ttft_ms;
@@ -997,11 +1004,24 @@ impl TurnEventBuffer {
             evt.cache_read_tokens = Some(r.cache_read_tokens);
         }
         evt.tool_calls_returned = Some(r.tool_calls_returned);
-        if !r.tool_call_names.is_empty() || r.finish_reason.is_some() {
-            evt.metadata = Some(serde_json::json!({
-                "tool_call_names": r.tool_call_names,
-                "finish_reason": r.finish_reason,
-            }));
+        if !r.tool_call_names.is_empty()
+            || r.finish_reason.is_some()
+            || r.source.is_some()
+            || r.run_id.is_some()
+        {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "tool_call_names".into(),
+                serde_json::json!(r.tool_call_names),
+            );
+            meta.insert("finish_reason".into(), serde_json::json!(r.finish_reason));
+            if let Some(source) = r.source {
+                meta.insert("source".into(), serde_json::json!(source));
+            }
+            if let Some(run_id) = r.run_id {
+                meta.insert("run_id".into(), serde_json::json!(run_id));
+            }
+            evt.metadata = Some(serde_json::Value::Object(meta));
         }
         self.events.push(evt);
         self.round += 1;
@@ -1893,6 +1913,7 @@ impl JournalEvent {
             ts: chrono::Utc::now().to_rfc3339(),
             session_id: session_id.map(|s| s.to_string()),
             turn: None,
+            agentic_step: None,
             model: None,
             user_input: None,
             assistant_output: None,
@@ -1944,6 +1965,11 @@ impl JournalEvent {
     /// Public variant of `base()` for use by external crates.
     pub fn base_public(event_type: JournalEventType, session_id: Option<&str>) -> Self {
         Self::base(event_type, session_id)
+    }
+
+    pub fn with_agentic_step(mut self, agentic_step: Option<u32>) -> Self {
+        self.agentic_step = agentic_step;
+        self
     }
 
     /// Session start event.
@@ -5538,6 +5564,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 2,
             tool_call_names: vec!["read_file".into(), "grep".into()],
             finish_reason: Some("tool_calls".into()),
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         assert_eq!(buf.current_round(), 1);
         assert_eq!(buf.len(), 1);
@@ -5551,6 +5580,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 1,
             tool_call_names: vec!["write_file".into()],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         assert_eq!(buf.current_round(), 2);
         assert_eq!(buf.len(), 2);
@@ -5568,12 +5600,16 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 3,
             tool_call_names: vec!["a".into(), "b".into(), "c".into()],
             finish_reason: Some("tool_calls".into()),
+            agentic_step: Some(4),
+            source: Some("agentic_loop".into()),
+            run_id: Some("run-42".into()),
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.event_type, JournalEventType::LlmRound);
         assert_eq!(ev.turn, Some(5));
+        assert_eq!(ev.agentic_step, Some(4));
         assert_eq!(ev.round, Some(0));
         assert_eq!(ev.ttft_ms, Some(42));
         assert_eq!(ev.tokens_in, Some(3000));
@@ -5582,6 +5618,8 @@ mod turn_event_buffer_tests {
         assert_eq!(ev.tool_calls_returned, Some(3));
         let meta = ev.metadata.as_ref().unwrap();
         assert_eq!(meta["tool_call_names"].as_array().unwrap().len(), 3);
+        assert_eq!(meta["source"], "agentic_loop");
+        assert_eq!(meta["run_id"], "run-42");
     }
 
     #[test]
@@ -5599,6 +5637,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         assert_eq!(buf.next_batch_id(), "b-1-0");
     }
@@ -5618,6 +5659,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let events = buf.drain();
         assert_eq!(
@@ -5642,6 +5686,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         assert_eq!(
             buf.current_round(),
@@ -5669,6 +5716,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 1,
             tool_call_names: vec!["read_file".into()],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         // Auto-reflection round
         buf.record_llm_round(LlmRoundRecord {
@@ -5680,6 +5730,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("auto_reflection".into()),
+            agentic_step: None,
+            source: Some("auto_reflection".into()),
+            run_id: Some("run-reflect".into()),
         });
         assert_eq!(buf.current_round(), 2);
         let events = buf.drain();
@@ -5688,6 +5741,9 @@ mod turn_event_buffer_tests {
         let refl = &events[1];
         assert_eq!(refl.round, Some(1));
         assert_eq!(refl.tokens_in, Some(54000));
+        let refl_meta = refl.metadata.as_ref().unwrap();
+        assert_eq!(refl_meta["source"], "auto_reflection");
+        assert_eq!(refl_meta["run_id"], "run-reflect");
     }
 
     /// Regression: rate-limited early exit must record an llm_round with
@@ -5704,6 +5760,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("rate_limited".into()),
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -5725,6 +5784,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("token_budget_exceeded".into()),
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -5750,6 +5812,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 1,
             tool_call_names: vec!["bash".into()],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         buf.record(JournalEvent::base_public(
             JournalEventType::Turn,
@@ -5786,6 +5851,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 2,
             tool_call_names: vec!["read_file".into(), "grep".into()],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
 
         buf.flush_interrupted(&writer).unwrap();
@@ -5875,6 +5943,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("stop".into()),
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let obs1 = buf1.drain();
         writer.append_bulk(&obs1).unwrap();
@@ -5902,6 +5973,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 1,
             tool_call_names: vec!["read_file".into()],
             finish_reason: None,
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         buf2.record_llm_round(LlmRoundRecord {
             ttft_ms: Some(1200),
@@ -5912,6 +5986,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("stop".into()),
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let obs2 = buf2.drain();
         writer.append_bulk(&obs2).unwrap();
@@ -5939,6 +6016,9 @@ mod turn_event_buffer_tests {
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("stop".into()),
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let obs3 = buf3.drain();
         writer.append_bulk(&obs3).unwrap();

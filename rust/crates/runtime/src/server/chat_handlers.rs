@@ -276,6 +276,15 @@ pub(super) async fn dispatch_chat_turn_bridge(
             },
         );
     }
+    if let Some(session_turn) = prepared.session_turn.as_deref() {
+        bridge_headers.insert(
+            HeaderName::from_static("x-mo-session-turn"),
+            match safe_header_value(session_turn) {
+                Ok(v) => v,
+                Err(r) => return r,
+            },
+        );
+    }
     if let Some(turn_chain_id) = prepared.turn_chain_id.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-turn-chain-id"),
@@ -546,11 +555,11 @@ mod tests {
     fn dispatch_header_count() {
         // Base headers: 4 (secret, user-id, username-b64, capabilities)
         // + authorization passthrough: 1
-        // + optional from prepared: 9 (session-id, turn-chain-id, user-query-event-id,
-        //   tools-changed, task-hint, user-query-b64, routing-meta-b64, force-intent,
-        //   execution-state-b64)
-        // Total possible: 14
-        assert_eq!(4 + 1 + 9, 14);
+        // + optional from prepared: 10 (session-id, session-turn, turn-chain-id,
+        //   user-query-event-id, tools-changed, task-hint, user-query-b64,
+        //   routing-meta-b64, force-intent, execution-state-b64)
+        // Total possible: 15
+        assert_eq!(4 + 1 + 10, 15);
     }
 }
 

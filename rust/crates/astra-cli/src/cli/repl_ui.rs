@@ -1,5 +1,6 @@
 use super::command_registry::{self, COMMANDS, CommandGroup};
 use super::*;
+use crate::command_usage;
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
     let terms: Vec<&str> = filter.split_whitespace().collect();
@@ -80,9 +81,16 @@ fn command_name_matches_fuzzy(command: &str, query: &str) -> bool {
 
 fn sort_picker_rows(rows: &mut [(&'static str, &'static str)], query: Option<&str>) {
     rows.sort_by(|(a_cmd, _), (b_cmd, _)| {
-        let query_cmp = query.map(|q| suggestion_score(b_cmd, q).cmp(&suggestion_score(a_cmd, q)));
+        let a_usage = command_usage::usage_count(a_cmd);
+        let b_usage = command_usage::usage_count(b_cmd);
+        let query_cmp = query.map(|q| {
+            suggestion_score(b_cmd, q)
+                .saturating_add(command_usage::usage_boost(b_cmd))
+                .cmp(&suggestion_score(a_cmd, q).saturating_add(command_usage::usage_boost(a_cmd)))
+        });
         query_cmp
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b_usage.cmp(&a_usage))
             .then_with(|| is_command_alias(a_cmd).cmp(&is_command_alias(b_cmd)))
             .then_with(|| a_cmd.cmp(b_cmd)) // alphabetical before length
     });
@@ -666,6 +674,8 @@ fn filtered_slash_rows(query: Option<&str>) -> Vec<(&'static str, &'static str)>
         }
         rows.retain(|(cmd, desc)| command_matches_filter(cmd, desc, q));
         sort_picker_rows(&mut rows, Some(q));
+    } else {
+        sort_picker_rows(&mut rows, None);
     }
     rows
 }
@@ -983,9 +993,24 @@ fn slash_ctrl_e_filter(line: &str, active: bool, in_slash: bool) -> Option<Optio
     slash_picker_filter(line)
 }
 
+fn ctrl_k_picker_filter(line: &str, active: bool, subcmd_active: bool) -> Option<Option<String>> {
+    if active || subcmd_active || !line.trim().is_empty() {
+        return None;
+    }
+    Some(None)
+}
+
+fn slash_overlay_command_label(cmd: &str) -> String {
+    if let Some(hint) = slash_argument_hint(cmd) {
+        format!("{cmd} {hint}")
+    } else {
+        cmd.to_string()
+    }
+}
+
 fn slash_overlay_command_width(rows: &[(&'static str, &'static str)]) -> usize {
     rows.iter()
-        .map(|(cmd, _)| cmd.chars().count())
+        .map(|(cmd, _)| visible_width(&slash_overlay_command_label(cmd)))
         .max()
         .unwrap_or(16)
         .max(16)
@@ -997,15 +1022,16 @@ fn slash_overlay_row_content(
     selected: bool,
     command_width: usize,
 ) -> String {
+    let label = slash_overlay_command_label(cmd);
     if selected {
         format!(
             "{} {:<command_width$} {}",
             "❯".cyan().bold(),
-            cmd.cyan().bold(),
+            label.cyan().bold(),
             desc.bold()
         )
     } else {
-        format!("  {:<command_width$} {}", cmd.dim(), desc.dim())
+        format!("  {:<command_width$} {}", label.dim(), desc.dim())
     }
 }
 
@@ -1493,7 +1519,10 @@ pub(super) fn print_keyboard_shortcuts() {
             "Editing",
             &[
                 ("Ctrl+W", "Delete word backward"),
-                ("Ctrl+K", "Kill to end of line"),
+                (
+                    "Ctrl+K",
+                    "Kill to end of line (or open picker on empty line)",
+                ),
                 ("Ctrl+U", "Kill to start of line"),
                 ("Ctrl+D", "Delete char / exit on empty"),
                 ("Ctrl+T", "Transpose characters"),
@@ -1521,6 +1550,7 @@ pub(super) fn print_keyboard_shortcuts() {
             "Slash Picker",
             &[
                 ("/", "Open picker"),
+                ("Ctrl+K", "Open picker from an empty line"),
                 ("Tab", "Complete using highlighted option"),
                 ("↑ / ↓", "Move highlight"),
                 ("Enter", "Execute selected"),
@@ -1924,6 +1954,17 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 if let Some(filter) = slash_ctrl_e_filter(ctx.line(), active, in_slash) {
                     set_slash_picker_selected(0);
                     render_slash_overlay(filter.as_deref());
+                }
+                return None;
+            }
+            RlKeyEvent(RlKeyCode::Char('k'), m)
+                if m.contains(RlModifiers::CTRL) && !m.contains(RlModifiers::ALT) =>
+            {
+                if let Some(filter) = ctrl_k_picker_filter(ctx.line(), active, subcmd_active) {
+                    set_slash_picker_selected(0);
+                    set_slash_filter(None);
+                    render_slash_overlay(filter.as_deref());
+                    return Some(RlCmd::Noop);
                 }
                 return None;
             }
@@ -2483,6 +2524,23 @@ mod tests {
         assert_eq!(rows[0].0, "/login");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn filtered_rows_without_query_prioritize_recent_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        command_usage::set_test_dir(dir.path());
+        command_usage::reset_for_tests();
+        for _ in 0..4 {
+            command_usage::record_command_use("/session").unwrap();
+        }
+
+        let rows = filtered_slash_rows(None);
+        assert_eq!(rows.first().map(|row| row.0), Some("/session"));
+
+        command_usage::clear_test_dir();
+        command_usage::reset_for_tests();
+    }
+
     // ── Bug fix: picker cycling wraps around ──────────────────────────────
 
     #[test]
@@ -2654,6 +2712,19 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_k_opens_picker_on_empty_line() {
+        assert_eq!(ctrl_k_picker_filter("", false, false), Some(None));
+        assert_eq!(ctrl_k_picker_filter("   ", false, false), Some(None));
+    }
+
+    #[test]
+    fn ctrl_k_preserves_normal_editing_when_input_is_not_empty() {
+        assert_eq!(ctrl_k_picker_filter("hello", false, false), None);
+        assert_eq!(ctrl_k_picker_filter("", true, false), None);
+        assert_eq!(ctrl_k_picker_filter("", false, true), None);
+    }
+
+    #[test]
     fn render_selected_slash_row_highlights_command_and_description() {
         let row = render_slash_overlay_row_with_width("/ask", "Toggle ask mode", true, 16, 40);
         let plain = strip_ansi_codes(&row);
@@ -2679,9 +2750,24 @@ mod tests {
     fn slash_overlay_command_width_tracks_longest_visible_command() {
         let width = slash_overlay_command_width(&[
             ("/ask", "Toggle ask mode"),
-            ("/session export", "Export session as markdown"),
+            ("/model", "Set or inspect active model"),
         ]);
-        assert_eq!(width, 16);
+        assert_eq!(width, visible_width("/model <name>").max(16));
+    }
+
+    #[test]
+    fn render_slash_row_includes_arg_hint_when_available() {
+        let width = slash_overlay_command_width(&[("/model", "Set or inspect active model")]);
+        let row = render_slash_overlay_row_with_width(
+            "/model",
+            "Set or inspect active model",
+            false,
+            width,
+            72,
+        );
+        let plain = strip_ansi_codes(&row);
+        assert!(plain.contains("/model <name>"));
+        assert!(plain.contains("Set or inspect active model"));
     }
 
     #[test]

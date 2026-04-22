@@ -34,16 +34,39 @@ fn should_complete_budget_exhaustion_gracefully(state: &AgenticLoopState) -> boo
         || state.stall.last_heavy_checkpoint.is_some()
 }
 
+pub(crate) fn session_turn_number(state: &AgenticLoopState) -> u32 {
+    if state.session_turn > 0 {
+        state.session_turn
+    } else {
+        state.max_turns.saturating_sub(state.remaining_turns).max(1) as u32
+    }
+}
+
+pub(crate) fn current_agentic_step(state: &AgenticLoopState) -> u32 {
+    state.max_turns.saturating_sub(state.remaining_turns) as u32
+}
+
+pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
+    state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
 fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
     let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
         " The latest checkpoint was saved, so you can continue in the next message."
     } else {
         " You can continue in the next message."
     };
-    if state.total_tool_calls > 0 {
+    let completed_tool_calls = completed_tool_calls(state);
+    if completed_tool_calls > 0 {
         format!(
             "[Turn budget exhausted after {} agentic turn(s). {} completed tool call(s) are preserved above.{}]\n",
-            state.max_turns, state.total_tool_calls, checkpoint_note
+            state.max_turns, completed_tool_calls, checkpoint_note
         )
     } else {
         format!(
@@ -60,8 +83,8 @@ pub(crate) fn interruption_state_summary(
 ) -> InterruptionStateSummary {
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
-        tool_calls_completed: state.total_tool_calls,
-        turns_completed: (state.max_turns - state.remaining_turns) as u32,
+        tool_calls_completed: completed_tool_calls(state),
+        turns_completed: current_agentic_step(state),
         remaining_turns: state.remaining_turns as u32,
         error_detail,
     }
@@ -116,6 +139,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
                 &state.skills.quality_tracker,
                 &state.skills.pinned,
                 &state.skills.discovered,
+                &state.skills.invoked,
                 &state.skills.search,
             );
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
@@ -343,7 +367,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.turn_event_buffer = Some(
             astra_services::session_journal::TurnEventBuffer::begin_turn(
                 state.current_session_id.as_deref(),
-                state.session_turn,
+                session_turn_number(state),
             ),
         );
     }
@@ -518,6 +542,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 &state.skills.quality_tracker,
                 &state.skills.pinned,
                 &state.skills.discovered,
+                &state.skills.invoked,
                 &state.skills.search,
             );
             Some(crate::turn::skill_tool::skill_listing_system_message(
@@ -767,5 +792,16 @@ mod tests {
 
         let expected = delegate_tool_schema();
         assert_eq!(host.injected_schemas[0], expected);
+    }
+
+    #[test]
+    fn session_turn_number_prefers_explicit_outer_turn_over_agentic_step() {
+        let mut state = make_state();
+        state.session_turn = 1;
+        state.max_turns = 50;
+        state.remaining_turns = 0;
+
+        assert_eq!(current_agentic_step(&state), 50);
+        assert_eq!(session_turn_number(&state), 1);
     }
 }

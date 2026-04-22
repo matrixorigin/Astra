@@ -1295,6 +1295,11 @@ pub(crate) mod tests {
         state.remaining_turns = 0;
         state.total_tool_calls = 3;
         state.total_prompt = 120;
+        state.stall.tool_call_records = vec![
+            tool_record("bash", true, Some("ok")),
+            tool_record("read_file", true, Some("ok")),
+            tool_record("grep", true, Some("ok")),
+        ];
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -6908,6 +6913,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 ts: chrono::Utc::now().to_rfc3339(),
                 session_id: Some("sess-reflect".to_string()),
                 turn: Some(3),
+                agentic_step: None,
                 model: Some("gpt-5.4".to_string()),
                 user_input: Some("debug bash timeout".to_string()),
                 assistant_output: None,

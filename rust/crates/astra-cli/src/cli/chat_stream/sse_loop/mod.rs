@@ -198,7 +198,18 @@ pub(crate) async fn stream_chat_sse(
     let mut prefetch_injected = false;
     let mut prefetch_task_type: Option<String> = None;
     let mut prefetch_body_bytes: Option<usize> = None;
-    if !p.plan_only_chat && !p.is_plan_subtask {
+    if let Some(ctx) = p.prefetched_context_override.take() {
+        prefetch_task_type = Some(ctx.task_type.to_string());
+        prefetch_body_bytes = Some(ctx.body.len());
+        astra_core::agent_info!(
+            "prefetch",
+            "injected override task_type={} body_bytes={}",
+            ctx.task_type,
+            ctx.body.len()
+        );
+        crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
+        prefetch_injected = true;
+    } else if !p.plan_only_chat && !p.is_plan_subtask {
         // Detect task type first (cheap, synchronous) before touching the spinner.
         if let Some(task_type) = astra_runtime::prompts::detect_task_type(p.message) {
             // Stop the generic "Preparing…" spinner and show a task-specific one.

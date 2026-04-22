@@ -100,6 +100,8 @@ pub(super) fn handle_debug_command(arg: &str, state: &ReplState) {
                 tools_used: Vec::new(),
                 tool_calls: Vec::new(),
                 selector_strategy: None,
+                llm_rounds: Vec::new(),
+                interruptions: Vec::new(),
             };
             inspect_turn(1, &stub, Some(&view), &session_id);
         } else {
@@ -552,6 +554,22 @@ fn dump_turn_json(
                 "tool_count": summary.tool_count,
                 "tools_used": summary.tools_used,
                 "selector_strategy": summary.selector_strategy,
+                "llm_rounds": summary.llm_rounds.iter().map(|round| serde_json::json!({
+                    "round": round.round,
+                    "agentic_step": round.agentic_step,
+                    "source": round.source,
+                    "run_id": round.run_id,
+                    "finish_reason": round.finish_reason,
+                    "tool_calls_returned": round.tool_calls_returned,
+                })).collect::<Vec<_>>(),
+                "interruptions": summary.interruptions.iter().map(|interruption| serde_json::json!({
+                    "kind": interruption.kind,
+                    "resumable": interruption.resumable,
+                    "agentic_step": interruption.agentic_step,
+                    "tool_calls_completed": interruption.tool_calls_completed,
+                    "turns_completed": interruption.turns_completed,
+                    "remaining_turns": interruption.remaining_turns,
+                })).collect::<Vec<_>>(),
             },
             "messages_delta": v.delta,
         })
@@ -585,6 +603,48 @@ fn show_summary(summary: &TurnSummary) {
         summary.tool_count,
         summary.tools_used.join(", ")
     );
+    if !summary.llm_rounds.is_empty() {
+        eprintln!("  llm:      {} round(s)", summary.llm_rounds.len());
+        for round in &summary.llm_rounds {
+            let source = round.source.as_deref().unwrap_or("agentic_loop");
+            let finish_reason = round.finish_reason.as_deref().unwrap_or("-");
+            let step = round
+                .agentic_step
+                .map(|value| format!(" step={value}"))
+                .unwrap_or_default();
+            let run = round
+                .run_id
+                .as_deref()
+                .map(|value| format!(" run={value}"))
+                .unwrap_or_default();
+            eprintln!(
+                "            r{}{} {} finish={} tools={}{}",
+                round.round.unwrap_or(0),
+                step,
+                source,
+                finish_reason,
+                round.tool_calls_returned,
+                run,
+            );
+        }
+    }
+    if !summary.interruptions.is_empty() {
+        for interruption in &summary.interruptions {
+            let step = interruption
+                .agentic_step
+                .map(|value| format!(" step={value}"))
+                .unwrap_or_default();
+            eprintln!(
+                "  stop:     {}{} resumable={} tools={} turns={} remaining={}",
+                interruption.kind,
+                step,
+                interruption.resumable,
+                interruption.tool_calls_completed,
+                interruption.turns_completed,
+                interruption.remaining_turns,
+            );
+        }
+    }
     if let Some(ref sel) = summary.selector_strategy {
         eprintln!("  selector: {}", sel);
     }
@@ -651,6 +711,8 @@ struct TurnSummary {
     tools_used: Vec<String>,
     tool_calls: Vec<ToolCallSummary>,
     selector_strategy: Option<String>,
+    llm_rounds: Vec<LlmRoundSummary>,
+    interruptions: Vec<InterruptionSummary>,
 }
 
 #[derive(Debug)]
@@ -662,72 +724,176 @@ struct ToolCallSummary {
     args_preview: Option<String>,
 }
 
+#[derive(Debug)]
+struct LlmRoundSummary {
+    round: Option<u32>,
+    agentic_step: Option<u32>,
+    source: Option<String>,
+    run_id: Option<String>,
+    finish_reason: Option<String>,
+    tool_calls_returned: u64,
+}
+
+#[derive(Debug)]
+struct InterruptionSummary {
+    kind: String,
+    resumable: bool,
+    agentic_step: Option<u32>,
+    tool_calls_completed: u64,
+    turns_completed: u64,
+    remaining_turns: u64,
+}
+
 fn load_journal_turns(path: &PathBuf) -> Vec<TurnSummary> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    content
+    let entries: Vec<serde_json::Value> = content
         .lines()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            if v.get("type")?.as_str()? != "turn" {
-                return None;
-            }
-            let tool_calls = v
-                .get("tool_calls")
-                .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|tc| {
-                            Some(ToolCallSummary {
-                                name: tc.get("name")?.as_str()?.to_string(),
-                                ok: tc.get("ok")?.as_bool()?,
-                                input_bytes: tc
-                                    .get("input_bytes")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                output_bytes: tc
-                                    .get("output_bytes")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                args_preview: tc
-                                    .get("args_preview")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                            })
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let mut turns = Vec::new();
+    let mut turn_index_by_id = std::collections::HashMap::new();
+
+    for v in &entries {
+        if v.get("type").and_then(|v| v.as_str()) != Some("turn") {
+            continue;
+        }
+        let tool_calls = v
+            .get("tool_calls")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| {
+                        Some(ToolCallSummary {
+                            name: tc.get("name")?.as_str()?.to_string(),
+                            ok: tc.get("ok")?.as_bool()?,
+                            input_bytes: tc
+                                .get("input_bytes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            output_bytes: tc
+                                .get("output_bytes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            args_preview: tc
+                                .get("args_preview")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
                         })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let journal_turn = v.get("turn").and_then(|t| t.as_u64()).map(|u| u as u32);
+        let idx = turns.len();
+        turns.push(TurnSummary {
+            journal_turn,
+            user_input: v
+                .get("user_input")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            tokens_in: v.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
+            tokens_out: v.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
+            duration_ms: v.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            ttft_ms: v.get("ttft_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            tool_count: v.get("tool_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            tools_used: v
+                .get("tools_used")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
                         .collect()
                 })
-                .unwrap_or_default();
-            Some(TurnSummary {
-                journal_turn: v.get("turn").and_then(|t| t.as_u64()).map(|u| u as u32),
-                user_input: v
-                    .get("user_input")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                tokens_in: v.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
-                tokens_out: v.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
-                duration_ms: v.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-                ttft_ms: v.get("ttft_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-                tool_count: v.get("tool_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                tools_used: v
-                    .get("tools_used")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                tool_calls,
-                selector_strategy: v
-                    .get("selector_strategy")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            })
-        })
-        .collect()
+                .unwrap_or_default(),
+            tool_calls,
+            selector_strategy: v
+                .get("selector_strategy")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            llm_rounds: Vec::new(),
+            interruptions: Vec::new(),
+        });
+        if let Some(turn_id) = journal_turn {
+            turn_index_by_id.insert(turn_id, idx);
+        }
+    }
+
+    for v in &entries {
+        let Some(turn_id) = v.get("turn").and_then(|t| t.as_u64()).map(|u| u as u32) else {
+            continue;
+        };
+        let Some(&idx) = turn_index_by_id.get(&turn_id) else {
+            continue;
+        };
+        match v.get("type").and_then(|v| v.as_str()) {
+            Some("llm_round") => {
+                let meta = v.get("metadata");
+                turns[idx].llm_rounds.push(LlmRoundSummary {
+                    round: v.get("round").and_then(|v| v.as_u64()).map(|u| u as u32),
+                    agentic_step: v
+                        .get("agentic_step")
+                        .and_then(|v| v.as_u64())
+                        .map(|u| u as u32),
+                    source: meta
+                        .and_then(|m| m.get("source"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    run_id: meta
+                        .and_then(|m| m.get("run_id"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    finish_reason: meta
+                        .and_then(|m| m.get("finish_reason"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    tool_calls_returned: v
+                        .get("tool_calls_returned")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                });
+            }
+            Some("interruption_recorded") => {
+                let interruption = v
+                    .get("metadata")
+                    .and_then(|m| m.get("interruption"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                turns[idx].interruptions.push(InterruptionSummary {
+                    kind: interruption
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    resumable: interruption
+                        .get("resumable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    agentic_step: v
+                        .get("agentic_step")
+                        .and_then(|v| v.as_u64())
+                        .map(|u| u as u32),
+                    tool_calls_completed: interruption
+                        .get("tool_calls_completed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    turns_completed: interruption
+                        .get("turns_completed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    remaining_turns: interruption
+                        .get("remaining_turns")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    turns
 }
 
 fn list_heavy_checkpoints(session_dir: &Path) -> Vec<PathBuf> {
@@ -1096,6 +1262,28 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert!(turns[0].tool_calls.is_empty());
         assert_eq!(turns[0].journal_turn, Some(1));
+    }
+
+    #[test]
+    fn load_journal_turns_attaches_llm_rounds_and_interruptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":2,"agentic_step":4,"round":1,"tool_calls_returned":2,"metadata":{"source":"bridge_inprocess","run_id":"run-7","finish_reason":"tool_calls"}}"#, "\n",
+            r#"{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"s1","turn":2,"agentic_step":4,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":3,"turns_completed":4,"remaining_turns":0}}}"#, "\n",
+            r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":2,"user_input":"continue","assistant_output":"done","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"tools_selected":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000}"#, "\n",
+        )).unwrap();
+        let turns = load_journal_turns(&path);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].llm_rounds.len(), 1);
+        assert_eq!(turns[0].llm_rounds[0].agentic_step, Some(4));
+        assert_eq!(
+            turns[0].llm_rounds[0].source.as_deref(),
+            Some("bridge_inprocess")
+        );
+        assert_eq!(turns[0].interruptions.len(), 1);
+        assert_eq!(turns[0].interruptions[0].kind, "budget_exhausted");
+        assert_eq!(turns[0].interruptions[0].tool_calls_completed, 3);
     }
 
     // ── Heavy checkpoint loading & deltas ───────────────────────────────

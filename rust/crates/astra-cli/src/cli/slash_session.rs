@@ -1781,28 +1781,74 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 );
                             }
                             session_journal::JournalEventType::InterruptionRecorded => {
-                                let kind = evt
+                                let interruption = evt
                                     .metadata
                                     .as_ref()
                                     .and_then(|m| m.get("interruption"))
-                                    .and_then(|v| v.get("kind"))
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                let kind = interruption
+                                    .get("kind")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown");
-                                let resumable = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("interruption"))
-                                    .and_then(|v| v.get("resumable"))
+                                let resumable = interruption
+                                    .get("resumable")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false);
+                                let tool_calls_completed = interruption
+                                    .get("tool_calls_completed")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let turns_completed = interruption
+                                    .get("turns_completed")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let remaining_turns = interruption
+                                    .get("remaining_turns")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let step_suffix = evt
+                                    .agentic_step
+                                    .map(|step| format!(" step={step}"))
+                                    .unwrap_or_default();
                                 let icon = if resumable { "⏸" } else { "⛔" };
                                 eprintln!(
-                                    "  {} {} T{} interruption: {} (resumable={})",
+                                    "  {} {} T{}{} interruption: {} (resumable={}, tools={}, turns={}, remaining={})",
                                     ts_short.dim(),
                                     icon.yellow(),
                                     evt.turn.unwrap_or(0),
+                                    step_suffix.dim(),
                                     kind,
                                     resumable,
+                                    tool_calls_completed,
+                                    turns_completed,
+                                    remaining_turns,
+                                );
+                            }
+                            session_journal::JournalEventType::LlmRound => {
+                                let meta = evt.metadata.as_ref();
+                                let source = meta
+                                    .and_then(|m| m.get("source"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("agentic_loop");
+                                let finish_reason = meta
+                                    .and_then(|m| m.get("finish_reason"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("-");
+                                let step_suffix = evt
+                                    .agentic_step
+                                    .map(|step| format!(" step={step}"))
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} {} T{}{} r{} llm: {} (finish={}, tools={})",
+                                    ts_short.dim(),
+                                    "◌".dim(),
+                                    evt.turn.unwrap_or(0),
+                                    step_suffix.dim(),
+                                    evt.round.unwrap_or(0),
+                                    source,
+                                    finish_reason,
+                                    evt.tool_calls_returned.unwrap_or(0),
                                 );
                             }
                             session_journal::JournalEventType::ConfidenceDiagnosisRecorded => {
@@ -1846,7 +1892,6 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     tokens_freed,
                                 );
                             }
-                            _ => {}
                         }
                     }
                     // Summary stats

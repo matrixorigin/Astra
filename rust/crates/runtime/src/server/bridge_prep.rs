@@ -120,6 +120,7 @@ fn extract_tool_name(tool: &serde_json::Value) -> Option<&str> {
 pub(super) struct PreparedChatTurnBridgeRequest {
     pub(super) body: Bytes,
     pub(super) trusted_session_id: Option<String>,
+    pub(super) session_turn: Option<String>,
     pub(super) turn_chain_id: Option<String>,
     pub(super) user_query_event_id: Option<String>,
     pub(super) tools_changed: Option<bool>,
@@ -136,6 +137,7 @@ impl PreparedChatTurnBridgeRequest {
         Self {
             body,
             trusted_session_id: None,
+            session_turn: None,
             turn_chain_id: None,
             user_query_event_id: None,
             tools_changed: None,
@@ -228,18 +230,21 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     ) {
         seed_bridge_session_created_at(state, session_id, created_at).await;
     }
-
     // ── Turn identifiers ────────────────────────────────────────────────
-    let (turn_chain_id, user_query_event_id) =
+    let (turn_chain_id, user_query_event_id, session_turn) =
         if let Some(session_id) = trusted_session_id.as_deref() {
             let messages = request.messages_slice();
             let has_tool_results = request.has_tool_results();
-            let (chain_id, event_id) =
+            let (chain_id, event_id, session_turn) =
                 prepare_chat_turn_bridge_identifiers(state, session_id, messages, has_tool_results)
                     .await;
-            (Some(chain_id), Some(event_id))
+            (
+                Some(chain_id),
+                Some(event_id),
+                Some(session_turn.to_string()),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
     // ── Cached inputs + tool trimming ───────────────────────────────────
@@ -273,6 +278,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         .map(|body| PreparedChatTurnBridgeRequest {
             body,
             trusted_session_id,
+            session_turn,
             turn_chain_id,
             user_query_event_id,
             tools_changed,
@@ -283,6 +289,20 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             execution_state_b64,
         })
         .map_err(internal_error)
+}
+
+async fn infer_bridge_session_turn(state: &AppState, session_id: &str) -> u32 {
+    let Some(shared_pool) = state.shared_pool.as_ref() else {
+        return 1;
+    };
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
+    )
+    .bind(session_id)
+    .fetch_one(shared_pool.get())
+    .await
+    .unwrap_or(0);
+    (count.max(0) as u32).saturating_add(1)
 }
 
 async fn seed_bridge_session_created_at(state: &AppState, session_id: &str, created_at: &str) {
@@ -334,10 +354,12 @@ async fn prepare_chat_turn_bridge_identifiers(
     session_id: &str,
     messages: &[serde_json::Value],
     has_tool_results: bool,
-) -> (String, String) {
+) -> (String, String, u32) {
+    let inferred_session_turn = infer_bridge_session_turn(state, session_id).await;
     let now = current_unix_seconds();
     let mut cache = state.chat_turn_bridge_cache.lock().await;
     let mut prev_entry = cache.get(session_id, now);
+    let is_continuation = bridge_turn_is_continuation(messages, has_tool_results);
     let new_turn_chain_id = Uuid::now_v7().to_string();
     let new_user_query_event_id = Uuid::now_v7().to_string();
     let (turn_chain_id, user_query_event_id) = resolve_turn_identifiers(
@@ -347,6 +369,17 @@ async fn prepare_chat_turn_bridge_identifiers(
         &new_turn_chain_id,
         &new_user_query_event_id,
     );
+    let session_turn = if is_continuation {
+        prev_entry
+            .as_ref()
+            .and_then(|entry| entry.get("session_turn"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|turn| u32::try_from(turn).ok())
+            .filter(|turn| *turn > 0)
+            .unwrap_or(inferred_session_turn)
+    } else {
+        inferred_session_turn
+    };
     let mut updated_entry = prev_entry.unwrap_or_default();
     updated_entry.insert(
         "turn_chain_id".to_string(),
@@ -356,8 +389,21 @@ async fn prepare_chat_turn_bridge_identifiers(
         "user_query_event_id".to_string(),
         serde_json::Value::String(user_query_event_id.clone()),
     );
+    updated_entry.insert("session_turn".to_string(), serde_json::json!(session_turn));
     cache.insert(session_id.to_string(), updated_entry, now);
-    (turn_chain_id, user_query_event_id)
+    (turn_chain_id, user_query_event_id, session_turn)
+}
+
+fn bridge_turn_is_continuation(messages: &[serde_json::Value], has_tool_results: bool) -> bool {
+    let latest_conversation_role = messages.iter().rev().find_map(|message| {
+        match message.get("role").and_then(serde_json::Value::as_str) {
+            Some("user" | "assistant" | "tool") => {
+                message.get("role").and_then(serde_json::Value::as_str)
+            }
+            _ => None,
+        }
+    });
+    latest_conversation_role != Some("user") && has_tool_results
 }
 
 async fn prepare_chat_turn_bridge_cached_inputs(
@@ -623,11 +669,45 @@ mod tests {
             prepared.trusted_session_id.as_deref(),
             Some("bound-session")
         );
+        assert_eq!(prepared.session_turn.as_deref(), Some("1"));
         assert!(prepared.turn_chain_id.is_some());
         assert!(prepared.user_query_event_id.is_some());
         let payload: serde_json::Value =
             serde_json::from_slice(&prepared.body).expect("prepared body should be valid json");
         assert_eq!(payload["session_id"], "bound-session");
+    }
+
+    #[tokio::test]
+    async fn prepare_body_reuses_cached_session_turn_for_continuation() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let now = current_unix_seconds();
+        {
+            let mut cache = state.chat_turn_bridge_cache.lock().await;
+            let mut entry = serde_json::Map::new();
+            entry.insert("turn_chain_id".to_string(), json!("chain-6"));
+            entry.insert("user_query_event_id".to_string(), json!("query-6"));
+            entry.insert("session_turn".to_string(), json!(6));
+            cache.insert("bound-session".to_string(), entry, now);
+        }
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
+                    {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+                ],
+                "tool_results": [{"name": "bash", "output": "done"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let prepared =
+            prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+                .expect("continuation should prepare");
+
+        assert_eq!(prepared.session_turn.as_deref(), Some("6"));
+        assert_eq!(prepared.turn_chain_id.as_deref(), Some("chain-6"));
+        assert_eq!(prepared.user_query_event_id.as_deref(), Some("query-6"));
     }
 
     // ── same_tool_names ─────────────────────────────────────────────
@@ -1136,6 +1216,7 @@ mod tests {
         let result = PreparedChatTurnBridgeRequest::passthrough(body.clone());
         assert_eq!(result.body, body);
         assert!(result.trusted_session_id.is_none());
+        assert!(result.session_turn.is_none());
         assert!(result.turn_chain_id.is_none());
         assert!(result.user_query_event_id.is_none());
         assert!(result.tools_changed.is_none());

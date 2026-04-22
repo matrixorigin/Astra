@@ -4695,6 +4695,8 @@ impl StreamRenderState {
         let line_count = output.lines().count();
         let byte_size = output.len();
         match tool {
+            "mo_query" => summarize_mo_query_output(output).map(structural),
+            "web_fetch" => summarize_web_fetch_output(output).map(structural),
             "bash" | "shell" | "shell_exec" | "run_build_test" => {
                 if output.trim().is_empty() {
                     return None;
@@ -4925,6 +4927,9 @@ impl StreamRenderState {
                 if output.trim().is_empty() {
                     return None;
                 }
+                if let Some(summary) = summarize_json_output(output) {
+                    return Some(structural(summary));
+                }
                 let meaningful_count = output
                     .lines()
                     .map(|l| l.trim())
@@ -4939,7 +4944,9 @@ impl StreamRenderState {
                 )))
             }
             _ => {
-                if line_count > 1 {
+                if let Some(summary) = summarize_json_output(output) {
+                    Some(structural(summary))
+                } else if line_count > 1 {
                     Some(structural(format!("{line_count} lines")))
                 } else if output.trim().is_empty() {
                     None
@@ -4965,6 +4972,165 @@ fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
         format!("1 {singular}")
     } else {
         format!("{count} {plural}")
+    }
+}
+
+fn mysql_table_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .filter(|cell| !cell.is_empty())
+        .collect()
+}
+
+fn summarize_mo_query_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(line) = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Query OK") || line.contains("rows affected"))
+    {
+        return Some(truncate_line(line, 80));
+    }
+
+    let table_rows: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|'))
+        .collect();
+    if table_rows.is_empty() {
+        return None;
+    }
+
+    let columns = mysql_table_cells(table_rows[0]);
+    if columns.is_empty() {
+        return None;
+    }
+    let row_count = table_rows.len().saturating_sub(1);
+    let preview_columns: Vec<String> = columns.iter().take(4).cloned().collect();
+    let remaining = columns.len().saturating_sub(preview_columns.len());
+    let columns_preview = if remaining > 0 {
+        format!("{} … +{remaining}", preview_columns.join(", "))
+    } else {
+        preview_columns.join(", ")
+    };
+
+    Some(format!(
+        "{} · cols: {}",
+        pluralize_with_count(row_count, "row", "rows"),
+        truncate_line(&columns_preview, 60)
+    ))
+}
+
+fn summarize_json_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || (!trimmed.starts_with('{') && !trimmed.starts_with('[')) {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    match value {
+        Value::Object(map) => {
+            let mut all_keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            all_keys.sort_unstable();
+            let keys: Vec<&str> = all_keys.into_iter().take(4).collect();
+            let remaining = map.len().saturating_sub(keys.len());
+            let key_preview = if keys.is_empty() {
+                "no keys".to_string()
+            } else if remaining > 0 {
+                format!("{} … +{remaining}", keys.join(", "))
+            } else {
+                keys.join(", ")
+            };
+            Some(format!(
+                "json object · keys: {}",
+                truncate_line(&key_preview, 60)
+            ))
+        }
+        Value::Array(items) => {
+            let count = items.len();
+            let mut object_keys: Vec<&str> = items
+                .first()
+                .and_then(Value::as_object)
+                .map(|obj| obj.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            object_keys.sort_unstable();
+            object_keys.truncate(4);
+            if object_keys.is_empty() {
+                Some(format!(
+                    "json array · {}",
+                    pluralize_with_count(count, "item", "items")
+                ))
+            } else {
+                let remaining = items
+                    .first()
+                    .and_then(Value::as_object)
+                    .map(|obj| obj.len().saturating_sub(object_keys.len()))
+                    .unwrap_or(0);
+                let key_preview = if remaining > 0 {
+                    format!("{} … +{remaining}", object_keys.join(", "))
+                } else {
+                    object_keys.join(", ")
+                };
+                Some(format!(
+                    "json array · {} · keys: {}",
+                    pluralize_with_count(count, "item", "items"),
+                    truncate_line(&key_preview, 40)
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn summarize_web_fetch_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let non_empty_lines = trimmed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if non_empty_lines == 0 {
+        return None;
+    }
+
+    let markdown_title = trimmed.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("# ")
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(ToString::to_string)
+    });
+
+    let html_title = {
+        let lower = trimmed.to_ascii_lowercase();
+        let start = lower.find("<title>");
+        let end = lower.find("</title>");
+        match (start, end) {
+            (Some(start), Some(end)) if end > start + "<title>".len() => {
+                Some(trimmed[start + "<title>".len()..end].trim().to_string())
+            }
+            _ => None,
+        }
+    };
+
+    let title = markdown_title.or(html_title);
+    match title {
+        Some(title) => Some(format!(
+            "{} · {}",
+            truncate_line(&title, 60),
+            pluralize_with_count(non_empty_lines, "line", "lines")
+        )),
+        None => Some(format!(
+            "{} fetched",
+            pluralize_with_count(non_empty_lines, "line", "lines")
+        )),
     }
 }
 
@@ -6823,6 +6989,17 @@ mod tests {
     }
 
     #[test]
+    fn mcp_output_summary_formats_json_arrays_structurally() {
+        let r = StreamRenderState::new();
+        let output = r#"[{"name":"repo1","stars":10},{"name":"repo2","stars":5}]"#;
+        let summary = r
+            .format_output_summary("mcp_github_search", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "json array · 2 items · keys: name, stars");
+    }
+
+    #[test]
     fn mcp_output_summary_empty() {
         let r = StreamRenderState::new();
         assert!(
@@ -6889,6 +7066,67 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert!(summary.text.contains("+1"));
         assert!(summary.text.contains("-1"));
         assert!(summary.text.contains("src/a.rs"));
+    }
+
+    #[test]
+    fn generic_output_summary_formats_json_objects_structurally() {
+        let r = StreamRenderState::new();
+        let output = r#"{"status":"ok","count":2,"items":["a","b"]}"#;
+        let summary = r
+            .format_output_summary("custom_tool", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "json object · keys: count, items, status");
+    }
+
+    #[test]
+    fn web_fetch_output_summary_uses_markdown_heading() {
+        let r = StreamRenderState::new();
+        let output = "# MatrixOne Docs\n\nWelcome to the docs.\nMore details.";
+        let summary = r
+            .format_output_summary("web_fetch", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "MatrixOne Docs · 3 lines");
+    }
+
+    #[test]
+    fn web_fetch_output_summary_uses_html_title() {
+        let r = StreamRenderState::new();
+        let output =
+            "<html><head><title>Release Notes</title></head><body><p>Shipped.</p></body></html>";
+        let summary = r
+            .format_output_summary("web_fetch", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "Release Notes · 1 line");
+    }
+
+    #[test]
+    fn mo_query_output_summary_extracts_row_and_column_counts() {
+        let r = StreamRenderState::new();
+        let output = "\
++----+-------+\n\
+| id | name  |\n\
++----+-------+\n\
+| 1  | alice |\n\
+| 2  | bob   |\n\
++----+-------+\n";
+        let summary = r
+            .format_output_summary("mo_query", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "2 rows · cols: id, name");
+    }
+
+    #[test]
+    fn mo_query_output_summary_handles_query_ok_messages() {
+        let r = StreamRenderState::new();
+        let summary = r
+            .format_output_summary("mo_query", "Query OK, 1 row affected (0.02 sec)", "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(summary.text, "Query OK, 1 row affected (0.02 sec)");
     }
 
     // ── Text buffering contract ─────────────────────────────────────────

@@ -1821,6 +1821,7 @@ fn apply_prepared_headers(
         };
     }
     set_header!(trusted_session_id, "x-mo-session-id");
+    set_header!(session_turn, "x-mo-session-turn");
     set_header!(turn_chain_id, "x-mo-turn-chain-id");
     set_header!(user_query_event_id, "x-mo-user-query-event-id");
     set_header!(task_hint, "x-mo-task-hint");
@@ -2700,6 +2701,7 @@ mod tests {
         let prepared = PreparedChatTurnBridgeRequest {
             body: Bytes::new(),
             trusted_session_id: Some("sess-1".into()),
+            session_turn: Some("4".into()),
             turn_chain_id: Some("run-1".into()),
             user_query_event_id: None,
             tools_changed: None,
@@ -2789,6 +2791,7 @@ mod tests {
         let prepared = PreparedChatTurnBridgeRequest {
             body: Bytes::new(),
             trusted_session_id: Some("sess-1".into()),
+            session_turn: Some("4".into()),
             turn_chain_id: None,
             user_query_event_id: None,
             tools_changed: None,
@@ -3434,6 +3437,7 @@ mod tests {
         PreparedChatTurnBridgeRequest {
             body: Bytes::from("{}"),
             trusted_session_id: Some("s1".into()),
+            session_turn: Some("4".into()),
             turn_chain_id: Some("tc1".into()),
             user_query_event_id: Some("uqe1".into()),
             tools_changed: Some(true),
@@ -3449,6 +3453,7 @@ mod tests {
         PreparedChatTurnBridgeRequest {
             body: Bytes::from("{}"),
             trusted_session_id: None,
+            session_turn: None,
             turn_chain_id: None,
             user_query_event_id: None,
             tools_changed: None,
@@ -3467,6 +3472,7 @@ mod tests {
         apply_prepared_headers(&mut headers, &prepared);
 
         assert_eq!(headers.get("x-mo-session-id").unwrap(), "s1");
+        assert_eq!(headers.get("x-mo-session-turn").unwrap(), "4");
         assert_eq!(headers.get("x-mo-turn-chain-id").unwrap(), "tc1");
         assert_eq!(headers.get("x-mo-user-query-event-id").unwrap(), "uqe1");
         assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");

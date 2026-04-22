@@ -1132,6 +1132,7 @@ async fn plan_executor_task(
                     api: &ctx.api,
                     token: &ctx.token,
                     message: &prompt,
+                    prefetched_context_override: None,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
                     explain: crate::ExplainMode::Off,
@@ -2113,6 +2114,9 @@ mod tests {
             finish_reason: None,
             tool_calls_returned: 0,
             tool_call_names: vec![],
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -2156,6 +2160,9 @@ mod tests {
                 finish_reason: None,
                 tool_calls_returned: 1,
                 tool_call_names: vec!["bash".into()],
+                agentic_step: None,
+                source: None,
+                run_id: None,
             });
         }
         // Emit observability events first (mirrors Ok(result) branch).
@@ -2217,6 +2224,9 @@ mod tests {
             finish_reason: None,
             tool_calls_returned: 1,
             tool_call_names: vec!["bash".into()],
+            agentic_step: None,
+            source: None,
+            run_id: None,
         });
 
         // Simulate the plan_executor emit loop: inject subtask_id on LlmRound events.

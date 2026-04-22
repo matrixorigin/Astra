@@ -425,10 +425,13 @@ fn events_of_type<'a>(events: &'a [Value], ty: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-async fn wait_for_journal(session_id: &str) -> Vec<astra_services::session_journal::JournalEvent> {
-    for _ in 0..50 {
+async fn wait_for_journal_event_type(
+    session_id: &str,
+    event_type: JournalEventType,
+) -> Vec<astra_services::session_journal::JournalEvent> {
+    for _ in 0..100 {
         if let Ok(events) = read_journal(session_id)
-            && !events.is_empty()
+            && events.iter().any(|event| event.event_type == event_type)
         {
             return events;
         }
@@ -605,7 +608,7 @@ async fn bridge_turn_persists_llm_round_journal_event() {
     let events = parse_sse_events(&raw);
     assert_eq!(events_of_type(&events, "tool_request").len(), 1);
 
-    let journal_events = wait_for_journal(&session_id).await;
+    let journal_events = wait_for_journal_event_type(&session_id, JournalEventType::LlmRound).await;
     let llm_round = journal_events
         .iter()
         .find(|event| event.event_type == JournalEventType::LlmRound)
