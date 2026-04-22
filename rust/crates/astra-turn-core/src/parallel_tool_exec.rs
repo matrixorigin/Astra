@@ -27,6 +27,13 @@ pub const MAX_CONCURRENT_READ_ONLY: usize = 10;
 
 /// Read-only tool names that are safe for parallel execution.
 /// These tools do not modify the filesystem or have side-effects.
+///
+/// NOTE: This list should stay in sync with
+/// `astra_turn_core::sse_stream_host::is_tool_concurrency_safe` for the tools
+/// advertised in the prompt's "Batching read-only tool calls" section. The two
+/// lists are not forcibly unified (different scopes: concurrency safety vs
+/// strict read-only classification), but the prompt-advertised set must appear
+/// in both.
 static READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "file_read",
@@ -48,6 +55,15 @@ static READ_ONLY_TOOLS: &[&str] = &[
     "list_files",
     "find_files",
     "view_file",
+    // git read-only inspection tools (no mutation)
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+    // code-intelligence read-only queries
+    "find_definition",
+    "find_references",
 ];
 
 /// Classify a tool call as read-only or mutating.
