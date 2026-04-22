@@ -474,6 +474,48 @@ fn is_credential_error(msg: &str) -> bool {
         || lower.contains("401")
 }
 
+/// Pick the `plan_progress` action for end-of-plan emission.
+///
+/// Bug #3 regression: previously the executor emitted `plan_complete` at 100%
+/// unconditionally once all subtasks had their status flipped to `Completed`,
+/// even when the global verifier said the plan was incorrect or when
+/// individual subtasks had been force-completed after exhausting their retry
+/// budget (`verification_completed {passed:false, retries_exhausted:true}`).
+///
+/// This produced journals where an agent appeared to succeed while
+/// downstream learning signals and UI would misinterpret a failed plan as
+/// successful. Returning `plan_failed` in those cases lets consumers
+/// distinguish the two outcomes without changing the 100% progress_pct
+/// semantics callers already expect.
+fn plan_completion_action(global_passed: bool, any_subtask_verification_failed: bool) -> &'static str {
+    if !global_passed || any_subtask_verification_failed {
+        "plan_failed"
+    } else {
+        "plan_complete"
+    }
+}
+
+/// Return true if any subtask has a `Failed` status *or* the durable contract
+/// records an unresolved `VerificationFailed` stage for any subtask. Used by
+/// [`plan_completion_action`] at end-of-plan emission.
+fn has_any_unresolved_verification_failure(
+    subtasks: &[astra_services::task_orchestrator::SubtaskPlan],
+    durable: Option<&super::durable_bridge::DurableTaskState>,
+) -> bool {
+    use astra_services::durable_task::SubtaskStage;
+    use astra_services::task_orchestrator::TaskStatus;
+
+    if subtasks.iter().any(|s| matches!(s.status, TaskStatus::Failed)) {
+        return true;
+    }
+    durable.is_some_and(|d| {
+        d.contract
+            .subtasks
+            .iter()
+            .any(|s| matches!(s.stage, SubtaskStage::VerificationFailed { .. }))
+    })
+}
+
 /// Build a one-line evidence sentence naming the tools with the highest
 /// failure rates across the caller's `ToolHealthEntry` set, so the retry
 /// hint can steer away from known-failing tools rather than emitting a
@@ -860,14 +902,29 @@ async fn plan_executor_task(
                     let _ = update_tx.send(PlanUpdate::DeliveryReport(report.clone()));
                 }
 
-                // Emit plan_completed journal + cloud event
+                // Emit plan completion journal + cloud event. Bug #3
+                // regression: previously this always emitted `plan_complete`
+                // at 100%, even when the global verifier rejected the plan
+                // (or individual subtasks had `retries_exhausted` and were
+                // force-marked Completed). That produced confusing journals
+                // where `plan_progress {action:"completed", progress_pct:100}`
+                // sat next to `verification_completed {passed:false}` for
+                // the same subtasks. Surface verification outcome in the
+                // action so downstream consumers (self_surface, UI, learning
+                // signals) can distinguish a genuinely finished plan from
+                // one that merely exhausted its retry budget.
                 let total = ctx.plan.subtasks.len();
+                let any_subtask_verification_failed = has_any_unresolved_verification_failure(
+                    &ctx.plan.subtasks,
+                    ctx.durable_task_state.as_ref(),
+                );
+                let action = plan_completion_action(global_passed, any_subtask_verification_failed);
                 let event = session_journal::JournalEvent::plan_progress(
                     ctx.session_id.as_deref(),
                     ctx.turn,
                     "",
                     ctx.plan_goal.as_deref().unwrap_or("plan"),
-                    "plan_complete",
+                    action,
                     100,
                     total,
                     total,
@@ -2292,5 +2349,59 @@ mod tests {
         assert!(is_credential_error("Authentication failed: token expired"));
         assert!(!is_credential_error("network timeout"));
         assert!(!is_credential_error("tool execution failed"));
+    }
+
+    // ── Bug #3 regression: plan_completion_action must reflect verification
+    // outcome, so downstream consumers (UI, learning signals, journal
+    // analysers) can distinguish a successful plan from one that merely
+    // exhausted retries. ─────────────────────────────────────────────────
+
+    #[test]
+    fn plan_completion_action_returns_complete_when_all_passed() {
+        assert_eq!(plan_completion_action(true, false), "plan_complete");
+    }
+
+    #[test]
+    fn plan_completion_action_returns_failed_when_global_verifier_failed() {
+        assert_eq!(plan_completion_action(false, false), "plan_failed");
+    }
+
+    #[test]
+    fn plan_completion_action_returns_failed_when_any_subtask_failed_verification() {
+        // Even if the global verifier was permissive (or absent), a single
+        // subtask with unresolved `VerificationFailed` must force the plan
+        // to report as failed. This prevents the "all subtasks Completed
+        // after retries_exhausted → plan_complete" false-positive observed
+        // in session 32c7c640.
+        assert_eq!(plan_completion_action(true, true), "plan_failed");
+    }
+
+    #[test]
+    fn plan_completion_action_failed_dominates_when_both_signals_bad() {
+        assert_eq!(plan_completion_action(false, true), "plan_failed");
+    }
+
+    #[test]
+    fn has_any_unresolved_verification_failure_detects_failed_status() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+        let subtasks = vec![SubtaskPlan {
+            id: "s1".into(),
+            title: "t".into(),
+            status: TaskStatus::Failed,
+            ..Default::default()
+        }];
+        assert!(has_any_unresolved_verification_failure(&subtasks, None));
+    }
+
+    #[test]
+    fn has_any_unresolved_verification_failure_returns_false_when_all_completed() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+        let subtasks = vec![SubtaskPlan {
+            id: "s1".into(),
+            title: "t".into(),
+            status: TaskStatus::Completed,
+            ..Default::default()
+        }];
+        assert!(!has_any_unresolved_verification_failure(&subtasks, None));
     }
 }

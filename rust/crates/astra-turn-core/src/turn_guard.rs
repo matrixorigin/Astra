@@ -112,12 +112,43 @@ pub struct TurnGuard {
     pub correction_history: Vec<CorrectionOutcome>,
 }
 
+/// Read-only core tools that are safe-by-construction and must never be
+/// hidden from the model, even after repeated spurious failures. Restricting
+/// a read-only tool typically creates a **false-positive cascade**: one bad
+/// verifier run deprioritizes `read_file`, the next turn can't observe file
+/// state, which causes further verification failures — snowballing into a
+/// stuck agent.
+///
+/// Mutating tools (bash, write_file, str_replace, delete_file, …) are
+/// **not** on this list — their deprioritization is a legitimate brake.
+///
+/// Keep in sync with the tool names registered in `schemas.rs`. Membership
+/// is checked case-sensitively.
+const READ_ONLY_NEVER_RESTRICT: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "git_status",
+    "git_diff",
+    "git_show",
+    "git_log",
+];
+
 /// Insert deprioritized tool names from [`TurnGuard`] into the selector restriction set (CLI parity).
+///
+/// Read-only tools in [`READ_ONLY_NEVER_RESTRICT`] are excluded: they can
+/// still be surfaced via `ToolHealthTracker::deprioritized_tools()` for
+/// telemetry/logging, but they are *not* removed from the model's tool
+/// schema. See the rationale on that constant.
 pub fn merge_deprioritized_tools_into_restricted(
     turn_guard: &TurnGuard,
     restricted: &mut HashSet<String>,
 ) {
     for t in turn_guard.health.deprioritized_tools() {
+        if READ_ONLY_NEVER_RESTRICT.contains(&t) {
+            continue;
+        }
         restricted.insert(t.to_string());
     }
 }
@@ -977,7 +1008,6 @@ mod tests {
     #[test]
     fn verdict_fields_reflect_actual_state() {
         let mut guard = TurnGuard::new();
-
         // Trigger stall AND divergence (same sig repeated — the unified
         // progress-aware detection treats a genuine loop identically for
         // both detectors once enough history accumulates).
@@ -1500,5 +1530,78 @@ mod tests {
         assert!((eff.success_after_correction_rate - 2.0 / 3.0).abs() < 0.01);
         // 1 out of 3 effective (followed AND succeeded)
         assert!((eff.effective_rate - 1.0 / 3.0).abs() < 0.01);
+    }
+
+    // ── Bug #2 regression: read-only tools must never be restricted even
+    // after repeated consecutive failures. Otherwise a single bad verifier
+    // cascade hides `read_file` from the schema and the agent can no
+    // longer observe file state. ─────────────────────────────────────────
+
+    fn deprioritize_tool(guard: &mut TurnGuard, name: &str, times: usize) {
+        for _ in 0..times {
+            guard.health.record_failure(name);
+        }
+    }
+
+    #[test]
+    fn merge_does_not_restrict_read_only_tools_even_after_many_failures() {
+        let mut guard = TurnGuard::new();
+        // Drive far past CONSECUTIVE_FAILURE_THRESHOLD for every read-only tool.
+        for tool in super::READ_ONLY_NEVER_RESTRICT {
+            deprioritize_tool(&mut guard, tool, 10);
+        }
+
+        let mut restricted: HashSet<String> = HashSet::new();
+        super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+
+        for tool in super::READ_ONLY_NEVER_RESTRICT {
+            assert!(
+                !restricted.contains(*tool),
+                "read-only tool `{tool}` must not be restricted after repeated failures; \
+                 restricting it creates a false-positive cascade (see bug #2)"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_still_restricts_mutating_tools_on_repeated_failure() {
+        // Guard-rail: the read-only exemption must not accidentally neutralise
+        // deprioritization for mutating tools. `bash`/`write_file` must still
+        // land in `restricted` so the model is steered away from them after
+        // repeated failures.
+        let mut guard = TurnGuard::new();
+        deprioritize_tool(&mut guard, "bash", 5);
+        deprioritize_tool(&mut guard, "write_file", 5);
+
+        let mut restricted: HashSet<String> = HashSet::new();
+        super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+
+        assert!(
+            restricted.contains("bash"),
+            "mutating tool `bash` must still be restricted after repeated failures"
+        );
+        assert!(
+            restricted.contains("write_file"),
+            "mutating tool `write_file` must still be restricted after repeated failures"
+        );
+    }
+
+    #[test]
+    fn merge_mixed_failures_exempts_only_read_only_names() {
+        // Complex case: both kinds fail repeatedly → the restriction set
+        // contains only the mutating ones.
+        let mut guard = TurnGuard::new();
+        deprioritize_tool(&mut guard, "read_file", 8);
+        deprioritize_tool(&mut guard, "grep", 4);
+        deprioritize_tool(&mut guard, "bash", 4);
+        deprioritize_tool(&mut guard, "str_replace", 4);
+
+        let mut restricted: HashSet<String> = HashSet::new();
+        super::merge_deprioritized_tools_into_restricted(&guard, &mut restricted);
+
+        assert!(!restricted.contains("read_file"));
+        assert!(!restricted.contains("grep"));
+        assert!(restricted.contains("bash"));
+        assert!(restricted.contains("str_replace"));
     }
 }
