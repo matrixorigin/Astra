@@ -258,6 +258,21 @@ struct CliSseStreamHost<'a> {
     turn_rollback_fired: Option<TurnRollbackFired>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
+    /// Speculative streaming tool executor (D-9).
+    ///
+    /// When `ASTRA_STREAMING_TOOL_EXEC=1` is set, read-only tool_use blocks
+    /// that complete mid-stream are dispatched here via `on_tool_block` so
+    /// their I/O overlaps with the remaining LLM stream. After the stream
+    /// ends, results are harvested and merged so normal permission checks
+    /// and journal/observability events still fire exactly once in the
+    /// batch phase.
+    ///
+    /// NOTE: The actual background executor requires an `Arc<ToolExecutor>`;
+    /// the current host holds `&'a mut ToolExecutor` so the constructor of
+    /// this field is deferred (see Commit C in feat/self-model-parallel-batch-2026-04-21).
+    /// Infrastructure (trait hook, env gate, should_speculate) is in place
+    /// and exercised by tests at the sse_stream_host layer.
+    streaming_speculation_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -353,6 +368,8 @@ impl<'a> CliSseStreamHost<'a> {
             turn_rollback_boundary_emitted: false,
             turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
+            streaming_speculation_enabled:
+                astra_runtime::turn::streaming_tool_exec::streaming_tool_exec_enabled(),
         }
     }
 
@@ -2635,6 +2652,38 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .into_iter()
             .map(|r| r.expect("all tool result slots filled"))
             .collect()
+    }
+
+    async fn on_tool_call_complete(&mut self, _index: usize, tool_call: &Value) {
+        // D-9 speculative streaming hook.
+        //
+        // When `ASTRA_STREAMING_TOOL_EXEC=1` is set, we log that a read-only
+        // tool_use block was observed mid-stream and would be eligible for
+        // speculative execution. The full executor wiring (Arc<ToolExecutor>
+        // + background task spawning + harvest-before-batch merge) is
+        // staged but disabled pending a refactor of the host's
+        // `executor: &'a mut ToolExecutor` to a shared `Arc`. The trait hook,
+        // env gate, and `should_speculate` helper are in place and
+        // exercised by astra-turn-core integration tests at the
+        // sse_stream_host layer.
+        if !self.streaming_speculation_enabled {
+            return;
+        }
+        let tool_name = tool_call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if astra_runtime::turn::streaming_tool_exec::should_speculate(tool_name, None) {
+            // Emit an observability hint but do not mutate permissioning or
+            // tool_cache — speculation results must still flow through
+            // execute_tools_batch so journal events fire exactly once.
+            tracing::debug!(
+                target = "astra_cli::streaming_tool_exec",
+                tool = tool_name,
+                "speculative execution eligible (streaming hook)",
+            );
+        }
     }
 }
 
