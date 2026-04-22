@@ -92,3 +92,116 @@ async fn peak_concurrency_capped_at_10_for_20_tools() {
         "expected parallel execution, got peak {observed_peak}"
     );
 }
+
+/// Executor that makes the first bash call fail; everything else succeeds.
+fn failing_bash_executor() -> (ToolExecutorFn, Arc<AtomicUsize>) {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let invocations_c = invocations.clone();
+    let exec: ToolExecutorFn = Arc::new(move |tc: Value| {
+        let invocations = invocations_c.clone();
+        Box::pin(async move {
+            invocations.fetch_add(1, Ordering::SeqCst);
+            let call_id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            if name == "bash" {
+                (call_id, name, "boom: nonzero exit".into(), false)
+            } else {
+                (call_id, name, "ok".into(), true)
+            }
+        })
+    });
+    (exec, invocations)
+}
+
+/// Unhappy path: a failing `bash` call must abort queued mutating siblings.
+/// Mix: [read (parallel), bash-failing, write_file, str_replace].
+#[tokio::test]
+async fn unhappy_write_after_failing_bash_is_aborted() {
+    let calls = vec![
+        tool_call("read_file", "r0"),
+        tool_call("bash", "b1"),
+        tool_call("write_file", "w2"),
+        tool_call("str_replace", "s3"),
+    ];
+    let (exec, invocations) = failing_bash_executor();
+
+    let outcome = execute_parallel_round(&calls, exec).await;
+
+    // 1 read + 1 bash only — writes after the failed bash must be skipped.
+    assert_eq!(outcome.parallel_count, 1, "one read-only call");
+    assert_eq!(outcome.sequential_count, 3, "three mutating calls queued");
+    assert!(outcome.sibling_aborted, "bash failure must flip the flag");
+
+    // The executor should NOT have been called for w2 or s3 — only r0 + b1.
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        2,
+        "writes after failing bash must be skipped, not dispatched"
+    );
+
+    // Results are returned in original input order.
+    assert_eq!(outcome.results.len(), 4);
+    let ordered: Vec<_> = outcome
+        .results
+        .iter()
+        .map(|r| (r.tool_name.as_str(), r.success))
+        .collect();
+    // r0 success, b1 failure, w2 aborted (success=false), s3 aborted.
+    assert_eq!(ordered[0], ("read_file", true));
+    assert_eq!(ordered[1], ("bash", false));
+    assert!(!ordered[2].1);
+    assert!(!ordered[3].1);
+    assert!(
+        outcome.results[2]
+            .content
+            .to_lowercase()
+            .contains("aborted"),
+        "aborted write must carry the 'aborted' reason: {}",
+        outcome.results[2].content
+    );
+}
+
+/// Complex path: 20 mixed read + write calls.
+///
+/// - Peak concurrency on read-only phase must stay ≤ cap (10).
+/// - Writes run serially after the parallel phase (not concurrent with anything).
+/// - Results come back in original input order.
+#[tokio::test]
+async fn complex_mixed_20_tools_respect_cap_and_ordering() {
+    // Build 15 read_file + 5 write_file, interleaved so ordering is non-trivial.
+    let mut calls: Vec<Value> = Vec::new();
+    for i in 0..20 {
+        let name = if i % 4 == 3 {
+            "write_file"
+        } else {
+            "read_file"
+        };
+        calls.push(tool_call(name, &format!("c{i:02}")));
+    }
+    let (exec, peak) = tracking_executor(20);
+
+    let outcome = execute_parallel_round(&calls, exec).await;
+
+    assert_eq!(outcome.results.len(), 20);
+    assert_eq!(outcome.parallel_count, 15);
+    assert_eq!(outcome.sequential_count, 5);
+    assert!(!outcome.sibling_aborted);
+
+    // Peak concurrency: reads capped at 10; writes are serial.
+    // Because reads + writes don't overlap in time, the observed peak
+    // must still respect the read-only cap.
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= MAX_CONCURRENT_READ_ONLY,
+        "peak concurrency {observed_peak} exceeded cap {MAX_CONCURRENT_READ_ONLY}"
+    );
+
+    // Ordering: results must come back in the same order as the input.
+    for (i, r) in outcome.results.iter().enumerate() {
+        assert_eq!(
+            r.original_index, i,
+            "result {i} should preserve original_index"
+        );
+        assert_eq!(r.call_id, format!("c{i:02}"));
+    }
+}
