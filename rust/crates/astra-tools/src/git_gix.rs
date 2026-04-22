@@ -35,29 +35,31 @@ fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::proce
         .spawn()
         .ok()?;
 
-    let start = std::time::Instant::now();
+    // Drain stdout/stderr on background threads to prevent pipe deadlock:
+    // if the parent doesn't read, the pipe buffer fills and git blocks forever,
+    // causing the 60s timeout to fire even on fast commands with large output.
+    let stdout_handle = {
+        let mut stdout = child.stdout.take()?;
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        })
+    };
+    let stderr_handle = {
+        let mut stderr = child.stderr.take()?;
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        })
+    };
 
+    let start = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait().ok().flatten() {
-            // Process exited — collect remaining stdout/stderr.
-            let stdout = child
-                .stdout
-                .take()
-                .map(|mut s| {
-                    let mut buf = Vec::new();
-                    let _ = s.read_to_end(&mut buf);
-                    buf
-                })
-                .unwrap_or_default();
-            let stderr = child
-                .stderr
-                .take()
-                .map(|mut s| {
-                    let mut buf = Vec::new();
-                    let _ = s.read_to_end(&mut buf);
-                    buf
-                })
-                .unwrap_or_default();
+            let stdout = stdout_handle.join().unwrap_or_default();
+            let stderr = stderr_handle.join().unwrap_or_default();
             return Some(std::process::Output {
                 status,
                 stdout,
@@ -65,9 +67,8 @@ fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::proce
             });
         }
         if start.elapsed() >= GIT_SUBPROCESS_TIMEOUT {
-            // Explicitly kill the child to avoid zombie thread / leaked FDs.
             let _ = child.kill();
-            let _ = child.wait(); // Reap the zombie.
+            let _ = child.wait();
             eprintln!(
                 "  ⚠️ git {} timed out after {}s",
                 args.first().unwrap_or(&""),

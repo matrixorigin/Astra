@@ -103,8 +103,6 @@ pub struct Aggregates {
     pub avg_llm_rounds: f64,
     /// Average tool calls per LLM round.
     pub avg_tool_calls_per_round: f64,
-    /// Number of turns where context_prefetch injected data.
-    pub prefetch_turn_count: usize,
 }
 
 #[derive(Serialize)]
@@ -165,15 +163,6 @@ pub struct TurnRow {
     /// Total tool execution time (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tool_ms: Option<u64>,
-    /// Whether context_prefetch injected data before the agentic loop.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefetch_injected: Option<bool>,
-    /// Task type detected by prefetch (e.g. "code_review", "exploration").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefetch_task_type: Option<String>,
-    /// Size of the prefetched context body in bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefetch_body_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub llm_round_details: Vec<LlmRoundRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -367,8 +356,6 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut session_end_count = 0usize;
 
     // Prefetch data extracted from ContextAssemblyRecorded events, keyed by turn number.
-    let mut prefetch_by_turn: std::collections::HashMap<u32, (Option<String>, Option<u64>)> =
-        std::collections::HashMap::new();
     let mut llm_rounds_by_turn: std::collections::HashMap<u32, Vec<LlmRoundRow>> =
         std::collections::HashMap::new();
 
@@ -465,9 +452,6 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     llm_rounds: ev.llm_rounds,
                     total_llm_ms: ev.total_llm_ms,
                     total_tool_ms: ev.total_tool_ms,
-                    prefetch_injected: None,
-                    prefetch_task_type: None,
-                    prefetch_body_bytes: None,
                     llm_round_details: Vec::new(),
                     tool_groups: if matches!(focus, DigestFocus::All) {
                         ev.tool_calls
@@ -541,22 +525,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             }
             JournalEventType::SessionStart => session_start_count += 1,
             JournalEventType::SessionEnd => session_end_count += 1,
-            JournalEventType::ContextAssemblyRecorded => {
-                if let Some(turn) = ev.turn {
-                    if let Some(trace) = &ev.context_assembly_trace {
-                        if let Some(pf) = trace.get("prefetch") {
-                            if pf.get("injected").and_then(|v| v.as_bool()) == Some(true) {
-                                let task_type = pf
-                                    .get("task_type")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
-                                let body_bytes = pf.get("body_bytes").and_then(|v| v.as_u64());
-                                prefetch_by_turn.insert(turn, (task_type, body_bytes));
-                            }
-                        }
-                    }
-                }
-            }
+            JournalEventType::ContextAssemblyRecorded => {}
             JournalEventType::LlmRound => {
                 if matches!(focus, DigestFocus::All)
                     && let Some(turn) = ev.turn
@@ -571,14 +540,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         }
     }
 
-    // Apply prefetch data from ContextAssemblyRecorded events to matching turns.
     for turn in &mut turns_out {
         if let Some(turn_id) = turn.turn_id {
-            if let Some((task_type, body_bytes)) = prefetch_by_turn.remove(&turn_id) {
-                turn.prefetch_injected = Some(true);
-                turn.prefetch_task_type = task_type;
-                turn.prefetch_body_bytes = body_bytes;
-            }
             if matches!(focus, DigestFocus::All)
                 && let Some(rounds) = llm_rounds_by_turn.remove(&turn_id)
             {
@@ -586,10 +549,6 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             }
         }
     }
-    let prefetch_turn_count = turns_out
-        .iter()
-        .filter(|t| t.prefetch_injected == Some(true))
-        .count();
 
     let turn_count = turns_out.len();
     let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if turn_count == 0 {
@@ -643,7 +602,6 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     0.0
                 }
             },
-            prefetch_turn_count,
         },
         turns: turns_out,
         compaction_events,
@@ -672,13 +630,12 @@ pub fn print_text(d: &JournalDigest) {
     let a = &d.aggregates;
     println!("\n  {}", "Aggregates".bold().cyan());
     println!(
-        "  turns={} turn_errors={} compacts={} stalls={} errors={} prefetch={}",
+        "  turns={} turn_errors={} compacts={} stalls={} errors={}",
         a.turn_count.to_string().cyan(),
         a.turn_error_count,
         a.compact_count,
         a.stall_count,
-        a.error_event_count,
-        a.prefetch_turn_count
+        a.error_event_count
     );
     println!(
         "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
@@ -726,16 +683,6 @@ pub fn print_text(d: &JournalDigest) {
                 ms,
                 t.user_input_preview.as_str().dim()
             );
-            if let Some(ref task_type) = t.prefetch_task_type {
-                let bytes_str = t
-                    .prefetch_body_bytes
-                    .map(|b| format!(" {b}B"))
-                    .unwrap_or_default();
-                println!(
-                    "                          {}",
-                    format!("prefetch:{task_type}{bytes_str}").dim()
-                );
-            }
             for group in &t.tool_groups {
                 let mut scope = match group.round {
                     Some(round) => format!("r{round}"),
@@ -1058,36 +1005,43 @@ mod tests {
         );
     }
 
+    /// Regression: /review command was not writing llm_rounds/total_llm_ms/total_tool_ms
+    /// to the journal turn event, causing avg_llm_rounds=0 in digest.
     #[test]
-    fn digest_extracts_prefetch_from_context_assembly() {
+    fn digest_surfaces_llm_rounds_from_review_command_turn() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
 
-        let sid = "test-digest-prefetch-00000000-0000-0000-0000-000000000004";
+        let sid = "test-digest-review-00000000-0000-0000-0000-000000000005";
         fs::write(
             tmp.path().join(format!("{sid}.jsonl")),
             concat!(
-                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"review latest commit","tool_calls":[]}"#, "\n",
-                r#"{"type":"context_assembly_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":1,"context_assembly_trace":{"prefetch":{"injected":true,"task_type":"code_review","body_bytes":12345}}}"#, "\n",
-                r#"{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":2,"tokens_in":200,"tokens_out":40,"duration_ms":600,"user_input":"fix it","tool_calls":[]}"#, "\n",
-                r#"{"type":"context_assembly_recorded","ts":"2026-01-01T00:00:03Z","session_id":"S","turn":2,"context_assembly_trace":{"explanations":[]}}"#, "\n",
+                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":38000,"tokens_out":500,"duration_ms":30000,"user_input":"/review latest 2 commits","tool_calls":[{"name":"git_show","ok":true,"ms":10},{"name":"git_show","ok":true,"ms":8}],"llm_rounds":3,"total_llm_ms":29900,"total_tool_ms":100}"#,
+                "\n",
             ),
         )
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
-        assert_eq!(d.aggregates.prefetch_turn_count, 1);
-
-        // Turn 1: has prefetch
-        assert_eq!(d.turns[0].prefetch_injected, Some(true));
+        assert_eq!(d.turns.len(), 1);
         assert_eq!(
-            d.turns[0].prefetch_task_type.as_deref(),
-            Some("code_review")
+            d.turns[0].llm_rounds,
+            Some(3),
+            "/review turn must surface llm_rounds in digest"
         );
-        assert_eq!(d.turns[0].prefetch_body_bytes, Some(12345));
-
-        // Turn 2: no prefetch (assembly event has no prefetch key)
-        assert!(d.turns[1].prefetch_injected.is_none());
-        assert!(d.turns[1].prefetch_task_type.is_none());
+        assert_eq!(
+            d.turns[0].total_llm_ms,
+            Some(29900),
+            "/review turn must surface total_llm_ms"
+        );
+        assert_eq!(
+            d.turns[0].total_tool_ms,
+            Some(100),
+            "/review turn must surface total_tool_ms"
+        );
+        assert_eq!(
+            d.aggregates.avg_llm_rounds, 3.0,
+            "avg_llm_rounds must not be 0 when llm_rounds is present"
+        );
     }
 }

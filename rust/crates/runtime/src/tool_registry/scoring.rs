@@ -105,10 +105,15 @@ pub fn tfidf_score(query_terms: &[String], tool_idx: usize) -> f64 {
 /// Returns a score in [0.0, 1.0] based on match quality.
 /// This is COMPLEMENTARY to TF-IDF — triggers capture multilingual synonyms
 /// and phrase patterns that TF-IDF might miss (e.g., "关注" → github tools).
-fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char]) -> f64 {
+pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char]) -> f64 {
     use super::state::word_boundary_match;
 
     let mut best_score = 0.0;
+    let query_words: Vec<&str> = query_lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+
     for trigger in tool.triggers {
         if word_boundary_match(query_lower, query_chars, trigger) {
             // Longer triggers = more specific = higher score
@@ -118,23 +123,32 @@ fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char])
                 best_score = score;
             }
         } else {
-            // Partial prefix match: if a query word matches the first word of a
-            // multi-word trigger, give a reduced score. This handles abbreviations
-            // like "ci" matching "ci status", "pr" matching "pr details", etc.
-            // General-purpose: works for any multi-word trigger.
             let trigger_lower = trigger.to_lowercase();
-            if let Some(first_word) = trigger_lower.split_whitespace().next()
-                && trigger_lower.contains(' ')
-            {
-                // Check if query contains this first word as an exact token
-                let query_has_word = query_lower
-                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .any(|w| w == first_word);
-                if query_has_word {
-                    // Partial match: score scaled down by 0.4 (vs full match 0.5-1.0)
-                    let partial_score = 0.3;
-                    if partial_score > best_score {
-                        best_score = partial_score;
+            let trigger_words: Vec<&str> = trigger_lower.split_whitespace().collect();
+
+            if trigger_words.len() >= 2 {
+                // Bag-of-words: all trigger words present in query (any order).
+                // Handles "review local changes" matching trigger "review changes".
+                let all_present = trigger_words
+                    .iter()
+                    .all(|tw| query_words.iter().any(|qw| qw == tw));
+                if all_present {
+                    let specificity = (trigger.chars().count() as f64 / 10.0).min(1.0);
+                    // Slightly lower than contiguous match (0.4 base vs 0.5).
+                    let score = 0.4 + 0.4 * specificity;
+                    if score > best_score {
+                        best_score = score;
+                    }
+                } else {
+                    // Partial prefix match: first word of trigger in query.
+                    let query_has_first = trigger_words
+                        .first()
+                        .is_some_and(|fw| query_words.iter().any(|qw| qw == fw));
+                    if query_has_first {
+                        let partial_score = 0.3;
+                        if partial_score > best_score {
+                            best_score = partial_score;
+                        }
                     }
                 }
             }

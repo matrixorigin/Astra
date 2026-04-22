@@ -196,8 +196,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     false,
                 );
             }
-            let (tool_msg, tr) =
+            let (mut tool_msg, tr) =
                 headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &cached.output);
+            // Add folding metadata so fold_old_read_only_results can decay
+            // cache-hit results the same way it decays fresh tool results.
+            if let Some(obj) = tool_msg.as_object_mut() {
+                obj.insert(
+                    "_round_index".to_string(),
+                    serde_json::Value::Number(self.ctx.llm_round.into()),
+                );
+                obj.insert(
+                    "_tool_name".to_string(),
+                    serde_json::Value::String(slot.name.clone()),
+                );
+            }
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
             let cache_key = idem_key.cache_key();
@@ -231,7 +243,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 slot.name,
                 prev_turn + 1,
             );
-            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+            let (mut tool_msg, tr) =
+                headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+            if let Some(obj) = tool_msg.as_object_mut() {
+                obj.insert(
+                    "_round_index".to_string(),
+                    serde_json::Value::Number(self.ctx.llm_round.into()),
+                );
+                obj.insert(
+                    "_tool_name".to_string(),
+                    serde_json::Value::String(slot.name.clone()),
+                );
+            }
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
             self.ctx.turn_guard.health.record_cache_hit(&slot.name);

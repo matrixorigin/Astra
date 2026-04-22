@@ -36,7 +36,6 @@ async fn stream_chat_sse_simple_text_response() {
         api: &api,
         token: "fake-token",
         message: "hi",
-        prefetched_context_override: None,
         session_id: None,
         model: None,
         explain: ExplainMode::Off,
@@ -86,98 +85,6 @@ async fn stream_chat_sse_simple_text_response() {
 }
 
 #[tokio::test]
-async fn stream_chat_sse_injects_prefetch_override_without_auto_detection() {
-    let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None::<serde_json::Value>));
-    let app = Router::new().route(
-        "/chat/turn",
-        post({
-            let captured = captured.clone();
-            move |axum::Json(body): axum::Json<serde_json::Value>| {
-                let captured = captured.clone();
-                async move {
-                    *captured.lock().await = Some(body);
-                    (
-                        [("content-type", "text/event-stream")],
-                        sse_text_response("Hello!", "sess-override"),
-                    )
-                }
-            }
-        }),
-    );
-    let base = spawn_mock(app).await;
-    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let selector = tool_selector::TfIdfSelector::new(registry);
-    let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
-
-    let result = stream_chat_sse(ChatTurnParams {
-        api: &api,
-        token: "fake-token",
-        message: "hello there",
-        prefetched_context_override: Some(crate::context_prefetch::PrefetchedContext {
-            task_type: "code_review",
-            body: "OVERRIDE DIFF".to_string(),
-        }),
-        session_id: None,
-        model: None,
-        explain: ExplainMode::Off,
-        render_md: false,
-        history: &[],
-        perm_manager: &mut pm,
-        verbose_mode: false,
-        render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: &selector,
-        recent_tools: &[],
-        tool_health_entries: &[],
-        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
-        plan_only_chat: false,
-        is_plan_subtask: false,
-        plan_subtask_id: None,
-        delegation_engine: None,
-        cancel_token: None,
-        plan_assemble_line_release: None,
-        stream_event_tx: None,
-        approval_request_tx: None,
-        mcp_manager: None,
-        skill_search: &skill_search,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
-        messaging_metrics: None,
-        agent_spawner: None,
-        root_agent_id: None,
-        root_mailbox_slot: None,
-        observability_hub: None,
-        observability_session: None,
-        file_journal: None,
-        database_snapshot_journal: None,
-        git_stash_journal: None,
-        git_commit_journal: None,
-        git_worktree_journal: None,
-        session_state_journal: None,
-        task_manager: None,
-        turn_index: 0,
-        evolution_service: None,
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(result.full_text, "Hello!");
-    let body = captured
-        .lock()
-        .await
-        .clone()
-        .expect("request body should be captured");
-    let first_message = body["messages"][0]["content"]
-        .as_str()
-        .expect("content string");
-    assert!(first_message.contains("hello there"));
-    assert!(first_message.contains("<prefetched_context>"));
-    assert!(first_message.contains("OVERRIDE DIFF"));
-}
-
-#[tokio::test]
 async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     let app = Router::new().route(
         "/chat/turn",
@@ -219,7 +126,6 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             api: &api,
             token: "fake-token",
             message: "hi",
-            prefetched_context_override: None,
             session_id,
             model: None,
             explain: ExplainMode::Off,
@@ -304,7 +210,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         api: &api,
         token: "fake-token",
         message: "hi",
-        prefetched_context_override: None,
         session_id: None,
         model: None,
         explain: ExplainMode::Off,
@@ -417,7 +322,6 @@ async fn stream_chat_sse_api_error_propagated() {
         api: &api,
         token: "fake-token",
         message: "hi",
-        prefetched_context_override: None,
         session_id: None,
         model: None,
         explain: ExplainMode::Off,
@@ -504,7 +408,6 @@ async fn stream_chat_sse_with_tool_call_loop() {
         api: &api,
         token: "fake-token",
         message: "run echo hi",
-        prefetched_context_override: None,
         session_id: None,
         model: None,
         explain: ExplainMode::Off,
@@ -614,7 +517,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         api: &api,
         token: "fake-token",
         message: "write inside a transaction",
-        prefetched_context_override: None,
         session_id: None,
         model: None,
         explain: ExplainMode::Off,

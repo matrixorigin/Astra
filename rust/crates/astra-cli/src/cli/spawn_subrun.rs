@@ -207,6 +207,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             max_turns,
             remaining_turns: max_turns,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
@@ -290,7 +291,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         };
 

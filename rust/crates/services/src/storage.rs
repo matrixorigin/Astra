@@ -1259,7 +1259,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             execution_id  VARCHAR(64)  PRIMARY KEY,
             team_id       VARCHAR(64)  NOT NULL,
             user_id       VARCHAR(64)  NOT NULL,
-            task          TEXT         NOT NULL,
+            `task`        TEXT         NOT NULL,
             status        VARCHAR(32)  NOT NULL DEFAULT 'pending',
             result_json   LONGTEXT,
             started_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),

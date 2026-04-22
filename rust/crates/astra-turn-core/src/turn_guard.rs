@@ -102,6 +102,10 @@ pub struct TurnGuard {
     /// Consecutive turns at Critical escalation. Progressive degradation:
     /// 1st Critical → restrict to read-only tools, 2nd → force stop.
     critical_turns: usize,
+    /// Consecutive Warning-or-higher verdicts. Used for progressive penalty.
+    pub(crate) consecutive_warnings: usize,
+    /// Total cache hits at last evaluate() — for delta-based nudge counting.
+    last_cache_hit_total: usize,
     /// Correction issued on the most recent `evaluate` call, awaiting compliance check.
     pub pending_correction: Option<CorrectionRecord>,
     /// History of resolved corrections and their outcomes.
@@ -133,6 +137,8 @@ impl TurnGuard {
             errors: SessionErrorSummary::new(),
             last_reflection: None,
             critical_turns: 0,
+            consecutive_warnings: 0,
+            last_cache_hit_total: 0,
             pending_correction: None,
             correction_history: Vec::new(),
         }
@@ -403,6 +409,9 @@ impl TurnGuard {
 
         // 5b. Cache duplication warning
         // When the LLM keeps making identical tool calls, flag token waste.
+        // High cache-hit counts also contribute to nudge_count so the escalation
+        // path can reach Critical even when there are zero tool errors (the model
+        // is spinning on reads, not failing).
         let cache_wasteful = self.health.cache_wasteful_tools(3);
         if !cache_wasteful.is_empty() {
             let tool_list: Vec<String> = cache_wasteful
@@ -431,6 +440,15 @@ impl TurnGuard {
                     _ => {}
                 }
             }
+            // Treat cache waste as a nudge signal so escalation can fire
+            // even with zero tool errors. Add 1 nudge per evaluation where
+            // NEW cache hits occurred (not just stale waste from earlier).
+            let current_total = self.health.total_cache_hits();
+            if current_total > self.last_cache_hit_total && !stall_detected && !divergence_detected
+            {
+                self.nudge_count += 1;
+            }
+            self.last_cache_hit_total = current_total;
             severity = severity.max(VerdictSeverity::Warning);
         }
 
@@ -545,6 +563,13 @@ impl TurnGuard {
                 avoid_tools: avoid_tools_vec.clone(),
                 suggested_alternatives,
             });
+        }
+
+        // Track consecutive warnings for progressive penalty in the agentic loop.
+        if severity >= VerdictSeverity::Warning {
+            self.consecutive_warnings += 1;
+        } else {
+            self.consecutive_warnings = 0;
         }
 
         TurnVerdict {

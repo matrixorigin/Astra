@@ -60,8 +60,26 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
+
+    // Inject round budget guidance so the model knows to batch or synthesize.
+    // Use llm_rounds_completed (actual LLM call count) not turn_index (step
+    // counter inflated by progressive penalty).
+    // Skip when the host already injects guidance (e.g. server path injects
+    // it into the system prompt in its own execute_turn).
+    if !host.injects_round_guidance() {
+        let guidance =
+            crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
+        if !guidance.is_empty() {
+            astra_turn_core::chat_history_openai::append_openai_user_content_messages(
+                &mut state.messages,
+                &[guidance],
+            );
+        }
+    }
+
     let llm_wall_start = Instant::now();
     let turn_result = host.execute_turn(state).await?;
+    state.llm_rounds_completed += 1;
     state.rate_limit_cooldown.record_success();
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_completed(
@@ -289,8 +307,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             }
 
             // Record the LLM round even for text-only responses (no tool calls).
-            // Without this, prefetch-enriched turns and simple Q&A turns have
-            // llm_rounds=0 in the journal despite the LLM being called.
+            // Without this, simple Q&A turns have llm_rounds=0 in the
+            // journal despite the LLM being called.
             record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
 
             observe_turn_end_without_tools(

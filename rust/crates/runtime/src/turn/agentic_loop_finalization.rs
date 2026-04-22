@@ -951,4 +951,176 @@ mod tests {
         assert!(l1.contains("[session-memory:v1]"));
         assert!(l1.contains("fix the bug"));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E: round budget guidance injection
+    // Verifies that the agentic loop injects round budget warning/limit
+    // messages into state.messages at the correct round thresholds.
+    // Regression: CLI path was missing this entirely (found in session analysis).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn round_budget_guidance_injected_at_threshold() {
+        // Simulate 5 tool rounds: the loop should inject guidance at round 3+.
+        let mut results = Vec::new();
+        for _ in 0..4 {
+            results.push(edge_tool_result(
+                vec![make_edge_tool("read_file", "file content here")],
+                100,
+                20,
+                Some(10),
+            ));
+        }
+        results.push(text_result("Final answer", 100, 50, Some(10)));
+
+        let mut host = MockHost::new(results).with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // Check that round budget guidance was injected into messages.
+        // After round 3 (ROUND_BUDGET_THRESHOLD), a user message with
+        // "Round Budget" or "Synthesize" should appear.
+        let guidance_found = state.messages.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.contains("Round Budget") || s.contains("Synthesize"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            guidance_found,
+            "round budget guidance must be injected after {} rounds, messages: {:?}",
+            crate::prompts::ROUND_BUDGET_THRESHOLD,
+            state
+                .messages
+                .iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                .filter(|s| s.len() < 200)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn round_budget_guidance_uses_llm_round_count_not_step_index() {
+        // Regression: guidance was using turn_index (step counter, inflated by
+        // progressive penalty) instead of llm_rounds_completed (actual LLM calls).
+        // With progressive penalty, step 10 = only 4th LLM call, but the old code
+        // would inject "round 10/6 EXCEEDED" which is nonsensical and ignored.
+        //
+        // This test verifies guidance fires at the 3rd LLM call regardless of
+        // what the step index is.  We simulate a state where step index is already
+        // high (e.g. 20) but only 2 LLM rounds have completed — guidance must NOT
+        // fire yet.
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("read_file", "a")], 100, 20, Some(10)),
+            edge_tool_result(vec![make_edge_tool("read_file", "b")], 100, 20, Some(10)),
+            text_result("Done", 100, 50, Some(10)),
+        ])
+        .with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        // Simulate inflated step index (as if progressive penalty already fired)
+        state.current_round_index = 20;
+        // But llm_rounds_completed starts at 0 (only 2 LLM calls will happen)
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // Only 2 LLM rounds completed — guidance threshold is 3 — must NOT fire
+        let guidance_found = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.contains("Round Budget") || s.contains("Synthesize"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !guidance_found,
+            "guidance must NOT fire when only 2 LLM rounds completed (step index is irrelevant)"
+        );
+        assert_eq!(
+            state.llm_rounds_completed, 3,
+            "3 LLM calls should have been made"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_budget_not_injected_before_threshold() {
+        // 2 tool rounds + final text = should NOT trigger guidance (threshold=3).
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "content")],
+                100,
+                20,
+                Some(10),
+            ),
+            edge_tool_result(vec![make_edge_tool("grep", "match")], 100, 20, Some(10)),
+            text_result("Done", 100, 50, Some(10)),
+        ])
+        .with_valid_tools(&["read_file", "grep"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        let guidance_found = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.contains("Round Budget") || s.contains("Synthesize"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !guidance_found,
+            "round budget guidance must NOT be injected before threshold"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E: progressive warning penalty drains budget
+    // Verifies that consecutive warnings from TurnGuard reduce remaining_turns
+    // progressively (2, 4, 6, ...) so spinning loops terminate faster.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn progressive_warning_penalty_limits_loop_duration() {
+        // Simulate 20 tool rounds — without progressive penalty this would
+        // run all 20. With it, the loop should terminate earlier.
+        let mut results = Vec::new();
+        for _ in 0..20 {
+            results.push(edge_tool_result(
+                vec![make_edge_tool("read_file", "same content")],
+                100,
+                20,
+                Some(10),
+            ));
+        }
+        // Final text in case loop completes normally
+        results.push(text_result("Done", 100, 50, Some(10)));
+
+        let mut host = MockHost::new(results).with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        state.max_turns = 50; // generous budget
+
+        // Pre-seed cache hits to trigger warnings from the start
+        for _ in 0..4 {
+            state.turn_guard.record_cache_hit("read_file");
+        }
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        // The loop should have terminated before using all 20 tool rounds.
+        // With progressive penalties + cache-hit nudges, it should stop
+        // well before 20 rounds.
+        let rounds_used = host.rendered_final_text.len()
+            + state
+                .messages
+                .iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+                .count();
+
+        // We don't assert exact count (depends on penalty math), but it
+        // must be significantly less than 20.
+        assert!(
+            rounds_used < 18,
+            "progressive penalty should limit loop to fewer rounds, got {rounds_used} tool messages. outcome={outcome:?}"
+        );
+    }
 }

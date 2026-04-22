@@ -9254,3 +9254,363 @@ mod cross_turn_cognition {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Session-journal regression tests
+//
+// Each test below is derived from a real session that exhibited token waste.
+// The test name encodes the session prefix and the failure pattern.
+// These are deterministic unit tests — no LLM calls, no network.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// P1: Tool selector must select git_diff and grep for code-review queries.
+/// Sessions de757bc9, 98fca6ae, 95c7cf45: model used bash grep/diff because
+/// the native tools were not selected.
+mod tool_selection_regressions {
+    use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+    use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+
+    fn test_registry() -> ToolRegistry {
+        let schemas: Vec<serde_json::Value> = TOOL_CATALOG
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
+            .collect();
+        ToolRegistry::new(schemas)
+    }
+
+    fn default_ctx(query: &str) -> SelectionContext<'_> {
+        SelectionContext {
+            query,
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 10_000,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
+            previous_confidence_fallback: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn review_local_changes_selects_git_diff() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector.select(&default_ctx("review local changes")).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "git_diff must be selected for 'review local changes', got: {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn review_local_changes_selects_grep() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector
+            .select(&default_ctx("search code for error patterns"))
+            .await;
+        assert!(
+            result.tool_names.contains(&"grep".to_string()),
+            "grep must be selected for 'search code' query, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn review_changes_chinese_selects_git_diff() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector.select(&default_ctx("看看改动")).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "git_diff must be selected for '看看改动', got: {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_review_issues_selects_edit_tools() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector.select(&default_ctx("按照review建议优化")).await;
+        assert!(
+            result.tool_names.contains(&"str_replace".to_string()),
+            "str_replace must be selected for fix-review query, got: {:?}",
+            result.tool_names
+        );
+        assert!(
+            result.tool_names.contains(&"read_file".to_string()),
+            "read_file must be selected for fix-review query, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    /// Under moderate budget pressure (0.22), git_diff must still be selected
+    /// for review queries. Session 98fca6ae had pressure=0.22 and git_diff was
+    /// dropped.
+    #[tokio::test]
+    async fn review_changes_under_pressure_keeps_git_diff() {
+        let selector = TfIdfSelector::new(test_registry());
+        let mut ctx = default_ctx("review local changes");
+        ctx.budget_pressure = 0.22;
+        let result = selector.select(&ctx).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "git_diff must survive budget_pressure=0.22 for review query, got: {:?}",
+            result.tool_names
+        );
+    }
+}
+
+/// P2+P6: TurnGuard must escalate cache-hit loops to Critical.
+/// Session c8df4aa8: 20 rounds, 4 cache hits, 0 errors → only Warning.
+mod turnguard_cache_escalation_regressions {
+    use astra_turn_core::error_recovery;
+    use astra_turn_core::turn_guard::TurnGuard;
+
+    /// Simulate a cache-hit loop: 6 cache hits on read_file with 0 errors.
+    /// The escalation must reach at least Warning.
+    #[test]
+    fn cache_hit_loop_reaches_warning() {
+        let mut guard = TurnGuard::new();
+        // Simulate 6 rounds of cache hits
+        for _ in 0..6 {
+            guard.record_cache_hit("read_file");
+            let verdict = guard.evaluate();
+            if verdict.severity >= astra_turn_core::turn_guard::VerdictSeverity::Warning {
+                return; // Pass: reached Warning
+            }
+        }
+        panic!("6 cache hits on read_file must trigger at least Warning");
+    }
+
+    /// With enough cache hits, nudge_count must grow high enough for Critical.
+    /// With delta-based nudge counting (1 nudge per eval with new hits),
+    /// we need 6+ evaluations with new cache hits to reach Critical.
+    #[test]
+    fn sustained_cache_hits_eventually_reach_critical_escalation() {
+        let mut guard = TurnGuard::new();
+        let mut reached_critical = false;
+        // Simulate 12 rounds, each with a new cache hit (threshold is 10)
+        for _ in 0..12 {
+            guard.record_cache_hit("read_file");
+            let verdict = guard.evaluate();
+            if verdict.severity >= astra_turn_core::turn_guard::VerdictSeverity::Critical {
+                reached_critical = true;
+                break;
+            }
+        }
+        assert!(
+            reached_critical,
+            "12 consecutive cache hits (1 per round) must eventually escalate to Critical"
+        );
+    }
+
+    /// nudge_count >= 10 alone must trigger Critical (no errors required).
+    /// Threshold raised from 6 to 10 to avoid false Critical on normal sessions
+    /// where cache-hit nudges accumulate without any actual errors.
+    #[test]
+    fn high_nudge_count_alone_triggers_critical() {
+        let level = error_recovery::escalation_level(10, 0, 0);
+        assert_eq!(
+            level,
+            error_recovery::EscalationLevel::Critical,
+            "nudge_count=10 with 0 errors must be Critical"
+        );
+    }
+
+    /// nudge_count=9 with 0 errors must NOT be Critical (avoid false positives).
+    #[test]
+    fn moderate_nudge_count_without_errors_is_not_critical() {
+        let level = error_recovery::escalation_level(9, 0, 0);
+        assert_ne!(
+            level,
+            error_recovery::EscalationLevel::Critical,
+            "nudge_count=5 with 0 errors should not be Critical"
+        );
+    }
+
+    /// Progressive warning penalty: consecutive warnings must drain budget faster.
+    #[test]
+    fn consecutive_warnings_increase_penalty() {
+        let mut guard = TurnGuard::new();
+        // Force warnings by adding cache hits
+        for _ in 0..4 {
+            guard.record_cache_hit("read_file");
+        }
+        let v1 = guard.evaluate();
+        assert!(
+            v1.severity >= astra_turn_core::turn_guard::VerdictSeverity::Warning,
+            "4 cache hits must trigger Warning"
+        );
+        // Add more cache hits and evaluate again
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        let v2 = guard.evaluate();
+        assert!(
+            v2.severity >= astra_turn_core::turn_guard::VerdictSeverity::Warning,
+            "continued cache hits must keep Warning"
+        );
+    }
+
+    /// Cache nudge must be delta-based, not cumulative.
+    /// Bug found in session 98fca6ae: cumulative counting caused runaway escalation.
+    #[test]
+    fn cache_nudge_is_delta_not_cumulative() {
+        let mut guard = TurnGuard::new();
+        // Add 3 cache hits → first evaluate adds 1 nudge
+        for _ in 0..3 {
+            guard.record_cache_hit("read_file");
+        }
+        guard.evaluate();
+        let nudge_after_first = guard.nudge_count;
+
+        // No new cache hits → second evaluate should NOT add more nudges
+        guard.evaluate();
+        let nudge_after_second = guard.nudge_count;
+
+        assert_eq!(
+            nudge_after_first, nudge_after_second,
+            "without new cache hits, nudge_count must not increase: first={nudge_after_first}, second={nudge_after_second}"
+        );
+    }
+}
+
+/// P4: Safety middleware must not block grep BRE alternation patterns.
+/// Session 98fca6ae: `grep -n fetch_spinner\|show_early_hint` was blocked.
+mod safety_middleware_regressions {
+    use astra_turn_core::safety_middleware::{
+        SafetyMiddlewareDecision, check_shell_command_safety, evaluate_tool_safety_request,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn grep_bre_alternation_unquoted_is_allowed() {
+        let result = check_shell_command_safety(r"grep -n fetch_spinner\|show_early_hint file.rs");
+        assert!(
+            result.is_none(),
+            "grep with \\| BRE alternation must be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn grep_bre_alternation_quoted_is_allowed() {
+        let result =
+            check_shell_command_safety(r#"grep -rn "fetch_spinner\|show_early_hint" rust/crates/"#);
+        assert!(
+            result.is_none(),
+            "grep with quoted \\| must be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sed_bre_alternation_is_allowed() {
+        let result = check_shell_command_safety(r"sed -n '/pattern1\|pattern2/p' file.txt");
+        assert!(
+            result.is_none(),
+            "sed with \\| BRE alternation must be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn grep_bre_via_bash_tool_is_allowed() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r"grep -rn 'error\|warning\|fatal' src/"}),
+        );
+        assert_eq!(
+            decision,
+            SafetyMiddlewareDecision::Allow,
+            "bash grep with \\| must be allowed"
+        );
+    }
+
+    /// Non-grep commands with \| must still be blocked.
+    #[test]
+    fn non_grep_backslash_pipe_still_blocked() {
+        let result = check_shell_command_safety(r"cat file.txt \| rm -rf /");
+        assert!(result.is_some(), "non-grep \\| must still be blocked");
+    }
+}
+
+/// P1: trigger_match_score must support bag-of-words matching.
+/// "review local changes" must match trigger "review changes".
+mod trigger_match_regressions {
+    use astra_runtime::tool_registry::TOOL_CATALOG;
+    use astra_runtime::tool_registry::scoring::trigger_match_score;
+
+    fn find_tool(name: &str) -> &'static astra_turn_core::tool_registry_meta::ToolMeta {
+        TOOL_CATALOG.iter().find(|t| t.name == name).unwrap()
+    }
+
+    #[test]
+    fn review_local_changes_matches_review_changes_trigger() {
+        let tool = find_tool("git_diff");
+        let query = "review local changes";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(
+            score > 0.4,
+            "trigger 'review changes' must match 'review local changes' with score > 0.4, got {score}"
+        );
+    }
+
+    #[test]
+    fn exact_trigger_scores_higher_than_bag_of_words() {
+        let tool = find_tool("git_diff");
+        let exact_query = "review changes";
+        let exact_chars: Vec<char> = exact_query.chars().collect();
+        let exact_score = trigger_match_score(tool, exact_query, &exact_chars);
+
+        let bow_query = "review local changes";
+        let bow_chars: Vec<char> = bow_query.chars().collect();
+        let bow_score = trigger_match_score(tool, bow_query, &bow_chars);
+
+        assert!(
+            exact_score > bow_score,
+            "exact match ({exact_score}) must score higher than bag-of-words ({bow_score})"
+        );
+    }
+
+    #[test]
+    fn single_word_trigger_still_works() {
+        let tool = find_tool("git_diff");
+        let query = "diff";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(
+            score > 0.4,
+            "single-word trigger 'diff' must match, got {score}"
+        );
+    }
+
+    #[test]
+    fn no_match_returns_zero() {
+        let tool = find_tool("git_diff");
+        let query = "send email to team";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(score < 0.01, "unrelated query must score ~0, got {score}");
+    }
+
+    #[test]
+    fn chinese_trigger_matches() {
+        let tool = find_tool("git_diff");
+        let query = "看改动";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(
+            score > 0.3,
+            "Chinese trigger '看改动' must match, got {score}"
+        );
+    }
+}

@@ -69,7 +69,6 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
-        state.prefetch_injected,
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,

@@ -151,8 +151,11 @@ pub fn apply_agentic_post_tool_policy(
                     remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL);
             }
             VerdictSeverity::Warning => {
-                *remaining_turns =
-                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING);
+                // Progressive penalty: each consecutive warning doubles the cost.
+                // 1st warning: -2, 2nd: -4, 3rd: -6, etc.
+                let multiplier = turn_guard.consecutive_warnings.max(1);
+                let penalty = CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING * multiplier;
+                *remaining_turns = remaining_turns.saturating_sub(penalty);
             }
             _ => {}
         }

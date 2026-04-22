@@ -67,15 +67,12 @@ pub struct ToolCallInfo {
 /// - `verdict_warning` — whether TurnGuard issued a Warning or higher
 /// - `budget_pressure` — 0.0–0.9 budget pressure from compaction tier
 /// - `is_factual_query` — whether the query likely needed tool calls
-/// - `prefetch_injected` — whether prefetched context (e.g. git diff) was
-///   injected into the prompt, making zero tool calls acceptable
 pub fn evaluate_turn(
     tool_calls: &[ToolCallInfo],
     stall_count: usize,
     verdict_warning: bool,
     budget_pressure: f64,
     is_factual_query: bool,
-    prefetch_injected: bool,
 ) -> TurnEvaluation {
     let mut signals = Vec::new();
     let mut quality = 0.5_f64; // base quality
@@ -85,7 +82,7 @@ pub fn evaluate_turn(
 
     // ─── No tool calls ──────────────────────────────────────────────────
     if total_calls == 0 {
-        if is_factual_query && !prefetch_injected {
+        if is_factual_query {
             // Needed tools but didn't use any — bad
             signals.push(EvalSignal::NoToolsNeeded);
             return TurnEvaluation {
@@ -187,7 +184,6 @@ pub fn evaluate_tool_call_records(
     stall_count: usize,
     verdict_warning: bool,
     budget_pressure: f64,
-    prefetch_injected: bool,
 ) -> TurnEvaluation {
     // Synthetic placeholders (skill skipped/deferred, surgically removed
     // parallel tool calls) are audit-only records that do NOT represent real
@@ -219,7 +215,6 @@ pub fn evaluate_tool_call_records(
         verdict_warning,
         budget_pressure,
         is_live_query,
-        prefetch_injected,
     )
 }
 
@@ -359,7 +354,7 @@ mod tests {
     #[test]
     fn all_tools_succeed_high_quality() {
         let calls = vec![ok_call("bash"), ok_call("grep"), ok_call("read_file")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(eval.success);
         assert!(eval.quality > 0.7, "quality={}", eval.quality);
         assert!(eval.signals.contains(&EvalSignal::AllToolsHealthy));
@@ -368,7 +363,7 @@ mod tests {
     #[test]
     fn all_tools_fail_low_quality() {
         let calls = vec![err_call("bash"), err_call("grep")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(!eval.success);
         assert!(eval.quality < 0.4, "quality={}", eval.quality);
         assert!(
@@ -381,7 +376,7 @@ mod tests {
     #[test]
     fn mixed_success_moderate_quality() {
         let calls = vec![ok_call("bash"), err_call("grep"), ok_call("read_file")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(eval.success); // error rate < 0.5
         let rate_signal = eval
             .signals
@@ -392,7 +387,7 @@ mod tests {
 
     #[test]
     fn no_tools_conversational_ok() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, false, false);
+        let eval = evaluate_turn(&[], 0, false, 0.3, false);
         assert!(eval.success);
         assert_eq!(eval.quality, 0.5);
         assert!(eval.confidence < 0.5); // low confidence for text-only
@@ -400,7 +395,7 @@ mod tests {
 
     #[test]
     fn no_tools_factual_query_bad() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, true, false);
+        let eval = evaluate_turn(&[], 0, false, 0.3, true);
         assert!(!eval.success);
         assert!(eval.quality < 0.3);
         assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
@@ -409,8 +404,8 @@ mod tests {
     #[test]
     fn stalls_reduce_quality() {
         let calls = vec![ok_call("bash")];
-        let no_stall = evaluate_turn(&calls, 0, false, 0.3, false, false);
-        let with_stall = evaluate_turn(&calls, 2, false, 0.3, false, false);
+        let no_stall = evaluate_turn(&calls, 0, false, 0.3, false);
+        let with_stall = evaluate_turn(&calls, 2, false, 0.3, false);
         assert!(with_stall.quality < no_stall.quality);
         assert!(with_stall.signals.contains(&EvalSignal::StallDetected));
     }
@@ -418,8 +413,8 @@ mod tests {
     #[test]
     fn verdict_warning_reduces_quality() {
         let calls = vec![ok_call("bash")];
-        let no_verdict = evaluate_turn(&calls, 0, false, 0.3, false, false);
-        let with_verdict = evaluate_turn(&calls, 0, true, 0.3, false, false);
+        let no_verdict = evaluate_turn(&calls, 0, false, 0.3, false);
+        let with_verdict = evaluate_turn(&calls, 0, true, 0.3, false);
         assert!(with_verdict.quality < no_verdict.quality);
         assert!(with_verdict.signals.contains(&EvalSignal::VerdictWarning));
     }
@@ -427,8 +422,8 @@ mod tests {
     #[test]
     fn high_budget_pressure_penalizes() {
         let calls = vec![ok_call("bash")];
-        let low_pressure = evaluate_turn(&calls, 0, false, 0.3, false, false);
-        let high_pressure = evaluate_turn(&calls, 0, false, 0.85, false, false);
+        let low_pressure = evaluate_turn(&calls, 0, false, 0.3, false);
+        let high_pressure = evaluate_turn(&calls, 0, false, 0.85, false);
         assert!(high_pressure.quality < low_pressure.quality);
         assert!(
             high_pressure
@@ -445,7 +440,7 @@ mod tests {
             ok_call("bash"),
             ok_call("grep"),
         ];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(
             eval.signals
                 .iter()
@@ -456,14 +451,13 @@ mod tests {
     #[test]
     fn empty_output_penalizes() {
         let calls = vec![empty_call("read_file"), ok_call("bash")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
         assert!(eval.signals.contains(&EvalSignal::EmptyToolOutput));
         let all_ok = evaluate_turn(
             &[ok_call("read_file"), ok_call("bash")],
             0,
             false,
             0.3,
-            false,
             false,
         );
         assert!(eval.quality < all_ok.quality);
@@ -473,7 +467,7 @@ mod tests {
     fn quality_clamped_to_bounds() {
         // Worst case: all errors + stalls + verdict + pressure
         let calls = vec![err_call("a"), err_call("b"), err_call("c")];
-        let eval = evaluate_turn(&calls, 5, true, 0.9, true, false);
+        let eval = evaluate_turn(&calls, 5, true, 0.9, true);
         assert!(eval.quality >= 0.0);
         assert!(eval.quality <= 1.0);
         assert!(eval.confidence >= 0.0);
@@ -482,15 +476,8 @@ mod tests {
 
     #[test]
     fn confidence_increases_with_more_signals() {
-        let simple = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false, false);
-        let complex = evaluate_turn(
-            &[err_call("bash"), err_call("grep")],
-            2,
-            true,
-            0.9,
-            false,
-            false,
-        );
+        let simple = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false);
+        let complex = evaluate_turn(&[err_call("bash"), err_call("grep")], 2, true, 0.9, false);
         assert!(complex.confidence > simple.confidence);
     }
 
@@ -503,17 +490,9 @@ mod tests {
             0,
             false,
             0.2,
-            false,
         );
         assert!(!eval.success);
         assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
-    }
-
-    #[test]
-    fn prefetch_injected_suppresses_no_tools_needed() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, true, true);
-        assert!(eval.success);
-        assert!(!eval.signals.contains(&EvalSignal::NoToolsNeeded));
     }
 
     #[test]
@@ -526,7 +505,6 @@ mod tests {
             0,
             false,
             0.2,
-            false,
         );
 
         let event = build_turn_evaluation_journal_event(
@@ -593,7 +571,6 @@ mod tests {
             0,
             false,
             0.1,
-            false,
         );
 
         // Must contain exactly one error_rate=0.0 signal AND AllToolsHealthy
@@ -662,7 +639,7 @@ mod tests {
             }))
             .collect();
 
-        let eval = evaluate_tool_call_records("noop", &[], &records, 0, false, 0.1, false);
+        let eval = evaluate_tool_call_records("noop", &[], &records, 0, false, 0.1);
         assert!(
             !eval
                 .signals
@@ -708,7 +685,6 @@ mod tests {
             0,
             false,
             0.1,
-            false,
         );
         assert!(
             !eval
@@ -731,7 +707,6 @@ mod tests {
             0,
             false,
             0.1,
-            false,
         );
         assert!(
             eval.signals
@@ -815,7 +790,6 @@ mod tests {
             0,
             false,
             0.446_225,
-            true,
         );
 
         assert!(

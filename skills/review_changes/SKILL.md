@@ -2,7 +2,7 @@
 name: review-changes
 description: "Developer skill: context-aware code review of uncommitted changes, branch diffs, specific commits, or GitHub PR URLs. Signal-driven analysis routing for efficient deep review."
 user_invocable: true
-when_to_use: "When the user asks to review code changes, commits, diffs, PRs, GitHub PR URLs (e.g. 'review https://github.com/.../pull/123'), or says 'review latest commit'"
+when_to_use: "For deep, thorough, or comprehensive analysis of large diffs (>5 files or >200 lines changed). Triggered by: 'deep analysis', 'thorough check', 'comprehensive review', 'full audit'. NOT for quick or simple change inspection."
 arguments:
   - name: TARGET
     description: "What to review: 'staged', 'unstaged', 'branch:<name>', 'commit:<sha>', 'pr:<number>', or a GitHub PR URL (e.g. 'https://github.com/owner/repo/pull/123'). Default: all uncommitted changes."
@@ -24,8 +24,6 @@ allowed_tools:
 
 # Review Changes
 
-Signal-driven code review. Goes beyond line-by-line diff — dynamically selects analysis depth based on what actually changed.
-
 **Only surface issues that matter**: bugs, security, logic errors, API breakage, missing tests. Never comment on style/formatting.
 
 ## Task
@@ -34,177 +32,75 @@ $ARGUMENTS
 
 ---
 
-## Phase 1: Gather + Route
+## Step 1: Size Check
 
-### 1.1 Resolve TARGET
+Call `git_diff(stat_only: true)` (or `git_show(sha, stat_only: true)` for a commit, `bash("gh pr diff N --repo owner/repo 2>&1")` for a PR).
 
-| TARGET | Tool call |
-|--------|-----------|
+**If stat returns empty:** report "No changes found" immediately. Do NOT call more tools.
+
+| Size | Next step |
+|------|-----------|
+| ≤ 80 lines, ≤ 5 files | Fetch full diff → go to Step 3 directly |
+| > 80 lines or > 5 files | Go to Step 2 |
+
+**TARGET resolution:**
+
+| TARGET | Tool |
+|--------|------|
 | Default (uncommitted) | `git_diff()` |
 | `staged` | `git_diff(staged: true)` |
 | `branch:<name>` | `git_diff(ref: "main")` |
-| `commit:<sha>` | `git_show(sha)` |
-| `latest commit` / `review latest commit` | `git_log()` once to resolve the SHA, then `git_show(resolved_sha)` once |
-| `pr:<number>` | See PR workflow below |
-| GitHub PR URL | See PR workflow below |
-| Stat overview | `git_diff(stat_only: true)` first, then per-file |
+| `commit:<sha>` / `latest commit` | `git_log()` once → `git_show(sha)` |
+| `pr:<number>` / GitHub PR URL | `bash("gh pr diff N --repo owner/repo 2>&1")` |
 
-**PR workflow** (for `pr:<number>` or GitHub PR URL like `https://github.com/owner/repo/pull/123`):
-
-1. Parse `owner/repo` and PR number from the URL (if URL given)
-2. Get the diff via `gh pr diff N --repo owner/repo 2>&1` using `bash`
-   - Always use `bash` + `gh` for PR diffs — it works with the user's `gh auth` credentials regardless of whether `GITHUB_TOKEN` is set
-   - If `gh` fails (not installed, not authenticated, repo not accessible), report the error and stop
-3. Optionally use `github_get_pr` with `detail: "normal"` for PR metadata (title, body, changed files). If it fails (no GITHUB_TOKEN for private repos), skip — the diff is sufficient for review
-
-No changes? Check `git_status`, try `staged: true`. Still nothing? Ask user.
-
-### 1.2 Reuse gathered evidence
-
-- For `latest commit`, resolve the SHA once and reuse that same commit diff for the rest of the review.
-- **Do not call `git_show` on the same commit more than once** unless you truly need a different object than the full diff you already fetched.
-- When searching changed symbols, prefer one decisive `grep` over a scoped `grep` followed by the same repo-wide `grep`.
-- Once the diff already identified the file to inspect, prefer `read_file` for local context instead of re-reading the whole commit diff.
-- Once the skill is loaded, **do not invoke `skill(review-changes)` again** in the same review. Continue with the evidence you already have.
-
-### 1.3 Hard review budgets
-
-- Treat the diff as the primary evidence source. **Do not start a file-by-file crawl** unless the diff leaves a concrete unresolved risk.
-- Default context budget: **at most 3 `read_file` calls** for the whole review.
-- You may extend to **at most 5 `read_file` calls** only when a specific unresolved risk is still plausible and the extra file is directly connected to that risk.
-- Before every `read_file`, be able to name the exact question it will answer. If you cannot, stop exploring and report with qualified confidence.
-- If the diff plus current context already supports a conclusion, stop and write the review. More reading without a new question is wasted latency.
-
-### 1.4 Strategy Router
-
-After reading the diff, route based on **signals** in the diff:
-
-**FOCUS override** (skip signal scan):
-| FOCUS | Phases |
-|-------|--------|
-| `bugs` | 1 → 3.1 → 6 |
-| `security` | 1 → 3.1 → 3.2 → 6 |
-| `logic` | 1 → 3.1 → 3.3 → 6 |
-| `api` | 1 → 2 → 3.1 → 4 → 6 |
-| `tests` | 1 → 3.3 → 6 |
-
-**Signal-based routing** (FOCUS unset):
-| Signal | Trigger |
-|--------|---------|
-| `unsafe`, `Command::new`, SQL interp, `unwrap()` non-test | → 3.2 |
-| `pub fn/struct/enum/trait` signature change | → 2 + 4 |
-| Tool schema/register, `JournalEvent`, `SubtaskStage`, `SERVER_EXECUTOR_TOOL_NAMES` | → 5 |
-| `impl Foo for Bar`, `#[async_trait]` | → 4.1 |
-| Error type/variant change, `thiserror` | → 4.2 |
-| Config struct, `Cargo.toml` | → 4.3 |
-| Pure docs/comments/config (no code logic) | → skip 2, 3, 4 |
-
-Internally decide your strategy; do NOT output it yet. Include it as a brief line in the final report (Phase 6).
-
-**Common patterns:**
-| Profile | Phases | Tool calls |
-|---------|--------|------------|
-| Trivial (<50 lines, no signals) | 1 → 3.1* → 6 | 2-3 |
-| Schema/config addition | 1 → 3.1* → 5.1 → 6 | 3-4 |
-| Bug fix with logic | 1 → 3.1 → 3.3 → 6 | 4-6 |
-| API change | 1 → 2 → 3.1 → 4 → 6 | 6-10 |
-| Security-relevant | 1 → 3.1 → 3.2 → 5 → 6 | 6-10 |
-| Large refactor (>300 lines) | 1 → 2 → 3 → 4 → 5 → 6 | 10-15 |
-
-*\*3.1 trivial = light scan only (5-10 diff lines for obvious bugs). Skip full checklist.*
-
-**Rules:** Always run 1 + 3.1 + 6. Re-route if Phase 3 reveals new signals. When in doubt, include.
+No changes? `git_status`, try `staged: true`. Still nothing? Ask user.
 
 ---
 
-## Phase 2: Structural Analysis *(conditional)*
+## Step 2: Fetch Diff + Scan Signals
 
-1. Extract changed symbols — are they `pub`?
-2. Find callers via `grep`
-3. Signature changes? Assess semver impact (breaking vs additive)
-4. Import changes? Old paths still valid?
+Fetch the full diff. Scan for signals and decide which checks to run in Step 3.
 
----
+**Signals → checks:**
 
-## Phase 3: Deep Review *(3.1 always; 3.2/3.3 conditional)*
+| Signal in diff | Check to run |
+|----------------|--------------|
+| `unsafe`, `Command::new`, SQL string interp, `unwrap()` outside tests | Security |
+| `pub fn/struct/enum/trait` signature change | API callers (`grep` for call sites) |
+| `impl Foo for Bar`, `#[async_trait]` | Trait conformance |
+| Error type/variant change, `thiserror` | `?`/`From`/`Into` chain |
+| Config struct, `Cargo.toml` dep change | Backward compat, defaults |
+| Tool schema/register, `edge_tools` | Registered? `parallel_safe`? Schema matches impl? |
+| `JournalEvent` change | `.jsonl` backward compat? New fields optional? |
+| `SubtaskStage` change | State transitions valid? Display updated? |
+| DB schema / cloud-synced struct | SQL migration needed? Sync adapter updated? |
+| Pure docs/comments/whitespace | Skip deep analysis |
 
-### 3.0 Context (only if diff is ambiguous)
+**Context budget:** at most 3 `read_file` calls total. Before each one, name the exact question it answers. If you can't, skip it.
 
-You already read the diff in Phase 1 — don't re-read it. Only `read_file` surrounding context when the diff alone is unclear. For files >200 lines, `outline: true` first.
-
-Prioritize the first `read_file` calls by risk:
-1. changed public API / trait / config boundaries
-2. unsafe / security-sensitive / process-spawning logic
-3. tests covering the changed behavior
-
-Do not spend the initial budget on low-risk helper files before checking these.
-
-### 3.1 Bug Detection
-
-Trivial: light scan for obvious bugs.
-Medium/Large: full scan — logic errors, concurrency issues, error handling gaps.
-
-### 3.2 Security *(conditional)*
-
-Command injection, path traversal, credential exposure, SQL injection, `unsafe` without safety comments.
-
-### 3.3 Test Coverage *(conditional)*
-
-For changed code paths: test exists? Covers new behavior? Edge cases?
+Do not call `git_show` or `git_diff` more than once on the same target. Do not invoke `skill(review-changes)` again in the same session.
 
 ---
 
-## Phase 4: Cross-File Consistency *(conditional)*
+## Step 3: Report
 
-| # | Signal | Check |
-|---|--------|-------|
-| 4.1 | Trait modified | All impls conform? Defaults/mocks updated? |
-| 4.2 | Error type changed | `?`/`From`/`Into` still valid? |
-| 4.3 | Config struct changed | Defaults sensible? Backward compatible? |
-| 4.4 | Public API changed | Docs/examples updated? |
+**Output NOTHING while making tool calls. Write the report only when all analysis is done.**
 
----
-
-## Phase 5: Astra-Specific *(conditional, sub-phases independent)*
-
-| # | Signal | Check |
-|---|--------|-------|
-| 5.1 | Tool schema/register | Registered in edge_tools? Category correct? `parallel_safe` if read-only? Schema matches impl? |
-| 5.2 | JournalEvent changed | .jsonl backward compat? New fields optional? Cloud ingestion updated? |
-| 5.3 | SubtaskStage changed | State transitions valid? Display handles new states? |
-| 5.4 | Cloud-synced struct | SQL migration needed? Sync adapter updated? |
-
----
-
-## Phase 6: Report
-
-**⚠ Write the report ONLY after all analysis is complete. While making tool calls, output NOTHING — no headers, no scope summaries, no strategy lines. All reporting belongs in Phase 6.**
-
----
-
+```
 ## Code Review: {target}
+Scope: {n} files, +{added}/-{removed} lines
 
-**Scope:** {n} files, +{added}/-{removed} lines  
-**Strategy:** {phase path, e.g. 1 → 3.1 → 5.1 → 6 | Skipped: 2, 3.2, 3.3, 4}
+### 🔴 Critical
+- {file}:{line} — {issue and why it matters}
 
-### 🔴 Critical ({n})
-{issues with file:line and why}
+### 🟡 Important
+- {file}:{line} — {issue and why it matters}
 
-### 🟡 Important ({n})
-{issues with file:line and why}
-
-### 💡 Suggestions ({n})
-{non-blocking improvements with benefit}
+### 💡 Suggestions
+- {file}:{line} — {improvement and benefit}
 
 ### ✅ Looks Good
-{what's well done}
+{what's well done, or "LGTM" if nothing material found}
+```
 
-### 📊 Impact Assessment
-| Aspect | Status |
-|--------|--------|
-| Public API | {n} ({breaking/additive/internal}) |
-| Test coverage | {adequate/needs-work/missing} |
-| Cross-file impact | {files affected} |
-| Semver | {major/minor/patch} |
-
-**Rules:** No style/formatting comments. Every issue needs file:line. Every 🔴🟡 must explain **why**. Every 💡 must explain **benefit**.
+No style/formatting comments. Every 🔴🟡 needs file:line and explains **why**. If nothing material: `LGTM` + one sentence on residual risk.

@@ -1132,7 +1132,6 @@ async fn plan_executor_task(
                     api: &ctx.api,
                     token: &ctx.token,
                     message: &prompt,
-                    prefetched_context_override: None,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
                     explain: crate::ExplainMode::Off,

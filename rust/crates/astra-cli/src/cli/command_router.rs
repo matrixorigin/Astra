@@ -2512,9 +2512,6 @@ mod exit_code_tests {
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
-            prefetch_injected: false,
-            prefetch_task_type: None,
-            prefetch_body_bytes: None,
             llm_rounds: None,
         }
     }

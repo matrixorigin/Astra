@@ -961,7 +961,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
         sqlx::query(
             "INSERT INTO team_execution_history \
-             (execution_id, team_id, user_id, task, status, started_at) \
+             (execution_id, team_id, user_id, `task`, status, started_at) \
              VALUES (?, ?, ?, ?, 'running', NOW(6))",
         )
         .bind(execution_id)
@@ -1004,7 +1004,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         use sqlx::Row;
 
         let rows = sqlx::query(
-            "SELECT execution_id, team_id, user_id, task, status, \
+            "SELECT execution_id, team_id, user_id, `task`, status, \
                     result_json, CAST(started_at AS CHAR) AS started_at, \
                     CAST(completed_at AS CHAR) AS completed_at \
              FROM team_execution_history \

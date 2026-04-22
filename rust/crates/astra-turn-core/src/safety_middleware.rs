@@ -1100,15 +1100,25 @@ fn check_backslash_escaped_operator(command: &str) -> bool {
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
-    let base_is_find = lowered
+    let base_command = lowered
         .iter()
         .find(|token| !token.is_empty() && !ZSH_PRECOMMAND_MODIFIERS.contains(&token.as_str()))
-        .is_some_and(|token| token == "find");
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let base_is_find = base_command == "find";
+    // grep/sed use BRE `\|` alternation; egrep uses ERE `|`; fgrep is fixed-string
+    // (no regex). awk supports ERE `|`. None of these are shell-exploit patterns.
+    let base_is_regex_tool = matches!(base_command, "grep" | "egrep" | "fgrep" | "sed" | "awk");
 
     for (idx, token) in tokens.iter().enumerate() {
         let Some(operator) = token_has_unquoted_escaped_operator(token) else {
             continue;
         };
+
+        // Allow \| in grep/sed/awk arguments (BRE alternation).
+        if base_is_regex_tool && operator == '|' {
+            continue;
+        }
 
         let allow_find_exec_terminator = base_is_find
             && operator == ';'
@@ -1864,6 +1874,16 @@ mod tests {
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"find . -name '*.rs' -exec sed -n 1p {} \;"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_grep_bre_alternation() {
+        // grep \| is standard BRE alternation, not a shell exploit.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"grep -n fetch_spinner\|show_early_hint\|last_prefetch_hash file.rs"#}),
         );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }

@@ -91,7 +91,7 @@ fn truncate_tool_result(content: &str, max_chars: usize) -> String {
     let head = &content[..head_end];
     let tail = &content[tail_start..];
     format!(
-        "{head}\n\n[… truncated {omitted} characters — output too large for context window …]\n\n{tail}"
+        "{head}\n\n[… truncated {omitted} characters — use start_line/end_line to read specific sections …]\n\n{tail}"
     )
 }
 

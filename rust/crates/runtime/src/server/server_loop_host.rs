@@ -913,7 +913,7 @@ impl ServerAgenticLoopHost {
         let (tool_round_guidance, guidance_signals) =
             crate::prompts::tool_round_guidance_trace_with(
                 &state.messages,
-                state.current_round_index,
+                state.llm_rounds_completed,
                 tool_cfg.effective_round_budget_warning(),
                 tool_cfg.effective_round_budget_limit(),
             );
@@ -1406,6 +1406,10 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn injects_round_guidance(&self) -> bool {
+        true // Server injects guidance into the system prompt in execute_turn.
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -2179,6 +2183,7 @@ mod tests {
 
         let mut state = create_test_state();
         state.current_round_index = crate::prompts::ROUND_BUDGET_THRESHOLD;
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
         state.messages = vec![
             json!({"role": "user", "content": "inspect the project"}),
             json!({"role": "tool", "content": "Cargo.toml"}),
@@ -2725,6 +2730,7 @@ mod tests {
             max_turns: 10,
             remaining_turns: 10,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
@@ -2780,7 +2786,6 @@ mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }

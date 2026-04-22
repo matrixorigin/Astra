@@ -1740,7 +1740,6 @@ Follow these steps:
                 api,
                 token: tok,
                 message: &reflection_message,
-                prefetched_context_override: None,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
                 explain: ExplainMode::Off,

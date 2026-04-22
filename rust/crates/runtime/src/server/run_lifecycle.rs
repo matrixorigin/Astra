@@ -432,7 +432,6 @@ fn build_runtime_turn_evaluation_event(
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
-        state.prefetch_injected,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
@@ -1763,6 +1762,7 @@ impl AgenticRunLifecycleService {
             max_turns,
             remaining_turns: max_turns,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools: std::collections::HashSet::new(),
             boosted_tools: std::collections::HashSet::new(),
@@ -1843,7 +1843,6 @@ impl AgenticRunLifecycleService {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }
@@ -2998,6 +2997,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             max_turns: 10,
             remaining_turns: 10,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: std::collections::HashSet::new(),
             boosted_tools: std::collections::HashSet::new(),
@@ -3084,7 +3084,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         };
 

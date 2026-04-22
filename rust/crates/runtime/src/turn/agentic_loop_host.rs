@@ -148,6 +148,13 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Whether the host already injects round budget guidance into the system
+    /// prompt during `execute_turn`.  When true, the agentic loop skips its
+    /// own user-message guidance injection to avoid double injection.
+    fn injects_round_guidance(&self) -> bool {
+        false
+    }
+
     /// Execute a hidden reflection-only LLM subcall and return the raw text.
     ///
     /// Hosts that do not support this can keep the default implementation.
@@ -504,6 +511,9 @@ pub struct AgenticLoopState {
     /// Used by the CLI to inject `round_index` into the bridge payload so the
     /// system prompt can include round budget directives.
     pub current_round_index: u32,
+    /// Actual number of LLM calls completed in this turn (not inflated by
+    /// progressive penalty).  Used for round budget guidance injection.
+    pub llm_rounds_completed: u32,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
     /// Positive allowlist bias populated by pipeline `add_tools` strategy.
@@ -587,11 +597,6 @@ pub struct AgenticLoopState {
     /// turn. The CLI host reads this to suppress intermediate text rendering
     /// on subsequent iterations (prevents markdown leak from draft text).
     pub skill_produced_output: bool,
-
-    /// True when context_prefetch injected data into the user message before
-    /// the agentic loop started. Suppresses "no tool call on live query" warnings
-    /// because the LLM already has the data it needs.
-    pub prefetch_injected: bool,
 
     // ── Cumulative token budget ──
     /// Maximum cumulative (prompt + completion) tokens across all rounds.
@@ -1094,6 +1099,7 @@ pub(crate) mod tests {
             max_turns: 10,
             remaining_turns: 10,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
@@ -1155,7 +1161,6 @@ pub(crate) mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }

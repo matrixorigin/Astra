@@ -4340,7 +4340,9 @@ async fn analysis_turn_injects_divergence_correction_after_five_exploration_roun
             // remaining_turns per round once the stall window fills). 5
             // repeats + 1 final text round → budget must absorb ≥3 penalties
             // plus 6 normal decrements.
-            "max_candidates": 14,
+            // Progressive warning penalty (2×N) needs more budget than flat:
+            // 6 rounds + penalties (2+4+6) = 18 steps minimum.
+            "max_candidates": 20,
             "context": {
                 // P2.5 progress-aware semantics: divergence fires only when
                 // the *same* (tool, args) signature repeats across the full

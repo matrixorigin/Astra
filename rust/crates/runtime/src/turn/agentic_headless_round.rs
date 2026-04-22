@@ -87,6 +87,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     messages: &mut Vec<Value>,
     tool_results: &mut Vec<Value>,
     step_recorder: &mut StepRecorder,
+    llm_round: u32,
 ) -> HeadlessPreparedRound<'a> {
     const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const PERMISSION_REQUEST_TIMEOUT_BACKGROUND: Duration = Duration::from_secs(5);
@@ -120,8 +121,18 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     for (call_id, result_text) in pre_resolved_results {
         pre_resolved_ids.insert(call_id.clone());
         let content_for_model = tool_result_content_for_model("pre_resolved", result_text);
-        let (tool_msg, tr) =
+        let (mut tool_msg, tr) =
             openai_tool_roundtrip_values(call_id, "pre_resolved", &content_for_model);
+        if let Some(obj) = tool_msg.as_object_mut() {
+            obj.insert(
+                "_round_index".to_string(),
+                serde_json::Value::Number(llm_round.into()),
+            );
+            obj.insert(
+                "_tool_name".to_string(),
+                serde_json::Value::String("pre_resolved".to_string()),
+            );
+        }
         messages.push(tool_msg);
         tool_results.push(tr);
     }
@@ -193,6 +204,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         messages,
         tool_results,
         step_recorder,
+        llm_round,
     )
     .await;
     let tool_calls = tool_calls.as_ref();

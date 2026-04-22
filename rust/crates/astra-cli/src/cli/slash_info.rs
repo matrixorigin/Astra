@@ -339,26 +339,6 @@ fn parse_review_git_target(arg: &str) -> ReviewGitTarget<'_> {
     ReviewGitTarget::Rev(a)
 }
 
-async fn prefetch_review_context(
-    arg: &str,
-    project_root: &std::path::Path,
-) -> Option<crate::context_prefetch::PrefetchedContext> {
-    let target = match parse_review_git_target(arg) {
-        ReviewGitTarget::Head => crate::context_prefetch::CodeReviewPrefetchTarget::Head,
-        ReviewGitTarget::WorkingTree => {
-            crate::context_prefetch::CodeReviewPrefetchTarget::WorkingTree
-        }
-        ReviewGitTarget::LastN(n) => crate::context_prefetch::CodeReviewPrefetchTarget::LastN(n),
-        ReviewGitTarget::Range(r) => {
-            crate::context_prefetch::CodeReviewPrefetchTarget::Range(r.to_string())
-        }
-        ReviewGitTarget::Rev(rev) => {
-            crate::context_prefetch::CodeReviewPrefetchTarget::Rev(rev.to_string())
-        }
-    };
-    crate::context_prefetch::prefetch_context_for_code_review_target(target, project_root).await
-}
-
 fn parse_review_match(line: &str) -> Option<ReviewMatch<'_>> {
     let mut parts = line.splitn(3, ':');
     let path = parts.next()?.trim();
@@ -483,34 +463,25 @@ fn build_review_prompt(arg: &str) -> String {
         ReviewGitTarget::Rev(r) => r.to_string(),
     };
     format!(
-        "You are an expert code reviewer working in the current local git repository.\n\
+        "Review target: {target_line}\n\
 \n\
-Review target: {target_line}\n\
+Step 1: Fetch the diff.\n\
+- HEAD → `git_show HEAD` (or parallel: `git_show HEAD` + `git_show HEAD~1` for last 2 commits)\n\
+- WORKING_TREE → `git_diff()`\n\
+- Range/rev → `git_show <rev>` or `git_diff(ref: ...)`\n\
 \n\
-The authoritative git review context is attached in `<prefetched_context>` when available.\n\
-Treat that attached diff/stat block as the primary evidence and review it directly.\n\
-Do NOT call git tools or the skill tool to repeat work already present in that attached context.\n\
+Step 2: Review the diff. Write findings. Stop.\n\
 \n\
-Process:\n\
-1. Start from the attached diff/stat context.\n\
-2. Only if that attached context is missing or explicitly truncated, fetch the minimum missing git context for the same target:\n\
-   - HEAD -> `git_show`\n\
-   - WORKING_TREE -> `git_diff` (use `stat_only:true` only if you truly only need per-file +/- counts)\n\
-   - Other -> `git_show <rev>`\n\
-3. Review the diff directly. Do NOT read entire files.\n\
-   Only use `read_file` with `start_line`/`end_line` if you need \
-   ~10 lines of surrounding context to verify a specific finding.\n\
-4. If you need to understand a function signature or type, use \
-   `read_file` with `outline=true` instead of reading the whole file.\n\
-5. Prefer `read_file`/`grep`/`glob` over `bash` unless a shell command is truly necessary.\n\
-6. Ignore pure formatting churn and environment-only failures unrelated to the reviewed change.\n\
-7. Do not narrate your process, do not repeat the attached diff/stat block, and do not output XML-like tags such as `<reflect>`.\n\
-8. In your answer, avoid markdown tables and lines dominated by `|` characters.\n\
+Hard constraints:\n\
+- Do NOT call `read_file` on any file. The diff is sufficient.\n\
+- Exception: if a specific line is ambiguous, use `read_file` with `start_line`/`end_line` for ≤15 lines max. At most 2 such calls total.\n\
+- Do NOT call `grep`, `glob`, or `bash` unless the diff references an external file not shown.\n\
+- Do NOT re-fetch the same commit twice.\n\
 \n\
-Output format:\n\
-- Findings: 0-3 bullets, only material issues.\n\
-- Verdict: `LGTM` or `Needs changes`, with one short sentence.\n\
-- If nothing material is wrong, say `LGTM` and mention residual risk only if it is real.\n"
+Output:\n\
+- 0-3 bullet findings, only material issues (bugs, security, logic errors, API breakage).\n\
+- Verdict: `LGTM` or `Needs changes` + one sentence.\n\
+- No style/formatting comments. No markdown tables.\n"
     )
 }
 
@@ -1248,7 +1219,6 @@ pub(super) async fn handle_info_command(
             };
             let project_root = std::env::current_dir().unwrap_or_default();
             let prompt = build_review_prompt(arg);
-            let prefetched_context = prefetch_review_context(arg, &project_root).await;
             let review_label = if arg.trim().is_empty() {
                 "HEAD".to_string()
             } else {
@@ -1267,7 +1237,6 @@ pub(super) async fn handle_info_command(
                 api,
                 token: tok,
                 message: &prompt,
-                prefetched_context_override: prefetched_context,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
                 explain: state.explain,
@@ -1326,7 +1295,13 @@ pub(super) async fn handle_info_command(
 
             // Write turn event to journal (same as normal chat turns).
             if let Some(journal) = state.journal.as_ref() {
-                let turn_event = astra_services::session_journal::JournalEvent::turn(
+                let tool_ms: u64 = sr
+                    .tool_call_records
+                    .iter()
+                    .filter(|r| !r.is_synthetic_placeholder())
+                    .map(|r| r.ms)
+                    .sum();
+                let mut turn_event = astra_services::session_journal::JournalEvent::turn(
                     state.session_id.as_deref(),
                     state.turn,
                     state.model.as_deref(),
@@ -1351,6 +1326,11 @@ pub(super) async fn handle_info_command(
                 .with_selector_time(sr.selector_ms)
                 .with_selector_tokens(sr.selector_tokens_in, sr.selector_tokens_out)
                 .with_memoria_time(sr.memoria_ms);
+                turn_event.llm_rounds = sr.llm_rounds;
+                turn_event.total_tool_ms = Some(tool_ms);
+                if let Some(dur) = turn_event.duration_ms {
+                    turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
+                }
                 state.last_turn_event = Some(turn_event.clone());
                 let _ = journal.append(&turn_event);
             }
@@ -2432,9 +2412,7 @@ mod tests {
         let prompt = super::build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
         assert!(prompt.contains("git_show"));
-        assert!(prompt.contains("authoritative git review context is attached"));
-        assert!(prompt.contains("Do NOT read entire files"));
-        assert!(prompt.contains("Do not narrate your process"));
+        assert!(prompt.contains("Do NOT call `read_file`"));
     }
 
     #[test]
@@ -2442,49 +2420,13 @@ mod tests {
         let prompt = super::build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
         assert!(prompt.contains("git_diff"));
-        assert!(prompt.contains("stat_only:true"));
-        assert!(prompt.contains("Start from the attached diff/stat context"));
-        assert!(prompt.contains("Prefer `read_file`/`grep`/`glob` over `bash`"));
+        assert!(prompt.contains("Do NOT call `read_file`"));
     }
 
     #[test]
     fn build_review_prompt_local_changes_maps_to_working_tree() {
         let prompt = super::build_review_prompt("local changes");
         assert!(prompt.contains("Review target: WORKING_TREE"));
-    }
-
-    #[tokio::test]
-    async fn prefetch_review_context_supports_working_tree() {
-        fn run_git(root: &std::path::Path, args: &[&str]) {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .expect("git should run");
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        run_git(root, &["init"]);
-        run_git(root, &["config", "user.name", "Review Tester"]);
-        run_git(root, &["config", "user.email", "review@test.local"]);
-        std::fs::write(root.join("review.txt"), "first version\n").expect("write file");
-        run_git(root, &["add", "review.txt"]);
-        run_git(root, &["commit", "-m", "first"]);
-        std::fs::write(root.join("review.txt"), "second version\n").expect("update file");
-
-        let ctx = super::prefetch_review_context("working", root)
-            .await
-            .expect("working tree prefetch should exist");
-        assert_eq!(ctx.task_type, "code_review");
-        assert!(ctx.body.contains("Working Directory Changes"));
-        assert!(ctx.body.contains("Unstaged Changes"));
     }
 
     #[test]
@@ -2548,48 +2490,6 @@ mod tests {
         let prompt = super::build_review_prompt("latest 2 commits");
         assert!(prompt.contains("HEAD~2..HEAD"));
         assert!(prompt.contains("last 2 commits"));
-    }
-
-    #[tokio::test]
-    async fn prefetch_review_context_supports_last_n_commits() {
-        fn run_git(root: &std::path::Path, args: &[&str]) {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .expect("git should run");
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        run_git(root, &["init"]);
-        run_git(root, &["config", "user.name", "Multi Review"]);
-        run_git(root, &["config", "user.email", "multi@test.local"]);
-        std::fs::write(root.join("a.txt"), "one\n").expect("write");
-        run_git(root, &["add", "a.txt"]);
-        run_git(root, &["commit", "-m", "commit one"]);
-        std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("write");
-        run_git(root, &["commit", "-am", "commit two"]);
-        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("write");
-        run_git(root, &["commit", "-am", "commit three"]);
-
-        let ctx = super::prefetch_review_context("latest 2 commits", root)
-            .await
-            .expect("multi-commit prefetch should exist");
-        assert_eq!(ctx.task_type, "code_review");
-        assert!(ctx.body.contains("Latest 2 Commits"));
-        assert!(ctx.body.contains("HEAD~2..HEAD"));
-        assert!(ctx.body.contains("commit two"));
-        assert!(ctx.body.contains("commit three"));
-        // `commit one` is the base of HEAD~2..HEAD, so it must NOT leak into
-        // the per-commit list.
-        assert!(!ctx.body.contains("commit one"));
     }
 
     #[test]

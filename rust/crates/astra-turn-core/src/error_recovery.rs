@@ -269,21 +269,27 @@ pub fn escalation_level(
     // Critical: nudges + errors coupled (prevents pure-stall sessions from
     // force-stopping when the agent is actually making progress with 0 errors),
     // or many errors with deprioritized tools,
-    // or very high total errors (scattered failures are still broken).
+    // or very high total errors (scattered failures are still broken),
+    // or very high nudge count alone (the agent is spinning even without errors,
+    //   e.g. cache-hit loops reading the same files repeatedly).
     //
     // Previously nudge_count >= 3 alone triggered Critical, which meant a session
     // with repeated exploration patterns (grep→read→grep) and ZERO tool errors
     // could be force-stopped. Now we require at least 3 actionable errors to
-    // accompany the stall signal, ensuring genuine stuck-ness.
+    // accompany the stall signal at the lower threshold, but a very high nudge
+    // count (>= 6) alone is sufficient — at that point the agent is clearly stuck.
     //
     // Thresholds raised after Session 7875e355 diagnostic showed:
     // - str_replace errors (old_str == new_str) were escalating too fast
     // - 5 errors → Warning was too aggressive for normal retry patterns
     // - Single-tool loops should not escalate; genuine stuck-ness requires
     //   failures across multiple tools or high error counts.
+    // - nudge_count alone requires 10 (not 6) to avoid false Critical on
+    //   normal sessions where cache-hit nudges accumulate without errors.
     if (nudge_count >= 4 && total_errors >= 3)
         || (total_errors >= 12 && deprioritized_count >= 2)
         || total_errors >= 15
+        || nudge_count >= 10
     {
         return EscalationLevel::Critical;
     }
