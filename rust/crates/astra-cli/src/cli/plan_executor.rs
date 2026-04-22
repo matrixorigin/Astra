@@ -55,6 +55,12 @@ pub enum PlanUpdate {
         pct: u32,
         remaining: usize,
         elapsed: Duration,
+        /// Subtask ids that blocked progress (empty for Ctrl+C interrupt pause).
+        /// When non-empty the monitor can show them so the user sees *why* the
+        /// plan paused instead of just a count. Added 2026-04-23 to close a
+        /// resume→re-pause loop where the user had no signal to diagnose the
+        /// dependency deadlock.
+        blocked_ids: Vec<String>,
     },
     PlanCompleted {
         pct: u32,
@@ -404,11 +410,21 @@ impl PlanOutputSink for ChannelSink {
         self.send(PlanUpdate::PlanCompleted { pct: 100, elapsed });
     }
 
-    fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, _blocked_ids: &str) {
+    fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, blocked_ids: &str) {
+        let blocked_ids = if blocked_ids.is_empty() {
+            Vec::new()
+        } else {
+            blocked_ids
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         self.send(PlanUpdate::PlanPaused {
             pct,
             remaining,
             elapsed,
+            blocked_ids,
         });
     }
 
@@ -443,6 +459,7 @@ impl PlanOutputSink for ChannelSink {
             pct,
             remaining,
             elapsed: Duration::ZERO,
+            blocked_ids: Vec::new(),
         });
     }
 
@@ -972,13 +989,79 @@ async fn plan_executor_task(
                 });
                 return; // Plan is done — exit the execution loop
             } else {
-                let blocked: Vec<_> = ctx
+                // ── Blocked-deps pause with auto-heal + resume-loop guard ──
+                //
+                // Bug fix 2026-04-23: Previously, if the ready set was empty
+                // and the plan was <100%, we paused and waited for Resume.
+                // Resume simply `continue`d the outer loop, which re-analysed
+                // deps with *identical* plan state — producing an infinite
+                // 继续→pause→继续→pause loop with no signal to the user
+                // about *why*. Observed in session 26f73ee4.
+                //
+                // Defences, cheapest first:
+                //   1. Auto-heal orphan `InProgress` subtasks (e.g. a crashed
+                //      worker left its subtask "running" — treat it as
+                //      retriable by resetting to `Pending`). This frequently
+                //      clears the deadlock without user intervention.
+                //   2. Surface the blocked ids in the `PlanPaused` UI event
+                //      so the user can diagnose at a glance.
+                //   3. If Resume is received and re-analysis produces the
+                //      *exact same* blocked set as before, abort with a
+                //      descriptive error rather than looping. The user can
+                //      always `rewind N`, edit the plan, or Cancel to recover.
+                let mut blocked: Vec<String> = ctx
                     .plan
                     .subtasks
                     .iter()
                     .filter(|s| s.status == TaskStatus::Pending)
-                    .map(|s| s.id.as_str())
+                    .map(|s| s.id.clone())
                     .collect();
+                blocked.sort();
+                let blocked_key = blocked.clone();
+
+                // Auto-heal InProgress orphans — they must have been
+                // abandoned (no live worker handle exists at this level of
+                // the executor) so resurrect them as Pending for another
+                // attempt. Log to journal so it's traceable.
+                let mut healed: Vec<String> = Vec::new();
+                for st in ctx.plan.subtasks.iter_mut() {
+                    if st.status == TaskStatus::InProgress {
+                        st.status = TaskStatus::Pending;
+                        healed.push(st.id.clone());
+                    }
+                }
+                if !healed.is_empty() {
+                    for id in &healed {
+                        let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                            id: id.clone(),
+                            status: TaskStatus::Pending,
+                        });
+                    }
+                    let healed_msg = format!(
+                        "Auto-healed {} orphan InProgress subtasks → Pending: {}",
+                        healed.len(),
+                        healed.join(", ")
+                    );
+                    let event = session_journal::JournalEvent::plan_progress(
+                        ctx.session_id.as_deref(),
+                        ctx.turn,
+                        "",
+                        ctx.plan_goal.as_deref().unwrap_or("plan"),
+                        "orphan_healed",
+                        pct,
+                        ctx.plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| s.status.is_terminal())
+                            .count(),
+                        ctx.plan.subtasks.len(),
+                    );
+                    emit_event(&update_tx, &ctx, event);
+                    eprintln!("  ℹ  {healed_msg}");
+                    // After healing, don't pause — jump back to re-analyse.
+                    continue;
+                }
+
                 sink.plan_paused(
                     pct,
                     blocked.len(),
@@ -1001,6 +1084,59 @@ async fn plan_executor_task(
                             return;
                         }
                         _ => {}
+                    }
+                }
+
+                // Anti-loop check: after resume, re-compute ready + blocked.
+                // If the blocked set is identical to what we just paused on,
+                // we'd immediately re-pause. Abort with an actionable error
+                // message instead of producing a user-visible infinite loop.
+                let new_ready = ctx.plan.ready_subtasks();
+                if new_ready.is_empty() {
+                    let mut new_blocked: Vec<String> = ctx
+                        .plan
+                        .subtasks
+                        .iter()
+                        .filter(|s| s.status == TaskStatus::Pending)
+                        .map(|s| s.id.clone())
+                        .collect();
+                    new_blocked.sort();
+                    if new_blocked == blocked_key {
+                        // Build a concise "who-blocks-whom" summary so the
+                        // user can rewind/edit the right subtask.
+                        let summary: Vec<String> = ctx
+                            .plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| s.status == TaskStatus::Pending)
+                            .map(|s| {
+                                let unmet: Vec<&str> = s
+                                    .depends_on
+                                    .iter()
+                                    .filter(|dep| {
+                                        !ctx.plan.subtasks.iter().any(|d| {
+                                            d.id == **dep && d.status == TaskStatus::Completed
+                                        })
+                                    })
+                                    .map(|s| s.as_str())
+                                    .collect();
+                                if unmet.is_empty() {
+                                    format!("{} (no unmet deps — status stuck?)", s.id)
+                                } else {
+                                    format!("{} needs [{}]", s.id, unmet.join(", "))
+                                }
+                            })
+                            .collect();
+                        let _ = update_tx.send(PlanUpdate::PlanError {
+                            error: format!(
+                                "Plan deadlocked: resume would re-pause on the same blocked set. \
+                                 Blocked subtasks:\n  - {}\n\
+                                 Use `rewind <id>` to revise a completed dep, edit the plan, \
+                                 or Cancel to abort.",
+                                summary.join("\n  - ")
+                            ),
+                        });
+                        return;
                     }
                 }
             }

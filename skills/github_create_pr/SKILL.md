@@ -57,7 +57,22 @@ If on `main` or the base branch, stop — nothing to create a PR from.
 ### 1.3 Check for uncommitted changes
 Use `git_status`. If dirty, ask if user wants to commit first.
 
-### 1.4 Check for existing PR from this branch
+### 1.4 Verify the branch actually has commits to PR (empty-diff guard)
+
+Before calling `gh pr create`, confirm the branch diverges from the base:
+
+```bash
+git rev-list --count main..HEAD 2>/dev/null || echo 0
+```
+
+If the count is `0` (or the command errors because `main` is unresolved), **STOP**:
+- Tell the user the branch has no commits ahead of base — there is nothing to PR.
+- Do not invoke `gh pr create` on an empty diff. GitHub will reject it with
+  "No commits between main and {branch}", and the failure is wasted tokens.
+- Suggest running `git_status` / `write_file` / `str_replace` first, or swap to a
+  different base branch if the user intended a fork-style PR.
+
+### 1.5 Check for existing PR from this branch
 Use `github_list_prs` with `state: "open"` to check. If a PR already exists from this branch, show it and ask whether to update or create a new one.
 
 ## Phase 2: Generate PR Content
