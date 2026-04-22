@@ -40,25 +40,9 @@ fn build_auto_reflection_tool_stats(
 }
 
 fn build_auto_reflection_experiment_summary(
-    state: &AgenticLoopState,
+    _state: &AgenticLoopState,
 ) -> Option<crate::liquid::reflection::ExperimentSummary> {
-    state
-        .telemetry
-        .observability_session
-        .as_ref()
-        .and_then(|session| session.read().ok())
-        .and_then(
-            |session| match (&session.active_experiment_id, &session.active_variant) {
-                (Some(experiment_id), Some(variant)) => {
-                    Some(crate::liquid::reflection::ExperimentSummary {
-                        experiment_id: experiment_id.clone(),
-                        variant: variant.clone(),
-                        samples: session.turn_number,
-                    })
-                }
-                _ => None,
-            },
-        )
+    None
 }
 
 fn reflection_goal_summary_from_surface(
@@ -510,7 +494,6 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         None => return,
     };
 
-    evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
     let (pending_before, applied_before, canary_before, resolved_before) =
         snapshot_evolution_promotion_ids(&evo).await;
     let (fast, llm_signals) = evo.flush().await;

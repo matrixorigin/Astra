@@ -149,8 +149,6 @@ mod slash_bug;
 mod slash_config;
 #[path = "cli/slash_debug.rs"]
 mod slash_debug;
-#[path = "cli/slash_experiment.rs"]
-mod slash_experiment;
 #[path = "cli/slash_health.rs"]
 mod slash_health;
 #[path = "cli/slash_info.rs"]

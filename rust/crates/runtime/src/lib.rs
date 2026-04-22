@@ -1,5 +1,4 @@
 // Clippy 1.94 tightened several lints; clean up incrementally rather than blocking CI.
-// ab_testing / execution_profile / exploration_engine are deprecated (superseded by SelfModel).
 #![allow(
     deprecated,
     clippy::await_holding_lock,
@@ -68,16 +67,12 @@ pub(crate) use storage::{
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
-pub mod ab_testing;
-pub mod adaptive_baselines;
-mod adaptive_execution_profile;
 mod app_state;
 pub mod auto_tuning;
 pub mod bridge;
 pub mod evaluation;
 pub mod evolution;
 pub mod execution_profile;
-pub mod exploration_engine;
 pub mod guardrail_tuning;
 pub mod introspection;
 pub mod liquid;
@@ -90,7 +85,6 @@ pub mod plan;
 pub mod plan_decompose;
 pub mod prompts;
 pub mod runtime_config;
-pub mod runtime_promotion_signals;
 pub mod self_model;
 pub mod server;
 pub mod sync_adapters;

@@ -288,15 +288,6 @@ pub(crate) struct ReplState {
     /// Persisted live goal-progress snapshot restored from workspace.
     pub pending_goal_progress: Option<astra_services::session_workspace::GoalProgressSnapshot>,
 
-    // ── A/B Testing (M4) ──
-    /// Shared experiment store for A/B testing.
-    pub experiment_store:
-        std::sync::Arc<std::sync::RwLock<astra_runtime::ab_testing::ExperimentStore>>,
-    /// Active experiment ID for this session (if enrolled).
-    pub active_experiment_id: Option<String>,
-    /// Active variant ID for this session (if enrolled).
-    pub active_variant_id: Option<String>,
-
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
     pub user_profile_manager: std::sync::Arc<astra_runtime::user_profile::UserProfileManager>,
@@ -441,11 +432,6 @@ impl Default for ReplState {
             observability_session: None,
             pending_adaptive_state: None,
             pending_goal_progress: None,
-            experiment_store: std::sync::Arc::new(std::sync::RwLock::new(
-                astra_runtime::ab_testing::ExperimentStore::new(),
-            )),
-            active_experiment_id: None,
-            active_variant_id: None,
             user_profile_manager: {
                 let store =
                     std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());

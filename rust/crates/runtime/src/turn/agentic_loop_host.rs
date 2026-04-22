@@ -343,9 +343,6 @@ pub struct TelemetryState {
     /// Typically set at session init and shared across agents.
     pub observability_hub:
         Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
-    /// Optional preloaded evaluation summaries used to damp runtime promotions.
-    pub runtime_promotion_signals:
-        Option<crate::runtime_promotion_signals::RuntimePromotionSignals>,
     /// Optional evaluation persistence context for refreshing DB-backed runtime signals.
     pub evaluation_persistence: Option<EvaluationPersistenceContext>,
     /// Optional event persistence context for mirroring context traces into cloud events.
@@ -854,9 +851,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use astra_core::confidence::ConfidenceInterval;
-    use astra_services::evaluation::types::ValueInterval;
-    use astra_services::session_audit::RuntimePromotionOutcome;
+
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
@@ -1162,36 +1157,6 @@ pub(crate) mod tests {
             session_turn: 0,
             prefetch_injected: false,
             turn_event_buffer: None,
-        }
-    }
-
-    fn promote_ready_runtime_signals() -> crate::runtime_promotion_signals::RuntimePromotionSignals
-    {
-        crate::runtime_promotion_signals::RuntimePromotionSignals {
-            noise_filtered_quality: Some(ConfidenceInterval::new(0.82, 0.78, 0.86)),
-            latest_gate: Some(
-                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
-                    passed: true,
-                    score_delta: Some(ValueInterval::new(0.06, 0.04, 0.08)),
-                },
-            ),
-            calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
-            ..crate::runtime_promotion_signals::RuntimePromotionSignals::default()
-        }
-    }
-
-    fn rollback_ready_runtime_signals() -> crate::runtime_promotion_signals::RuntimePromotionSignals
-    {
-        crate::runtime_promotion_signals::RuntimePromotionSignals {
-            noise_filtered_quality: Some(ConfidenceInterval::new(0.42, 0.39, 0.45)),
-            latest_gate: Some(
-                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
-                    passed: false,
-                    score_delta: Some(ValueInterval::new(-0.12, -0.16, -0.08)),
-                },
-            ),
-            calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
-            ..crate::runtime_promotion_signals::RuntimePromotionSignals::default()
         }
     }
 
@@ -4520,41 +4485,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[test]
-    fn adaptive_profile_assigns_experiment_variant() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "implement the feature".into();
-
-        let mut experiment = crate::ab_testing::Experiment::new("exp-router")
-            .with_variant(crate::ab_testing::Variant::control())
-            .with_variant(
-                crate::ab_testing::Variant::new("treatment")
-                    .with_traffic(0.5)
-                    .with_config_diff("compression.max_history_tokens", serde_json::json!(25_000)),
-            )
-            .with_metric(crate::ab_testing::MetricDefinition::success_rate())
-            .with_min_samples(5)
-            .build();
-        experiment.start();
-        hub.experiments_mut().register(experiment);
-
-        apply_adaptive_execution_profile(&mut state);
-
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(guard.active_experiment_id.as_deref(), Some("exp-router"));
-        assert!(guard.active_variant.is_some());
-        assert!(
-            guard
-                .profile
-                .active_experiments
-                .contains(&"exp-router".to_string())
-        );
-    }
-
-    #[test]
     fn adaptive_profile_enables_liquid_runtime_when_adaptive_context_is_on() {
         let hub = make_hub();
         let session = make_session();
@@ -4598,119 +4528,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         assert!(state.tactical_adapter.is_none());
         assert!(state.step_signal_collector.is_none());
-    }
-
-    #[test]
-    fn tuning_cycle_concludes_mature_experiments() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session);
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-        state.current_session_id = Some("test-session-promote".to_string());
-
-        let mut experiment = crate::ab_testing::Experiment::new("exp-mature")
-            .with_variant(crate::ab_testing::Variant::control())
-            .with_variant(
-                crate::ab_testing::Variant::new("treatment")
-                    .with_traffic(0.5)
-                    .with_config_diff("memory.retrieval_top_k", serde_json::json!(8)),
-            )
-            .with_metric(crate::ab_testing::MetricDefinition::success_rate())
-            .with_tag("task_type:fetch")
-            .with_tag("domain:any")
-            .with_min_samples(1)
-            .build();
-        experiment.start();
-        hub.experiments_mut().register(experiment);
-        {
-            let experiments = hub.experiments();
-            for (idx, value) in [0.10, 0.20, 0.25, 0.15, 0.30].into_iter().enumerate() {
-                experiments.record_outcome(
-                    "exp-mature",
-                    crate::ab_testing::ExperimentOutcome::new(format!("c{idx}"), "control")
-                        .with_metric("success_rate", value)
-                        .with_success(false),
-                );
-            }
-            for (idx, value) in [0.82, 0.91, 0.88, 0.95, 0.86].into_iter().enumerate() {
-                experiments.record_outcome(
-                    "exp-mature",
-                    crate::ab_testing::ExperimentOutcome::new(format!("t{idx}"), "treatment")
-                        .with_metric("success_rate", value)
-                        .with_success(true),
-                );
-            }
-        }
-
-        maybe_run_tuning_cycle(&mut state);
-
-        assert_eq!(
-            hub.experiments().get("exp-mature").map(|exp| exp.status),
-            Some(crate::ab_testing::ExperimentStatus::Completed)
-        );
-        let baseline = hub
-            .adaptive_baselines()
-            .resolve(crate::pipeline::routing::TaskType::Fetch, None);
-        assert!(
-            baseline.is_some(),
-            "winner should be promoted into a baseline"
-        );
-        let events = astra_services::session_journal::read_journal("test-session-promote").unwrap();
-        assert!(events.iter().any(|event| {
-            event.event_type
-                == astra_services::session_journal::JournalEventType::AdaptiveBaselinePromoted
-        }));
-    }
-
-    #[test]
-    fn tuning_cycle_creates_exploration_experiments_from_pattern_library() {
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session);
-        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
-
-        let pattern_library = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::pipeline::pattern::PatternLibrary::default(),
-        ));
-        {
-            let mut library = pattern_library.lock().unwrap();
-            library.record_outcome(
-                &["view".to_string()],
-                crate::pipeline::routing::TaskType::Fetch,
-                None,
-                false,
-                0.2,
-                None,
-            );
-            library.record_outcome(
-                &["view".to_string()],
-                crate::pipeline::routing::TaskType::Fetch,
-                None,
-                false,
-                0.3,
-                None,
-            );
-        }
-        hub.attach_pattern_library(pattern_library);
-
-        maybe_run_tuning_cycle(&mut state);
-
-        let experiments = hub.experiments();
-        let created = experiments.get("explore-fetch-any");
-        assert!(
-            created.is_some(),
-            "tuning cycle should auto-create exploration"
-        );
-        assert_eq!(
-            created.map(|experiment| experiment.status),
-            Some(crate::ab_testing::ExperimentStatus::Running)
-        );
     }
 
     // ── Per-turn micro-adaptation tests ──
@@ -5600,109 +5417,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[test]
-    fn stress_experiment_lifecycle_create_enroll_conclude_promote() {
-        use crate::ab_testing::{Experiment, Variant};
-
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-
-        // Step 1: Create an experiment via the hub
-        let experiment = Experiment::new("test-exp-lifecycle")
-            .with_description("Test lifecycle experiment")
-            .with_variant(Variant {
-                id: "control".into(),
-                name: "control".into(),
-                description: "Control: default config".into(),
-                config_diff: std::collections::HashMap::new(),
-                traffic_percentage: 0.5,
-                is_control: true,
-            })
-            .with_variant(Variant {
-                id: "treatment".into(),
-                name: "treatment".into(),
-                description: "Treatment: higher budget".into(),
-                config_diff: {
-                    let mut m = std::collections::HashMap::new();
-                    m.insert(
-                        "token_budget.max_turn_input_tokens".into(),
-                        serde_json::json!(120_000),
-                    );
-                    m
-                },
-                traffic_percentage: 0.5,
-                is_control: false,
-            })
-            .with_min_samples(3)
-            .build();
-        hub.experiments().register(experiment);
-
-        // Step 2: Enroll by setting active experiment
-        {
-            let mut guard = session.write().unwrap();
-            guard.active_experiment_id = Some("test-exp-lifecycle".into());
-            guard
-                .profile
-                .enroll_experiment("test-exp-lifecycle".to_string());
-        }
-
-        // Step 3: Simulate turns with the experiment active
-        state.message = "fix the crash in the parser module".into();
-        state.recent_tools = vec!["bash".into()];
-        for turn in 1..=5u32 {
-            let mut guard = session.write().unwrap();
-            guard.turn_number = turn;
-            guard.record_query("fix the crash in the parser module");
-        }
-
-        // Step 4: Record outcomes for the experiment
-        for _ in 0..5 {
-            let experiments = hub.experiments();
-            let outcome = crate::ab_testing::ExperimentOutcome::new("test-user", "treatment")
-                .with_success(true);
-            experiments.record_outcome("test-exp-lifecycle", outcome);
-        }
-        for _ in 0..2 {
-            let experiments = hub.experiments();
-            let outcome = crate::ab_testing::ExperimentOutcome::new("test-user", "control")
-                .with_success(true);
-            experiments.record_outcome("test-exp-lifecycle", outcome);
-        }
-        for _ in 0..3 {
-            let experiments = hub.experiments();
-            let outcome = crate::ab_testing::ExperimentOutcome::new("test-user", "control")
-                .with_success(false);
-            experiments.record_outcome("test-exp-lifecycle", outcome);
-        }
-
-        // Step 5: Try conclusion
-        let exploration = crate::exploration_engine::ExplorationEngine::default();
-        let experiments = hub.experiments();
-        let concluded = exploration.conclude_mature_experiments(&experiments);
-
-        // The experiment may or may not be mature enough to conclude depending
-        // on min_samples, but the lifecycle should not panic.
-        if !concluded.is_empty() {
-            let conclusion = &concluded[0];
-            assert_eq!(conclusion.experiment_id, "test-exp-lifecycle");
-            // Treatment had 5/5 success (100%), control had 2/5 (40%)
-            // Treatment should win
-            if let Some(winner) = &conclusion.winner_variant_id {
-                assert_eq!(
-                    winner, "treatment",
-                    "treatment should win with higher success"
-                );
-            }
-        }
-
-        // Verify experiment is accessible and no corruption
-        let exp = experiments.get("test-exp-lifecycle");
-        assert!(exp.is_some(), "experiment should still exist");
-    }
-
-    #[test]
     fn stress_all_8_default_rules_fire() {
         use crate::auto_tuning::{FeedbackSignal, SignalType, default_rules};
 
@@ -5792,158 +5506,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let _some_change = budget_changed || memory_changed;
 
         // No panic, no corruption — all rules composed successfully
-    }
-
-    /// Full-loop replay test covering:
-    /// signal emission → tuning cycle → experiment creation → conclusion → baseline promotion → abort/rollback
-    #[test]
-    fn replay_full_adaptive_cycle_with_experiment_lifecycle() {
-        use crate::ab_testing::{ExperimentOutcome, ExperimentStore};
-        use crate::adaptive_baselines::AdaptiveBaselineStore;
-        use crate::exploration_engine::ExplorationEngine;
-        use crate::pipeline::routing::TaskType;
-
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.observability_session = Some(session.clone());
-        state.current_session_id = Some("replay-test".into());
-        state.current_run_id = Some("run-replay".into());
-
-        {
-            let mut guard = session.write().unwrap();
-            guard.config.context_window.adaptive = true;
-            guard.config.token_budget.max_turn_input_tokens = 100_000;
-        }
-        state.max_turn_input_tokens = 100_000;
-
-        // --- Phase 1: Generate mixed signals over 10 turns ---
-        let success: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Completed);
-        let failure: Result<AgenticLoopOutcome, astra_core::ClassifiedError> =
-            Ok(AgenticLoopOutcome::Error("test error".into()));
-
-        for i in 0..10 {
-            let outcome = if i % 3 == 0 { &failure } else { &success };
-            simulate_turn(
-                &mut state,
-                &session,
-                "analyze the code structure",
-                &["view", "grep"],
-                60_000 + (i as u64 * 3_000),
-                outcome,
-            );
-        }
-
-        // Verify signals were recorded: should have mix of successes and failures
-        let config = crate::runtime_config::RuntimeConfig::default();
-        hub.tuning()
-            .add_rule(crate::auto_tuning::EvolutionRule::new(
-                "check-signals",
-                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
-                    threshold: 0.9,
-                    window_secs: 3600,
-                    min_samples: 3,
-                },
-                crate::auto_tuning::EvolutionAction::Alert {
-                    message: "low success".into(),
-                    severity: crate::auto_tuning::AlertSeverity::Warning,
-                },
-            ));
-        let triggered = hub.tuning().evaluate(&config);
-        assert!(
-            !triggered.is_empty(),
-            "mixed success/failure should trigger low-success rule"
-        );
-
-        // --- Phase 2: Exercise experiment lifecycle separately ---
-        let exp_store = ExperimentStore::new();
-        let baselines = AdaptiveBaselineStore::new();
-        let exploration = ExplorationEngine::new(0.5, 3, 1);
-
-        // Manually seed a pattern library with low-confidence area
-        let mut pattern_lib = crate::pipeline::pattern::PatternLibrary::default();
-        for _ in 0..5 {
-            pattern_lib.record_outcome(
-                &["view".to_string()],
-                TaskType::Fetch,
-                None,
-                false,
-                0.2,
-                None,
-            );
-        }
-
-        // Create experiments from pattern opportunities
-        let created = exploration.check_and_create_experiments(&pattern_lib, &exp_store);
-        assert!(
-            !created.is_empty(),
-            "should create experiment for low-confidence area"
-        );
-        let exp_id = created[0].id.clone();
-
-        // Record outcomes for the experiment
-        exp_store.record_outcome(
-            &exp_id,
-            ExperimentOutcome::new("u1", "control")
-                .with_metric("success_rate", 0.3)
-                .with_success(false),
-        );
-        exp_store.record_outcome(
-            &exp_id,
-            ExperimentOutcome::new("u2", "treatment-low-success")
-                .with_metric("success_rate", 0.9)
-                .with_success(true),
-        );
-
-        // Conclude mature experiments
-        let conclusions = exploration.conclude_mature_experiments(&exp_store);
-        assert_eq!(conclusions.len(), 1);
-        assert_eq!(conclusions[0].experiment_id, exp_id);
-        // With only 2 data points, statistical analysis may return NoSignificantDifference.
-        // The important thing is the experiment was concluded.
-
-        // Promote treatment as baseline (simulating a real winner decision).
-        if let Some(exp) = exp_store.get(&exp_id) {
-            let _ = baselines.promote_winner(&exp, "treatment-low-success");
-        }
-        assert!(
-            baselines.resolve(TaskType::Fetch, None).is_some(),
-            "baseline should be promoted"
-        );
-
-        // --- Phase 3: Abort experiment → rollback baseline ---
-        // Create a new experiment for abort testing
-        let mut abort_exp = crate::ab_testing::Experiment::new("exp-abort-replay")
-            .with_variant(crate::ab_testing::Variant::control())
-            .with_variant(
-                crate::ab_testing::Variant::new("risky")
-                    .with_traffic(0.5)
-                    .with_config_diff("max_tools", serde_json::json!(99)),
-            )
-            .with_tag("task_type:code")
-            .with_tag("domain:any")
-            .build();
-        abort_exp.start();
-        exp_store.register(abort_exp.clone());
-        let _ = baselines.promote_winner(&abort_exp, "risky");
-        assert!(baselines.resolve(TaskType::Code, None).is_some());
-
-        let (cancelled, rollbacks) =
-            exploration.abort_experiment("exp-abort-replay", &exp_store, &baselines);
-        assert!(cancelled);
-        assert_eq!(rollbacks.len(), 1);
-        assert!(
-            baselines.resolve(TaskType::Code, None).is_none(),
-            "baseline should be rolled back after abort"
-        );
-
-        // Original Fetch baseline should still exist
-        assert!(
-            baselines.resolve(TaskType::Fetch, None).is_some(),
-            "unrelated baseline should survive abort"
-        );
     }
 
     #[test]
@@ -7078,8 +6640,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
         ));
         {
             let mut guard = session.write().unwrap();
-            guard.active_experiment_id = Some("exp-123".into());
-            guard.active_variant = Some("variant-b".into());
             guard.turn_number = 4;
         }
         state.telemetry.observability_session = Some(session);
@@ -7117,75 +6677,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("Recent adaptation verification impacts:"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
-        assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
         assert!(prompt.contains("Recent tactical actions:"));
         assert!(prompt.contains("verify outputs more strictly"));
         assert!(prompt.contains("[ToolFailure] bash: Permission denied"));
         assert!(state.recent_tactical_actions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn maybe_trigger_auto_reflection_records_auto_canary_promotions() {
-        use crate::evolution::service::EvolutionService;
-        let calibrator = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::pipeline::calibration::ProgressiveCalibrator::default(),
-        ));
-        let evo = std::sync::Arc::new(EvolutionService::new().with_calibrator(calibrator));
-        let ctx = evo.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
-        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
-
-        evo.ingest_reflection_response_detailed(llm, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(evo.active_canaries().await.len(), 1);
-
-        let mut host = MockHost::new(vec![]);
-        let mut state = make_state();
-        state.evolution_service = Some(evo.clone());
-        state.telemetry.runtime_promotion_signals = Some(promote_ready_runtime_signals());
-
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        assert!(evo.active_canaries().await.is_empty());
-        assert!(
-            state
-                .telemetry
-                .promotion_events
-                .iter()
-                .any(|event| event.outcome == RuntimePromotionOutcome::CanaryPromoted)
-        );
-    }
-
-    #[tokio::test]
-    async fn maybe_trigger_auto_reflection_records_auto_canary_rollbacks() {
-        use crate::evolution::service::EvolutionService;
-        let calibrator = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::pipeline::calibration::ProgressiveCalibrator::default(),
-        ));
-        let evo = std::sync::Arc::new(EvolutionService::new().with_calibrator(calibrator));
-        let ctx = evo.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
-        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
-
-        evo.ingest_reflection_response_detailed(llm, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(evo.active_canaries().await.len(), 1);
-
-        let mut host = MockHost::new(vec![]);
-        let mut state = make_state();
-        state.evolution_service = Some(evo.clone());
-        state.telemetry.runtime_promotion_signals = Some(rollback_ready_runtime_signals());
-
-        maybe_trigger_auto_reflection(&mut host, &mut state).await;
-
-        assert!(evo.active_canaries().await.is_empty());
-        assert!(
-            state
-                .telemetry
-                .promotion_events
-                .iter()
-                .any(|event| event.outcome == RuntimePromotionOutcome::CanaryRolledBack)
-        );
     }
 
     // ── Skill deferral behavior tests ─────────────────────────────────────

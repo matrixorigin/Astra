@@ -79,6 +79,20 @@ pub struct SelfModel {
     /// agent can audit why a tool is being preferred or avoided.
     #[serde(default)]
     pub outcome_bias: std::collections::BTreeMap<String, f64>,
+    /// High-failure tools surfaced for the model to reason about — the
+    /// runtime provides the signal; the model decides whether to avoid
+    /// them or try anyway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub low_confidence_tools: Vec<LowConfidenceTool>,
+}
+
+/// A tool that has been failing at a high rate in recent use, surfaced
+/// to the model for reasoning.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct LowConfidenceTool {
+    pub name: String,
+    pub fail_rate: f64,
+    pub samples: u32,
 }
 
 /// Gap 3: a single recent permission rejection, rendered into the
@@ -496,6 +510,7 @@ impl SelfModel {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
+            low_confidence_tools: Vec::new(),
         }
     }
 
@@ -540,6 +555,13 @@ impl SelfModel {
     /// supplied.
     pub fn with_outcome_bias(mut self, bias: std::collections::BTreeMap<String, f64>) -> Self {
         self.outcome_bias = bias;
+        self
+    }
+
+    /// Attach high-failure tool signals so the model can reason about
+    /// alternatives. Overwrites any previously-attached list.
+    pub fn with_low_confidence_tools(mut self, tools: Vec<LowConfidenceTool>) -> Self {
+        self.low_confidence_tools = tools;
         self
     }
 
@@ -915,6 +937,23 @@ impl SelfModel {
                 String::new()
             }
         );
+
+        if !self.low_confidence_tools.is_empty() {
+            let mut sorted = self.low_confidence_tools.clone();
+            sorted.sort_by(|a, b| {
+                b.fail_rate
+                    .partial_cmp(&a.fail_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            s.push_str("⚠ Recent high-failure tools (consider alternatives):\n");
+            for entry in sorted.iter().take(5) {
+                let _ = writeln!(
+                    s,
+                    "  - {}: failure_rate={:.2} over {} samples",
+                    entry.name, entry.fail_rate, entry.samples
+                );
+            }
+        }
 
         s
     }
@@ -2043,5 +2082,43 @@ mod tests {
         let model = minimal_model();
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Tool outcome bias"), "got: {rendered}");
+    }
+
+    #[test]
+    fn low_confidence_tools_rendered_sorted_by_fail_rate_desc() {
+        let model = minimal_model().with_low_confidence_tools(vec![
+            LowConfidenceTool {
+                name: "bash".into(),
+                fail_rate: 0.3,
+                samples: 10,
+            },
+            LowConfidenceTool {
+                name: "write_file".into(),
+                fail_rate: 0.75,
+                samples: 8,
+            },
+            LowConfidenceTool {
+                name: "grep".into(),
+                fail_rate: 0.5,
+                samples: 15,
+            },
+        ]);
+        let rendered = model.to_system_prompt_section();
+        assert!(rendered.contains("high-failure tools"));
+        let pos_write = rendered.find("write_file").unwrap();
+        let pos_grep = rendered.find("grep").unwrap();
+        let pos_bash = rendered.find("bash").unwrap();
+        assert!(pos_write < pos_grep, "write_file should appear before grep");
+        assert!(pos_grep < pos_bash, "grep should appear before bash");
+    }
+
+    #[test]
+    fn low_confidence_tools_empty_produces_no_output() {
+        let model = minimal_model().with_low_confidence_tools(vec![]);
+        let rendered = model.to_system_prompt_section();
+        assert!(
+            !rendered.contains("high-failure"),
+            "should not render section when empty"
+        );
     }
 }

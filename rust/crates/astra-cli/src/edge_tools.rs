@@ -1540,7 +1540,7 @@ impl ToolExecutor {
             session.turn_number,
             latest_budget,
             None,
-            session.active_experiment_id.as_deref(),
+            None,
             elapsed,
             session.user_corrections.len(),
             session.compressed_turns.len(),
@@ -1571,6 +1571,22 @@ impl ToolExecutor {
         }
         if !session.outcome_bias.is_empty() {
             snapshot = snapshot.with_outcome_bias(session.outcome_bias.clone());
+        }
+        if !session.low_confidence_tools.is_empty() {
+            snapshot = snapshot.with_low_confidence_tools(
+                session
+                    .low_confidence_tools
+                    .iter()
+                    .cloned()
+                    .map(|(name, fail_rate, samples)| {
+                        astra_runtime::self_model::LowConfidenceTool {
+                            name,
+                            fail_rate,
+                            samples,
+                        }
+                    })
+                    .collect(),
+            );
         }
         Some(snapshot)
     }

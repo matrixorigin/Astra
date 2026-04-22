@@ -129,13 +129,6 @@ impl ExecutionProfile {
         }
     }
 
-    /// Apply an experiment variant's config overrides.
-    pub fn apply_variant(&mut self, experiment_id: &str, variant: &crate::ab_testing::Variant) {
-        self.experiment_id = Some(experiment_id.to_string());
-        self.variant_id = Some(variant.id.clone());
-        variant.apply_to_config(&mut self.config);
-    }
-
     /// Store pattern library boost terms for tool selection.
     pub fn merge_boosts(&mut self, boost_terms: Vec<String>) {
         self.boost_terms = boost_terms;
@@ -212,24 +205,6 @@ mod tests {
             profile.config.tool_selection.confidence_threshold,
             orig.max(0.35)
         );
-    }
-
-    #[test]
-    fn apply_variant_sets_experiment_info() {
-        let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
-
-        let mut variant = crate::ab_testing::Variant::new("treatment-1");
-        variant.config_diff.insert(
-            "compression.max_history_tokens".to_string(),
-            serde_json::json!(30_000),
-        );
-
-        profile.apply_variant("exp-001", &variant);
-
-        assert_eq!(profile.experiment_id.as_deref(), Some("exp-001"));
-        assert_eq!(profile.variant_id.as_deref(), Some("treatment-1"));
-        assert_eq!(profile.config.compression.max_history_tokens, 30_000);
-        assert!(profile.is_in_experiment());
     }
 
     #[test]

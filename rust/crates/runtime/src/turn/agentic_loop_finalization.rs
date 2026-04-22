@@ -416,7 +416,6 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     }
 
     if let Some(evo) = state.evolution_service.clone() {
-        evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
         let (pending_before, applied_before, canary_before, resolved_before) =
             snapshot_evolution_promotion_ids(&evo).await;
         let (auto_applied, _llm_signals) = evo.flush().await;

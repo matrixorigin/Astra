@@ -1,16 +1,14 @@
 //! Observability Integration Layer
 //!
-//! Wires M1-M6 modules into the agentic loop:
+//! Wires observability modules into the agentic loop:
 //! - M1: Context Assembly Telemetry
 //! - M2: Decision Explainer
 //! - M3: RuntimeConfig (via session)
-//! - M4: A/B Testing
 //! - M5: User Profiles
 //! - M6: Auto-Tuning
 //!
 //! This module provides hooks that can be called at strategic points
 //! in the agentic loop lifecycle.
-#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,11 +21,6 @@ use astra_services::session_workspace::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::ab_testing::{ExperimentAnalyzer, ExperimentOutcome, ExperimentStatus, ExperimentStore};
-use crate::adaptive_baselines::{
-    AdaptiveBaselinePromotionDecision, AdaptiveBaselineScope, AdaptiveBaselineStore,
-    evaluate_promotion_verdict,
-};
 use crate::auto_tuning::{AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
@@ -54,14 +47,8 @@ pub struct ObservabilitySession {
     /// User profile (loaded at session start).
     pub profile: UserProfile,
 
-    /// Runtime config (possibly modified by A/B testing).
+    /// Runtime config.
     pub config: RuntimeConfig,
-
-    /// Active experiment variant (if enrolled).
-    pub active_variant: Option<String>,
-
-    /// Active experiment ID (if enrolled).
-    pub active_experiment_id: Option<String>,
 
     /// Context assembly traces for this session.
     pub context_traces: Vec<ContextAssemblyTrace>,
@@ -161,6 +148,11 @@ pub struct ObservabilitySession {
     /// Gap 6: per-tool outcome bias currently applied by the selector
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
     pub outcome_bias: std::collections::BTreeMap<String, f64>,
+
+    /// High-failure tools surfaced for SelfModel reasoning (name, fail_rate, samples).
+    /// Populated by the adaptive-tuning cycle; consumed by the SelfModel snapshot
+    /// builder. Replaced (not appended to) on each publish.
+    pub low_confidence_tools: Vec<(String, f64, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,31 +210,12 @@ impl ObservabilitySession {
         user_id: impl Into<String>,
         session_id: impl Into<String>,
         manager: &UserProfileManager,
-        experiment_store: Option<&ExperimentStore>,
     ) -> Self {
         let user_id = user_id.into();
         let profile = manager.get_profile(&user_id);
 
         // Load config from defaults + file hierarchy + env vars
         let mut config = RuntimeConfig::load();
-        let mut active_variant = None;
-        let mut active_experiment_id = None;
-
-        if let Some(store) = experiment_store {
-            // Check for active experiments
-            for exp_id in &profile.active_experiments {
-                if let Some(exp) = store.get(exp_id) {
-                    if matches!(exp.status, ExperimentStatus::Running) {
-                        if let Some(variant) = exp.assign_variant(&user_id) {
-                            variant.apply_to_config(&mut config);
-                            active_variant = Some(variant.id.clone());
-                            active_experiment_id = Some(exp_id.clone());
-                            break; // Only one active experiment at a time
-                        }
-                    }
-                }
-            }
-        }
 
         // Apply user preferences
         profile.preferences.apply_to_config(&mut config);
@@ -253,8 +226,6 @@ impl ObservabilitySession {
             turn_number: 0,
             profile,
             config,
-            active_variant,
-            active_experiment_id,
             context_traces: Vec::new(),
             decision_explanations: Vec::new(),
             drift_detector: DriftDetector::default(),
@@ -279,13 +250,14 @@ impl ObservabilitySession {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
+            low_confidence_tools: Vec::new(),
         }
     }
 
     /// Create a simple session without full profile infrastructure.
     ///
     /// This is useful for CLI contexts where we don't have access to the
-    /// full UserProfileManager/ExperimentStore.
+    /// full UserProfileManager.
     pub fn new_simple(session_id: impl Into<String>) -> Self {
         Self {
             user_id: "anonymous".to_string(),
@@ -293,8 +265,6 @@ impl ObservabilitySession {
             turn_number: 0,
             profile: UserProfile::new("anonymous"),
             config: RuntimeConfig::load(),
-            active_variant: None,
-            active_experiment_id: None,
             context_traces: Vec::new(),
             decision_explanations: Vec::new(),
             drift_detector: DriftDetector::default(),
@@ -319,6 +289,7 @@ impl ObservabilitySession {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
+            low_confidence_tools: Vec::new(),
         }
     }
 
@@ -690,17 +661,10 @@ impl ObservabilitySession {
 ///
 /// Thread-safe singleton that manages:
 /// - User profile store
-/// - Experiment store
 /// - Auto-tuning engine
 pub struct ObservabilityHub {
     /// User profile manager.
     profile_manager: UserProfileManager,
-
-    /// A/B experiment store.
-    experiment_store: RwLock<ExperimentStore>,
-
-    /// Durable promoted baselines from completed experiments.
-    adaptive_baselines: AdaptiveBaselineStore,
 
     /// Auto-tuning engine.
     tuning_engine: AutoTuningEngine,
@@ -713,6 +677,9 @@ pub struct ObservabilityHub {
 
     /// Active sessions.
     sessions: RwLock<HashMap<String, Arc<RwLock<ObservabilitySession>>>>,
+
+    /// High-failure tools surfaced for SelfModel reasoning.
+    low_confidence_tools: Mutex<Vec<(String, f64, u32)>>,
 }
 
 impl Default for ObservabilityHub {
@@ -727,12 +694,11 @@ impl ObservabilityHub {
         let profile_store = Arc::new(UserProfileStore::new());
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            experiment_store: RwLock::new(ExperimentStore::new()),
-            adaptive_baselines: AdaptiveBaselineStore::new(),
             tuning_engine: AutoTuningEngine::new(),
             delegation_outcomes: DelegationOutcomeTracker::new(),
             pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
+            low_confidence_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -745,18 +711,16 @@ impl ObservabilityHub {
         }
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
-        let baseline_path = observability_storage_file(&storage_root, "adaptive-baselines.json");
         let tuning_path = observability_storage_file(&storage_root, "feedback-aggregator.json");
         let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            experiment_store: RwLock::new(ExperimentStore::new()),
-            adaptive_baselines: AdaptiveBaselineStore::with_storage(baseline_path),
             tuning_engine: AutoTuningEngine::with_storage(tuning_path),
             delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
+            low_confidence_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -768,12 +732,7 @@ impl ObservabilityHub {
         user_id: &str,
         session_id: &str,
     ) -> Arc<RwLock<ObservabilitySession>> {
-        let store = self
-            .experiment_store
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let session =
-            ObservabilitySession::new(user_id, session_id, &self.profile_manager, Some(&store));
+        let session = ObservabilitySession::new(user_id, session_id, &self.profile_manager);
         let session = Arc::new(RwLock::new(session));
         self.sessions
             .write()
@@ -799,33 +758,6 @@ impl ObservabilityHub {
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id)?;
         let session = session.read().unwrap_or_else(|e| e.into_inner());
-
-        // Record experiment outcome if active
-        if let (Some(variant_id), Some(experiment_id)) =
-            (&session.active_variant, &session.active_experiment_id)
-        {
-            // Calculate success based on drift and feedback
-            let success_rate = if session.decision_explanations.is_empty() {
-                0.5 // Neutral if no data
-            } else {
-                let drift_count = session
-                    .decision_explanations
-                    .iter()
-                    .filter(|d| d.confidence < 0.5)
-                    .count();
-                1.0 - (drift_count as f64 / session.decision_explanations.len() as f64)
-            };
-
-            let store = self
-                .experiment_store
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let outcome = ExperimentOutcome::new(&session.user_id, variant_id)
-                .with_metric("success_rate", success_rate)
-                .with_metric("turns", session.turn_number as f64)
-                .with_metric("duration_ms", session.duration().as_millis() as f64);
-            store.record_outcome(experiment_id, outcome);
-        }
 
         Some(SessionSummary {
             user_id: session.user_id.clone(),
@@ -935,19 +867,6 @@ impl ObservabilityHub {
             .tuning_engine
             .run_cycle_with_patterns(config, pattern_lib_ref);
 
-        // Handle experiment enable/disable actions
-        for execution in &executions {
-            match &execution.action {
-                crate::auto_tuning::EvolutionAction::EnableExperiment { experiment_id } => {
-                    self.experiments_mut().enable_experiment(experiment_id);
-                }
-                crate::auto_tuning::EvolutionAction::DisableExperiment { experiment_id } => {
-                    self.experiments_mut().disable_experiment(experiment_id);
-                }
-                _ => {}
-            }
-        }
-
         // Persist aggregator state after tuning cycle.
         if !executions.is_empty() {
             self.tuning_engine.persist();
@@ -978,87 +897,30 @@ impl ObservabilityHub {
         self.profile_manager.observe_tool(user_id, tool_name);
     }
 
-    // ─── Experiment Management ──────────────────────────────────────────────
+    // ─── Low-Confidence Tools (SelfModel Signal) ────────────────────────────
 
-    /// Get the experiment store for management.
-    pub fn experiments(&self) -> std::sync::RwLockReadGuard<'_, ExperimentStore> {
-        self.experiment_store
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Get mutable experiment store.
-    pub fn experiments_mut(&self) -> std::sync::RwLockWriteGuard<'_, ExperimentStore> {
-        self.experiment_store
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub fn adaptive_baselines(&self) -> &AdaptiveBaselineStore {
-        &self.adaptive_baselines
-    }
-
-    pub fn promote_experiment_winner(
-        &self,
-        experiment_id: &str,
-        winner_variant_id: &str,
-    ) -> Result<AdaptiveBaselinePromotionDecision, String> {
-        self.promote_experiment_winner_with_signals(experiment_id, winner_variant_id, None)
-    }
-
-    pub fn promote_experiment_winner_with_signals(
-        &self,
-        experiment_id: &str,
-        winner_variant_id: &str,
-        promotion_signals: Option<&crate::runtime_promotion_signals::RuntimePromotionSignals>,
-    ) -> Result<AdaptiveBaselinePromotionDecision, String> {
-        let experiment_store = self
-            .experiment_store
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let experiment = experiment_store
-            .get(experiment_id)
-            .ok_or_else(|| format!("missing experiment {experiment_id}"))?;
-        let outcomes = experiment_store.get_outcomes(experiment_id);
-
-        let winner = experiment.variant(winner_variant_id).ok_or_else(|| {
-            format!(
-                "experiment {} missing winner variant {winner_variant_id}",
-                experiment.id
-            )
-        })?;
-        if winner.is_control || winner.config_diff.is_empty() {
-            return Ok(AdaptiveBaselinePromotionDecision::Skipped);
+    /// Replace the current high-failure tool list (doesn't append). Also
+    /// mirrors the value into each active session so downstream snapshot
+    /// builders (e.g. SelfModel) can read it via the session handle.
+    pub fn record_low_confidence_tools(&self, entries: Vec<(String, f64, u32)>) {
+        if let Ok(mut guard) = self.low_confidence_tools.lock() {
+            *guard = entries.clone();
         }
-
-        let analysis = ExperimentAnalyzer::analyze(&experiment, &outcomes);
-        let scope = AdaptiveBaselineScope::from_experiment(&experiment)
-            .ok_or_else(|| format!("experiment {} missing baseline scope tags", experiment.id))?;
-        let verdict = evaluate_promotion_verdict(
-            &experiment,
-            &analysis,
-            winner_variant_id,
-            self.adaptive_baselines.has_scope(&scope),
-            promotion_signals,
-        )?;
-
-        match verdict.recommendation {
-            crate::evolution::types::ProposalPromotionRecommendation::Promote => {
-                match self
-                    .adaptive_baselines
-                    .promote_winner(&experiment, winner_variant_id)?
-                {
-                    Some(promotion) => {
-                        Ok(AdaptiveBaselinePromotionDecision::Promoted { promotion, verdict })
-                    }
-                    None => Ok(AdaptiveBaselinePromotionDecision::Skipped),
+        if let Ok(sessions) = self.sessions.read() {
+            for session in sessions.values() {
+                if let Ok(mut guard) = session.write() {
+                    guard.low_confidence_tools = entries.clone();
                 }
             }
-            crate::evolution::types::ProposalPromotionRecommendation::Canary
-            | crate::evolution::types::ProposalPromotionRecommendation::Hold => {
-                Ok(AdaptiveBaselinePromotionDecision::Deferred(verdict))
-            }
         }
+    }
+
+    /// Get the current high-failure tool list.
+    pub fn low_confidence_tools(&self) -> Vec<(String, f64, u32)> {
+        self.low_confidence_tools
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Get the auto-tuning engine.
@@ -1119,8 +981,6 @@ pub(crate) struct SessionSignalAttribution {
     user_id: String,
     turn_number: u32,
     scenario: Option<Scenario>,
-    active_experiment_id: Option<String>,
-    active_variant: Option<String>,
 }
 
 pub(crate) fn session_signal_attribution(
@@ -1131,8 +991,6 @@ pub(crate) fn session_signal_attribution(
         user_id: session.user_id.clone(),
         turn_number: session.turn_number,
         scenario: session.current_scenario(),
-        active_experiment_id: session.active_experiment_id.clone(),
-        active_variant: session.active_variant.clone(),
     }
 }
 
@@ -1166,17 +1024,6 @@ pub(crate) fn with_signal_attribution(
         signal
             .context
             .insert("scenario".to_string(), serde_json::json!(scenario));
-    }
-    if let Some(experiment_id) = &attribution.active_experiment_id {
-        signal.context.insert(
-            "active_experiment_id".to_string(),
-            serde_json::json!(experiment_id),
-        );
-    }
-    if let Some(variant) = &attribution.active_variant {
-        signal
-            .context
-            .insert("active_variant".to_string(), serde_json::json!(variant));
     }
 
     signal
@@ -1387,13 +1234,26 @@ pub fn on_task_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::routing::TaskType;
 
     #[test]
     fn test_observability_hub_creation() {
         let hub = ObservabilityHub::new();
         let session = hub.start_session("user1", "session1");
         assert!(session.read().unwrap_or_else(|e| e.into_inner()).user_id == "user1");
+    }
+
+    #[test]
+    fn record_low_confidence_tools_replaces_and_propagates_to_sessions() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("user1", "sess1");
+        hub.record_low_confidence_tools(vec![("bash".to_string(), 0.3, 10)]);
+        hub.record_low_confidence_tools(vec![("write_file".to_string(), 0.75, 8)]);
+        let tools = hub.low_confidence_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "write_file");
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.low_confidence_tools.len(), 1);
+        assert_eq!(guard.low_confidence_tools[0].0, "write_file");
     }
 
     #[test]
@@ -1696,89 +1556,6 @@ mod tests {
         // Oldest traces evicted, newest retained
         assert_eq!(guard.context_traces[0].turn_id, "turn-10");
         assert_eq!(guard.context_traces[49].turn_id, "turn-59");
-    }
-
-    #[test]
-    fn promote_experiment_winner_defers_on_significant_regression() {
-        let hub = ObservabilityHub::new();
-        let experiment = crate::ab_testing::Experiment::new("exp-mixed")
-            .with_variant(crate::ab_testing::Variant::control())
-            .with_variant(
-                crate::ab_testing::Variant::new("treatment")
-                    .with_traffic(0.5)
-                    .with_config_diff("memory.retrieval_top_k", serde_json::json!(8)),
-            )
-            .with_metric(crate::ab_testing::MetricDefinition::success_rate())
-            .with_metric(crate::ab_testing::MetricDefinition::token_usage())
-            .with_min_samples(5)
-            .with_tag("task_type:fetch")
-            .with_tag("domain:any")
-            .build();
-        let outcomes = vec![
-            crate::ab_testing::ExperimentOutcome::new("c1", "control")
-                .with_metric("success_rate", 0.35)
-                .with_metric("token_usage", 100.0),
-            crate::ab_testing::ExperimentOutcome::new("c2", "control")
-                .with_metric("success_rate", 0.40)
-                .with_metric("token_usage", 98.0),
-            crate::ab_testing::ExperimentOutcome::new("c3", "control")
-                .with_metric("success_rate", 0.45)
-                .with_metric("token_usage", 102.0),
-            crate::ab_testing::ExperimentOutcome::new("c4", "control")
-                .with_metric("success_rate", 0.38)
-                .with_metric("token_usage", 101.0),
-            crate::ab_testing::ExperimentOutcome::new("c5", "control")
-                .with_metric("success_rate", 0.42)
-                .with_metric("token_usage", 99.0),
-            crate::ab_testing::ExperimentOutcome::new("t1", "treatment")
-                .with_metric("success_rate", 0.80)
-                .with_metric("token_usage", 180.0),
-            crate::ab_testing::ExperimentOutcome::new("t2", "treatment")
-                .with_metric("success_rate", 0.85)
-                .with_metric("token_usage", 185.0),
-            crate::ab_testing::ExperimentOutcome::new("t3", "treatment")
-                .with_metric("success_rate", 0.88)
-                .with_metric("token_usage", 190.0),
-            crate::ab_testing::ExperimentOutcome::new("t4", "treatment")
-                .with_metric("success_rate", 0.90)
-                .with_metric("token_usage", 175.0),
-            crate::ab_testing::ExperimentOutcome::new("t5", "treatment")
-                .with_metric("success_rate", 0.86)
-                .with_metric("token_usage", 188.0),
-        ];
-
-        {
-            let store = hub.experiments_mut();
-            store.register(experiment.clone());
-            for outcome in outcomes {
-                store.record_outcome(&experiment.id, outcome);
-            }
-        }
-
-        let decision = hub
-            .promote_experiment_winner(&experiment.id, "treatment")
-            .expect("promotion decision");
-
-        match decision {
-            AdaptiveBaselinePromotionDecision::Deferred(verdict) => {
-                assert_eq!(
-                    verdict.recommendation,
-                    crate::evolution::types::ProposalPromotionRecommendation::Hold
-                );
-                assert!(
-                    verdict
-                        .blockers
-                        .iter()
-                        .any(|blocker| blocker.contains("token_usage"))
-                );
-            }
-            other => panic!("expected deferred decision, got {other:?}"),
-        }
-        assert!(
-            hub.adaptive_baselines()
-                .resolve(TaskType::Fetch, None)
-                .is_none()
-        );
     }
 
     #[test]

@@ -303,16 +303,6 @@ pub(super) async fn handle_slash_command(
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
 
-        "/experiment" => {
-            let ctx = slash_experiment::ExperimentCommandContext {
-                experiment_store: &state.experiment_store,
-                session_id: state.session_id.as_deref(),
-                active_experiment_id: state.active_experiment_id.as_deref(),
-                active_variant_id: state.active_variant_id.as_deref(),
-            };
-            slash_experiment::handle_experiment_command(arg, &ctx);
-        }
-
         "/profile" => {
             let user_id =
                 profile.unwrap_or_else(|| state.session_id.as_deref().unwrap_or("default"));

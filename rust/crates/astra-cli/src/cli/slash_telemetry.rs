@@ -196,20 +196,6 @@ fn show_summary(
         }
     }
 
-    // Active experiment
-    if let Some(ref variant) = session_guard.active_variant {
-        eprintln!(
-            "  {:<18} {} ({})",
-            "experiment:".dim(),
-            variant.clone().cyan(),
-            session_guard
-                .active_experiment_id
-                .as_deref()
-                .unwrap_or("?")
-                .dim()
-        );
-    }
-
     // Scenario
     if let Some(scenario) = session_guard.current_scenario() {
         eprintln!("  {:<18} {:?}", "detected_scenario:".dim(), scenario);

@@ -2626,8 +2626,6 @@ fn sync_session_state_to_workspace(
             ws.last_scenario_change_turn = guard.last_scenario_change_turn;
             ws.last_token_budget_direction = guard.last_token_budget_direction;
             ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
-            ws.active_experiment_id = guard.active_experiment_id.clone();
-            ws.active_variant = guard.active_variant.clone();
             ws.tuned_config_json = serde_json::to_string(&guard.config).ok();
         }
     }
@@ -2684,10 +2682,6 @@ pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
     guard.last_scenario_change_turn = adaptive.last_scenario_change_turn;
     guard.last_token_budget_direction = adaptive.last_token_budget_direction;
     guard.last_token_budget_change_turn = adaptive.last_token_budget_change_turn;
-    if adaptive.active_experiment_id.is_some() {
-        guard.active_experiment_id = adaptive.active_experiment_id;
-        guard.active_variant = adaptive.active_variant;
-    }
     // Restore tuned RuntimeConfig (merge on top of freshly loaded defaults)
     if let Some(json) = &adaptive.tuned_config_json {
         if let Ok(saved_config) =

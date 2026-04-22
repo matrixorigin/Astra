@@ -37,7 +37,6 @@ use crate::MatrixOneSettings;
 use crate::evolution::service::EvolutionService;
 use crate::observability_integration::ObservabilityHub;
 use crate::pipeline::step_recorder::StepRecorder;
-use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
     EvaluationPersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
@@ -45,7 +44,7 @@ use crate::turn::agentic_loop_host::{
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTurnCoreEventWriter,
-    EvaluationService, EventCreateRequestData, EventService,
+    EventCreateRequestData, EventService,
 };
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
@@ -514,31 +513,6 @@ fn build_runtime_evaluation_service(
     }
 }
 
-pub(crate) async fn load_runtime_promotion_signals_with_service(
-    service: &impl EvaluationService,
-    user_id: &str,
-) -> Result<RuntimePromotionSignals, (StatusCode, Json<ErrorResponse>)> {
-    let quality = service.get_quality_trend(user_id, 30, None).await?;
-    let gate_history = service.get_gate_history(user_id, 1).await?;
-    let calibration = service.get_calibration(user_id, None, 30).await?;
-    let latest_gate = gate_history.gates.first();
-    let calibration_error = if calibration.noise_filtered_sample_count > 0 {
-        calibration.noise_filtered_calibration_error_interval
-    } else {
-        calibration.calibration_error_interval
-    };
-
-    Ok(RuntimePromotionSignals {
-        noise_filtered_quality: Some(quality.noise_filtered_overall_avg_interval),
-        latest_gate: latest_gate.map(|gate| RuntimePromotionGateSignal {
-            passed: gate.passed,
-            score_delta: Some(gate.score_delta_interval),
-        }),
-        calibration_error: Some(calibration_error),
-        recent_turn: None,
-    })
-}
-
 fn seed_restricted_tools_from_blocked_patterns(
     loop_state: &mut AgenticLoopState,
     pattern_library: &crate::pipeline::pattern::PatternLibrary,
@@ -552,7 +526,6 @@ async fn initialize_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
-    promotion_signals: Option<RuntimePromotionSignals>,
     evaluation_persistence: Option<EvaluationPersistenceContext>,
     context_trace_persistence: Option<ContextTracePersistenceContext>,
 ) -> super::state_builder::PipelineLearningStack {
@@ -581,11 +554,9 @@ async fn initialize_runtime_controllers(
             "Failed to restore persisted active canary: {err}"
         );
     }
-    evolution_service.set_runtime_promotion_signals(promotion_signals.clone());
 
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
-    loop_state.telemetry.runtime_promotion_signals = promotion_signals;
     loop_state.telemetry.evaluation_persistence = evaluation_persistence;
     loop_state.telemetry.context_trace_persistence = context_trace_persistence;
     loop_state.evolution_service = Some(evolution_service);
@@ -599,9 +570,6 @@ async fn configure_runtime_controllers(
     user_id: &str,
     session_id: &str,
 ) -> super::state_builder::PipelineLearningStack {
-    // Promotion signals require a live database connection. When no shared pool
-    // is available (e.g. edge-only mode) skip the preload rather than creating a
-    // throwaway connection that may hang on unreachable hosts.
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
         evaluation_service: build_runtime_evaluation_service(matrixone, Some(pool)),
@@ -611,31 +579,10 @@ async fn configure_runtime_controllers(
         event_service: build_runtime_event_service(matrixone, Some(pool)),
         agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.to_string(),
     });
-    let promotion_signals = if let Some(context) = evaluation_persistence.as_ref() {
-        match load_runtime_promotion_signals_with_service(&context.evaluation_service, user_id)
-            .await
-        {
-            Ok(context) => Some(context),
-            Err((status, response)) => {
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    user_id = %user_id,
-                    status = %status,
-                    detail = %response.0.detail,
-                    "promotion-signals preload failed"
-                );
-                None
-            }
-        }
-    } else {
-        tracing::debug!("skipping promotion-signals preload: no shared database pool");
-        None
-    };
     initialize_runtime_controllers(
         loop_state,
         user_id,
         session_id,
-        promotion_signals,
         evaluation_persistence,
         context_trace_persistence,
     )
