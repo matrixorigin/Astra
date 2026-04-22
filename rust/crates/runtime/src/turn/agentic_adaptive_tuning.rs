@@ -248,10 +248,13 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         profile.apply_scenario(scenario);
         profile.confidence = profile.confidence.min(confidence.lower);
     } else if let Some(scenario) = match routing.task_type {
-        crate::pipeline::routing::TaskType::Code
-        | crate::pipeline::routing::TaskType::Mutate => Some(crate::user_profile::Scenario::Implementation),
+        crate::pipeline::routing::TaskType::Code | crate::pipeline::routing::TaskType::Mutate => {
+            Some(crate::user_profile::Scenario::Implementation)
+        }
         crate::pipeline::routing::TaskType::Reasoning
-        | crate::pipeline::routing::TaskType::Fetch => Some(crate::user_profile::Scenario::Exploration),
+        | crate::pipeline::routing::TaskType::Fetch => {
+            Some(crate::user_profile::Scenario::Exploration)
+        }
         _ => None,
     } {
         profile.apply_scenario(scenario);

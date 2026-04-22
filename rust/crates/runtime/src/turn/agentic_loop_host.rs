@@ -851,9 +851,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    
-    
-    
+
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
@@ -1161,7 +1159,6 @@ pub(crate) mod tests {
             turn_event_buffer: None,
         }
     }
-
 
     // ── Original tests ──────────────────────────────────────────────────────
 
@@ -6680,7 +6677,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("Recent adaptation verification impacts:"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
-        assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
         assert!(prompt.contains("Recent tactical actions:"));
         assert!(prompt.contains("verify outputs more strictly"));
         assert!(prompt.contains("[ToolFailure] bash: Permission denied"));

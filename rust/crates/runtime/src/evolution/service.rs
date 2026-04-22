@@ -1018,7 +1018,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn flush_empty_returns_nothing() {
         let svc = EvolutionService::new();
@@ -1707,7 +1706,6 @@ mod tests {
                 .calibrated_threshold("fetch", None, TaskType::Unknown);
         assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
     }
-
 
     #[tokio::test]
     async fn second_canary_queues_while_one_is_active() {
