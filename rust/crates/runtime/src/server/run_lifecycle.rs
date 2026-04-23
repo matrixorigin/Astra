@@ -2125,6 +2125,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
         let bg_session_id = session_id.clone();
+        let bg_resource_governor = self.resource_governor.clone();
+        let bg_user_id = user_id.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -2148,6 +2150,39 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // refactor touches the public service surface so it's deferred to a
         // dedicated PR.
         tokio::spawn(async move {
+            // Pre-flight: check daily token budget before starting the agentic loop.
+            if let Some(ref gov) = bg_resource_governor {
+                use astra_services::resource_governor::LimitCheck;
+                if let LimitCheck::Denied { reason } = gov.check_token_budget(&bg_user_id).await {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        user_id = %bg_user_id,
+                        run_id = %bg_run_id,
+                        reason = %reason,
+                        "run rejected: daily token budget exhausted"
+                    );
+                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                        run.status = RunStatus::Failed;
+                    }
+                    if let Some(ref engine) = run_engine {
+                        astra_core::log_persist!(
+                            engine
+                                .persist_status(
+                                    &bg_run_id,
+                                    astra_core::STATUS_FAILED,
+                                    None,
+                                    Some(&reason),
+                                )
+                                .await,
+                            "run_lifecycle",
+                            &bg_run_id,
+                            "budget_reject"
+                        );
+                    }
+                    return;
+                }
+            }
+
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
             let loop_success = outcome.is_ok();
             let (events, final_status, error_msg) =
@@ -4866,6 +4901,18 @@ mod tests {
         assert!(
             source.contains("/chat/runs/{run_id}/delegations/resume"),
             "Missing delegations resume route"
+        );
+    }
+
+    /// P0-C: The agentic loop spawn must check token budget before starting.
+    #[test]
+    fn run_lifecycle_checks_token_budget_before_loop() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("check_token_budget"),
+            "run_lifecycle must call check_token_budget before the agentic loop"
         );
     }
 }

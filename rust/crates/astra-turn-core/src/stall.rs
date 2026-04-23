@@ -676,6 +676,13 @@ pub fn detect_nudge_ignored(
 
 /// Adaptive stall detection thresholds that can be tuned based on
 /// accumulated correction effectiveness data.
+///
+/// Wired into [`crate::turn_guard::TurnGuard::evaluate()`] — after each
+/// correction outcome is resolved, `adjust_from_effectiveness` is called
+/// with the current follow_rate and effective_rate. The adjusted
+/// `stall_window` overrides the static `TaskExecutionProfile::stall_window`
+/// when corrections have been ineffective (window widens to reduce false
+/// positives).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveStallThresholds {
     /// Repetition window for stall detection (default: SERVER_STALL_WINDOW).
@@ -1458,6 +1465,57 @@ mod tests {
         ]);
         let result = detect_intent_drift("review 最新的commit", &turns);
         assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    /// P1-G: Realistic scenario — user asks to fix a specific bug, agent
+    /// goes off to refactor unrelated code for 4 turns.
+    #[test]
+    fn intent_drift_correction_references_original_request() {
+        let turns = make_intent_turns(&[
+            // Agent drifts to refactoring unrelated module
+            (&["write_file"], r#"{"path":"src/telemetry.rs"}"#),
+            (&["str_replace"], r#"{"path":"src/telemetry.rs"}"#),
+            (&["write_file"], r#"{"path":"src/metrics.rs"}"#),
+            (&["bash"], r#"{"command":"cargo clippy"}"#),
+        ]);
+        let result =
+            detect_intent_drift("fix authentication timeout when password expires", &turns);
+        match result {
+            IntentDrift::Drifting {
+                consecutive_off_task,
+                correction,
+            } => {
+                assert!(
+                    consecutive_off_task >= 3,
+                    "must detect 3+ off-task turns, got {consecutive_off_task}"
+                );
+                assert!(
+                    correction.contains("authentication") || correction.contains("password"),
+                    "correction must reference original request: {correction}"
+                );
+            }
+            IntentDrift::OnTask => {
+                panic!(
+                    "drift must be detected when agent refactors telemetry instead of fixing auth"
+                )
+            }
+        }
+    }
+
+    /// P1-G: Chinese query — intent drift detection must work with CJK.
+    #[test]
+    fn intent_drift_works_with_chinese_query() {
+        let turns = make_intent_turns(&[
+            (&["read_file"], r#"{"path":"src/database.rs"}"#),
+            (&["write_file"], r#"{"path":"docs/readme.md"}"#),
+            (&["write_file"], r#"{"path":"docs/guide.md"}"#),
+            (&["bash"], r#"{"command":"mdbook build"}"#),
+        ]);
+        let result = detect_intent_drift("修复数据库连接超时的问题", &turns);
+        assert!(
+            matches!(result, IntentDrift::Drifting { .. }),
+            "drift must be detected for Chinese query when agent writes docs instead of fixing DB"
+        );
     }
 
     #[test]
@@ -2288,6 +2346,120 @@ mod tests {
         assert!(
             stalled,
             "stall must be detected despite interleaved text turn"
+        );
+    }
+
+    // ── P0-D: Adaptive stall threshold behavioral tests ─────────────
+
+    /// When corrections are frequently ignored (low follow_rate), the stall
+    /// window should widen to reduce false positives.
+    #[test]
+    fn adaptive_thresholds_widen_on_low_follow_rate() {
+        let mut thresholds = AdaptiveStallThresholds::default();
+        let original_window = thresholds.stall_window;
+
+        // Low follow rate + decent effectiveness → widen
+        thresholds.adjust_from_effectiveness(0.2, 0.5);
+        assert!(
+            thresholds.stall_window > original_window,
+            "stall window must widen when follow_rate < 0.3"
+        );
+        assert!(
+            thresholds.max_exploration_rounds > MAX_EXPLORATION_ROUNDS,
+            "exploration budget must also widen"
+        );
+    }
+
+    /// When corrections are effective, thresholds should NOT change.
+    #[test]
+    fn adaptive_thresholds_stable_when_effective() {
+        let mut thresholds = AdaptiveStallThresholds::default();
+        let original = thresholds.clone();
+
+        // High follow rate + high effectiveness → no change
+        thresholds.adjust_from_effectiveness(0.8, 0.7);
+        assert_eq!(
+            thresholds.stall_window, original.stall_window,
+            "effective corrections should not change thresholds"
+        );
+    }
+
+    /// Thresholds have an upper bound — they can't widen indefinitely.
+    #[test]
+    fn adaptive_thresholds_have_upper_bound() {
+        let mut thresholds = AdaptiveStallThresholds::default();
+
+        // Repeatedly adjust with low rates
+        for _ in 0..20 {
+            thresholds.adjust_from_effectiveness(0.1, 0.1);
+        }
+
+        assert!(
+            thresholds.stall_window <= 6,
+            "stall window must not exceed 6, got {}",
+            thresholds.stall_window
+        );
+    }
+
+    // ── P1-E: Reward-hacking detection behavioral tests ─────────────
+
+    /// Scenario: Agent calls the same tool with the same args 3 times in one
+    /// turn, and reports high quality. This is classic reward hacking.
+    #[test]
+    fn reward_hacking_detected_on_identical_calls_with_high_quality() {
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+        ];
+        let assessment = assess_reward_hacking(&calls, 0.9, None).unwrap();
+        assert!(
+            assessment.risk >= ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
+            "3 identical calls + high quality must trigger reward hacking (risk={})",
+            assessment.risk
+        );
+        assert!(!assessment.flags.is_empty(), "must have diagnostic flags");
+
+        // Quality must be dampened
+        let dampened = dampen_quality_for_reward_hacking(0.9, &assessment);
+        assert!(
+            dampened < 0.9,
+            "quality must be dampened from 0.9, got {dampened}"
+        );
+    }
+
+    /// Scenario: Agent calls the same tool with DIFFERENT args (e.g.,
+    /// str_replace on 4 different files). This is legitimate work.
+    #[test]
+    fn no_reward_hacking_on_same_tool_different_args() {
+        let calls = vec![
+            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+        ];
+        let assessment = assess_reward_hacking(&calls, 0.8, None).unwrap();
+        assert!(
+            assessment.risk < ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
+            "same tool with different args is legitimate (risk={})",
+            assessment.risk
+        );
+    }
+
+    /// Scenario: Low user feedback score on repetitive actions should
+    /// increase reward hacking risk.
+    #[test]
+    fn low_user_feedback_amplifies_reward_hacking_risk() {
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+        ];
+        let without_feedback = assess_reward_hacking(&calls, 0.5, None).unwrap();
+        let with_low_feedback = assess_reward_hacking(&calls, 0.5, Some(20)).unwrap();
+        assert!(
+            with_low_feedback.risk > without_feedback.risk,
+            "low user feedback must amplify risk ({} vs {})",
+            with_low_feedback.risk,
+            without_feedback.risk
         );
     }
 }

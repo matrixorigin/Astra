@@ -605,4 +605,71 @@ mod tests {
             "fallback should be user-friendly"
         );
     }
+
+    // ── P0-A: Hallucinated tool name behavioral tests ───────────────
+
+    /// Scenario: LLM returns a mix of valid and invented tool names.
+    /// Expected: find_hallucinated_tools returns ONLY the invented ones.
+    #[test]
+    fn hallucinated_tool_detected_among_valid_calls() {
+        let tool_calls = vec![
+            serde_json::json!({"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}),
+            serde_json::json!({"name": "super_analyze_code", "arguments": "{}"}),
+            serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}),
+            serde_json::json!({"name": "quantum_refactor", "arguments": "{}"}),
+        ];
+        let allowed = vec!["read_file", "grep", "write_file", "bash"];
+        let hallucinated = find_hallucinated_tools(&tool_calls, &allowed);
+        assert_eq!(
+            hallucinated,
+            vec!["super_analyze_code", "quantum_refactor"],
+            "must detect exactly the invented tool names"
+        );
+    }
+
+    /// Scenario: LLM returns only valid tool names.
+    /// Expected: no hallucinations detected.
+    #[test]
+    fn no_false_positive_on_valid_tools() {
+        let tool_calls = vec![
+            serde_json::json!({"name": "read_file", "arguments": "{}"}),
+            serde_json::json!({"name": "bash", "arguments": "{}"}),
+        ];
+        let allowed = vec!["read_file", "bash", "grep"];
+        assert!(
+            find_hallucinated_tools(&tool_calls, &allowed).is_empty(),
+            "valid tools must not be flagged"
+        );
+    }
+
+    /// Scenario: LLM returns malformed JSON arguments alongside valid ones.
+    /// Expected: find_malformed_args catches the broken ones.
+    #[test]
+    fn malformed_args_detected_in_mixed_calls() {
+        let tool_calls = vec![
+            serde_json::json!({"name": "read_file", "arguments": "{\"path\": \"ok.rs\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{broken json!!!"}),
+            serde_json::json!({"name": "grep", "arguments": serde_json::json!({"pattern": "x"})}),
+        ];
+        let malformed = find_malformed_args(&tool_calls);
+        assert_eq!(malformed, vec!["bash"], "only the broken-JSON call flagged");
+    }
+
+    /// Scenario: LLM returns XML artifact as tool name (e.g. "<reflect>").
+    /// Expected: empty name after XML filtering → not treated as hallucination
+    /// (handled by a different layer), but find_hallucinated_tools must not
+    /// panic or produce garbage.
+    #[test]
+    fn xml_artifact_tool_name_handled_gracefully() {
+        let tool_calls = vec![
+            serde_json::json!({"name": "", "arguments": "{}"}),
+            serde_json::json!({"name": "read_file", "arguments": "{}"}),
+        ];
+        let allowed = vec!["read_file"];
+        let hallucinated = find_hallucinated_tools(&tool_calls, &allowed);
+        assert!(
+            hallucinated.is_empty(),
+            "empty names should be skipped, not flagged as hallucination"
+        );
+    }
 }

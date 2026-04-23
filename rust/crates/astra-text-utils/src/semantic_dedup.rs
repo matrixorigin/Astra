@@ -1031,8 +1031,88 @@ mod tests {
             "file content here for normalization test",
             0,
         );
-        // Trailing slash should normalize to the same semantic key
         let block = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs/"}), 1);
         assert!(block.is_some(), "normalized path should match");
+    }
+
+    // ── P1-H: Semantic dedup behavioral tests ───────────────────────
+
+    /// Scenario: Agent reads the same file twice. The second call must be
+    /// blocked by pre_check_block and return the cached output.
+    #[test]
+    fn duplicate_read_file_returns_cached_output() {
+        let mut dedup = SemanticDedup::new(0.75);
+        let original_content = "fn main() {\n    println!(\"hello\");\n}";
+
+        // First read — records the output
+        let dup = dedup.check_and_record(
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            original_content,
+            0,
+        );
+        assert!(dup.is_none(), "first read should not be a duplicate");
+
+        // Second read — pre_check_block should return cached output
+        let block = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs"}), 1);
+        let (prev_turn, cached) = block.expect("second read must be blocked as duplicate");
+        assert_eq!(prev_turn, 0, "must reference the original turn");
+        assert_eq!(cached, original_content, "must return exact cached output");
+    }
+
+    /// Scenario: Agent reads two DIFFERENT files. No dedup should trigger.
+    #[test]
+    fn different_files_not_deduplicated() {
+        let mut dedup = SemanticDedup::new(0.75);
+
+        dedup.check_and_record(
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            "fn main() {}",
+            0,
+        );
+
+        let block = dedup.pre_check_block("read_file", &json!({"path": "src/lib.rs"}), 1);
+        assert!(block.is_none(), "different files must not be deduplicated");
+    }
+
+    /// Scenario: Agent greps the same pattern in the same directory twice.
+    /// Second call must be detected as duplicate.
+    #[test]
+    fn duplicate_grep_detected() {
+        let mut dedup = SemanticDedup::new(0.75);
+
+        dedup.check_and_record(
+            "grep",
+            &json!({"path": "src/", "pattern": "TODO"}),
+            "src/main.rs:10: // TODO: fix this",
+            0,
+        );
+
+        let block = dedup.pre_check_block("grep", &json!({"path": "src/", "pattern": "TODO"}), 1);
+        assert!(block.is_some(), "identical grep must be deduplicated");
+    }
+
+    /// Scenario: Tier 3 output similarity — two different tool calls that
+    /// produce nearly identical output should be flagged.
+    #[test]
+    fn output_similarity_detects_near_duplicate() {
+        let mut dedup = SemanticDedup::new(0.75);
+        let output = "error: cannot find module `auth`\n  --> src/main.rs:5:1\n  |\n5 | mod auth;\n  | ^^^^^^^^^ file not found";
+
+        // First call
+        dedup.check_and_record("bash", &json!({"command": "cargo check 2>&1"}), output, 0);
+
+        // Second call with slightly different command but same output
+        let dup = dedup.check_and_record(
+            "bash",
+            &json!({"command": "cargo check --all 2>&1"}),
+            output,
+            1,
+        );
+        assert!(
+            dup.is_some(),
+            "identical output from different commands should be flagged"
+        );
     }
 }

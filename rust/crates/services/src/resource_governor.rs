@@ -86,6 +86,26 @@ pub trait ResourceGovernor: Send + Sync + 'static {
 
     /// Record tokens consumed.
     async fn record_tokens(&self, user_id: &str, tokens: u64);
+
+    /// Check whether the user's daily token budget allows further LLM calls.
+    /// Called before each LLM invocation for mid-session enforcement.
+    async fn check_token_budget(&self, user_id: &str) -> LimitCheck {
+        let limits = self.get_limits(user_id).await;
+        if limits.max_tokens_per_day == 0 {
+            return LimitCheck::Allowed;
+        }
+        let usage = self.get_usage(user_id).await;
+        if usage.tokens_consumed >= limits.max_tokens_per_day {
+            LimitCheck::Denied {
+                reason: format!(
+                    "daily token budget exhausted ({}/{})",
+                    usage.tokens_consumed, limits.max_tokens_per_day
+                ),
+            }
+        } else {
+            LimitCheck::Allowed
+        }
+    }
 }
 
 // ── Database implementation ──────────────────────────────────────────────
@@ -617,6 +637,72 @@ mod tests {
             silent_count, 0,
             "resource governor has {silent_count} silently-dropped DB writes; \
              use `if let Err(e) = ... {{ tracing::warn!(...) }}` instead"
+        );
+    }
+
+    /// P0-C: A session that starts within budget must be DENIED further
+    /// tokens once the daily limit is exceeded mid-session.
+    /// This verifies the check_token_budget method exists and works.
+    #[tokio::test]
+    async fn mid_session_token_enforcement() {
+        let gov = InMemoryResourceGovernor::new();
+        let user = "u-budget-test";
+
+        // Set a low daily token limit
+        gov.set_limits(
+            user,
+            ResourceLimits {
+                max_tokens_per_day: 1000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Session starts fine
+        assert_eq!(gov.check_session_create(user).await, LimitCheck::Allowed);
+        gov.record_session_created(user).await;
+
+        // Consume 800 tokens — still within budget
+        gov.record_tokens(user, 800).await;
+        assert_eq!(
+            gov.check_token_budget(user).await,
+            LimitCheck::Allowed,
+            "800/1000 tokens should be allowed"
+        );
+
+        // Consume 300 more — now over budget (1100 > 1000)
+        gov.record_tokens(user, 300).await;
+        match gov.check_token_budget(user).await {
+            LimitCheck::Denied { reason } => {
+                assert!(
+                    reason.contains("token"),
+                    "denial reason must mention tokens: {reason}"
+                );
+            }
+            LimitCheck::Allowed => {
+                panic!("mid-session token check must deny when over budget (1100/1000)")
+            }
+        }
+    }
+
+    /// Zero limit means unlimited — check_token_budget must allow.
+    #[tokio::test]
+    async fn token_budget_zero_means_unlimited() {
+        let gov = InMemoryResourceGovernor::new();
+        let user = "u-unlimited";
+        gov.set_limits(
+            user,
+            ResourceLimits {
+                max_tokens_per_day: 0, // unlimited
+                ..Default::default()
+            },
+        )
+        .await;
+        gov.record_tokens(user, 999_999_999).await;
+        assert_eq!(
+            gov.check_token_budget(user).await,
+            LimitCheck::Allowed,
+            "zero limit means unlimited"
         );
     }
 }

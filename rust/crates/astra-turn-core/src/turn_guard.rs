@@ -110,6 +110,8 @@ pub struct TurnGuard {
     pub pending_correction: Option<CorrectionRecord>,
     /// History of resolved corrections and their outcomes.
     pub correction_history: Vec<CorrectionOutcome>,
+    /// Adaptive thresholds tuned by correction effectiveness.
+    adaptive_thresholds: stall::AdaptiveStallThresholds,
 }
 
 /// Read-only core tools that are safe-by-construction and must never be
@@ -172,6 +174,7 @@ impl TurnGuard {
             last_cache_hit_total: 0,
             pending_correction: None,
             correction_history: Vec::new(),
+            adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
         }
     }
 
@@ -192,7 +195,11 @@ impl TurnGuard {
     }
 
     pub fn stall_window(&self) -> usize {
-        self.task_profile.stall_window
+        // Adaptive threshold overrides the static profile when corrections
+        // have been ineffective (window widens to reduce false positives).
+        self.adaptive_thresholds
+            .stall_window
+            .max(self.task_profile.stall_window)
     }
 
     /// Record tool call signatures for this turn.
@@ -556,11 +563,20 @@ impl TurnGuard {
         // Resolve next_turn_succeeded on the most recent unresolved CorrectionOutcome.
         // Only resolve once (on the immediate next turn). Once resolved, the
         // value is frozen — later turns cannot retroactively change it.
+        let mut just_resolved = false;
         if let Some(last) = self.correction_history.last_mut()
             && !last.resolved
         {
             last.next_turn_succeeded = severity <= VerdictSeverity::Info;
             last.resolved = true;
+            just_resolved = true;
+        }
+
+        // Tune adaptive thresholds when a correction outcome is resolved.
+        if just_resolved {
+            let eff = self.correction_effectiveness();
+            self.adaptive_thresholds
+                .adjust_from_effectiveness(eff.follow_rate, eff.effective_rate);
         }
 
         // Store a CorrectionRecord when the verdict carries actionable corrections.
@@ -1603,5 +1619,252 @@ mod tests {
         assert!(!restricted.contains("grep"));
         assert!(restricted.contains("bash"));
         assert!(restricted.contains("str_replace"));
+    }
+
+    // ── P0-B: Full stall recovery pipeline behavioral test ──────────
+
+    /// Simulate an agent stuck in a loop calling the same tool with the same
+    /// args for many turns. Verify the FULL pipeline:
+    ///   1. Stall detected after window (3 identical rounds)
+    ///   2. Structured reflection built with avoid_tools
+    ///   3. Nudge injected into verdict
+    ///   4. Continued stalling → escalation to Warning → Critical
+    ///   5. Second Critical → force_stop
+    #[test]
+    fn stall_pipeline_detection_through_force_stop() {
+        let mut guard = TurnGuard::new();
+        let identical_call =
+            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+
+        let mut first_stall_turn = None;
+        let mut first_warning_turn = None;
+        let mut first_critical_turn = None;
+        let mut force_stop_turn = None;
+
+        for turn in 0..30 {
+            guard.record_tool_calls(&identical_call);
+            guard.record_tool_result("bash", "total 42\ndrwxr-xr-x 2 user user 4096 ...");
+            let verdict = guard.evaluate();
+
+            if verdict.stall_detected && first_stall_turn.is_none() {
+                first_stall_turn = Some(turn);
+            }
+            if verdict.severity >= VerdictSeverity::Warning && first_warning_turn.is_none() {
+                first_warning_turn = Some(turn);
+            }
+            if verdict.severity >= VerdictSeverity::Critical && first_critical_turn.is_none() {
+                first_critical_turn = Some(turn);
+            }
+            if verdict.force_stop {
+                force_stop_turn = Some(turn);
+                break;
+            }
+        }
+
+        let stall_turn = first_stall_turn.expect("stall must be detected");
+        assert!(
+            stall_turn <= 5,
+            "stall detected too late: turn {stall_turn}"
+        );
+
+        let warn_turn = first_warning_turn.expect("warning must be issued");
+        assert!(warn_turn <= stall_turn, "warning should come with stall");
+
+        let crit_turn = first_critical_turn.expect("critical must be reached");
+        assert!(crit_turn > warn_turn, "critical must come after warning");
+
+        let stop_turn = force_stop_turn.expect("force_stop must be reached");
+        assert!(
+            stop_turn > crit_turn,
+            "force_stop must come after first critical"
+        );
+    }
+
+    /// Verify that stall reflection contains structured guidance, not just
+    /// a flat string.
+    #[test]
+    fn stall_reflection_is_structured_and_actionable() {
+        let mut guard = TurnGuard::new();
+        let identical_call =
+            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+
+        for _ in 0..5 {
+            guard.record_tool_calls(&identical_call);
+            guard.record_tool_result("bash", "ok");
+            let verdict = guard.evaluate();
+            if verdict.stall_detected {
+                assert!(
+                    !verdict.injections.is_empty(),
+                    "stall must inject correction messages"
+                );
+                let msg = &verdict.injections[0];
+                assert!(
+                    msg.len() > 50,
+                    "stall nudge must be substantial, got: {msg}"
+                );
+                return;
+            }
+        }
+        panic!("stall was never detected in 5 identical turns");
+    }
+
+    /// Verify that when the agent ignores a correction (uses avoided tools),
+    /// the next evaluate detects the violation and escalates.
+    #[test]
+    fn nudge_ignore_detected_and_escalates() {
+        let mut guard = TurnGuard::new();
+        let bash_call =
+            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+
+        for _ in 0..5 {
+            guard.record_tool_calls(&bash_call);
+            guard.record_tool_result("bash", "ok");
+            guard.evaluate();
+        }
+
+        // Agent IGNORES correction — uses bash again
+        guard.record_tool_calls(&bash_call);
+        guard.record_tool_result("bash", "ok");
+        let verdict = guard.evaluate();
+
+        // After 6 identical turns, the system must produce correction injections
+        assert!(
+            verdict.severity >= VerdictSeverity::Warning,
+            "ignoring correction must escalate to at least Warning"
+        );
+        assert!(
+            !verdict.injections.is_empty(),
+            "ignoring correction must produce injection messages"
+        );
+        // The injections should contain stall reflection or escalation guidance
+        let all_text = verdict.injections.join(" ");
+        assert!(
+            all_text.contains("stuck")
+                || all_text.contains("Avoid")
+                || all_text.contains("WARNING"),
+            "injections must contain stall/avoidance guidance: {all_text}"
+        );
+    }
+
+    /// Verify correction tracking: after a correction is issued, the next
+    /// turn's tool calls are checked for compliance.
+    #[test]
+    fn correction_compliance_tracked_accurately() {
+        let mut guard = TurnGuard::new();
+        let bash_call =
+            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+        let grep_call =
+            vec![serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"})];
+
+        // Trigger stall → correction issued
+        for _ in 0..5 {
+            guard.record_tool_calls(&bash_call);
+            guard.record_tool_result("bash", "ok");
+            guard.evaluate();
+        }
+
+        // Switch to a different tool (compliance)
+        guard.record_tool_calls(&grep_call);
+        guard.record_tool_result("grep", "found 3 matches");
+        let verdict = guard.evaluate();
+
+        assert!(
+            !verdict.force_stop,
+            "compliant agent must not be force-stopped"
+        );
+
+        let effectiveness = guard.correction_effectiveness();
+        assert!(
+            effectiveness.total_corrections > 0,
+            "corrections must be tracked"
+        );
+    }
+
+    /// P1-F: Full correction lifecycle — stall → correction → compliance →
+    /// ignore → mixed effectiveness metrics.
+    #[test]
+    fn correction_lifecycle_mixed_compliance() {
+        let mut guard = TurnGuard::new();
+        let bash_call =
+            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+        let grep_call =
+            vec![serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"})];
+
+        // Phase 1: Trigger stall (3 identical turns)
+        for _ in 0..4 {
+            guard.record_tool_calls(&bash_call);
+            guard.record_tool_result("bash", "ok");
+            guard.evaluate();
+        }
+
+        // Phase 2: Comply — switch to grep
+        guard.record_tool_calls(&grep_call);
+        guard.record_tool_result("grep", "found 5 matches");
+        let v = guard.evaluate();
+        assert!(!v.force_stop);
+
+        // Phase 3: Relapse — back to bash stall
+        for _ in 0..4 {
+            guard.record_tool_calls(&bash_call);
+            guard.record_tool_result("bash", "ok");
+            guard.evaluate();
+        }
+
+        // Phase 4: Ignore correction — keep using bash
+        guard.record_tool_calls(&bash_call);
+        guard.record_tool_result("bash", "ok");
+        guard.evaluate();
+
+        // Verify effectiveness metrics reflect mixed compliance
+        let eff = guard.correction_effectiveness();
+        assert!(
+            eff.total_corrections >= 2,
+            "must have at least 2 corrections, got {}",
+            eff.total_corrections
+        );
+        // follow_rate should be between 0 and 1 (some followed, some not)
+        assert!(
+            eff.follow_rate > 0.0,
+            "at least one correction was followed (grep turn)"
+        );
+        assert!(
+            eff.follow_rate < 1.0,
+            "not all corrections were followed (relapse happened), got follow_rate={}",
+            eff.follow_rate
+        );
+        assert!(
+            eff.effective_rate < 1.0,
+            "effective_rate must reflect the relapse, got {}",
+            eff.effective_rate
+        );
+    }
+
+    /// Verify that adaptive stall thresholds are actually wired into
+    /// TurnGuard: when corrections are repeatedly ignored, the stall
+    /// window widens to reduce false positives.
+    #[test]
+    fn adaptive_thresholds_widen_after_repeated_ignored_corrections() {
+        let mut guard = TurnGuard::new();
+        let initial_window = guard.stall_window();
+
+        let bash_call =
+            vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
+
+        // Run many turns of stall → correction → ignore → resolve.
+        for _cycle in 0..6 {
+            for _ in 0..5 {
+                guard.record_tool_calls(&bash_call);
+                guard.record_tool_result("bash", "ok");
+                guard.evaluate();
+            }
+        }
+
+        // After many ignored corrections, the adaptive window should have widened
+        let final_window = guard.stall_window();
+        assert!(
+            final_window > initial_window,
+            "stall window must widen after repeated ignored corrections \
+             (initial={initial_window}, final={final_window})"
+        );
     }
 }

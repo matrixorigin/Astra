@@ -88,17 +88,37 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
     // Sort by name descending (latest = highest number)
     heavy_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
-    if let Some(entry) = heavy_files.first() {
-        let content = std::fs::read_to_string(entry.path())?;
-        let checkpoint: StepCheckpoint = serde_json::from_str(&content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    for entry in &heavy_files {
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping unreadable checkpoint {:?}: {}",
+                    entry.file_name(),
+                    e
+                );
+                continue;
+            }
+        };
+        let checkpoint: StepCheckpoint = match serde_json::from_str(&content) {
+            Ok(cp) => cp,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping corrupted checkpoint {:?}: {}",
+                    entry.file_name(),
+                    e
+                );
+                continue;
+            }
+        };
         match checkpoint {
-            StepCheckpoint::Heavy(boxed) => Ok(Some(*boxed)),
-            _ => Ok(None),
+            StepCheckpoint::Heavy(boxed) => return Ok(Some(*boxed)),
+            _ => continue,
         }
-    } else {
-        Ok(None)
     }
+    Ok(None)
 }
 
 /// Read the latest light checkpoint (for quick cursor restore).
@@ -126,17 +146,37 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
 
     all_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
-    if let Some(entry) = all_files.first() {
-        let content = std::fs::read_to_string(entry.path())?;
-        let checkpoint: StepCheckpoint = serde_json::from_str(&content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    for entry in &all_files {
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping unreadable checkpoint {:?}: {}",
+                    entry.file_name(),
+                    e
+                );
+                continue;
+            }
+        };
+        let checkpoint: StepCheckpoint = match serde_json::from_str(&content) {
+            Ok(cp) => cp,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping corrupted checkpoint {:?}: {}",
+                    entry.file_name(),
+                    e
+                );
+                continue;
+            }
+        };
         match checkpoint {
-            StepCheckpoint::Light(light) => Ok(Some(light)),
-            StepCheckpoint::Heavy(heavy) => Ok(Some(heavy.light)),
+            StepCheckpoint::Light(light) => return Ok(Some(light)),
+            StepCheckpoint::Heavy(heavy) => return Ok(Some(heavy.light)),
         }
-    } else {
-        Ok(None)
     }
+    Ok(None)
 }
 
 /// List all checkpoint numbers and tiers for a session.
@@ -825,13 +865,16 @@ mod tests {
         // Write a corrupted heavy checkpoint with a higher number
         std::fs::write(dir.join("000003-heavy.json"), "NOT VALID JSON{{{").unwrap();
 
-        // read_latest_heavy should attempt 000003 first (highest), fail to parse,
-        // and return an InvalidData error — the corruption is not silently swallowed.
+        // read_latest_heavy should skip 000003 (corrupted) and fall back to 000002 (valid).
         let result = read_latest_heavy_checkpoint(&session_id);
         assert!(
-            result.is_err(),
-            "Corrupted checkpoint JSON should return error"
+            result.is_ok(),
+            "Corrupted checkpoint must not propagate error: {:?}",
+            result.err()
         );
+        let cp = result.unwrap();
+        assert!(cp.is_some(), "must fall back to valid checkpoint");
+        assert_eq!(cp.unwrap().light.step_id, "step-ok");
 
         // Clean up
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
@@ -853,12 +896,16 @@ mod tests {
         // Write a corrupted light checkpoint with higher number
         std::fs::write(dir.join("000002-light.json"), "GARBAGE").unwrap();
 
-        // read_latest_light tries 000002 first → error
+        // read_latest_light tries 000002 first → corrupted → falls back to 000001
         let result = read_latest_light_checkpoint(&session_id);
         assert!(
-            result.is_err(),
-            "Corrupted light checkpoint should return error"
+            result.is_ok(),
+            "Corrupted light checkpoint must not propagate error: {:?}",
+            result.err()
         );
+        let cp = result.unwrap();
+        assert!(cp.is_some(), "must fall back to valid checkpoint");
+        assert_eq!(cp.unwrap().step_id, "step-ok");
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
@@ -908,6 +955,44 @@ mod tests {
         let cp = result.unwrap();
         assert!(cp.is_some());
         assert_eq!(cp.unwrap().light.step_id, "step-1");
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// P2-I: When the latest heavy checkpoint is corrupted, recovery must
+    /// fall back to the previous valid checkpoint instead of returning an error.
+    #[test]
+    fn corrupted_latest_checkpoint_falls_back_to_previous() {
+        let session_id = format!("test-corrupt-fallback-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a valid checkpoint as #1
+        let heavy = make_heavy(
+            "step-valid",
+            vec![json!({"role": "user", "content": "hello"})],
+        );
+        let cp = StepCheckpoint::Heavy(Box::new(heavy));
+        let json_str = serde_json::to_string(&cp).unwrap();
+        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+
+        // Write a CORRUPTED checkpoint as #2 (latest)
+        std::fs::write(dir.join("000002-heavy.json"), "{{{{CORRUPTED JSON!!!!").unwrap();
+
+        // Recovery must return the valid checkpoint, not an error
+        let result = read_latest_heavy_checkpoint(&session_id);
+        assert!(
+            result.is_ok(),
+            "corrupted latest must not propagate error: {:?}",
+            result.err()
+        );
+        let cp = result.unwrap();
+        assert!(cp.is_some(), "must fall back to previous valid checkpoint");
+        assert_eq!(
+            cp.unwrap().light.step_id,
+            "step-valid",
+            "must return the valid checkpoint, not the corrupted one"
+        );
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
