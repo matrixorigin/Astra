@@ -861,7 +861,7 @@ impl VerificationRunner {
                 let cmd = cmd.clone();
                 let expected = *expected_exit;
                 let dir = self.work_dir.clone();
-                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 let evidence = if stderr.is_empty() {
                     stdout
                 } else {
@@ -881,7 +881,7 @@ impl VerificationRunner {
             } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (_code, stdout, _stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (_code, stdout, _stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 let has_all = contains.iter().all(|s| stdout.contains(s));
                 let has_none = not_contains.iter().all(|s| !stdout.contains(s));
                 let passed = has_all && has_none;
@@ -1017,14 +1017,14 @@ impl VerificationRunner {
             VerifierKind::BuildPass { cmd } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (code, _stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (code, _stdout, stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 Ok((code == 0, truncate(&stderr, 4096), "exit code == 0".into()))
             }
 
             VerifierKind::TestPass { cmd, min_pass_rate } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 let combined = format!("{stdout}\n{stderr}");
 
                 // Try to parse structured test output for actual pass rate
@@ -1208,9 +1208,10 @@ async fn run_shell_cmd(
     cmd: &str,
     dir: &std::path::Path,
     sink: &Option<OutputSink>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(i32, String, String), String> {
     if let Some(sink) = sink {
-        run_shell_cmd_streaming(cmd, dir, sink).await
+        run_shell_cmd_streaming(cmd, dir, sink, cancel).await
     } else {
         run_shell_cmd_buffered(cmd, dir).await
     }
@@ -1221,6 +1222,7 @@ async fn run_shell_cmd_streaming(
     cmd: &str,
     dir: &std::path::Path,
     sink: &OutputSink,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(i32, String, String), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
@@ -1271,13 +1273,35 @@ async fn run_shell_cmd_streaming(
         acc
     });
 
-    let status = match child.wait().await {
-        Ok(s) => s,
-        Err(e) => {
-            // audit-#11: stderr/stdout reader tasks must not leak on wait error.
-            stderr_handle.abort();
-            stdout_handle.abort();
-            return Err(format!("wait failed: {e}"));
+    let status = if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                // audit-#3: caller asked us to stop. Send SIGKILL (start_kill is
+                // non-blocking) and tear down the reader tasks so nothing leaks.
+                let _ = child.start_kill();
+                stderr_handle.abort();
+                stdout_handle.abort();
+                return Err("cancelled".to_string());
+            }
+            wait_res = child.wait() => match wait_res {
+                Ok(s) => s,
+                Err(e) => {
+                    stderr_handle.abort();
+                    stdout_handle.abort();
+                    return Err(format!("wait failed: {e}"));
+                }
+            },
+        }
+    } else {
+        match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                // audit-#11: stderr/stdout reader tasks must not leak on wait error.
+                stderr_handle.abort();
+                stdout_handle.abort();
+                return Err(format!("wait failed: {e}"));
+            }
         }
     };
 
@@ -1296,9 +1320,12 @@ async fn run_shell_cmd_buffered(
     cmd: &str,
     dir: &std::path::Path,
 ) -> Result<(i32, String, String), String> {
+    // audit-#17: a misbehaving `sh -c <cmd>` could otherwise wedge the worker
+    // forever. Cap each buffered shell invocation at 10 minutes.
+    const BUFFERED_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     let cmd = cmd.to_string();
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let join = tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -1308,10 +1335,16 @@ async fn run_shell_cmd_buffered(
         let code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Ok((code, stdout, stderr))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
+        Ok::<(i32, String, String), String>((code, stdout, stderr))
+    });
+    match tokio::time::timeout(BUFFERED_CMD_TIMEOUT, join).await {
+        Err(_) => Err(format!(
+            "command timed out after {}s",
+            BUFFERED_CMD_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => Err(format!("spawn_blocking: {e}")),
+        Ok(Ok(inner)) => inner,
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -7358,5 +7391,47 @@ Time:        3.456 s
             .expect("aborts must be followed by the wait-failed return");
         assert!(stdout_abort > stderr_abort);
         assert!(return_err > 0);
+    }
+
+    /// audit-#3: streaming variant must observe a CancellationToken so a
+    /// caller can kill a runaway build/test command.
+    #[test]
+    fn run_shell_cmd_streaming_has_cancel_support() {
+        let source = include_str!("durable_task.rs");
+        let fn_start = source
+            .find("async fn run_shell_cmd_streaming(")
+            .expect("streaming fn must exist");
+        let body_end = source[fn_start..]
+            .find("\nasync fn ")
+            .map(|i| fn_start + i)
+            .unwrap_or(source.len());
+        let body = &source[fn_start..body_end];
+        assert!(
+            body.contains("cancel: Option<&tokio_util::sync::CancellationToken>"),
+            "run_shell_cmd_streaming must accept a cancel token parameter"
+        );
+        assert!(
+            body.contains("cancelled()") && body.contains("start_kill"),
+            "run_shell_cmd_streaming must select! on cancel and start_kill the child"
+        );
+    }
+
+    /// audit-#17: buffered variant must have an outer timeout so a hung
+    /// `sh -c` command cannot wedge the worker indefinitely.
+    #[test]
+    fn run_shell_cmd_buffered_has_timeout() {
+        let source = include_str!("durable_task.rs");
+        let fn_start = source
+            .find("async fn run_shell_cmd_buffered(")
+            .expect("buffered fn must exist");
+        let body_end = source[fn_start..]
+            .find("\nfn ")
+            .map(|i| fn_start + i)
+            .unwrap_or(source.len());
+        let body = &source[fn_start..body_end];
+        assert!(
+            body.contains("tokio::time::timeout") || body.contains("time::timeout"),
+            "run_shell_cmd_buffered must wrap spawn_blocking in tokio::time::timeout"
+        );
     }
 }
