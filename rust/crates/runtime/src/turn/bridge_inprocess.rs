@@ -403,6 +403,9 @@ pub struct InProcessChatTurnBridge {
     /// Shared session facts for facts-first compaction. Updated by the agentic loop
     /// at each turn end; read by the bridge during compaction.
     pub session_facts: Arc<std::sync::Mutex<crate::turn::cloud::session_facts::SessionFacts>>,
+    /// Shutdown-aware tracker for fire-and-forget SSE persist tasks (HIGH #4).
+    /// When `None` the bridge falls back to raw `tokio::spawn` (dev / test mode).
+    pub persist_tracker: Option<Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>>,
 }
 
 impl InProcessChatTurnBridge {
@@ -416,6 +419,7 @@ impl InProcessChatTurnBridge {
             feedback_store: Arc::new(crate::pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
+            persist_tracker: None,
         }
     }
 
@@ -434,6 +438,17 @@ impl InProcessChatTurnBridge {
         ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     ) -> Self {
         self.edge_callback_ledger = ledger;
+        self
+    }
+
+    /// Attach a shutdown-aware persist tracker (HIGH #4).
+    /// When set, SSE-generator persist tasks are tracked and drained on shutdown
+    /// rather than being fire-and-forgot via raw `tokio::spawn`.
+    pub fn with_persist_tracker(
+        mut self,
+        tracker: Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>,
+    ) -> Self {
+        self.persist_tracker = Some(tracker);
         self
     }
 }
@@ -557,6 +572,7 @@ impl InProcessChatTurnBridge {
         let feedback_store_capture = self.feedback_store.clone();
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
+        let persist_tracker_shared = self.persist_tracker.clone();
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
@@ -1894,16 +1910,10 @@ impl InProcessChatTurnBridge {
                 .map(|plan| plan.events.len())
                 .unwrap_or(0);
 
-            // TODO(audit-#3): The persist tokio::spawn here is fire-and-forget,
-            // so a turn that is cancelled (or whose session is dropped) right
-            // after the SSE "turn complete" event leaves the in-flight persist
-            // racing the runtime tear-down — session state can be left
-            // partially written. Fix shape: capture this JoinHandle on a
-            // tracked persist set on the bridge and either await it before
-            // emitting the terminal SSE frame or drain it during runtime
-            // shutdown. Deferred until the bridge owns a shared task tracker
-            // (paired with audit-#2).
-            tokio::spawn(async move {
+            // audit-#3 resolved: tasks are now routed through the shutdown-aware
+            // BridgePersistTracker so they drain on SIGTERM instead of being fire-and-forget.
+            let persist_tracker_for_main = persist_tracker_shared.clone();
+            let persist_future = async move {
                 let persist_start = std::time::Instant::now();
                 let core_outcome = match writer.persist(persist_plan).await {
                     Ok(outcome) => outcome,
@@ -1968,7 +1978,13 @@ impl InProcessChatTurnBridge {
                         error = e
                     );
                 }
-            });
+            };
+            // HIGH #4: route through shutdown-aware tracker when available.
+            if let Some(tracker) = persist_tracker_for_main {
+                tracker.track_persist_task(Box::pin(persist_future));
+            } else {
+                tokio::spawn(persist_future);
+            }
 
             if !session_id.is_empty()
                 && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())
@@ -2114,7 +2130,8 @@ impl InProcessChatTurnBridge {
                 let aux_trace_signal = trace_signal.clone();
                 let aux_evaluation = evaluation.clone();
                 let aux_step_count = tool_call_records.len();
-                tokio::spawn(async move {
+                let persist_tracker_for_aux = persist_tracker_shared.clone();
+                let aux_future = async move {
                     // Routing decision event (inprocess uses default router)
                     let routing_event = crate::TurnAuxiliaryEventRecord {
                         event_id: Uuid::now_v7().to_string(),
@@ -2147,7 +2164,13 @@ impl InProcessChatTurnBridge {
                         aux_step_count,
                     )
                     .await;
-                });
+                };
+                // HIGH #4: route through shutdown-aware tracker when available.
+                if let Some(tracker) = persist_tracker_for_aux {
+                    tracker.track_persist_task(Box::pin(aux_future));
+                } else {
+                    tokio::spawn(aux_future);
+                }
             }
 
             if explain {
