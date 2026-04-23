@@ -252,16 +252,16 @@ fn recover_tool_call_args(rest: &str) -> String {
                 }
                 // Best-effort: wrap as {"command": "..."} — works for bash/shell.
                 // For other tools the executor will return an error, triggering retry.
-                let escaped = arg_content.replace('\\', "\\\\").replace('"', "\\\"");
-                return format!("{{\"command\":\"{escaped}\"}}");
+                // Use serde_json to guarantee valid JSON (escapes control chars,
+                // quotes, backslashes, and non-ASCII correctly).
+                return serde_json::json!({ "command": arg_content }).to_string();
             }
         }
     }
 
     // Last resort: if cleaned text is non-empty, wrap as command
     if !cleaned.is_empty() {
-        let escaped = cleaned.replace('\\', "\\\\").replace('"', "\\\"");
-        return format!("{{\"command\":\"{escaped}\"}}");
+        return serde_json::json!({ "command": cleaned }).to_string();
     }
 
     "{}".to_string()
