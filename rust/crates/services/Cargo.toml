@@ -30,7 +30,7 @@ fs2 = "0.4.3"
 
 [dev-dependencies]
 dotenvy.workspace = true
-astra-core.workspace = true
+astra-core = { workspace = true, features = ["dev-defaults"] }
 filetime = "0.2"
 serde_json.workspace = true
 serial_test = "3"

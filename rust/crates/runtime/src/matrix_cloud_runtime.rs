@@ -41,9 +41,12 @@ pub trait BridgePersistTracker: Send + Sync {
     fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>);
 }
 
-/// Environment-driven MatrixOne settings (same defaults as legacy CLI `try_init_ingestion`).
-pub fn matrix_settings_from_env() -> MatrixOneSettings {
-    MatrixOneSettings {
+/// Environment-driven MatrixOne settings.
+///
+/// Requires `MATRIXONE_PASSWORD` to be set — fails closed rather than
+/// substituting a hardcoded development password.
+pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
+    Ok(MatrixOneSettings {
         host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
         port: std::env::var("MATRIXONE_PORT")
             .ok()
@@ -51,9 +54,9 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
             .unwrap_or(6001),
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.into()),
+            .map_err(|_| "MATRIXONE_PASSWORD environment variable is required".to_string())?,
         database: resolve_database_name(&|k| std::env::var(k).ok()),
-    }
+    })
 }
 
 /// Pool + ingestion + unified sync orchestrator. Safe to share behind `Arc`.
@@ -374,10 +377,13 @@ mod tests {
 
     #[test]
     fn matrix_settings_from_env_non_empty() {
-        let s = matrix_settings_from_env();
+        // SAFETY: tests run sequentially in this module; setting env temporarily.
+        unsafe { std::env::set_var("MATRIXONE_PASSWORD", "test-pw") };
+        let s = matrix_settings_from_env().expect("password set");
         assert!(!s.host.is_empty());
         assert!(s.port > 0);
         assert!(!s.database.is_empty());
+        unsafe { std::env::remove_var("MATRIXONE_PASSWORD") };
     }
 
     #[test]

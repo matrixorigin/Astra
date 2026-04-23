@@ -127,6 +127,10 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 /// Default MatrixOne password used in development mode only.
 /// Production deployments MUST set `MATRIXONE_PASSWORD` env var.
+///
+/// Gated behind `dev-defaults` feature (or test builds) so production binaries
+/// cannot link this hardcoded fallback.
+#[cfg(any(test, feature = "dev-defaults"))]
 pub const DEV_MATRIXONE_PASSWORD: &str = "111";
 
 /// Static assertion: ensure const default matches what Default impl uses.
@@ -137,6 +141,7 @@ const _: () = assert!(
 );
 
 /// Emit a one-time warning if using the default MatrixOne password.
+#[cfg(any(test, feature = "dev-defaults"))]
 pub fn warn_default_credentials_once() {
     use std::sync::Once;
     static WARNED: Once = Once::new();

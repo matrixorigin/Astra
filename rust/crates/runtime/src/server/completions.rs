@@ -71,7 +71,12 @@ pub(super) async fn completions_handler(
     let _user = state.auth_service.current_user(&headers).await?;
 
     // 2. Resolve LLM model
-    let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env();
+    let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("MatrixOne configuration unavailable: {e}"),
+        )
+    })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
     let resolved = astra_services::resolve_active_llm_model(
         &matrixone,
