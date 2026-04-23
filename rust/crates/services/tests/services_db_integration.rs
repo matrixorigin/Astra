@@ -33,8 +33,8 @@ use astra_services::{
     DatabaseSkillService, DecisionListFilter, DecisionService, DurableTaskLifecycle,
     EventCreateRequestData, EventListFilter, EventService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
     MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
-    SessionListFilter, SessionService, SkillSearchQuery, SkillService, StagedMutationState,
-    ensure_core_schema,
+    MatrixOneSyncService, SessionListFilter, SessionService, SkillSearchQuery, SkillService,
+    StagedMutationState, StateSyncService, ensure_core_schema,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -2742,4 +2742,171 @@ async fn event_write_paths_reconcile_event_count_on_live_matrixone() {
         &[],
     )
     .await;
+}
+
+// ── At-most-once idempotency integration tests ───────────────────────────────
+// Gated by ASTRA_SERVICES_DB_IT=1. Document the end-to-end compare-before-reject
+// contract introduced by the idempotency audit (PR: fix/at-most-once-idempotency-audit).
+
+#[tokio::test]
+#[ignore]
+async fn it_register_skill_idempotent_retry_returns_200() {
+    let (shared_pool, settings) = setup_pool_and_settings().await;
+    let raw_pool = shared_pool.get().clone();
+    let svc = DatabaseSkillService::new(settings).with_pool(shared_pool);
+    let skill_id = format!("it-idem-reg-{}", Uuid::new_v4().simple());
+    let request = astra_services::SkillRegisterRequestData {
+        skill_id: skill_id.clone(),
+        skill_name: skill_id.clone(),
+        skill_version: "1.0.0".to_string(),
+        skill_code: "fn run() {}".to_string(),
+        skill_type: "local".to_string(),
+        remote_url: None,
+        description: Some("idempotency test".to_string()),
+        metadata: None,
+    };
+
+    // First call — should insert.
+    let first = svc
+        .register_skill("it-user".to_string(), request.clone())
+        .await
+        .expect("first register_skill should succeed");
+    assert_eq!(first.skill_id, skill_id);
+
+    // Second call with identical payload — should return 200, not 409.
+    let second = svc
+        .register_skill("it-user".to_string(), request)
+        .await
+        .expect("idempotent retry of register_skill must return 200");
+    assert_eq!(
+        second.skill_id, skill_id,
+        "idempotent reply must return same skill_id"
+    );
+
+    // Cleanup.
+    sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+        .bind(&skill_id)
+        .execute(&raw_pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+#[ignore]
+async fn it_register_skill_conflict_different_code_returns_409() {
+    let (shared_pool, settings) = setup_pool_and_settings().await;
+    let raw_pool = shared_pool.get().clone();
+    let svc = DatabaseSkillService::new(settings).with_pool(shared_pool);
+    let skill_id = format!("it-conflict-reg-{}", Uuid::new_v4().simple());
+    let base = astra_services::SkillRegisterRequestData {
+        skill_id: skill_id.clone(),
+        skill_name: skill_id.clone(),
+        skill_version: "1.0.0".to_string(),
+        skill_code: "fn run() {}".to_string(),
+        skill_type: "local".to_string(),
+        remote_url: None,
+        description: Some("conflict test".to_string()),
+        metadata: None,
+    };
+    svc.register_skill("it-user".to_string(), base.clone())
+        .await
+        .expect("first register_skill should succeed");
+
+    let different = astra_services::SkillRegisterRequestData {
+        skill_code: "fn run() { panic!() }".to_string(),
+        ..base
+    };
+    let err = svc
+        .register_skill("it-user".to_string(), different)
+        .await
+        .expect_err("different code for same skill_id must return 409");
+    assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+
+    // Cleanup.
+    sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+        .bind(&skill_id)
+        .execute(&raw_pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+#[ignore]
+async fn it_publish_skill_idempotent_retry_returns_200() {
+    let (shared_pool, settings) = setup_pool_and_settings().await;
+    let raw_pool = shared_pool.get().clone();
+    let svc = DatabaseSkillService::new(settings).with_pool(shared_pool);
+    let name = format!("it-idem-pub-{}", Uuid::new_v4().simple());
+    let request = astra_services::SkillPublishRequestData {
+        name: name.clone(),
+        version: "1.0.0".to_string(),
+        description: "idempotency test".to_string(),
+        triggers: None,
+        dependencies: None,
+        manifest: None,
+        skill_type: "local".to_string(),
+        remote_url: None,
+        category: "user".to_string(),
+        priority: 5,
+        publisher_id: None,
+        trust_tier: None,
+    };
+
+    let first = svc
+        .publish_skill("it-user".to_string(), request.clone())
+        .await
+        .expect("first publish_skill should succeed");
+    assert_eq!(first["status"], "published");
+
+    // Retry with identical payload — must return 200.
+    let second = svc
+        .publish_skill("it-user".to_string(), request)
+        .await
+        .expect("idempotent retry of publish_skill must return 200");
+    assert_eq!(second["status"], "published");
+
+    let skill_id = format!("{}@1.0.0", name);
+    sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
+        .bind(&skill_id)
+        .execute(&raw_pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+#[ignore]
+async fn it_push_learning_versioned_idempotent_insert_returns_ok() {
+    let (shared_pool, settings) = setup_pool_and_settings().await;
+    let raw_pool = shared_pool.get().clone();
+    let _ = settings; // used for pool setup; MatrixOneSyncService takes a raw pool
+    let svc = MatrixOneSyncService::new(raw_pool.clone());
+    let user_id = format!("it-sync-user-{}", Uuid::new_v4().simple());
+    let profile = "default";
+    let snapshot = r#"{"entities":[],"patterns":[]}"#;
+
+    let first = svc
+        .push_learning_versioned(&user_id, profile, snapshot, 0, 0, false, None)
+        .await;
+    assert!(first.success, "first insert must succeed: {first:?}");
+
+    // Retry with same snapshot — must succeed (idempotent), not conflict.
+    // (Simulates: INSERT committed, TCP reset, client retries → gets dup-key.)
+    let second = svc
+        .push_learning_versioned(&user_id, profile, snapshot, 0, 0, false, None)
+        .await;
+    assert!(
+        second.success,
+        "idempotent retry of push_learning_versioned must return success, got: {second:?}"
+    );
+    assert!(
+        !second.is_conflict,
+        "idempotent retry must not be a conflict"
+    );
+
+    // Cleanup.
+    sqlx::query("DELETE FROM learning_snapshots WHERE user_id = ?")
+        .bind(&user_id)
+        .execute(&raw_pool)
+        .await
+        .ok();
 }
