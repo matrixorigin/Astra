@@ -1571,9 +1571,86 @@ Keep responses concise. The plan JSON must be valid if provided."#,
 
 // ─── Auto Plan Detection ─────────────────────────────────────────────────────
 
+/// Returns true when the input clearly asks an analytical/evaluative
+/// question rather than requesting executable work.
+///
+/// These questions should go to a normal chat turn, not plan mode, because
+/// `/plan` builds a `TaskPlan` with executable subtasks and an analytical
+/// response would either fail JSON parsing or produce useless make-work
+/// subtasks like "research the answer".
+fn looks_analytical(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let trimmed = input.trim();
+
+    // Question marks at the end strongly signal an inquiry.
+    let ends_with_question = trimmed.ends_with('?')
+        || trimmed.ends_with('？')
+        || trimmed.ends_with("吗")
+        || trimmed.ends_with("吗？")
+        || trimmed.ends_with("吗?");
+
+    // Lead-ins that almost always mean "answer me" not "do for me".
+    let analytical_leads_en = [
+        "what is",
+        "what are",
+        "why ",
+        "why is",
+        "how do",
+        "how does",
+        "should i",
+        "should we",
+        "is it",
+        "are there",
+        "explain ",
+        "compare ",
+        "evaluate ",
+        "review ",
+        "assess ",
+        "analyze ",
+        "analyse ",
+        "thoughts on",
+    ];
+    let analytical_leads_cjk = [
+        "是不是",
+        "是否",
+        "可不可以",
+        "可以吗",
+        "能不能",
+        "为什么",
+        "怎么理解",
+        "如何看待",
+        "如何评价",
+        "评价",
+        "评估",
+        "分析",
+        "客观评价",
+        "客观评估",
+        "解释",
+        "对比",
+        "比较",
+        "吗？",
+        "吗?",
+    ];
+    let has_en = analytical_leads_en
+        .iter()
+        .any(|kw| lower.starts_with(kw) || lower.contains(&format!(" {kw}")));
+    // CJK has no word boundaries — substring match is the right semantic.
+    let has_cjk = analytical_leads_cjk.iter().any(|kw| input.contains(kw));
+
+    ends_with_question || has_en || has_cjk
+}
+
 /// Heuristics to detect if user input likely needs a plan.
 /// Returns Some(reason) if plan mode should be suggested.
+///
+/// Returns `None` for analytical/evaluative inputs even when they otherwise
+/// match the length/keyword heuristics, because /plan only knows how to
+/// build executable TaskPlans.
 pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
+    if looks_analytical(input) {
+        return None;
+    }
+
     let lower = input.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
 
@@ -7110,6 +7187,53 @@ Done!"#;
         // Simple questions should not trigger
         assert!(should_suggest_plan_mode("how does this work").is_none());
         assert!(should_suggest_plan_mode("explain the code").is_none());
+    }
+
+    #[test]
+    fn should_suggest_plan_mode_skips_analytical_questions() {
+        // B1: Analytical / evaluative questions are answered by chat, not by
+        // building a TaskPlan with executable subtasks.
+        // The user's actual failing input from session 5544bc3b:
+        assert!(
+            should_suggest_plan_mode(
+                "当前memoria的接口对context管理来说，客观评价是正确的方向吗？需要看内部实现啊"
+            )
+            .is_none(),
+            "evaluative '吗？' question must NOT auto-trigger plan mode"
+        );
+
+        // English equivalents
+        assert!(
+            should_suggest_plan_mode(
+                "should we refactor the authentication module to use JWT?"
+            )
+            .is_none()
+        );
+        assert!(
+            should_suggest_plan_mode(
+                "evaluate whether the current implementation of services is correct"
+            )
+            .is_none()
+        );
+        assert!(
+            should_suggest_plan_mode(
+                "compare the build system with cargo for the new module"
+            )
+            .is_none()
+        );
+        assert!(
+            should_suggest_plan_mode("分析当前模块的设计是否合理").is_none()
+        );
+        assert!(
+            should_suggest_plan_mode("如何评价这个重构方案").is_none()
+        );
+
+        // Sanity: actionable instructions still trigger
+        assert!(
+            should_suggest_plan_mode("refactor the auth module and add comprehensive tests")
+                .is_some(),
+            "imperative instructions still route to plan mode"
+        );
     }
 
     #[test]

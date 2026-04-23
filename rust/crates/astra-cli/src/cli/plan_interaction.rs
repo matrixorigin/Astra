@@ -1369,7 +1369,12 @@ enum PlanResumeRecovery {
     /// recovered plan ready for a new executor.
     Ready(astra_services::task_orchestrator::TaskPlan),
     /// All subtasks are already Completed — nothing to resume.
-    NothingToDo,
+    AllCompleted,
+    /// Plan has no subtasks at all — generation never produced any work.
+    /// (Previously misreported as `NothingToDo`/AllCompleted, surfacing the
+    /// confusing "All subtasks already completed" message on a fresh empty
+    /// plan after a failed generation.)
+    EmptyNoSubtasks,
 }
 
 /// Recover a plan for resume: reset Failed→Pending and return a clone if work remains.
@@ -1381,12 +1386,16 @@ fn recover_plan_for_resume(
 ) -> PlanResumeRecovery {
     use astra_services::task_orchestrator::TaskStatus;
 
+    if plan.subtasks.is_empty() {
+        return PlanResumeRecovery::EmptyNoSubtasks;
+    }
+
     let has_work = plan
         .subtasks
         .iter()
         .any(|s| s.status == TaskStatus::Pending || s.status == TaskStatus::Failed);
     if !has_work {
-        return PlanResumeRecovery::NothingToDo;
+        return PlanResumeRecovery::AllCompleted;
     }
     for st in &mut plan.subtasks {
         if st.status == TaskStatus::Failed {
@@ -1714,11 +1723,21 @@ async fn handle_plan_command(
                         state.executing_plan = Some(plan);
                         eprintln!("  {} Resuming plan execution...", "▶".cyan());
                     }
-                    PlanResumeRecovery::NothingToDo => {
+                    PlanResumeRecovery::AllCompleted => {
                         eprintln!(
                             "  {} {}",
                             theme::icon_warn(),
                             "All subtasks already completed — nothing to resume".yellow()
+                        );
+                    }
+                    PlanResumeRecovery::EmptyNoSubtasks => {
+                        // Plan generation never produced subtasks (likely
+                        // failed JSON parse or cancelled). Don't lie that
+                        // everything is "completed" — guide the user back.
+                        eprintln!(
+                            "  {} {}",
+                            theme::icon_warn(),
+                            "Plan is empty — type a goal to generate one, or 'cancel' to exit plan mode".yellow()
                         );
                     }
                 }
@@ -2952,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_plan_for_resume_all_completed_returns_nothing() {
+    fn recover_plan_for_resume_all_completed_returns_all_completed() {
         use astra_services::task_orchestrator::TaskPlan;
         let mut plan = TaskPlan {
             subtasks: vec![
@@ -2973,7 +2992,23 @@ mod tests {
         };
         assert!(matches!(
             super::recover_plan_for_resume(&mut plan),
-            super::PlanResumeRecovery::NothingToDo
+            super::PlanResumeRecovery::AllCompleted
+        ));
+    }
+
+    #[test]
+    fn recover_plan_for_resume_empty_subtasks_returns_empty_no_subtasks() {
+        // B4: An empty subtasks list means generation never produced a plan.
+        // Previously this fell into the "AllCompleted" branch and confused the
+        // user with "All subtasks already completed — nothing to resume".
+        use astra_services::task_orchestrator::TaskPlan;
+        let mut plan = TaskPlan {
+            subtasks: vec![],
+            notes: None,
+        };
+        assert!(matches!(
+            super::recover_plan_for_resume(&mut plan),
+            super::PlanResumeRecovery::EmptyNoSubtasks
         ));
     }
 
