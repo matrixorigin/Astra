@@ -151,10 +151,7 @@ pub fn prompt_auto_suggest(reason: &str, timeout: Duration) -> AutoSuggestDecisi
             );
         }
         AutoSuggestDecision::Declined => {
-            eprintln!(
-                "{}  Skipping plan mode — proceeding with normal chat.",
-                "→".dim()
-            );
+            eprintln!("{}  Skipping plan mode — proceeding with normal chat.", "→".dim());
         }
         AutoSuggestDecision::Interrupted => {
             eprintln!("{}  Cancelled.", theme::icon_warn());
