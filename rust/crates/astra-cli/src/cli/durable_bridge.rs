@@ -1202,6 +1202,16 @@ pub struct HttpLlmJudge {
     model: String,
 }
 
+impl std::fmt::Debug for HttpLlmJudge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpLlmJudge")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
 impl HttpLlmJudge {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
         let client = build_client_for_url(&base_url);

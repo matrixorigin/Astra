@@ -95,11 +95,21 @@ pub struct CloudJudgePersistContext {
 }
 
 /// Configuration for the cloud LLM judge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CloudLlmConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+}
+
+impl std::fmt::Debug for CloudLlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudLlmConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 impl CloudLlmConfig {
@@ -4182,6 +4192,24 @@ mod tests {
         };
         assert!(reason.starts_with("LLM judge error:"));
         assert!(reason.contains("503"));
+    }
+
+    #[test]
+    fn cloud_llm_config_debug_redacts_api_key() {
+        let config = CloudLlmConfig {
+            api_key: "sk-XYZ123secret".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o".to_string(),
+        };
+        let debug_str = format!("{config:?}");
+        assert!(
+            !debug_str.contains("sk-XYZ123secret"),
+            "api_key should be redacted: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should show [REDACTED]: {debug_str}"
+        );
     }
 
     #[test]
