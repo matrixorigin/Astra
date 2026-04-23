@@ -1534,7 +1534,7 @@ async fn handle_plan_command(
                 &mut state.journal,
                 session_journal::JournalEventType::PlanLifecycle,
                 "Plan mode cancelled",
-                None,
+                Some(serde_json::json!({ "stage": "cancelled" })),
             );
 
             PlanModeState::clear_saved_state();
@@ -1832,6 +1832,12 @@ async fn handle_plan_command(
                 match handle.send_command(crate::plan_executor::PlanCommand::Resume { corrections })
                 {
                     Ok(()) => {
+                        journal_plan_event(
+                            &mut state.journal,
+                            session_journal::JournalEventType::PlanLifecycle,
+                            "Plan execution resumed",
+                            Some(serde_json::json!({ "stage": "resumed" })),
+                        );
                         eprintln!(
                             "  {} Resuming plan execution in background. Use {} for progress.",
                             "▶".cyan(),
@@ -1876,7 +1882,15 @@ async fn handle_plan_command(
         PlanCommand::Pause => {
             if let Some(ref handle) = state.plan_handle {
                 match handle.send_command(crate::plan_executor::PlanCommand::Pause) {
-                    Ok(()) => eprintln!("  {} Pause requested.", "⏸".cyan()),
+                    Ok(()) => {
+                        journal_plan_event(
+                            &mut state.journal,
+                            session_journal::JournalEventType::PlanLifecycle,
+                            "Plan execution pause requested",
+                            Some(serde_json::json!({ "stage": "pause_requested" })),
+                        );
+                        eprintln!("  {} Pause requested.", "⏸".cyan());
+                    }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
             } else {

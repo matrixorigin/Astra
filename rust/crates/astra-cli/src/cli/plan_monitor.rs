@@ -99,6 +99,33 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
     }
 }
 
+/// Emit a structured plan-lifecycle journal event with common counters.
+fn emit_plan_lifecycle_event(
+    state: &ReplState,
+    description: &str,
+    stage: &str,
+    mut extra: serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(ref journal) = state.journal {
+        let (items_done, items_total) = state
+            .executing_plan
+            .as_ref()
+            .map_or((0, 0), |p| (p.items_done(), p.subtasks.len() as u32));
+        extra.insert(
+            "stage".to_string(),
+            serde_json::Value::String(stage.to_string()),
+        );
+        extra.insert("items_done".to_string(), serde_json::json!(items_done));
+        extra.insert("items_total".to_string(), serde_json::json!(items_total));
+        let event = astra_services::session_journal::JournalEvent::plan_lifecycle(
+            state.session_id.as_deref(),
+            description,
+            Some(serde_json::Value::Object(extra)),
+        );
+        let _ = journal.append(&event);
+    }
+}
+
 /// Format a duration in milliseconds as a compact human-readable string.
 fn format_duration_ms(ms: u64) -> String {
     if ms >= 60_000 {
@@ -320,6 +347,14 @@ fn display_plan_updates_live(
                         apply_trailing_update(trailing, state);
                     }
                 }
+                // R3: emit structured journal event for plan completion.
+                let mut extra = serde_json::Map::new();
+                extra.insert(
+                    "elapsed_ms".to_string(),
+                    serde_json::json!(elapsed.as_millis() as u64),
+                );
+                extra.insert("pct".to_string(), serde_json::json!(pct));
+                emit_plan_lifecycle_event(state, "Plan execution completed", "completed", extra);
                 let msg = format!(
                     "\n🏁  Plan complete — {pct}% verified in {}",
                     format_duration_short(elapsed),
@@ -360,6 +395,10 @@ fn display_plan_updates_live(
                         apply_trailing_update(trailing, state);
                     }
                 }
+                // R3: emit structured journal event for plan error.
+                let mut extra = serde_json::Map::new();
+                extra.insert("error".to_string(), serde_json::json!(error));
+                emit_plan_lifecycle_event(state, "Plan execution failed", "error", extra);
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
@@ -415,6 +454,16 @@ fn display_plan_updates_live(
                     };
                     format!("{base}\n    blocked by: {}{suffix}", shown.join(", "))
                 };
+                // R3: emit structured journal event for plan pause.
+                let mut extra = serde_json::Map::new();
+                extra.insert(
+                    "elapsed_ms".to_string(),
+                    serde_json::json!(elapsed.as_millis() as u64),
+                );
+                extra.insert("pct".to_string(), serde_json::json!(pct));
+                extra.insert("remaining".to_string(), serde_json::json!(remaining));
+                extra.insert("blocked_ids".to_string(), serde_json::json!(blocked_ids));
+                emit_plan_lifecycle_event(state, "Plan execution paused", "paused", extra);
                 (msg, PostSpinner::None)
             }
             PlanUpdate::GlobalVerificationFailed => (
@@ -706,7 +755,7 @@ pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut ReplState)
     let Some(ref svc) = state.task_service else {
         return;
     };
-    use astra_services::{TaskService, task_orchestrator::TaskOutcome};
+    use astra_services::{task_orchestrator::TaskOutcome, TaskService};
     if let Some(ref err) = state.plan_run_task_last_error {
         let err = err.clone();
         let _ = svc.fail_task(&tid, &err).await;
@@ -1029,5 +1078,173 @@ mod tests {
                 .status,
             TaskStatus::InProgress
         );
+    }
+
+    // ── R3: journal metadata assertion tests ──────────────────────────────────
+
+    /// Create a JournalWriter for a unique test session and return (writer, path).
+    fn make_test_journal(
+        session_id: &str,
+    ) -> (
+        astra_services::session_journal::JournalWriter,
+        std::path::PathBuf,
+    ) {
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        let path = writer.path().clone();
+        (writer, path)
+    }
+
+    /// Read all journal events from a jsonl file.
+    fn read_journal(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn plan_completed_journal_has_stage_and_elapsed_ms() {
+        let sid = format!("test-plan-completed-{}", std::process::id());
+        let (writer, path) = make_test_journal(&sid);
+        let mut state = ReplState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanCompleted {
+            pct: 100,
+            elapsed: std::time::Duration::from_millis(1234),
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "completed", "stage field present");
+        assert_eq!(detail["elapsed_ms"], 1234u64, "elapsed_ms matches");
+        assert_eq!(detail["items_done"], 1u32, "items_done correct");
+        assert_eq!(detail["items_total"], 1u32, "items_total correct");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_error_journal_has_stage_and_error_field() {
+        let sid = format!("test-plan-error-{}", std::process::id());
+        let (writer, path) = make_test_journal(&sid);
+        let mut state = ReplState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanError {
+            error: "subtask failed".into(),
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "error", "stage field present");
+        assert_eq!(detail["error"], "subtask failed", "error field present");
+        assert_eq!(detail["items_total"], 1u32, "items_total correct");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_paused_journal_has_stage_elapsed_ms_and_items() {
+        let sid = format!("test-plan-paused-{}", std::process::id());
+        let (writer, path) = make_test_journal(&sid);
+        let mut state = ReplState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "one".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "two".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanPaused {
+            pct: 50,
+            remaining: 1,
+            elapsed: std::time::Duration::from_millis(500),
+            blocked_ids: vec![],
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "paused", "stage field present");
+        assert_eq!(detail["elapsed_ms"], 500u64, "elapsed_ms matches");
+        assert_eq!(detail["items_done"], 1u32, "items_done correct");
+        assert_eq!(detail["items_total"], 2u32, "items_total correct");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cancel_journal_has_stage_cancelled() {
+        use astra_services::session_journal;
+        let sid = format!("test-plan-cancel-{}", std::process::id());
+        let (writer, path) = make_test_journal(&sid);
+
+        // Replicate what the Cancel branch does.
+        let event = session_journal::JournalEvent::plan_lifecycle(
+            None,
+            "Plan mode cancelled",
+            Some(serde_json::json!({ "stage": "cancelled" })),
+        );
+        writer.append(&event).unwrap();
+        drop(writer);
+
+        let events = read_journal(&path);
+        assert_eq!(events.len(), 1);
+        let detail = &events[0]["metadata"]["detail"];
+        assert_eq!(detail["stage"], "cancelled");
+        let _ = std::fs::remove_file(&path);
     }
 }

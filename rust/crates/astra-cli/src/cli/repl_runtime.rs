@@ -1642,4 +1642,52 @@ mod tests {
             assert_eq!(frame.lines().count(), idx + 1);
         }
     }
+
+    // ── R4: persistence contract tests ────────────────────────────────────────
+
+    #[test]
+    fn maybe_restore_pending_plan_mode_rejects_workspace_mismatch() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        // Create a plan state rooted at a different directory.
+        let other_dir = tempdir().unwrap();
+        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+            "goal from other workspace".to_string(),
+            astra_runtime::plan_decompose::ProjectContext {
+                root: other_dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        );
+        plan_state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "t1".into(),
+                title: "step".into(),
+                status: astra_services::task_orchestrator::TaskStatus::Pending,
+                ..Default::default()
+            });
+        // Save to the current-cwd-scoped path (which is the test's cwd, not other_dir).
+        plan_state
+            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .unwrap();
+
+        let mut state = ReplState {
+            pending_plan_resume_digest: Some(
+                "[plan-resume] goal=\"goal from other workspace\"".into(),
+            ),
+            ..ReplState::default()
+        };
+        // Should refuse to restore because the saved plan's root != current cwd.
+        let restored = maybe_restore_pending_plan_mode("please @resume-plan", &mut state);
+        assert!(!restored, "workspace mismatch must not restore");
+        assert!(
+            state.plan_mode.is_none(),
+            "plan_mode must remain None on mismatch"
+        );
+    }
 }
