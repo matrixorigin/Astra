@@ -878,11 +878,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
     let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
     let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD").map_err(|_| {
-        "Error: MATRIXONE_PASSWORD environment variable is required. \
-         Set it before using MatrixOne tools."
-            .to_string()
-    })?;
+    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
     let db = database
         .map(ToString::to_string)
         .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
