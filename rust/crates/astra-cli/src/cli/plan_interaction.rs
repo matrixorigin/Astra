@@ -2038,7 +2038,10 @@ async fn handle_goal_submission(
         }
     }
 
-    let plan_state = state.plan_mode.as_mut().expect("plan_mode is_some checked above");
+    let plan_state = state
+        .plan_mode
+        .as_mut()
+        .expect("plan_mode is_some checked above");
     plan_state.goal = goal.clone();
 
     journal_plan_event(

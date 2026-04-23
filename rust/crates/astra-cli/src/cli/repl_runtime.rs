@@ -622,8 +622,7 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut ReplState)
             // B8: Refuse to restore a plan from a different workspace —
             // continuing it against the wrong project would corrupt
             // both contexts.
-            let cwd =
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             if !plan_state.matches_workspace(&cwd) {
                 eprintln!(
                     "  ⚠ Saved plan belongs to a different workspace ({}) — \

@@ -1108,8 +1108,8 @@ fn fix_python_literals(s: &str) -> String {
             let n = lit_chars.len();
             if i + n <= len && chars[i..i + n] == **lit_chars {
                 let prev_ok = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
-                let next_ok = i + n == len
-                    || (!chars[i + n].is_alphanumeric() && chars[i + n] != '_');
+                let next_ok =
+                    i + n == len || (!chars[i + n].is_alphanumeric() && chars[i + n] != '_');
                 if prev_ok && next_ok {
                     out.push_str(repl);
                     i += n;
@@ -7472,10 +7472,8 @@ Done!"#;
 
         // English equivalents
         assert!(
-            should_suggest_plan_mode(
-                "should we refactor the authentication module to use JWT?"
-            )
-            .is_none()
+            should_suggest_plan_mode("should we refactor the authentication module to use JWT?")
+                .is_none()
         );
         assert!(
             should_suggest_plan_mode(
@@ -7484,17 +7482,11 @@ Done!"#;
             .is_none()
         );
         assert!(
-            should_suggest_plan_mode(
-                "compare the build system with cargo for the new module"
-            )
-            .is_none()
+            should_suggest_plan_mode("compare the build system with cargo for the new module")
+                .is_none()
         );
-        assert!(
-            should_suggest_plan_mode("分析当前模块的设计是否合理").is_none()
-        );
-        assert!(
-            should_suggest_plan_mode("如何评价这个重构方案").is_none()
-        );
+        assert!(should_suggest_plan_mode("分析当前模块的设计是否合理").is_none());
+        assert!(should_suggest_plan_mode("如何评价这个重构方案").is_none());
 
         // Sanity: actionable instructions still trigger
         assert!(
