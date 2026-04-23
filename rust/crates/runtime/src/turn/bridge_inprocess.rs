@@ -315,6 +315,40 @@ fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn attach_skill_selector_metric_to_hook_payload(
+    hook_payload: &mut Map<String, Value>,
+    llm_messages: &[Value],
+    tool_calls: &[Value],
+) {
+    let Some(session_id) = hook_payload.get("session_id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(user_id) = hook_payload.get("user_id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(turn_number) = hook_payload.get("turn_count").and_then(Value::as_i64) else {
+        return;
+    };
+    let Some(shortlist) =
+        crate::turn::skill_tool::parse_skill_selector_shortlist_from_messages(llm_messages)
+    else {
+        return;
+    };
+    let selected_skills = crate::turn::skill_tool::selected_skill_names_from_tool_calls(tool_calls);
+    let Some(metric) = crate::turn::skill_tool::build_turn_skill_selector_metric_record(
+        session_id,
+        user_id,
+        turn_number,
+        Some(&shortlist),
+        &selected_skills,
+    ) else {
+        return;
+    };
+    if let Ok(metric_value) = serde_json::to_value(metric) {
+        hook_payload.insert("skill_selector_metric".to_string(), metric_value);
+    }
+}
+
 fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<String>) -> Vec<Value> {
     if restricted_tools.is_empty() {
         return edge_tools.to_vec();
@@ -1981,6 +2015,11 @@ impl InProcessChatTurnBridge {
                     false, // run_implicit_feedback = false → triggers feedback
                     false, // run_reflection_learning = false → triggers reflection
                 );
+                attach_skill_selector_metric_to_hook_payload(
+                    &mut hook_payload,
+                    &llm_messages,
+                    &all_round_tool_calls,
+                );
                 // Propagate correction signal and routing metadata so pipeline
                 // learning can update ProgressiveCalibrator with actual data.
                 if is_correction_turn {
@@ -2280,6 +2319,58 @@ mod tests {
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
         assert_eq!(count_inprocess_persisted_events(2, 3, false), 2);
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
+    }
+
+    #[test]
+    fn attach_skill_selector_metric_uses_assembled_llm_messages() {
+        let request_messages = vec![json!({
+            "role": "user",
+            "content": "deploy the service"
+        })];
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "skill",
+                "arguments": "{\"skill_name\":\"deploy\"}"
+            }
+        })];
+        let llm_messages = vec![
+            json!({
+                "role": "system",
+                "content": "<available_skills>\n<skill>\n  <name>build</name>\n  <description>Build artifacts</description>\n</skill>\n<skill>\n  <name>deploy</name>\n  <description>Deploy the service</description>\n</skill>\n</available_skills>\n\ndiscover_skills"
+            }),
+            request_messages[0].clone(),
+        ];
+        let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
+            "user-1",
+            "session-1",
+            &request_messages,
+            &[],
+            "",
+            &tool_calls,
+            None,
+            None,
+            None,
+            Some("parent-1"),
+            7,
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        attach_skill_selector_metric_to_hook_payload(&mut hook_payload, &llm_messages, &tool_calls);
+
+        let metric = hook_payload
+            .get("skill_selector_metric")
+            .cloned()
+            .expect("metric should be attached");
+        assert_eq!(metric["turn_number"], 7);
+        assert_eq!(metric["visible_skill_count"], 2);
+        assert_eq!(metric["best_chosen_rank"], 2);
+        assert_eq!(metric["hit_at_3"], true);
     }
 
     #[test]

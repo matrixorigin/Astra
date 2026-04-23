@@ -29,6 +29,7 @@ use crate::context_assembly_trace::{
     ToolSelectionTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
     build_tool_trace_from_selection,
 };
+use crate::skill_selector_metrics::SkillSelectorShortlistTrace;
 
 /// Thread-safe trace collector for a single turn.
 ///
@@ -48,6 +49,7 @@ struct CollectorState {
     history: Option<HistorySelectionTrace>,
     memory: Option<MemoryRetrievalTrace>,
     tools: Option<ToolSelectionTrace>,
+    skill_selector: Option<SkillSelectorShortlistTrace>,
     token_budget: Option<TokenBudgetTrace>,
     explanations: Vec<DecisionExplanation>,
 }
@@ -64,6 +66,7 @@ impl TurnTraceCollector {
                 history: None,
                 memory: None,
                 tools: None,
+                skill_selector: None,
                 token_budget: None,
                 explanations: Vec::new(),
             })),
@@ -121,6 +124,14 @@ impl TurnTraceCollector {
         );
         let mut state = recover_rwlock_write(&self.inner);
         state.tools = Some(trace);
+    }
+
+    /// Record the initial visible skill shortlist for this outer turn.
+    pub fn record_skill_selector(&self, trace: SkillSelectorShortlistTrace) {
+        let mut state = recover_rwlock_write(&self.inner);
+        if state.skill_selector.is_none() {
+            state.skill_selector = Some(trace);
+        }
     }
 
     /// Record memory retrieval results.
@@ -291,6 +302,9 @@ impl TurnTraceCollector {
         if let Some(ref t) = state.tools {
             builder = builder.with_tools(t.clone());
         }
+        if let Some(ref skill_selector) = state.skill_selector {
+            builder = builder.with_skill_selector(skill_selector.clone());
+        }
         if let Some(ref tb) = state.token_budget {
             builder = builder.with_token_budget(tb.clone());
         }
@@ -337,6 +351,7 @@ impl TurnTraceCollector {
             || state.history.is_some()
             || state.memory.is_some()
             || state.tools.is_some()
+            || state.skill_selector.is_some()
             || state.token_budget.is_some()
     }
 
@@ -498,6 +513,44 @@ mod tests {
         assert_eq!(trace.tools.tools_selected[0].tokens, 350);
         assert_eq!(trace.tools.tools_selected[1].tool_name, "grep");
         assert_eq!(trace.tools.tools_selected[1].tokens, 280);
+    }
+
+    #[test]
+    fn record_skill_selector_keeps_initial_shortlist() {
+        let collector = TurnTraceCollector::new("turn-0", "s1");
+        collector.record_skill_selector(
+            crate::skill_selector_metrics::SkillSelectorShortlistTrace {
+                open_catalog: true,
+                visible_skill_count: 1,
+                skills: vec![crate::skill_selector_metrics::SkillSelectorShortlistEntry {
+                    rank: 1,
+                    skill_name: "build".into(),
+                    aliases: vec!["compile".into()],
+                    description: "compile the project".into(),
+                    source: "bundled".into(),
+                    category: Some("dev".into()),
+                }],
+            },
+        );
+        collector.record_skill_selector(
+            crate::skill_selector_metrics::SkillSelectorShortlistTrace {
+                open_catalog: false,
+                visible_skill_count: 1,
+                skills: vec![crate::skill_selector_metrics::SkillSelectorShortlistEntry {
+                    rank: 1,
+                    skill_name: "ignored".into(),
+                    aliases: vec![],
+                    description: "ignored".into(),
+                    source: "local".into(),
+                    category: None,
+                }],
+            },
+        );
+
+        let trace = collector.finalize();
+        let shortlist = trace.skill_selector.expect("shortlist should be recorded");
+        assert!(shortlist.open_catalog);
+        assert_eq!(shortlist.skills[0].skill_name, "build");
     }
 
     #[test]

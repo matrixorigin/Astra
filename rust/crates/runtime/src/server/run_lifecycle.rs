@@ -950,6 +950,7 @@ async fn persist_server_loop_hook_events(
     // tool name across all rounds.  state.messages does NOT carry assistant
     // tool_call objects in the server loop path.
     let tool_call_names: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    let selected_skills = state.telemetry.all_selected_skills.clone();
     let event_id = Uuid::now_v7().to_string();
 
     let decision_audit = Some(TurnDecisionAuditRecord {
@@ -973,25 +974,51 @@ async fn persist_server_loop_hook_events(
         context_capture_id: None,
     });
 
-    let skill_selection = tool_call_names
-        .first()
-        .map(|first_tool| TurnSkillSelectionRecord {
+    let skill_selection = if let Some(first_skill) = selected_skills.first() {
+        Some(TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
             agent_id: None,
             user_query: truncate_for_audit(user_message, 2000),
-            selected_skills: tool_call_names.clone(),
-            skill_name: first_tool.clone(),
+            selected_skills: selected_skills.clone(),
+            skill_name: first_skill.clone(),
             skill_version: None,
-            selection_method: "llm_tool_choice".to_string(),
+            selection_method: "llm_skill_choice".to_string(),
             execution_success: Some(1),
             execution_time_ms: None,
-        });
+        })
+    } else {
+        tool_call_names
+            .first()
+            .map(|first_tool| TurnSkillSelectionRecord {
+                event_id: Uuid::now_v7().to_string(),
+                session_id: session_id.to_string(),
+                user_id: user_id.to_string(),
+                agent_id: None,
+                user_query: truncate_for_audit(user_message, 2000),
+                selected_skills: tool_call_names.clone(),
+                skill_name: first_tool.clone(),
+                skill_version: None,
+                selection_method: "llm_tool_choice".to_string(),
+                execution_success: Some(1),
+                execution_time_ms: None,
+            })
+    };
+    let skill_selector_metric = crate::turn::skill_tool::build_turn_skill_selector_metric_record(
+        session_id,
+        user_id,
+        i64::from(crate::turn::agentic_loop_lifecycle::session_turn_number(
+            state,
+        )),
+        state.telemetry.initial_skill_selector_shortlist.as_ref(),
+        &selected_skills,
+    );
 
     let plan = TurnHookDbPersistPlan {
         decision_audit,
         skill_selection,
+        skill_selector_metric,
         implicit_feedback: None,
         reflection_mark: None,
         reflection_lesson: None,
@@ -3185,7 +3212,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DatabaseTurnHookDbWriter;
     use astra_services::session_journal::{JournalEventType, ToolCallRecord};
+    use astra_services::{ensure_core_schema, load_recent_skill_selector_metric_summary};
+    use astra_turn_core::skill_selector_metrics::{
+        SkillSelectorShortlistEntry, SkillSelectorShortlistTrace,
+    };
+    use sqlx::Row;
+    use uuid::Uuid;
 
     /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
     fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
@@ -3232,6 +3266,78 @@ mod tests {
         )
     }
 
+    fn runtime_db_it_settings(database: &str) -> MatrixOneSettings {
+        assert_eq!(
+            std::env::var("ASTRA_RUNTIME_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_RUNTIME_DB_IT=1 for ignored runtime DB e2e tests"
+        );
+        dotenvy::dotenv().ok();
+        MatrixOneSettings {
+            host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("MATRIXONE_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6001),
+            user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
+            password: std::env::var("MATRIXONE_PASSWORD")
+                .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string()),
+            database: database.to_string(),
+        }
+    }
+
+    async fn setup_runtime_db_pool(database: &str) -> (MatrixOneSettings, SharedPool) {
+        let settings = runtime_db_it_settings(database);
+        let mut bootstrap = settings.clone();
+        bootstrap.database =
+            std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        let admin_pool = connect_matrixone(&bootstrap)
+            .await
+            .expect("connect bootstrap catalog");
+        sqlx::query(&format!(
+            "CREATE DATABASE IF NOT EXISTS `{}`",
+            settings.database
+        ))
+        .execute(&admin_pool)
+        .await
+        .expect("create test database");
+        admin_pool.close().await;
+        ensure_core_schema(&settings)
+            .await
+            .expect("ensure_core_schema; is MatrixOne up?");
+        let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
+        (settings, pool)
+    }
+
+    async fn drop_runtime_db(settings: &MatrixOneSettings) {
+        let mut bootstrap = settings.clone();
+        bootstrap.database =
+            std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        let admin_pool = connect_matrixone(&bootstrap)
+            .await
+            .expect("connect bootstrap catalog for drop");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", settings.database))
+            .execute(&admin_pool)
+            .await
+            .expect("drop test database");
+        admin_pool.close().await;
+    }
+
+    async fn cleanup_runtime_selector_rows(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+        let _ = sqlx::query("DELETE FROM skill_selector_turn_metrics WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM skill_selection_events WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ?")
+            .bind(session_id)
+            .execute(pool)
+            .await;
+    }
+
     fn test_request(message: &str) -> ChatRequestData {
         ChatRequestData {
             message: message.to_string(),
@@ -3248,6 +3354,108 @@ mod tests {
             explain: false,
             interactive_client: false,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "ASTRA_RUNTIME_DB_IT=1 and live MatrixOne"]
+    async fn persist_server_loop_hook_events_e2e_persists_selector_metric() {
+        let database = format!("server_selector_e2e_{}", Uuid::new_v4().simple());
+        let (settings, shared_pool) = setup_runtime_db_pool(&database).await;
+        let pool = shared_pool.get().clone();
+        let session_id = format!("server-selector-session-{}", Uuid::new_v4());
+        let user_id = format!("server-selector-user-{}", Uuid::new_v4());
+        cleanup_runtime_selector_rows(&pool, &session_id).await;
+
+        let service = AgenticRunLifecycleService::new(
+            settings.clone(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        );
+        let request = test_request("deploy the service");
+        let mut state = service.build_initial_state(&request, &session_id, "run-1", None);
+        state.final_text = "deployment finished".to_string();
+        state.session_turn = 7;
+        state.telemetry.all_tools_used.insert("skill".to_string());
+        state.telemetry.all_selected_skills = vec!["deploy".to_string()];
+        state.telemetry.initial_skill_selector_shortlist = Some(SkillSelectorShortlistTrace {
+            open_catalog: true,
+            visible_skill_count: 2,
+            skills: vec![
+                SkillSelectorShortlistEntry {
+                    rank: 1,
+                    skill_name: "build".to_string(),
+                    aliases: Vec::new(),
+                    description: "build artifacts".to_string(),
+                    source: "test".to_string(),
+                    category: Some("ops".to_string()),
+                },
+                SkillSelectorShortlistEntry {
+                    rank: 2,
+                    skill_name: "deploy".to_string(),
+                    aliases: Vec::new(),
+                    description: "deploy the service".to_string(),
+                    source: "test".to_string(),
+                    category: Some("ops".to_string()),
+                },
+            ],
+        });
+
+        let writer = DatabaseTurnHookDbWriter::new(settings.clone()).with_pool(shared_pool.clone());
+        persist_server_loop_hook_events(
+            &writer,
+            &user_id,
+            &session_id,
+            &request.message,
+            &state,
+            Some("test-model"),
+        )
+        .await;
+
+        let row = sqlx::query(
+            "SELECT turn_number, visible_skill_count, chosen_skill_count, shortlisted_chosen_count, \
+                    best_chosen_rank, hit_at_1, hit_at_3 \
+             FROM skill_selector_turn_metrics WHERE session_id = ?",
+        )
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query server selector metric row");
+        assert_eq!(row.try_get::<i64, _>("turn_number").unwrap_or_default(), 7);
+        assert_eq!(
+            row.try_get::<i64, _>("visible_skill_count")
+                .unwrap_or_default(),
+            2
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("chosen_skill_count")
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            row.try_get::<i64, _>("shortlisted_chosen_count")
+                .unwrap_or_default(),
+            1
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("best_chosen_rank")
+                .ok()
+                .flatten(),
+            Some(2)
+        );
+        assert!(!row.try_get::<bool, _>("hit_at_1").unwrap_or(false));
+        assert!(row.try_get::<bool, _>("hit_at_3").unwrap_or(false));
+
+        let summary = load_recent_skill_selector_metric_summary(&pool, 1)
+            .await
+            .expect("load server selector summary");
+        assert_eq!(summary.sample_size, 1);
+        assert_eq!(summary.hit_at_1_rate, 0.0);
+        assert_eq!(summary.hit_at_3_rate, 1.0);
+        assert_eq!(summary.avg_best_chosen_rank, Some(2.0));
+
+        cleanup_runtime_selector_rows(&pool, &session_id).await;
+        shared_pool.close().await;
+        drop_runtime_db(&settings).await;
     }
 
     #[tokio::test]

@@ -334,6 +334,9 @@ pub struct TelemetryState {
     pub selector_tokens_out: u64,
     /// All skill names selected across all turns.
     pub all_selected_skills: Vec<String>,
+    /// Initial visible skill shortlist for the current outer turn.
+    pub initial_skill_selector_shortlist:
+        Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace>,
     /// Optional observability session for context tracing, drift detection, and auto-tuning.
     /// When set, hooks are called at turn start/end, tool selection, etc.
     pub observability_session: Option<

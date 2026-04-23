@@ -517,6 +517,30 @@ pub fn visible_skills_for_host_turn(
     (filtered, true)
 }
 
+pub fn build_skill_selector_shortlist_trace(
+    visible: &[SkillToolInfo],
+    open_catalog: bool,
+) -> astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
+    astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
+        open_catalog,
+        visible_skill_count: i32::try_from(visible.len()).unwrap_or(i32::MAX),
+        skills: visible
+            .iter()
+            .enumerate()
+            .map(|(idx, skill)| {
+                astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry {
+                    rank: i32::try_from(idx + 1).unwrap_or(i32::MAX),
+                    skill_name: skill.name.clone(),
+                    aliases: skill.aliases.clone(),
+                    description: format_skill_description(skill),
+                    source: format!("{:?}", skill.source).to_lowercase(),
+                    category: skill.category.clone(),
+                }
+            })
+            .collect(),
+    }
+}
+
 /// Lowercased canonical names and aliases — used to filter `discover_skills` results.
 pub fn skill_mask_names_lowercase(skills: &[SkillToolInfo]) -> HashSet<String> {
     let mut m = HashSet::new();
@@ -780,6 +804,87 @@ pub fn skill_listing_system_message(
     })
 }
 
+fn xml_tag_value<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag)? + start_tag.len();
+    let end = text[start..].find(&end_tag)? + start;
+    Some(text[start..end].trim())
+}
+
+fn parse_aliases_from_description(description: &str) -> (String, Vec<String>) {
+    const ALIAS_PREFIX: &str = " [aliases: ";
+    if let Some(alias_start) = description.rfind(ALIAS_PREFIX)
+        && description.ends_with(']')
+    {
+        let aliases = description[alias_start + ALIAS_PREFIX.len()..description.len() - 1]
+            .split(',')
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        return (description[..alias_start].to_string(), aliases);
+    }
+    (description.to_string(), Vec::new())
+}
+
+pub fn parse_skill_selector_shortlist_from_text(
+    content: &str,
+) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
+    let start = content.find("<available_skills>")?;
+    let end = content.find("</available_skills>")? + "</available_skills>".len();
+    let mut rest = &content[start..end];
+    let mut skills = Vec::new();
+
+    while let Some(skill_start) = rest.find("<skill>") {
+        let after_start = &rest[skill_start + "<skill>".len()..];
+        let Some(skill_end) = after_start.find("</skill>") else {
+            break;
+        };
+        let skill_block = &after_start[..skill_end];
+        let skill_name = xml_tag_value(skill_block, "name")?.to_string();
+        let description = xml_tag_value(skill_block, "description").unwrap_or_default();
+        let (description, aliases) = parse_aliases_from_description(description);
+        skills.push(
+            astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry {
+                rank: i32::try_from(skills.len() + 1).unwrap_or(i32::MAX),
+                skill_name,
+                aliases,
+                description,
+                source: "listing_message".to_string(),
+                category: xml_tag_value(skill_block, "category").map(ToString::to_string),
+            },
+        );
+        rest = &after_start[skill_end + "</skill>".len()..];
+    }
+
+    if skills.is_empty() {
+        return None;
+    }
+
+    Some(
+        astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
+            open_catalog: content.contains("discover_skills"),
+            visible_skill_count: i32::try_from(skills.len()).unwrap_or(i32::MAX),
+            skills,
+        },
+    )
+}
+
+pub fn parse_skill_selector_shortlist_from_messages(
+    messages: &[Value],
+) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
+    messages.iter().find_map(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("system") {
+            return None;
+        }
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .and_then(parse_skill_selector_shortlist_from_text)
+    })
+}
+
 /// Check if a tool call is a skill invocation.
 pub fn is_skill_call(tool_call: &Value) -> bool {
     tool_call
@@ -811,6 +916,43 @@ pub fn extract_skill_name(tool_call: &Value) -> Option<String> {
         .get("skill_name")
         .and_then(Value::as_str)
         .map(String::from)
+}
+
+pub fn selected_skill_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .filter(|tool_call| is_skill_call(tool_call))
+        .filter_map(extract_skill_name)
+        .collect()
+}
+
+pub fn build_turn_skill_selector_metric_record(
+    session_id: &str,
+    user_id: &str,
+    turn_number: i64,
+    shortlist: Option<&astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace>,
+    chosen_skills: &[String],
+) -> Option<crate::turn::contracts::TurnSkillSelectorMetricRecord> {
+    let shortlist = shortlist?;
+    let computed = astra_turn_core::skill_selector_metrics::compute_skill_selector_metric(
+        shortlist,
+        chosen_skills,
+    )?;
+    Some(crate::turn::contracts::TurnSkillSelectorMetricRecord {
+        event_id: uuid::Uuid::now_v7().to_string(),
+        session_id: session_id.to_string(),
+        user_id: user_id.to_string(),
+        turn_number,
+        visible_skill_count: computed.visible_skill_count,
+        chosen_skill_count: computed.chosen_skill_count,
+        shortlisted_chosen_count: computed.shortlisted_chosen_count,
+        missed_chosen_count: computed.missed_chosen_count,
+        best_chosen_rank: computed.best_chosen_rank,
+        hit_at_1: computed.hit_at_1,
+        hit_at_3: computed.hit_at_3,
+        hit_at_5: computed.hit_at_5,
+        hit_at_14: computed.hit_at_14,
+    })
 }
 
 /// Execute a skill tool call from the SSE edge handler.
@@ -5572,5 +5714,109 @@ Normal.
         let (manifest, _body) = crate::skills::loader::parse_skill_md(skill_md).unwrap();
         let comp = manifest.composition.unwrap();
         assert_eq!(comp.max_depth, None);
+    }
+
+    #[test]
+    fn selected_skill_names_from_tool_calls_extracts_skill_only_calls() {
+        let tool_calls = vec![
+            serde_json::json!({
+                "function": {
+                    "name": "skill",
+                    "arguments": "{\"skill_name\": \"alpha\"}"
+                }
+            }),
+            serde_json::json!({
+                "function": {
+                    "name": "bash",
+                    "arguments": "{}"
+                }
+            }),
+            serde_json::json!({
+                "function": {
+                    "name": "skill",
+                    "arguments": {"skill_name": "beta"}
+                }
+            }),
+        ];
+        assert_eq!(
+            selected_skill_names_from_tool_calls(&tool_calls),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_turn_skill_selector_metric_record_uses_initial_shortlist() {
+        let shortlist = build_skill_selector_shortlist_trace(
+            &[
+                SkillToolInfo {
+                    name: "alpha".into(),
+                    description: "first".into(),
+                    ..Default::default()
+                },
+                SkillToolInfo {
+                    name: "beta".into(),
+                    description: "second".into(),
+                    aliases: vec!["beta-alt".into()],
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+
+        let metric = build_turn_skill_selector_metric_record(
+            "sess-1",
+            "user-1",
+            7,
+            Some(&shortlist),
+            &[
+                "beta-alt".to_string(),
+                "outside".to_string(),
+                "beta".to_string(),
+            ],
+        )
+        .expect("metric should exist");
+
+        assert_eq!(metric.turn_number, 7);
+        assert_eq!(metric.visible_skill_count, 2);
+        assert_eq!(metric.chosen_skill_count, 2);
+        assert_eq!(metric.shortlisted_chosen_count, 1);
+        assert_eq!(metric.missed_chosen_count, 1);
+        assert_eq!(metric.best_chosen_rank, Some(2));
+        assert!(!metric.hit_at_1);
+        assert!(metric.hit_at_3);
+        assert!(metric.hit_at_5);
+        assert!(metric.hit_at_14);
+    }
+
+    #[test]
+    fn parse_skill_selector_shortlist_from_messages_recovers_listing_order_and_aliases() {
+        let listing = skill_listing_system_message(
+            &[
+                SkillToolInfo {
+                    name: "deploy".into(),
+                    description: "ship code".into(),
+                    aliases: vec!["ship-it".into()],
+                    category: Some("ops".into()),
+                    ..Default::default()
+                },
+                SkillToolInfo {
+                    name: "inspect".into(),
+                    description: "inspect system".into(),
+                    ..Default::default()
+                },
+            ],
+            None,
+            None,
+            true,
+        );
+        let shortlist = parse_skill_selector_shortlist_from_messages(&[listing])
+            .expect("shortlist should parse");
+
+        assert!(shortlist.open_catalog);
+        assert_eq!(shortlist.visible_skill_count, 2);
+        assert_eq!(shortlist.skills[0].skill_name, "deploy");
+        assert_eq!(shortlist.skills[0].aliases, vec!["ship-it"]);
+        assert_eq!(shortlist.skills[0].category.as_deref(), Some("ops"));
+        assert_eq!(shortlist.skills[1].rank, 2);
     }
 }

@@ -54,6 +54,7 @@ pub mod response_guard;
 pub mod routing;
 pub mod safety_middleware;
 pub mod skill_instructions_merge;
+pub mod skill_selector_metrics;
 pub mod snapshot;
 pub mod sse_blocks;
 pub mod sse_edge_stderr_lines;

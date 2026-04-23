@@ -796,6 +796,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_turn_trace_preserves_initial_skill_selector_shortlist() {
+        let mut state = make_state();
+        state.max_turns = 10;
+        state.remaining_turns = 9; // outer turn 1
+        state.current_session_id = Some("s1".to_string());
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(42_000);
+
+        let collector = crate::turn::turn_trace_collector::TurnTraceCollector::new(
+            "turn-0".to_string(),
+            "s1".to_string(),
+        );
+        collector.record_skill_selector(
+            astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
+                open_catalog: true,
+                visible_skill_count: 2,
+                skills: vec![
+                    astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry {
+                        rank: 1,
+                        skill_name: "build".to_string(),
+                        aliases: Vec::new(),
+                        description: "build artifacts".to_string(),
+                        source: "test".to_string(),
+                        category: Some("ops".to_string()),
+                    },
+                    astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry {
+                        rank: 2,
+                        skill_name: "deploy".to_string(),
+                        aliases: vec!["ship-it".to_string()],
+                        description: "deploy service".to_string(),
+                        source: "test".to_string(),
+                        category: Some("ops".to_string()),
+                    },
+                ],
+            },
+        );
+        state.telemetry.turn_trace_collector = Some(collector);
+
+        finalize_turn_trace(&mut state).await;
+
+        let (turn_num, trace_json) = state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .expect("pending_context_assembly_trace should be set");
+        assert_eq!(*turn_num, 1);
+        assert_eq!(trace_json["skill_selector"]["visible_skill_count"], 2);
+        assert_eq!(
+            trace_json["skill_selector"]["skills"][0]["skill_name"],
+            "build"
+        );
+        assert_eq!(
+            trace_json["skill_selector"]["skills"][1]["skill_name"],
+            "deploy"
+        );
+        assert_eq!(
+            trace_json["skill_selector"]["skills"][1]["aliases"][0],
+            "ship-it"
+        );
+    }
+
+    #[tokio::test]
     async fn finalize_turn_trace_preserves_first_pending_trace_within_outer_turn() {
         let mut state = make_state();
         state.max_turns = 40;

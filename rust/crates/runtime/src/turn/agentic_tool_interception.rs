@@ -340,6 +340,10 @@ async fn intercept_skill_calls(
     let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
 
     let (dedup_pairs, fresh_tool_calls) = dedup_skill_calls(state, tool_calls);
+    state
+        .telemetry
+        .all_selected_skills
+        .extend(crate::turn::skill_tool::selected_skill_names_from_tool_calls(&fresh_tool_calls));
     let mut short_circuit_meta: HashMap<String, SkillShortCircuitMeta> = HashMap::new();
     let mut dedup_results = Vec::with_capacity(dedup_pairs.len());
     for (res, meta) in dedup_pairs {

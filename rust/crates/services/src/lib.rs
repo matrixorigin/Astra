@@ -199,8 +199,9 @@ pub use state_sync::{
     SyncDirection, SyncResult, SyncStatus,
 };
 pub use storage::{
-    CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
-    ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
+    CleanupResult, RetentionPolicy, SkillSelectorMetricSummary, cleanup_expired_data,
+    database_user_from_row, ensure_core_schema, load_recent_skill_selector_metric_summary,
+    log_session_audit, resolve_active_skill_versions, session_record_from_row,
     update_turn_skill_selection_version,
 };
 pub use streaming::{StreamingService, UnconfiguredStreamingService};

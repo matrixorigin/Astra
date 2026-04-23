@@ -562,6 +562,7 @@ pub(crate) async fn stream_chat_sse(
             selector_tokens_in: 0,
             selector_tokens_out: 0,
             all_selected_skills: Vec::new(),
+            initial_skill_selector_shortlist: None,
             observability_session: p.observability_session.clone(),
             observability_hub: p.observability_hub.clone(),
             turn_trace_collector: None,

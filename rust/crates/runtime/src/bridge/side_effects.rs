@@ -89,6 +89,13 @@ fn build_hook_db_persist_from_payload(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let tool_calls = object_array_maps(hook_payload, "tool_calls");
+    let selected_skills = crate::turn::skill_tool::selected_skill_names_from_tool_calls(
+        &tool_calls
+            .iter()
+            .cloned()
+            .map(serde_json::Value::Object)
+            .collect::<Vec<_>>(),
+    );
     let user_content = first_user_content(&messages).unwrap_or_default();
     let tool_call_names = tool_calls
         .iter()
@@ -272,6 +279,10 @@ fn build_hook_db_persist_from_payload(
     let mutation_objective_score =
         crate::pipeline::learning::build_learning_outcome_from_payload(payload)
             .and_then(|outcome| serde_json::to_value(outcome.mutation_objective_score()).ok());
+    let turn_number = hook_payload
+        .get("turn_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
         session_id: session_id.clone(),
@@ -293,37 +304,67 @@ fn build_hook_db_persist_from_payload(
         context_capture_id: optional_object_str(hook_payload, "context_capture_id")
             .map(ToString::to_string),
     });
-    let skill_selection = tool_calls
-        .first()
-        .and_then(|tool_call| {
-            tool_call
-                .get("function")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|function| function.get("name"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(|first_tool_name| TurnSkillSelectionRecord {
+    let skill_selection = if let Some(first_skill_name) = selected_skills.first() {
+        Some(TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
-            session_id,
+            session_id: session_id.clone(),
             user_id: user_id.clone(),
             agent_id: optional_object_str(hook_payload, "agent_id").map(ToString::to_string),
             user_query: truncate_text(user_content, 2000),
-            selected_skills: tool_calls
-                .iter()
-                .filter_map(|tool_call| {
-                    tool_call
-                        .get("function")
-                        .and_then(serde_json::Value::as_object)
-                        .and_then(|function| function.get("name"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
-                })
-                .collect(),
-            skill_name: first_tool_name.to_string(),
+            selected_skills: selected_skills.clone(),
+            skill_name: first_skill_name.to_string(),
             skill_version: None,
-            selection_method: "llm_tool_choice".to_string(),
+            selection_method: "llm_skill_choice".to_string(),
             execution_success: None,
             execution_time_ms: None,
+        })
+    } else {
+        tool_calls
+            .first()
+            .and_then(|tool_call| {
+                tool_call
+                    .get("function")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(|first_tool_name| TurnSkillSelectionRecord {
+                event_id: Uuid::now_v7().to_string(),
+                session_id: session_id.clone(),
+                user_id: user_id.clone(),
+                agent_id: optional_object_str(hook_payload, "agent_id").map(ToString::to_string),
+                user_query: truncate_text(user_content, 2000),
+                selected_skills: tool_calls
+                    .iter()
+                    .filter_map(|tool_call| {
+                        tool_call
+                            .get("function")
+                            .and_then(serde_json::Value::as_object)
+                            .and_then(|function| function.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .collect(),
+                skill_name: first_tool_name.to_string(),
+                skill_version: None,
+                selection_method: "llm_tool_choice".to_string(),
+                execution_success: None,
+                execution_time_ms: None,
+            })
+    };
+    let derived_shortlist =
+        crate::turn::skill_tool::parse_skill_selector_shortlist_from_messages(&messages);
+    let skill_selector_metric = hook_payload
+        .get("skill_selector_metric")
+        .and_then(parse_turn_skill_selector_metric_record)
+        .or_else(|| {
+            crate::turn::skill_tool::build_turn_skill_selector_metric_record(
+                &session_id,
+                &user_id,
+                turn_number,
+                derived_shortlist.as_ref(),
+                &selected_skills,
+            )
         });
     let implicit_feedback = if !run_implicit_feedback {
         first_user_content(&messages).and_then(|user_content| {
@@ -356,6 +397,7 @@ fn build_hook_db_persist_from_payload(
         TurnHookDbPersistPlan {
             decision_audit,
             skill_selection,
+            skill_selector_metric,
             implicit_feedback,
             reflection_mark: None,
             reflection_lesson: None,
@@ -527,6 +569,12 @@ fn truncate_text(text: &str, limit: usize) -> String {
     } else {
         text[..limit].to_string()
     }
+}
+
+fn parse_turn_skill_selector_metric_record(
+    value: &serde_json::Value,
+) -> Option<TurnSkillSelectorMetricRecord> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 fn first_user_content(messages: &[serde_json::Value]) -> Option<&str> {
@@ -940,6 +988,107 @@ mod inprocess_hook_contract_tests {
         ))
     }
 
+    fn build_hook_payload_with_skill_metric() -> Value {
+        let messages = vec![json!({"role": "user", "content": "deploy the service"})];
+        let tool_results: Vec<Value> = vec![json!({
+            "tool_call_id": "call-skill-1",
+            "name": "skill",
+            "result": "Loaded deploy skill."
+        })];
+        let tool_calls = vec![json!({
+            "id": "call-skill-1",
+            "function": {"name": "skill", "arguments": "{\"skill_name\": \"deploy-beta\"}"}
+        })];
+        let mut payload = build_turn_hook_args(
+            "user-1",
+            "session-1",
+            &messages,
+            &tool_results,
+            "Using the deployment skill.",
+            &tool_calls,
+            None,
+            Some("gpt-4"),
+            Some("agent-1"),
+            Some("evt-query-skill"),
+            5,
+            None,
+            false,
+            true,
+            true,
+            true,
+        );
+        payload.insert(
+            "skill_selector_metric".to_string(),
+            json!({
+                "event_id": "metric-1",
+                "session_id": "session-1",
+                "user_id": "user-1",
+                "turn_number": 5,
+                "visible_skill_count": 4,
+                "chosen_skill_count": 1,
+                "shortlisted_chosen_count": 1,
+                "missed_chosen_count": 0,
+                "best_chosen_rank": 2,
+                "hit_at_1": false,
+                "hit_at_3": true,
+                "hit_at_5": true,
+                "hit_at_14": true
+            }),
+        );
+        Value::Object(payload)
+    }
+
+    fn build_hook_payload_with_derived_skill_metric() -> Value {
+        let messages = vec![
+            crate::turn::skill_tool::skill_listing_system_message(
+                &[
+                    crate::turn::skill_tool::SkillToolInfo {
+                        name: "inspect".into(),
+                        description: "inspect cluster".into(),
+                        ..Default::default()
+                    },
+                    crate::turn::skill_tool::SkillToolInfo {
+                        name: "deploy".into(),
+                        description: "deploy service".into(),
+                        aliases: vec!["ship-it".into()],
+                        ..Default::default()
+                    },
+                ],
+                None,
+                None,
+                true,
+            ),
+            json!({"role": "user", "content": "deploy the service"}),
+        ];
+        let tool_results: Vec<Value> = vec![json!({
+            "tool_call_id": "call-skill-2",
+            "name": "skill",
+            "result": "Loaded deploy skill."
+        })];
+        let tool_calls = vec![json!({
+            "id": "call-skill-2",
+            "function": {"name": "skill", "arguments": "{\"skill_name\": \"ship-it\"}"}
+        })];
+        Value::Object(build_turn_hook_args(
+            "user-1",
+            "session-1",
+            &messages,
+            &tool_results,
+            "Using the deployment skill.",
+            &tool_calls,
+            None,
+            Some("gpt-4"),
+            Some("agent-1"),
+            Some("evt-query-skill-derived"),
+            6,
+            None,
+            false,
+            true,
+            true,
+            true,
+        ))
+    }
+
     fn build_hook_payload_text_only() -> Value {
         let messages = vec![json!({"role": "user", "content": "what is Rust?"})];
         Value::Object(build_turn_hook_args(
@@ -1245,6 +1394,65 @@ mod inprocess_hook_contract_tests {
             plan.skill_selection.is_none(),
             "text-only turn should not produce skill_selection"
         );
+    }
+
+    #[tokio::test]
+    async fn hook_persists_skill_selector_metric_and_skill_names() {
+        let hook_writer = RecordingHookDbWriter::default();
+        run_bridge_hook_side_effects(
+            Some(build_hook_payload_with_skill_metric()),
+            Arc::new(hook_writer.clone()),
+            Arc::new(RecordingReflectionStateStore::default()),
+            Arc::new(RecordingReflectionLessonWriter::default()),
+            Arc::new(RecordingObserverWorker::default()),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        let plan = &plans[0];
+        let selection = plan
+            .skill_selection
+            .as_ref()
+            .expect("skill selection missing");
+        assert_eq!(selection.skill_name, "deploy-beta");
+        assert_eq!(selection.selected_skills, vec!["deploy-beta"]);
+        assert_eq!(selection.selection_method, "llm_skill_choice");
+
+        let metric = plan
+            .skill_selector_metric
+            .as_ref()
+            .expect("skill selector metric missing");
+        assert_eq!(metric.event_id, "metric-1");
+        assert_eq!(metric.turn_number, 5);
+        assert_eq!(metric.best_chosen_rank, Some(2));
+        assert!(metric.hit_at_3);
+    }
+
+    #[tokio::test]
+    async fn hook_derives_skill_selector_metric_from_skill_listing_message() {
+        let hook_writer = RecordingHookDbWriter::default();
+        run_bridge_hook_side_effects(
+            Some(build_hook_payload_with_derived_skill_metric()),
+            Arc::new(hook_writer.clone()),
+            Arc::new(RecordingReflectionStateStore::default()),
+            Arc::new(RecordingReflectionLessonWriter::default()),
+            Arc::new(RecordingObserverWorker::default()),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        let metric = plans[0]
+            .skill_selector_metric
+            .as_ref()
+            .expect("derived metric missing");
+        assert_eq!(metric.turn_number, 6);
+        assert_eq!(metric.visible_skill_count, 2);
+        assert_eq!(metric.best_chosen_rank, Some(2));
+        assert!(metric.hit_at_3);
     }
 
     #[tokio::test]

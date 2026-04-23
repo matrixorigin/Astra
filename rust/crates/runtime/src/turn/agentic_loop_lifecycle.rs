@@ -385,7 +385,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
     apply_adaptive_execution_profile(state);
 
-    if state.telemetry.observability_session.is_some()
+    if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
     {
         let capture = std::env::var("MO_CAPTURE_TRACES")
@@ -545,6 +545,16 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 &state.skills.invoked,
                 &state.skills.search,
             );
+            let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
+                &visible,
+                open_skill_name,
+            );
+            if state.telemetry.initial_skill_selector_shortlist.is_none() {
+                if let Some(ref collector) = state.telemetry.turn_trace_collector {
+                    collector.record_skill_selector(shortlist.clone());
+                }
+                state.telemetry.initial_skill_selector_shortlist = Some(shortlist);
+            }
             Some(crate::turn::skill_tool::skill_listing_system_message(
                 &visible,
                 Some(&state.skills.quality_tracker),

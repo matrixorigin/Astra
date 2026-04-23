@@ -2,11 +2,11 @@ pub use astra_services::storage::*;
 
 use std::time::Duration;
 
-use sqlx::{MySql, query};
+use sqlx::{MySql, Row, query};
 
 use crate::turn::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnImplicitFeedbackRecord,
-    TurnSkillSelectionRecord, TurnToolEventRecord,
+    TurnSkillSelectionRecord, TurnSkillSelectorMetricRecord, TurnToolEventRecord,
 };
 use crate::turn::hook_plans::SnapshotLinkPlan;
 
@@ -147,6 +147,61 @@ pub(crate) async fn insert_turn_skill_selection(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+pub(crate) async fn insert_turn_skill_selector_metric(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    record: &TurnSkillSelectorMetricRecord,
+) -> Result<(), sqlx::Error> {
+    query(
+        "INSERT INTO skill_selector_turn_metrics \
+         (event_id, session_id, user_id, turn_number, visible_skill_count, chosen_skill_count, \
+          shortlisted_chosen_count, missed_chosen_count, best_chosen_rank, hit_at_1, hit_at_3, \
+          hit_at_5, hit_at_14, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+    )
+    .bind(&record.event_id)
+    .bind(&record.session_id)
+    .bind(&record.user_id)
+    .bind(record.turn_number)
+    .bind(record.visible_skill_count)
+    .bind(record.chosen_skill_count)
+    .bind(record.shortlisted_chosen_count)
+    .bind(record.missed_chosen_count)
+    .bind(record.best_chosen_rank)
+    .bind(record.hit_at_1)
+    .bind(record.hit_at_3)
+    .bind(record.hit_at_5)
+    .bind(record.hit_at_14)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn trim_turn_skill_selector_metrics_window(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    window_size: i64,
+) -> Result<u64, sqlx::Error> {
+    let row = query("SELECT COUNT(*) AS total_rows FROM skill_selector_turn_metrics")
+        .fetch_one(&mut **tx)
+        .await?;
+    let total_rows = row.try_get::<i64, _>("total_rows").unwrap_or(0);
+    let overflow = astra_turn_core::skill_selector_metrics::skill_selector_window_overflow(
+        total_rows,
+        window_size,
+    );
+    if overflow == 0 {
+        return Ok(0);
+    }
+    let result = query(
+        "DELETE FROM skill_selector_turn_metrics \
+         ORDER BY created_at ASC, event_id ASC \
+         LIMIT ?",
+    )
+    .bind(overflow)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub(crate) async fn insert_turn_implicit_feedback(

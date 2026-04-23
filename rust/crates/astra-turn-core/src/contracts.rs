@@ -90,6 +90,23 @@ pub struct TurnSkillSelectionRecord {
     pub execution_time_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TurnSkillSelectorMetricRecord {
+    pub event_id: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub turn_number: i64,
+    pub visible_skill_count: i64,
+    pub chosen_skill_count: i64,
+    pub shortlisted_chosen_count: i64,
+    pub missed_chosen_count: i64,
+    pub best_chosen_rank: Option<i64>,
+    pub hit_at_1: bool,
+    pub hit_at_3: bool,
+    pub hit_at_5: bool,
+    pub hit_at_14: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnImplicitFeedbackRecord {
     pub feedback_id: String,
@@ -134,6 +151,7 @@ pub struct TurnReflectionLessonRequest {
 pub struct TurnHookDbPersistPlan {
     pub decision_audit: Option<TurnDecisionAuditRecord>,
     pub skill_selection: Option<TurnSkillSelectionRecord>,
+    pub skill_selector_metric: Option<TurnSkillSelectorMetricRecord>,
     pub implicit_feedback: Option<TurnImplicitFeedbackRecord>,
     pub reflection_mark: Option<TurnReflectionMark>,
     pub reflection_lesson: Option<TurnReflectionLessonRecord>,

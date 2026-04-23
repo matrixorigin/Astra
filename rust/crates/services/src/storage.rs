@@ -527,6 +527,29 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS skill_selector_turn_metrics (
+            event_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NULL,
+            turn_number BIGINT NOT NULL,
+            visible_skill_count BIGINT NOT NULL,
+            chosen_skill_count BIGINT NOT NULL,
+            shortlisted_chosen_count BIGINT NOT NULL,
+            missed_chosen_count BIGINT NOT NULL,
+            best_chosen_rank BIGINT NULL,
+            hit_at_1 BOOLEAN NOT NULL DEFAULT FALSE,
+            hit_at_3 BOOLEAN NOT NULL DEFAULT FALSE,
+            hit_at_5 BOOLEAN NOT NULL DEFAULT FALSE,
+            hit_at_14 BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_skill_selector_metrics_created (created_at),
+            INDEX idx_skill_selector_metrics_session_turn (session_id, turn_number)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS eval_llm_feedback (
             feedback_id VARCHAR(64) PRIMARY KEY,
             prompt_template_id VARCHAR(255) NULL,
@@ -1460,6 +1483,91 @@ pub async fn resolve_active_skill_versions(
         }
     }
     Ok(versions)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillSelectorMetricSummary {
+    pub sample_size: i64,
+    pub hit_at_1_rate: f64,
+    pub hit_at_3_rate: f64,
+    pub hit_at_5_rate: f64,
+    pub hit_at_14_rate: f64,
+    pub shortlist_recall_rate: f64,
+    pub avg_best_chosen_rank: Option<f64>,
+}
+
+fn row_f64_or_zero(row: &sqlx::mysql::MySqlRow, column: &str) -> f64 {
+    row.try_get::<f64, _>(column)
+        .or_else(|_| {
+            row.try_get::<String, _>(column)
+                .map(|value| value.parse::<f64>().unwrap_or(0.0))
+        })
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(column).map(|value| {
+                std::str::from_utf8(&value)
+                    .ok()
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            })
+        })
+        .unwrap_or(0.0)
+}
+
+fn row_optional_f64(row: &sqlx::mysql::MySqlRow, column: &str) -> Option<f64> {
+    row.try_get::<Option<f64>, _>(column)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            row.try_get::<Option<String>, _>(column)
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .or_else(|| {
+            row.try_get::<Option<Vec<u8>>, _>(column)
+                .ok()
+                .flatten()
+                .and_then(|value| std::str::from_utf8(&value).ok().map(str::to_string))
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+}
+
+pub async fn load_recent_skill_selector_metric_summary(
+    pool: &sqlx::Pool<MySql>,
+    limit: i64,
+) -> Result<SkillSelectorMetricSummary, sqlx::Error> {
+    let limit = limit.max(1);
+    let row = query(
+        "SELECT COUNT(*) AS sample_size,
+                CAST(AVG(CASE WHEN hit_at_1 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_1_rate,
+                CAST(AVG(CASE WHEN hit_at_3 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_3_rate,
+                CAST(AVG(CASE WHEN hit_at_5 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_5_rate,
+                CAST(AVG(CASE WHEN hit_at_14 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_14_rate,
+                CAST(AVG(CASE
+                        WHEN chosen_skill_count > 0
+                        THEN (1.0 * shortlisted_chosen_count) / chosen_skill_count
+                    END) AS CHAR) AS shortlist_recall_rate,
+                CAST(AVG(best_chosen_rank) AS CHAR) AS avg_best_chosen_rank
+         FROM (
+             SELECT *
+             FROM skill_selector_turn_metrics
+             ORDER BY created_at DESC, event_id DESC
+             LIMIT ?
+         ) recent",
+    )
+    .bind(limit)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(SkillSelectorMetricSummary {
+        sample_size: row.try_get("sample_size").unwrap_or(0),
+        hit_at_1_rate: row_f64_or_zero(&row, "hit_at_1_rate"),
+        hit_at_3_rate: row_f64_or_zero(&row, "hit_at_3_rate"),
+        hit_at_5_rate: row_f64_or_zero(&row, "hit_at_5_rate"),
+        hit_at_14_rate: row_f64_or_zero(&row, "hit_at_14_rate"),
+        shortlist_recall_rate: row_f64_or_zero(&row, "shortlist_recall_rate"),
+        avg_best_chosen_rank: row_optional_f64(&row, "avg_best_chosen_rank"),
+    })
 }
 
 // ─── Expired Data Cleanup ────────────────────────────────────────────────────

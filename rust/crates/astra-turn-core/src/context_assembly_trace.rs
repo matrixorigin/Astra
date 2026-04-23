@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+use crate::skill_selector_metrics::SkillSelectorShortlistTrace;
+
 // ─── Top-Level Trace ─────────────────────────────────────────────────────────
 
 /// Complete trace of context assembly for one turn.
@@ -37,6 +39,10 @@ pub struct ContextAssemblyTrace {
 
     /// Tool selection trace.
     pub tools: ToolSelectionTrace,
+
+    /// Initial visible skill shortlist for this outer turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_selector: Option<SkillSelectorShortlistTrace>,
 
     /// Final token budget and allocation.
     pub token_budget: TokenBudgetTrace,
@@ -70,6 +76,7 @@ impl Default for ContextAssemblyTrace {
             history: HistorySelectionTrace::default(),
             memory: MemoryRetrievalTrace::default(),
             tools: ToolSelectionTrace::default(),
+            skill_selector: None,
             token_budget: TokenBudgetTrace::default(),
             explanations: Vec::new(),
         }
@@ -415,6 +422,11 @@ impl ContextAssemblyTraceBuilder {
 
     pub fn with_tools(mut self, tools: ToolSelectionTrace) -> Self {
         self.trace.tools = tools;
+        self
+    }
+
+    pub fn with_skill_selector(mut self, skill_selector: SkillSelectorShortlistTrace) -> Self {
+        self.trace.skill_selector = Some(skill_selector);
         self
     }
 
