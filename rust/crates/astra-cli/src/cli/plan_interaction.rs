@@ -845,6 +845,91 @@ fn abort_plan_mode_after_failure(state: &mut ReplState, stage: &'static str, rea
     let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
 }
 
+/// P2: Single-stage analytical-plan generation.
+///
+/// Runs one LLM call against `astra_plan::analytical::analytical_prompt`,
+/// renders the resulting `ResearchPlan`, and tears down plan_mode. Unlike
+/// the executable flow there is no outline/confirm/expand loop and no
+/// executor invocation — the deliverable is the rendered plan itself.
+async fn handle_analytical_goal(
+    goal: String,
+    tok: &str,
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+) -> Result<PlanInputResult, String> {
+    let context = state
+        .plan_mode
+        .as_ref()
+        .map(|ps| ps.context.clone())
+        .unwrap_or_default();
+
+    let prompt = astra_runtime::plan::analytical::analytical_prompt(&goal, &context);
+    let payload = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "session_id": state.session_id.clone(),
+    });
+
+    eprintln!();
+    eprintln!("  {} Analyzing question…", "⋯".dim());
+
+    let result = plan_llm_call(api, tok, &payload).await;
+    maybe_init_session_from_plan(state, &result);
+    let text = match result {
+        PlanLlmOutcome::Ok { text, .. } => text,
+        PlanLlmOutcome::Cancelled => {
+            eprintln!("  {} Analytical plan cancelled.", theme::icon_warn());
+            abort_plan_mode_after_failure(state, "analytical", "cancelled");
+            return Ok(PlanInputResult::Handled);
+        }
+        PlanLlmOutcome::Error(e) => {
+            eprintln!("  {} {}", theme::icon_err(), e.clone().red());
+            abort_plan_mode_after_failure(state, "analytical", &e);
+            return Ok(PlanInputResult::Handled);
+        }
+    };
+
+    match astra_runtime::plan::analytical::parse_analytical_response(&text) {
+        Ok(plan) => {
+            eprintln!();
+            eprintln!(
+                "{}",
+                astra_runtime::plan::analytical::format_research_plan(&plan)
+            );
+            journal_plan_event(
+                &mut state.journal,
+                session_journal::JournalEventType::PlanLifecycle,
+                &format!(
+                    "Analytical plan delivered ({} questions)",
+                    plan.questions.len()
+                ),
+                Some(serde_json::json!({
+                    "stage": "analytical_delivered",
+                    "kind": "analytical",
+                    "question_count": plan.questions.len(),
+                    "outcome": "ok",
+                })),
+            );
+            // Analytical is one-shot: drop plan_mode so the user falls
+            // back into normal chat to discuss any of the sub-questions.
+            state.plan_mode = None;
+            state.chat_plan_only = false;
+            state.pending_plan_resume_digest = None;
+            let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+            let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
+            Ok(PlanInputResult::Handled)
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to parse analytical plan: {}",
+                theme::icon_err(),
+                e.clone().red()
+            );
+            abort_plan_mode_after_failure(state, "analytical", &e);
+            Ok(PlanInputResult::Handled)
+        }
+    }
+}
+
 pub(super) fn journal_goal_steering_event(
     journal: &mut Option<session_journal::JournalWriter>,
     turn: u32,
@@ -2084,6 +2169,18 @@ async fn handle_goal_submission(
         state.verbose_mode,
     )
     .await;
+
+    // P2: If the goal classifies as an analytical / evaluative question,
+    // route it through the single-stage research-plan generator instead of
+    // the outline → subtasks → executor pipeline. The research plan is a
+    // one-shot deliverable; we tear down plan_mode after rendering so the
+    // user falls back into normal chat to continue the discussion.
+    if matches!(
+        astra_runtime::plan_decompose::classify_plan_suggestion(&goal).map(|s| s.kind),
+        Some(astra_runtime::plan_decompose::PlanKind::Analytical)
+    ) {
+        return handle_analytical_goal(goal, tok, state, api).await;
+    }
 
     // ── Stage 1: Generate outline ───────────────────────────────────────
     eprintln!();
