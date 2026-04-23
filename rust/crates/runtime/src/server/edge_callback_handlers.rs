@@ -31,10 +31,11 @@ fn edge_id_from_headers(headers: &HeaderMap) -> String {
 pub(crate) enum LedgerInsertError {
     /// Ledger is at capacity and this key is new.
     CapacityExceeded,
-    /// Key already present — refuses to overwrite to preserve the
-    /// at-most-once contract for `/tools/result` and `/approval/respond`
-    /// callbacks (a duplicate POST for the same `request_id` must not
-    /// silently replace the first, already-delivered value).
+    /// Key already present with a DIFFERENT value — refuses to overwrite
+    /// to preserve the at-most-once contract for `/tools/result` and
+    /// `/approval/respond` callbacks. Duplicate POSTs with *identical*
+    /// payload are treated as idempotent replays (Ok(false)); only a
+    /// payload divergence surfaces as a conflict.
     DuplicateKey,
 }
 
@@ -62,12 +63,27 @@ fn ledger_insert_error_response(
     }
 }
 
+/// Insert a tool-callback ledger entry preserving HTTP idempotency.
+///
+/// Contract:
+/// * Key absent + capacity OK → insert, return `Ok(true)`.
+/// * Key present AND incoming value equals the stored value → no-op,
+///   return `Ok(false)`. This is the edge-agent retry path: duplicate
+///   POST /tools/result with identical payload must return 200 without
+///   corrupting state (canonical HTTP idempotency).
+/// * Key present AND incoming value differs from the stored value →
+///   `Err(DuplicateKey)` (HTTP 409 conflict). Protects the at-most-once
+///   contract against two writers competing for the same `request_id`.
+/// * Key absent AND ledger full → `Err(CapacityExceeded)` (HTTP 503).
 pub(crate) fn insert_ledger_entry(
     ledger: &mut std::collections::HashMap<String, serde_json::Value>,
     key: String,
     value: serde_json::Value,
 ) -> Result<bool, LedgerInsertError> {
-    if ledger.contains_key(&key) {
+    if let Some(existing) = ledger.get(&key) {
+        if existing == &value {
+            return Ok(false);
+        }
         return Err(LedgerInsertError::DuplicateKey);
     }
     if ledger.len() >= LEDGER_MAX_ENTRIES {
@@ -77,13 +93,21 @@ pub(crate) fn insert_ledger_entry(
     Ok(true)
 }
 
+/// Insert an approval-callback ledger entry. Same idempotency contract
+/// as [`insert_ledger_entry`], plus: when the ledger is full AND
+/// `durable_fallback_ready` is true (session journal persisted the
+/// decision), return `Ok(false)` so the handler still responds 200 —
+/// the durable store is the source of truth for the approval decision.
 pub(crate) fn insert_approval_ledger_entry(
     ledger: &mut std::collections::HashMap<String, serde_json::Value>,
     key: String,
     value: serde_json::Value,
     durable_fallback_ready: bool,
 ) -> Result<bool, LedgerInsertError> {
-    if ledger.contains_key(&key) {
+    if let Some(existing) = ledger.get(&key) {
+        if existing == &value {
+            return Ok(false);
+        }
         return Err(LedgerInsertError::DuplicateKey);
     }
     if ledger.len() >= LEDGER_MAX_ENTRIES {
@@ -311,34 +335,61 @@ mod edge_callback_insert_tests {
     use std::collections::HashMap;
 
     #[test]
-    fn duplicate_tool_insert_is_rejected_not_overwritten() {
+    fn duplicate_tool_insert_different_payload_is_conflict() {
         let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
         let key = "u1:tool:r1".to_string();
         let first = json!({"body": {"output": "REAL"}});
         let second = json!({"body": {"output": "REPLAY"}});
 
-        assert!(insert_ledger_entry(&mut ledger, key.clone(), first.clone()).is_ok());
+        assert_eq!(
+            insert_ledger_entry(&mut ledger, key.clone(), first.clone()),
+            Ok(true)
+        );
 
-        let err = insert_ledger_entry(&mut ledger, key.clone(), second.clone())
-            .expect_err("duplicate key must be rejected");
+        let err = insert_ledger_entry(&mut ledger, key.clone(), second)
+            .expect_err("different payload for same key must conflict");
         assert_eq!(err, LedgerInsertError::DuplicateKey);
 
         let stored = ledger.get(&key).expect("first insert still present");
         assert_eq!(stored, &first, "original value must not be overwritten");
     }
 
+    /// HTTP idempotency: duplicate POST with *identical* payload must
+    /// succeed (Ok(false)) so edge-agent retries don't hit 409 and the
+    /// handler returns 200. Distinct from the different-payload case
+    /// above which is a true conflict.
     #[test]
-    fn duplicate_approval_insert_is_rejected_not_overwritten() {
+    fn duplicate_tool_insert_identical_payload_is_idempotent_replay() {
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        let key = "u1:tool:r1".to_string();
+        let value = json!({"body": {"output": "REAL"}});
+
+        assert_eq!(
+            insert_ledger_entry(&mut ledger, key.clone(), value.clone()),
+            Ok(true)
+        );
+        assert_eq!(
+            insert_ledger_entry(&mut ledger, key.clone(), value.clone()),
+            Ok(false),
+            "identical-payload replay must be a no-op idempotent success"
+        );
+        assert_eq!(ledger.get(&key), Some(&value));
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_approval_insert_different_payload_is_conflict() {
         let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
         let key = "u1:approval:a1".to_string();
         let first = json!({"body": {"decision": "allow"}});
         let second = json!({"body": {"decision": "deny"}});
 
-        assert!(
-            insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), false).is_ok()
+        assert_eq!(
+            insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), false),
+            Ok(true)
         );
-        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second.clone(), false)
-            .expect_err("duplicate approval must be rejected");
+        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second, false)
+            .expect_err("different approval decision for same key must conflict");
         assert_eq!(err, LedgerInsertError::DuplicateKey);
 
         let stored = ledger.get(&key).expect("first approval still present");
@@ -346,17 +397,36 @@ mod edge_callback_insert_tests {
     }
 
     #[test]
+    fn duplicate_approval_insert_identical_payload_is_idempotent_replay() {
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        let key = "u1:approval:a1".to_string();
+        let value = json!({"body": {"decision": "allow"}});
+
+        assert_eq!(
+            insert_approval_ledger_entry(&mut ledger, key.clone(), value.clone(), false),
+            Ok(true)
+        );
+        assert_eq!(
+            insert_approval_ledger_entry(&mut ledger, key.clone(), value.clone(), false),
+            Ok(false),
+            "identical approval payload replay must be idempotent"
+        );
+    }
+
+    #[test]
     fn duplicate_approval_insert_rejected_even_with_durable_fallback_ready() {
-        // Durable fallback only relaxes the capacity path; duplicates must
-        // still be rejected so replayed callbacks never overwrite.
+        // Durable fallback only relaxes the capacity path; a true conflict
+        // (different payload for same key) must still be rejected so
+        // replayed callbacks never overwrite.
         let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
         let key = "u1:approval:a1".to_string();
         let first = json!({"body": {"decision": "allow"}});
         let second = json!({"body": {"decision": "deny"}});
 
         insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), true).unwrap();
-        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second, true)
-            .expect_err("duplicate must still be rejected under durable fallback");
+        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second, true).expect_err(
+            "differing-payload duplicate must still be rejected under durable fallback",
+        );
         assert_eq!(err, LedgerInsertError::DuplicateKey);
         assert_eq!(ledger.get(&key), Some(&first));
     }
