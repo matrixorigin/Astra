@@ -1,4 +1,8 @@
-//! Background plan execution wiring.
+//! Plan execution wiring: spawns a background executor task, then runs the
+//! in-process plan monitor in the current task until the run pauses, completes, or
+//! the user cancels. Progress is shown live; between-monitor idle time (if the REPL
+//! is reached again) may still use [`crate::plan_monitor::flush_plan_updates_between_prompts`]
+//! when applicable.
 
 use crate::durable_bridge;
 use crate::plan_executor;
@@ -101,12 +105,15 @@ fn create_background_selector(
     create_background_plan_selector(ctx)
 }
 
-/// Spawn a plan executor and return immediately to the normal REPL prompt.
+/// Spawns a background plan executor, then **blocks the caller** in
+/// [`crate::plan_monitor::run_blocking_plan_monitor`] until the run pauses, finishes,
+/// or the user hits Ctrl+C (per monitor behavior).
 ///
-/// The executor runs as a `tokio` task. Progress is rendered between prompts
-/// by [`crate::plan_monitor::flush_plan_updates_between_prompts`], while the
-/// in-memory `executing_plan` copy keeps `/plan status` useful from normal
-/// chat after plan mode exits.
+/// The heavy work still runs in the executor’s `tokio` task. This function only
+/// returns after the blocking monitor loop exits, so the normal REPL prompt is not
+/// interleaved with that plan run. The in-memory `executing_plan` copy and
+/// `plan_handle` keep [`crate::plan_monitor::flush_plan_updates_between_prompts`] and
+/// `/plan status` useful when the user is at the prompt again.
 pub(crate) async fn start_and_monitor_plan(
     state: &mut ReplState,
     current_token: Option<&str>,
@@ -130,8 +137,12 @@ pub(crate) async fn start_and_monitor_plan(
     eprintln!(
         "  {} {}",
         "▸".bold().cyan(),
-        "Plan executing in background — use /plan status to inspect progress.".bold()
+        "Plan executing — Ctrl+C to pause.".bold()
     );
+
+    // Run the blocking monitor so the user sees live progress.
+    // The monitor handles Ctrl+C (pause/cancel) and approval prompts inline.
+    super::plan_monitor::run_blocking_plan_monitor(state).await;
 
     Ok(())
 }

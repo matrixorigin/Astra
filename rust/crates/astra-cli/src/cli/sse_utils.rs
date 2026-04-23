@@ -138,6 +138,11 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
                                 {
                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                     trace_sse_server_error_event(msg);
+                                    if result.stream_error.is_none()
+                                        && astra_runtime::turn::chat_turn_heuristics::is_session_not_found_error(msg)
+                                    {
+                                        result.stream_error = Some(msg.to_string());
+                                    }
                                 }
                             }
                             _ => {}
@@ -259,6 +264,11 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
                                 {
                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                     trace_sse_server_error_event(msg);
+                                    if result.stream_error.is_none()
+                                        && astra_runtime::turn::chat_turn_heuristics::is_session_not_found_error(msg)
+                                    {
+                                        result.stream_error = Some(msg.to_string());
+                                    }
                                 }
                             }
                             _ => {}
@@ -383,6 +393,11 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
                                 {
                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                     trace_sse_server_error_event(msg);
+                                    if result.stream_error.is_none()
+                                        && astra_runtime::turn::chat_turn_heuristics::is_session_not_found_error(msg)
+                                    {
+                                        result.stream_error = Some(msg.to_string());
+                                    }
                                 }
                             }
                             _ => {}
@@ -539,6 +554,11 @@ pub async fn collect_sse_cancellable(
                                                 {
                                                     eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                                     trace_sse_server_error_event(msg);
+                                                    if result.stream_error.is_none()
+                                                        && astra_runtime::turn::chat_turn_heuristics::is_session_not_found_error(msg)
+                                                    {
+                                                        result.stream_error = Some(msg.to_string());
+                                                    }
                                                 }
                                             }
                                             _ => {}
@@ -867,5 +887,26 @@ mod tests {
         assert!(!r.is_cancelled());
         r.cancelled = true;
         assert!(r.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn collect_sse_session_not_found_promotes_to_stream_error() {
+        let body = "data: {\"type\":\"error\",\"message\":\"Session not found\"}\n\n";
+        let r = collect_sse_text(sse_response(body), false).await;
+        assert!(
+            r.completion_error().is_some(),
+            "Session not found should be promoted to stream_error"
+        );
+        assert!(r.completion_error().unwrap().contains("Session not found"),);
+    }
+
+    #[tokio::test]
+    async fn collect_sse_generic_error_does_not_promote_to_stream_error() {
+        let body = "data: {\"type\":\"error\",\"message\":\"rate limit exceeded\"}\n\n";
+        let r = collect_sse_text(sse_response(body), false).await;
+        assert!(
+            r.completion_error().is_none(),
+            "generic errors should not be promoted to stream_error"
+        );
     }
 }

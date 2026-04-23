@@ -502,6 +502,7 @@ async fn run_chat_repl(
                         || maybe_restore_pending_plan_mode(&line, &mut state)
                     {
                         // Plan mode: handle input as plan editing
+                        let mut plan_monitor_started = false;
                         match handle_plan_mode_input(
                             line.clone(),
                             current_token.as_deref(),
@@ -540,6 +541,7 @@ async fn run_chat_repl(
                                         profile,
                                     )
                                     .await?;
+                                    plan_monitor_started = true;
                                 }
                             }
                             Ok(plan_interaction::PlanInputResult::SendAsChat(msg)) => {
@@ -561,8 +563,9 @@ async fn run_chat_repl(
                             }
                         }
 
-                        // If plan execution was just triggered, start the background executor.
-                        if state.executing_plan.is_some() {
+                        // If plan execution was just triggered, start the blocking monitor (once
+                        // per readline event — DispatchSlash may have already run it).
+                        if state.executing_plan.is_some() && !plan_monitor_started {
                             start_and_monitor_plan(
                                 &mut state,
                                 current_token.as_deref(),

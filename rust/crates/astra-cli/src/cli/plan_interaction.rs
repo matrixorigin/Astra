@@ -37,7 +37,9 @@ fn maybe_init_session_from_plan(state: &mut ReplState, outcome: &PlanLlmOutcome)
         ..
     } = outcome
     {
-        if state.session_id.is_none() {
+        // Always adopt the server-created session_id. The local session_id
+        // (generated at plan entry for journal) may differ from the server's.
+        if state.session_id.as_deref() != Some(sid.as_str()) {
             super::repl_turn::initialize_journal_pub(state, sid);
             state.session_id = Some(sid.clone());
         }
@@ -114,14 +116,13 @@ async fn plan_generate_with_retry(
     token: &str,
     goal: &str,
     context: &plan::ProjectContext,
-    session_id: Option<&str>,
+    _session_id: Option<&str>,
 ) -> PlanLlmOutcome {
     use astra_runtime::plan::decomposition_prompt;
 
     let prompt = decomposition_prompt(goal, context);
     let payload = serde_json::json!({
         "messages": [{"role": "user", "content": prompt}],
-        "session_id": session_id,
     });
 
     let result = plan_llm_call(api, token, &payload).await;
@@ -157,7 +158,6 @@ async fn plan_generate_with_retry(
             {"role": "assistant", "content": text},
             {"role": "user", "content": retry_prompt},
         ],
-        "session_id": session_id,
     });
 
     plan_llm_call(api, token, &retry_payload).await
@@ -866,7 +866,6 @@ async fn handle_analytical_goal(
     let prompt = astra_runtime::plan::analytical::analytical_prompt(&goal, &context);
     let payload = serde_json::json!({
         "messages": [{"role": "user", "content": prompt}],
-        "session_id": state.session_id.clone(),
     });
 
     eprintln!();
@@ -1081,7 +1080,6 @@ pub async fn handle_plan_mode_input(
         let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
         let payload = serde_json::json!({
             "messages": [{"role": "user", "content": prompt}],
-            "session_id": state.session_id.clone(),
         });
 
         eprintln!();
@@ -2211,7 +2209,6 @@ async fn handle_goal_submission(
     let outline_prompt = outline::outline_prompt(&goal, &plan_state.context);
     let outline_payload = serde_json::json!({
         "messages": [{"role": "user", "content": outline_prompt}],
-        "session_id": state.session_id.clone(),
     });
 
     let outline_result = plan_llm_call(api, tok, &outline_payload).await;
@@ -2542,7 +2539,6 @@ async fn expand_outline_to_plan(
             outline::phase_detail_prompt(goal, ol, phase, &completed_phases, &plan_ctx);
         let payload = serde_json::json!({
             "messages": [{"role": "user", "content": detail_prompt}],
-            "session_id": state.session_id.clone(),
         });
 
         let expand_result = plan_llm_call(api, tok, &payload).await;
@@ -2604,7 +2600,6 @@ async fn expand_outline_to_plan(
                         {"role": "assistant", "content": text},
                         {"role": "user", "content": retry_prompt},
                     ],
-                    "session_id": state.session_id.clone(),
                 });
                 let retry_result = plan_llm_call(api, tok, &retry_payload).await;
                 maybe_init_session_from_plan(state, &retry_result);
@@ -3264,5 +3259,58 @@ mod tests {
         } else {
             panic!("expected Ready");
         }
+    }
+
+    // ── Plan session_id fixes ────────────────────────────────────────────
+
+    #[test]
+    fn maybe_init_session_from_plan_adopts_server_session_even_when_local_exists() {
+        let mut state = ReplState::default();
+        // Simulate local session_id generated at plan entry
+        state.session_id = Some("local-uuid-1234".to_string());
+
+        let outcome = PlanLlmOutcome::Ok {
+            text: "plan text".to_string(),
+            session_id: Some("server-session-5678".to_string()),
+        };
+        maybe_init_session_from_plan(&mut state, &outcome);
+
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("server-session-5678"),
+            "should adopt server session_id even when local one exists"
+        );
+    }
+
+    #[test]
+    fn maybe_init_session_from_plan_noop_when_already_matching() {
+        let mut state = ReplState::default();
+        state.session_id = Some("same-id".to_string());
+
+        let outcome = PlanLlmOutcome::Ok {
+            text: "text".to_string(),
+            session_id: Some("same-id".to_string()),
+        };
+        maybe_init_session_from_plan(&mut state, &outcome);
+
+        assert_eq!(state.session_id.as_deref(), Some("same-id"));
+    }
+
+    #[test]
+    fn maybe_init_session_from_plan_noop_on_no_server_session() {
+        let mut state = ReplState::default();
+        state.session_id = Some("local-id".to_string());
+
+        let outcome = PlanLlmOutcome::Ok {
+            text: "text".to_string(),
+            session_id: None,
+        };
+        maybe_init_session_from_plan(&mut state, &outcome);
+
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("local-id"),
+            "should keep local id when server returns no session"
+        );
     }
 }

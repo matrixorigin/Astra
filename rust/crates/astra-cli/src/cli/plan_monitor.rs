@@ -100,17 +100,21 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
 }
 
 /// Emit a structured plan-lifecycle journal event with common counters.
+///
+/// Takes individual field refs instead of `&ReplState` so callers inside
+/// `while let Some(update) = handle.try_recv()` (which holds a mutable
+/// borrow on `state.plan_handle`) can still call this without conflicting.
 fn emit_plan_lifecycle_event(
-    state: &ReplState,
+    journal: Option<&astra_services::session_journal::JournalWriter>,
+    session_id: Option<&str>,
+    executing_plan: Option<&astra_services::task_orchestrator::TaskPlan>,
     description: &str,
     stage: &str,
     mut extra: serde_json::Map<String, serde_json::Value>,
 ) {
-    if let Some(ref journal) = state.journal {
-        let (items_done, items_total) = state
-            .executing_plan
-            .as_ref()
-            .map_or((0, 0), |p| (p.items_done(), p.subtasks.len() as u32));
+    if let Some(journal) = journal {
+        let (items_done, items_total) =
+            executing_plan.map_or((0, 0), |p| (p.items_done(), p.subtasks.len() as u32));
         extra.insert(
             "stage".to_string(),
             serde_json::Value::String(stage.to_string()),
@@ -118,7 +122,7 @@ fn emit_plan_lifecycle_event(
         extra.insert("items_done".to_string(), serde_json::json!(items_done));
         extra.insert("items_total".to_string(), serde_json::json!(items_total));
         let event = astra_services::session_journal::JournalEvent::plan_lifecycle(
-            state.session_id.as_deref(),
+            session_id,
             description,
             Some(serde_json::Value::Object(extra)),
         );
@@ -354,7 +358,14 @@ fn display_plan_updates_live(
                     serde_json::json!(elapsed.as_millis() as u64),
                 );
                 extra.insert("pct".to_string(), serde_json::json!(pct));
-                emit_plan_lifecycle_event(state, "Plan execution completed", "completed", extra);
+                emit_plan_lifecycle_event(
+                    state.journal.as_ref(),
+                    state.session_id.as_deref(),
+                    state.executing_plan.as_ref(),
+                    "Plan execution completed",
+                    "completed",
+                    extra,
+                );
                 let msg = format!(
                     "\n🏁  Plan complete — {pct}% verified in {}",
                     format_duration_short(elapsed),
@@ -398,7 +409,14 @@ fn display_plan_updates_live(
                 // R3: emit structured journal event for plan error.
                 let mut extra = serde_json::Map::new();
                 extra.insert("error".to_string(), serde_json::json!(error));
-                emit_plan_lifecycle_event(state, "Plan execution failed", "error", extra);
+                emit_plan_lifecycle_event(
+                    state.journal.as_ref(),
+                    state.session_id.as_deref(),
+                    state.executing_plan.as_ref(),
+                    "Plan execution failed",
+                    "error",
+                    extra,
+                );
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
@@ -463,7 +481,14 @@ fn display_plan_updates_live(
                 extra.insert("pct".to_string(), serde_json::json!(pct));
                 extra.insert("remaining".to_string(), serde_json::json!(remaining));
                 extra.insert("blocked_ids".to_string(), serde_json::json!(blocked_ids));
-                emit_plan_lifecycle_event(state, "Plan execution paused", "paused", extra);
+                emit_plan_lifecycle_event(
+                    state.journal.as_ref(),
+                    state.session_id.as_deref(),
+                    state.executing_plan.as_ref(),
+                    "Plan execution paused",
+                    "paused",
+                    extra,
+                );
                 (msg, PostSpinner::None)
             }
             PlanUpdate::GlobalVerificationFailed => (
@@ -755,7 +780,7 @@ pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut ReplState)
     let Some(ref svc) = state.task_service else {
         return;
     };
-    use astra_services::{task_orchestrator::TaskOutcome, TaskService};
+    use astra_services::{TaskService, task_orchestrator::TaskOutcome};
     if let Some(ref err) = state.plan_run_task_last_error {
         let err = err.clone();
         let _ = svc.fail_task(&tid, &err).await;
