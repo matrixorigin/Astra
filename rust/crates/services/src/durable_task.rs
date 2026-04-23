@@ -269,6 +269,17 @@ impl CloudLlmJudge {
             let bytes = resp.bytes().await.unwrap_or_default();
             // Truncate upstream error body before it reaches logs.
             let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+            // 401/403: redact provider secrets from logs and return a generic
+            // error message instead of echoing the upstream body.
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                let truncated = &text[..text.len().min(80)];
+                tracing::debug!(
+                    target: "astra_services::durable_task",
+                    "LLM judge auth error ({status}): {}",
+                    redact_judge_secrets(truncated)
+                );
+                return Err("LLM judge unavailable (auth error)".to_string());
+            }
             return Err(format!(
                 "Cloud LLM API error {status}: {}",
                 &text[..text.len().min(200)]
@@ -1074,11 +1085,24 @@ impl VerificationRunner {
                                 format!("LLM evaluation: {}", truncate(prompt, 200)),
                             ))
                         }
-                        Err(e) => Ok((
-                            false,
-                            format!("LLM judge error: {e}"),
-                            format!("LLM evaluation: {}", truncate(prompt, 200)),
-                        )),
+                        Err(e) => {
+                            // call_cloud_llm already maps 401/403 to a
+                            // redacted "LLM judge unavailable (auth error)"
+                            // message; pass it through cleanly. Other errors
+                            // get the legacy 'LLM judge error:' prefix.
+                            let reason = if e.contains("auth error")
+                                || e.starts_with("LLM judge unavailable")
+                            {
+                                e.clone()
+                            } else {
+                                format!("LLM judge error: {e}")
+                            };
+                            Ok((
+                                false,
+                                reason,
+                                format!("LLM evaluation: {}", truncate(prompt, 200)),
+                            ))
+                        }
                     }
                 } else {
                     // No LLM judge available — skip with informative message
@@ -1314,6 +1338,45 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…[truncated]", &s[..max])
     }
+}
+
+/// Local copy of `astra_runtime::turn::llm_client::redact_provider_secrets`.
+///
+/// Duplicated here because `services` cannot depend on `runtime`. The two
+/// implementations are intentionally identical and will be consolidated in
+/// a follow-up alongside `feat/secret-hardening`.
+fn redact_judge_secrets(s: &str) -> String {
+    fn boundary(c: char) -> bool {
+        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
+    }
+    let prefixes = ["sk-", "Bearer ", "key-"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut best: Option<(usize, &str)> = None;
+        for p in &prefixes {
+            if let Some(idx) = rest.find(p)
+                && best.map(|(b, _)| idx < b).unwrap_or(true)
+            {
+                best = Some((idx, p));
+            }
+        }
+        match best {
+            Some((idx, p)) => {
+                out.push_str(&rest[..idx]);
+                out.push_str(p);
+                out.push_str("[REDACTED]");
+                let tail = &rest[idx + p.len()..];
+                let cut = tail.find(boundary).unwrap_or(tail.len());
+                rest = &tail[cut..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Search for a file by its basename (or path suffix) under `root`.
@@ -4033,6 +4096,53 @@ mod tests {
     #[test]
     fn verification_history_row_cap_is_positive() {
         const _: () = assert!(MAX_VERIFICATION_HISTORY_ROWS >= 1000);
+    }
+
+    #[test]
+    fn redact_judge_secrets_replaces_known_prefixes() {
+        let s = "auth failed: sk-abc12345 used Bearer tok_xyz key-pqrs9";
+        let out = redact_judge_secrets(s);
+        assert!(!out.contains("abc12345"));
+        assert!(!out.contains("tok_xyz"));
+        assert!(!out.contains("pqrs9"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_judge_secrets_passthrough_for_clean_text() {
+        let s = "internal error: timeout";
+        assert_eq!(redact_judge_secrets(s), s);
+    }
+
+    #[test]
+    fn judge_error_reason_drops_auth_prefix_and_secret() {
+        // Simulate the mapping at the judge call site: call_cloud_llm
+        // returns "LLM judge unavailable (auth error)" for 401/403.
+        let upstream_err = "LLM judge unavailable (auth error)".to_string();
+        let reason = if upstream_err.contains("auth error")
+            || upstream_err.starts_with("LLM judge unavailable")
+        {
+            upstream_err.clone()
+        } else {
+            format!("LLM judge error: {upstream_err}")
+        };
+        assert!(!reason.contains("sk-"));
+        assert!(reason.contains("LLM judge unavailable"));
+        assert!(!reason.starts_with("LLM judge error:"));
+    }
+
+    #[test]
+    fn judge_error_reason_keeps_prefix_for_non_auth_errors() {
+        let upstream_err = "Cloud LLM API error 503: backend down".to_string();
+        let reason = if upstream_err.contains("auth error")
+            || upstream_err.starts_with("LLM judge unavailable")
+        {
+            upstream_err.clone()
+        } else {
+            format!("LLM judge error: {upstream_err}")
+        };
+        assert!(reason.starts_with("LLM judge error:"));
+        assert!(reason.contains("503"));
     }
 
     #[test]

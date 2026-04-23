@@ -43,10 +43,10 @@ pub(crate) fn redact_provider_secrets(s: &str) -> String {
     while !rest.is_empty() {
         let mut best: Option<(usize, &str)> = None;
         for p in &prefixes {
-            if let Some(idx) = rest.find(p) {
-                if best.map(|(b, _)| idx < b).unwrap_or(true) {
-                    best = Some((idx, p));
-                }
+            if let Some(idx) = rest.find(p)
+                && best.map(|(b, _)| idx < b).unwrap_or(true)
+            {
+                best = Some((idx, p));
             }
         }
         match best {
