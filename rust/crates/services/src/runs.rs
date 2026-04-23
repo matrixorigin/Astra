@@ -106,6 +106,13 @@ pub trait RunLifecycleService: Send + Sync {
     async fn drain_progress_events(&self, _run_id: &str) -> Vec<serde_json::Value> {
         vec![]
     }
+
+    /// Wait for in-flight background tasks to finish during graceful shutdown.
+    /// Returns `true` if all tasks drained within the timeout.
+    /// Default: no-op (returns true immediately).
+    async fn drain_background_tasks(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +337,9 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
+    /// Find runs in RUNNING status (for crash recovery — mark them failed on restart).
+    async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
+
     /// Find all sub-runs belonging to a delegation.
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String>;
 
@@ -475,6 +485,15 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(runs
             .values()
             .filter(|r| r.status == "waiting")
+            .cloned()
+            .collect())
+    }
+
+    async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|r| r.status == "running")
             .cloned()
             .collect())
     }

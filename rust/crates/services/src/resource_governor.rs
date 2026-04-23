@@ -705,4 +705,59 @@ mod tests {
             "zero limit means unlimited"
         );
     }
+
+    /// P0-A: record_tokens must be called after each run so check_token_budget
+    /// sees up-to-date usage. Simulates two runs consuming 600 tokens each
+    /// against a 1000-token daily cap.
+    #[tokio::test]
+    async fn token_cap_enforced_across_runs() {
+        let gov = InMemoryResourceGovernor::default();
+        let user = "user-cap-test";
+        gov.set_limits(
+            user,
+            ResourceLimits {
+                max_tokens_per_day: 1000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Simulate first run completing and recording tokens
+        gov.record_tokens(user, 600).await;
+        assert_eq!(
+            gov.check_token_budget(user).await,
+            LimitCheck::Allowed,
+            "600/1000 tokens — should still be allowed"
+        );
+
+        // Simulate second run completing and recording tokens
+        gov.record_tokens(user, 600).await;
+        match gov.check_token_budget(user).await {
+            LimitCheck::Denied { reason } => {
+                assert!(
+                    reason.contains("1200") || reason.contains("1000"),
+                    "denial reason must mention token counts, got: {reason}"
+                );
+            }
+            LimitCheck::Allowed => {
+                panic!("1200/1000 tokens consumed — must be Denied but got Allowed");
+            }
+        }
+    }
+
+    /// P0-A source guard: run_lifecycle must call record_tokens after the loop.
+    #[test]
+    fn run_lifecycle_records_tokens_after_loop() {
+        let source = include_str!("../../runtime/src/server/run_lifecycle.rs");
+        // Find the persist_usage call and verify record_tokens follows it
+        let persist_pos = source
+            .find("persist_usage")
+            .expect("persist_usage must exist");
+        let after_persist = &source[persist_pos..];
+        let record_pos = after_persist.find("record_tokens");
+        assert!(
+            record_pos.is_some(),
+            "record_tokens must be called after persist_usage in run_lifecycle"
+        );
+    }
 }

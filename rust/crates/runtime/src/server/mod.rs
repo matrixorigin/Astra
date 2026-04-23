@@ -135,6 +135,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // Clone the matrix runtime handle before moving `state` into `build_app`
     // so we can drain ingestion + sync sidecars after axum returns.
     let matrix_runtime = state.matrix_cloud_runtime.clone();
+    let run_lifecycle = state.run_lifecycle_service.clone();
 
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(http_shutdown_signal())
@@ -145,11 +146,21 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     for h in bg_handles {
         let _ = h.await;
     }
-    // 2. Drain Matrix ingestion + tracked session sync tasks.
+    // 2. Drain in-flight agentic loop tasks (up to 30s).
+    if !run_lifecycle
+        .drain_background_tasks(std::time::Duration::from_secs(30))
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::serve",
+            "graceful shutdown: some background tasks did not finish within 30s"
+        );
+    }
+    // 3. Drain Matrix ingestion + tracked session sync tasks.
     if let Some(rt) = matrix_runtime {
         rt.shutdown_ingestion_and_wait().await;
     }
-    // 3. Flush OTLP exporter last so the prior shutdown work is observable.
+    // 4. Flush OTLP exporter last so the prior shutdown work is observable.
     astra_logging::shutdown_otel();
     Ok(())
 }
@@ -246,6 +257,18 @@ mod tests {
         assert!(
             prod_code.contains("DefaultBodyLimit"),
             "build_app must apply DefaultBodyLimit layer to prevent OOM"
+        );
+    }
+
+    /// P0-C: serve() shutdown path must drain background agentic loop tasks.
+    #[test]
+    fn shutdown_drains_background_tasks() {
+        let source = include_str!("mod.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("drain_background_tasks"),
+            "serve() shutdown must call drain_background_tasks"
         );
     }
 }

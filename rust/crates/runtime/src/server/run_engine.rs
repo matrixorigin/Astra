@@ -174,16 +174,39 @@ impl RunEngine {
 
     /// Recover active runs after a crash/restart.
     ///
-    /// Loads all runs with status `running` or `waiting` from the store.
-    /// These represent runs that were in-flight when the process died and
-    /// need to be either resumed or marked as failed.
+    /// - `waiting` runs: returned for the caller to resume.
+    /// - `running` runs: were in-flight when the process died; marked `failed`
+    ///   with reason "recovered from crash" and returned so callers can notify
+    ///   subscribers.
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        // Waiting runs can be resumed; running runs were interrupted
         let waiting = self.store.find_waiting_runs().await?;
-        // Running runs at crash time should be marked as needing recovery
-        // For now, return waiting runs; running-at-crash will be addressed
-        // when we implement the background execution spawner
-        Ok(waiting)
+        let running = self.store.find_running_runs().await?;
+
+        // Mark crashed running runs as failed.
+        for run in &running {
+            if let Err(e) = self
+                .store
+                .update_run_status(
+                    &run.run_id,
+                    astra_core::STATUS_FAILED,
+                    None,
+                    Some("recovered from crash"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "astra_runtime::run_engine",
+                    run_id = %run.run_id,
+                    error = %e,
+                    "failed to mark crashed run as failed during recovery"
+                );
+            }
+        }
+
+        // Return all: waiting (to resume) + running (now failed, for notification).
+        let mut all = waiting;
+        all.extend(running);
+        Ok(all)
     }
 
     /// List runs for a user (delegates to store).
@@ -495,5 +518,60 @@ mod tests {
         let run = engine.load_run("run-1").await.unwrap().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(run.error_message.as_deref(), Some("OOM killed"));
+    }
+
+    /// P0-B: recover_active_runs must mark crashed running runs as failed.
+    /// Simulates a process crash: run was in `running` state when the server died.
+    #[tokio::test]
+    async fn recover_active_runs_marks_crashed_running_as_failed() {
+        let engine = test_engine();
+
+        // Insert a run that was running when the process crashed
+        engine
+            .start_run("run-crash", "user-1", "sess-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-crash", "running", None, None)
+            .await
+            .unwrap();
+
+        // Insert a waiting run (should be returned for resume, not failed)
+        engine
+            .start_run("run-wait", "user-1", "sess-2")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-wait", "waiting", None, None)
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        // Both runs returned
+        assert_eq!(
+            recovered.len(),
+            2,
+            "both waiting and crashed-running returned"
+        );
+
+        // The crashed running run must now be marked failed in the store
+        let crashed = engine.load_run("run-crash").await.unwrap().unwrap();
+        assert_eq!(
+            crashed.status, "failed",
+            "crashed running run must be marked failed"
+        );
+        assert_eq!(
+            crashed.error_message.as_deref(),
+            Some("recovered from crash"),
+            "error message must indicate crash recovery"
+        );
+
+        // The waiting run must remain waiting
+        let waiting = engine.load_run("run-wait").await.unwrap().unwrap();
+        assert_eq!(
+            waiting.status, "waiting",
+            "waiting run must remain waiting for resume"
+        );
     }
 }

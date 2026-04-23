@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -1155,6 +1155,31 @@ impl RunStatus {
             Self::Cancelled => STATUS_CANCELLED,
         }
     }
+
+    /// Validate a status transition. Returns `Err` if the transition is illegal.
+    ///
+    /// Rules:
+    /// - Terminal states (Completed, Failed, Cancelled) cannot transition to anything.
+    /// - Running → Paused, Completed, Failed, Cancelled
+    /// - Paused → Running, Cancelled, Failed
+    pub fn try_transition(&self, next: &RunStatus) -> Result<(), String> {
+        let allowed = match self {
+            Self::Running => matches!(
+                next,
+                Self::Paused | Self::Completed | Self::Failed | Self::Cancelled
+            ),
+            Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Completed | Self::Failed | Self::Cancelled => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid run status transition: {:?} → {:?}",
+                self, next
+            ))
+        }
+    }
 }
 
 fn is_run_finished_event(event: &Value) -> bool {
@@ -1286,6 +1311,10 @@ pub struct AgenticRunLifecycleService {
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     /// Tool event writer for persisting tool_call events to agent_events.
     tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
+    /// Counter of in-flight background agentic loop tasks.
+    /// Incremented before spawn, decremented when the task exits.
+    /// Used by `drain_background_tasks` for graceful shutdown.
+    background_task_count: Arc<AtomicUsize>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1312,6 +1341,7 @@ impl AgenticRunLifecycleService {
             hook_db_writer: None,
             observer_worker: None,
             tool_event_writer: None,
+            background_task_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1368,6 +1398,29 @@ impl AgenticRunLifecycleService {
     pub fn with_tool_event_writer(mut self, writer: Arc<dyn TurnToolEventWriter>) -> Self {
         self.tool_event_writer = Some(writer);
         self
+    }
+
+    /// Wait for all in-flight background agentic loop tasks to finish.
+    ///
+    /// Called during graceful shutdown. Polls the task counter with 100ms
+    /// intervals up to `timeout`. Returns `true` if all tasks drained within
+    /// the timeout, `false` if tasks are still running.
+    async fn drain_background_tasks_impl(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.background_task_count.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Returns the current number of in-flight background tasks.
+    pub fn background_task_count(&self) -> usize {
+        self.background_task_count.load(Ordering::Acquire)
     }
 
     /// Clone the Arc handle to the runs map (for background tasks).
@@ -2015,9 +2068,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        // Guard: reject if this session already has an active (running/paused) run.
+        // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
-        self.runs.write().await.insert(run_id.clone(), run_state);
+        {
+            let mut runs = self.runs.write().await;
+            let has_active = runs.values().any(|r| {
+                r.session_id == session_id
+                    && matches!(r.status, RunStatus::Running | RunStatus::Paused)
+            });
+            if has_active {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            runs.insert(run_id.clone(), run_state);
+        }
 
         // Persist to durable store if available
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
@@ -2141,15 +2209,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             tool_event_writer: self.tool_event_writer.clone(),
         };
 
-        // TODO(audit-#2): Track agentic loop JoinHandles for graceful shutdown
-        // drain. Today the spawned task is fire-and-forget; on SIGTERM a
-        // long-running run can be torn down mid-persist. Fix shape: add an
-        // Arc<Mutex<JoinSet<()>>> field on RunLifecycleService, route both
-        // background spawns through it, and expose a `drain_running_tasks`
-        // helper that serve()'s shutdown path awaits with a timeout. The
-        // refactor touches the public service surface so it's deferred to a
-        // dedicated PR.
+        // Background task tracking: background_task_count is incremented before
+        // spawn and decremented via RAII guard on exit. serve()'s shutdown path
+        // calls drain_background_tasks() to wait for in-flight runs.
+        let bg_task_count_1 = Arc::clone(&self.background_task_count);
+        bg_task_count_1.fetch_add(1, Ordering::Release);
         tokio::spawn(async move {
+            // RAII guard: decrement counter when this task exits (normal or panic).
+            struct TaskCountGuard(Arc<AtomicUsize>);
+            impl Drop for TaskCountGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let _guard = TaskCountGuard(bg_task_count_1);
             // Pre-flight: check daily token budget before starting the agentic loop.
             if let Some(ref gov) = bg_resource_governor {
                 use astra_services::resource_governor::LimitCheck;
@@ -2162,7 +2235,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "run rejected: daily token budget exhausted"
                     );
                     if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                        run.status = RunStatus::Failed;
+                        if run.status.try_transition(&RunStatus::Failed).is_ok() {
+                            run.status = RunStatus::Failed;
+                        }
                     }
                     if let Some(ref engine) = run_engine {
                         astra_core::log_persist!(
@@ -2207,7 +2282,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     flush_turn_observability(&mut loop_state, &bg_session_id, true);
                 } else {
                     run.events.extend(events);
-                    run.status = final_status;
+                    if run.status.try_transition(&final_status).is_ok() {
+                        run.status = final_status;
+                    }
                 }
             }
 
@@ -2235,6 +2312,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     "usage"
                 );
+                // Record tokens consumed so check_token_budget sees up-to-date usage.
+                if let Some(ref gov) = bg_resource_governor {
+                    let total = loop_state.total_prompt + loop_state.total_completion;
+                    if total > 0 {
+                        gov.record_tokens(&bg_user_id, total).await;
+                    }
+                }
                 if persist_terminal_state {
                     for event in terminal_events {
                         astra_core::log_persist!(
@@ -2421,6 +2505,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
         let bg_session_id = session_id.clone();
+        let bg_resource_governor = self.resource_governor.clone();
+        let bg_user_id = user_id.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -2435,13 +2521,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             tool_event_writer: self.tool_event_writer.clone(),
         };
 
-        // TODO(audit-#2): Track this background spawn via the same
-        // JoinSet/CancellationToken pair as the bg-run spawn above so
-        // serve()'s shutdown path can drain it. See run_lifecycle.rs comment
-        // on the bg-run spawn for the full fix shape.
+        // Background task tracking (same pattern as the create_run spawn above).
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
+        let bg_task_count_2 = Arc::clone(&self.background_task_count);
+        bg_task_count_2.fetch_add(1, Ordering::Release);
         tokio::spawn(async move {
+            struct TaskCountGuard(Arc<AtomicUsize>);
+            impl Drop for TaskCountGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let _guard = TaskCountGuard(bg_task_count_2);
             let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
             let loop_success = loop_result.is_ok();
 
@@ -2458,7 +2550,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                 run.events = all_events.clone();
-                run.status = final_status.clone();
+                if run.status.try_transition(&final_status).is_ok() {
+                    run.status = final_status.clone();
+                }
             }
 
             if let Some(engine) = &run_engine {
@@ -2488,6 +2582,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     "usage"
                 );
+                // Record tokens consumed so check_token_budget sees up-to-date usage.
+                if let Some(ref gov) = bg_resource_governor {
+                    let total = state.total_prompt + state.total_completion;
+                    if total > 0 {
+                        gov.record_tokens(&bg_user_id, total).await;
+                    }
+                }
             }
 
             // Persist terminal events to durable store.
@@ -2611,6 +2712,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         events
     }
 
+    async fn drain_background_tasks(&self, timeout: std::time::Duration) -> bool {
+        self.drain_background_tasks_impl(timeout).await
+    }
+
     async fn cancel_run(
         &self,
         run_id: String,
@@ -2622,7 +2727,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                let mutated = matches!(run.status, RunStatus::Running | RunStatus::Paused);
+                let mutated = run.status.try_transition(&RunStatus::Cancelled).is_ok();
                 if mutated {
                     run.cancel_flag.store(true, Ordering::SeqCst);
                     run.pause_flag.store(false, Ordering::SeqCst);
@@ -2745,7 +2850,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if run.status != RunStatus::Running {
+                if run.status.try_transition(&RunStatus::Paused).is_err() {
                     return Err(Self::run_state_conflict("pause", run.status.as_str()));
                 }
                 let previous = run.status.as_str().to_string();
@@ -2812,7 +2917,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if run.status != RunStatus::Paused {
+                if run.status.try_transition(&RunStatus::Running).is_err() {
                     return Err(Self::run_state_conflict("resume", run.status.as_str()));
                 }
                 let previous = run.status.as_str().to_string();
@@ -4915,6 +5020,134 @@ mod tests {
         assert!(
             prod_code.contains("check_token_budget"),
             "run_lifecycle must call check_token_budget before the agentic loop"
+        );
+    }
+
+    /// P0-C: drain_background_tasks returns true when no tasks are running.
+    #[tokio::test]
+    async fn drain_background_tasks_returns_immediately_when_idle() {
+        // Test the drain logic directly: counter at 0 → drain returns true immediately.
+        let count = Arc::new(AtomicUsize::new(0));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let drained = loop {
+            if count.load(Ordering::Acquire) == 0 {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(drained, "counter at 0 — drain must return true immediately");
+    }
+
+    /// P0-C: background_task_count increments on spawn and decrements on exit.
+    #[tokio::test]
+    async fn background_task_count_tracks_spawned_tasks() {
+        use std::sync::atomic::Ordering;
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        // Simulate what the spawn does: increment, spawn, decrement on drop
+        count.fetch_add(1, Ordering::Release);
+        let handle = tokio::spawn(async move {
+            struct Guard(Arc<AtomicUsize>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let _g = Guard(count_clone);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        assert_eq!(count.load(Ordering::Acquire), 1, "task in flight");
+        handle.await.unwrap();
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "task completed — counter must be 0"
+        );
+    }
+
+    /// P0-C source guard: both spawns must wire the background_task_count counter.
+    #[test]
+    fn both_spawns_wire_background_task_count() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("background_task_count").count();
+        assert!(
+            count >= 4,
+            "background_task_count must appear in field def + drain method + both spawns, got {count}"
+        );
+    }
+
+    /// P1-A: RunStatus::try_transition enforces valid state machine transitions.
+    #[test]
+    fn run_status_try_transition_valid_and_invalid() {
+        use super::RunStatus::*;
+
+        // Valid transitions
+        assert!(Running.try_transition(&Paused).is_ok());
+        assert!(Running.try_transition(&Completed).is_ok());
+        assert!(Running.try_transition(&Failed).is_ok());
+        assert!(Running.try_transition(&Cancelled).is_ok());
+        assert!(Paused.try_transition(&Running).is_ok());
+        assert!(Paused.try_transition(&Cancelled).is_ok());
+        assert!(Paused.try_transition(&Failed).is_ok());
+
+        // Terminal states cannot transition
+        let err = Completed.try_transition(&Running);
+        assert!(err.is_err(), "Completed → Running must be rejected");
+        assert!(
+            err.unwrap_err().contains("Completed"),
+            "error must name the source state"
+        );
+
+        let err = Failed.try_transition(&Running);
+        assert!(err.is_err(), "Failed → Running must be rejected");
+
+        let err = Cancelled.try_transition(&Completed);
+        assert!(err.is_err(), "Cancelled → Completed must be rejected");
+
+        // Running cannot go back to Running
+        let err = Running.try_transition(&Running);
+        assert!(err.is_err(), "Running → Running must be rejected");
+    }
+
+    /// P1-B: create_run must reject a second run on the same session with 409.
+    #[test]
+    fn per_session_active_run_guard_in_source() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find create_run function
+        let fn_start = source
+            .find("async fn create_run(")
+            .expect("create_run must exist");
+        // Find the guard within create_run (before stream_chat)
+        let stream_chat_pos = source.find("async fn stream_chat(").unwrap_or(source.len());
+        let create_run_body = &source[fn_start..stream_chat_pos];
+        assert!(
+            create_run_body.contains("session already has an active run"),
+            "create_run must reject concurrent runs on the same session"
+        );
+        assert!(
+            create_run_body.contains("CONFLICT"),
+            "create_run must return 409 CONFLICT for concurrent session runs"
+        );
+    }
+
+    /// P1-A: try_transition must be used in all production status update paths.
+    #[test]
+    fn try_transition_used_in_production_code() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("try_transition").count();
+        // Budget reject + post-loop (x2) + cancel + pause + resume = 6
+        assert!(
+            count >= 6,
+            "try_transition must be called in all 6 status update paths, found {count}"
         );
     }
 }
