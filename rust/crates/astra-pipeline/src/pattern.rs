@@ -2276,7 +2276,14 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // One success so the pattern exists, then Block adds 5 failures + 3 false outcomes.
         // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
-        lib.record_outcome(&tools(&["custom_tool"]), TaskType::Code, None, true, 0.8, None);
+        lib.record_outcome(
+            &tools(&["custom_tool"]),
+            TaskType::Code,
+            None,
+            true,
+            0.8,
+            None,
+        );
         lib.apply_evolution_action("custom_tool", PatternAction::Block);
 
         let blocked = lib.blocked_tool_names();
@@ -2290,7 +2297,14 @@ mod tests {
     #[test]
     fn blocked_tool_names_expires_after_ttl() {
         let mut lib = PatternLibrary::new();
-        lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, true, 0.8, None);
+        lib.record_outcome(
+            &tools(&["flaky_tool"]),
+            TaskType::Code,
+            None,
+            true,
+            0.8,
+            None,
+        );
         lib.apply_evolution_action("flaky_tool", PatternAction::Block);
 
         // Immediately after blocking, it should be blocked
@@ -2315,7 +2329,14 @@ mod tests {
         let mut lib = PatternLibrary::new();
         // 3 successes + Block (adds 5 failures) = 3/8 = 37.5% success → not blocked
         for _ in 0..3 {
-            lib.record_outcome(&tools(&["mixed_tool"]), TaskType::Code, None, true, 0.8, None);
+            lib.record_outcome(
+                &tools(&["mixed_tool"]),
+                TaskType::Code,
+                None,
+                true,
+                0.8,
+                None,
+            );
         }
         lib.apply_evolution_action("mixed_tool", PatternAction::Block);
 

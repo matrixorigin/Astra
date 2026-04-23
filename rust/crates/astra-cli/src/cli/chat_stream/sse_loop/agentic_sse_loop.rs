@@ -349,10 +349,7 @@ mod tests {
         let tg = make_turn_guard();
         let mut ctx = make_build_ctx(&sr, &tg);
         ctx.tool_calls_count = 3;
-        ctx.tools_used = HashSet::from([
-            "read_file".to_string(),
-            "bash".to_string(),
-        ]);
+        ctx.tools_used = HashSet::from(["read_file".to_string(), "bash".to_string()]);
         ctx.tool_call_records = vec![
             // Blocked by restricted_tools policy — should be excluded
             ToolCallRecord {
