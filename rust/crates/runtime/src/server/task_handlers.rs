@@ -384,7 +384,15 @@ fn parse_task_status(s: &str) -> Option<astra_services::TaskStatus> {
 fn extract_plan_progress_events(session_id: &str) -> Vec<PlanProgressEventResponse> {
     let events = match session_journal::read_journal(session_id) {
         Ok(events) => events,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                target: "astra_runtime::task_progress",
+                session_id,
+                err = %err,
+                "failed to read plan progress journal"
+            );
+            return Vec::new();
+        }
     };
 
     events

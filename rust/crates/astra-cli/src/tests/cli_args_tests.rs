@@ -8,6 +8,7 @@ fn cli_no_args_gives_no_command() {
     assert!(cli.command.is_none());
     assert!(!cli.print);
     assert!(!cli.continue_last);
+    assert!(!cli.no_journal_content);
     assert!(!cli.yes);
     assert!(cli.model.is_none());
     assert!(cli.resume.is_none());
@@ -59,6 +60,12 @@ fn cli_continue_flag_short() {
 fn cli_continue_flag_long() {
     let cli = Cli::try_parse_from(["astra", "--continue"]).unwrap();
     assert!(cli.continue_last);
+}
+
+#[test]
+fn cli_no_journal_content_flag_long() {
+    let cli = Cli::try_parse_from(["astra", "--no-journal-content"]).unwrap();
+    assert!(cli.no_journal_content);
 }
 
 #[test]

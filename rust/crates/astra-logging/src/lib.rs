@@ -198,6 +198,46 @@ impl<T: AsRef<str>> Secret<T> {
     }
 }
 
+/// Redact inline secret values that appear after well-known prefixes.
+///
+/// Replaces the value following prefixes like `sk-`, `Bearer `, and `key-`
+/// with `[REDACTED]`. This is intended for sanitizing provider or verifier
+/// error strings before they are logged or surfaced to users.
+pub fn redact_known_secret_patterns(s: &str) -> String {
+    fn boundary(c: char) -> bool {
+        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
+    }
+
+    let prefixes = ["sk-", "Bearer ", "key-"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut best: Option<(usize, &str)> = None;
+        for p in &prefixes {
+            if let Some(idx) = rest.find(p)
+                && best.map(|(b, _)| idx < b).unwrap_or(true)
+            {
+                best = Some((idx, p));
+            }
+        }
+        match best {
+            Some((idx, p)) => {
+                out.push_str(&rest[..idx]);
+                out.push_str(p);
+                out.push_str("[REDACTED]");
+                let tail = &rest[idx + p.len()..];
+                let cut = tail.find(boundary).unwrap_or(tail.len());
+                rest = &tail[cut..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
 impl<T: AsRef<str>> std::fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[REDACTED]")
@@ -224,7 +264,7 @@ impl From<&str> for Secret<String> {
 
 #[cfg(test)]
 mod secret_tests {
-    use super::Secret;
+    use super::{Secret, redact_known_secret_patterns};
 
     #[test]
     fn secret_debug_is_redacted() {
@@ -254,5 +294,21 @@ mod secret_tests {
         assert_eq!(a.expose(), "hello");
         assert_eq!(b.expose(), "hello");
         assert_eq!(format!("{a:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_known_secret_patterns_masks_well_known_prefixes() {
+        let redacted =
+            redact_known_secret_patterns("auth failed: sk-abc12345 used Bearer tok_xyz key-pqrs9");
+        assert!(!redacted.contains("abc12345"));
+        assert!(!redacted.contains("tok_xyz"));
+        assert!(!redacted.contains("pqrs9"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_known_secret_patterns_passthrough_for_clean_text() {
+        let input = "internal error: timeout";
+        assert_eq!(redact_known_secret_patterns(input), input);
     }
 }

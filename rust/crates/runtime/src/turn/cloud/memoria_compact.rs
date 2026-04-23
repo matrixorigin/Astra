@@ -328,6 +328,44 @@ impl HttpMemoriaClient {
     }
 }
 
+fn parse_retrieved_memories(data: &Value) -> Vec<MemoriaMemory> {
+    let Some(arr) = data
+        .get("memories")
+        .and_then(Value::as_array)
+        .or_else(|| data.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut memories = Vec::with_capacity(arr.len());
+    let mut dropped = 0usize;
+    let mut first_error = None;
+
+    for (index, value) in arr.iter().enumerate() {
+        match serde_json::from_value::<MemoriaMemory>(value.clone()) {
+            Ok(memory) => memories.push(memory),
+            Err(err) => {
+                dropped += 1;
+                if first_error.is_none() {
+                    first_error = Some(format!("index {index}: {err}"));
+                }
+            }
+        }
+    }
+
+    if dropped > 0 {
+        tracing::warn!(
+            target: "astra_runtime::memoria_compact",
+            parsed = memories.len(),
+            dropped,
+            first_error = first_error.as_deref().unwrap_or("unknown"),
+            "discarded malformed Memoria retrieve entries"
+        );
+    }
+
+    memories
+}
+
 #[async_trait::async_trait]
 impl MemoriaClient for HttpMemoriaClient {
     async fn retrieve_ext(
@@ -370,18 +408,7 @@ impl MemoriaClient for HttpMemoriaClient {
             .await
             .map_err(|e| format!("Memoria retrieve parse failed: {e}"))?;
 
-        let memories = data
-            .get("memories")
-            .and_then(Value::as_array)
-            .or_else(|| data.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(memories)
+        Ok(parse_retrieved_memories(&data))
     }
 
     async fn store(
@@ -1077,6 +1104,28 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn parse_retrieved_memories_skips_and_reports_malformed_entries() {
+        let data = json!({
+            "memories": [
+                {
+                    "memory_id": "m1",
+                    "content": "working memory",
+                    "memory_type": "working",
+                    "retrieval_score": 0.9
+                },
+                {
+                    "memory_id": "m2",
+                    "content": "missing type"
+                }
+            ]
+        });
+
+        let memories = parse_retrieved_memories(&data);
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, "m1");
     }
 
     fn with_env_paths<R>(

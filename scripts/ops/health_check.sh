@@ -11,10 +11,20 @@ NC='\033[0m' # No Color
 
 # Configuration
 API_URL="${API_URL:-http://localhost:8000}"
+
+if [ -f .env ]; then
+    set -a; source .env; set +a
+fi
+
+if [ -z "${MATRIXONE_PASSWORD:-}" ]; then
+    echo -e "${RED}❌ MATRIXONE_PASSWORD is required (set it explicitly or source .env)${NC}"
+    exit 1
+fi
+
 DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
-DB_PASSWORD="${MATRIXONE_PASSWORD:-111}"
+DB_PASSWORD="${MATRIXONE_PASSWORD}"
 REDIS_HOST="${REDIS_HOST:-localhost}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 

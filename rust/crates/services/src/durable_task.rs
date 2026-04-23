@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use astra_logging::redact_known_secret_patterns;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -1389,43 +1390,9 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Local copy of `astra_runtime::turn::llm_client::redact_provider_secrets`.
-///
-/// Duplicated here because `services` cannot depend on `runtime`. The two
-/// implementations are intentionally identical and will be consolidated in
-/// a follow-up alongside `feat/secret-hardening`.
+/// Shared secret-pattern redaction used for judge/provider error strings.
 fn redact_judge_secrets(s: &str) -> String {
-    fn boundary(c: char) -> bool {
-        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
-    }
-    let prefixes = ["sk-", "Bearer ", "key-"];
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while !rest.is_empty() {
-        let mut best: Option<(usize, &str)> = None;
-        for p in &prefixes {
-            if let Some(idx) = rest.find(p)
-                && best.map(|(b, _)| idx < b).unwrap_or(true)
-            {
-                best = Some((idx, p));
-            }
-        }
-        match best {
-            Some((idx, p)) => {
-                out.push_str(&rest[..idx]);
-                out.push_str(p);
-                out.push_str("[REDACTED]");
-                let tail = &rest[idx + p.len()..];
-                let cut = tail.find(boundary).unwrap_or(tail.len());
-                rest = &tail[cut..];
-            }
-            None => {
-                out.push_str(rest);
-                break;
-            }
-        }
-    }
-    out
+    redact_known_secret_patterns(s)
 }
 
 /// Search for a file by its basename (or path suffix) under `root`.

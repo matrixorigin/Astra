@@ -3179,15 +3179,14 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Returns true when `ASTRA_JOURNAL_CONTENT_REDACT=1` is set in the
+pub const ASTRA_JOURNAL_CONTENT_REDACT_ENV: &str = "ASTRA_JOURNAL_CONTENT_REDACT";
+
+/// Returns true when [`ASTRA_JOURNAL_CONTENT_REDACT_ENV`]=`1` is set in the
 /// environment. When enabled, the on-disk JSONL journal stores a privacy
 /// marker (`<redacted: len=N sha=...>`) in place of `user_input` and
 /// `assistant_output` fields.
-///
-/// TODO: a `--no-journal-content` CLI flag should map onto this env var
-/// in `stream_render.rs` so operators can toggle it without touching env.
 pub fn journal_content_redact_enabled() -> bool {
-    std::env::var("ASTRA_JOURNAL_CONTENT_REDACT").as_deref() == Ok("1")
+    std::env::var(ASTRA_JOURNAL_CONTENT_REDACT_ENV).as_deref() == Ok("1")
 }
 
 /// Replace raw user content with a deterministic privacy marker.

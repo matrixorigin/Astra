@@ -11,6 +11,7 @@ use std::{
     time::Instant,
 };
 
+use astra_logging::redact_known_secret_patterns;
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
@@ -34,37 +35,7 @@ use crate::prompts;
 /// which is sufficient for the JSON / plaintext error bodies that providers
 /// commonly echo authorization material into.
 pub(crate) fn redact_provider_secrets(s: &str) -> String {
-    fn boundary(c: char) -> bool {
-        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
-    }
-    let prefixes = ["sk-", "Bearer ", "key-"];
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while !rest.is_empty() {
-        let mut best: Option<(usize, &str)> = None;
-        for p in &prefixes {
-            if let Some(idx) = rest.find(p)
-                && best.map(|(b, _)| idx < b).unwrap_or(true)
-            {
-                best = Some((idx, p));
-            }
-        }
-        match best {
-            Some((idx, p)) => {
-                out.push_str(&rest[..idx]);
-                out.push_str(p);
-                out.push_str("[REDACTED]");
-                let tail = &rest[idx + p.len()..];
-                let cut = tail.find(boundary).unwrap_or(tail.len());
-                rest = &tail[cut..];
-            }
-            None => {
-                out.push_str(rest);
-                break;
-            }
-        }
-    }
-    out
+    redact_known_secret_patterns(s)
 }
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).

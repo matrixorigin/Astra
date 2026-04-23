@@ -38,8 +38,8 @@ pub struct IngestionConfig {
     pub max_retries: u32,
     /// When true, replace user-content fields (`content`) on outgoing
     /// IngestionEvents with a privacy marker (`<redacted: len=N sha=...>`)
-    /// instead of the raw text. Default: `false` for backward compat;
-    /// callers that need PII-free cloud ingestion should opt in.
+    /// instead of the raw text. Default: `true` so cloud ingestion is
+    /// privacy-safe unless a caller explicitly opts out.
     pub redact_content: bool,
 }
 
@@ -50,7 +50,7 @@ impl Default for IngestionConfig {
             flush_interval_secs: 5,
             channel_capacity: 200,
             max_retries: 3,
-            redact_content: false,
+            redact_content: true,
         }
     }
 }
@@ -764,8 +764,8 @@ mod tests {
         assert_eq!(config.channel_capacity, 200);
         assert_eq!(config.max_retries, 3);
         assert!(
-            !config.redact_content,
-            "redact_content default must be false for backward compat"
+            config.redact_content,
+            "redact_content default must be true for privacy-safe cloud ingestion"
         );
     }
 

@@ -59,7 +59,7 @@ if [ -z "${CHAT_TURN_BRIDGE_URL:-}" ]; then
         code=$(curl -s --noproxy '*' -m 2 -D "$header_file" -o "$resp_file" -w '%{http_code}' \
             -X POST "$candidate" \
             -H 'content-type: application/json' \
-            -H "x-mo-bridge-secret: ${CHAT_TURN_BRIDGE_SECRET:-dev-bridge-secret-change-me}" \
+            -H "x-mo-bridge-secret: ${CHAT_TURN_BRIDGE_SECRET:-}" \
             -d '{"messages":[{"role":"user","content":"ping"}]}' || true)
         ctype=$(grep -i '^content-type:' "$header_file" | head -1 | tr -d '\r' | cut -d' ' -f2- | tr '[:upper:]' '[:lower:]')
         body=$(cat "$resp_file" 2>/dev/null)

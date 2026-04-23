@@ -439,6 +439,7 @@ name = "astra-services"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-logging",
  "async-trait",
  "axum 0.8.9",
  "base64",

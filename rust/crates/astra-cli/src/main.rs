@@ -1030,6 +1030,7 @@ async fn main() {
         session_name,
         bare,
         no_instructions,
+        no_journal_content,
         startup_trace,
         diagnostic_log: _,
         log_file: _,
@@ -1054,6 +1055,12 @@ async fn main() {
     if no_instructions {
         unsafe {
             std::env::set_var("ASTRA_NO_INSTRUCTIONS", "1");
+        }
+    }
+
+    if no_journal_content {
+        unsafe {
+            std::env::set_var(session_journal::ASTRA_JOURNAL_CONTENT_REDACT_ENV, "1");
         }
     }
 

@@ -118,10 +118,13 @@ services:
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
+      - MATRIXONE_PASSWORD=${MATRIXONE_PASSWORD}
       - ASTRA_DATABASE=${ASTRA_DATABASE:-astra_runtime}
       - ASTRA_DATABASE_PREFIX=${ASTRA_DATABASE_PREFIX:-}
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - CHAT_TURN_BRIDGE_SECRET=${CHAT_TURN_BRIDGE_SECRET}
       # Memoria backend configuration
       - MEMORY_BACKEND=memoria
       - MEMORIA_BASE_URL=http://memoria:8000
