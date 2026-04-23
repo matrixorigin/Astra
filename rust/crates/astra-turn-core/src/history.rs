@@ -317,7 +317,7 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                 // replay. Earlier versions of this path `continue`d, which
                 // caused data loss when metadata came back as an unparseable
                 // JSON string (parsed_object → empty Map → empty id).
-                let mut synthetic_id_holder = String::new();
+                let synthetic_id_holder: String;
                 let effective_id: &str = if !tool_call_id.is_empty() {
                     tool_call_id
                 } else {

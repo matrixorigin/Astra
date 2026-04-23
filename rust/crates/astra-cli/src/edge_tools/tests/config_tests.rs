@@ -62,7 +62,10 @@ fn config_get_api_key_status() {
     let parsed: Value = serde_json::from_str(&result).unwrap();
 
     // Security: must never leak actual key material in any form.
-    assert!(!result.contains("sk-"), "must not leak OpenAI-style key prefix");
+    assert!(
+        !result.contains("sk-"),
+        "must not leak OpenAI-style key prefix"
+    );
     assert!(
         !result.to_lowercase().contains("bearer "),
         "must not emit bearer-token shape"

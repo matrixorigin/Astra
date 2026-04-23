@@ -95,9 +95,9 @@ fn web_search_empty_query() {
     let result = exe.web_search(&json!({"query": ""}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    let err = parsed["error"].as_str().unwrap_or_else(|| {
-        panic!("empty query must yield string `error` field — got: {parsed}")
-    });
+    let err = parsed["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("empty query must yield string `error` field — got: {parsed}"));
     assert!(
         err.to_lowercase().contains("query"),
         "error should mention `query` — got: {err}"
@@ -115,9 +115,9 @@ fn web_search_missing_query() {
     let result = exe.web_search(&json!({}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    let err = parsed["error"].as_str().unwrap_or_else(|| {
-        panic!("missing query must yield string `error` field — got: {parsed}")
-    });
+    let err = parsed["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing query must yield string `error` field — got: {parsed}"));
     assert!(
         err.to_lowercase().contains("query"),
         "error should mention `query` — got: {err}"
@@ -176,21 +176,19 @@ fn web_search_has_alternatives() {
         "alternatives must not be empty — got: {parsed}"
     );
     for alt in alternatives {
-        let engine = alt["engine"].as_str().unwrap_or_else(|| {
-            panic!("each alternative must have a string `engine` — got: {alt}")
-        });
-        let url = alt["url"].as_str().unwrap_or_else(|| {
-            panic!("each alternative must have a string `url` — got: {alt}")
-        });
+        let engine = alt["engine"]
+            .as_str()
+            .unwrap_or_else(|| panic!("each alternative must have a string `engine` — got: {alt}"));
+        let url = alt["url"]
+            .as_str()
+            .unwrap_or_else(|| panic!("each alternative must have a string `url` — got: {alt}"));
         assert!(
             url.starts_with("http://") || url.starts_with("https://"),
             "alternative url must be http(s) — engine={engine} url={url}"
         );
     }
 
-    let usage = parsed["usage"]
-        .as_str()
-        .expect("usage must be a string");
+    let usage = parsed["usage"].as_str().expect("usage must be a string");
     assert!(
         usage.contains("web_fetch"),
         "usage hint must point the caller at web_fetch — got: {usage}"

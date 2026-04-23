@@ -17,10 +17,18 @@ async fn task_create_returns_task_id() {
     let exe = ToolExecutor::new(dir.path());
     let result = exe.task_create(&json!({"title": "Test task"})).await;
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-    assert_eq!(parsed["success"], true, "task_create must succeed — got: {result}");
+    assert_eq!(
+        parsed["success"], true,
+        "task_create must succeed — got: {result}"
+    );
     assert_eq!(parsed["task_id"], "task-1", "first task id must be task-1");
-    let msg = parsed["message"].as_str().expect("message must be a string");
-    assert!(msg.contains("Test task"), "message must reference title — got: {msg}");
+    let msg = parsed["message"]
+        .as_str()
+        .expect("message must be a string");
+    assert!(
+        msg.contains("Test task"),
+        "message must reference title — got: {msg}"
+    );
 }
 
 #[tokio::test]
