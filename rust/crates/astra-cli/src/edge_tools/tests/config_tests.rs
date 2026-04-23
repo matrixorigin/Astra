@@ -8,13 +8,41 @@ fn config_list_settings() {
     let result = exe.config_tool(&json!({ "setting": "list" }));
     let parsed: Value = serde_json::from_str(&result).unwrap();
 
-    assert!(parsed.get("available_settings").is_some());
-    let settings = parsed
-        .get("available_settings")
-        .unwrap()
+    let settings = parsed["available_settings"]
         .as_array()
-        .unwrap();
-    assert!(!settings.is_empty());
+        .expect("available_settings must be an array");
+    assert!(!settings.is_empty(), "must expose at least one setting");
+
+    // Settings are objects carrying at least a `setting` key (canonical name)
+    // plus a human-readable `description`. Require that shape so the UI can
+    // always render each entry uniformly.
+    for (i, s) in settings.iter().enumerate() {
+        let name = s
+            .get("setting")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("settings[{i}].setting must be a string — got: {s}"));
+        assert!(
+            !name.is_empty(),
+            "settings[{i}].setting must be non-empty — got: {s}"
+        );
+    }
+
+    // Every canonical setting the config_tool supports must be represented.
+    // Protects against accidental list regression.
+    let surface: Vec<String> = settings
+        .iter()
+        .filter_map(|s| {
+            s.get("setting")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    for required in ["model", "api_key", "output_limit"] {
+        assert!(
+            surface.iter().any(|s| s == required),
+            "expected canonical setting `{required}` in list — got: {surface:?}"
+        );
+    }
 }
 
 #[test]
@@ -33,9 +61,33 @@ fn config_get_api_key_status() {
     let result = exe.config_tool(&json!({ "setting": "api_key" }));
     let parsed: Value = serde_json::from_str(&result).unwrap();
 
-    // Should never expose actual key values
-    assert!(!result.contains("sk-"));
-    assert!(parsed.get("status").is_some());
+    // Security: must never leak actual key material in any form.
+    assert!(
+        !result.contains("sk-"),
+        "must not leak OpenAI-style key prefix"
+    );
+    assert!(
+        !result.to_lowercase().contains("bearer "),
+        "must not emit bearer-token shape"
+    );
+
+    assert_eq!(parsed["setting"], "api_key");
+    let status = parsed["status"]
+        .as_object()
+        .expect("status must be an object mapping provider env var → state");
+
+    // Must cover every canonical provider env var so the UI can render a full
+    // matrix, not just the one that happens to be set.
+    for key in ["MO_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+        let v = status
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("status.{key} must be a string state — got: {parsed}"));
+        assert!(
+            v == "set" || v == "not set",
+            "status.{key} must be a canonical state ('set'/'not set') — got: {v:?}"
+        );
+    }
 }
 
 #[test]
