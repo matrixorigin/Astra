@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d6ec4578b00ec8a372ff5a5646e16819b8fcba57aae24484fbdc618bccf8465a # shrinks to name = "A", noise_prefix = "A", noise_suffix = "\u{1})"
+cc ec76291d83da26e41769ee7d029a46d7dd621a60477f226b6a300c43f3f6fafb # shrinks to blocks = [("_", "𐀀𐀀𐀀¡ࠀ ¡𐀀¡AAA00\0¡¡𐀀\0𐀀"), ("_", "\0A0\0A=\u{1}a𐀀a   ")], prefix = "", suffix = "", close_every_other = false

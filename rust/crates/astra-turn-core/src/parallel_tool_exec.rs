@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -27,6 +27,31 @@ pub const MAX_CONCURRENT_READ_ONLY: usize = 10;
 /// Kept equal to [`MAX_CONCURRENT_READ_ONLY`] so the in-turn cap matches
 /// claude-code semantics (10) across both speculative and batched paths.
 pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = MAX_CONCURRENT_READ_ONLY;
+
+/// Process-wide semaphore shared across every tool-execution batch.
+///
+/// Previously, each call to `execute_parallel_round` and each CLI batch in
+/// `stream_render::execute_tools_batch` allocated its own `Semaphore::new(10)`.
+/// That made the 10-concurrent cap **per batch**, not shared — N overlapping
+/// batches allowed 10·N concurrent tools, contradicting the "shared semaphore"
+/// contract stated in prompts and code comments. On large sessions or when
+/// the runtime server multiplexes turns, this could saturate edge I/O or
+/// exhaust file descriptors.
+///
+/// The single process-wide instance below enforces the true cap across all
+/// batches, turns, and concurrent sessions sharing the same process.
+///
+/// Intended usage:
+///
+/// ```ignore
+/// let permit = shared_tool_semaphore().acquire_owned().await?;
+/// // run the tool, holding the permit
+/// ```
+pub fn shared_tool_semaphore() -> Arc<Semaphore> {
+    static CELL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    CELL.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TOOL_EXECUTIONS)))
+        .clone()
+}
 
 // ───────────────────────────── Tool Classification ──────────────────────
 
@@ -172,7 +197,7 @@ pub async fn execute_parallel_round(
     // Phase 1: Execute read-only tools in parallel
     let parallel_count = read_only.len();
     if !read_only.is_empty() {
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_READ_ONLY));
+        let semaphore = shared_tool_semaphore();
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, tc) in read_only {
