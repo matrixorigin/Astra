@@ -104,6 +104,8 @@ mod mock_llm;
 mod permission_manager;
 #[path = "cli/picker_echo.rs"]
 mod picker_echo;
+#[path = "cli/plan_auto_suggest.rs"]
+mod plan_auto_suggest;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]
@@ -687,19 +689,12 @@ async fn run_chat_repl(
                         let mut should_proceed_normal = true;
                         let line_for_plan = line.clone(); // Clone early to avoid borrow issues
                         if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
-                            eprintln!();
-                            eprintln!("{}  {}", "📋".yellow(), reason);
-                            eprintln!(
-                                "{}  This task might benefit from planning. Enter plan mode? (y/n)",
-                                "💡".cyan()
+                            let decision = plan_auto_suggest::prompt_auto_suggest(
+                                reason,
+                                plan_auto_suggest::DEFAULT_TIMEOUT,
                             );
-
-                            // Read user response
-                            let mut response = String::new();
-                            if std::io::stdin().read_line(&mut response).is_ok() {
-                                let resp = response.trim().to_lowercase();
-                                if resp == "y" || resp == "yes" || resp == "是" {
-                                    // Enter plan mode with the goal
+                            match decision {
+                                plan_auto_suggest::AutoSuggestDecision::Accepted => {
                                     let project_root = std::env::current_dir()
                                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                     let context = plan_decompose::analyze_project(&project_root);
@@ -709,7 +704,6 @@ async fn run_chat_repl(
                                         context,
                                     );
 
-                                    eprintln!();
                                     eprintln!(
                                         "{}  Entering plan mode for: {}",
                                         "📋".green(),
@@ -717,11 +711,9 @@ async fn run_chat_repl(
                                     );
                                     eprintln!("{}  Generating plan...", "⋯".dim());
 
-                                    // Trigger plan generation (set goal, plan will be generated in plan mode)
                                     state.plan_mode = Some(plan_state);
                                     should_proceed_normal = false;
 
-                                    // Call handle_plan_mode_input to generate the plan
                                     handle_plan_mode_input(
                                         line_for_plan,
                                         current_token.as_deref(),
@@ -729,8 +721,12 @@ async fn run_chat_repl(
                                         api,
                                     )
                                     .await?;
-                                } else {
-                                    eprintln!("{}  Proceeding with normal chat...", "→".dim());
+                                }
+                                plan_auto_suggest::AutoSuggestDecision::Declined
+                                | plan_auto_suggest::AutoSuggestDecision::TimedOut
+                                | plan_auto_suggest::AutoSuggestDecision::Interrupted => {
+                                    // Fall through to normal chat. Decision banner
+                                    // already printed by prompt_auto_suggest.
                                 }
                             }
                         }
