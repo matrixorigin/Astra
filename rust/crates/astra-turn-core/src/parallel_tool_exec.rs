@@ -264,8 +264,12 @@ pub async fn execute_parallel_round(
     // commit → push) where later steps become meaningless once an earlier
     // one fails, and continuing can partially apply destructive state.
     let sequential_count = mutating.len();
+    let mut mutating_executed: usize = 0;
+    let mut aborted_count: usize = 0;
+    let mut trigger_tool: Option<String> = None;
+    let mut trigger_position: Option<usize> = None;
 
-    for (idx, tc) in mutating {
+    for (mut_pos, (idx, tc)) in mutating.into_iter().enumerate() {
         if sibling_aborted {
             let call_id = tc
                 .get("id")
@@ -279,6 +283,7 @@ pub async fn execute_parallel_round(
                 .or_else(|| tc.get("name").and_then(|n| n.as_str()))
                 .unwrap_or("")
                 .to_string();
+            aborted_count += 1;
             results[idx] = Some(ToolExecResult {
                 original_index: idx,
                 call_id,
@@ -290,10 +295,13 @@ pub async fn execute_parallel_round(
         }
 
         let (call_id, tool_name, content, success) = executor(tc.clone()).await;
+        mutating_executed += 1;
 
         // Sibling abort: any mutating-tool failure aborts remaining siblings.
         if !success {
             sibling_aborted = true;
+            trigger_tool = Some(tool_name.clone());
+            trigger_position = Some(mut_pos);
         }
 
         results[idx] = Some(ToolExecResult {
@@ -304,6 +312,25 @@ pub async fn execute_parallel_round(
             success,
         });
     }
+
+    // Structured signal for the "signals to watch" section of
+    // docs/design/sibling-abort-policy.md. One event per round lets log
+    // aggregation answer: how often are mutating batches ≥ 2? which tool
+    // triggers aborts? at what position (early vs late) does the trigger
+    // sit in the queue?
+    tracing::info!(
+        target: "astra::parallel_tool_exec::round",
+        parallel_count,
+        sequential_count,
+        mutating_executed,
+        aborted_count,
+        sibling_aborted,
+        trigger_tool = trigger_tool.as_deref().unwrap_or(""),
+        trigger_position = trigger_position
+            .map(|p| p as i64)
+            .unwrap_or(-1),
+        "parallel_tool_exec round completed"
+    );
 
     ParallelRoundOutcome {
         results: results.into_iter().flatten().collect(),
