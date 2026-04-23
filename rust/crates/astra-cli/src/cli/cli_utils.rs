@@ -570,6 +570,42 @@ pub(super) fn urlencoding(s: &str) -> String {
         .collect()
 }
 
+/// Read current git HEAD (short SHA) and branch name for journal git snapshots.
+///
+/// `cwd` should be the session's `git_root` so the snapshot reflects the
+/// correct repo even if the process cwd differs. Falls back to process cwd
+/// when `None`.
+///
+/// Returns `(git_head, git_branch)` — either or both may be `None` if not in a
+/// git repo or in detached HEAD state (branch will be None).
+pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>) {
+    let mut head_cmd = std::process::Command::new("git");
+    head_cmd.args(["rev-parse", "--short", "HEAD"]);
+    if let Some(dir) = cwd {
+        head_cmd.current_dir(dir);
+    }
+    let head = head_cmd
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut branch_cmd = std::process::Command::new("git");
+    branch_cmd.args(["symbolic-ref", "--short", "HEAD"]);
+    if let Some(dir) = cwd {
+        branch_cmd.current_dir(dir);
+    }
+    let branch = branch_cmd
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    (head, branch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,5 +985,53 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "credentials.json must be 0600, got {mode:o}");
         }
+    }
+
+    #[test]
+    fn git_snapshot_returns_head_and_branch_in_git_repo() {
+        // This test runs inside the astra git repo, so both should be Some.
+        let (head, _branch) = super::git_snapshot(None);
+        assert!(
+            head.is_some(),
+            "git_snapshot must return Some(head) inside a git repo"
+        );
+        let h = head.unwrap();
+        assert!(
+            h.len() >= 7 && h.len() <= 40,
+            "git HEAD should be 7-40 chars, got {}: '{h}'",
+            h.len()
+        );
+        // branch may be None in CI detached HEAD, so we only check head is valid hex
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit()),
+            "git HEAD must be hex, got '{h}'"
+        );
+    }
+
+    #[test]
+    fn git_snapshot_with_explicit_cwd_matches_none() {
+        // Passing the current dir explicitly should give the same result as None.
+        let cwd = std::env::current_dir().unwrap();
+        let (head_none, branch_none) = super::git_snapshot(None);
+        let (head_cwd, branch_cwd) = super::git_snapshot(Some(cwd.to_str().unwrap()));
+        assert_eq!(head_none, head_cwd, "explicit cwd must match implicit cwd");
+        assert_eq!(
+            branch_none, branch_cwd,
+            "explicit cwd must match implicit cwd"
+        );
+    }
+
+    #[test]
+    fn git_snapshot_with_non_git_dir_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (head, branch) = super::git_snapshot(Some(tmp.path().to_str().unwrap()));
+        assert!(
+            head.is_none(),
+            "non-git dir must return None for head, got {head:?}"
+        );
+        assert!(
+            branch.is_none(),
+            "non-git dir must return None for branch, got {branch:?}"
+        );
     }
 }

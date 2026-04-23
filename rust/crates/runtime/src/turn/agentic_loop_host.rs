@@ -6727,6 +6727,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")

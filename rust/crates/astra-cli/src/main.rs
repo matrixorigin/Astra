@@ -684,15 +684,8 @@ async fn run_chat_repl(
                         // Auto plan detection: suggest plan mode for complex tasks
                         let mut should_proceed_normal = true;
                         let line_for_plan = line.clone(); // Clone early to avoid borrow issues
-                        // P2: classify both kinds — analytical inputs now route
-                        // through the research-plan generator instead of being
-                        // suppressed.
-                        if let Some(suggestion) = plan_decompose::classify_plan_suggestion(&line) {
-                            let kind_label = match suggestion.kind {
-                                plan_decompose::PlanKind::Executable => "execution plan",
-                                plan_decompose::PlanKind::Analytical => "research plan",
-                            };
-                            let banner = format!("{} ({})", suggestion.reason, kind_label);
+                        if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
+                            let banner = format!("{reason} (execution plan)");
                             let decision = plan_auto_suggest::prompt_auto_suggest(
                                 &banner,
                                 plan_auto_suggest::DEFAULT_TIMEOUT,

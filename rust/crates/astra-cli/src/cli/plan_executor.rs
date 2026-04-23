@@ -1409,6 +1409,17 @@ async fn plan_executor_task(
                         .with_tool_calls(result.tool_call_records.clone())
                         .with_ttft(result.ttft_ms);
                         turn_event.llm_rounds = result.llm_rounds;
+                        // Attach per-turn git snapshot.
+                        let git_root = ctx
+                            .session_id
+                            .as_deref()
+                            .and_then(|sid| {
+                                astra_services::session_workspace::read_workspace(sid).ok()
+                            })
+                            .and_then(|ws| ws.git_root);
+                        let (git_head, git_branch) =
+                            super::cli_utils::git_snapshot(git_root.as_deref());
+                        turn_event = turn_event.with_git_snapshot(git_head, git_branch);
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 
