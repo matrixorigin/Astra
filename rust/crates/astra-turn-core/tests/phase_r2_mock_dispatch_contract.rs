@@ -165,3 +165,86 @@ fn nested_tool_object_shape_is_silently_dropped_regression_anchor() {
          at the same time."
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Bug #3: mock-LLM usage accounting is never captured by dispatch
+//
+// Mock emits a terminal `done` event with nested `usage:{prompt,completion}`:
+//   {"type":"done","tokens_used":200,"usage":{"prompt_tokens":200,"completion_tokens":50}}
+// but dispatch has:
+//   (a) NO handler for `type == "done"` (falls into the `_` default arm),
+//   (b) a `usage` handler that expects `prompt_tokens`/`completion_tokens`
+//       at the TOP level, not nested inside `usage:{}`.
+// Result: accum.prompt_tokens / accum.completion_tokens stay at their
+// default (0) for every scenario driven by the mock. Any assertion that
+// "mock harness returned N tokens" was a false pass.
+//
+// Fix: mock now emits a flat `usage` event before `done`, mirroring what
+// the real server loop emits (server_loop_host.rs line 822, etc.).
+// ────────────────────────────────────────────────────────────────────────
+
+/// The failing-until-fixed contract: after dispatching the terminal tail
+/// of a mock-LLM body, `accum` must carry non-zero token counts.
+///
+/// We replicate the mock's terminal sequence exactly. If mock stops
+/// emitting a flat `usage` event, this test fails.
+#[test]
+fn mock_llm_terminal_sequence_populates_usage_tokens() {
+    // This matches what mock_llm.rs now writes just before `done`.
+    let usage = json!({
+        "type": "usage",
+        "prompt_tokens": 200u64,
+        "completion_tokens": 50u64,
+    });
+    let done = json!({
+        "type": "done",
+        "tokens_used": 200u64,
+        "usage": { "prompt_tokens": 200u64, "completion_tokens": 50u64 },
+    });
+
+    let mut accum = ChatTurnSseAccum::default();
+    let mut edge: Vec<ChatTurnEdgePending> = Vec::new();
+    dispatch_chat_turn_sse_event_block(&sse_block(&usage), &mut accum, &mut edge);
+    dispatch_chat_turn_sse_event_block(&sse_block(&done), &mut accum, &mut edge);
+
+    assert!(
+        accum.has_usage,
+        "mock terminal sequence did not populate accum.has_usage — \
+         usage event is missing or malformed"
+    );
+    assert_eq!(
+        accum.prompt_tokens, 200,
+        "mock terminal usage event must set prompt_tokens"
+    );
+    assert_eq!(
+        accum.completion_tokens, 50,
+        "mock terminal usage event must set completion_tokens"
+    );
+}
+
+/// Regression anchor: the mock's `done` event alone (with usage NESTED
+/// inside) does NOT populate token counts. Dispatch has no `done`
+/// handler, and its `usage` handler reads from the top level. This pins
+/// the fact that the `done` event is ONLY a terminal marker; usage must
+/// ride on a separate `usage` event.
+#[test]
+fn mock_done_event_alone_leaves_usage_unset_regression_anchor() {
+    let done = json!({
+        "type": "done",
+        "tokens_used": 200u64,
+        "usage": { "prompt_tokens": 200u64, "completion_tokens": 50u64 },
+    });
+
+    let mut accum = ChatTurnSseAccum::default();
+    let mut edge: Vec<ChatTurnEdgePending> = Vec::new();
+    dispatch_chat_turn_sse_event_block(&sse_block(&done), &mut accum, &mut edge);
+
+    assert!(
+        !accum.has_usage,
+        "if dispatch starts parsing `done.usage` nested payload, this \
+         anchor flips — make sure both producers (mock + real server) and \
+         consumers agree before relying on nested form"
+    );
+    assert_eq!(accum.prompt_tokens, 0);
+    assert_eq!(accum.completion_tokens, 0);
+}

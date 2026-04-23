@@ -166,11 +166,25 @@ fn tool_result(call_id: &str, result: &str) -> String {
 }
 
 fn done_event(tokens: u64) -> String {
-    sse_line(&serde_json::json!({
+    // Emit a FLAT `usage` event first (matching the real server at
+    // server_loop_host.rs line 822 and ws_handler.rs line 2505), THEN
+    // the terminal `done` event. Dispatch has no handler for `done` —
+    // tokens ride on the `usage` event only.
+    //
+    // Regression anchor: phase_r2_mock_dispatch_contract::
+    //   mock_llm_terminal_sequence_populates_usage_tokens
+    //   mock_done_event_alone_leaves_usage_unset_regression_anchor
+    let usage = sse_line(&serde_json::json!({
+        "type": "usage",
+        "prompt_tokens": tokens,
+        "completion_tokens": 50u64,
+    }));
+    let done = sse_line(&serde_json::json!({
         "type": "done",
         "tokens_used": tokens,
         "usage": { "prompt_tokens": tokens, "completion_tokens": 50 },
-    }))
+    }));
+    format!("{usage}{done}")
 }
 
 fn error_event(msg: &str) -> String {
