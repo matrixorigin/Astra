@@ -15,11 +15,11 @@
 
 | Command | Description |
 | --- | --- |
-| `make test` | `test-offline` + `test-online` (Rust + `@astra/sdk`; see below) |
+| `make test` | `test-offline` + `test-online` (see rows below; SDK **remote** E2E only if `ASTRA_SDK_ONLINE_E2E=1`) |
 | `make test-offline` | Rust: workspace + `bridge-e2e-hooks`. JS SDK (`packages/sdk`): `typecheck`, `ASTRA_SDK_E2E=1` Jest with coverage (unit + in-process Mode A), `build` |
-| `make test-online` | Rust: astra-runtime `#[ignore]` tests + Matrix / services ignored suites. JS SDK: Jest against `ASTRA_SDK_BASE_URL` (default `http://127.0.0.1:${API_PORT:-8000}` from `.env`) + `npm run test:online` — **requires a running API** (e.g. `make dev-start`) and `make dev-deps-up` for Rust DB-backed tests |
+| `make test-online` | Rust: astra-runtime `#[ignore]` + Matrix / services ignored suites (needs **live DB** e.g. `dev-deps` in CI). **JS SDK** remote Jest/smoke runs **only** when `ASTRA_SDK_ONLINE_E2E=1` (and a live API, e.g. `make dev-start`); otherwise skipped so CI does not need HTTP on :8000 |
 | `make test-sdk-offline` | `@astra/sdk` only — same SDK steps as the SDK portion of `test-offline` |
-| `make test-sdk-online` | `@astra/sdk` only — Jest remote integration + `test:online` smoke; **requires a running API** |
+| `make test-sdk-online` | `@astra/sdk` only — Jest remote integration + `test:online` smoke; **requires a running API**; also invoked from `test-online` when `ASTRA_SDK_ONLINE_E2E=1` |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
 
 ## Static Checks

@@ -27,11 +27,11 @@ help:
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - test-offline + test-online (MatrixOne for Rust online; + @astra/sdk needs API for SDK online part)"
+	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (typecheck, Jest+coverage+Mode A in-process, build)"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E + @astra/sdk (Jest Mode B + smoke; need live API, e.g. make dev-start)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (set ASTRA_SDK_ONLINE_E2E=1 + API to also run make test-sdk-online)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
-	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; invoked by test-offline / test-online)"
+	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
@@ -495,7 +495,7 @@ test-ignored-integration:
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
-# @astra/sdk: Jest Mode B + npm run test:online (needs running API, default http://127.0.0.1:API_PORT).
+# @astra/sdk remote E2E is opt-in (ASTRA_SDK_ONLINE_E2E=1) so CI make test-online has no API on :8000.
 .PHONY: test-online
 test-online:
 	@if [ ! -f .env ]; then \
@@ -505,7 +505,11 @@ test-online:
 	@echo "Running astra-runtime ignored unit tests (live DB)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored
 	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
-	@$(MAKE) test-sdk-online
+	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
+		$(MAKE) test-sdk-online; \
+	else \
+		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
+	fi
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline
