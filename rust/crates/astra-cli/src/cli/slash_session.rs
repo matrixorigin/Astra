@@ -4431,7 +4431,6 @@ fn reset_state_for_session_restore(state: &mut ReplState) {
     state.last_turn_interrupted = false;
     state.last_turn_event = None;
     state.plan_execution_corrections.clear();
-    state.plan_resume_pending = false;
     state.pending_approval = None;
     state.plan_in_token_stream = false;
     state.plan_md_renderer = None;

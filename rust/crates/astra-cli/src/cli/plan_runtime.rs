@@ -3,7 +3,6 @@
 use crate::durable_bridge;
 use crate::plan_executor;
 use crate::plan_interaction;
-use crate::plan_monitor::run_blocking_plan_monitor;
 use crate::repl_runtime::create_background_plan_selector;
 use crate::repl_state::ReplState;
 use crate::theme;
@@ -35,16 +34,16 @@ pub(crate) fn build_learning_bridge(
 
 /// Extract a [`BackgroundPlanContext`] from the current REPL state.
 ///
-/// Moves the active plan, durable task state, and corrections out of `state`
-/// (using `take()`), and clones the remaining fields needed by the background
-/// executor. On success `state.executing_plan` will be `None`.
+/// Clones the active plan for the background executor, moves durable task state
+/// and corrections out of `state`, and leaves an in-memory copy behind so
+/// `/plan status` can keep reporting progress after plan mode exits.
 fn take_plan_context(
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
     current_token: Option<&str>,
     profile: Option<&str>,
 ) -> Result<plan_executor::BackgroundPlanContext, String> {
-    let plan = state.executing_plan.take().ok_or("No plan to execute")?;
+    let plan = state.executing_plan.clone().ok_or("No plan to execute")?;
     let token = current_token
         .ok_or("Not logged in — cannot start background plan")?
         .to_string();
@@ -102,12 +101,12 @@ fn create_background_selector(
     create_background_plan_selector(ctx)
 }
 
-/// Spawn a plan executor, then block until it finishes, pauses, or errors.
+/// Spawn a plan executor and return immediately to the normal REPL prompt.
 ///
-/// The executor runs as a `tokio` task; this function enters a monitoring
-/// loop that displays progress in real-time, handles Ctrl-C (→ pause), and
-/// resolves approval prompts inline. The REPL prompt is not shown until
-/// this function returns.
+/// The executor runs as a `tokio` task. Progress is rendered between prompts
+/// by [`crate::plan_monitor::flush_plan_updates_between_prompts`], while the
+/// in-memory `executing_plan` copy keeps `/plan status` useful from normal
+/// chat after plan mode exits.
 pub(crate) async fn start_and_monitor_plan(
     state: &mut ReplState,
     current_token: Option<&str>,
@@ -128,9 +127,11 @@ pub(crate) async fn start_and_monitor_plan(
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 
-    eprintln!("  {} {}", "▸".bold().cyan(), "Plan executing…".bold());
-
-    run_blocking_plan_monitor(state).await;
+    eprintln!(
+        "  {} {}",
+        "▸".bold().cyan(),
+        "Plan executing in background — use /plan status to inspect progress.".bold()
+    );
 
     Ok(())
 }

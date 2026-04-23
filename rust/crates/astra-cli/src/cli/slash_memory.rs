@@ -2289,14 +2289,18 @@ fn handle_plan_status(state: &ReplState) {
 }
 
 fn handle_plan_pause(state: &mut ReplState) {
-    if state.executing_plan.is_some() {
-        // Signal the running plan to pause after current subtask
-        // Currently, plan execution is synchronous, so this just sets a flag
-        // that run_plan_execution checks between subtasks.
-        state.last_turn_interrupted = true;
+    if let Some(ref handle) = state.plan_handle {
+        match handle.send_command(crate::plan_executor::PlanCommand::Pause) {
+            Ok(()) => eprintln!(
+                "  {} Pause requested. The background run will stop after the current subtask.",
+                "⏸".yellow()
+            ),
+            Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
+        }
+    } else if state.executing_plan.is_some() {
         eprintln!(
-            "  {} Pause requested. Plan will pause after current subtask completes.",
-            "⏸".yellow()
+            "  {} No live executor is attached right now. Use 'continue' to restart the plan run.",
+            theme::icon_warn()
         );
     } else {
         eprintln!("  {} No plan is currently executing.", theme::icon_warn());
