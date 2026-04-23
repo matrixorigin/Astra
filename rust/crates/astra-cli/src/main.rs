@@ -275,7 +275,7 @@ pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, Ver
 use idle_agent_messages::drain_root_mailbox_into_idle_queue;
 use plan_monitor::{
     finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
-    run_blocking_plan_monitor, sync_plan_run_task_progress,
+    sync_plan_run_task_progress,
 };
 pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
 pub(crate) use plan_runtime::build_learning_bridge;
@@ -557,12 +557,11 @@ async fn run_chat_repl(
                                 .await?;
                             }
                             Err(e) => {
-                                state.plan_resume_pending = false;
                                 return Err(e);
                             }
                         }
 
-                        // If plan execution was just triggered, start the executor (blocking).
+                        // If plan execution was just triggered, start the background executor.
                         if state.executing_plan.is_some() {
                             start_and_monitor_plan(
                                 &mut state,
@@ -571,10 +570,6 @@ async fn run_chat_repl(
                                 profile,
                             )
                             .await?;
-                        } else if state.plan_resume_pending {
-                            // Resume was sent to a paused executor — re-enter blocking monitor.
-                            state.plan_resume_pending = false;
-                            run_blocking_plan_monitor(&mut state).await;
                         }
                     } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
                         && plan_decompose::is_resume_command(&line)
@@ -590,8 +585,6 @@ async fn run_chat_repl(
                                     Some(std::mem::take(&mut state.plan_execution_corrections))
                                 },
                             });
-                            // Re-enter blocking monitor until done/paused/error
-                            run_blocking_plan_monitor(&mut state).await;
                         } else {
                             start_and_monitor_plan(
                                 &mut state,

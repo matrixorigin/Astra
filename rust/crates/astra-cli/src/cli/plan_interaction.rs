@@ -1330,7 +1330,6 @@ pub async fn handle_plan_mode_input(
         }
         state.plan_handle = None;
         state.plan_mode = None;
-        state.plan_resume_pending = false;
         state.executing_plan = None;
         eprintln!(
             "  {} Plan abandoned. Sending as normal chat...",
@@ -1705,9 +1704,8 @@ async fn handle_plan_command(
                     "⚙".cyan()
                 );
                 eprintln!(
-                    "  {} Prompt shows {} while the run is active.",
+                    "  {} The run continues in background; approvals and status stay available on the normal prompt.",
                     "→".dim(),
-                    "plan*[…]>".yellow()
                 );
                 eprintln!();
             }
@@ -1812,6 +1810,15 @@ async fn handle_plan_command(
             state.plan_execution_rounds = 0;
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);
+            state.plan_mode = None;
+            state.chat_plan_only = false;
+            state.pending_plan_resume_digest = None;
+            PlanModeState::clear_saved_state();
+            eprintln!(
+                "  {} Left plan mode — execution is now running in background. Use {} to inspect it.",
+                "←".cyan(),
+                "/plan status".cyan()
+            );
         }
 
         PlanCommand::Resume => {
@@ -1825,8 +1832,11 @@ async fn handle_plan_command(
                 match handle.send_command(crate::plan_executor::PlanCommand::Resume { corrections })
                 {
                     Ok(()) => {
-                        eprintln!("  {} Resuming plan execution...", "▶".cyan());
-                        state.plan_resume_pending = true;
+                        eprintln!(
+                            "  {} Resuming plan execution in background. Use {} for progress.",
+                            "▶".cyan(),
+                            "/plan status".cyan()
+                        );
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
@@ -2928,6 +2938,37 @@ mod tests {
         assert!(
             state.plan_handle.is_none(),
             "plain chat should clear the paused executor handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_exits_plan_mode_and_leaves_background_state() {
+        let mut state = ReplState::default();
+        state.chat_plan_only = true;
+        let mut ps = plan::PlanModeState::new("goal".into(), plan::ProjectContext::default());
+        ps.plan.subtasks.push(SubtaskPlan {
+            id: "s1".into(),
+            title: "one".into(),
+            ..Default::default()
+        });
+        state.plan_mode = Some(ps);
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("go".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, PlanInputResult::Handled));
+        assert!(state.plan_mode.is_none(), "execute should leave plan mode");
+        assert!(
+            state.executing_plan.is_some(),
+            "execute should preserve plan for background status"
+        );
+        assert_eq!(state.executing_plan_goal.as_deref(), Some("goal"));
+        assert!(
+            !state.chat_plan_only,
+            "execute should restore normal chat after leaving plan mode"
         );
     }
 

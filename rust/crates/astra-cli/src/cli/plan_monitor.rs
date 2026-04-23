@@ -279,6 +279,11 @@ fn display_plan_updates_live(
                 continue;
             }
             PlanUpdate::SubtaskStatusSync { id, status } => {
+                if let Some(ref mut plan) = state.executing_plan {
+                    if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == id) {
+                        st.status = status;
+                    }
+                }
                 if let Some(ref mut ps) = state.plan_mode {
                     if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == id) {
                         st.status = status;
@@ -969,15 +974,60 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut ReplStat
     }
 }
 
-/// Update the plan_mode's subtask status to keep it in sync with the executor.
+/// Update all in-memory plan copies so background execution stays observable
+/// after plan mode exits.
 fn sync_subtask_status(
     state: &mut ReplState,
     subtask_id: &str,
     status: astra_services::task_orchestrator::TaskStatus,
 ) {
+    if let Some(ref mut plan) = state.executing_plan {
+        if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
+            st.status = status;
+        }
+    }
     if let Some(ref mut ps) = state.plan_mode {
         if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
             st.status = status;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
+
+    #[test]
+    fn flush_plan_updates_syncs_status_into_executing_plan() {
+        let mut state = ReplState::default();
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::SubtaskStatusSync {
+            id: "s1".into(),
+            status: TaskStatus::InProgress,
+        });
+
+        let terminal = flush_plan_updates_between_prompts(&mut state);
+        assert!(!terminal);
+        assert_eq!(
+            state
+                .executing_plan
+                .as_ref()
+                .expect("plan retained")
+                .subtasks[0]
+                .status,
+            TaskStatus::InProgress
+        );
     }
 }
