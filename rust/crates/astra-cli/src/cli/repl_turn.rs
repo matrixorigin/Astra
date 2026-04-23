@@ -1255,7 +1255,12 @@ fn commit_turn_journal_workspace_and_sidecars(
 
         // Attach per-turn git snapshot for rewind/fork/sync lineage.
         {
-            let (git_head, git_branch) = super::cli_utils::git_snapshot();
+            let git_root = state
+                .session_id
+                .as_deref()
+                .and_then(|sid| astra_services::session_workspace::read_workspace(sid).ok())
+                .and_then(|ws| ws.git_root);
+            let (git_head, git_branch) = super::cli_utils::git_snapshot(git_root.as_deref());
             turn_event = turn_event.with_git_snapshot(git_head, git_branch);
         }
 
