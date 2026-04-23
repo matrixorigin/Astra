@@ -4149,6 +4149,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         &app,
         json!({
             "message": "inspect the project files",
+            "max_candidates": 10,
             "context": {
                 "test_llm_rounds": [
                     {
