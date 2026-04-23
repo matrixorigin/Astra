@@ -746,4 +746,24 @@ mod tests {
 
         assert!(err.contains("recursion depth 3 reached maximum 3"));
     }
+
+    // ── Phase-R10 adversarial contract pins (CLI-side constants) ────────
+    //
+    // These pin the exact values of [`SUBRUN_MAX_TURNS`] and
+    // [`SUBRUN_MAX_CUMULATIVE_TOKENS`] so silent drift (e.g. a typo
+    // bumping 25→35 or 120_000→12_000) breaks this test loudly.
+    // The server-side equivalents are pinned in
+    // `rust/crates/astra-cli/tests/phase_r10_skill_subrun_contracts.rs`
+    // via the now-`pub` constants in
+    // [`astra_runtime::server::server_skill_subrun`].
+
+    #[test]
+    fn cli_subrun_max_turns_is_exactly_25() {
+        assert_eq!(SUBRUN_MAX_TURNS, 25);
+    }
+
+    #[test]
+    fn cli_subrun_max_cumulative_tokens_is_exactly_120_000() {
+        assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
+    }
 }

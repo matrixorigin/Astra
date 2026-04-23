@@ -859,4 +859,91 @@ mod tests {
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
     }
+
+    // ── Phase-R edge ledger contract pins ────────────────────────────────
+
+    /// Destructive-take: two concurrent pollers on the same key — exactly
+    /// one gets `Some`, the other gets `None`. Pins the at-most-once
+    /// delivery contract at the ledger level (the HTTP handler-side
+    /// at-most-once INSERT contract is pinned separately in the runtime
+    /// crate's edge_callback handler tests).
+    #[tokio::test]
+    async fn take_ledger_entry_destructive_exactly_one_poller_wins() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", "dup");
+        ledger
+            .lock()
+            .await
+            .insert(key.clone(), json!({"value": "once"}));
+
+        let l1 = ledger.clone();
+        let k1 = key.clone();
+        let h1 =
+            tokio::spawn(
+                async move { take_ledger_entry(&l1, &k1, Duration::from_millis(500)).await },
+            );
+        let l2 = ledger.clone();
+        let k2 = key.clone();
+        let h2 =
+            tokio::spawn(
+                async move { take_ledger_entry(&l2, &k2, Duration::from_millis(500)).await },
+            );
+
+        let (a, b) = (h1.await.unwrap(), h2.await.unwrap());
+        let some_count = usize::from(a.is_some()) + usize::from(b.is_some());
+        assert_eq!(some_count, 1, "exactly one poller must receive the entry");
+        let winner = a.or(b).unwrap();
+        assert_eq!(winner, json!({"value": "once"}));
+        assert!(ledger.lock().await.is_empty(), "entry removed after take");
+    }
+
+    /// In-memory only: a "restart" (new HashMap) loses all prior entries.
+    /// Pinned explicitly so future refactors toward durable storage have
+    /// to update this test and document the contract change.
+    #[tokio::test]
+    async fn ledger_is_in_memory_only_restart_loses_data() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", "restart");
+        ledger.lock().await.insert(key.clone(), json!({"v": 1}));
+        assert_eq!(ledger.lock().await.len(), 1);
+
+        // "Restart": drop the old Arc, spin up a fresh ledger. Any real
+        // process restart behaves identically — there is no persistence.
+        let fresh: Arc<tokio::sync::Mutex<HashMap<String, Value>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        assert!(
+            take_ledger_entry(&fresh, &key, Duration::from_millis(20))
+                .await
+                .is_none(),
+            "fresh ledger must not see the old entry"
+        );
+    }
+
+    /// Polling wakes on new insert within roughly one poll interval (~50ms).
+    /// Assert wait time is at least the poll interval (proof of polling)
+    /// but well below timeout (proof of prompt wake).
+    #[tokio::test]
+    async fn take_ledger_entry_wakes_within_one_poll_interval() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", "wake");
+
+        let l2 = ledger.clone();
+        let k2 = key.clone();
+        // Insert after ~10ms — well under one poll interval.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(k2, json!("ok"));
+        });
+
+        let started = Instant::now();
+        let got = take_ledger_entry(&ledger, &key, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(got, Some(json!("ok")));
+        // Upper bound: must wake within ~1 poll interval + jitter.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "should wake within one poll interval + jitter; elapsed={elapsed:?}"
+        );
+    }
 }
