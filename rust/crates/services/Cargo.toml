@@ -32,6 +32,7 @@ dotenvy.workspace = true
 astra-core.workspace = true
 filetime = "0.2"
 serde_json.workspace = true
+serial_test = "3"
 sqlx.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

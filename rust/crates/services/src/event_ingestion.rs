@@ -36,6 +36,11 @@ pub struct IngestionConfig {
     pub channel_capacity: usize,
     /// Max retries per batch on transient errors.
     pub max_retries: u32,
+    /// When true, replace user-content fields (`content`) on outgoing
+    /// IngestionEvents with a privacy marker (`<redacted: len=N sha=...>`)
+    /// instead of the raw text. Default: `false` for backward compat;
+    /// callers that need PII-free cloud ingestion should opt in.
+    pub redact_content: bool,
 }
 
 impl Default for IngestionConfig {
@@ -45,8 +50,24 @@ impl Default for IngestionConfig {
             flush_interval_secs: 5,
             channel_capacity: 200,
             max_retries: 3,
+            redact_content: false,
         }
     }
+}
+
+/// Replace raw user content with a deterministic privacy marker.
+///
+/// The marker has the form `<redacted: len=N sha=HHHHHHHHHHHHHHHH>` where
+/// the suffix is a non-cryptographic 64-bit hash. It is used only for
+/// dedup/debugging when `IngestionConfig.redact_content` is enabled — not as
+/// a security primitive — so [`std::collections::hash_map::DefaultHasher`]
+/// is acceptable.
+pub fn redacted_content_marker(raw: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("<redacted: len={} sha={:016x}>", raw.len(), h.finish())
 }
 
 /// A journal event prepared for cloud ingestion.
@@ -119,6 +140,16 @@ impl IngestionEvent {
     /// - `user_id`: the authenticated user (not stored in journal events)
     /// - Generates a unique event_id from session_id + turn + event_type
     pub fn from_journal_event(event: &crate::session_journal::JournalEvent, user_id: &str) -> Self {
+        Self::from_journal_event_with_redact(event, user_id, false)
+    }
+
+    /// Like [`from_journal_event`] but optionally replaces the `content` field
+    /// with a deterministic privacy marker when `redact_content == true`.
+    pub fn from_journal_event_with_redact(
+        event: &crate::session_journal::JournalEvent,
+        user_id: &str,
+        redact_content: bool,
+    ) -> Self {
         let session_id = event
             .session_id
             .clone()
@@ -156,6 +187,11 @@ impl IngestionEvent {
             .clone()
             .or_else(|| event.error.clone())
             .or_else(|| event.stall_type.clone());
+        let content = if redact_content {
+            content.as_deref().map(redacted_content_marker)
+        } else {
+            content
+        };
 
         // Token usage as JSON
         let token_usage = match (event.tokens_in, event.tokens_out) {
@@ -207,7 +243,17 @@ impl IngestionEvent {
         event: &crate::session_journal::JournalEvent,
         user_id: &str,
     ) -> Vec<Self> {
-        let main_event = Self::from_journal_event(event, user_id);
+        Self::expand_journal_event_with_redact(event, user_id, false)
+    }
+
+    /// Like [`expand_journal_event`] but applies privacy redaction to both the
+    /// main event and any tool_call expansion content when enabled.
+    pub fn expand_journal_event_with_redact(
+        event: &crate::session_journal::JournalEvent,
+        user_id: &str,
+        redact_content: bool,
+    ) -> Vec<Self> {
+        let main_event = Self::from_journal_event_with_redact(event, user_id, redact_content);
         let session_id = main_event.session_id.clone();
         let uid = main_event.user_id.clone();
         let main_event_id = main_event.event_id.clone();
@@ -230,7 +276,7 @@ impl IngestionEvent {
                     format!("evt-{:016x}", hasher.finish())
                 };
 
-                let content = if tc.ok {
+                let raw_content = if tc.ok {
                     format!("{} completed in {}ms", tc.name, tc.ms)
                 } else {
                     format!(
@@ -239,6 +285,11 @@ impl IngestionEvent {
                         tc.ms,
                         tc.error.as_deref().unwrap_or("unknown error")
                     )
+                };
+                let content = if redact_content {
+                    redacted_content_marker(&raw_content)
+                } else {
+                    raw_content
                 };
 
                 let metadata = serde_json::json!({
@@ -710,6 +761,95 @@ mod tests {
         assert_eq!(config.flush_interval_secs, 5);
         assert_eq!(config.channel_capacity, 200);
         assert_eq!(config.max_retries, 3);
+        assert!(
+            !config.redact_content,
+            "redact_content default must be false for backward compat"
+        );
+    }
+
+    #[test]
+    fn redacted_content_marker_is_deterministic() {
+        let a = redacted_content_marker("hello world");
+        let b = redacted_content_marker("hello world");
+        assert_eq!(a, b);
+        assert!(a.contains("len=11"));
+        assert!(a.starts_with("<redacted: len=11 sha="));
+        assert!(a.ends_with('>'));
+        assert!(!a.contains("hello"));
+    }
+
+    #[test]
+    fn from_journal_event_with_redact_off_keeps_raw_content() {
+        let event = crate::session_journal::JournalEvent::turn(
+            Some("sess-r"),
+            1,
+            Some("gpt-4"),
+            "hello world",
+            "ok",
+            0,
+            10,
+            5,
+            100,
+        );
+        let ingestion = IngestionEvent::from_journal_event_with_redact(&event, "u1", false);
+        assert_eq!(ingestion.content.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn from_journal_event_with_redact_on_replaces_content_with_marker() {
+        let event = crate::session_journal::JournalEvent::turn(
+            Some("sess-r"),
+            1,
+            Some("gpt-4"),
+            "hello world",
+            "ok",
+            0,
+            10,
+            5,
+            100,
+        );
+        let ingestion = IngestionEvent::from_journal_event_with_redact(&event, "u1", true);
+        let content = ingestion.content.expect("content present");
+        assert!(!content.contains("hello world"));
+        assert!(content.starts_with("<redacted: len=11 sha="));
+    }
+
+    #[test]
+    fn expand_journal_event_with_redact_redacts_tool_call_content() {
+        use crate::session_journal::{JournalEvent, ToolCallRecord};
+        let mut event = JournalEvent::turn(
+            Some("sess-tc"),
+            1,
+            Some("gpt-4"),
+            "list files",
+            "done",
+            1,
+            10,
+            5,
+            100,
+        );
+        event.tool_calls = Some(vec![ToolCallRecord {
+            name: "shell".into(),
+            ok: true,
+            ms: 12,
+            ..Default::default()
+        }]);
+        let evs = IngestionEvent::expand_journal_event_with_redact(&event, "u1", true);
+        assert_eq!(evs.len(), 2);
+        let main = &evs[0];
+        assert!(
+            main.content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("<redacted:")
+        );
+        let tc = &evs[1];
+        assert!(
+            tc.content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("<redacted:")
+        );
     }
 
     #[test]
