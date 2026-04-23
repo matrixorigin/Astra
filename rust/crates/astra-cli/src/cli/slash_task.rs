@@ -305,6 +305,7 @@ pub(super) async fn handle_task_command(
                     observability_hub: bg_observability_hub.clone(),
                     observability_session: bg_observability_session.clone(),
                     file_journal: None,
+                    file_state: None,
                     database_snapshot_journal: None,
                     git_stash_journal: None,
                     git_commit_journal: None,

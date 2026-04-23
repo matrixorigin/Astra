@@ -1771,6 +1771,7 @@ Follow these steps:
                 observability_hub: state.observability_hub.clone(),
                 observability_session: state.observability_session.clone(),
                 file_journal: Some(state.file_journal.clone()),
+                file_state: Some(state.file_state.clone()),
                 database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
                 git_stash_journal: Some(state.git_stash_journal.clone()),
                 git_commit_journal: Some(state.git_commit_journal.clone()),

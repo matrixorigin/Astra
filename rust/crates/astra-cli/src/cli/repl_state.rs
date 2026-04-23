@@ -72,6 +72,9 @@ pub(crate) struct ReplState {
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
     pub file_journal:
         std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    /// Session-scoped file-state cache — shared with ToolExecutors so
+    /// read-before-write tracking persists across turns.
+    pub file_state: crate::edge_tools::SharedFileState,
     /// Session-scoped MatrixOne snapshot journal — shared with ToolExecutors for
     /// bounded database rollback support across turns.
     pub database_snapshot_journal:
@@ -317,6 +320,9 @@ impl Default for ReplState {
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
             )),
+            file_state: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),

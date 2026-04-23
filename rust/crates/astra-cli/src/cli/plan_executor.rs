@@ -717,6 +717,9 @@ pub(super) struct BackgroundPlanContext {
     >,
     pub file_journal:
         Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    /// Session-scoped file-state cache — shared across subtask turns so
+    /// read-before-write tracking persists.
+    pub file_state: crate::edge_tools::SharedFileState,
     pub database_snapshot_journal:
         Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
     pub git_stash_journal: Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
@@ -1362,6 +1365,7 @@ async fn plan_executor_task(
                     observability_hub: ctx.observability_hub.clone(),
                     observability_session: ctx.observability_session.clone(),
                     file_journal: Some(ctx.file_journal.clone()),
+                    file_state: Some(ctx.file_state.clone()),
                     database_snapshot_journal: Some(ctx.database_snapshot_journal.clone()),
                     git_stash_journal: Some(ctx.git_stash_journal.clone()),
                     git_commit_journal: Some(ctx.git_commit_journal.clone()),
@@ -1824,6 +1828,9 @@ mod tests {
             file_journal: Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
             )),
+            file_state: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             database_snapshot_journal: Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),

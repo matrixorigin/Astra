@@ -117,6 +117,12 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        // Wire session-scoped file-state cache for cross-subtask read-before-write
+        let ex = if let Some(ref state) = p.file_state {
+            ex.with_shared_file_state(state.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(ref journal) = p.database_snapshot_journal {
             ex.with_shared_database_snapshot_journal(journal.clone())
         } else {

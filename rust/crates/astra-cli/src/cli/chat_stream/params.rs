@@ -125,6 +125,9 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) file_journal: Option<
         std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
     >,
+    /// Session-scoped file-state cache — shared with ToolExecutors so
+    /// read-before-write tracking survives across plan subtask turns.
+    pub(crate) file_state: Option<crate::edge_tools::SharedFileState>,
     /// Session-scoped MatrixOne snapshot journal — shared with ToolExecutors for
     /// bounded database rollback support across turns.
     pub(crate) database_snapshot_journal: Option<
@@ -221,6 +224,7 @@ impl<'a> ChatTurnParams<'a> {
             observability_hub: None,
             observability_session: None,
             file_journal: None,
+            file_state: None,
             database_snapshot_journal: None,
             git_stash_journal: None,
             git_commit_journal: None,

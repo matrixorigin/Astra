@@ -1268,6 +1268,7 @@ pub(super) async fn handle_info_command(
                 observability_hub: state.observability_hub.clone(),
                 observability_session: state.observability_session.clone(),
                 file_journal: None,
+                file_state: None,
                 database_snapshot_journal: None,
                 git_stash_journal: None,
                 git_commit_journal: None,

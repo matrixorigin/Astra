@@ -76,6 +76,7 @@ fn take_plan_context(
         observability_hub: state.observability_hub.clone(),
         observability_session: state.observability_session.clone(),
         file_journal: state.file_journal.clone(),
+        file_state: state.file_state.clone(),
         database_snapshot_journal: state.database_snapshot_journal.clone(),
         git_stash_journal: state.git_stash_journal.clone(),
         git_commit_journal: state.git_commit_journal.clone(),

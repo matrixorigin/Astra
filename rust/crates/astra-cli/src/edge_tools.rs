@@ -90,6 +90,9 @@ pub(crate) use task_mgmt::TaskManager;
 mod web_search;
 use file_state::FileState;
 pub(crate) use file_state::ReadDedupKey;
+
+/// Shared file-state cache handle for cross-turn read-before-write tracking.
+pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
@@ -347,7 +350,7 @@ pub struct ToolExecutor {
     /// File state tracker: records mtime after each read/write/edit.
     /// Used for staleness detection (prevent overwriting user edits)
     /// and dedup (skip re-reading unchanged files).
-    file_state: std::sync::Mutex<HashMap<PathBuf, FileState>>,
+    file_state: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>,
     /// Per-turn aggregate tool output size (bytes). When this exceeds
     /// `AGGREGATE_OUTPUT_BUDGET`, subsequent tool outputs are truncated
     /// more aggressively.
@@ -450,7 +453,7 @@ impl ToolExecutor {
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_fail_count: std::sync::atomic::AtomicU32::new(0),
-            file_state: std::sync::Mutex::new(HashMap::new()),
+            file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             url_cache: std::sync::Mutex::new(HashMap::new()),
             passive_cargo_pending: AtomicBool::new(false),
@@ -573,6 +576,18 @@ impl ToolExecutor {
     ) -> Self {
         self.file_journal = journal;
         self
+    }
+
+    /// Use a shared file-state cache (session-scoped) so read-before-write
+    /// tracking survives across plan executor subtask turns.
+    pub fn with_shared_file_state(mut self, state: SharedFileState) -> Self {
+        self.file_state = state;
+        self
+    }
+
+    /// Return a clone of the shared file-state Arc for cross-turn sharing.
+    pub fn shared_file_state(&self) -> SharedFileState {
+        self.file_state.clone()
     }
 
     /// Use a shared MatrixOne snapshot journal (session-scoped) instead of the default.
