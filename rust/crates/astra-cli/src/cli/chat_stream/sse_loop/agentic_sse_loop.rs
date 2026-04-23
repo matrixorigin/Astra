@@ -134,7 +134,7 @@ where
     let mut tools_used = Vec::new();
     let mut tool_calls_count = 0u32;
     for record in tool_call_records {
-        if record.is_synthetic_placeholder() {
+        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
             continue;
         }
         tool_calls_count += 1;
@@ -341,6 +341,35 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn build_stream_result_excludes_blocked_tools_from_metrics() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.tool_calls_count = 3;
+        ctx.tools_used = HashSet::from([
+            "read_file".to_string(),
+            "bash".to_string(),
+        ]);
+        ctx.tool_call_records = vec![
+            // Blocked by restricted_tools policy — should be excluded
+            ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                error: Some("blocked_tool: Tool 'read_file' is currently restricted and cannot be executed.".into()),
+                ..Default::default()
+            },
+            // Normal successful call — should be included
+            tool_record("bash", true, Some("output")),
+        ];
+
+        let result = build_stream_result(ctx);
+
+        // read_file was blocked, so only bash should appear in tools_used
+        assert_eq!(result.tools_used, vec!["bash".to_string()]);
+        assert_eq!(result.tool_calls_count, 1);
     }
 
     #[test]

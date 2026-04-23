@@ -565,6 +565,18 @@ impl ToolCallRecord {
                 && result_preview.starts_with("Skill '")
                 && result_preview.contains(" was already loaded (turn "))
     }
+
+    /// True when this tool call was rejected by the pipeline before execution
+    /// (e.g. restricted_tools policy).  These calls should not count toward
+    /// `tools_used` for pattern learning — they never ran, so attributing
+    /// turn-level success/failure to them creates a self-reinforcing block loop.
+    pub fn was_blocked_by_policy(&self) -> bool {
+        !self.ok
+            && self
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("blocked_tool:"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5707,6 +5719,42 @@ mod tests {
         // Error message itself is system-generated, kept as-is.
         assert_eq!(evt.error.as_deref(), Some("boom"));
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+    }
+
+    #[test]
+    fn was_blocked_by_policy_detects_restricted_tool() {
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: false,
+            error: Some(
+                "blocked_tool: Tool 'read_file' is currently restricted and cannot be executed."
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(rec.was_blocked_by_policy());
+    }
+
+    #[test]
+    fn was_blocked_by_policy_ignores_normal_failures() {
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: false,
+            error: Some("Error: file not found".into()),
+            ..Default::default()
+        };
+        assert!(!rec.was_blocked_by_policy());
+    }
+
+    #[test]
+    fn was_blocked_by_policy_ignores_successful_calls() {
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: true,
+            error: None,
+            ..Default::default()
+        };
+        assert!(!rec.was_blocked_by_policy());
     }
 }
 

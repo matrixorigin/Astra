@@ -192,7 +192,7 @@ pub fn evaluate_tool_call_records(
     // success/quality verdict honest.
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| !record.is_synthetic_placeholder() && !record.was_blocked_by_policy())
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             repeat_key: record
@@ -288,7 +288,7 @@ pub fn build_turn_evaluation_journal_event(
         // the user-visible tool_call_count — they are audit-only records.
         tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| !r.is_synthetic_placeholder() && !r.was_blocked_by_policy())
             .count(),
         eval_signals_to_json(&eval.signals),
     )
