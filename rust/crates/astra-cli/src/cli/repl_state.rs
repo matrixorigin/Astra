@@ -221,10 +221,6 @@ pub(crate) struct ReplState {
     /// Set when the executor exits with [`PlanUpdate::PlanError`].
     pub plan_run_task_last_error: Option<String>,
 
-    /// Set by `handle_plan_command(Resume)` so the main loop re-enters
-    /// the blocking plan monitor after `handle_plan_mode_input` returns.
-    pub plan_resume_pending: bool,
-
     /// When Some, a plan-executor tool is waiting for user approval.
     /// In blocking mode this is handled inline; kept for edge-case fallback.
     pub pending_approval: Option<tokio::sync::oneshot::Sender<bool>>,
@@ -411,7 +407,6 @@ impl Default for ReplState {
             plan_run_task_id: None,
             plan_run_task_last_progress: None,
             plan_run_task_last_error: None,
-            plan_resume_pending: false,
             pending_approval: None,
             plan_in_token_stream: false,
             plan_md_renderer: None,

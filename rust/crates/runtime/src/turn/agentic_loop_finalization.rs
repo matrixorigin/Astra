@@ -969,11 +969,24 @@ mod tests {
 
     #[tokio::test]
     async fn round_budget_guidance_injected_at_threshold() {
-        // Simulate 5 tool rounds: the loop should inject guidance at round 3+.
+        // Simulate enough tool rounds to exceed ROUND_BUDGET_THRESHOLD (8).
+        // Use varied tool names to avoid the stall detector's duplicate-call
+        // force-stop interfering with the test.
+        let tool_names = [
+            "read_file",
+            "grep",
+            "bash",
+            "glob",
+            "read_file",
+            "grep",
+            "bash",
+            "glob",
+            "read_file",
+        ];
         let mut results = Vec::new();
-        for _ in 0..4 {
+        for name in &tool_names {
             results.push(edge_tool_result(
-                vec![make_edge_tool("read_file", "file content here")],
+                vec![make_edge_tool(name, "tool output")],
                 100,
                 20,
                 Some(10),
@@ -981,13 +994,15 @@ mod tests {
         }
         results.push(text_result("Final answer", 100, 50, Some(10)));
 
-        let mut host = MockHost::new(results).with_valid_tools(&["read_file"]);
+        let mut host =
+            MockHost::new(results).with_valid_tools(&["read_file", "grep", "bash", "glob"]);
         let mut state = make_state();
+        state.max_turns = 25;
+        state.remaining_turns = 25;
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Check that round budget guidance was injected into messages.
-        // After round 3 (ROUND_BUDGET_THRESHOLD), a user message with
+        // After ROUND_BUDGET_THRESHOLD rounds, a user message with
         // "Round Budget" or "Synthesize" should appear.
         let guidance_found = state.messages.iter().any(|m| {
             m.get("role").and_then(|r| r.as_str()) == Some("user")
@@ -998,15 +1013,8 @@ mod tests {
         });
         assert!(
             guidance_found,
-            "round budget guidance must be injected after {} rounds, messages: {:?}",
+            "round budget guidance must be injected after {} rounds",
             crate::prompts::ROUND_BUDGET_THRESHOLD,
-            state
-                .messages
-                .iter()
-                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-                .filter(|s| s.len() < 200)
-                .collect::<Vec<_>>()
         );
     }
 

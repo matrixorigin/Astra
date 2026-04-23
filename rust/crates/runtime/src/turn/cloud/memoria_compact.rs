@@ -312,6 +312,8 @@ impl HttpMemoriaClient {
             api_key,
             http: reqwest::Client::builder()
                 .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -2612,6 +2614,25 @@ mod tests {
             semantic_entries.is_empty(),
             "should not store semantic entries when disabled, got {}",
             semantic_entries.len()
+        );
+    }
+
+    /// audit-A3: HttpMemoriaClient must have connect_timeout and timeout so a
+    /// hung Memoria server cannot block the compaction pipeline indefinitely.
+    #[test]
+    fn memoria_compact_client_has_timeout() {
+        let source = include_str!("memoria_compact.rs");
+        let fn_start = source
+            .find("pub fn new(base_url: String, api_key: String)")
+            .expect("HttpMemoriaClient::new must exist");
+        let body = &source[fn_start..fn_start + 400];
+        assert!(
+            body.contains("connect_timeout("),
+            "HttpMemoriaClient must set connect_timeout"
+        );
+        assert!(
+            body.contains(".timeout("),
+            "HttpMemoriaClient must set request timeout"
         );
     }
 }

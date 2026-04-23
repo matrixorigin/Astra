@@ -142,18 +142,20 @@ pub async fn take_ledger_entry(
     }
 }
 
-/// Fill missing or empty `id` on each tool call so SSE + `POST /tools/result` agree.
+/// Fill missing, empty, or duplicate `id` on each tool call so SSE +
+/// `POST /tools/result` agree and the edge callback ledger never sees
+/// colliding keys (which would cause HTTP 409).
 pub fn ensure_tool_call_ids(tool_calls: &mut [Value]) {
+    let mut seen = std::collections::HashSet::with_capacity(tool_calls.len());
     for tc in tool_calls.iter_mut() {
         let Some(obj) = tc.as_object_mut() else {
             continue;
         };
-        let id_empty = obj
-            .get("id")
-            .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(true))
-            .unwrap_or(true);
-        if id_empty {
-            obj.insert("id".to_string(), Value::String(Uuid::now_v7().to_string()));
+        let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            let new_id = Uuid::now_v7().to_string();
+            seen.insert(new_id.clone());
+            obj.insert("id".to_string(), Value::String(new_id));
         }
     }
 }
@@ -383,6 +385,29 @@ mod tests {
             "body": {"request_id": "c1", "status": "ok", "output": "done"}
         });
         assert_eq!(tool_content_from_ledger_entry(&entry), "done");
+    }
+
+    #[test]
+    fn ensure_tool_call_ids_deduplicates_non_empty_ids() {
+        let mut calls = vec![
+            json!({"id": "read_file:0", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "read_file:0", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "bash:0", "function": {"name": "bash", "arguments": "{}"}}),
+        ];
+        ensure_tool_call_ids(&mut calls);
+        let id0 = calls[0].get("id").and_then(Value::as_str).unwrap();
+        let id1 = calls[1].get("id").and_then(Value::as_str).unwrap();
+        let id2 = calls[2].get("id").and_then(Value::as_str).unwrap();
+        // First occurrence keeps its ID
+        assert_eq!(id0, "read_file:0");
+        // Duplicate gets a new unique ID
+        assert_ne!(id1, "read_file:0");
+        assert!(!id1.is_empty());
+        // Non-duplicate keeps its ID
+        assert_eq!(id2, "bash:0");
+        // All IDs are unique
+        assert_ne!(id0, id1);
+        assert_ne!(id1, id2);
     }
 
     #[test]

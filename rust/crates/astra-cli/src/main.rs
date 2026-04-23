@@ -275,7 +275,7 @@ pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, Ver
 use idle_agent_messages::drain_root_mailbox_into_idle_queue;
 use plan_monitor::{
     finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
-    run_blocking_plan_monitor, sync_plan_run_task_progress,
+    sync_plan_run_task_progress,
 };
 pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
 pub(crate) use plan_runtime::build_learning_bridge;
@@ -502,6 +502,7 @@ async fn run_chat_repl(
                         || maybe_restore_pending_plan_mode(&line, &mut state)
                     {
                         // Plan mode: handle input as plan editing
+                        let mut plan_monitor_started = false;
                         match handle_plan_mode_input(
                             line.clone(),
                             current_token.as_deref(),
@@ -540,6 +541,7 @@ async fn run_chat_repl(
                                         profile,
                                     )
                                     .await?;
+                                    plan_monitor_started = true;
                                 }
                             }
                             Ok(plan_interaction::PlanInputResult::SendAsChat(msg)) => {
@@ -557,13 +559,13 @@ async fn run_chat_repl(
                                 .await?;
                             }
                             Err(e) => {
-                                state.plan_resume_pending = false;
                                 return Err(e);
                             }
                         }
 
-                        // If plan execution was just triggered, start the executor (blocking).
-                        if state.executing_plan.is_some() {
+                        // If plan execution was just triggered, start the blocking monitor (once
+                        // per readline event — DispatchSlash may have already run it).
+                        if state.executing_plan.is_some() && !plan_monitor_started {
                             start_and_monitor_plan(
                                 &mut state,
                                 current_token.as_deref(),
@@ -571,10 +573,6 @@ async fn run_chat_repl(
                                 profile,
                             )
                             .await?;
-                        } else if state.plan_resume_pending {
-                            // Resume was sent to a paused executor — re-enter blocking monitor.
-                            state.plan_resume_pending = false;
-                            run_blocking_plan_monitor(&mut state).await;
                         }
                     } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
                         && plan_decompose::is_resume_command(&line)
@@ -590,8 +588,6 @@ async fn run_chat_repl(
                                     Some(std::mem::take(&mut state.plan_execution_corrections))
                                 },
                             });
-                            // Re-enter blocking monitor until done/paused/error
-                            run_blocking_plan_monitor(&mut state).await;
                         } else {
                             start_and_monitor_plan(
                                 &mut state,
@@ -688,9 +684,17 @@ async fn run_chat_repl(
                         // Auto plan detection: suggest plan mode for complex tasks
                         let mut should_proceed_normal = true;
                         let line_for_plan = line.clone(); // Clone early to avoid borrow issues
-                        if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
+                        // P2: classify both kinds — analytical inputs now route
+                        // through the research-plan generator instead of being
+                        // suppressed.
+                        if let Some(suggestion) = plan_decompose::classify_plan_suggestion(&line) {
+                            let kind_label = match suggestion.kind {
+                                plan_decompose::PlanKind::Executable => "execution plan",
+                                plan_decompose::PlanKind::Analytical => "research plan",
+                            };
+                            let banner = format!("{} ({})", suggestion.reason, kind_label);
                             let decision = plan_auto_suggest::prompt_auto_suggest(
-                                reason,
+                                &banner,
                                 plan_auto_suggest::DEFAULT_TIMEOUT,
                             );
                             match decision {

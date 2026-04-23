@@ -144,7 +144,7 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitAction::Proceed,
             STATE_COOLDOWN => {
-                let info = self.cooldown_info.lock().expect("cooldown mutex");
+                let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref cooldown) = *info {
                     if Instant::now() >= cooldown.reset_at {
                         // Cooldown expired
@@ -270,7 +270,7 @@ impl RateLimitCooldown {
         let reset_at = Instant::now() + Duration::from_millis(duration_ms);
 
         {
-            let mut info = self.cooldown_info.lock().expect("cooldown mutex");
+            let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
             *info = Some(CooldownInfo {
                 reset_at,
                 reason,
@@ -289,7 +289,7 @@ impl RateLimitCooldown {
         let reset_at = Instant::now() + Duration::from_millis(DEFAULT_COOLDOWN_MS);
 
         {
-            let mut info = self.cooldown_info.lock().expect("cooldown mutex");
+            let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
             *info = Some(CooldownInfo {
                 reset_at,
                 reason,
@@ -306,7 +306,7 @@ impl RateLimitCooldown {
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
 
-        let mut info = self.cooldown_info.lock().expect("cooldown mutex");
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         *info = None;
     }
 
@@ -315,7 +315,7 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitState::Active,
             STATE_COOLDOWN => {
-                let info = self.cooldown_info.lock().expect("cooldown mutex");
+                let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref cooldown) = *info {
                     // Convert Instant to epoch ms for external use
                     let now = Instant::now();
@@ -368,7 +368,7 @@ impl RateLimitCooldown {
             return 0;
         }
 
-        let info = self.cooldown_info.lock().expect("cooldown mutex");
+        let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref cooldown) = *info {
             cooldown
                 .reset_at
@@ -384,7 +384,7 @@ impl RateLimitCooldown {
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
-        let mut info = self.cooldown_info.lock().expect("cooldown mutex");
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         *info = None;
     }
 }
@@ -974,5 +974,29 @@ mod tests {
         rl.state.store(255, Ordering::SeqCst);
         let m = rl.metrics();
         assert_eq!(m.state, "unknown");
+    }
+
+    /// audit-B1: cooldown_info mutex must recover from poison instead of
+    /// cascading panics. This test poisons the mutex by panicking inside a
+    /// lock scope, then verifies subsequent operations still work.
+    #[test]
+    fn cooldown_mutex_recovers_from_poison() {
+        let rl = std::sync::Arc::new(RateLimitCooldown::new());
+        let rl2 = rl.clone();
+
+        // Poison the mutex by panicking while holding the lock.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = rl2.cooldown_info.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err(), "should have panicked");
+        assert!(rl.cooldown_info.lock().is_err(), "mutex should be poisoned");
+
+        // Despite the poison, all operations must still work.
+        assert!(matches!(rl.check_request(false), RateLimitAction::Proceed));
+        rl.record_429(None, false);
+        rl.record_success();
+        let m = rl.metrics();
+        assert_eq!(m.state, "active");
     }
 }

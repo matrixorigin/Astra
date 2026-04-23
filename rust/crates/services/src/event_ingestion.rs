@@ -362,7 +362,13 @@ impl IngestionSender {
 
     /// Enqueue with backpressure (waits if channel full).
     pub async fn enqueue_async(&self, event: IngestionEvent) {
-        let _ = self.tx.send(event).await;
+        if self.tx.send(event).await.is_err() {
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "astra_services::event_ingestion",
+                "ingestion channel closed; event dropped"
+            );
+        }
     }
 
     /// Signal the worker to flush remaining events and shut down.

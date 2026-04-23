@@ -4149,6 +4149,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         &app,
         json!({
             "message": "inspect the project files",
+            "max_candidates": 10,
             "context": {
                 "test_llm_rounds": [
                     {
@@ -4161,10 +4162,25 @@ async fn context_meta_exposes_late_round_guidance_signals() {
                         "tool_calls": [tool_call("tc-guidance-r3", "grep", json!({"pattern": "TODO", "path": "."}))]
                     },
                     {
+                        "tool_calls": [tool_call("tc-guidance-r4", "grep", json!({"pattern": "FIXME", "path": "."}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r5", "glob", json!({"pattern": "**/*.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r6", "read_file", json!({"path": "src/main.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r7", "list_dir", json!({"path": "src"}))]
+                    },
+                    {
                         "tool_calls": [
-                            tool_call("tc-guidance-r4a", "grep", json!({"pattern": "FIXME", "path": "."})),
-                            tool_call("tc-guidance-r4b", "glob", json!({"pattern": "**/*.rs"}))
+                            tool_call("tc-guidance-r8a", "grep", json!({"pattern": "fn main", "path": "."})),
+                            tool_call("tc-guidance-r8b", "glob", json!({"pattern": "**/*.toml"}))
                         ]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-guidance-r9", "read_file", json!({"path": "Cargo.toml"}))]
                     },
                     { "full_text": "Done." }
                 ],
@@ -4180,32 +4196,23 @@ async fn context_meta_exposes_late_round_guidance_signals() {
     .await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r1"));
-    let status = post_tool_result(&app, "tc-guidance-r1", "README contents", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r2"));
-    let status = post_tool_result(&app, "tc-guidance-r2", "src\nREADME.md", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r3"));
-    let status =
-        post_tool_result(&app, "tc-guidance-r3", "src/main.rs:12:// TODO", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r4a"));
-    let status =
-        post_tool_result(&app, "tc-guidance-r4a", "src/lib.rs:5:// FIXME", "success").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let request = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-guidance-r4b"));
-    let status = post_tool_result(&app, "tc-guidance-r4b", "src/main.rs", "success").await;
-    assert_eq!(status, StatusCode::OK);
+    for (id, result) in [
+        ("tc-guidance-r1", "README contents"),
+        ("tc-guidance-r2", "src\nREADME.md"),
+        ("tc-guidance-r3", "src/main.rs:12:// TODO"),
+        ("tc-guidance-r4", "src/lib.rs:5:// FIXME"),
+        ("tc-guidance-r5", "src/main.rs\nsrc/lib.rs"),
+        ("tc-guidance-r6", "fn main() {}"),
+        ("tc-guidance-r7", "main.rs\nlib.rs"),
+        ("tc-guidance-r8a", "src/main.rs:1:fn main"),
+        ("tc-guidance-r8b", "Cargo.toml"),
+        ("tc-guidance-r9", "[package]\nname = \"astra\""),
+    ] {
+        let request = wait_for_sse(&mut rx, "tool_request", 5).await;
+        assert_eq!(request["request_id"].as_str(), Some(id));
+        let status = post_tool_result(&app, id, result, "success").await;
+        assert_eq!(status, StatusCode::OK);
+    }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await

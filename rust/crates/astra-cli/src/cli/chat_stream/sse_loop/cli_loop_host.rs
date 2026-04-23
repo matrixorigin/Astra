@@ -158,11 +158,24 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
         // Propagate skill sandbox policy to the tool executor for this turn.
         // Saved/restored so it doesn't persist after the skill deactivates.
-        let prev_sandbox = self.executor.sandbox_policy.write().unwrap().take();
+        let prev_sandbox = self
+            .executor
+            .sandbox_policy
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(ref policy) = state.skills.sandbox_policy {
-            *self.executor.sandbox_policy.write().unwrap() = Some(policy.clone());
+            *self
+                .executor
+                .sandbox_policy
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(policy.clone());
         } else {
-            *self.executor.sandbox_policy.write().unwrap() = prev_sandbox.clone();
+            *self
+                .executor
+                .sandbox_policy
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = prev_sandbox.clone();
         }
         self.executor.set_send_message_context(
             state
@@ -254,7 +267,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         }
 
         // Restore previous sandbox policy after the turn.
-        *self.executor.sandbox_policy.write().unwrap() = prev_sandbox;
+        *self
+            .executor
+            .sandbox_policy
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = prev_sandbox;
 
         // Sync latest approval overrides into state for checkpoint persistence.
         state.approval_overrides = self.perm_manager.export_session_overrides();

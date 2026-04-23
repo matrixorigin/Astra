@@ -70,14 +70,44 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
 fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        let connect = llm_connect_timeout();
+        let total = std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60);
+        match reqwest::Client::builder()
             .no_proxy()
-            .connect_timeout(llm_connect_timeout())
+            .connect_timeout(connect)
             // Use a generous timeout; per-request timeout handled via tokio::time::timeout
-            .timeout(std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60))
+            .timeout(total)
             .pool_max_idle_per_host(4)
             .build()
-            .expect("failed to build global LLM HTTP client")
+        {
+            Ok(client) => client,
+            Err(e) => {
+                // audit-C1: TLS / HTTP stack init failure should not crash the process.
+                // Retry with the same timeouts but without pool tuning so we still bound
+                // hung-upstream risk if this tier succeeds.
+                tracing::error!(
+                    target: "astra_runtime::llm_client",
+                    error = %e,
+                    "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
+                );
+                match reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(connect)
+                    .timeout(total)
+                    .build()
+                {
+                    Ok(client) => client,
+                    Err(e2) => {
+                        tracing::error!(
+                            target: "astra_runtime::llm_client",
+                            error = %e2,
+                            "failed to build minimal global LLM HTTP client; using reqwest::Client::new() without explicit timeouts"
+                        );
+                        reqwest::Client::new()
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -3270,5 +3300,20 @@ mod tests {
         );
         assert!(!log_line.contains("sk-abc12345"));
         assert!(log_line.contains("[REDACTED]"));
+    }
+
+    /// audit-C1: global_llm_client must not use .expect() — a TLS backend
+    /// failure should not crash the entire process.
+    #[test]
+    fn global_llm_client_does_not_panic_on_build() {
+        let source = include_str!("llm_client.rs");
+        let fn_start = source
+            .find("fn global_llm_client()")
+            .expect("global_llm_client must exist");
+        let body = &source[fn_start..(fn_start + 600).min(source.len())];
+        assert!(
+            !body.contains(".expect("),
+            "global_llm_client must not use .expect(); use .unwrap_or_else with fallback"
+        );
     }
 }

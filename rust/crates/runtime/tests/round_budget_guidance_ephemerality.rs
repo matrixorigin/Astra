@@ -117,12 +117,17 @@ fn synthesize_directive_fires_after_tool_tail_and_clears_after_assistant_text() 
         tool_msg("a"),
         tool_msg("b"),
     ];
-    assert!(!synthesize_or_batch_directive(&tool_tail, warn_round).is_empty());
+    assert!(
+        !synthesize_or_batch_directive(&tool_tail, warn_round, ROUND_BUDGET_THRESHOLD).is_empty()
+    );
 
     // After assistant speaks, the trailing tool-result window is gone.
     let mut resolved = tool_tail.clone();
     resolved.push(assistant_text("here is what I found"));
-    assert_eq!(synthesize_or_batch_directive(&resolved, warn_round), "");
+    assert_eq!(
+        synthesize_or_batch_directive(&resolved, warn_round, ROUND_BUDGET_THRESHOLD),
+        ""
+    );
 }
 
 #[test]
