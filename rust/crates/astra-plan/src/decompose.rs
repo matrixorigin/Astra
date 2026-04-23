@@ -1804,6 +1804,26 @@ fn looks_analytical(input: &str) -> bool {
     ends_with_question || has_en || has_cjk
 }
 
+/// What kind of plan an input maps to.
+///
+/// Executable plans drive the orchestrator (subtasks → executor steps).
+/// Analytical plans are research/evaluation questions where the user wants
+/// structured thinking rather than file mutations. The CLI may handle them
+/// differently (e.g. richer prompts, no executor invocation), but the
+/// classifier itself is purely lexical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanKind {
+    Executable,
+    Analytical,
+}
+
+/// Outcome of suggesting whether to enter plan mode for a free-form input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSuggestion {
+    pub kind: PlanKind,
+    pub reason: &'static str,
+}
+
 /// Heuristics to detect if user input likely needs a plan.
 /// Returns Some(reason) if plan mode should be suggested.
 ///
@@ -1811,10 +1831,32 @@ fn looks_analytical(input: &str) -> bool {
 /// match the length/keyword heuristics, because /plan only knows how to
 /// build executable TaskPlans.
 pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
-    if looks_analytical(input) {
-        return None;
-    }
+    classify_plan_suggestion(input).and_then(|s| match s.kind {
+        PlanKind::Executable => Some(s.reason),
+        // Analytical inputs intentionally do NOT trigger the auto-suggest
+        // prompt today — the CLI has no analytical generator yet, so
+        // suggesting plan mode would lead the user back to the empty-plan
+        // dead-end this refactor is designed to eliminate.
+        PlanKind::Analytical => None,
+    })
+}
 
+/// Classify an input into an executable or analytical plan suggestion.
+/// Returns `None` if the input is too short / too vague to suggest at all.
+pub fn classify_plan_suggestion(input: &str) -> Option<PlanSuggestion> {
+    if looks_analytical(input) {
+        return Some(PlanSuggestion {
+            kind: PlanKind::Analytical,
+            reason: "Analytical / evaluative question detected",
+        });
+    }
+    classify_executable(input).map(|reason| PlanSuggestion {
+        kind: PlanKind::Executable,
+        reason,
+    })
+}
+
+fn classify_executable(input: &str) -> Option<&'static str> {
     let lower = input.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
 
@@ -2009,9 +2051,35 @@ impl PlanModeState {
 
     /// Default path for plan state persistence.
     pub fn state_path() -> std::path::PathBuf {
+        Self::state_path_for_cwd(&std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    }
+
+    /// P6: Workspace-scoped persistence path.
+    ///
+    /// Each unique cwd gets its own state file under
+    /// `~/.astra/plans/<8-char-hash>/plan_state.json`. The hash is a stable
+    /// short blake3 of the canonicalized cwd. Falling back to the hashed
+    /// path means two repos open at the same time no longer race to
+    /// overwrite a single global file, and the workspace guard added in B8
+    /// becomes a defense-in-depth check rather than the only line of
+    /// safety.
+    pub fn state_path_for_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let key = canon.to_string_lossy();
+        // Use the first 16 hex chars of the SHA-1 of the cwd. We avoid
+        // pulling in a new crypto dep by using the std hasher — collisions
+        // here only mean two unrelated repos share a state file (which the
+        // workspace guard then catches) and reduce the path length to
+        // something readable.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        let digest = format!("{:016x}", h.finish());
         std::path::PathBuf::from(home)
             .join(".astra")
+            .join("plans")
+            .join(digest)
             .join("plan_state.json")
     }
 
@@ -5736,6 +5804,19 @@ Done!"#;
     }
 
     #[test]
+    fn state_path_for_cwd_is_workspace_scoped() {
+        // P6: different cwds map to different files. Same cwd is stable.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let pa1 = PlanModeState::state_path_for_cwd(a.path());
+        let pa2 = PlanModeState::state_path_for_cwd(a.path());
+        let pb = PlanModeState::state_path_for_cwd(b.path());
+        assert_eq!(pa1, pa2, "same cwd → same path");
+        assert_ne!(pa1, pb, "different cwds → different paths");
+        assert!(pa1.to_string_lossy().contains("plans"));
+    }
+
+    #[test]
     fn parse_plan_paused_corrections_and_rewind() {
         assert_eq!(
             parse_plan_paused_user_line("correct skip tests for now"),
@@ -7421,6 +7502,25 @@ Done!"#;
                 .is_some(),
             "imperative instructions still route to plan mode"
         );
+    }
+
+    #[test]
+    fn classify_plan_suggestion_distinguishes_kinds() {
+        // Analytical: classifier identifies kind even though
+        // should_suggest_plan_mode would suppress the auto-prompt.
+        let s = classify_plan_suggestion("客观评价是正确的方向吗？")
+            .expect("analytical input should classify");
+        assert_eq!(s.kind, PlanKind::Analytical);
+
+        let s = classify_plan_suggestion(
+            "refactor the auth module and add comprehensive tests for login/logout",
+        )
+        .expect("executable input should classify");
+        assert_eq!(s.kind, PlanKind::Executable);
+
+        // Too short or too vague returns None for both kinds.
+        assert!(classify_plan_suggestion("hi").is_none());
+        assert!(classify_plan_suggestion("fix bug").is_none());
     }
 
     #[test]

@@ -2050,6 +2050,21 @@ async fn handle_goal_submission(
         ),
         Some(serde_json::json!({
             "goal": goal,
+            "stage": "entered",
+            // P5: classify the goal at entry so downstream digesters can
+            // distinguish executable vs analytical without re-running the
+            // heuristic.
+            "kind": match astra_runtime::plan_decompose::classify_plan_suggestion(&goal)
+                .map(|s| s.kind)
+                .unwrap_or(astra_runtime::plan_decompose::PlanKind::Executable)
+            {
+                astra_runtime::plan_decompose::PlanKind::Executable => "executable",
+                astra_runtime::plan_decompose::PlanKind::Analytical => "analytical",
+            },
+            "started_at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
         })),
     );
 
