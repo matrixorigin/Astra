@@ -1449,6 +1449,28 @@ fn could_become_thinking_tag(partial: &str) -> bool {
         .any(|p| p.starts_with(partial) || partial.starts_with(p))
 }
 
+/// D-9 correctness guard: decide whether a speculative result may be
+/// reused as-is in place of a real tool execution.
+///
+/// A speculative tool invocation returns `(output, success)`. A `success=false`
+/// outcome means the speculation **errored** (permission-denied mid-stream,
+/// tool panic surfaced as error string, bash non-zero exit, grep pattern not
+/// found reported as error, etc.). Silently substituting an errored output as
+/// if it were a successful tool_result causes the LLM to reason on an
+/// error-as-success and cascades into hallucinated next steps.
+///
+/// When `success=false`, callers must fall through to the normal execution
+/// path so the tool re-runs and the real outcome (success or genuine error)
+/// surfaces through the standard journal/observability pipeline.
+///
+/// Returns `Some(output)` only when the speculation was a genuine success.
+pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<String> {
+    match r {
+        Some((output, true)) => Some(output),
+        _ => None,
+    }
+}
+
 impl CliSseStreamHost<'_> {
     /// D-9: Harvest speculative results for the upcoming concurrent batch.
     ///
@@ -1472,9 +1494,35 @@ impl CliSseStreamHost<'_> {
             .collect();
         let (done, _needed) = exec.merge_speculative(&ids).await;
         let mut out = std::collections::HashMap::new();
+        let mut reusable = 0usize;
+        let mut rejected_failure = 0usize;
         for r in done {
+            if r.success {
+                reusable += 1;
+            } else {
+                // Speculation completed but failed — the reconciler will fall
+                // back to real execution (see `reusable_speculative_output`).
+                // Track this separately from `snapshot().wasted` so operators
+                // can distinguish "speculation errored" from "speculation
+                // never started" when diagnosing hit-rate drops.
+                rejected_failure += 1;
+            }
             out.insert(r.call_id.clone(), (r.content.clone(), r.success));
         }
+        // Per-batch reconciliation breakdown: complements the cumulative
+        // `astra::streaming_speculation::metrics` with this-batch counts so
+        // operators can correlate a specific turn's LLM-emitted batch against
+        // what actually came back from speculation. Target:
+        // `astra::streaming_speculation::batch`.
+        tracing::info!(
+            target: "astra::streaming_speculation::batch",
+            batch_size = conc_reqs.len(),
+            reusable = reusable,
+            rejected_failure = rejected_failure,
+            not_speculated = conc_reqs.len().saturating_sub(reusable + rejected_failure),
+            session_id = self.executor.active_session_id().as_deref().unwrap_or(""),
+            "speculation reconciliation for batch"
+        );
         // Emit a structured metrics event once per batch merge so log
         // aggregators / ObservabilityHub can track speculation effectiveness
         // over time. Target: `astra::streaming_speculation::metrics`.
@@ -2476,6 +2524,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 );
             }
         }
+        // Batch-size observation: correlates the read-only batching prompt
+        // (`prompts/system.rs`) with actual LLM emission patterns. When >=2
+        // concurrent tools arrive together the model followed the guidance;
+        // when conc_reqs is empty or has a single entry, batching didn't
+        // happen this turn. Target: `astra::tool_batching::batch_size`.
+        if !conc_reqs.is_empty() {
+            tracing::info!(
+                target: "astra::tool_batching::batch_size",
+                parallel_count = conc_reqs.len(),
+                sequential_count = seq_total,
+                tool_names = ?conc_reqs.iter().map(|(_, r)| r.tool.as_str()).collect::<Vec<_>>(),
+                session_id = self.executor.active_session_id().as_deref().unwrap_or(""),
+                "LLM emitted parallel tool batch"
+            );
+        }
 
         // Pre-check: can all concurrent tools auto-proceed?
         // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
@@ -2583,9 +2646,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
         // a tool failure instead of aborting the whole batch/turn.
         let executor: &crate::edge_tools::ToolExecutor = &self.executor;
-        let sem = Arc::new(tokio::sync::Semaphore::new(
-            astra_runtime::turn::parallel_tool_exec::MAX_CONCURRENT_TOOL_EXECUTIONS,
-        ));
+        // Use the process-wide shared semaphore so the concurrency cap
+        // genuinely spans every batch and every concurrent session in this
+        // process — previously each batch constructed its own `Semaphore::new(10)`,
+        // which allowed 10·N concurrent tools when N batches overlapped.
+        let sem = astra_runtime::turn::parallel_tool_exec::shared_tool_semaphore();
         // D-9: harvest speculative results from mid-stream execution.
         // Matching request_ids skip the normal dispatch and reuse the
         // speculative output. Journal/observability still fire exactly
@@ -2601,7 +2666,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let sem = sem.clone();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
                     async move {
-                        if let Some((output, _ok)) = speculative {
+                        if let Some(output) = reusable_speculative_output(speculative) {
                             return (
                                 crate::edge_tools::ToolExecutionOutcome {
                                     output,
@@ -6038,6 +6103,46 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── D-9 regression: speculative success flag must gate reuse ──
+    //
+    // Guards against the cascade bug where a speculative tool execution that
+    // failed (semaphore saturated, permission denied mid-stream, tool errored
+    // with non-empty error message) was silently reused as a successful
+    // tool_result because the consumer discarded `success` with `_ok`.
+    // See `reusable_speculative_output` for the fix rationale.
+
+    #[test]
+    fn reusable_speculative_output_accepts_successful_result() {
+        let out = reusable_speculative_output(Some(("real grep hit: line 42".to_string(), true)));
+        assert_eq!(out, Some("real grep hit: line 42".to_string()));
+    }
+
+    #[test]
+    fn reusable_speculative_output_rejects_failed_result_even_with_content() {
+        // A failed speculation may carry a non-empty error message. That
+        // message MUST NOT be reused as a successful tool_result — the real
+        // execution path must re-run so genuine status surfaces.
+        let out = reusable_speculative_output(Some((
+            "Error: permission denied on /etc/shadow".to_string(),
+            false,
+        )));
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn reusable_speculative_output_rejects_none() {
+        let out = reusable_speculative_output(None);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn reusable_speculative_output_rejects_failed_empty_content() {
+        // Semaphore-saturated speculation returns empty content + success=false.
+        // Must not be reused (would surface empty output as successful tool_result).
+        let out = reusable_speculative_output(Some((String::new(), false)));
+        assert_eq!(out, None);
+    }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
         let dir = tempdir().expect("temp repo");

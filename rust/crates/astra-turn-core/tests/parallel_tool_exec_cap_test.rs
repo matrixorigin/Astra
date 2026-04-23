@@ -205,3 +205,80 @@ async fn complex_mixed_20_tools_respect_cap_and_ordering() {
         assert_eq!(r.call_id, format!("c{i:02}"));
     }
 }
+
+// ─────────── Process-wide shared-semaphore regression ───────────
+//
+// Previously `execute_parallel_round` allocated a fresh
+// `Semaphore::new(MAX_CONCURRENT_READ_ONLY)` on every call. Two concurrent
+// batches could therefore run up to 2·10 = 20 tools simultaneously, breaking
+// the "shared semaphore" contract stated in comments and prompts.
+//
+// With the process-wide semaphore, two (or more) concurrent batches must
+// collectively respect `MAX_CONCURRENT_TOOL_EXECUTIONS`.
+
+#[tokio::test]
+async fn two_concurrent_batches_share_process_wide_semaphore_cap() {
+    // Each batch fires 15 read-only tools. If the cap were per-batch, peak
+    // across both batches could reach 2·10 = 20. With the shared cap, peak
+    // must stay <= MAX_CONCURRENT_TOOL_EXECUTIONS.
+    let delay = 120u64;
+
+    let calls_a: Vec<Value> = (0..15)
+        .map(|i| tool_call("read_file", &format!("a{i:02}")))
+        .collect();
+    let calls_b: Vec<Value> = (0..15)
+        .map(|i| tool_call("grep", &format!("b{i:02}")))
+        .collect();
+
+    // Use a shared inflight/peak counter across BOTH executors so we observe
+    // the true cross-batch peak, not per-batch.
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let make_exec = || -> ToolExecutorFn {
+        let inflight = inflight.clone();
+        let peak = peak.clone();
+        Arc::new(move |tc: Value| {
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            Box::pin(async move {
+                let cur = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                let call_id = tc["id"].as_str().unwrap_or("").to_string();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                (call_id, name, "ok".into(), true)
+            })
+        })
+    };
+
+    let (oa, ob) = tokio::join!(
+        execute_parallel_round(&calls_a, make_exec()),
+        execute_parallel_round(&calls_b, make_exec()),
+    );
+
+    assert_eq!(oa.results.len(), 15);
+    assert_eq!(ob.results.len(), 15);
+
+    let observed_peak = peak.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= MAX_CONCURRENT_TOOL_EXECUTIONS,
+        "cross-batch peak {observed_peak} must not exceed shared cap {MAX_CONCURRENT_TOOL_EXECUTIONS}"
+    );
+    assert!(
+        observed_peak > 0,
+        "sanity: at least one tool should have run concurrently",
+    );
+}
+
+#[test]
+fn shared_tool_semaphore_returns_same_instance() {
+    use astra_turn_core::parallel_tool_exec::shared_tool_semaphore;
+    let a = shared_tool_semaphore();
+    let b = shared_tool_semaphore();
+    assert!(
+        Arc::ptr_eq(&a, &b),
+        "shared_tool_semaphore must return the same Arc on repeat calls"
+    );
+}

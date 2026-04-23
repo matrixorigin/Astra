@@ -313,43 +313,134 @@ async fn sibling_delegations_have_isolated_cancel_tokens() {
     token_b.cancel();
 }
 
-// ─── 4. Shared Arc<CancellationToken> — one cancel flips every clone ───────
-// Pure primitive invariant that the `DelegationEngine` relies on.
-// Codifying this guards against a refactor that accidentally introduces
-// `child_token()` (which would break the nested propagation contract).
-#[tokio::test]
-async fn shared_arc_cancellation_token_fires_every_clone_once() {
-    let root = Arc::new(CancellationToken::new());
+// ─── 4. REMOVED: `shared_arc_cancellation_token_fires_every_clone_once`
+//     per review: that test was exercising the `tokio_util::sync::CancellationToken`
+//     primitive itself, not any business logic in `DelegationEngine`. Property
+//     is already covered by `tokio_util`'s own test suite.
 
-    let clones: Vec<Arc<CancellationToken>> = (0..8).map(|_| root.clone()).collect();
+// ─── 5. Precise-count propagation (no DelegationEngine abort_all in the way) ──
+//
+// The `nested_cancel_propagates_through_three_levels` test above must use
+// a lower-bound (>= 1) assertion because the production `DelegationEngine`
+// calls `join_set.abort_all()` on token fire, which MAY unwind depth-0
+// tasks before they reach their `select!` cancel arm. That's a real
+// (and desirable) fast-path optimization.
+//
+// This test bypasses `DelegationEngine` entirely and builds the same
+// 3-level tree directly from `tokio::spawn`, so every spawned task HAS
+// to reach its cancel-await boundary before we fire the root. With nothing
+// aborting tasks mid-flight, we can assert *exact* counts at every depth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_cancel_primitive_exact_counts_per_depth() {
+    let token = Arc::new(CancellationToken::new());
+    let seen_0 = Arc::new(AtomicUsize::new(0));
+    let seen_1 = Arc::new(AtomicUsize::new(0));
+    let seen_2 = Arc::new(AtomicUsize::new(0));
 
-    // All clones start un-cancelled.
-    for c in &clones {
-        assert!(!c.is_cancelled());
-    }
+    const D0: usize = 2; // number of depth-0 branches
+    const D1: usize = 3; // per depth-0: depth-1 children
+    const D2: usize = 4; // per depth-1: depth-2 children
+    const TOTAL_0: usize = D0;
+    const TOTAL_1: usize = D0 * D1;
+    const TOTAL_2: usize = D0 * D1 * D2;
 
-    // Spawn a watcher per clone.
-    let mut handles = Vec::new();
-    let counter = Arc::new(AtomicUsize::new(0));
-    for c in clones {
-        let counter = counter.clone();
-        handles.push(tokio::spawn(async move {
-            c.cancelled().await;
-            counter.fetch_add(1, Ordering::SeqCst);
+    // Readiness signal: every leaf reports when it's PARKED on the select.
+    let ready_0 = Arc::new(AtomicUsize::new(0));
+    let ready_1 = Arc::new(AtomicUsize::new(0));
+    let ready_2 = Arc::new(AtomicUsize::new(0));
+
+    let mut depth_0_handles = Vec::new();
+    for _ in 0..D0 {
+        let t0 = token.clone();
+        let s0 = seen_0.clone();
+        let s1 = seen_1.clone();
+        let s2 = seen_2.clone();
+        let r0 = ready_0.clone();
+        let r1 = ready_1.clone();
+        let r2 = ready_2.clone();
+
+        depth_0_handles.push(tokio::spawn(async move {
+            // Spawn depth-1 children.
+            let mut d1_handles = Vec::new();
+            for _ in 0..D1 {
+                let t1 = t0.clone();
+                let s1 = s1.clone();
+                let s2 = s2.clone();
+                let r1 = r1.clone();
+                let r2 = r2.clone();
+                d1_handles.push(tokio::spawn(async move {
+                    // Spawn depth-2 children.
+                    let mut d2_handles = Vec::new();
+                    for _ in 0..D2 {
+                        let t2 = t1.clone();
+                        let s2 = s2.clone();
+                        let r2 = r2.clone();
+                        d2_handles.push(tokio::spawn(async move {
+                            r2.fetch_add(1, Ordering::SeqCst);
+                            t2.cancelled().await;
+                            s2.fetch_add(1, Ordering::SeqCst);
+                        }));
+                    }
+                    r1.fetch_add(1, Ordering::SeqCst);
+                    t1.cancelled().await;
+                    s1.fetch_add(1, Ordering::SeqCst);
+                    for h in d2_handles {
+                        let _ = h.await;
+                    }
+                }));
+            }
+            r0.fetch_add(1, Ordering::SeqCst);
+            t0.cancelled().await;
+            s0.fetch_add(1, Ordering::SeqCst);
+            for h in d1_handles {
+                let _ = h.await;
+            }
         }));
     }
 
-    // Fire once at the root.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    root.cancel();
-
-    for h in handles {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    // Wait until EVERY task is parked on its cancel-await (ready counts == totals).
+    let start = Instant::now();
+    loop {
+        if ready_0.load(Ordering::SeqCst) == TOTAL_0
+            && ready_1.load(Ordering::SeqCst) == TOTAL_1
+            && ready_2.load(Ordering::SeqCst) == TOTAL_2
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "tasks failed to park: ready_0={}/{} ready_1={}/{} ready_2={}/{}",
+            ready_0.load(Ordering::SeqCst),
+            TOTAL_0,
+            ready_1.load(Ordering::SeqCst),
+            TOTAL_1,
+            ready_2.load(Ordering::SeqCst),
+            TOTAL_2
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+
+    // All parked — fire root exactly once.
+    token.cancel();
+
+    for h in depth_0_handles {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
+
+    // EXACT counts — every spawned task observed exactly one cancel.
     assert_eq!(
-        counter.load(Ordering::SeqCst),
-        8,
-        "single root cancel must fire every Arc clone exactly once"
+        seen_0.load(Ordering::SeqCst),
+        TOTAL_0,
+        "depth-0 exact propagation"
     );
-    assert!(root.is_cancelled());
+    assert_eq!(
+        seen_1.load(Ordering::SeqCst),
+        TOTAL_1,
+        "depth-1 exact propagation"
+    );
+    assert_eq!(
+        seen_2.load(Ordering::SeqCst),
+        TOTAL_2,
+        "depth-2 exact propagation"
+    );
 }
