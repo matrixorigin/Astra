@@ -312,6 +312,19 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                     .and_then(Value::as_str)
                     .unwrap_or_default();
 
+                // Synthesize a stable id when metadata is malformed/empty so
+                // that the tool_result content is never silently dropped on
+                // replay. Earlier versions of this path `continue`d, which
+                // caused data loss when metadata came back as an unparseable
+                // JSON string (parsed_object → empty Map → empty id).
+                let mut synthetic_id_holder = String::new();
+                let effective_id: &str = if !tool_call_id.is_empty() {
+                    tool_call_id
+                } else {
+                    synthetic_id_holder = format!("recovered-orphan-{}", history.len());
+                    &synthetic_id_holder
+                };
+
                 if !pending_tool_calls.is_empty() {
                     let mut assistant = Map::from_iter([
                         ("role".to_string(), Value::String("assistant".to_string())),
@@ -332,16 +345,13 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                     pending_tool_calls.clear();
                     in_tool_batch = true;
                 } else if !in_tool_batch {
-                    if tool_call_id.is_empty() {
-                        continue;
-                    }
                     let mut orphan = Map::from_iter([
                         ("role".to_string(), Value::String("assistant".to_string())),
                         ("content".to_string(), Value::String(String::new())),
                         (
                             "tool_calls".to_string(),
                             json!([{
-                                "id": tool_call_id,
+                                "id": effective_id,
                                 "type": "function",
                                 "function": {
                                     "name": tool_name,
@@ -373,7 +383,7 @@ pub fn append_recovered_events(history: &mut Vec<Value>, rows: &[RecoveredEventR
                     .collect::<String>();
                 history.push(json!({
                     "role": "tool",
-                    "tool_call_id": tool_call_id,
+                    "tool_call_id": effective_id,
                     "content": result_content,
                 }));
             }
@@ -816,6 +826,89 @@ mod tests {
         assert_eq!(history[0]["tool_calls"][0]["id"], "c99");
         assert_eq!(history[1]["role"], "tool");
         assert_eq!(history[1]["content"], "orphan result");
+    }
+
+    /// Regression: a tool_result recovered with malformed metadata (non-JSON
+    /// string) and no pending tool_call used to be SILENTLY DROPPED because
+    /// `parsed_metadata` returned an empty Map → empty tool_call_id →
+    /// `continue`. The result content — which may carry important payload —
+    /// vanished on replay. Fix: synthesize a `recovered-orphan-N` id so the
+    /// content is always preserved.
+    #[test]
+    fn append_tool_result_with_malformed_metadata_preserves_content() {
+        let mut history = Vec::new();
+        let rows = vec![RecoveredEventRow {
+            event_type: "tool_result".to_string(),
+            content: Some(r#"{"result":"payload must survive"}"#.to_string()),
+            metadata: Some(Value::String("this is not json".to_string())),
+            reasoning_content: None,
+        }];
+
+        append_recovered_events(&mut history, &rows);
+
+        // Content MUST NOT vanish just because metadata was unparseable.
+        assert_eq!(history.len(), 2, "malformed metadata must not drop result");
+        assert_eq!(history[0]["role"], "assistant");
+        assert_eq!(history[1]["role"], "tool");
+        assert_eq!(history[1]["content"], "payload must survive");
+        // The synthetic id must be paired on both sides so an LLM call would
+        // not reject the history as orphan.
+        let synthetic_id = history[1]["tool_call_id"].as_str().unwrap();
+        assert!(
+            synthetic_id.starts_with("recovered-orphan-"),
+            "expected synthetic id prefix, got {synthetic_id:?}"
+        );
+        assert_eq!(history[0]["tool_calls"][0]["id"], synthetic_id);
+    }
+
+    /// Regression: same bug when metadata is entirely absent. Must not drop.
+    #[test]
+    fn append_tool_result_with_no_metadata_preserves_content() {
+        let mut history = Vec::new();
+        let rows = vec![RecoveredEventRow {
+            event_type: "tool_result".to_string(),
+            content: Some(r#"{"result":"still preserved"}"#.to_string()),
+            metadata: None,
+            reasoning_content: None,
+        }];
+
+        append_recovered_events(&mut history, &rows);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1]["content"], "still preserved");
+        let synthetic_id = history[1]["tool_call_id"].as_str().unwrap();
+        assert_eq!(history[0]["tool_calls"][0]["id"], synthetic_id);
+    }
+
+    /// Contract: tool_call rows with malformed content JSON must not crash
+    /// ingestion and must not silently produce a broken assistant message
+    /// with a bogus id. `arguments` should fall back to "{}" as documented.
+    #[test]
+    fn append_tool_call_with_malformed_content_degrades_gracefully() {
+        let mut history = Vec::new();
+        let rows = vec![
+            RecoveredEventRow {
+                event_type: "tool_call".to_string(),
+                content: Some("not parseable json".to_string()),
+                metadata: Some(json!({"tool_call_id": "fallback-1", "name": "bash"})),
+                reasoning_content: None,
+            },
+            RecoveredEventRow {
+                event_type: "tool_result".to_string(),
+                content: Some(r#"{"result":"ok"}"#.to_string()),
+                metadata: Some(json!({"tool_call_id": "fallback-1", "name": "bash"})),
+                reasoning_content: None,
+            },
+        ];
+
+        append_recovered_events(&mut history, &rows);
+
+        assert_eq!(history.len(), 2);
+        // id & name fall back from metadata since content was garbage
+        assert_eq!(history[0]["tool_calls"][0]["id"], "fallback-1");
+        assert_eq!(history[0]["tool_calls"][0]["function"]["name"], "bash");
+        assert_eq!(history[0]["tool_calls"][0]["function"]["arguments"], "{}");
+        assert_eq!(history[1]["tool_call_id"], "fallback-1");
     }
 
     // ── edge cases ──────────────────────────────────────────────────
