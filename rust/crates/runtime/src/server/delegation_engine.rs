@@ -481,7 +481,13 @@ impl DelegationTracker {
         };
         let writer = match astra_services::session_journal::JournalWriter::new(sid) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "JournalWriter::new failed for session {sid}: {e}"
+                );
+                return;
+            }
         };
         if let Err(e) = writer.append(&event) {
             astra_core::agent_warn!("delegation", "Failed to write journal event: {e}");
@@ -559,14 +565,14 @@ impl DelegationTracker {
             });
         }
 
-        self.delegations
-            .write()
-            .await
-            .entry(delegation_id)
-            .or_default()
-            .push(record);
-
-        self.parents.write().await.insert(run_id, parent_id);
+        // LOCK ORDER: delegations → parents (matches `cleanup_delegation` and
+        // `load_from_run_records`). Both maps must be inserted into atomically
+        // so concurrent `is_sub_run` cannot observe the parents map without the
+        // matching delegations entry (and vice-versa).
+        let mut delegations = self.delegations.write().await;
+        let mut parents = self.parents.write().await;
+        delegations.entry(delegation_id).or_default().push(record);
+        parents.insert(run_id, parent_id);
     }
 
     /// Get all sub-runs for a delegation.
@@ -763,7 +769,7 @@ impl DelegationTracker {
             .read()
             .await
             .get(run_id)
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+            .is_some_and(|f| f.load(Ordering::Acquire))
     }
 
     // ── State Machine + Lifecycle ───────────────────────────────────────────

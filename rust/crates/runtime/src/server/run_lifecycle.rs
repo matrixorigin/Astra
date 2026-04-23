@@ -1441,7 +1441,7 @@ impl AgenticRunLifecycleService {
             .cancellation
             .flag
             .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+            .is_some_and(|f| f.load(Ordering::Acquire))
             || loop_state
                 .cancellation
                 .token
@@ -1983,7 +1983,7 @@ impl AgenticRunLifecycleService {
     pub(crate) async fn test_pause_flag_is_set(&self, run_id: &str) -> Option<bool> {
         let runs = self.runs.read().await;
         runs.get(run_id)
-            .map(|r| r.pause_flag.load(Ordering::Relaxed))
+            .map(|r| r.pause_flag.load(Ordering::Acquire))
     }
 }
 
@@ -2587,7 +2587,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if matches!(run.status, RunStatus::Running | RunStatus::Paused) {
+                let mutated = matches!(run.status, RunStatus::Running | RunStatus::Paused);
+                if mutated {
                     run.cancel_flag.store(true, Ordering::SeqCst);
                     run.pause_flag.store(false, Ordering::SeqCst);
                     run.llm_cancel_token.cancel();
@@ -2597,7 +2598,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "event_type": "run_finished",
                         "data": {"cancelled": true}
                     }));
-                    // Persist cancellation
+                }
+                let final_status = run.status.as_str().to_string();
+                // Drop the write lock before async persist calls so concurrent
+                // readers/writers (and pause/resume) are not blocked across DB I/O.
+                drop(runs);
+
+                if mutated {
                     if let Some(engine) = &self.run_engine {
                         astra_core::log_persist!(
                             engine
@@ -2622,7 +2629,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 return Ok(CancelRunRecord {
                     run_id,
-                    status: run.status.as_str().to_string(),
+                    status: final_status,
                 });
             }
         }

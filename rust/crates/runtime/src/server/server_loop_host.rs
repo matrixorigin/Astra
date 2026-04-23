@@ -689,12 +689,29 @@ impl ServerAgenticLoopHost {
     /// Access collected SSE events from the last turn.
     /// Also drains any pending agent progress events into the result.
     pub fn take_emitted_events(&mut self) -> Vec<Value> {
-        // Drain pending progress events from the broadcast receiver
+        // Drain pending progress events from the broadcast receiver.
+        // Treat `Lagged(n)` as a recoverable warning: the receiver continues
+        // and we collect every still-buffered event after the gap, preventing
+        // silent loss of all subsequent progress events.
         let mut progress_events = Vec::new();
         if let Some(ref mut rx) = self.progress_rx {
-            while let Ok(evt) = rx.try_recv() {
-                if let Some(sse_val) = progress_event_to_sse(&evt) {
-                    progress_events.push(sse_val);
+            use tokio::sync::broadcast::error::TryRecvError;
+            loop {
+                match rx.try_recv() {
+                    Ok(evt) => {
+                        if let Some(sse_val) = progress_event_to_sse(&evt) {
+                            progress_events.push(sse_val);
+                        }
+                    }
+                    Err(TryRecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            target: "astra_runtime::server_loop_host",
+                            dropped = n,
+                            "progress receiver lagged; continuing drain"
+                        );
+                        continue;
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
                 }
             }
         }

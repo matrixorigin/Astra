@@ -2098,6 +2098,11 @@ impl ServerToolExecutor {
         let Some(observability_session) = self.observability_session.as_ref() else {
             return json!({"error": "No observability session available"}).to_string();
         };
+        // LOCK ORDER: observability_session → self_mod_mutation_counter.
+        // The session guard is held across the counter lock because the
+        // mutation paths below require atomic read-modify-write of session
+        // config based on the counter check. All call sites that need both
+        // locks MUST take them in this order to avoid deadlock.
         let mut session = match observability_session.write() {
             Ok(guard) => guard,
             Err(_) => {

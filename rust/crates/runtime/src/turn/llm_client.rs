@@ -191,8 +191,8 @@ impl LlmCancel<'_> {
         match self {
             LlmCancel::None => false,
             LlmCancel::Token(t) => t.is_cancelled(),
-            LlmCancel::Flag(f) => f.load(Ordering::Relaxed),
-            LlmCancel::FlagAndToken(f, t) => f.load(Ordering::Relaxed) || t.is_cancelled(),
+            LlmCancel::Flag(f) => f.load(Ordering::Acquire),
+            LlmCancel::FlagAndToken(f, t) => f.load(Ordering::Acquire) || t.is_cancelled(),
         }
     }
 }
@@ -204,7 +204,7 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
         LlmCancel::Token(t) => t.cancelled().await,
         LlmCancel::Flag(f) => {
             const POLL: std::time::Duration = std::time::Duration::from_millis(50);
-            while !f.load(Ordering::Relaxed) {
+            while !f.load(Ordering::Acquire) {
                 tokio::time::sleep(POLL).await;
             }
         }
@@ -214,7 +214,7 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
                 biased;
                 _ = t.cancelled() => {}
                 _ = async {
-                    while !f.load(Ordering::Relaxed) {
+                    while !f.load(Ordering::Acquire) {
                         tokio::time::sleep(POLL).await;
                     }
                 } => {}
