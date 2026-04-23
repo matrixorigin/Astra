@@ -6138,4 +6138,33 @@ mod tests {
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
     }
+
+    /// audit-#5: closing the semaphore must surface as a graceful Err from
+    /// `acquire().await`, not a panic. This is the building-block invariant
+    /// that the spawned delegation tasks now rely on (no `.expect`).
+    #[tokio::test]
+    async fn semaphore_acquire_returns_err_when_closed() {
+        use tokio::sync::Semaphore;
+        let sem = std::sync::Arc::new(Semaphore::new(0));
+        let sem2 = sem.clone();
+        let h = tokio::spawn(async move { sem2.acquire().await.map(|_| ()) });
+        sem.close();
+        let res = h.await.expect("task joins");
+        assert!(res.is_err(), "closed semaphore must yield Err, not panic");
+    }
+
+    /// audit-#5: source-level guard — no `.expect("semaphore closed")` calls
+    /// remain in the spawned delegation tasks.
+    #[test]
+    fn delegation_does_not_panic_on_closed_semaphore() {
+        let source = include_str!("delegation_engine.rs");
+        // Build the needle dynamically to avoid matching this assertion's
+        // own literal in the included source.
+        let needle = format!(".expect(\"sem{}closed\")", "aphore ");
+        assert_eq!(
+            source.matches(needle.as_str()).count(),
+            0,
+            "spawned delegation tasks must not panic on a closed semaphore"
+        );
+    }
 }

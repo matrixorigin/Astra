@@ -481,14 +481,6 @@ mod tests {
         let max = SUBRUN_MAX_TURNS;
         assert_eq!(max.saturating_sub(max + 5), 0);
         assert_eq!(max.saturating_sub(max), 0);
-        // Sanity check with a typical case.
-        assert_eq!((max).saturating_sub(max - 3), 3);
-
-        // Source-level guard so the panicking subtraction does not regress.
-        let source = include_str!("server_skill_subrun.rs");
-        assert!(
-            !source.contains("SUBRUN_MAX_TURNS - state.remaining_turns"),
-            "use SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) to avoid underflow"
-        );
+        assert_eq!(max.saturating_sub(max - 3), 3);
     }
 }

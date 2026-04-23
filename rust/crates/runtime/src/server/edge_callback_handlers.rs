@@ -165,8 +165,12 @@ pub(super) async fn post_approval_respond_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
     let key = approval_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
-    if let Some(session_id) = body.session_id.as_deref() {
+
+    // audit-#2: perform ALL journal I/O (validate → lookup → JournalWriter
+    // append) BEFORE acquiring the ledger mutex. Holding the in-process lock
+    // across blocking fs work serializes every concurrent edge callback
+    // behind a single fsync.
+    let durable_fallback_ready = if let Some(session_id) = body.session_id.as_deref() {
         validate_session_id(session_id)
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         let decision = match &body.decision {
@@ -219,19 +223,27 @@ pub(super) async fn post_approval_respond_handler(
                     )
                 })?;
         }
-    }
-    let ledger_enqueued = insert_approval_ledger_entry(
-        &mut lock,
-        key.clone(),
-        serde_json::json!({
-            "kind": "approval_respond",
-            "user_id": user.user_id,
-            "edge_id": edge_id,
-            "body": serde_json::to_value(&body).unwrap_or_default(),
-        }),
-        body.session_id.is_some(),
-    )
-    .map_err(|err| ledger_insert_error_response(&key, err))?;
+        true
+    } else {
+        false
+    };
+
+    // Narrow lock scope: only the in-memory map insert is critical-section.
+    let ledger_enqueued = {
+        let mut lock = state.edge_callback_ledger.lock().await;
+        insert_approval_ledger_entry(
+            &mut lock,
+            key.clone(),
+            serde_json::json!({
+                "kind": "approval_respond",
+                "user_id": user.user_id,
+                "edge_id": edge_id,
+                "body": serde_json::to_value(&body).unwrap_or_default(),
+            }),
+            durable_fallback_ready,
+        )
+        .map_err(|err| ledger_insert_error_response(&key, err))?
+    };
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -472,5 +484,37 @@ mod edge_callback_insert_tests {
         )
         .expect("durable fallback path returns Ok(false)");
         assert!(!out, "durable fallback path signals not-enqueued");
+    }
+
+    /// audit-#2: blocking journal I/O must NOT happen while the
+    /// `edge_callback_ledger` mutex is held, otherwise every other
+    /// in-flight callback stalls behind a single fsync.
+    #[test]
+    fn approval_handler_acquires_lock_after_journal_io() {
+        let source = include_str!("edge_callback_handlers.rs");
+        let fn_start = source
+            .find("pub(super) async fn post_approval_respond_handler(")
+            .expect("approval handler must exist");
+        let body = &source[fn_start..];
+        // Stop at the next top-level `pub(super)` definition to avoid scanning
+        // unrelated handlers.
+        let body_end = body[1..]
+            .find("\npub(super) ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..body_end];
+
+        let lock_pos = body
+            .find("edge_callback_ledger.lock().await")
+            .expect("approval handler must take the ledger lock somewhere");
+        let journal_pos = body
+            .find("find_latest_approval_required")
+            .expect("approval handler must look up the latest approval");
+        assert!(
+            journal_pos < lock_pos,
+            "journal I/O (find_latest_approval_required at offset {journal_pos}) \
+             must happen BEFORE ledger lock acquisition (offset {lock_pos}) \
+             so a slow journal append cannot stall every concurrent callback"
+        );
     }
 }
