@@ -199,7 +199,7 @@ pub async fn resolve_active_llm_model(
         None => {
             ephemeral = sqlx::mysql::MySqlPoolOptions::new()
                 .max_connections(1)
-                .connect(&matrixone.database_url())
+                .connect(&matrixone.database_url_with_password())
                 .await
                 .map_err(|e| format!("DB connect: {e}"))?;
             &ephemeral

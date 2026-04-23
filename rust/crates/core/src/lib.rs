@@ -177,7 +177,7 @@ pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySq
     MySqlPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(2))
-        .connect(&settings.database_url())
+        .connect(&settings.database_url_with_password())
         .await
 }
 
@@ -195,7 +195,7 @@ impl SharedPool {
             .min_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .idle_timeout(std::time::Duration::from_secs(300))
-            .connect(&settings.database_url())
+            .connect(&settings.database_url_with_password())
             .await?;
         Ok(Self {
             pool: Arc::new(pool),

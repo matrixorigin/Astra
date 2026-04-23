@@ -37,7 +37,7 @@ impl SkillSearchSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
     pub application: ApplicationSettings,
@@ -47,6 +47,27 @@ pub struct AppSettings {
     pub memoria_master_key: Option<String>,
     pub chat_turn_bridge_url: Option<String>,
     pub chat_turn_bridge_secret: String,
+}
+
+impl fmt::Debug for AppSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppSettings")
+            .field("matrixone", &self.matrixone)
+            .field("application", &self.application)
+            .field("jwt", &self.jwt)
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("memoria_base_url", &self.memoria_base_url)
+            .field(
+                "memoria_master_key",
+                &self.memoria_master_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("chat_turn_bridge_url", &self.chat_turn_bridge_url)
+            .field("chat_turn_bridge_secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl AppSettings {
@@ -94,7 +115,7 @@ impl AppSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MatrixOneSettings {
     pub host: String,
     pub port: u16,
@@ -103,8 +124,33 @@ pub struct MatrixOneSettings {
     pub database: String,
 }
 
+impl fmt::Debug for MatrixOneSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatrixOneSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
 impl MatrixOneSettings {
+    /// Returns the database URL with password REDACTED — safe for logging.
+    ///
+    /// Use [`MatrixOneSettings::database_url_with_password`] when an actual
+    /// connection string is required (e.g. constructing a sqlx pool).
     pub fn database_url(&self) -> String {
+        format!(
+            "mysql://{}:[REDACTED]@{}:{}/{}",
+            self.user, self.host, self.port, self.database
+        )
+    }
+
+    /// Returns the database URL with the actual password — use ONLY for DB
+    /// connection construction. Never log the result.
+    pub fn database_url_with_password(&self) -> String {
         format!(
             "mysql://{}:{}@{}:{}/{}",
             self.user, self.password, self.host, self.port, self.database
@@ -112,11 +158,21 @@ impl MatrixOneSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApplicationSettings {
     pub app_env: String,
     pub log_level: String,
     pub secret_key: String,
+}
+
+impl fmt::Debug for ApplicationSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplicationSettings")
+            .field("app_env", &self.app_env)
+            .field("log_level", &self.log_level)
+            .field("secret_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ApplicationSettings {
@@ -129,12 +185,23 @@ impl ApplicationSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JwtSettings {
     pub secret_key: String,
     pub algorithm: String,
     pub access_token_expire_minutes: u32,
     pub refresh_token_expire_days: u32,
+}
+
+impl fmt::Debug for JwtSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JwtSettings")
+            .field("secret_key", &"[REDACTED]")
+            .field("algorithm", &self.algorithm)
+            .field("access_token_expire_minutes", &self.access_token_expire_minutes)
+            .field("refresh_token_expire_days", &self.refresh_token_expire_days)
+            .finish()
+    }
 }
 
 impl JwtSettings {
@@ -319,9 +386,89 @@ mod tests {
             database: "agent".into(),
         };
 
+        // Default `database_url()` returns the masked form for safe logging.
         assert_eq!(
             settings.database_url(),
+            "mysql://alice:[REDACTED]@db:3306/agent"
+        );
+        assert_eq!(
+            settings.database_url_with_password(),
             "mysql://alice:secret@db:3306/agent"
+        );
+    }
+
+    #[test]
+    fn jwt_settings_debug_redacts_secret() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let debug_str = format!("{:?}", settings.jwt);
+        assert!(
+            !debug_str.contains("change-me-in-production"),
+            "secret should be redacted: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should show [REDACTED]: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn matrixone_settings_debug_redacts_password() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let debug_str = format!("{:?}", settings.matrixone);
+        assert!(
+            !debug_str.contains("\"111\""),
+            "password should be redacted: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should show [REDACTED]: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn matrixone_settings_database_url_is_masked() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let url = settings.matrixone.database_url();
+        assert!(
+            !url.contains(":111@"),
+            "masked url should not contain password: {url}"
+        );
+        assert!(
+            url.contains("[REDACTED]"),
+            "masked url should contain [REDACTED]: {url}"
+        );
+        let url_with_pw = settings.matrixone.database_url_with_password();
+        assert!(
+            url_with_pw.contains(":111@"),
+            "url_with_password should contain actual password: {url_with_pw}"
+        );
+    }
+
+    #[test]
+    fn app_settings_debug_redacts_optional_secrets() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        m.insert("GITHUB_TOKEN".into(), "ghp_supersecret_token".into());
+        m.insert("MEMORIA_MASTER_KEY".into(), "memoria-master-key-xyz".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let debug_str = format!("{settings:?}");
+        assert!(
+            !debug_str.contains("ghp_supersecret_token"),
+            "github_token should be redacted: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("memoria-master-key-xyz"),
+            "memoria_master_key should be redacted: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("dev-bridge-secret-change-me"),
+            "chat_turn_bridge_secret should be redacted: {debug_str}"
         );
     }
 

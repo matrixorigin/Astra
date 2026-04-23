@@ -706,7 +706,7 @@ impl HealthChecker for MatrixOneHealthChecker {
         let pool = match MySqlPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(2))
-            .connect(&self.settings.database_url())
+            .connect(&self.settings.database_url_with_password())
             .await
         {
             Ok(pool) => pool,
