@@ -3682,22 +3682,24 @@ mod tests {
         let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
         let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
 
-        for _ in 0..3 {
-            pattern_library.record_outcome(
-                &["bash".to_string()],
-                crate::pipeline::routing::TaskType::Code,
-                None,
-                true,
-                0.8,
-                None,
-            );
-        }
-        pattern_library
-            .apply_evolution_action("bash", crate::evolution::types::PatternAction::Block);
+        // One success so the pattern exists, then Block adds 5 failures.
+        // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
+        pattern_library.record_outcome(
+            &["some_custom_tool".to_string()],
+            crate::pipeline::routing::TaskType::Code,
+            None,
+            true,
+            0.8,
+            None,
+        );
+        pattern_library.apply_evolution_action(
+            "some_custom_tool",
+            crate::evolution::types::PatternAction::Block,
+        );
 
         seed_restricted_tools_from_blocked_patterns(&mut state, &pattern_library);
 
-        assert!(state.restricted_tools.contains("bash"));
+        assert!(state.restricted_tools.contains("some_custom_tool"));
     }
 
     #[test]

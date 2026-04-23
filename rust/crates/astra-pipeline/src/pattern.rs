@@ -624,12 +624,33 @@ impl PatternLibrary {
     /// matches the explicit `PatternAction::Block` mutation while avoiding
     /// turning a short-lived 3-failure streak into a persisted hard block.
     /// These tools should be added to `restricted_tools` for deny-at-assembly.
+    /// Return individual tool names from patterns that are effectively blocked.
+    ///
+    /// A pattern is blocked when ALL of:
+    /// 1. At least 5 failures total (avoids blocking on small samples)
+    /// 2. Last 3 outcomes are all failures (recent trend is bad)
+    /// 3. Failure rate > 80% (occasional failures don't trigger block)
+    /// 4. Last used within 24 hours (stale blocks expire automatically)
+    ///
+    /// Condition 3 prevents blocking tools that mostly work but had a bad
+    /// streak.  Condition 4 ensures blocks are temporary — if the underlying
+    /// cause was an environment bug that got fixed, the tool gets a fresh
+    /// chance after 24h instead of being permanently disabled.
+    ///
+    /// These tools should be added to `restricted_tools` for deny-at-assembly.
     pub fn blocked_tool_names(&self) -> Vec<String> {
+        const BLOCK_TTL_SECS: u64 = 24 * 3600;
+        let now = current_timestamp();
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for pattern in self.patterns.values() {
+            let total = pattern.success_count + pattern.failure_count;
+            let age_secs = now.saturating_sub(pattern.last_used_at);
             if pattern.recent_outcomes.len() >= 3
                 && pattern.failure_count >= 5
                 && pattern.recent_outcomes.iter().rev().take(3).all(|ok| !ok)
+                && total > 0
+                && (pattern.failure_count as f64 / total as f64) > 0.8
+                && age_secs < BLOCK_TTL_SECS
             {
                 for tool in &pattern.tools {
                     names.insert(tool.clone());
@@ -2253,14 +2274,55 @@ mod tests {
     #[test]
     fn blocked_tool_names_returns_tools_from_blocked_patterns() {
         let mut lib = PatternLibrary::new();
-        for _ in 0..3 {
-            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
-        }
-
-        lib.apply_evolution_action("bash", PatternAction::Block);
+        // One success so the pattern exists, then Block adds 5 failures + 3 false outcomes.
+        // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
+        lib.record_outcome(&tools(&["custom_tool"]), TaskType::Code, None, true, 0.8, None);
+        lib.apply_evolution_action("custom_tool", PatternAction::Block);
 
         let blocked = lib.blocked_tool_names();
-        assert!(blocked.iter().any(|tool| tool == "bash"));
+        assert!(
+            blocked.iter().any(|tool| tool == "custom_tool"),
+            "expected custom_tool to be blocked, got: {blocked:?}"
+        );
+    }
+
+    /// Blocked patterns expire after 24h — the tool gets a fresh chance.
+    #[test]
+    fn blocked_tool_names_expires_after_ttl() {
+        let mut lib = PatternLibrary::new();
+        lib.record_outcome(&tools(&["flaky_tool"]), TaskType::Code, None, true, 0.8, None);
+        lib.apply_evolution_action("flaky_tool", PatternAction::Block);
+
+        // Immediately after blocking, it should be blocked
+        assert!(lib.blocked_tool_names().contains(&"flaky_tool".to_string()));
+
+        // Simulate 25 hours passing by backdating last_used_at
+        let key = pattern_key("flaky_tool", TaskType::Code);
+        if let Some(pattern) = lib.patterns.get_mut(&key) {
+            pattern.last_used_at = pattern.last_used_at.saturating_sub(25 * 3600);
+        }
+
+        // After TTL, it should no longer be blocked
+        assert!(
+            !lib.blocked_tool_names().contains(&"flaky_tool".to_string()),
+            "pattern should expire after 24h TTL"
+        );
+    }
+
+    /// Patterns with moderate success rate (>20%) should not be blocked.
+    #[test]
+    fn blocked_tool_names_spares_moderate_success_rate() {
+        let mut lib = PatternLibrary::new();
+        // 3 successes + Block (adds 5 failures) = 3/8 = 37.5% success → not blocked
+        for _ in 0..3 {
+            lib.record_outcome(&tools(&["mixed_tool"]), TaskType::Code, None, true, 0.8, None);
+        }
+        lib.apply_evolution_action("mixed_tool", PatternAction::Block);
+
+        assert!(
+            !lib.blocked_tool_names().contains(&"mixed_tool".to_string()),
+            "tool with 37.5% success rate should not be blocked"
+        );
     }
 
     // ── Active Exploration Tests ──
