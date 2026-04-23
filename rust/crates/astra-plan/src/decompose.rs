@@ -1108,8 +1108,8 @@ fn fix_python_literals(s: &str) -> String {
             let n = lit_chars.len();
             if i + n <= len && chars[i..i + n] == **lit_chars {
                 let prev_ok = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
-                let next_ok =
-                    i + n == len || (!chars[i + n].is_alphanumeric() && chars[i + n] != '_');
+                let next_ok = i + n == len
+                    || (!chars[i + n].is_alphanumeric() && chars[i + n] != '_');
                 if prev_ok && next_ok {
                     out.push_str(repl);
                     i += n;
