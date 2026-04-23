@@ -1,4 +1,5 @@
 import { AstraClient, AstraApiError, chatRequestToWire } from '../client';
+import { PATH_SESSIONS } from '../paths';
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -577,6 +578,64 @@ describe('AstraClient — Errors', () => {
       expect(e).toBeInstanceOf(AstraApiError);
       expect((e as AstraApiError).status).toBe(404);
     }
+  });
+
+  test('throws AstraApiError when response is ok but body is not JSON', async () => {
+    globalThis.fetch = mockFetch(200, '<!DOCTYPE html><html>');
+
+    try {
+      await createClient().getSession('s1');
+      fail('Expected error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(AstraApiError);
+      expect((e as AstraApiError).status).toBe(200);
+      expect((e as AstraApiError).body).toMatch(/Invalid JSON response/);
+    }
+  });
+
+  test('merges RequestInit headers (plain record)', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve('{"sessions":[], "total":0, "limit":20, "offset":0}'),
+      headers: new Headers(),
+    } as unknown as Response);
+
+    const client = createClient();
+    await client.fetch(PATH_SESSIONS, {
+      method: 'GET',
+      headers: { 'X-Plain': 'from-record' },
+    });
+
+    const headersArg = (globalThis.fetch as jest.Mock).mock.calls[0][1].headers as Record<
+      string,
+      string
+    >;
+    expect(headersArg['X-Plain']).toBe('from-record');
+  });
+
+  test('merges RequestInit headers when value is a Headers object', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve('{"sessions":[], "total":0, "limit":20, "offset":0}'),
+      headers: new Headers(),
+    } as unknown as Response);
+
+    const client = createClient();
+    const h = new Headers();
+    h.set('X-Custom', 'from-headers-object');
+    await client.fetch(PATH_SESSIONS, { method: 'GET', headers: h });
+
+    const headersArg = (globalThis.fetch as jest.Mock).mock.calls[0][1].headers as Record<
+      string,
+      string
+    >;
+    // Undici/Node may normalize names; value must be present.
+    expect(Object.values(headersArg)).toContain('from-headers-object');
+    expect(
+      Object.keys(headersArg).some((k) => k.toLowerCase() === 'x-custom'),
+    ).toBe(true);
   });
 
   test('auto-refresh on 401', async () => {

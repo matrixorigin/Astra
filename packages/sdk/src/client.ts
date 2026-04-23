@@ -85,6 +85,41 @@ import {
 } from './paths';
 import { SSEClient, parseSseDataEvents } from './sse-client';
 
+/** `Headers` or undici/VM instances where `instanceof Headers` is unreliable. */
+function isWebHeadersObject(h: unknown): h is Headers {
+  if (h == null || typeof h !== 'object' || Array.isArray(h)) return false;
+  if (h instanceof Headers) return true;
+  return (
+    'append' in h &&
+    'forEach' in h &&
+    typeof (h as Headers).forEach === 'function' &&
+    typeof (h as Headers).append === 'function'
+  );
+}
+
+/** Merge `RequestInit.headers` into a plain record (handles `Headers` and `[string, string][]`). */
+function mergeHeadersInit(
+  base: Record<string, string>,
+  initHeaders?: HeadersInit,
+): Record<string, string> {
+  if (initHeaders == null) return { ...base };
+  if (Array.isArray(initHeaders)) {
+    const out = { ...base };
+    for (const [k, v] of initHeaders) {
+      out[k] = v;
+    }
+    return out;
+  }
+  if (isWebHeadersObject(initHeaders)) {
+    const out = { ...base };
+    initHeaders.forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  }
+  return { ...base, ...(initHeaders as Record<string, string>) };
+}
+
 type SessionWire = {
   session_id: string;
   user_id?: string;
@@ -331,7 +366,7 @@ export class AstraClient {
     const url = this.apiPath(path);
     let res = await fetch(url, {
       ...init,
-      headers: { ...this.buildHeaders(init), ...(init?.headers as Record<string, string>) },
+      headers: mergeHeadersInit(this.buildHeaders(init), init?.headers),
     });
 
     if (res.status === 401) {
@@ -339,7 +374,7 @@ export class AstraClient {
       if (refreshed) {
         res = await fetch(url, {
           ...init,
-          headers: { ...this.buildHeaders(init), ...(init?.headers as Record<string, string>) },
+          headers: mergeHeadersInit(this.buildHeaders(init), init?.headers),
         });
       }
     }
@@ -355,7 +390,16 @@ export class AstraClient {
 
     const text = await res.text();
     if (!text) return undefined as T;
-    return JSON.parse(text) as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch (parseErr) {
+      const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      throw new AstraApiError(
+        res.status,
+        `Invalid JSON response: ${msg}; body starts: ${text.slice(0, 500)}`,
+        path,
+      );
+    }
   }
 
   async post<T>(path: string, body?: unknown): Promise<T> {
