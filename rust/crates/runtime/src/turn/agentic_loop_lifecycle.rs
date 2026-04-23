@@ -201,13 +201,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         .cancellation
         .pause_flag
         .as_ref()
-        .is_some_and(|f| f.load(Ordering::Relaxed))
+        .is_some_and(|f| f.load(Ordering::Acquire))
     {
         if state
             .cancellation
             .flag
             .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+            .is_some_and(|f| f.load(Ordering::Acquire))
             || state
                 .cancellation
                 .token
@@ -231,7 +231,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         .cancellation
         .flag
         .as_ref()
-        .is_some_and(|f| f.load(Ordering::Relaxed))
+        .is_some_and(|f| f.load(Ordering::Acquire))
         || state
             .cancellation
             .token

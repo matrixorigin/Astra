@@ -118,15 +118,37 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Spawn periodic expired data cleanup (runs every 6 hours)
+    // Cancellation token wired into background sweepers; cancelled after axum
+    // serve returns so we can drain them deterministically before tearing down
+    // the runtime / pool / OTLP exporter.
+    let bg_cancel = tokio_util::sync::CancellationToken::new();
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(ref pool) = state.shared_pool {
-        spawn_data_cleanup(pool.clone());
-        astra_services::session_reaper::spawn_session_reaper(pool.clone());
+        bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
+        bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
+            pool.clone(),
+            bg_cancel.clone(),
+        ));
     }
+
+    // Clone the matrix runtime handle before moving `state` into `build_app`
+    // so we can drain ingestion + sync sidecars after axum returns.
+    let matrix_runtime = state.matrix_cloud_runtime.clone();
 
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(http_shutdown_signal())
         .await?;
+
+    // 1. Stop background sweepers and wait for them to exit.
+    bg_cancel.cancel();
+    for h in bg_handles {
+        let _ = h.await;
+    }
+    // 2. Drain Matrix ingestion + tracked session sync tasks.
+    if let Some(rt) = matrix_runtime {
+        rt.shutdown_ingestion_and_wait().await;
+    }
+    // 3. Flush OTLP exporter last so the prior shutdown work is observable.
     astra_logging::shutdown_otel();
     Ok(())
 }
@@ -160,7 +182,10 @@ async fn http_shutdown_signal() {
 }
 
 /// Spawn a background task that periodically cleans up expired data.
-fn spawn_data_cleanup(pool: astra_core::SharedPool) {
+fn spawn_data_cleanup(
+    pool: astra_core::SharedPool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     use astra_services::RetentionPolicy;
     use std::time::Duration;
 
@@ -176,7 +201,16 @@ fn spawn_data_cleanup(pool: astra_core::SharedPool) {
         let mut interval = tokio::time::interval(cleanup_interval);
         interval.tick().await; // skip immediate first tick
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        "data cleanup received cancellation; exiting"
+                    );
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
             let results = astra_services::cleanup_expired_data(pool.get(), &policy).await;
             let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
             if total > 0 {
@@ -194,5 +228,5 @@ fn spawn_data_cleanup(pool: astra_core::SharedPool) {
                 );
             }
         }
-    });
+    })
 }

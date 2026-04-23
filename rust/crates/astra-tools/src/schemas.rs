@@ -1764,10 +1764,6 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "pattern": {
                             "type": "string",
                             "description": "Regex pattern for search (case-insensitive)"
-                        },
-                        "show_values": {
-                            "type": "boolean",
-                            "description": "Show full values in list/search (default: false, shows char count instead)"
                         }
                     },
                     "required": ["operation"]
@@ -2034,6 +2030,28 @@ mod tests {
                 "`{name}` is in DEFAULT_EXECUTOR_TOOL_NAMES but missing from SERVER_EXECUTOR_TOOL_NAMES"
             );
         }
+    }
+
+    #[test]
+    fn env_tool_schema_does_not_advertise_show_values() {
+        let schemas = all_tool_schemas();
+        let env_schema = schemas
+            .iter()
+            .find(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("env")
+            })
+            .expect("env tool schema present");
+        let props = env_schema
+            .pointer("/function/parameters/properties")
+            .and_then(Value::as_object)
+            .expect("env parameters.properties");
+        assert!(
+            !props.contains_key("show_values"),
+            "env tool schema must not expose show_values to the LLM"
+        );
     }
 
     #[test]

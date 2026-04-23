@@ -6334,7 +6334,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             &[],
             &[],
             None,
-            (state.max_turns - state.remaining_turns) as u32,
+            state.max_turns.saturating_sub(state.remaining_turns) as u32,
             None,
             None,
             None,
@@ -7794,5 +7794,15 @@ mod parallel_execution_tests {
         assert!(matches!(&batches[0], ToolBatch::Concurrent(v) if v.len() == 2));
         assert!(matches!(&batches[1], ToolBatch::Serial(_)));
         assert!(matches!(&batches[2], ToolBatch::Concurrent(v) if v.len() == 2));
+    }
+
+    /// audit-#8: source-level guard against the panicking subtraction.
+    #[test]
+    fn turn_count_uses_saturating_sub() {
+        let source = include_str!("agentic_loop_host.rs");
+        assert!(
+            source.contains("state.max_turns.saturating_sub(state.remaining_turns)"),
+            "expected saturating_sub in agentic_loop_host"
+        );
     }
 }

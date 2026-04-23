@@ -188,20 +188,14 @@ pub async fn build_server_state(
     )));
 
     // Wire in-process chat turn bridge.
-    let encryptor =
+    // Note: persist_tracker is wired after matrix_rt is created below.
+    let bridge_encryptor =
         Arc::new(FernetTokenEncryptor::from_env().map_err(Box::<dyn std::error::Error>::from)?);
-    let edge_ledger = state.edge_callback_ledger.clone();
-    let state = state
-        .with_chat_turn_bridge(Arc::new(
-            turn::bridge_inprocess::InProcessChatTurnBridge::new(
-                settings.matrixone.clone(),
-                encryptor,
-            )
-            .with_pool(shared_pool.clone())
-            .with_learning_writer(learning_stack.writer.clone())
-            .with_edge_callback_ledger(edge_ledger),
-        ))
-        .with_chat_turn_bridge_secret(settings.chat_turn_bridge_secret);
+    let bridge_edge_ledger = state.edge_callback_ledger.clone();
+    let bridge_matrixone = settings.matrixone.clone();
+    let bridge_pool = shared_pool.clone();
+    let bridge_learning_writer = learning_stack.writer.clone();
+    let bridge_chat_turn_bridge_secret = settings.chat_turn_bridge_secret;
     let state = state.with_memoria_config(settings.memoria_base_url, settings.memoria_master_key);
 
     // Wire run lifecycle service: uses ServerAgenticLoopHost for agentic loops.
@@ -336,6 +330,22 @@ pub async fn build_server_state(
         None,
         Arc::clone(&lease_hold_cache),
     ));
+    // Wire in-process chat turn bridge with matrix_rt as the persist tracker.
+    // HIGH #4: attach matrix_rt as BridgePersistTracker so SSE persist tasks drain on shutdown.
+    let state = state
+        .with_chat_turn_bridge(Arc::new(
+            turn::bridge_inprocess::InProcessChatTurnBridge::new(
+                bridge_matrixone,
+                bridge_encryptor,
+            )
+            .with_pool(bridge_pool)
+            .with_learning_writer(bridge_learning_writer)
+            .with_edge_callback_ledger(bridge_edge_ledger)
+            .with_persist_tracker(Arc::clone(&matrix_rt)
+                as Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>),
+        ))
+        .with_chat_turn_bridge_secret(bridge_chat_turn_bridge_secret);
+
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
     Ok(state)
 }

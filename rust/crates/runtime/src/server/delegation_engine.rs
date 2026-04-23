@@ -481,7 +481,13 @@ impl DelegationTracker {
         };
         let writer = match astra_services::session_journal::JournalWriter::new(sid) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "JournalWriter::new failed for session {sid}: {e}"
+                );
+                return;
+            }
         };
         if let Err(e) = writer.append(&event) {
             astra_core::agent_warn!("delegation", "Failed to write journal event: {e}");
@@ -559,14 +565,14 @@ impl DelegationTracker {
             });
         }
 
-        self.delegations
-            .write()
-            .await
-            .entry(delegation_id)
-            .or_default()
-            .push(record);
-
-        self.parents.write().await.insert(run_id, parent_id);
+        // LOCK ORDER: delegations → parents (matches `cleanup_delegation` and
+        // `load_from_run_records`). Both maps must be inserted into atomically
+        // so concurrent `is_sub_run` cannot observe the parents map without the
+        // matching delegations entry (and vice-versa).
+        let mut delegations = self.delegations.write().await;
+        let mut parents = self.parents.write().await;
+        delegations.entry(delegation_id).or_default().push(record);
+        parents.insert(run_id, parent_id);
     }
 
     /// Get all sub-runs for a delegation.
@@ -763,7 +769,7 @@ impl DelegationTracker {
             .read()
             .await
             .get(run_id)
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+            .is_some_and(|f| f.load(Ordering::Acquire))
     }
 
     // ── State Machine + Lifecycle ───────────────────────────────────────────
@@ -1950,8 +1956,18 @@ impl DelegationEngine {
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
             let abort_handle = join_set.spawn(async move {
+                // audit-#5: do not panic if the semaphore was closed during shutdown.
                 let _permit = match sem {
-                    Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
+                    Some(ref s) => match s.acquire().await {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            tracing::info!(
+                                target: "astra_runtime::delegation",
+                                "semaphore closed during shutdown; proceeding without permit"
+                            );
+                            None
+                        }
+                    },
                     None => None,
                 };
                 let run_id = config.run_id.clone();
@@ -3054,8 +3070,18 @@ impl DelegationEngine {
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
             let abort_handle = handles.spawn(async move {
+                // audit-#5: do not panic if the semaphore was closed during shutdown.
                 let _permit = match sem {
-                    Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
+                    Some(ref s) => match s.acquire().await {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            tracing::info!(
+                                target: "astra_runtime::delegation",
+                                "semaphore closed during shutdown; proceeding without permit"
+                            );
+                            None
+                        }
+                    },
                     None => None,
                 };
                 let run_id = config.run_id.clone();
@@ -6117,5 +6143,34 @@ mod tests {
         let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
+    }
+
+    /// audit-#5: closing the semaphore must surface as a graceful Err from
+    /// `acquire().await`, not a panic. This is the building-block invariant
+    /// that the spawned delegation tasks now rely on (no `.expect`).
+    #[tokio::test]
+    async fn semaphore_acquire_returns_err_when_closed() {
+        use tokio::sync::Semaphore;
+        let sem = std::sync::Arc::new(Semaphore::new(0));
+        let sem2 = sem.clone();
+        let h = tokio::spawn(async move { sem2.acquire().await.map(|_| ()) });
+        sem.close();
+        let res = h.await.expect("task joins");
+        assert!(res.is_err(), "closed semaphore must yield Err, not panic");
+    }
+
+    /// audit-#5: source-level guard — no panicking expect calls remain in
+    /// the spawned delegation tasks for the closed-semaphore path.
+    #[test]
+    fn delegation_does_not_panic_on_closed_semaphore() {
+        let source = include_str!("delegation_engine.rs");
+        // Build the needle dynamically to avoid matching this assertion's
+        // own literal in the included source.
+        let needle = format!(".expect(\"sem{}closed\")", "aphore ");
+        assert_eq!(
+            source.matches(needle.as_str()).count(),
+            0,
+            "spawned delegation tasks must not panic on a closed semaphore"
+        );
     }
 }

@@ -576,6 +576,10 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                         let _ = socket.send(Message::Pong(data)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
+                        // audit-#9: echo a Close frame so the peer knows we
+                        // observed the closure and isn't left waiting on a
+                        // reciprocal frame before tearing down the TCP socket.
+                        let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
                     Some(Ok(_)) => {
@@ -782,6 +786,54 @@ async fn handle_resume_run(
     }
 }
 
+/// Outcome of a dedup-insert into the edge-callback ledger.
+#[derive(Debug, PartialEq)]
+pub(crate) enum WsLedgerOutcome {
+    /// Key was absent; value has been inserted.
+    Inserted,
+    /// Key was present with an identical JSON value; no-op idempotent replay.
+    IdempotentReplay,
+    /// Key was present with a DIFFERENT value; the original decision is preserved.
+    ConflictIgnored,
+}
+
+/// Insert `value` under `key` in the ledger with at-most-once idempotency semantics.
+///
+/// - Key absent → insert, return `Inserted`.
+/// - Key present + same JSON value → no-op, return `IdempotentReplay`.
+/// - Key present + different JSON value → do NOT overwrite; emit a warning;
+///   return `ConflictIgnored`.
+pub(crate) fn ws_ledger_dedup_insert(
+    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) -> WsLedgerOutcome {
+    use std::collections::hash_map::Entry;
+    match ledger.entry(key.clone()) {
+        Entry::Vacant(e) => {
+            e.insert(value);
+            WsLedgerOutcome::Inserted
+        }
+        Entry::Occupied(e) => {
+            let existing = e.get();
+            if existing == &value {
+                WsLedgerOutcome::IdempotentReplay
+            } else {
+                let existing_repr = existing.to_string().chars().take(80).collect::<String>();
+                let new_repr = value.to_string().chars().take(80).collect::<String>();
+                tracing::warn!(
+                    target: "astra_runtime::ws_callback",
+                    key = %key,
+                    existing = %existing_repr,
+                    incoming = %new_repr,
+                    "WS ledger dedup: incoming value conflicts with stored decision; original preserved"
+                );
+                WsLedgerOutcome::ConflictIgnored
+            }
+        }
+    }
+}
+
 /// Store a tool approval response in the edge callback ledger.
 async fn handle_tool_approval(
     state: &AppState,
@@ -799,7 +851,7 @@ async fn handle_tool_approval(
     });
     let ledger = state.edge_callback_ledger.clone();
     let mut guard = ledger.lock().await;
-    guard.insert(key, value);
+    ws_ledger_dedup_insert(&mut guard, key, value);
 }
 
 /// Store an ask_user response in the edge callback ledger.
@@ -819,7 +871,7 @@ async fn handle_user_prompt_response(
     });
     let ledger = state.edge_callback_ledger.clone();
     let mut guard = ledger.lock().await;
-    guard.insert(key, value);
+    ws_ledger_dedup_insert(&mut guard, key, value);
 }
 
 #[cfg(test)]
@@ -4036,5 +4088,66 @@ mod tests {
 
         let json = r#"{"type":"user_prompt","request_id":"req-1"}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+    }
+
+    // ── ws_ledger_dedup_insert unit tests ──────────────────────────────────
+
+    #[test]
+    fn ws_ledger_dedup_insert_absent_key_inserts_and_returns_inserted() {
+        let mut ledger = std::collections::HashMap::new();
+        let outcome = ws_ledger_dedup_insert(
+            &mut ledger,
+            "user:req-1".to_string(),
+            serde_json::json!({"approved": true, "reason": null}),
+        );
+        assert_eq!(outcome, WsLedgerOutcome::Inserted);
+        assert_eq!(
+            ledger["user:req-1"],
+            serde_json::json!({"approved": true, "reason": null})
+        );
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_identical_value_is_idempotent_replay() {
+        let mut ledger = std::collections::HashMap::new();
+        let value = serde_json::json!({"approved": true, "reason": null});
+        ledger.insert("user:req-1".to_string(), value.clone());
+
+        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-1".to_string(), value.clone());
+        assert_eq!(outcome, WsLedgerOutcome::IdempotentReplay);
+        // original value unchanged
+        assert_eq!(ledger["user:req-1"], value);
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_different_value_is_conflict_ignored_and_preserves_original() {
+        let mut ledger = std::collections::HashMap::new();
+        let original = serde_json::json!({"approved": true, "reason": null});
+        let conflicting = serde_json::json!({"approved": false, "reason": "changed mind"});
+        ledger.insert("user:req-1".to_string(), original.clone());
+
+        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-1".to_string(), conflicting);
+        assert_eq!(outcome, WsLedgerOutcome::ConflictIgnored);
+        // original MUST NOT be overwritten
+        assert_eq!(
+            ledger["user:req-1"], original,
+            "conflicting update must not overwrite the first decision"
+        );
+    }
+
+    /// audit-#9: the message loop must echo a Close frame back to the peer
+    /// before tearing the socket down so the WebSocket close handshake completes.
+    #[test]
+    fn message_loop_echoes_close_frame() {
+        let source = include_str!("ws_handler.rs");
+        // Find the Close arm and ensure a `socket.send(Message::Close(None))`
+        // appears in it before the `break`.
+        let needle = "Some(Ok(Message::Close(_))) | None =>";
+        let idx = source.find(needle).expect("close arm present");
+        let arm = &source[idx..idx + 400];
+        assert!(
+            arm.contains("socket.send(Message::Close(None))"),
+            "WS message_loop must echo a Close frame before breaking"
+        );
     }
 }

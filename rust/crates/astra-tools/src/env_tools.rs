@@ -89,11 +89,11 @@ pub fn env_tool(args: &Value) -> String {
 
 /// List all environment variables (values masked by default for security).
 fn env_list(args: &Value) -> String {
-    let show_values = args
-        .get("show_values")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
+    // The `show_values` parameter is intentionally not honored on the LLM
+    // tool path: a malicious / drifted model must not be able to exfiltrate
+    // env values by passing show_values=true. Direct CLI callers should use
+    // the CLI surface (which can still print raw values when appropriate).
+    let _ = args;
     let vars = overlay_all();
 
     let entries: Vec<Value> = vars
@@ -101,8 +101,6 @@ fn env_list(args: &Value) -> String {
         .map(|(name, value)| {
             let display_value = if is_sensitive_var(&name) {
                 format!("***MASKED*** ({} chars)", value.len())
-            } else if show_values {
-                value
             } else {
                 format!("({} chars)", value.len())
             };
@@ -221,10 +219,7 @@ fn env_search(args: &Value) -> String {
         Some(p) => p,
         None => return json!({ "error": "Missing required parameter: pattern" }).to_string(),
     };
-    let show_values = args
-        .get("show_values")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `show_values` intentionally not honored — see env_list().
 
     // ReDoS protection: limit pattern length
     if pattern.len() > 500 {
@@ -243,8 +238,6 @@ fn env_search(args: &Value) -> String {
         if regex.is_match(&name) || regex.is_match(&value) {
             let display_value = if is_sensitive_var(&name) {
                 format!("***MASKED*** ({} chars)", value.len())
-            } else if show_values {
-                value
             } else {
                 format!("({} chars)", value.len())
             };
@@ -309,4 +302,40 @@ pub fn is_sensitive_var(name: &str) -> bool {
         || upper.starts_with("STRIPE_")
         || upper.starts_with("SENDGRID")
         || upper.starts_with("TWILIO")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn env_list_ignores_show_values_arg_from_llm() {
+        overlay_set("R5_TEST_NONSENSITIVE", "abcdefgh");
+        let out = env_list(&json!({ "show_values": true }));
+        assert!(
+            !out.contains("\"abcdefgh\""),
+            "env_list leaked raw value despite show_values=true: {out}"
+        );
+        assert!(
+            out.contains("(8 chars)"),
+            "expected char-count format in output: {out}"
+        );
+        overlay_remove("R5_TEST_NONSENSITIVE");
+    }
+
+    #[test]
+    fn env_search_ignores_show_values_arg_from_llm() {
+        overlay_set("R5_TEST_SEARCHABLE", "matchvalue");
+        let out = env_search(&json!({
+            "pattern": "R5_TEST_SEARCHABLE",
+            "show_values": true,
+        }));
+        assert!(
+            !out.contains("\"matchvalue\""),
+            "env_search leaked raw value despite show_values=true: {out}"
+        );
+        assert!(out.contains("(10 chars)"));
+        overlay_remove("R5_TEST_SEARCHABLE");
+    }
 }

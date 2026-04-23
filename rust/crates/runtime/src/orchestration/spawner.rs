@@ -220,6 +220,9 @@ pub struct DynamicAgentSpawner {
     agent_registry: super::team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<Vec<SpawnedAgentState>>>,
+    /// JoinSet tracking all in-flight background agent tasks for graceful shutdown drain.
+    /// Shared across `clone_for_task` clones so every background handle lands here.
+    background_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl DynamicAgentSpawner {
@@ -234,6 +237,7 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
+            background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -253,6 +257,7 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
+            background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -270,6 +275,7 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
+            background_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -468,17 +474,27 @@ impl DynamicAgentSpawner {
 
         // 8. Execute or launch
         if input.background {
-            // Background mode: launch async and return immediately
+            // Background mode: launch async and return immediately.
+            // The JoinHandle is tracked in `background_tasks` so `shutdown_and_wait`
+            // can drain it and panics are surfaced instead of silently lost.
             if let Some(ref executor) = self.executor {
                 let executor = Arc::clone(executor);
                 let spawner = self.clone_for_task();
                 let agent_id_clone = agent_id.clone();
                 let _description = input.description.clone();
 
-                tokio::spawn(async move {
-                    let result = executor.execute(run_config).await;
-                    spawner.handle_completion(&agent_id_clone, result).await;
-                });
+                if let Ok(mut tasks) = self.background_tasks.lock() {
+                    tasks.spawn(async move {
+                        let result = executor.execute(run_config).await;
+                        spawner.handle_completion(&agent_id_clone, result).await;
+                    });
+                } else {
+                    // Lock poisoned (extremely unlikely) — fall back to untracked spawn.
+                    tokio::spawn(async move {
+                        let result = executor.execute(run_config).await;
+                        spawner.handle_completion(&agent_id_clone, result).await;
+                    });
+                }
             }
 
             Ok(SpawnAgentOutput::Launched {
@@ -713,7 +729,56 @@ impl DynamicAgentSpawner {
             session_id: self.session_id.clone(),
             agent_registry: self.agent_registry.clone(),
             completed_agents: Arc::clone(&self.completed_agents),
+            // Share the same JoinSet so shutdown can drain tasks spawned by clones.
+            background_tasks: Arc::clone(&self.background_tasks),
         }
+    }
+
+    /// Signal all background agents to finish and wait for them to drain.
+    ///
+    /// This aborts tasks that exceed `deadline` rather than leaving them as zombies.
+    /// Panics inside a background task are caught via [`tokio::task::JoinError`] and
+    /// logged; they do not propagate to the caller.
+    pub async fn shutdown_and_wait(&self, deadline: std::time::Duration) {
+        let mut set = self
+            .background_tasks
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+
+        if set.is_empty() {
+            return;
+        }
+
+        match tokio::time::timeout(deadline, async {
+            while let Some(result) = set.join_next().await {
+                if let Err(e) = result {
+                    if e.is_panic() {
+                        astra_core::agent_warn!(
+                            "spawner",
+                            "background agent task panicked during shutdown drain"
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => {
+                astra_core::agent_warn!(
+                    "spawner",
+                    "background agent drain timed out after {deadline:?}; aborting remaining tasks"
+                );
+                set.abort_all();
+            }
+        }
+    }
+
+    /// Number of in-flight background tasks currently tracked.
+    /// Primarily useful for tests and observability.
+    pub fn background_task_count(&self) -> usize {
+        self.background_tasks.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     /// List all active agents spawned by a parent.
@@ -1441,5 +1506,147 @@ mod tests {
             inherited_skills: Vec::new(),
         };
         assert!(context.inherited_skills.is_empty());
+    }
+
+    // ─── HIGH #5: Background agent shutdown drain tests ─────────────────────
+
+    struct BlockingExecutorFactory {
+        gate_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        gate_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl BlockingExecutorFactory {
+        fn new() -> Arc<Self> {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            Arc::new(Self {
+                gate_tx: std::sync::Mutex::new(Some(tx)),
+                gate_rx: std::sync::Mutex::new(Some(rx)),
+            })
+        }
+
+        fn unblock(&self) {
+            if let Some(tx) = self.gate_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for BlockingExecutorFactory {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            let rx = self.gate_rx.lock().unwrap().take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                output: Some("done".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct PanicExecutor;
+
+    #[async_trait]
+    impl SpawnAgentExecutor for PanicExecutor {
+        async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            panic!("deliberate panic in background executor");
+        }
+    }
+
+    fn make_bg_context() -> SpawnContext {
+        SpawnContext {
+            parent_run_id: "root".to_string(),
+            parent_agent_id: "root".to_string(),
+            recursion_depth: 0,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
+            inherited_skills: vec![],
+        }
+    }
+
+    fn make_bg_input() -> SpawnAgentInput {
+        SpawnAgentInput {
+            description: "bg test".to_string(),
+            prompt: "do it".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: true,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        }
+    }
+
+    /// HIGH #5: background agent tracked in JoinSet; shutdown_and_wait drains it.
+    #[tokio::test]
+    async fn background_agent_tracked_and_drained_on_shutdown() {
+        let factory = BlockingExecutorFactory::new();
+        let factory2 = Arc::clone(&factory);
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(factory as Arc<dyn SpawnAgentExecutor>);
+
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, SpawnAgentOutput::Launched { .. }),
+            "background spawn should return Launched"
+        );
+
+        // Task is in flight — JoinSet should have at least one entry.
+        assert!(
+            spawner.background_task_count() > 0,
+            "background task must be tracked before unblocking"
+        );
+
+        // Unblock the executor so it can complete.
+        factory2.unblock();
+
+        // shutdown_and_wait must drain the JoinSet within the deadline.
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+
+        assert_eq!(
+            spawner.background_task_count(),
+            0,
+            "all background tasks must be drained after shutdown"
+        );
+    }
+
+    /// HIGH #5: background agent that panics does not leave a zombie in the JoinSet.
+    #[tokio::test]
+    async fn background_agent_panic_does_not_leave_zombie() {
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(PanicExecutor) as Arc<dyn SpawnAgentExecutor>);
+
+        let _ = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
+
+        // Give the panic time to propagate; shutdown_and_wait catches the JoinError.
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_secs(2))
+            .await;
+
+        assert_eq!(
+            spawner.background_task_count(),
+            0,
+            "panicked background task must not leave zombie in JoinSet"
+        );
     }
 }

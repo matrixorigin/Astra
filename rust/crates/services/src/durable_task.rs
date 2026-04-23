@@ -269,6 +269,17 @@ impl CloudLlmJudge {
             let bytes = resp.bytes().await.unwrap_or_default();
             // Truncate upstream error body before it reaches logs.
             let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+            // 401/403: redact provider secrets from logs and return a generic
+            // error message instead of echoing the upstream body.
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                let truncated = &text[..text.len().min(80)];
+                tracing::debug!(
+                    target: "astra_services::durable_task",
+                    "LLM judge auth error ({status}): {}",
+                    redact_judge_secrets(truncated)
+                );
+                return Err("LLM judge unavailable (auth error)".to_string());
+            }
             return Err(format!(
                 "Cloud LLM API error {status}: {}",
                 &text[..text.len().min(200)]
@@ -861,7 +872,7 @@ impl VerificationRunner {
                 let cmd = cmd.clone();
                 let expected = *expected_exit;
                 let dir = self.work_dir.clone();
-                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 let evidence = if stderr.is_empty() {
                     stdout
                 } else {
@@ -881,7 +892,7 @@ impl VerificationRunner {
             } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (_code, stdout, _stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (_code, stdout, _stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 let has_all = contains.iter().all(|s| stdout.contains(s));
                 let has_none = not_contains.iter().all(|s| !stdout.contains(s));
                 let passed = has_all && has_none;
@@ -1017,14 +1028,14 @@ impl VerificationRunner {
             VerifierKind::BuildPass { cmd } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (code, _stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (code, _stdout, stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 Ok((code == 0, truncate(&stderr, 4096), "exit code == 0".into()))
             }
 
             VerifierKind::TestPass { cmd, min_pass_rate } => {
                 let cmd = cmd.clone();
                 let dir = self.work_dir.clone();
-                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink).await?;
+                let (code, stdout, stderr) = run_shell_cmd(&cmd, &dir, sink, None).await?;
                 let combined = format!("{stdout}\n{stderr}");
 
                 // Try to parse structured test output for actual pass rate
@@ -1074,11 +1085,24 @@ impl VerificationRunner {
                                 format!("LLM evaluation: {}", truncate(prompt, 200)),
                             ))
                         }
-                        Err(e) => Ok((
-                            false,
-                            format!("LLM judge error: {e}"),
-                            format!("LLM evaluation: {}", truncate(prompt, 200)),
-                        )),
+                        Err(e) => {
+                            // call_cloud_llm already maps 401/403 to a
+                            // redacted "LLM judge unavailable (auth error)"
+                            // message; pass it through cleanly. Other errors
+                            // get the legacy 'LLM judge error:' prefix.
+                            let reason = if e.contains("auth error")
+                                || e.starts_with("LLM judge unavailable")
+                            {
+                                e.clone()
+                            } else {
+                                format!("LLM judge error: {e}")
+                            };
+                            Ok((
+                                false,
+                                reason,
+                                format!("LLM evaluation: {}", truncate(prompt, 200)),
+                            ))
+                        }
                     }
                 } else {
                     // No LLM judge available — skip with informative message
@@ -1208,9 +1232,10 @@ async fn run_shell_cmd(
     cmd: &str,
     dir: &std::path::Path,
     sink: &Option<OutputSink>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(i32, String, String), String> {
     if let Some(sink) = sink {
-        run_shell_cmd_streaming(cmd, dir, sink).await
+        run_shell_cmd_streaming(cmd, dir, sink, cancel).await
     } else {
         run_shell_cmd_buffered(cmd, dir).await
     }
@@ -1221,6 +1246,7 @@ async fn run_shell_cmd_streaming(
     cmd: &str,
     dir: &std::path::Path,
     sink: &OutputSink,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(i32, String, String), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
@@ -1234,6 +1260,7 @@ async fn run_shell_cmd_streaming(
         .current_dir(dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
 
@@ -1270,10 +1297,37 @@ async fn run_shell_cmd_streaming(
         acc
     });
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("wait failed: {e}"))?;
+    let status = if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                // audit-#3: caller asked us to stop. Send SIGKILL (start_kill is
+                // non-blocking) and tear down the reader tasks so nothing leaks.
+                let _ = child.start_kill();
+                stderr_handle.abort();
+                stdout_handle.abort();
+                return Err("cancelled".to_string());
+            }
+            wait_res = child.wait() => match wait_res {
+                Ok(s) => s,
+                Err(e) => {
+                    stderr_handle.abort();
+                    stdout_handle.abort();
+                    return Err(format!("wait failed: {e}"));
+                }
+            },
+        }
+    } else {
+        match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                // audit-#11: stderr/stdout reader tasks must not leak on wait error.
+                stderr_handle.abort();
+                stdout_handle.abort();
+                return Err(format!("wait failed: {e}"));
+            }
+        }
+    };
 
     let stderr = stderr_handle
         .await
@@ -1290,9 +1344,12 @@ async fn run_shell_cmd_buffered(
     cmd: &str,
     dir: &std::path::Path,
 ) -> Result<(i32, String, String), String> {
+    // audit-#17: a misbehaving `sh -c <cmd>` could otherwise wedge the worker
+    // forever. Cap each buffered shell invocation at 10 minutes.
+    const BUFFERED_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     let cmd = cmd.to_string();
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let join = tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -1302,10 +1359,16 @@ async fn run_shell_cmd_buffered(
         let code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Ok((code, stdout, stderr))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))?
+        Ok::<(i32, String, String), String>((code, stdout, stderr))
+    });
+    match tokio::time::timeout(BUFFERED_CMD_TIMEOUT, join).await {
+        Err(_) => Err(format!(
+            "command timed out after {}s",
+            BUFFERED_CMD_TIMEOUT.as_secs()
+        )),
+        Ok(Err(e)) => Err(format!("spawn_blocking: {e}")),
+        Ok(Ok(inner)) => inner,
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1314,6 +1377,45 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…[truncated]", &s[..max])
     }
+}
+
+/// Local copy of `astra_runtime::turn::llm_client::redact_provider_secrets`.
+///
+/// Duplicated here because `services` cannot depend on `runtime`. The two
+/// implementations are intentionally identical and will be consolidated in
+/// a follow-up alongside `feat/secret-hardening`.
+fn redact_judge_secrets(s: &str) -> String {
+    fn boundary(c: char) -> bool {
+        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
+    }
+    let prefixes = ["sk-", "Bearer ", "key-"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut best: Option<(usize, &str)> = None;
+        for p in &prefixes {
+            if let Some(idx) = rest.find(p)
+                && best.map(|(b, _)| idx < b).unwrap_or(true)
+            {
+                best = Some((idx, p));
+            }
+        }
+        match best {
+            Some((idx, p)) => {
+                out.push_str(&rest[..idx]);
+                out.push_str(p);
+                out.push_str("[REDACTED]");
+                let tail = &rest[idx + p.len()..];
+                let cut = tail.find(boundary).unwrap_or(tail.len());
+                rest = &tail[cut..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Search for a file by its basename (or path suffix) under `root`.
@@ -4033,6 +4135,53 @@ mod tests {
     #[test]
     fn verification_history_row_cap_is_positive() {
         const _: () = assert!(MAX_VERIFICATION_HISTORY_ROWS >= 1000);
+    }
+
+    #[test]
+    fn redact_judge_secrets_replaces_known_prefixes() {
+        let s = "auth failed: sk-abc12345 used Bearer tok_xyz key-pqrs9";
+        let out = redact_judge_secrets(s);
+        assert!(!out.contains("abc12345"));
+        assert!(!out.contains("tok_xyz"));
+        assert!(!out.contains("pqrs9"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_judge_secrets_passthrough_for_clean_text() {
+        let s = "internal error: timeout";
+        assert_eq!(redact_judge_secrets(s), s);
+    }
+
+    #[test]
+    fn judge_error_reason_drops_auth_prefix_and_secret() {
+        // Simulate the mapping at the judge call site: call_cloud_llm
+        // returns "LLM judge unavailable (auth error)" for 401/403.
+        let upstream_err = "LLM judge unavailable (auth error)".to_string();
+        let reason = if upstream_err.contains("auth error")
+            || upstream_err.starts_with("LLM judge unavailable")
+        {
+            upstream_err.clone()
+        } else {
+            format!("LLM judge error: {upstream_err}")
+        };
+        assert!(!reason.contains("sk-"));
+        assert!(reason.contains("LLM judge unavailable"));
+        assert!(!reason.starts_with("LLM judge error:"));
+    }
+
+    #[test]
+    fn judge_error_reason_keeps_prefix_for_non_auth_errors() {
+        let upstream_err = "Cloud LLM API error 503: backend down".to_string();
+        let reason = if upstream_err.contains("auth error")
+            || upstream_err.starts_with("LLM judge unavailable")
+        {
+            upstream_err.clone()
+        } else {
+            format!("LLM judge error: {upstream_err}")
+        };
+        assert!(reason.starts_with("LLM judge error:"));
+        assert!(reason.contains("503"));
     }
 
     #[test]
@@ -7311,6 +7460,88 @@ Time:        3.456 s
             result.passed,
             "fallback should find out/app.js: {:?}",
             result
+        );
+    }
+
+    /// audit-#4: the streaming runner must propagate `kill_on_drop` so that
+    /// cancelling the future also reaps the spawned child process.
+    #[test]
+    fn streaming_runner_uses_kill_on_drop() {
+        let source = include_str!("durable_task.rs");
+        let needle = "fn run_shell_cmd_streaming";
+        let start = source.find(needle).expect("function present");
+        let body = &source[start..];
+        let kod = body
+            .find(".kill_on_drop(true)")
+            .expect("kill_on_drop must be set on the streaming child Command");
+        let spawn = body.find(".spawn()").expect("spawn must follow");
+        assert!(
+            kod < spawn,
+            "kill_on_drop must be applied before .spawn() so the child is reaped on drop"
+        );
+    }
+
+    /// audit-#11: when `child.wait()` errors, both reader tasks must be aborted
+    /// before returning so they do not leak.
+    #[test]
+    fn streaming_runner_aborts_reader_tasks_on_wait_error() {
+        let source = include_str!("durable_task.rs");
+        let needle = "fn run_shell_cmd_streaming";
+        let start = source.find(needle).expect("function present");
+        let body = &source[start..];
+        // Look for the explicit abort calls in the wait-error branch.
+        let stderr_abort = body
+            .find("stderr_handle.abort();")
+            .expect("stderr_handle must be aborted on wait error");
+        let stdout_abort = body
+            .find("stdout_handle.abort();")
+            .expect("stdout_handle must be aborted on wait error");
+        let return_err = body[stderr_abort..]
+            .find("return Err(format!(\"wait failed:")
+            .expect("aborts must be followed by the wait-failed return");
+        assert!(stdout_abort > stderr_abort);
+        assert!(return_err > 0);
+    }
+
+    /// audit-#3: streaming variant must observe a CancellationToken so a
+    /// caller can kill a runaway build/test command.
+    #[test]
+    fn run_shell_cmd_streaming_has_cancel_support() {
+        let source = include_str!("durable_task.rs");
+        let fn_start = source
+            .find("async fn run_shell_cmd_streaming(")
+            .expect("streaming fn must exist");
+        let body_end = source[fn_start..]
+            .find("\nasync fn ")
+            .map(|i| fn_start + i)
+            .unwrap_or(source.len());
+        let body = &source[fn_start..body_end];
+        assert!(
+            body.contains("cancel: Option<&tokio_util::sync::CancellationToken>"),
+            "run_shell_cmd_streaming must accept a cancel token parameter"
+        );
+        assert!(
+            body.contains("cancelled()") && body.contains("start_kill"),
+            "run_shell_cmd_streaming must select! on cancel and start_kill the child"
+        );
+    }
+
+    /// audit-#17: buffered variant must have an outer timeout so a hung
+    /// `sh -c` command cannot wedge the worker indefinitely.
+    #[test]
+    fn run_shell_cmd_buffered_has_timeout() {
+        let source = include_str!("durable_task.rs");
+        let fn_start = source
+            .find("async fn run_shell_cmd_buffered(")
+            .expect("buffered fn must exist");
+        let body_end = source[fn_start..]
+            .find("\nfn ")
+            .map(|i| fn_start + i)
+            .unwrap_or(source.len());
+        let body = &source[fn_start..body_end];
+        assert!(
+            body.contains("tokio::time::timeout") || body.contains("time::timeout"),
+            "run_shell_cmd_buffered must wrap spawn_blocking in tokio::time::timeout"
         );
     }
 }

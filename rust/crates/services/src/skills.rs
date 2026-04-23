@@ -161,6 +161,125 @@ const SKILL_REGISTRY_LIST_SELECT: &str = "\
     status, source, category, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
 
+// ── Idempotency classifiers ───────────────────────────────────────────────────
+
+/// Row fetched from `skills_registry` when checking for a duplicate before register.
+pub(crate) struct ExistingRegisterRow {
+    pub skill_name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub skill_definition: String,
+    pub code_hash: String,
+    pub created_at: Option<String>,
+}
+
+/// Decision returned by [`classify_register_duplicate`].
+#[derive(Debug, PartialEq)]
+pub(crate) enum RegisterDuplicateDecision {
+    /// No existing row; proceed with INSERT.
+    Insert,
+    /// Existing row is identical to the incoming request; return it as idempotent success.
+    IdempotentReplay(SkillRecord),
+    /// Existing row differs; return 409 Conflict.
+    Conflict,
+}
+
+/// Classify whether a duplicate `register_skill` call is an idempotent retry or a real conflict.
+///
+/// Compares `skill_definition` JSON and `code_hash` of the stored row against the values
+/// that would be produced by the incoming request.  Identical → idempotent success; different → 409.
+///
+/// JSON is compared **structurally** (parse-then-compare via [`serde_json::Value`]) because
+/// MatrixOne — like many JSON-typed columns — does not guarantee that the read-back textual form
+/// preserves the on-write key ordering or whitespace. A textual `==` would falsely return
+/// `Conflict` on identical retries when the storage engine canonicalised the JSON on insert.
+pub(crate) fn classify_register_duplicate(
+    existing: Option<ExistingRegisterRow>,
+    skill_id: &str,
+    new_definition_json: &str,
+    new_code_hash: &str,
+) -> RegisterDuplicateDecision {
+    let Some(row) = existing else {
+        return RegisterDuplicateDecision::Insert;
+    };
+    let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
+    let same_hash = row.code_hash == new_code_hash;
+    if same_def && same_hash {
+        let metadata: Option<serde_json::Value> = serde_json::from_str(&row.skill_definition).ok();
+        RegisterDuplicateDecision::IdempotentReplay(SkillRecord {
+            skill_id: skill_id.to_string(),
+            skill_name: row.skill_name,
+            version: row.version,
+            description: row.description,
+            metadata,
+            created_at: row.created_at,
+        })
+    } else {
+        RegisterDuplicateDecision::Conflict
+    }
+}
+
+/// Row fetched from `skills_registry` when a duplicate key fires during publish.
+pub(crate) struct ExistingPublishRow {
+    pub skill_name: String,
+    pub version: String,
+    pub skill_definition: String,
+    pub manifest: String,
+}
+
+/// Decision returned by [`classify_publish_duplicate`].
+#[derive(Debug, PartialEq)]
+pub(crate) enum PublishDuplicateDecision {
+    /// Existing row is identical; return 200 success with original payload.
+    IdempotentReplay(serde_json::Value),
+    /// Existing row differs; return 409 Conflict.
+    Conflict,
+}
+
+/// Classify whether a duplicate `publish_skill` call is an idempotent retry or a real conflict.
+///
+/// Compares `skill_definition` and `manifest` of the stored row against what was being inserted,
+/// using structural JSON equality (see [`classify_register_duplicate`] for rationale).
+pub(crate) fn classify_publish_duplicate(
+    existing: Option<ExistingPublishRow>,
+    skill_id: &str,
+    new_definition_json: &str,
+    new_manifest_json: &str,
+) -> PublishDuplicateDecision {
+    let Some(row) = existing else {
+        return PublishDuplicateDecision::Conflict;
+    };
+    let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
+    let same_manifest = json_structurally_equal(&row.manifest, new_manifest_json);
+    if same_def && same_manifest {
+        PublishDuplicateDecision::IdempotentReplay(serde_json::json!({
+            "skill_id": skill_id,
+            "skill_name": row.skill_name,
+            "version": row.version,
+            "status": "published",
+        }))
+    } else {
+        PublishDuplicateDecision::Conflict
+    }
+}
+
+/// Compare two JSON strings for **structural** equality.
+///
+/// Returns `true` iff both strings parse to the same `serde_json::Value` tree.
+/// Falls back to byte-equality when either side fails to parse — that way
+/// non-JSON columns (or schema-evolved free-form text) still behave like a
+/// strict `==` comparison instead of silently collapsing to "equal" on a
+/// parser error.
+pub(crate) fn json_structurally_equal(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(va), Ok(vb)) => va == vb,
+        _ => a == b,
+    }
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -304,18 +423,8 @@ impl SkillService for DatabaseSkillService {
             request.skill_id.clone()
         };
 
-        let existing = query("SELECT skill_id FROM skills_registry WHERE skill_id = ?")
-            .bind(&skill_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(internal_error)?;
-        if existing.is_some() {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                format!("Skill '{}' already exists", skill_id),
-            ));
-        }
-
+        // Build skill_definition and code_hash before the duplicate-check SELECT so the
+        // classifier can compare them against the stored row.
         let mut skill_definition = match request.metadata.clone() {
             Some(serde_json::Value::Object(mut map)) => {
                 strip_reserved_skill_definition_keys(&mut map);
@@ -345,6 +454,44 @@ impl SkillService for DatabaseSkillService {
         let definition_json =
             serde_json::to_string(&definition_value).unwrap_or_else(|_| "{}".to_string());
         let code_hash = format!("{:x}", sha2::Sha256::digest(request.skill_code.as_bytes()));
+
+        // Idempotency check: fetch existing row to compare definition + code_hash.
+        let existing_row = query(
+            "SELECT skill_name, version, description, \
+             IFNULL(CAST(skill_definition AS CHAR), '') AS skill_definition, \
+             IFNULL(code_hash, '') AS code_hash, \
+             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM skills_registry WHERE skill_id = ?",
+        )
+        .bind(&skill_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?
+        .map(|row| ExistingRegisterRow {
+            skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
+            version: row.try_get::<String, _>("version").unwrap_or_default(),
+            description: row.try_get::<String, _>("description").ok(),
+            skill_definition: row
+                .try_get::<String, _>("skill_definition")
+                .unwrap_or_default(),
+            code_hash: row.try_get::<String, _>("code_hash").unwrap_or_default(),
+            created_at: row.try_get::<String, _>("created_at").ok(),
+        });
+
+        match classify_register_duplicate(existing_row, &skill_id, &definition_json, &code_hash) {
+            RegisterDuplicateDecision::Insert => {
+                // Proceed to INSERT below.
+            }
+            RegisterDuplicateDecision::IdempotentReplay(record) => {
+                return Ok(record);
+            }
+            RegisterDuplicateDecision::Conflict => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!("Skill '{}' already exists", skill_id),
+                ));
+            }
+        }
 
         query(
             "INSERT INTO skills_registry \
@@ -754,10 +901,43 @@ impl SkillService for DatabaseSkillService {
 
         if let Err(error) = insert_result {
             if is_duplicate_key_error(&error) {
-                return Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!("Skill '{}' already exists", skill_id),
-                ));
+                // Re-query to determine whether this is an idempotent retry or a real conflict.
+                let dup_row = query(
+                    "SELECT skill_name, version, \
+                     IFNULL(CAST(skill_definition AS CHAR), '') AS skill_definition, \
+                     IFNULL(CAST(manifest AS CHAR), '') AS manifest \
+                     FROM skills_registry WHERE skill_id = ?",
+                )
+                .bind(&skill_id)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten()
+                .map(|row| ExistingPublishRow {
+                    skill_name: row.try_get::<String, _>("skill_name").unwrap_or_default(),
+                    version: row.try_get::<String, _>("version").unwrap_or_default(),
+                    skill_definition: row
+                        .try_get::<String, _>("skill_definition")
+                        .unwrap_or_default(),
+                    manifest: row.try_get::<String, _>("manifest").unwrap_or_default(),
+                });
+
+                match classify_publish_duplicate(
+                    dup_row,
+                    &skill_id,
+                    &skill_definition_json,
+                    &manifest_json,
+                ) {
+                    PublishDuplicateDecision::IdempotentReplay(value) => {
+                        return Ok(value);
+                    }
+                    PublishDuplicateDecision::Conflict => {
+                        return Err(error_response(
+                            StatusCode::CONFLICT,
+                            format!("Skill '{}' already exists", skill_id),
+                        ));
+                    }
+                }
             }
             return Err(internal_error(error));
         }
@@ -1096,5 +1276,163 @@ mod tests {
             !SKILL_REGISTRY_LIST_SELECT.contains("skill_definition"),
             "list_skills must not read skill_definition (use get_skill for full record)"
         );
+    }
+
+    // ── classify_register_duplicate unit tests ────────────────────────────────
+
+    fn make_existing_register_row(def: &str, hash: &str) -> ExistingRegisterRow {
+        ExistingRegisterRow {
+            skill_name: "my-skill".to_string(),
+            version: "1.0.0".to_string(),
+            description: Some("desc".to_string()),
+            skill_definition: def.to_string(),
+            code_hash: hash.to_string(),
+            created_at: Some("2024-01-01T00:00:00".to_string()),
+        }
+    }
+
+    #[test]
+    fn classify_register_duplicate_none_returns_insert() {
+        let decision =
+            classify_register_duplicate(None, "my-skill@1.0.0", r#"{"skill_type":"local"}"#, "abc");
+        assert_eq!(decision, RegisterDuplicateDecision::Insert);
+    }
+
+    #[test]
+    fn classify_register_duplicate_identical_returns_idempotent_replay() {
+        let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
+        let hash = "deadbeef";
+        let row = make_existing_register_row(def, hash);
+        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", def, hash);
+        assert!(
+            matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
+            "identical payload must return IdempotentReplay, got {decision:?}"
+        );
+        if let RegisterDuplicateDecision::IdempotentReplay(record) = decision {
+            assert_eq!(record.skill_id, "my-skill@1.0.0");
+            assert_eq!(record.skill_name, "my-skill");
+        }
+    }
+
+    #[test]
+    fn classify_register_duplicate_different_definition_returns_conflict() {
+        let stored_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
+        let new_def = r#"{"skill_type":"local","instructions":"fn run() { panic!() }"}"#;
+        let row = make_existing_register_row(stored_def, "abc");
+        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", new_def, "abc");
+        assert_eq!(decision, RegisterDuplicateDecision::Conflict);
+    }
+
+    #[test]
+    fn classify_register_duplicate_different_hash_returns_conflict() {
+        let def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
+        let row = make_existing_register_row(def, "old-hash");
+        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", def, "new-hash");
+        assert_eq!(decision, RegisterDuplicateDecision::Conflict);
+    }
+
+    /// Regression: MatrixOne (and most JSON-typed columns) reorders object
+    /// keys on persist/read-back. The classifier must compare structurally,
+    /// not byte-for-byte, otherwise an identical retry returns 409 instead
+    /// of the idempotent 200. Caught by
+    /// `it_register_skill_idempotent_retry_returns_200`.
+    #[test]
+    fn classify_register_duplicate_reordered_keys_returns_idempotent_replay() {
+        let new_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
+        let stored_def = r#"{"instructions":"fn run() {}","skill_type":"local"}"#;
+        let row = make_existing_register_row(stored_def, "abc");
+        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", new_def, "abc");
+        assert!(
+            matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
+            "reordered-keys retry must be idempotent replay, got {decision:?}"
+        );
+    }
+
+    // ── classify_publish_duplicate unit tests ─────────────────────────────────
+
+    fn make_existing_publish_row(def: &str, manifest: &str) -> ExistingPublishRow {
+        ExistingPublishRow {
+            skill_name: "pub-skill".to_string(),
+            version: "2.0.0".to_string(),
+            skill_definition: def.to_string(),
+            manifest: manifest.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_publish_duplicate_none_returns_conflict() {
+        let decision = classify_publish_duplicate(None, "pub-skill@2.0.0", r#"{}"#, r#"{}"#);
+        assert_eq!(decision, PublishDuplicateDecision::Conflict);
+    }
+
+    #[test]
+    fn classify_publish_duplicate_identical_returns_idempotent_replay() {
+        let def = r#"{"skill_type":"local","priority":5}"#;
+        let manifest = r#"{"skill_type":"local","priority":5}"#;
+        let row = make_existing_publish_row(def, manifest);
+        let decision = classify_publish_duplicate(Some(row), "pub-skill@2.0.0", def, manifest);
+        assert!(
+            matches!(decision, PublishDuplicateDecision::IdempotentReplay(_)),
+            "identical payload must return IdempotentReplay, got {decision:?}"
+        );
+        if let PublishDuplicateDecision::IdempotentReplay(value) = decision {
+            assert_eq!(value["skill_id"], "pub-skill@2.0.0");
+            assert_eq!(value["status"], "published");
+        }
+    }
+
+    #[test]
+    fn classify_publish_duplicate_different_definition_returns_conflict() {
+        let row = make_existing_publish_row(r#"{"priority":5}"#, r#"{"priority":5}"#);
+        let decision = classify_publish_duplicate(
+            Some(row),
+            "pub-skill@2.0.0",
+            r#"{"priority":10}"#,
+            r#"{"priority":5}"#,
+        );
+        assert_eq!(decision, PublishDuplicateDecision::Conflict);
+    }
+
+    #[test]
+    fn classify_publish_duplicate_different_manifest_returns_conflict() {
+        let row = make_existing_publish_row(r#"{"priority":5}"#, r#"{"priority":5}"#);
+        let decision = classify_publish_duplicate(
+            Some(row),
+            "pub-skill@2.0.0",
+            r#"{"priority":5}"#,
+            r#"{"priority":10}"#,
+        );
+        assert_eq!(decision, PublishDuplicateDecision::Conflict);
+    }
+
+    /// Regression: same as `classify_register_duplicate_reordered_keys_*`,
+    /// but on the publish path. Caught by
+    /// `it_publish_skill_idempotent_retry_returns_200`.
+    #[test]
+    fn classify_publish_duplicate_reordered_keys_returns_idempotent_replay() {
+        let new_def = r#"{"skill_type":"local","priority":5}"#;
+        let stored_def = r#"{"priority":5,"skill_type":"local"}"#;
+        let new_manifest = r#"{"a":1,"b":2}"#;
+        let stored_manifest = r#"{"b":2,"a":1}"#;
+        let row = make_existing_publish_row(stored_def, stored_manifest);
+        let decision =
+            classify_publish_duplicate(Some(row), "pub-skill@2.0.0", new_def, new_manifest);
+        assert!(
+            matches!(decision, PublishDuplicateDecision::IdempotentReplay(_)),
+            "reordered-keys retry must be idempotent replay, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn json_structurally_equal_ignores_key_order_and_whitespace() {
+        assert!(json_structurally_equal(
+            r#"{"a":1,"b":2}"#,
+            r#"{ "b": 2, "a": 1 }"#
+        ));
+        assert!(json_structurally_equal(r#"[1,2,3]"#, r#"[ 1, 2, 3 ]"#));
+        assert!(!json_structurally_equal(r#"{"a":1}"#, r#"{"a":2}"#));
+        // Non-JSON falls back to byte equality, not silent "equal".
+        assert!(json_structurally_equal("not-json", "not-json"));
+        assert!(!json_structurally_equal("not-json-a", "not-json-b"));
     }
 }
