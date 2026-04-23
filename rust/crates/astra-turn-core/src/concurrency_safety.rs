@@ -182,7 +182,7 @@ fn global_cell() -> &'static RwLock<ConcurrencySafetyRegistry> {
 pub fn global_classify(tool_name: &str) -> ConcurrencySafety {
     global_cell()
         .read()
-        .expect("concurrency_safety global poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .classify(tool_name)
 }
 
@@ -190,7 +190,7 @@ pub fn global_classify(tool_name: &str) -> ConcurrencySafety {
 pub fn global_register(tool_name: &str, level: ConcurrencySafety) {
     global_cell()
         .write()
-        .expect("concurrency_safety global poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .register(tool_name, level);
 }
 
@@ -349,5 +349,18 @@ mod tests {
         // Post-registration: seen as read-only by both APIs.
         assert_eq!(global_classify(name), ConcurrencySafety::ReadOnly);
         assert!(super::super::parallel_tool_exec::is_read_only_tool(name));
+    }
+
+    /// audit-B2: the global concurrency_safety RwLock must not cascade panics
+    /// if poisoned. Source-level guard: do not reintroduce expect on the global lock.
+    #[test]
+    fn concurrency_safety_does_not_expect_on_poison() {
+        let source = include_str!("concurrency_safety.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains(".expect(\"concurrency_safety global poisoned\")"),
+            "concurrency_safety production code must not use .expect on poisoned global lock"
+        );
     }
 }

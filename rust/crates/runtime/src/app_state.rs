@@ -655,6 +655,8 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         let url = format!("{}{}", self.base_url, endpoint);
         let client = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Memoria client build error: {e}"))?;
         let resp = client
@@ -756,5 +758,46 @@ mod tests {
         async fn database_healthy(&self) -> bool {
             true
         }
+    }
+
+    /// audit-A1: ReqwestMemoriaForwarder must set connect_timeout and timeout
+    /// so a hung Memoria server cannot block the Axum handler indefinitely.
+    /// This test starts a real TCP listener that accepts but never responds,
+    /// proving the client times out instead of hanging forever.
+    #[tokio::test]
+    async fn memoria_forwarder_times_out_on_unresponsive_server() {
+        // Black-hole server: accepts connections, never sends a response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                // Hold the connection open, never respond.
+                tokio::spawn(async move {
+                    let _ = tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let forwarder = ReqwestMemoriaForwarder {
+            base_url: format!("http://{addr}"),
+            master_key: "test-key".to_string(),
+        };
+
+        let start = std::time::Instant::now();
+        let result = forwarder
+            .forward(
+                "/v1/memories/retrieve",
+                serde_json::json!({"query": "test"}),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "should fail with timeout, got: {result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "should time out well before 60s, took {elapsed:?}"
+        );
     }
 }

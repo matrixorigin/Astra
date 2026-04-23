@@ -1353,7 +1353,13 @@ fn remote_skill_http_client() -> &'static reqwest::Client {
         if cfg!(test) {
             builder = builder.no_proxy();
         }
-        builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
+        // Without a timeout, a malicious skill server can hang the agent loop forever.
+        builder
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
@@ -5572,5 +5578,38 @@ Normal.
         let (manifest, _body) = crate::skills::loader::parse_skill_md(skill_md).unwrap();
         let comp = manifest.composition.unwrap();
         assert_eq!(comp.max_depth, None);
+    }
+
+    /// audit-A4: remote_skill_http_client must have connect_timeout and timeout.
+    /// Remote skill URLs are attacker-controllable via skill manifests — without
+    /// a timeout, a malicious skill server hangs the agent loop forever.
+    /// This test proves the timeout fires against a real black-hole server.
+    #[tokio::test]
+    async fn remote_skill_client_times_out_on_unresponsive_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let client = remote_skill_http_client();
+        let start = std::time::Instant::now();
+        let result = client
+            .get(format!("http://{addr}/v1/skill/invoke"))
+            .send()
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "should fail with timeout, got: {result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "should time out well before 60s, took {elapsed:?}"
+        );
     }
 }

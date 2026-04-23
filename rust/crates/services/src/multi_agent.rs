@@ -583,14 +583,23 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
         .rows_affected();
 
         if n > 0 {
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE agent_tasks SET agent_id = NULL WHERE task_id = ? AND user_id = ? AND agent_id = ?",
             )
             .bind(task_id)
             .bind(user_id)
             .bind(agent_id)
             .execute(&self.pool)
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    target: "astra_services::multi_agent",
+                    task_id = %task_id,
+                    agent_id = %agent_id,
+                    error = %e,
+                    "failed to clear agent_id after lease release"
+                );
+            }
             self.hold_cache.release_hold(agent_id, task_id);
             Ok(true)
         } else {
@@ -741,5 +750,18 @@ mod unit_tests {
     async fn unconfigured_task_lease_errors() {
         let s = UnconfiguredTaskLeaseService;
         assert!(s.try_claim_lease("u", "t", "a", "e", 60).await.is_err());
+    }
+
+    /// audit-D9: multi_agent must not silently drop DB write errors.
+    #[test]
+    fn multi_agent_db_writes_are_not_silently_dropped() {
+        let source = include_str!("multi_agent.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("let _ = sqlx::query").count();
+        assert_eq!(
+            count, 0,
+            "multi_agent has {count} silently-dropped DB writes"
+        );
     }
 }

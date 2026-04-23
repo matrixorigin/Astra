@@ -199,14 +199,14 @@ where
     Fut: std::future::Future<Output = String>,
 {
     {
-        let mut guard = cache.lock().expect("result cache poisoned");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = guard.lookup(sig) {
             return (hit, true);
         }
     }
     let fresh = f().await;
     {
-        let mut guard = cache.lock().expect("result cache poisoned");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         guard.record(sig.clone(), fresh.clone());
     }
     (fresh, false)
@@ -223,14 +223,14 @@ where
     F: FnOnce() -> String,
 {
     {
-        let mut guard = cache.lock().expect("result cache poisoned");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = guard.lookup(sig) {
             return (hit, true);
         }
     }
     let fresh = f();
     {
-        let mut guard = cache.lock().expect("result cache poisoned");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         guard.record(sig.clone(), fresh.clone());
     }
     (fresh, false)
@@ -484,5 +484,27 @@ mod tests {
         let (out2, hit) = lookup_or_compute_sync(&cache, &sig2, || "miss".into());
         assert!(hit);
         assert_eq!(out2, "hello");
+    }
+
+    /// audit-B3: result cache mutex must recover from poison instead of
+    /// cascading panics across all tool dedup operations.
+    #[test]
+    fn result_cache_recovers_from_poison() {
+        let cache = new_shared_cache(10, None);
+        let cache2 = cache.clone();
+
+        // Poison the mutex.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache2.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err());
+        assert!(cache.lock().is_err(), "mutex should be poisoned");
+
+        // Despite the poison, lookup_or_compute_sync must still work.
+        let sig = CallSignature::from_args("tool", &json!({"key": "val"}));
+        let (out, hit) = lookup_or_compute_sync(&cache, &sig, || "recovered".to_string());
+        assert!(!hit);
+        assert_eq!(out, "recovered");
     }
 }
