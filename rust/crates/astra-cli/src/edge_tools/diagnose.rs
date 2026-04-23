@@ -279,7 +279,10 @@ impl ToolExecutor {
 
             // Sandbox policy
             {
-                let sp_guard = self.sandbox_policy.read().unwrap();
+                let sp_guard = self
+                    .sandbox_policy
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(ref policy) = *sp_guard {
                     session_info.insert(
                         "sandbox_mode".to_string(),

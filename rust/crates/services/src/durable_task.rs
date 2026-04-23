@@ -198,7 +198,7 @@ impl CloudLlmJudge {
         };
 
         let evidence_with_score = format!("score={score:.2}; {evidence}");
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO task_verification_results \
              (result_id, contract_id, task_id, subtask_id, criterion_id, \
               session_id, passed, evidence, expected, duration_ms, error_message) \
@@ -216,7 +216,16 @@ impl CloudLlmJudge {
         .bind(duration_ms as i64)
         .bind(error)
         .execute(pool)
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::durable_task",
+                contract_id = %contract_id,
+                result_id = %result_id,
+                error = %e,
+                "failed to persist verification result"
+            );
+        }
     }
 
     /// Generic chat-completion helper shared by the judge scoring path and
@@ -1527,8 +1536,16 @@ impl TaskBranchOps for TaskBranchService {
         // subtask may race. This is acceptable because subtasks are typically
         // executed sequentially per task_id; concurrent execution is rare.
         let drop_sql = format!("DROP SNAPSHOT IF EXISTS `{name}`");
-        // Drop failure is expected when snapshot doesn't exist; ignore error
-        let _ = sqlx::query(&drop_sql).execute(&self.pool).await;
+        // Drop failure is expected when snapshot doesn't exist, but log
+        // unexpected errors (permissions, connection) at debug level.
+        if let Err(e) = sqlx::query(&drop_sql).execute(&self.pool).await {
+            tracing::debug!(
+                target: "astra_services::durable_task",
+                snapshot = %name,
+                error = %e,
+                "failed to drop snapshot before recreate"
+            );
+        }
 
         let sql = crate::snapshot_sql::create_snapshot_for_db_sql(&name, &self.database);
         sqlx::query(&sql)

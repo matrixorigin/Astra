@@ -116,6 +116,8 @@ async fn fetch_memories(
 ) -> String {
     let client = reqwest::Client::builder()
         .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut payload = serde_json::json!({"query": query, "top_k": top_k});
@@ -303,5 +305,41 @@ mod tests {
         assert_eq!(r.items, 0);
         assert!(r.preview.is_empty());
         assert_eq!(r.fetch_ms, 0);
+    }
+
+    /// audit-A2: fetch_memories must time out on an unresponsive Memoria server
+    /// instead of blocking the turn pipeline indefinitely.
+    #[tokio::test]
+    async fn fetch_memories_times_out_on_unresponsive_server() {
+        // Black-hole server: accepts connections, never responds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let result = fetch_memories(
+            &format!("http://{addr}"),
+            "test-key",
+            "test query",
+            "user1",
+            5,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // fetch_memories returns empty string on error, not Err
+        assert!(result.is_empty(), "should return empty on timeout");
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "should time out well before 30s, took {elapsed:?}"
+        );
     }
 }

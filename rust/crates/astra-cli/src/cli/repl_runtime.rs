@@ -350,7 +350,13 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
         // If refresh_token is truly expired, the next refresh will also fail and
         // user will be prompted to re-login then.
     }
-    let _ = save_credentials(&creds);
+    if let Err(e) = save_credentials(&creds) {
+        tracing::warn!(
+            target: "astra_cli::repl_runtime",
+            error = %e,
+            "failed to save credentials after token refresh"
+        );
+    }
 }
 
 fn should_keep_credentials_on_refresh_error(err: &astra_thin_client::ThinClientError) -> bool {

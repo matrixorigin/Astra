@@ -582,7 +582,7 @@ impl MatrixOneSyncService {
     }
 
     async fn prune_sync_logs(&self, user_id: &str, sync_type: &str, status: &str, retain: usize) {
-        let _ = sqlx::query(build_sync_log_prune_query())
+        if let Err(e) = sqlx::query(build_sync_log_prune_query())
             .bind(user_id)
             .bind(status)
             .bind(sync_type)
@@ -591,7 +591,16 @@ impl MatrixOneSyncService {
             .bind(sync_type)
             .bind(retain as i64)
             .execute(&self.pool)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                target: "astra_services::state_sync",
+                user_id = %user_id,
+                sync_type = %sync_type,
+                error = %e,
+                "failed to prune sync logs"
+            );
+        }
     }
 }
 
@@ -1013,7 +1022,7 @@ impl StateSyncService for MatrixOneSyncService {
         // Write audit trail (best-effort, don't fail the push)
         if result.is_ok() {
             let history_id = uuid::Uuid::new_v4().to_string();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO user_preference_history \
                  (history_id, user_id, pref_key, old_value, new_value, old_version, new_version, source) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, 'edge')",
@@ -1026,7 +1035,16 @@ impl StateSyncService for MatrixOneSyncService {
             .bind(old_version)
             .bind(new_version)
             .execute(&self.pool)
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    target: "astra_services::state_sync",
+                    user_id = %user_id,
+                    pref_key = %key,
+                    error = %e,
+                    "failed to write preference history audit trail"
+                );
+            }
         }
 
         match result {
@@ -1960,5 +1978,18 @@ mod tests {
         assert_eq!(h1, h2);
         let h3 = sha256_bytes("world");
         assert_ne!(h1, h3);
+    }
+
+    /// audit-D7/D8: state_sync must not silently drop DB write errors.
+    #[test]
+    fn state_sync_db_writes_are_not_silently_dropped() {
+        let source = include_str!("state_sync.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("let _ = sqlx::query").count();
+        assert_eq!(
+            count, 0,
+            "state_sync has {count} silently-dropped DB writes"
+        );
     }
 }

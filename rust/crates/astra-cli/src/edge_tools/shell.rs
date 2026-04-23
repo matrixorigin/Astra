@@ -2993,7 +2993,10 @@ impl ToolExecutor {
         harden_command: bool,
     ) -> Result<std::process::Output, String> {
         let effective_command = if harden_command {
-            let sp_guard = self.sandbox_policy.read().unwrap();
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard {
                 if !matches!(policy.mode, SandboxMode::Permissive) {
                     wrap_command_with_limits(policy, command)
@@ -3028,7 +3031,10 @@ impl ToolExecutor {
 
         // Apply sandbox environment filtering
         {
-            let sp_guard = self.sandbox_policy.read().unwrap();
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
                 && !matches!(policy.mode, SandboxMode::Permissive)
                 && let Err(e) = sandbox_command(policy, &mut child_cmd)
@@ -3273,7 +3279,10 @@ impl ToolExecutor {
         // This closes the loophole where read_file is blocked by the sandbox
         // but `cat /outside/path` bypasses it.
         {
-            let sp_guard = self.sandbox_policy.read().unwrap();
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
                 && !matches!(policy.mode, SandboxMode::Permissive)
             {
@@ -3412,7 +3421,10 @@ impl ToolExecutor {
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
 
         {
-            let sp_guard = self.sandbox_policy.read().unwrap();
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
                 && !matches!(policy.mode, SandboxMode::Permissive)
             {
@@ -3771,7 +3783,10 @@ impl ToolExecutor {
 
         // Apply sandbox environment filtering (same as bash)
         {
-            let sp_guard = self.sandbox_policy.read().unwrap();
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
                 && !matches!(policy.mode, SandboxMode::Permissive)
                 && let Err(e) = sandbox_command(policy, &mut cmd)

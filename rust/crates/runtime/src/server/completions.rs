@@ -103,9 +103,9 @@ pub(super) async fn completions_handler(
 
     // Anthropic uses max_tokens; OpenAI prefers max_completion_tokens
     if resolved.provider != "anthropic" && !resolved.model_name.contains("claude") {
-        body.as_object_mut()
-            .expect("json object")
-            .remove("max_tokens");
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("max_tokens");
+        }
         body["max_completion_tokens"] = serde_json::json!(request.max_tokens);
     }
 
@@ -237,6 +237,19 @@ mod tests {
         assert_eq!(
             json["choices"][0]["message"]["content"],
             r#"{"score": 0.85}"#
+        );
+    }
+
+    /// audit-C2: completions handler must not use .expect("json object") —
+    /// panicking in a request handler crashes the connection.
+    #[test]
+    fn completions_handler_does_not_expect_json_object() {
+        let source = include_str!("completions.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains(".expect(\"json object\")"),
+            "completions handler must not panic on json object access"
         );
     }
 }

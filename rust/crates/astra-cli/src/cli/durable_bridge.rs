@@ -31,7 +31,11 @@ fn build_client_for_url(url: &str) -> reqwest::Client {
     if is_local {
         builder = builder.no_proxy();
     }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 // ─── Active contract state held by the REPL ──────────────────────────────────
@@ -2747,6 +2751,25 @@ mod tests {
         assert!(
             err.contains("Server proxy judge error"),
             "error should mention proxy: {err}"
+        );
+    }
+
+    /// audit-A6: build_client_for_url must set connect_timeout and timeout so a
+    /// hung durable task server cannot block the CLI indefinitely.
+    #[test]
+    fn durable_bridge_client_has_timeout() {
+        let source = include_str!("durable_bridge.rs");
+        let fn_start = source
+            .find("fn build_client_for_url(")
+            .expect("build_client_for_url must exist");
+        let body = &source[fn_start..fn_start + 500];
+        assert!(
+            body.contains("connect_timeout("),
+            "durable bridge client must set connect_timeout"
+        );
+        assert!(
+            body.contains(".timeout("),
+            "durable bridge client must set request timeout"
         );
     }
 }

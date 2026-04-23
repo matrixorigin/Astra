@@ -180,7 +180,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
     }
 
     async fn set_limits(&self, user_id: &str, limits: ResourceLimits) {
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_limits \
                 (user_id, max_concurrent_sessions, max_tokens_per_day, max_disk_bytes, \
                  max_concurrent_bash, max_sessions_per_day) \
@@ -200,7 +200,15 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(limits.max_concurrent_bash as i32)
         .bind(limits.max_sessions_per_day as i32)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to persist resource limits"
+            );
+        }
     }
 
     async fn get_usage(&self, user_id: &str) -> ResourceUsage {
@@ -270,7 +278,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
 
     async fn record_session_created(&self, user_id: &str) {
         let today = Self::today();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_usage (user_id, usage_date, sessions_created) \
              VALUES (?, ?, 1) \
              ON DUPLICATE KEY UPDATE sessions_created = sessions_created + 1",
@@ -278,12 +286,20 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(user_id)
         .bind(&today)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to record session creation"
+            );
+        }
     }
 
     async fn record_tool_calls(&self, user_id: &str, count: u64) {
         let today = Self::today();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_usage (user_id, usage_date, tool_calls) \
              VALUES (?, ?, ?) \
              ON DUPLICATE KEY UPDATE tool_calls = tool_calls + VALUES(tool_calls)",
@@ -292,12 +308,20 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(&today)
         .bind(count as i64)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to record tool calls"
+            );
+        }
     }
 
     async fn record_tokens(&self, user_id: &str, tokens: u64) {
         let today = Self::today();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_usage (user_id, usage_date, tokens_consumed) \
              VALUES (?, ?, ?) \
              ON DUPLICATE KEY UPDATE tokens_consumed = tokens_consumed + VALUES(tokens_consumed)",
@@ -306,7 +330,15 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(&today)
         .bind(tokens as i64)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to record token usage"
+            );
+        }
     }
 }
 
@@ -565,5 +597,21 @@ mod tests {
         gov.record_tool_calls("b", 20).await;
         assert_eq!(gov.get_usage("a").await.tool_calls, 10);
         assert_eq!(gov.get_usage("b").await.tool_calls, 20);
+    }
+
+    /// audit-D1/D2: DatabaseResourceGovernor must not silently drop DB write
+    /// errors. Every `sqlx::query(...).execute(...)` in production code must
+    /// be wrapped in error handling, not `let _ =`.
+    #[test]
+    fn resource_governor_db_writes_are_not_silently_dropped() {
+        let source = include_str!("resource_governor.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let silent_count = prod_code.matches("let _ = sqlx::query").count();
+        assert_eq!(
+            silent_count, 0,
+            "resource governor has {silent_count} silently-dropped DB writes; \
+             use `if let Err(e) = ... {{ tracing::warn!(...) }}` instead"
+        );
     }
 }
