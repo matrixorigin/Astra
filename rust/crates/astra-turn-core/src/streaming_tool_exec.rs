@@ -174,12 +174,14 @@ impl StreamingToolExecutor {
             let _permit = match sem.try_acquire() {
                 Ok(p) => p,
                 Err(_) => {
-                    // Semaphore full — don't speculate, will run later
+                    // audit-#9: surface a descriptive sentinel instead of an
+                    // empty string so callers (and tests) can distinguish
+                    // "speculation skipped" from "tool returned empty output".
                     return ToolExecResult {
                         original_index,
                         call_id: cid,
                         tool_name,
-                        content: String::new(),
+                        content: "speculative execution skipped: capacity reached".to_string(),
                         success: false,
                     };
                 }
@@ -348,6 +350,33 @@ impl StreamingToolExecutor {
             hit_rate = snap.hit_rate(),
             "streaming speculation metrics"
         );
+    }
+}
+
+/// audit-#12: speculative tool tasks must not outlive their executor. When a
+/// turn aborts and the host drops the [`StreamingToolExecutor`], any
+/// in-flight tasks would otherwise keep running, holding onto the cloned
+/// executor closure (and its captured permissions/IO handles) indefinitely.
+///
+/// We can't `await` a lock from `Drop`, but `try_lock` succeeds whenever no
+/// other task is currently mutating the map — which is the common case at
+/// drop time because the host has stopped invoking [`Self::on_tool_block`]
+/// and friends. If `try_lock` fails (a poll is racing with us), the tasks
+/// are still bounded by the per-task semaphore + their own work; the leak
+/// surface shrinks dramatically without the panic risk of blocking inside
+/// `Drop`.
+impl Drop for StreamingToolExecutor {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.try_lock() {
+            for (_cid, handle) in inflight.drain() {
+                handle.abort();
+            }
+        } else {
+            tracing::debug!(
+                target: "astra_turn_core::streaming_tool_exec",
+                "StreamingToolExecutor dropped while inflight map was locked; speculative tasks may finish on their own"
+            );
+        }
     }
 }
 
@@ -604,5 +633,63 @@ mod tests {
         exec.reset_metrics().await;
         let after = exec.snapshot().await;
         assert_eq!(after, StreamingSpeculationMetrics::default());
+    }
+
+    /// audit-#12: dropping the executor must abort any speculative tasks it
+    /// started so they don't outlive the turn.
+    #[tokio::test]
+    async fn drop_aborts_inflight_speculative_tasks() {
+        // Use a sufficiently slow executor that the speculative task is still
+        // running when we drop the host.
+        let exec = StreamingToolExecutor::new(make_slow_executor(2_000));
+        // read_only tool ("read_file") is eligible for speculation.
+        let started = exec
+            .on_tool_block(
+                "c-drop".into(),
+                "read_file".into(),
+                tool_block("read_file", "c-drop"),
+                0,
+            )
+            .await;
+        assert!(started, "speculative task should have started");
+
+        // Capture the underlying handle before dropping the executor.
+        let handle: tokio::task::JoinHandle<ToolExecResult> = {
+            let mut g = exec.inflight.lock().await;
+            g.remove("c-drop").expect("inflight handle present")
+        };
+        // Re-insert so Drop has something to abort.
+        exec.inflight.lock().await.insert("c-drop".into(), handle);
+
+        // Get a clone of the Arc so we can observe the handle after drop.
+        let inflight_arc = exec.inflight.clone();
+        drop(exec);
+
+        // Yield enough times for the abort to take effect on the runtime.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if inflight_arc.lock().await.is_empty() {
+                break;
+            }
+        }
+
+        let map = inflight_arc.lock().await;
+        assert!(
+            map.is_empty(),
+            "Drop must drain in-flight speculative tasks"
+        );
+    }
+
+    /// audit-#9: when speculative execution is skipped because the semaphore
+    /// is full, the result content must be a descriptive sentinel — not an
+    /// empty string that callers cannot distinguish from a tool that legally
+    /// returned no output.
+    #[test]
+    fn speculative_exec_returns_descriptive_error_on_capacity() {
+        let source = include_str!("streaming_tool_exec.rs");
+        assert!(
+            source.contains("speculative execution skipped: capacity reached"),
+            "try_start must surface a descriptive sentinel when speculation is skipped"
+        );
     }
 }

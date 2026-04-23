@@ -1609,4 +1609,20 @@ mod tests {
             );
         }
     }
+
+    /// audit-#7: the ingestion worker's `select!` must mark its arms `biased;`
+    /// so a saturated `rx` cannot starve the shutdown branch.
+    #[test]
+    fn ingestion_select_is_biased_toward_shutdown() {
+        let source = include_str!("event_ingestion.rs");
+        let needle = "async fn run_with_shutdown";
+        let start = source.find(needle).expect("function present");
+        let body = &source[start..];
+        let select_idx = body.find("tokio::select! {").expect("select! present");
+        let after = &body[select_idx..select_idx + 200];
+        assert!(
+            after.contains("biased;"),
+            "ingestion worker select! must be biased so shutdown wins over rx"
+        );
+    }
 }

@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-/// Cap in-memory map size; evicted wholesale when exceeded (handlers + design tradeoff).
+/// Cap in-memory map size. New entries are REJECTED (not evicted) when this
+/// limit is reached, unless the durable-fallback path is active. Callers
+/// receive `LedgerInsertError::CapacityExceeded`. See
+/// `super::edge_callback_handlers::insert_approval_ledger_entry` for details.
 pub const LEDGER_MAX_ENTRIES: usize = 4096;
 
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
@@ -1052,12 +1055,7 @@ mod tests {
         let now = Instant::now();
         ts.insert("orphan".into(), now);
 
-        let removed = sweep_expired_entries_inner(
-            &mut ledger,
-            &mut ts,
-            now,
-            MAX_LEDGER_ENTRY_AGE,
-        );
+        let removed = sweep_expired_entries_inner(&mut ledger, &mut ts, now, MAX_LEDGER_ENTRY_AGE);
         assert_eq!(removed, 0);
         assert!(ts.is_empty(), "orphan timestamps must be pruned");
     }
@@ -1072,5 +1070,23 @@ mod tests {
         let removed = sweep_expired_entries(&ledger).await;
         assert_eq!(removed, 0, "fresh entry should not be evicted");
         assert_eq!(ledger.lock().await.len(), 1);
+    }
+
+    /// audit-#16: the `LEDGER_MAX_ENTRIES` doc comment must accurately
+    /// describe rejection (not eviction) of new entries when the cap is hit.
+    #[test]
+    fn edge_ledger_cap_comment_reflects_rejection_not_eviction() {
+        let source = include_str!("edge_ledger.rs");
+        // Build the misleading needle dynamically so this test's own message
+        // doesn't accidentally satisfy the substring search.
+        let bad_needle = format!("evicted{}wholesale", " ");
+        assert!(
+            !source.contains(bad_needle.as_str()),
+            "edge_ledger comment must not describe entries as wholesale-evicted"
+        );
+        assert!(
+            source.contains("REJECTED (not evicted)"),
+            "edge_ledger comment must explicitly state entries are REJECTED on capacity"
+        );
     }
 }

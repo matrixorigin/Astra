@@ -2139,6 +2139,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             tool_event_writer: self.tool_event_writer.clone(),
         };
 
+        // TODO(audit-#2): Track agentic loop JoinHandles for graceful shutdown
+        // drain. Today the spawned task is fire-and-forget; on SIGTERM a
+        // long-running run can be torn down mid-persist. Fix shape: add an
+        // Arc<Mutex<JoinSet<()>>> field on RunLifecycleService, route both
+        // background spawns through it, and expose a `drain_running_tasks`
+        // helper that serve()'s shutdown path awaits with a timeout. The
+        // refactor touches the public service surface so it's deferred to a
+        // dedicated PR.
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
             let loop_success = outcome.is_ok();
@@ -2392,6 +2400,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             tool_event_writer: self.tool_event_writer.clone(),
         };
 
+        // TODO(audit-#2): Track this background spawn via the same
+        // JoinSet/CancellationToken pair as the bg-run spawn above so
+        // serve()'s shutdown path can drain it. See run_lifecycle.rs comment
+        // on the bg-run spawn for the full fix shape.
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
         tokio::spawn(async move {

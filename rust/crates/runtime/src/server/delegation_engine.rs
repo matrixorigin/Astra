@@ -6153,8 +6153,8 @@ mod tests {
         assert!(res.is_err(), "closed semaphore must yield Err, not panic");
     }
 
-    /// audit-#5: source-level guard — no `.expect("semaphore closed")` calls
-    /// remain in the spawned delegation tasks.
+    /// audit-#5: source-level guard — no panicking expect calls remain in
+    /// the spawned delegation tasks for the closed-semaphore path.
     #[test]
     fn delegation_does_not_panic_on_closed_semaphore() {
         let source = include_str!("delegation_engine.rs");
