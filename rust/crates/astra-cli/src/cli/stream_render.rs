@@ -1494,9 +1494,35 @@ impl CliSseStreamHost<'_> {
             .collect();
         let (done, _needed) = exec.merge_speculative(&ids).await;
         let mut out = std::collections::HashMap::new();
+        let mut reusable = 0usize;
+        let mut rejected_failure = 0usize;
         for r in done {
+            if r.success {
+                reusable += 1;
+            } else {
+                // Speculation completed but failed — the reconciler will fall
+                // back to real execution (see `reusable_speculative_output`).
+                // Track this separately from `snapshot().wasted` so operators
+                // can distinguish "speculation errored" from "speculation
+                // never started" when diagnosing hit-rate drops.
+                rejected_failure += 1;
+            }
             out.insert(r.call_id.clone(), (r.content.clone(), r.success));
         }
+        // Per-batch reconciliation breakdown: complements the cumulative
+        // `astra::streaming_speculation::metrics` with this-batch counts so
+        // operators can correlate a specific turn's LLM-emitted batch against
+        // what actually came back from speculation. Target:
+        // `astra::streaming_speculation::batch`.
+        tracing::info!(
+            target: "astra::streaming_speculation::batch",
+            batch_size = conc_reqs.len(),
+            reusable = reusable,
+            rejected_failure = rejected_failure,
+            not_speculated = conc_reqs.len().saturating_sub(reusable + rejected_failure),
+            session_id = self.executor.active_session_id().as_deref().unwrap_or(""),
+            "speculation reconciliation for batch"
+        );
         // Emit a structured metrics event once per batch merge so log
         // aggregators / ObservabilityHub can track speculation effectiveness
         // over time. Target: `astra::streaming_speculation::metrics`.
@@ -2498,6 +2524,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 );
             }
         }
+        // Batch-size observation: correlates the read-only batching prompt
+        // (`prompts/system.rs`) with actual LLM emission patterns. When >=2
+        // concurrent tools arrive together the model followed the guidance;
+        // when conc_reqs is empty or has a single entry, batching didn't
+        // happen this turn. Target: `astra::tool_batching::batch_size`.
+        if !conc_reqs.is_empty() {
+            tracing::info!(
+                target: "astra::tool_batching::batch_size",
+                parallel_count = conc_reqs.len(),
+                sequential_count = seq_total,
+                tool_names = ?conc_reqs.iter().map(|(_, r)| r.tool.as_str()).collect::<Vec<_>>(),
+                session_id = self.executor.active_session_id().as_deref().unwrap_or(""),
+                "LLM emitted parallel tool batch"
+            );
+        }
 
         // Pre-check: can all concurrent tools auto-proceed?
         // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
@@ -2605,9 +2646,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
         // a tool failure instead of aborting the whole batch/turn.
         let executor: &crate::edge_tools::ToolExecutor = &self.executor;
-        let sem = Arc::new(tokio::sync::Semaphore::new(
-            astra_runtime::turn::parallel_tool_exec::MAX_CONCURRENT_TOOL_EXECUTIONS,
-        ));
+        // Use the process-wide shared semaphore so the concurrency cap
+        // genuinely spans every batch and every concurrent session in this
+        // process — previously each batch constructed its own `Semaphore::new(10)`,
+        // which allowed 10·N concurrent tools when N batches overlapped.
+        let sem = astra_runtime::turn::parallel_tool_exec::shared_tool_semaphore();
         // D-9: harvest speculative results from mid-stream execution.
         // Matching request_ids skip the normal dispatch and reuse the
         // speculative output. Journal/observability still fire exactly
