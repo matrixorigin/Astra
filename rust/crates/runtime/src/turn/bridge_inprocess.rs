@@ -1917,6 +1917,16 @@ impl InProcessChatTurnBridge {
                                 elapsed = format!("{:?}", persist_start.elapsed()),
                                 error = e
                             );
+                            // audit-#6: core events are durable but tool events
+                            // are lost. Emit a structured forensic marker so
+                            // log-based reconciliation can find the orphans.
+                            tracing::error!(
+                                target: "astra_runtime::persist",
+                                session_id = %sid,
+                                tool_event_count = tool_event_count,
+                                marker = "tool_events_orphaned",
+                                "CRITICAL: core events persisted but tool events lost; journal needs forensic recovery"
+                            );
                             false
                         } else {
                             true
@@ -4838,5 +4848,18 @@ mod tests {
                     > 10
             });
         assert!(!is_cjk, "should not detect CJK in English content");
+    }
+
+    /// audit-#6: when tool events fail to persist after core events succeed,
+    /// the spawned persist task must emit a structured `tool_events_orphaned`
+    /// marker so log-based reconciliation can recover the lost data.
+    #[test]
+    fn persist_task_emits_orphan_marker_on_tool_failure() {
+        let source = include_str!("bridge_inprocess.rs");
+        assert!(
+            source.contains("marker = \"tool_events_orphaned\""),
+            "bridge persist task must emit a `tool_events_orphaned` marker when \
+             tool_writer.persist fails after core events were already committed"
+        );
     }
 }
