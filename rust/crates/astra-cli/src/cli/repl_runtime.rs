@@ -560,7 +560,15 @@ fn detect_pending_plan_resume_digest() -> Option<String> {
         return None;
     }
     match astra_runtime::plan_decompose::PlanModeState::load_with_recovery(&path) {
-        Ok(state) => astra_runtime::plan::plan_resume::plan_resume_digest(&state),
+        Ok(state) => {
+            // B8: Don't surface a resume hint for a plan from a different
+            // workspace — it would mis-direct @resume-plan.
+            let cwd = std::env::current_dir().ok()?;
+            if !state.matches_workspace(&cwd) {
+                return None;
+            }
+            astra_runtime::plan::plan_resume::plan_resume_digest(&state)
+        }
         Err(err) => {
             eprintln!("  ⚠ plan_state.json present but unreadable: {err}");
             None
@@ -611,6 +619,21 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut ReplState)
 
     match astra_runtime::plan_decompose::PlanModeState::load_with_recovery(&path) {
         Ok(mut plan_state) => {
+            // B8: Refuse to restore a plan from a different workspace —
+            // continuing it against the wrong project would corrupt
+            // both contexts.
+            let cwd =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if !plan_state.matches_workspace(&cwd) {
+                eprintln!(
+                    "  ⚠ Saved plan belongs to a different workspace ({}) — \
+                     ignoring @resume-plan in this directory.",
+                    plan_state.context.root
+                );
+                state.pending_plan_resume_digest = None;
+                return false;
+            }
+
             if should_refresh_pending_plan_context(&path) {
                 let project_root =
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

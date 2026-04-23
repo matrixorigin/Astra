@@ -1851,6 +1851,29 @@ impl PlanModeState {
             .join("plan_state.json")
     }
 
+    /// Return true when this saved plan state was captured in (or beneath)
+    /// the current working directory.
+    ///
+    /// B8: prior to this guard, `~/.astra/plan_state.json` was a single
+    /// global file. Opening `astra` in repo B after working in repo A
+    /// would silently restore A's plan and `@resume-plan` would attempt
+    /// to drive A's subtasks against B's project context. We now require
+    /// the saved `context.root` to either equal `current_cwd` or be an
+    /// ancestor of it (so subdirectories of the same project still match).
+    pub fn matches_workspace(&self, current_cwd: &std::path::Path) -> bool {
+        if self.context.root.is_empty() {
+            // Older state files may pre-date this field — be permissive
+            // but log via the caller so it's traceable.
+            return true;
+        }
+        let saved = std::path::Path::new(&self.context.root);
+        let saved_canon = saved.canonicalize().unwrap_or_else(|_| saved.to_path_buf());
+        let cwd_canon = current_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| current_cwd.to_path_buf());
+        cwd_canon == saved_canon || cwd_canon.starts_with(&saved_canon)
+    }
+
     /// Load plan state with recovery — falls back to last good version
     /// if primary state file is corrupted.
     pub fn load_with_recovery(path: &Path) -> Result<Self, PlanLoadError> {
@@ -7234,6 +7257,31 @@ Done!"#;
                 .is_some(),
             "imperative instructions still route to plan mode"
         );
+    }
+
+    #[test]
+    fn matches_workspace_accepts_same_dir_and_subdirs_rejects_unrelated() {
+        // B8: Saved plan_state.json must not silently restore in a foreign
+        // workspace.
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let dir_b = tempfile::tempdir().expect("tempdir B");
+        let sub_a = dir_a.path().join("crates/foo");
+        std::fs::create_dir_all(&sub_a).unwrap();
+
+        let mut state = PlanModeState::new("g".into(), ProjectContext::default());
+        state.context.root = dir_a.path().to_string_lossy().into_owned();
+
+        // Same dir matches.
+        assert!(state.matches_workspace(dir_a.path()));
+        // Subdirectory of saved root matches (e.g. running astra from
+        // crates/foo of the original repo).
+        assert!(state.matches_workspace(&sub_a));
+        // Unrelated workspace must NOT match.
+        assert!(!state.matches_workspace(dir_b.path()));
+
+        // Empty saved root → permissive (older state files).
+        state.context.root.clear();
+        assert!(state.matches_workspace(dir_b.path()));
     }
 
     #[test]
