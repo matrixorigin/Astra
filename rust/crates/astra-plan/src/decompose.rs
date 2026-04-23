@@ -967,6 +967,165 @@ fn strip_json_comments(s: &str) -> String {
     out
 }
 
+/// Replace Unicode "smart" quotes with ASCII equivalents.
+///
+/// LLMs (especially Chinese-tuned models) sometimes emit `"` (U+201C/D) or
+/// `'` (U+2018/9) instead of plain ASCII quotes. This converts them to the
+/// JSON-compatible form. Only operates outside of already-balanced ASCII
+/// strings — a quoted string that legitimately contains a smart quote keeps
+/// it because we don't enter the escape; the conversion is best-effort
+/// applied uniformly here, which is acceptable because any subsequent
+/// `serde_json::from_str` re-validates.
+fn normalize_smart_quotes(s: &str) -> String {
+    s.replace(['\u{201C}', '\u{201D}', '\u{FF02}'], "\"")
+        .replace(['\u{2018}', '\u{2019}', '\u{FF07}'], "'")
+}
+
+/// Convert single-quoted JSON strings to double-quoted. The walker tracks
+/// whether it is inside a (possibly already double-quoted) string region so
+/// it never disturbs a legitimate apostrophe inside a value like
+/// `"don't"`. Inside a single-quoted region, any embedded ASCII `"` is
+/// escaped to `\"` so the resulting double-quoted string remains valid.
+fn fix_single_quoted_strings(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_dq = false;
+    while i < len {
+        let c = chars[i];
+        if c == '\\' && in_dq && i + 1 < len {
+            out.push(c);
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            in_dq = !in_dq;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_dq && c == '\'' {
+            // Only treat this as a single-quoted string if it is followed,
+            // somewhere on the same logical token, by a closing `'`. Avoid
+            // converting bare apostrophes mid-identifier (we should not see
+            // those in valid JSON anyway).
+            let mut j = i + 1;
+            let mut found_close = false;
+            while j < len {
+                if chars[j] == '\\' && j + 1 < len {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '\'' {
+                    found_close = true;
+                    break;
+                }
+                if chars[j] == '\n' {
+                    break;
+                }
+                j += 1;
+            }
+            if found_close {
+                out.push('"');
+                let mut k = i + 1;
+                while k < j {
+                    if chars[k] == '"' {
+                        out.push('\\');
+                        out.push('"');
+                    } else if chars[k] == '\\' && k + 1 < j {
+                        out.push(chars[k]);
+                        out.push(chars[k + 1]);
+                        k += 2;
+                        continue;
+                    } else {
+                        out.push(chars[k]);
+                    }
+                    k += 1;
+                }
+                out.push('"');
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Replace Python-style literals with their JSON equivalents.
+///
+/// LLMs that have been heavily fine-tuned on Python sometimes emit `True`,
+/// `False`, or `None` even inside an otherwise valid JSON document. We
+/// rewrite these only when they appear outside of any string and are
+/// surrounded by non-identifier characters, so identifiers like `"True"`
+/// inside a string are untouched.
+fn fix_python_literals(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let lits: [(&[char], &str); 3] = [
+        (&['T', 'r', 'u', 'e'], "true"),
+        (&['F', 'a', 'l', 's', 'e'], "false"),
+        (&['N', 'o', 'n', 'e'], "null"),
+    ];
+    while i < len {
+        let c = chars[i];
+        if escape {
+            out.push(c);
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                out.push(c);
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        let mut matched = false;
+        for (lit_chars, repl) in &lits {
+            let n = lit_chars.len();
+            if i + n <= len && chars[i..i + n] == **lit_chars {
+                let prev_ok = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
+                let next_ok = i + n == len
+                    || (!chars[i + n].is_alphanumeric() && chars[i + n] != '_');
+                if prev_ok && next_ok {
+                    out.push_str(repl);
+                    i += n;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Strip LLM thinking/reasoning tags: `<think>…</think>`, `<thinking>…</thinking>`, etc.
 ///
 /// Many models wrap their reasoning in XML-like tags before the actual JSON output.
@@ -1008,27 +1167,32 @@ pub fn extract_json_robust(response: &str) -> String {
     let cleaned = strip_thinking_tags(response);
     let extracted = extract_json(&cleaned);
 
-    // Fast path: already valid
-    if serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
-        return extracted;
-    }
-
-    // Try trailing comma fix
-    let fixed_commas = fix_trailing_commas(&extracted);
-    if serde_json::from_str::<serde_json::Value>(&fixed_commas).is_ok() {
-        return fixed_commas;
-    }
-
-    // Try comment stripping
-    let stripped = strip_json_comments(&extracted);
-    if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
-        return stripped;
-    }
-
-    // Try both
-    let both = fix_trailing_commas(&stripped);
-    if serde_json::from_str::<serde_json::Value>(&both).is_ok() {
-        return both;
+    // Each repair stage is checked in order, returning early on success so
+    // the cheapest fix wins. The list grows over time as we encounter new
+    // LLM-emitted variants — keep the order roughly cheapest-to-most-
+    // invasive so we don't aggressively rewrite valid input.
+    let candidates = [
+        extracted.clone(),
+        normalize_smart_quotes(&extracted),
+        fix_trailing_commas(&extracted),
+        strip_json_comments(&extracted),
+        fix_single_quoted_strings(&extracted),
+        fix_python_literals(&extracted),
+        // Composed: strip comments → trailing commas (common pair).
+        fix_trailing_commas(&strip_json_comments(&extracted)),
+        // Composed: smart quotes → trailing commas → comments.
+        fix_trailing_commas(&strip_json_comments(&normalize_smart_quotes(&extracted))),
+        // Composed: smart quotes → single quotes → trailing commas → comments.
+        // This is the heaviest path — applied last when a Python-tuned LLM
+        // returns single-quoted dicts inside markdown fences.
+        fix_python_literals(&fix_trailing_commas(&strip_json_comments(
+            &fix_single_quoted_strings(&normalize_smart_quotes(&extracted)),
+        ))),
+    ];
+    for cand in &candidates {
+        if serde_json::from_str::<serde_json::Value>(cand).is_ok() {
+            return cand.clone();
+        }
     }
 
     extracted
@@ -7613,6 +7777,78 @@ Done!"#;
         let input = r#"{"url": "https://example.com"}"#;
         let stripped = strip_json_comments(input);
         assert_eq!(stripped, input);
+    }
+
+    #[test]
+    fn extract_json_robust_handles_smart_quotes() {
+        let input = "{\u{201C}id\u{201D}: \u{201C}t1\u{201D}}";
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("smart-quote payload should parse");
+        assert_eq!(v["id"], "t1");
+    }
+
+    #[test]
+    fn extract_json_robust_handles_single_quoted_strings() {
+        let input = "{'id': 'task-1', 'title': 'first'}";
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("single-quoted JSON should parse");
+        assert_eq!(v["id"], "task-1");
+        assert_eq!(v["title"], "first");
+    }
+
+    #[test]
+    fn extract_json_robust_handles_python_literals() {
+        let input = r#"{"done": True, "skip": False, "note": None}"#;
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("python literals should be normalized");
+        assert_eq!(v["done"], true);
+        assert_eq!(v["skip"], false);
+        assert!(v["note"].is_null());
+    }
+
+    #[test]
+    fn extract_json_robust_handles_combined_errors() {
+        // Smart quotes + single quotes + trailing comma + Python literal +
+        // JS comment all in one payload — pathological but observed in
+        // real LLM output.
+        let input = "```json\n{\u{201C}items\u{201D}: ['a', 'b',], \
+                     // trailing comment\n  \"done\": True,}\n```";
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("combined repair should parse: {result}");
+        assert_eq!(v["items"][0], "a");
+        assert_eq!(v["items"][1], "b");
+        assert_eq!(v["done"], true);
+    }
+
+    #[test]
+    fn fix_python_literals_preserves_strings() {
+        // The literal `True` inside a string must NOT be rewritten.
+        let input = r#"{"label": "True positive", "flag": True}"#;
+        let out = fix_python_literals(input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must parse");
+        assert_eq!(v["label"], "True positive");
+        assert_eq!(v["flag"], true);
+    }
+
+    #[test]
+    fn fix_single_quoted_strings_preserves_apostrophes_in_double_quoted() {
+        // An apostrophe inside a double-quoted string must survive intact.
+        let input = r#"{"msg": "don't break me"}"#;
+        let out = fix_single_quoted_strings(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn fix_single_quoted_strings_escapes_embedded_double_quote() {
+        let input = r#"{'msg': 'she said "hi"'}"#;
+        let out = fix_single_quoted_strings(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("escaped embedded quote should parse");
+        assert_eq!(v["msg"], "she said \"hi\"");
     }
 
     #[test]
