@@ -11,8 +11,18 @@ fn notebook_edit_requires_ipynb_extension() {
         "new_source": "print('hello')"
     }));
 
-    assert!(result.contains("error"));
-    assert!(result.contains(".ipynb"));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let err = parsed["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected `error` string for non-.ipynb path — got: {result}"));
+    assert!(
+        err.contains(".ipynb"),
+        "error must mention .ipynb extension — got: {err}"
+    );
+    assert!(
+        parsed.get("success").is_none() || parsed["success"] == false,
+        "must not claim success — got: {parsed}"
+    );
 }
 
 #[test]
