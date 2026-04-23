@@ -1950,8 +1950,18 @@ impl DelegationEngine {
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
             let abort_handle = join_set.spawn(async move {
+                // audit-#5: do not panic if the semaphore was closed during shutdown.
                 let _permit = match sem {
-                    Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
+                    Some(ref s) => match s.acquire().await {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            tracing::info!(
+                                target: "astra_runtime::delegation",
+                                "semaphore closed during shutdown; proceeding without permit"
+                            );
+                            None
+                        }
+                    },
                     None => None,
                 };
                 let run_id = config.run_id.clone();
@@ -3054,8 +3064,18 @@ impl DelegationEngine {
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
             let abort_handle = handles.spawn(async move {
+                // audit-#5: do not panic if the semaphore was closed during shutdown.
                 let _permit = match sem {
-                    Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
+                    Some(ref s) => match s.acquire().await {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            tracing::info!(
+                                target: "astra_runtime::delegation",
+                                "semaphore closed during shutdown; proceeding without permit"
+                            );
+                            None
+                        }
+                    },
                     None => None,
                 };
                 let run_id = config.run_id.clone();

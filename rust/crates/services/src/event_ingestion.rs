@@ -423,6 +423,8 @@ impl EventIngestionWorker {
             tokio::pin!(deadline);
 
             tokio::select! {
+                // audit-#7: bias toward shutdown so a busy `rx` cannot starve the drain branch.
+                biased;
                 _ = shutdown.notified() => {
                     // Drain any remaining events from the channel before flushing.
                     while let Ok(event) = self.rx.try_recv() {

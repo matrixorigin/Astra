@@ -422,4 +422,26 @@ mod tests {
             "shutdown_ingestion_and_wait should await tracked session sync tasks before exit"
         );
     }
+
+    #[test]
+    fn serve_calls_shutdown_ingestion_and_wait() {
+        let source = include_str!("server/mod.rs");
+        assert!(
+            source.contains("shutdown_ingestion_and_wait"),
+            "serve() must call shutdown_ingestion_and_wait after axum serve returns"
+        );
+    }
+
+    #[test]
+    fn spawn_data_cleanup_respects_cancellation_token() {
+        let source = include_str!("server/mod.rs");
+        assert!(
+            source.contains("CancellationToken"),
+            "spawn_data_cleanup must accept a CancellationToken so shutdown can drain it"
+        );
+        assert!(
+            source.contains("cancel.cancelled()") || source.contains("cancel_token.cancelled()"),
+            "spawn_data_cleanup loop must select! on the cancel token"
+        );
+    }
 }

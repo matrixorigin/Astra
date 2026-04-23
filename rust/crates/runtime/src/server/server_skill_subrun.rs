@@ -403,12 +403,13 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             return Err(format!(
                 "Skill sub-run '{}' failed after {} turns: {}",
                 skill_name,
-                SUBRUN_MAX_TURNS - state.remaining_turns,
+                SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns),
                 err
             ));
         }
 
-        let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
+        // audit-#8: avoid underflow if remaining_turns somehow exceeds the cap.
+        let turns = SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) as u32;
         let tokens_used = (state.total_prompt + state.total_completion) as u32;
 
         Ok(SubRunResult {
@@ -470,5 +471,24 @@ mod tests {
         assert!(executor.llm_token_service.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
+    }
+
+    /// audit-#8: turn-count math must not underflow when `remaining_turns`
+    /// briefly exceeds the cap (race conditions, future refactors, etc.).
+    #[test]
+    fn turn_count_subtraction_uses_saturating_sub() {
+        // Saturating semantics: max < remaining → 0, max == remaining → 0.
+        let max = SUBRUN_MAX_TURNS;
+        assert_eq!(max.saturating_sub(max + 5), 0);
+        assert_eq!(max.saturating_sub(max), 0);
+        // Sanity check with a typical case.
+        assert_eq!((max).saturating_sub(max - 3), 3);
+
+        // Source-level guard so the panicking subtraction does not regress.
+        let source = include_str!("server_skill_subrun.rs");
+        assert!(
+            !source.contains("SUBRUN_MAX_TURNS - state.remaining_turns"),
+            "use SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) to avoid underflow"
+        );
     }
 }

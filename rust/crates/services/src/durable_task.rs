@@ -1234,6 +1234,7 @@ async fn run_shell_cmd_streaming(
         .current_dir(dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
 
@@ -1270,10 +1271,15 @@ async fn run_shell_cmd_streaming(
         acc
     });
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("wait failed: {e}"))?;
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            // audit-#11: stderr/stdout reader tasks must not leak on wait error.
+            stderr_handle.abort();
+            stdout_handle.abort();
+            return Err(format!("wait failed: {e}"));
+        }
+    };
 
     let stderr = stderr_handle
         .await
@@ -7312,5 +7318,45 @@ Time:        3.456 s
             "fallback should find out/app.js: {:?}",
             result
         );
+    }
+
+    /// audit-#4: the streaming runner must propagate `kill_on_drop` so that
+    /// cancelling the future also reaps the spawned child process.
+    #[test]
+    fn streaming_runner_uses_kill_on_drop() {
+        let source = include_str!("durable_task.rs");
+        let needle = "fn run_shell_cmd_streaming";
+        let start = source.find(needle).expect("function present");
+        let body = &source[start..];
+        let kod = body
+            .find(".kill_on_drop(true)")
+            .expect("kill_on_drop must be set on the streaming child Command");
+        let spawn = body.find(".spawn()").expect("spawn must follow");
+        assert!(
+            kod < spawn,
+            "kill_on_drop must be applied before .spawn() so the child is reaped on drop"
+        );
+    }
+
+    /// audit-#11: when `child.wait()` errors, both reader tasks must be aborted
+    /// before returning so they do not leak.
+    #[test]
+    fn streaming_runner_aborts_reader_tasks_on_wait_error() {
+        let source = include_str!("durable_task.rs");
+        let needle = "fn run_shell_cmd_streaming";
+        let start = source.find(needle).expect("function present");
+        let body = &source[start..];
+        // Look for the explicit abort calls in the wait-error branch.
+        let stderr_abort = body
+            .find("stderr_handle.abort();")
+            .expect("stderr_handle must be aborted on wait error");
+        let stdout_abort = body
+            .find("stdout_handle.abort();")
+            .expect("stdout_handle must be aborted on wait error");
+        let return_err = body[stderr_abort..]
+            .find("return Err(format!(\"wait failed:")
+            .expect("aborts must be followed by the wait-failed return");
+        assert!(stdout_abort > stderr_abort);
+        assert!(return_err > 0);
     }
 }
