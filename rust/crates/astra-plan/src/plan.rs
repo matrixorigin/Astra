@@ -592,8 +592,10 @@ impl PlanCommand {
             return Some(PlanCommand::Execute { step_by_step: true });
         }
 
-        // Resume commands
-        if matches!(lower.as_str(), "continue" | "resume" | "继续" | "next") {
+        // Resume commands — delegate to the canonical resume detector so
+        // this parser stays in sync with `is_resume_command` /
+        // `message_signals_resume`. (Dropped `next` alias.)
+        if crate::plan_resume::message_signals_resume(stripped) {
             return Some(PlanCommand::Resume);
         }
 
@@ -1071,8 +1073,11 @@ mod tests {
         assert_eq!(PlanCommand::parse("继续！"), Some(PlanCommand::Resume));
         // CJK full stop (。) is declarative like ASCII '.', so NOT stripped
         assert_eq!(PlanCommand::parse("执行。"), None);
-        // English punctuation
-        assert_eq!(PlanCommand::parse("continue!"), Some(PlanCommand::Resume));
+        // English punctuation — bare "continue" is too ambiguous; must
+        // pair with "plan" (or use the `@resume-plan` tag).
+        assert_eq!(PlanCommand::parse("resume!"), Some(PlanCommand::Resume));
+        assert_eq!(PlanCommand::parse("continue plan!"), Some(PlanCommand::Resume));
+        assert_eq!(PlanCommand::parse("continue!"), None);
         assert_eq!(
             PlanCommand::parse("go!"),
             Some(PlanCommand::Execute {

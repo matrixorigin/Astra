@@ -114,9 +114,13 @@ impl TaskPlan {
     }
 
     /// Compute overall progress as percentage.
+    ///
+    /// An empty plan (no subtasks) reports 0% — it has not been generated yet,
+    /// so progress is undefined. Reporting 100% caused user-visible bugs where
+    /// failed plan generation was misreported as "all subtasks completed".
     pub fn progress_pct(&self) -> u32 {
         if self.subtasks.is_empty() {
-            return 100;
+            return 0;
         }
         let done = self
             .subtasks
@@ -1656,10 +1660,12 @@ mod tests {
     // ── TaskPlan ──
 
     #[test]
-    fn empty_plan_complete_progress() {
+    fn empty_plan_progress_is_zero_not_complete() {
+        // B5: An empty plan reports 0% — it has not been generated yet.
+        // Previously returned 100%, which caused REPL to misreport
+        // failed plan generation as "all subtasks completed".
         let plan = TaskPlan::default();
-        // Empty plan = nothing to do = 100% complete
-        assert_eq!(plan.progress_pct(), 100);
+        assert_eq!(plan.progress_pct(), 0);
         assert_eq!(plan.items_done(), 0);
         assert!(plan.ready_subtasks().is_empty());
     }

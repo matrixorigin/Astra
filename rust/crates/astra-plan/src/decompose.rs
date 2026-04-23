@@ -1818,11 +1818,22 @@ impl PlanModeState {
         self.save_to_file(path)
     }
 
-    /// Remove the saved state file.
+    /// Remove the saved state file and its backup.
+    ///
+    /// The backup is written as `{path}.json.bak` (see `save_with_backup`),
+    /// not `{path}.bak`. The previous implementation deleted the wrong file,
+    /// leaving a recoverable backup behind that resurrected "ghost" plans on
+    /// the next REPL start.
     pub fn clear_saved_state() {
         let path = Self::state_path();
-        let _ = std::fs::remove_file(&path);
-        let backup = path.with_extension("bak");
+        Self::clear_saved_state_at(&path);
+    }
+
+    /// Remove the saved state file and its backup at an explicit path
+    /// (test-friendly variant of [`clear_saved_state`]).
+    pub fn clear_saved_state_at(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let backup = path.with_extension("json.bak");
         let _ = std::fs::remove_file(backup);
     }
 
@@ -2516,12 +2527,16 @@ pub fn plan_modification_prompt(state: &PlanModeState, user_request: &str) -> St
 }
 
 /// Check if user input is a resume command for paused plan execution.
+///
+/// Delegates to [`crate::plan_resume::message_signals_resume`] so that all
+/// three historical detectors (this one, `PlanCommand::parse` Resume branch,
+/// and `message_signals_resume` itself) share a single source of truth.
+///
+/// The legacy aliases `go` and `next` were intentionally dropped:
+/// `go` overlaps with the Execute alias and `next` was ambiguous with
+/// "next subtask" semantics.
 pub fn is_resume_command(input: &str) -> bool {
-    let trimmed = input.trim().to_lowercase();
-    matches!(
-        trimmed.as_str(),
-        "continue" | "resume" | "继续" | "go" | "next"
-    )
+    crate::plan_resume::message_signals_resume(input)
 }
 
 // ── Paused plan: operator corrections + rewind ─────────────────────────────
@@ -5411,15 +5426,16 @@ Done!"#;
 
     #[test]
     fn is_resume_command_detects_keywords() {
-        assert!(is_resume_command("continue"));
-        assert!(is_resume_command("Continue"));
+        assert!(is_resume_command("continue plan"));
+        assert!(is_resume_command("Continue plan"));
         assert!(is_resume_command("resume"));
-        assert!(is_resume_command("go"));
-        assert!(is_resume_command("next"));
         assert!(is_resume_command("继续"));
+        assert!(is_resume_command("继续计划"));
         // Whitespace
-        assert!(is_resume_command("  continue  "));
+        assert!(is_resume_command("  resume  "));
         assert!(is_resume_command(" RESUME "));
+        // Explicit tag works anywhere
+        assert!(is_resume_command("please @resume-plan now"));
     }
 
     #[test]
@@ -5428,6 +5444,31 @@ Done!"#;
         assert!(!is_resume_command("fix the bug"));
         assert!(!is_resume_command("continue with something else"));
         assert!(!is_resume_command(""));
+        // Dropped aliases — they were too broad. "go" overlaps with Execute,
+        // "next" is ambiguous with "next subtask".
+        assert!(!is_resume_command("go"));
+        assert!(!is_resume_command("next"));
+        // Bare "continue" alone is no longer enough — must be paired with
+        // "plan" or use the @resume-plan tag.
+        assert!(!is_resume_command("continue"));
+    }
+
+    #[test]
+    fn clear_saved_state_at_removes_both_state_and_json_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan_state.json");
+        let backup = path.with_extension("json.bak");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::write(&backup, "{}").unwrap();
+        assert!(path.exists() && backup.exists());
+
+        PlanModeState::clear_saved_state_at(&path);
+
+        assert!(!path.exists(), "primary state file must be removed");
+        assert!(
+            !backup.exists(),
+            "backup .json.bak must be removed (B7 — was deleting wrong .bak)"
+        );
     }
 
     #[test]
