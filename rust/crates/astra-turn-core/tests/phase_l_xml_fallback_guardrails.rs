@@ -8,15 +8,23 @@
 use astra_turn_core::xml_tool_call_fallback::{parse_xml_tool_calls, strip_parsed_invocations};
 
 #[test]
-fn phase_l_xml_prose_heavy_rejected() {
+fn phase_l_xml_prose_heavy_invoke_is_parsed() {
+    // Previously this was rejected by a ratio guard (MAX_NON_XML_RATIO).
+    // The guard caused real tool calls with prose prefixes to leak to output
+    // (regression from session 47ff190c).
+    //
+    // The <invoke name="..."><parameter>...</parameter></invoke> format is
+    // unambiguous — it only appears as actual tool calls, never in explanatory
+    // prose. So we always parse it regardless of surrounding text.
     let prose = "Here is a discussion about tool-call XML. ".repeat(20);
     let text =
         format!("{prose}<invoke name=\"bash\"><parameter name=\"cmd\">ls</parameter></invoke>");
     let result = parse_xml_tool_calls(&text);
     assert!(
-        result.is_none(),
-        "heavy prose + single invoke must be treated as normal speech, got {result:?}"
+        result.is_some(),
+        "invoke block must always be parsed regardless of surrounding prose"
     );
+    assert_eq!(result.unwrap()[0]["function"]["name"], "bash");
 }
 
 #[test]

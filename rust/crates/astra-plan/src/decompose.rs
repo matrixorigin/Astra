@@ -8725,4 +8725,79 @@ Done!"#;
         assert_eq!(loaded.goal, ps.goal);
         assert_eq!(loaded.history.len(), 1);
     }
+
+    // ─── Regression: plan regeneration path shows clarification questions as JSON parse failure
+    //
+    // After the user answers clarification questions, the LLM may return another
+    // round of clarification questions instead of a plan.  The plan regeneration
+    // paths in plan_interaction.rs must call detect_clarification_questions()
+    // BEFORE parse_plan_response(), otherwise the questions are shown as
+    // "Plan response was not structured JSON".
+
+    /// Exact JSON from the user-reported session (session 47ff190c).
+    const SESSION_CLARIFICATION_JSON: &str = r#"[
+ {
+ "question": "What does 'tmp directory' mean - should I use /tmp or create a 'tmp' folder in the project root?",
+ "options": ["Use /tmp folder", "Create tmp/ in project root"],
+ "default": 0,
+ "category": "technical"
+ },
+ {
+ "question": "Which React framework should I use?",
+ "options": ["React (existing react-app folder)", "Vue"],
+ "default": 0,
+ "category": "technical"
+ },
+ {
+ "question": "What agent status information should the dashboard display?",
+ "options": ["Basic status indicator", "Detailed metrics with charts", "Full pipeline status"],
+ "default": 0,
+ "category": "scope"
+ }
+]"#;
+
+    #[test]
+    fn detect_clarification_questions_parses_session_json() {
+        // The exact JSON from the user session must be detected as clarification questions,
+        // not fall through to parse_plan_response as a JSON parse failure.
+        let questions = detect_clarification_questions(SESSION_CLARIFICATION_JSON);
+        assert!(
+            questions.is_some(),
+            "session clarification JSON must be detected by detect_clarification_questions"
+        );
+        let qs = questions.unwrap();
+        assert_eq!(qs.len(), 3);
+        assert!(qs[0].question.contains("tmp directory"));
+        assert_eq!(qs[0].options.len(), 2);
+        assert!(qs[1].question.contains("React framework"));
+        assert!(qs[2].question.contains("agent status"));
+    }
+
+    #[test]
+    fn parse_plan_response_rejects_session_clarification_json() {
+        // parse_plan_response must reject this — it's not a plan.
+        // The caller must check detect_clarification_questions first.
+        let result = parse_plan_response(SESSION_CLARIFICATION_JSON);
+        assert!(
+            result.is_err(),
+            "clarification JSON array must not parse as a plan"
+        );
+    }
+
+    #[test]
+    fn detect_clarification_questions_takes_priority_over_parse_plan_response() {
+        // This test documents the required call order in plan regeneration paths:
+        // detect_clarification_questions() must be called before parse_plan_response().
+        // If detect returns Some, the caller must handle it as clarification, not as a parse error.
+        let text = SESSION_CLARIFICATION_JSON;
+        assert!(
+            detect_clarification_questions(text).is_some(),
+            "detect_clarification_questions must return Some for this input"
+        );
+        assert!(
+            parse_plan_response(text).is_err(),
+            "parse_plan_response must return Err for this input"
+        );
+        // Correct handling: detect first, then parse only if detect returns None.
+    }
 }

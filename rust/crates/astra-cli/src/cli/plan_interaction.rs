@@ -1000,7 +1000,8 @@ pub async fn handle_plan_mode_input(
 ) -> Result<PlanInputResult, String> {
     use plan::{
         ClarificationAnswer, PlanEntryChoice, PlanModeState, decomposition_prompt,
-        parse_clarification_response, parse_plan_entry_choice, parse_plan_response,
+        detect_clarification_questions, parse_clarification_response, parse_plan_entry_choice,
+        parse_plan_response,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -1110,6 +1111,12 @@ pub async fn handle_plan_mode_input(
                 return Ok(PlanInputResult::Handled);
             }
         };
+
+        // LLM may return another round of clarification questions instead of a plan.
+        if let Some(questions) = detect_clarification_questions(&full_text) {
+            let goal = plan_state.goal.clone();
+            return handle_outline_clarifications(questions, &goal, token, state, api).await;
+        }
 
         match parse_plan_response(&full_text) {
             Ok(plan) => {
@@ -2448,6 +2455,24 @@ async fn handle_outline_clarifications(
                     return Ok(PlanInputResult::Handled);
                 }
             };
+
+            // LLM may return another round of clarification questions instead of a plan.
+            if let Some(questions) = plan::detect_clarification_questions(&full_text) {
+                // Store the new questions and show the first one — the user will answer
+                // in the next turn, which re-enters handle_outline_clarifications naturally.
+                if let Some(plan_state) = state.plan_mode.as_mut() {
+                    let pending = plan::PendingClarifications {
+                        questions: questions.clone(),
+                        answers: Vec::new(),
+                    };
+                    plan_state.pending_clarifications = Some(pending);
+                    let _ = plan_state.save_to_file(&plan::PlanModeState::state_path());
+                }
+                if let Some(first) = questions.first() {
+                    eprint_clarification_question(first);
+                }
+                return Ok(PlanInputResult::Handled);
+            }
 
             match plan::parse_plan_response(&full_text) {
                 Ok(plan) => return accept_generated_plan(plan, token, state, api).await,

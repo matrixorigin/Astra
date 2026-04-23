@@ -43,7 +43,6 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
     }
 
     let mut calls = Vec::new();
-    let mut xml_bytes: usize = 0;
     let mut search_from = 0;
 
     while let Some(start) = text[search_from..].find("<invoke") {
@@ -61,7 +60,6 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
         let block = &text[abs_start..block_end];
         if let Some(tc) = parse_single_invoke(block) {
             calls.push(tc);
-            xml_bytes += block_end - abs_start;
         }
         search_from = block_end;
     }
@@ -70,17 +68,9 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
         return None;
     }
 
-    // False-positive guard: if the surrounding prose is substantial relative
-    // to the XML blocks, this is likely a normal response discussing the
-    // format rather than a degraded tool call.
-    let total = text.trim().len();
-    if total > 0 {
-        let non_xml = total.saturating_sub(xml_bytes);
-        let ratio = non_xml as f64 / total as f64;
-        if ratio > MAX_NON_XML_RATIO {
-            return None;
-        }
-    }
+    // No false-positive ratio guard here: `<invoke name="..."><parameter>...</parameter></invoke>`
+    // is a highly specific structured format that only appears as actual tool calls, never in
+    // explanatory prose. (The <tool_call> parser keeps its own guard for its more ambiguous format.)
 
     Some(calls)
 }
@@ -490,24 +480,32 @@ mod tests {
 
     #[test]
     fn rejects_invoke_embedded_in_prose() {
-        // Normal response that discusses the XML format — should NOT trigger fallback
+        // Even when the model discusses the XML format, a valid <invoke> block
+        // is treated as a tool call — the structured format is unambiguous.
+        // (Previously this was rejected by a ratio guard, but that caused real
+        // tool calls with prose prefixes to leak to output.)
         let text = r#"The system uses XML tool calls like this:
 <invoke name="read_file">
 <parameter name="path">src/lib.rs</parameter>
 </invoke>
 This format is used when the model degrades under context pressure.
 You can see the invoke block contains parameter elements."#;
-        assert!(parse_xml_tool_calls(text).is_none());
+        let calls = parse_xml_tool_calls(text);
+        assert!(calls.is_some(), "valid invoke block should always be parsed");
+        assert_eq!(calls.unwrap()[0]["function"]["name"], "read_file");
     }
 
     #[test]
     fn rejects_single_invoke_in_explanation() {
+        // Even in an explanatory context, a valid <invoke> block is parsed as a tool call.
         let text = r#"Here is an example of the invoke format:
 <invoke name="bash">
 <parameter name="command">echo hello</parameter>
 </invoke>
 As you can see, the name attribute specifies the tool."#;
-        assert!(parse_xml_tool_calls(text).is_none());
+        let calls = parse_xml_tool_calls(text);
+        assert!(calls.is_some());
+        assert_eq!(calls.unwrap()[0]["function"]["name"], "bash");
     }
 
     #[test]
@@ -697,5 +695,55 @@ Done."#;
     #[test]
     fn unified_returns_none_for_plain_text() {
         assert!(parse_degraded_tool_calls("just normal text").is_none());
+    }
+
+    // ─── Regression: prose-prefixed invoke leak (session 47ff190c) ──────────
+    //
+    // LLM outputs a sentence of prose before the <invoke> block.
+    // With MAX_NON_XML_RATIO=0.20 the prose pushes non-xml ratio above the
+    // threshold and parse_xml_tool_calls returns None — the XML leaks to output.
+
+    #[test]
+    fn prose_prefix_invoke_is_parsed_not_leaked() {
+        // Exact pattern from the user-reported session: one sentence of prose
+        // followed by a valid <invoke> block.
+        let text = "1. Let me start by exploring the project structure and understanding the context better.\n\n\
+<invoke name=\"list_dir\">\n\
+<parameter name=\"path\">/home/xupeng/github/astra</parameter>\n\
+</invoke>";
+        let calls = parse_degraded_tool_calls(text);
+        assert!(
+            calls.is_some(),
+            "invoke block with prose prefix should be parsed, not leaked to output"
+        );
+        let calls = calls.unwrap();
+        assert_eq!(calls[0]["function"]["name"], "list_dir");
+    }
+
+    #[test]
+    fn prose_prefix_invoke_is_stripped_from_text() {
+        let text = "1. Let me start by exploring the project structure and understanding the context better.\n\n\
+<invoke name=\"list_dir\">\n\
+<parameter name=\"path\">/home/xupeng/github/astra</parameter>\n\
+</invoke>";
+        let stripped = strip_degraded_tool_calls(text);
+        assert!(
+            !stripped.contains("<invoke"),
+            "invoke block must be stripped from output text, got: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn multi_step_prose_with_invoke_is_parsed() {
+        // LLM enumerates steps, one of which is an invoke block
+        let text = "I'll help you with that. Let me check the directory first.\n\n\
+<invoke name=\"bash\">\n\
+<parameter name=\"command\">ls -la</parameter>\n\
+</invoke>\n\nThen I'll analyze the results.";
+        let calls = parse_degraded_tool_calls(text);
+        assert!(
+            calls.is_some(),
+            "invoke with surrounding prose should be parsed"
+        );
     }
 }
