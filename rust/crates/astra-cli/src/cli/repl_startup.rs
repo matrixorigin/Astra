@@ -234,9 +234,7 @@ pub(crate) async fn complete_repl_startup(
     }
 
     if let Ok(settings) = astra_runtime::matrix_settings_from_env().map_err(|e| {
-        eprintln!(
-            "[startup] cloud sync disabled: {e}. Set MATRIXONE_PASSWORD to enable."
-        );
+        eprintln!("[startup] cloud sync disabled: {e}. Set MATRIXONE_PASSWORD to enable.");
         state.matrix_runtime = None;
     }) {
         state.matrix_runtime = match SharedPool::new(&settings).await {

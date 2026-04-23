@@ -31,8 +31,8 @@ fn mo_current_account() -> &'static str {
     use std::sync::OnceLock;
     static ACCOUNT: OnceLock<String> = OnceLock::new();
     ACCOUNT.get_or_init(|| {
-        let out = mo_execute_sql("SELECT current_account_name() AS name", None)
-            .unwrap_or_else(|e| e);
+        let out =
+            mo_execute_sql("SELECT current_account_name() AS name", None).unwrap_or_else(|e| e);
         // Parse the value from mysql --table output.
         out.lines()
             .filter(|l| !l.starts_with('+') && !l.contains("name"))
@@ -464,8 +464,9 @@ impl ToolExecutor {
         let mut tool_result_fields = None;
         if mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
             let snapshot_id = mo_pre_state_snapshot_name();
-            let snapshot_output = mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None)
-                .unwrap_or_else(|e| e);
+            let snapshot_output =
+                mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None)
+                    .unwrap_or_else(|e| e);
             if is_mo_error(&snapshot_output) {
                 return ToolExecutionOutcome::text(format!(
                     "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"

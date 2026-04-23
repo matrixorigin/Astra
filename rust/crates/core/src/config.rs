@@ -198,7 +198,10 @@ impl fmt::Debug for JwtSettings {
         f.debug_struct("JwtSettings")
             .field("secret_key", &"[REDACTED]")
             .field("algorithm", &self.algorithm)
-            .field("access_token_expire_minutes", &self.access_token_expire_minutes)
+            .field(
+                "access_token_expire_minutes",
+                &self.access_token_expire_minutes,
+            )
             .field("refresh_token_expire_days", &self.refresh_token_expire_days)
             .finish()
     }
