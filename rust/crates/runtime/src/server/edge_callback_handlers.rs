@@ -26,6 +26,18 @@ fn edge_id_from_headers(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Error returned by the ledger insert helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LedgerInsertError {
+    /// Ledger is at capacity and this key is new.
+    CapacityExceeded,
+    /// Key already present — refuses to overwrite to preserve the
+    /// at-most-once contract for `/tools/result` and `/approval/respond`
+    /// callbacks (a duplicate POST for the same `request_id` must not
+    /// silently replace the first, already-delivered value).
+    DuplicateKey,
+}
+
 fn ledger_capacity_error() -> (StatusCode, Json<ErrorResponse>) {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -33,29 +45,52 @@ fn ledger_capacity_error() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-fn insert_ledger_entry(
+fn ledger_duplicate_error(key: &str) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::CONFLICT,
+        format!("edge callback already recorded for key {key}; refusing to overwrite"),
+    )
+}
+
+fn ledger_insert_error_response(
+    key: &str,
+    err: LedgerInsertError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match err {
+        LedgerInsertError::CapacityExceeded => ledger_capacity_error(),
+        LedgerInsertError::DuplicateKey => ledger_duplicate_error(key),
+    }
+}
+
+pub(crate) fn insert_ledger_entry(
     ledger: &mut std::collections::HashMap<String, serde_json::Value>,
     key: String,
     value: serde_json::Value,
-) -> Result<bool, ()> {
-    if !ledger.contains_key(&key) && ledger.len() >= LEDGER_MAX_ENTRIES {
-        return Err(());
+) -> Result<bool, LedgerInsertError> {
+    if ledger.contains_key(&key) {
+        return Err(LedgerInsertError::DuplicateKey);
+    }
+    if ledger.len() >= LEDGER_MAX_ENTRIES {
+        return Err(LedgerInsertError::CapacityExceeded);
     }
     ledger.insert(key, value);
     Ok(true)
 }
 
-fn insert_approval_ledger_entry(
+pub(crate) fn insert_approval_ledger_entry(
     ledger: &mut std::collections::HashMap<String, serde_json::Value>,
     key: String,
     value: serde_json::Value,
     durable_fallback_ready: bool,
-) -> Result<bool, ()> {
-    if !ledger.contains_key(&key) && ledger.len() >= LEDGER_MAX_ENTRIES {
+) -> Result<bool, LedgerInsertError> {
+    if ledger.contains_key(&key) {
+        return Err(LedgerInsertError::DuplicateKey);
+    }
+    if ledger.len() >= LEDGER_MAX_ENTRIES {
         if durable_fallback_ready {
             return Ok(false);
         }
-        return Err(());
+        return Err(LedgerInsertError::CapacityExceeded);
     }
     ledger.insert(key, value);
     Ok(true)
@@ -73,7 +108,7 @@ pub(super) async fn post_tool_result_handler(
     let mut lock = state.edge_callback_ledger.lock().await;
     insert_ledger_entry(
         &mut lock,
-        key,
+        key.clone(),
         serde_json::json!({
             "kind": "tool_result",
             "user_id": user.user_id,
@@ -81,7 +116,7 @@ pub(super) async fn post_tool_result_handler(
             "body": serde_json::to_value(&body).unwrap_or_default(),
         }),
     )
-    .map_err(|()| ledger_capacity_error())?;
+    .map_err(|err| ledger_insert_error_response(&key, err))?;
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -163,7 +198,7 @@ pub(super) async fn post_approval_respond_handler(
     }
     let ledger_enqueued = insert_approval_ledger_entry(
         &mut lock,
-        key,
+        key.clone(),
         serde_json::json!({
             "kind": "approval_respond",
             "user_id": user.user_id,
@@ -172,7 +207,7 @@ pub(super) async fn post_approval_respond_handler(
         }),
         body.session_id.is_some(),
     )
-    .map_err(|()| ledger_capacity_error())?;
+    .map_err(|err| ledger_insert_error_response(&key, err))?;
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -260,4 +295,112 @@ pub(super) async fn post_agents_edge_heartbeat_handler(
         "edge_id": edge_id,
         "edge_agent_id": body.edge_agent_id,
     })))
+}
+
+#[cfg(test)]
+mod edge_callback_insert_tests {
+    //! Phase-R adversarial regression tests for the edge callback ledger
+    //! insert helpers. These directly exercise [`insert_ledger_entry`] /
+    //! [`insert_approval_ledger_entry`] without the full HTTP stack: the
+    //! point is to lock in the "at-most-once" contract broken by the
+    //! previous `contains_key` short-circuit.
+
+    use super::{LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry};
+    use crate::turn::edge_ledger::LEDGER_MAX_ENTRIES;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn duplicate_tool_insert_is_rejected_not_overwritten() {
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        let key = "u1:tool:r1".to_string();
+        let first = json!({"body": {"output": "REAL"}});
+        let second = json!({"body": {"output": "REPLAY"}});
+
+        assert!(insert_ledger_entry(&mut ledger, key.clone(), first.clone()).is_ok());
+
+        let err = insert_ledger_entry(&mut ledger, key.clone(), second.clone())
+            .expect_err("duplicate key must be rejected");
+        assert_eq!(err, LedgerInsertError::DuplicateKey);
+
+        let stored = ledger.get(&key).expect("first insert still present");
+        assert_eq!(stored, &first, "original value must not be overwritten");
+    }
+
+    #[test]
+    fn duplicate_approval_insert_is_rejected_not_overwritten() {
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        let key = "u1:approval:a1".to_string();
+        let first = json!({"body": {"decision": "allow"}});
+        let second = json!({"body": {"decision": "deny"}});
+
+        assert!(
+            insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), false).is_ok()
+        );
+        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second.clone(), false)
+            .expect_err("duplicate approval must be rejected");
+        assert_eq!(err, LedgerInsertError::DuplicateKey);
+
+        let stored = ledger.get(&key).expect("first approval still present");
+        assert_eq!(stored, &first);
+    }
+
+    #[test]
+    fn duplicate_approval_insert_rejected_even_with_durable_fallback_ready() {
+        // Durable fallback only relaxes the capacity path; duplicates must
+        // still be rejected so replayed callbacks never overwrite.
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        let key = "u1:approval:a1".to_string();
+        let first = json!({"body": {"decision": "allow"}});
+        let second = json!({"body": {"decision": "deny"}});
+
+        insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), true).unwrap();
+        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second, true)
+            .expect_err("duplicate must still be rejected under durable fallback");
+        assert_eq!(err, LedgerInsertError::DuplicateKey);
+        assert_eq!(ledger.get(&key), Some(&first));
+    }
+
+    #[test]
+    fn distinct_keys_still_insert_normally() {
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        for i in 0..10 {
+            let key = format!("u1:tool:r{i}");
+            insert_ledger_entry(&mut ledger, key, json!({"i": i})).unwrap();
+        }
+        assert_eq!(ledger.len(), 10);
+    }
+
+    #[test]
+    fn capacity_exceeded_reported_distinctly_from_duplicate() {
+        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
+        for i in 0..LEDGER_MAX_ENTRIES {
+            ledger.insert(format!("u:tool:k{i}"), json!(i));
+        }
+        assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
+
+        let err = insert_ledger_entry(&mut ledger, "u:tool:new".into(), json!("nope"))
+            .expect_err("full ledger should reject new key");
+        assert_eq!(err, LedgerInsertError::CapacityExceeded);
+
+        // Approval variant without durable fallback → same CapacityExceeded.
+        let err = insert_approval_ledger_entry(
+            &mut ledger,
+            "u:approval:new".into(),
+            json!("nope"),
+            false,
+        )
+        .expect_err("full ledger + no fallback should reject");
+        assert_eq!(err, LedgerInsertError::CapacityExceeded);
+
+        // Approval variant WITH durable fallback → returns Ok(false), not error.
+        let out = insert_approval_ledger_entry(
+            &mut ledger,
+            "u:approval:new2".into(),
+            json!("nope"),
+            true,
+        )
+        .expect("durable fallback path returns Ok(false)");
+        assert!(!out, "durable fallback path signals not-enqueued");
+    }
 }

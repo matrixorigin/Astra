@@ -34,10 +34,10 @@ use crate::turn::turn_guard::TurnGuard;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 
 /// Maximum turns for a skill sub-run (matches CLI's SUBRUN_MAX_TURNS).
-const SUBRUN_MAX_TURNS: usize = 30;
+pub const SUBRUN_MAX_TURNS: usize = 30;
 
 /// Maximum cumulative tokens for a skill sub-run.
-const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 500_000;
+pub const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 500_000;
 
 /// Server-side implementation of [`SkillSubRunExecutor`].
 ///

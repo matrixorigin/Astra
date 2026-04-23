@@ -256,15 +256,30 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
 
         let (first_status, first_body) = first.join().unwrap();
         let (second_status, second_body) = second.join().unwrap();
+        // Post-Phase-R fix: the ledger insert is at-most-once, so exactly
+        // one of the two concurrent callers sees 200 OK and the other
+        // sees 409 CONFLICT (refusal to overwrite). Journal idempotency
+        // still guarantees a single recorded decision regardless (asserted
+        // below).
+        let statuses = [
+            (first_status, first_body.clone()),
+            (second_status, second_body.clone()),
+        ];
+        let ok_count = statuses
+            .iter()
+            .filter(|(s, _)| *s == StatusCode::OK)
+            .count();
+        let conflict_count = statuses
+            .iter()
+            .filter(|(s, _)| *s == StatusCode::CONFLICT)
+            .count();
         assert_eq!(
-            first_status,
-            StatusCode::OK,
-            "first duplicate approval: {first_body}"
+            ok_count, 1,
+            "exactly one concurrent duplicate approval returns 200: {statuses:?}"
         );
         assert_eq!(
-            second_status,
-            StatusCode::OK,
-            "second duplicate approval: {second_body}"
+            conflict_count, 1,
+            "the other duplicate approval returns 409 CONFLICT: {statuses:?}"
         );
     });
 
