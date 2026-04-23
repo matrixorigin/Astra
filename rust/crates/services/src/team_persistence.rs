@@ -1164,8 +1164,8 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
     } else {
         serde_json::from_str(&context_str).map_err(|e| format!("bad context JSON: {e}"))?
     };
-    let worktree_mode: WorktreeMode =
-        serde_json::from_str(&format!("\"{wt_str}\"")).unwrap_or_default();
+    let worktree_mode: WorktreeMode = serde_json::from_str(&format!("\"{wt_str}\""))
+        .map_err(|e| format!("invalid worktree_mode {wt_str:?}: {e}"))?;
     let budget: Option<TeamBudget> = budget_str
         .filter(|s| !s.is_empty())
         .map(|s| serde_json::from_str(&s))

@@ -204,10 +204,20 @@ fn append_session_journal_event(
     match astra_services::session_journal::JournalWriter::new(session_id) {
         Ok(journal) => {
             if let Err(err) = journal.append(&event) {
-                eprintln!("  ⚠ execution boundary journal append failed: {err}");
+                tracing::error!(
+                    target: "astra_runtime::agentic_loop_tool_phase",
+                    session_id = %session_id,
+                    err = %err,
+                    "execution boundary journal append failed"
+                );
             }
         }
-        Err(err) => eprintln!("  ⚠ execution boundary journal init failed: {err}"),
+        Err(err) => tracing::error!(
+            target: "astra_runtime::agentic_loop_tool_phase",
+            session_id = %session_id,
+            err = %err,
+            "execution boundary journal init failed"
+        ),
     }
 }
 

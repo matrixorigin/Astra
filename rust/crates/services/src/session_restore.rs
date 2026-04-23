@@ -1677,19 +1677,35 @@ pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetada
     // Defense: reject excessively large metadata to prevent DoS
     const MAX_METADATA_SIZE: usize = 512 * 1024; // 512 KB
     if metadata_json.len() > MAX_METADATA_SIZE {
-        eprintln!(
-            "[WARN] session metadata too large ({} bytes), skipping plan extraction",
-            metadata_json.len()
+        tracing::warn!(
+            target: "astra_services::session_restore",
+            size = metadata_json.len(),
+            "session metadata too large, skipping plan extraction"
         );
         return SessionMetadataState::default();
     }
     let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
         Ok(v) => v,
-        Err(_) => return SessionMetadataState::default(),
+        Err(e) => {
+            let prefix = &metadata_json[..metadata_json.len().min(200)];
+            tracing::error!(
+                target: "astra_services::session_restore",
+                err = %e,
+                payload_prefix = %prefix,
+                "metadata JSON parse failed; returning default state"
+            );
+            return SessionMetadataState::default();
+        }
     };
     let obj = match parsed.as_object() {
         Some(o) => o,
-        None => return SessionMetadataState::default(),
+        None => {
+            tracing::warn!(
+                target: "astra_services::session_restore",
+                "session metadata is not a JSON object; returning default state"
+            );
+            return SessionMetadataState::default();
+        }
     };
 
     SessionMetadataState {

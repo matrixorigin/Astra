@@ -2147,9 +2147,11 @@ impl InProcessChatTurnBridge {
                         reasoning_content: None,
                     };
                     if let Err(e) = aux_writer.persist_events(vec![routing_event]).await {
-                        eprintln!(
-                            "PERSIST_FAIL session={} stage=auxiliary error={}",
-                            aux_sid, e
+                        tracing::error!(
+                            target: "astra_runtime::bridge_inprocess",
+                            aux_session_id = %aux_sid,
+                            err = %e,
+                            "auxiliary routing event persist failed"
                         );
                     }
                     persist_legacy_bridge_trace_and_quality(
