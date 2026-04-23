@@ -2583,9 +2583,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
         // a tool failure instead of aborting the whole batch/turn.
         let executor: &crate::edge_tools::ToolExecutor = &self.executor;
-        let sem = Arc::new(tokio::sync::Semaphore::new(
-            astra_runtime::turn::parallel_tool_exec::MAX_CONCURRENT_TOOL_EXECUTIONS,
-        ));
+        // Use the process-wide shared semaphore so the concurrency cap
+        // genuinely spans every batch and every concurrent session in this
+        // process — previously each batch constructed its own `Semaphore::new(10)`,
+        // which allowed 10·N concurrent tools when N batches overlapped.
+        let sem = astra_runtime::turn::parallel_tool_exec::shared_tool_semaphore();
         // D-9: harvest speculative results from mid-stream execution.
         // Matching request_ids skip the normal dispatch and reuse the
         // speculative output. Journal/observability still fire exactly
