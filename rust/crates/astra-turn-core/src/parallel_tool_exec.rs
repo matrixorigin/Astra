@@ -12,7 +12,6 @@
 //! `execute_tool` function is supplied by the caller (CLI's stream_render.rs
 //! or any other host).
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -259,12 +258,12 @@ pub async fn execute_parallel_round(
         }
     }
 
-    // Phase 2: Execute mutating tools sequentially
+    // Phase 2: Execute mutating tools sequentially.
+    // Sibling-abort fires on ANY mutating-tool failure (not just bash): a
+    // batched sequence of mutations is typically a coherent plan (write →
+    // commit → push) where later steps become meaningless once an earlier
+    // one fails, and continuing can partially apply destructive state.
     let sequential_count = mutating.len();
-    let bash_names: HashSet<&str> = ["bash", "BashTool", "shell", "execute_command"]
-        .iter()
-        .copied()
-        .collect();
 
     for (idx, tc) in mutating {
         if sibling_aborted {
@@ -292,8 +291,8 @@ pub async fn execute_parallel_round(
 
         let (call_id, tool_name, content, success) = executor(tc.clone()).await;
 
-        // Sibling abort: if a bash tool fails, skip remaining mutating tools
-        if !success && bash_names.contains(tool_name.as_str()) {
+        // Sibling abort: any mutating-tool failure aborts remaining siblings.
+        if !success {
             sibling_aborted = true;
         }
 

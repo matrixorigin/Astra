@@ -113,6 +113,27 @@ fn failing_bash_executor() -> (ToolExecutorFn, Arc<AtomicUsize>) {
     (exec, invocations)
 }
 
+/// Executor that makes the first `write_file` call fail; everything else succeeds.
+/// Used to verify sibling-abort triggers on non-bash mutating failures too.
+fn failing_write_executor() -> (ToolExecutorFn, Arc<AtomicUsize>) {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let invocations_c = invocations.clone();
+    let exec: ToolExecutorFn = Arc::new(move |tc: Value| {
+        let invocations = invocations_c.clone();
+        Box::pin(async move {
+            invocations.fetch_add(1, Ordering::SeqCst);
+            let call_id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            if name == "write_file" {
+                (call_id, name, "boom: permission denied".into(), false)
+            } else {
+                (call_id, name, "ok".into(), true)
+            }
+        })
+    });
+    (exec, invocations)
+}
+
 /// Unhappy path: a failing `bash` call must abort queued mutating siblings.
 /// Mix: [read (parallel), bash-failing, write_file, str_replace].
 #[tokio::test]
@@ -281,4 +302,61 @@ fn shared_tool_semaphore_returns_same_instance() {
         Arc::ptr_eq(&a, &b),
         "shared_tool_semaphore must return the same Arc on repeat calls"
     );
+}
+
+// ── Sibling-abort coverage for non-bash mutating tools ──
+//
+// Previously, the sibling-abort guard only fired when the failing tool was
+// in `["bash", "BashTool", "shell", "execute_command"]`. A failing
+// `write_file`, `git_commit`, `str_replace`, etc. did **not** abort queued
+// mutating siblings — even though mutations are typically part of a
+// coherent sequence (write → commit → push; the next step is meaningless
+// once an earlier one fails) and continuing can partially apply state.
+//
+// The guard now fires on any mutating-tool failure.
+
+#[tokio::test]
+async fn unhappy_any_failing_mutating_tool_aborts_siblings() {
+    // write_file fails first; subsequent mutating tools (str_replace, bash)
+    // must be skipped, not dispatched.
+    let calls = vec![
+        tool_call("read_file", "r0"),
+        tool_call("write_file", "w1"),
+        tool_call("str_replace", "s2"),
+        tool_call("bash", "b3"),
+    ];
+    let (exec, invocations) = failing_write_executor();
+
+    let outcome = execute_parallel_round(&calls, exec).await;
+
+    assert_eq!(outcome.parallel_count, 1, "one read-only call");
+    assert_eq!(outcome.sequential_count, 3, "three mutating calls queued");
+    assert!(
+        outcome.sibling_aborted,
+        "write_file failure must flip the sibling-abort flag too"
+    );
+
+    // Executor should have been called for r0 + w1 only — 2 calls total.
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        2,
+        "mutating siblings after a failing write_file must be skipped"
+    );
+
+    let ordered: Vec<_> = outcome
+        .results
+        .iter()
+        .map(|r| (r.tool_name.as_str(), r.success))
+        .collect();
+    assert_eq!(ordered[0], ("read_file", true));
+    assert_eq!(ordered[1], ("write_file", false));
+    assert!(!ordered[2].1, "str_replace should be aborted");
+    assert!(!ordered[3].1, "bash should be aborted");
+    for r in &outcome.results[2..] {
+        assert!(
+            r.content.to_lowercase().contains("aborted"),
+            "aborted sibling must carry 'aborted' reason: {}",
+            r.content
+        );
+    }
 }
