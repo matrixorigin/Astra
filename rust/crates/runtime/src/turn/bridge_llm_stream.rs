@@ -506,7 +506,10 @@ pub(crate) async fn call_llm_stream(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
 
-        let text = response.text().await.unwrap_or_default();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read error: {e}>"));
         last_err = format!("LLM error {status}: {text}");
 
         // Record rate-limit errors to cooldown tracker

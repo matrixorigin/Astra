@@ -27,6 +27,46 @@ use crate::bridge::rate_limit_cooldown::{
 use crate::output_style::current_output_style;
 use crate::prompts;
 
+/// Redact common provider secret patterns from a string before logging.
+///
+/// Replaces the value following well-known prefixes (`sk-`, `Bearer `, `key-`)
+/// with `[REDACTED]`. The scan stops at the first whitespace, quote, or comma,
+/// which is sufficient for the JSON / plaintext error bodies that providers
+/// commonly echo authorization material into.
+pub(crate) fn redact_provider_secrets(s: &str) -> String {
+    fn boundary(c: char) -> bool {
+        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
+    }
+    let prefixes = ["sk-", "Bearer ", "key-"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut best: Option<(usize, &str)> = None;
+        for p in &prefixes {
+            if let Some(idx) = rest.find(p) {
+                if best.map(|(b, _)| idx < b).unwrap_or(true) {
+                    best = Some((idx, p));
+                }
+            }
+        }
+        match best {
+            Some((idx, p)) => {
+                out.push_str(&rest[..idx]);
+                out.push_str(p);
+                out.push_str("[REDACTED]");
+                let tail = &rest[idx + p.len()..];
+                let cut = tail.find(boundary).unwrap_or(tail.len());
+                rest = &tail[cut..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Maximum retries for transient LLM errors (429, 5xx, network).
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
@@ -813,8 +853,35 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
 
-        let text = response.text().await.unwrap_or_default();
-        last_err = format!("LLM error {status}: {text}");
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read error: {e}>"));
+
+        // Auth errors: redact the body in logs and return a generic message
+        // so provider-echoed secrets cannot leak through error propagation.
+        if status == 401 || status == 403 {
+            let truncated = &text[..text.len().min(80)];
+            let redacted = redact_provider_secrets(truncated);
+            tracing::warn!(
+                target: "astra_runtime::llm_client",
+                "LLM auth error ({status}) on {model_key}: {redacted}",
+            );
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Auth,
+                "LLM provider authentication failed".to_string(),
+            ));
+        }
+
+        // For other 4xx errors, suppress the raw response body to avoid
+        // leaking secrets that providers may echo back. Retain body for 5xx
+        // (helpful for diagnosing transient backend failures) and the 400
+        // context-window check below (which still needs to inspect text).
+        last_err = if (400..500).contains(&status) {
+            format!("LLM request rejected: {status}")
+        } else {
+            format!("LLM error {status}: {text}")
+        };
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
@@ -875,15 +942,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         if status == 400 && is_context_window_error(&text.to_lowercase()) {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
-                last_err,
-            ));
-        }
-
-        // Auth errors
-        if status == 401 || status == 403 {
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Auth,
-                last_err,
+                format!("LLM error {status}: {text}"),
             ));
         }
 
@@ -2768,6 +2827,12 @@ mod tests {
         .await
         .expect_err("should fail with auth");
         assert_eq!(err.kind, astra_core::ErrorKind::Auth);
+        assert!(
+            !err.message.contains("Unauthorized"),
+            "auth error message must not echo provider body, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("authentication failed"));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
@@ -3196,5 +3261,43 @@ mod tests {
         let (r, c) = extract_think_tags(text).unwrap();
         assert_eq!(r, "step 1");
         assert_eq!(c, "answer");
+    }
+
+    #[test]
+    fn redact_provider_secrets_strips_known_prefixes() {
+        let input = "sk-abc12345 and Bearer tok_xyz plus key-deadbeef end";
+        let out = redact_provider_secrets(input);
+        assert!(out.contains("[REDACTED]"), "missing redacted marker: {out}");
+        assert!(!out.contains("abc12345"), "leaked sk- secret: {out}");
+        assert!(!out.contains("tok_xyz"), "leaked bearer secret: {out}");
+        assert!(!out.contains("deadbeef"), "leaked key- secret: {out}");
+        assert!(out.contains("end"), "trailing text dropped: {out}");
+    }
+
+    #[test]
+    fn redact_provider_secrets_leaves_clean_text() {
+        let input = "Internal server error: upstream timeout";
+        assert_eq!(redact_provider_secrets(input), input);
+    }
+
+    #[test]
+    fn redact_provider_secrets_handles_quoted_json() {
+        let input = r#"{"error":"invalid api key sk-abcXYZ"}"#;
+        let out = redact_provider_secrets(input);
+        assert!(!out.contains("abcXYZ"), "leaked sk- secret in JSON: {out}");
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_provider_secrets_simulates_auth_log_path() {
+        // Simulate what the auth-error path logs: a truncated body containing a key.
+        let body = r#"{"error":{"message":"Incorrect API key sk-abc12345 provided"}}"#;
+        let truncated = &body[..body.len().min(80)];
+        let log_line = format!(
+            "LLM auth error (401): {}",
+            redact_provider_secrets(truncated)
+        );
+        assert!(!log_line.contains("sk-abc12345"));
+        assert!(log_line.contains("[REDACTED]"));
     }
 }
