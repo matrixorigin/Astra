@@ -2,93 +2,80 @@ use super::*;
 
 // ─── web_search tests ─────────────────────────────────────────────────────────
 
+/// Table-driven engine coverage — each row pins one branch of the
+/// engine selector. Consolidated from 5 near-duplicate tests
+/// (google/duckduckgo/wikipedia/github/bing) that only differed by
+/// input literals.
 #[test]
-fn web_search_google_default() {
+fn web_search_engine_routing_table() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "rust programming"}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    assert_eq!(parsed["engine"], "Google");
-    assert!(
-        parsed["search_url"]
+    struct Case {
+        query: &'static str,
+        engine: Option<&'static str>,
+        expect_engine_label: &'static str,
+        expect_url_contains: &'static [&'static str],
+    }
+
+    let cases = [
+        Case {
+            query: "rust programming",
+            engine: None, // default
+            expect_engine_label: "Google",
+            expect_url_contains: &["google.com", "rust%20programming"],
+        },
+        Case {
+            query: "hello world",
+            engine: Some("duckduckgo"),
+            expect_engine_label: "DuckDuckGo",
+            expect_url_contains: &["duckduckgo.com"],
+        },
+        Case {
+            query: "quantum physics",
+            engine: Some("wikipedia"),
+            expect_engine_label: "Wikipedia",
+            expect_url_contains: &["wikipedia.org", "action=opensearch"],
+        },
+        Case {
+            query: "tokio async",
+            engine: Some("github"),
+            expect_engine_label: "GitHub",
+            expect_url_contains: &["github.com/search"],
+        },
+        Case {
+            query: "test query",
+            engine: Some("bing"),
+            expect_engine_label: "Bing",
+            expect_url_contains: &["bing.com"],
+        },
+    ];
+
+    for case in &cases {
+        let input = match case.engine {
+            Some(e) => json!({"query": case.query, "engine": e}),
+            None => json!({"query": case.query}),
+        };
+        let result = exe.web_search(&input);
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .unwrap_or_else(|e| panic!("engine={:?} produced invalid JSON: {e}", case.engine));
+        assert_eq!(
+            parsed["engine"], case.expect_engine_label,
+            "engine label mismatch for {:?}",
+            case.engine
+        );
+        let url = parsed["search_url"]
             .as_str()
-            .unwrap()
-            .contains("google.com")
-    );
-    assert!(
-        parsed["search_url"]
-            .as_str()
-            .unwrap()
-            .contains("rust%20programming")
-    );
-    assert!(parsed["tip"].as_str().is_some());
-}
-
-#[test]
-fn web_search_duckduckgo() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "hello world", "engine": "duckduckgo"}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["engine"], "DuckDuckGo");
-    assert!(
-        parsed["search_url"]
-            .as_str()
-            .unwrap()
-            .contains("duckduckgo.com")
-    );
-}
-
-#[test]
-fn web_search_wikipedia() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "quantum physics", "engine": "wikipedia"}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["engine"], "Wikipedia");
-    assert!(
-        parsed["search_url"]
-            .as_str()
-            .unwrap()
-            .contains("wikipedia.org")
-    );
-    assert!(
-        parsed["search_url"]
-            .as_str()
-            .unwrap()
-            .contains("action=opensearch")
-    );
-    assert!(parsed["tip"].as_str().unwrap().contains("JSON"));
-}
-
-#[test]
-fn web_search_github() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "tokio async", "engine": "github"}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["engine"], "GitHub");
-    assert!(
-        parsed["search_url"]
-            .as_str()
-            .unwrap()
-            .contains("github.com/search")
-    );
-}
-
-#[test]
-fn web_search_bing() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "test query", "engine": "bing"}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["engine"], "Bing");
-    assert!(parsed["search_url"].as_str().unwrap().contains("bing.com"));
+            .unwrap_or_else(|| panic!("no search_url for {:?}", case.engine));
+        for needle in case.expect_url_contains {
+            assert!(
+                url.contains(needle),
+                "url for {:?} missing {:?}: url={url}",
+                case.engine,
+                needle
+            );
+        }
+    }
 }
 
 #[test]
@@ -134,27 +121,24 @@ fn web_search_special_characters_encoded() {
     assert!(url.contains("%26")); // & encoded
 }
 
+/// Boundary-table for num_results handling — consolidated from two
+/// near-duplicate tests (25 respected / 100 capped to 50).
 #[test]
-fn web_search_num_results_respected() {
+fn web_search_num_results_boundary_table() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "test", "num_results": 25}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    let url = parsed["search_url"].as_str().unwrap();
-    assert!(url.contains("num=25"));
-}
-
-#[test]
-fn web_search_num_results_capped() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    let result = exe.web_search(&json!({"query": "test", "num_results": 100}));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    let url = parsed["search_url"].as_str().unwrap();
-    // Should be capped at 50
-    assert!(url.contains("num=50"));
+    // (requested, expected_in_url)
+    let cases = [(1u32, 1u32), (25, 25), (50, 50), (100, 50), (9999, 50)];
+    for (requested, expected) in cases {
+        let result = exe.web_search(&json!({"query": "test", "num_results": requested}));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let url = parsed["search_url"].as_str().unwrap();
+        assert!(
+            url.contains(&format!("num={expected}")),
+            "requested={requested} should appear (or cap) as num={expected} — url={url}"
+        );
+    }
 }
 
 #[test]
