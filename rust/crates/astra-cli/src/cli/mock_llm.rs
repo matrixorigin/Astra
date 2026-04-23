@@ -107,10 +107,18 @@ fn text_done(full: &str) -> String {
 }
 
 fn tool_call_start(call_id: &str, tool: &str, args: Value) -> String {
+    // Canonical tool_call_start shape: flat `tool` (name string) + top-level
+    // `arguments` (JSON-stringified). See
+    // `chat_turn_sse_dispatch::normalize_tool_call_for_accum` — a nested
+    // `tool: {name, arguments}` would be silently dropped because that
+    // normalizer reads `tool` with `as_str()` and falls back to "" on a
+    // non-string, returning None. The regression anchor is
+    // `phase_r2_mock_dispatch_contract::mock_llm_tool_call_start_shape_is_captured_by_dispatch`.
     sse_line(&serde_json::json!({
         "type": "tool_call_start",
         "call_id": call_id,
-        "tool": { "name": tool, "arguments": args.to_string() },
+        "tool": tool,
+        "arguments": args.to_string(),
     }))
 }
 
