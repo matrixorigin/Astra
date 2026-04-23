@@ -15,9 +15,11 @@
 
 | Command | Description |
 | --- | --- |
-| `make test` | Workspace tests + `bridge-e2e-hooks` + online `#[ignore]` Matrix E2E and multi-agent integration (MatrixOne + Redis required for the online portion) |
-| `make test-offline` | Workspace tests + `bridge-e2e-hooks` only (no online `#[ignore]` suites) |
-| `make test-online` | Online `#[ignore]` suites only (`system_matrix_http_e2e`, `multi_agent_integration`) |
+| `make test` | `test-offline` + `test-online` (Rust + `@astra/sdk`; see below) |
+| `make test-offline` | Rust: workspace + `bridge-e2e-hooks`. JS SDK (`packages/sdk`): `typecheck`, `ASTRA_SDK_E2E=1` Jest with coverage (unit + in-process Mode A), `build` |
+| `make test-online` | Rust: astra-runtime `#[ignore]` tests + Matrix / services ignored suites. JS SDK: Jest against `ASTRA_SDK_BASE_URL` (default `http://127.0.0.1:${API_PORT:-8000}` from `.env`) + `npm run test:online` — **requires a running API** (e.g. `make dev-start`) and `make dev-deps-up` for Rust DB-backed tests |
+| `make test-sdk-offline` | `@astra/sdk` only — same SDK steps as the SDK portion of `test-offline` |
+| `make test-sdk-online` | `@astra/sdk` only — Jest remote integration + `test:online` smoke; **requires a running API** |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
 
 ## Static Checks

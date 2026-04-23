@@ -677,6 +677,47 @@ describe('chatRequestToWire', () => {
     expect(body.allow_skills).toBeUndefined();
     expect(body.allow_tools).toBeUndefined();
   });
+
+  test('default max_candidates is 8', () => {
+    const body = chatRequestToWire({ message: 'm' });
+    expect(body.max_candidates).toBe(8);
+  });
+
+  test('full snake_case mapping: session, agent, model, context, plan, edge, capabilities', () => {
+    const body = chatRequestToWire({
+      message: 'q',
+      maxCandidates: 3,
+      sessionId: 'sess-1',
+      agentId: 'ag-1',
+      model: 'kimi',
+      context: { files: [] },
+      explain: true,
+      planSubtaskId: 'p1',
+      isPlanSubtask: true,
+      edgeExecutorId: 'ex1',
+      capabilities: ['a', 'b'],
+    });
+    expect(body).toMatchObject({
+      message: 'q',
+      max_candidates: 3,
+      session_id: 'sess-1',
+      agent_id: 'ag-1',
+      model: 'kimi',
+      context: { files: [] },
+      explain: true,
+      plan_subtask_id: 'p1',
+      is_plan_subtask: true,
+      edge_executor_id: 'ex1',
+      capabilities: ['a', 'b'],
+    });
+  });
+
+  test('omits undefined optional fields', () => {
+    const body = chatRequestToWire({ message: 'x' });
+    expect(Object.keys(body).sort()).toEqual(
+      ['max_candidates', 'message'].sort(),
+    );
+  });
 });
 
 // ─── Skills lifecycle ─────────────────────────────────────────────

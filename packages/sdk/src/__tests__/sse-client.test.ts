@@ -1,5 +1,6 @@
 import { SSEClient, parseSseDataEvents } from '../sse-client';
 import type { StreamEvent, ConnectionState } from '../types';
+import { readSseFixture } from './sse-fixture-helpers';
 
 // ─── Mock Fetch + ReadableStream ────────────────────────────────────
 
@@ -364,5 +365,16 @@ describe('parseSseDataEvents', () => {
     expect(events).toHaveLength(2);
     expect(events[0].type).toBe('session_info');
     expect(events[1]).toMatchObject({ type: 'text_delta', content: 'hi' });
+  });
+
+  test('parses __fixtures__/sse/workspace-stream.txt', () => {
+    const events = parseSseDataEvents(readSseFixture('workspace-stream.txt'));
+    expect(events.map((e) => e.type)).toEqual([
+      'session_info',
+      'text_delta',
+      'text_delta',
+      'usage',
+      'turn_complete',
+    ]);
   });
 });

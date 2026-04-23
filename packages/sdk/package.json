@@ -26,7 +26,12 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "jest --config jest.config.mjs"
+    "test": "jest --config jest.config.mjs",
+    "test:coverage": "jest --config jest.config.mjs --coverage",
+    "test:online": "node scripts/sdk-online-smoke.mjs",
+    "test:integration:local": "ASTRA_SDK_E2E=1 jest --config jest.config.mjs --testPathPatterns=integration/online",
+    "test:integration:remote": "node scripts/run-remote-integration.mjs",
+    "ci": "npm run typecheck && npm run test && npm run build"
   },
   "peerDependencies": {
     "react": ">=18.0.0"

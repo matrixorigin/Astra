@@ -157,6 +157,36 @@ describe('useAstraChat', () => {
     expect(assistantMsg?.content).toBe('Hello World');
   });
 
+  /** Aligns with real-world-scenarios / streamChat ordering (session → text → usage → complete). */
+  test('processes session_info → text_deltas → usage → turn_complete', () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: 'session_info', session_id: 's-w', run_id: 'r-w' } as StreamEvent,
+      { type: 'text_delta', content: 'Ok' } as StreamEvent,
+      {
+        type: 'usage',
+        prompt_tokens: 1,
+        completion_tokens: 2,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+      } as StreamEvent,
+      { type: 'turn_complete' } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client }));
+
+    act(() => {
+      result.current.sendMessage('Go');
+    });
+
+    expect(result.current.sessionId).toBe('s-w');
+    expect(result.current.runId).toBe('r-w');
+    const assistant = result.current.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toBe('Ok');
+    expect(assistant?.streaming).toBe(false);
+    expect(result.current.usage.totalTokens).toBe(3);
+  });
+
   test('processes tool_call_start and tool_call_end', () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [

@@ -217,6 +217,18 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         setError(event.message);
         break;
 
+      case 'turn_complete':
+        setIsStreaming(false);
+        setConnectionState('idle');
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === 'assistant' && last.streaming) {
+            return [...prev.slice(0, -1), { ...last, streaming: false }];
+          }
+          return prev;
+        });
+        break;
+
       case 'run_finished':
       case 'run_cancelled':
         setIsStreaming(false);
