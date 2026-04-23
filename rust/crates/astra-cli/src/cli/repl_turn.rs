@@ -1253,6 +1253,12 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_memoria_time(result.memoria_ms)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
 
+        // Attach per-turn git snapshot for rewind/fork/sync lineage.
+        {
+            let (git_head, git_branch) = super::cli_utils::git_snapshot();
+            turn_event = turn_event.with_git_snapshot(git_head, git_branch);
+        }
+
         // Add turn observability summary.
         turn_event.llm_rounds = result.llm_rounds;
         let tool_ms: u64 = result

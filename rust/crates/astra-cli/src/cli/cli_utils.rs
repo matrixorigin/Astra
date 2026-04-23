@@ -570,6 +570,28 @@ pub(super) fn urlencoding(s: &str) -> String {
         .collect()
 }
 
+/// Read current git HEAD (short SHA) and branch name for journal git snapshots.
+///
+/// Returns `(git_head, git_branch)` — either or both may be `None` if not in a
+/// git repo or in detached HEAD state (branch will be None).
+pub(crate) fn git_snapshot() -> (Option<String>, Option<String>) {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    let branch = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    (head, branch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,5 +971,26 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "credentials.json must be 0600, got {mode:o}");
         }
+    }
+
+    #[test]
+    fn git_snapshot_returns_head_and_branch_in_git_repo() {
+        // This test runs inside the astra git repo, so both should be Some.
+        let (head, _branch) = super::git_snapshot();
+        assert!(
+            head.is_some(),
+            "git_snapshot must return Some(head) inside a git repo"
+        );
+        let h = head.unwrap();
+        assert!(
+            h.len() >= 7 && h.len() <= 40,
+            "git HEAD should be 7-40 chars, got {}: '{h}'",
+            h.len()
+        );
+        // branch may be None in CI detached HEAD, so we only check head is valid hex
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit()),
+            "git HEAD must be hex, got '{h}'"
+        );
     }
 }

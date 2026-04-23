@@ -752,6 +752,18 @@ pub struct JournalEvent {
     /// Total tool execution time in this turn (set on turn_completed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tool_ms: Option<u64>,
+    // ── Causal lineage (P5) ──────────────────────────────────────────────
+    /// Parent event ID for causal tree construction.
+    /// Turn → SessionStart, LlmRound → Turn, DelegationSubRunStarted → DelegationStarted, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    // ── Git snapshot (P0) ────────────────────────────────────────────────
+    /// Git HEAD commit hash at the time of this event (short or full SHA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    /// Git branch name at the time of this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
 }
 
 /// Event type discriminator.
@@ -1979,6 +1991,9 @@ impl JournalEvent {
             llm_rounds: None,
             total_llm_ms: None,
             total_tool_ms: None,
+            parent_event_id: None,
+            git_head: None,
+            git_branch: None,
         }
     }
 
@@ -1990,6 +2005,19 @@ impl JournalEvent {
 
     pub fn with_agentic_step(mut self, agentic_step: Option<u32>) -> Self {
         self.agentic_step = agentic_step;
+        self
+    }
+
+    /// Set the parent event ID for causal lineage.
+    pub fn with_parent_event_id(mut self, parent_event_id: Option<String>) -> Self {
+        self.parent_event_id = parent_event_id;
+        self
+    }
+
+    /// Attach git snapshot (HEAD commit + branch) to this event.
+    pub fn with_git_snapshot(mut self, head: Option<String>, branch: Option<String>) -> Self {
+        self.git_head = head;
+        self.git_branch = branch;
         self
     }
 
@@ -6454,5 +6482,163 @@ mod observability_serde_tests {
         assert_eq!(deser.llm_rounds, Some(2));
         assert_eq!(deser.total_llm_ms, Some(4500));
         assert_eq!(deser.total_tool_ms, Some(500));
+    }
+
+    // ── P5: parent_event_id causal lineage ──────────────────────────────
+
+    #[test]
+    fn parent_event_id_round_trips_through_serde() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_parent_event_id(Some("evt-session-start-001".to_string()));
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("parent_event_id"));
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deser.parent_event_id.as_deref(),
+            Some("evt-session-start-001")
+        );
+    }
+
+    #[test]
+    fn parent_event_id_none_omitted_from_json() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
+        assert!(ev.parent_event_id.is_none());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !json.contains("parent_event_id"),
+            "None parent_event_id must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn parent_event_id_backward_compat_old_json_without_field() {
+        // Simulate reading a journal line written before parent_event_id existed.
+        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","turn":1,"tokens_in":10,"tokens_out":5,"duration_ms":100}"#;
+        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert!(
+            ev.parent_event_id.is_none(),
+            "old events without parent_event_id must deserialize as None"
+        );
+    }
+
+    #[test]
+    fn parent_event_id_chaining_with_other_builders() {
+        let ev = JournalEvent::turn(Some("s"), 2, Some("m"), "q", "a", 1, 50, 10, 200)
+            .with_parent_event_id(Some("parent-123".to_string()))
+            .with_agentic_step(Some(3));
+        assert_eq!(ev.parent_event_id.as_deref(), Some("parent-123"));
+        assert_eq!(ev.agentic_step, Some(3));
+    }
+
+    #[test]
+    fn parent_event_id_persists_through_writer_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-parent-id-00000000-0000-0000-0000-000000000001";
+        let writer = JournalWriter::new(sid).unwrap();
+
+        let ev = JournalEvent::session_start(Some(sid), Some("m"))
+            .with_parent_event_id(Some("root".to_string()));
+        writer.append(&ev).unwrap();
+
+        let (events, _, _) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].parent_event_id.as_deref(), Some("root"));
+    }
+
+    // ── P0: git snapshot on Turn events ─────────────────────────────────
+
+    #[test]
+    fn git_snapshot_round_trips_through_serde() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(
+                Some("abc1234".to_string()),
+                Some("feat/my-branch".to_string()),
+            );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("git_head"));
+        assert!(json.contains("git_branch"));
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.git_head.as_deref(), Some("abc1234"));
+        assert_eq!(deser.git_branch.as_deref(), Some("feat/my-branch"));
+    }
+
+    #[test]
+    fn git_snapshot_none_omitted_from_json() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("git_head"), "None git_head must be omitted");
+        assert!(
+            !json.contains("git_branch"),
+            "None git_branch must be omitted"
+        );
+    }
+
+    #[test]
+    fn git_snapshot_backward_compat_old_json_without_fields() {
+        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","turn":1}"#;
+        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert!(ev.git_head.is_none());
+        assert!(ev.git_branch.is_none());
+    }
+
+    #[test]
+    fn git_snapshot_partial_only_head_no_branch() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(Some("deadbeef".to_string()), None);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("git_head"));
+        assert!(!json.contains("git_branch"));
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.git_head.as_deref(), Some("deadbeef"));
+        assert!(deser.git_branch.is_none());
+    }
+
+    #[test]
+    fn git_snapshot_detached_head_no_branch() {
+        // Detached HEAD: git_head is set but git_branch is None (not on any branch).
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(Some("f36ae6b1".to_string()), None);
+        assert!(ev.git_branch.is_none());
+        assert_eq!(ev.git_head.as_deref(), Some("f36ae6b1"));
+    }
+
+    #[test]
+    fn git_snapshot_persists_through_writer_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-git-snap-00000000-0000-0000-0000-000000000001";
+        let writer = JournalWriter::new(sid).unwrap();
+
+        let ev = JournalEvent::turn(Some(sid), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(Some("abc1234def5678".to_string()), Some("main".to_string()));
+        writer.append(&ev).unwrap();
+
+        let (events, _, _) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].git_head.as_deref(), Some("abc1234def5678"));
+        assert_eq!(events[0].git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn git_snapshot_and_parent_event_id_combined() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_parent_event_id(Some("parent-abc".to_string()))
+            .with_git_snapshot(Some("cafe0123".to_string()), Some("dev".to_string()));
+        let json = serde_json::to_string(&ev).unwrap();
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.parent_event_id.as_deref(), Some("parent-abc"));
+        assert_eq!(deser.git_head.as_deref(), Some("cafe0123"));
+        assert_eq!(deser.git_branch.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn git_snapshot_on_non_turn_event_works() {
+        // git_snapshot can be attached to any event type (e.g., CompositeSnapshot).
+        let ev = JournalEvent::base_public(JournalEventType::CompositeSnapshot, Some("s"))
+            .with_git_snapshot(Some("1111aaaa".to_string()), Some("release".to_string()));
+        let json = serde_json::to_string(&ev).unwrap();
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.git_head.as_deref(), Some("1111aaaa"));
     }
 }

@@ -1409,6 +1409,9 @@ async fn plan_executor_task(
                         .with_tool_calls(result.tool_call_records.clone())
                         .with_ttft(result.ttft_ms);
                         turn_event.llm_rounds = result.llm_rounds;
+                        // Attach per-turn git snapshot.
+                        let (git_head, git_branch) = super::cli_utils::git_snapshot();
+                        turn_event = turn_event.with_git_snapshot(git_head, git_branch);
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 

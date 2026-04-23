@@ -896,62 +896,12 @@ pub(crate) fn persist_manual_compression(
     reason: &str,
 ) -> Result<(), String> {
     let writer = session_journal::JournalWriter::new(session_id).map_err(|e| e.to_string())?;
-    writer
-        .append(&JournalEvent {
-            event_type: JournalEventType::Compact,
-            ts: Utc::now().to_rfc3339(),
-            session_id: Some(session_id.to_string()),
-            turn: Some(turn),
-            agentic_step: None,
-            model: None,
-            user_input: None,
-            assistant_output: None,
-            tool_count: None,
-            tokens_in: None,
-            tokens_out: None,
-            duration_ms: None,
-            error: None,
-            config_key: None,
-            config_value: None,
-            turns_compacted: Some(1),
-            facts_stored: None,
-            tools_selected: None,
-            selected_skills: None,
-            tools_used: None,
-            tool_calls: None,
-            budget_used: None,
-            budget_pressure: None,
-            stall_type: None,
-            metadata: Some(serde_json::json!({
-                "source": "compress_context",
-                "reason": reason,
-            })),
-            plan_subtask_id: None,
-            ttft_ms: None,
-            context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: None,
-            selector_tokens_out: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            memoria_ms: None,
-            session_lineage: None,
-            coordination: None,
-            edge_policy: None,
-            selection_trace: None,
-            context_assembly_trace: None,
-            selector_confidence: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            round: None,
-            tool_calls_returned: None,
-            offset_ms: None,
-            llm_rounds: None,
-            total_llm_ms: None,
-            total_tool_ms: None,
-        })
-        .map_err(|e| e.to_string())
+    let mut evt = JournalEvent::compact(Some(session_id), turn, 1, 0);
+    evt.metadata = Some(serde_json::json!({
+        "source": "compress_context",
+        "reason": reason,
+    }));
+    writer.append(&evt).map_err(|e| e.to_string())
 }
 
 fn append_config_change_event(
@@ -970,59 +920,10 @@ fn append_config_change_event(
     if let Some(old_value) = old_value {
         metadata.insert("old_value".to_string(), old_value);
     }
-    writer
-        .append(&JournalEvent {
-            event_type: JournalEventType::ConfigChange,
-            ts: Utc::now().to_rfc3339(),
-            session_id: Some(session_id.to_string()),
-            turn: Some(turn),
-            agentic_step: None,
-            model: None,
-            user_input: None,
-            assistant_output: None,
-            tool_count: None,
-            tokens_in: None,
-            tokens_out: None,
-            duration_ms: None,
-            error: None,
-            config_key: Some(key.to_string()),
-            config_value: Some(new_value.to_string()),
-            turns_compacted: None,
-            facts_stored: None,
-            tools_selected: None,
-            selected_skills: None,
-            tools_used: None,
-            tool_calls: None,
-            budget_used: None,
-            budget_pressure: None,
-            stall_type: None,
-            metadata: Some(serde_json::Value::Object(metadata)),
-            plan_subtask_id: None,
-            ttft_ms: None,
-            context_ms: None,
-            selector_strategy: None,
-            selector_ms: None,
-            selector_tokens_in: None,
-            selector_tokens_out: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            memoria_ms: None,
-            session_lineage: None,
-            coordination: None,
-            edge_policy: None,
-            selection_trace: None,
-            context_assembly_trace: None,
-            selector_confidence: None,
-            routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
-            round: None,
-            tool_calls_returned: None,
-            offset_ms: None,
-            llm_rounds: None,
-            total_llm_ms: None,
-            total_tool_ms: None,
-        })
-        .map_err(|e| e.to_string())
+    let mut evt = JournalEvent::config_change(Some(session_id), key, &new_value.to_string());
+    evt.turn = Some(turn);
+    evt.metadata = Some(serde_json::Value::Object(metadata));
+    writer.append(&evt).map_err(|e| e.to_string())
 }
 
 pub(crate) fn append_goal_steering_event(
@@ -1883,6 +1784,9 @@ mod tests {
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
 
@@ -2087,6 +1991,9 @@ mod tests {
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
         writer
@@ -2147,6 +2054,9 @@ mod tests {
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
         writer
@@ -2229,6 +2139,9 @@ mod tests {
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
         writer
@@ -2515,6 +2428,9 @@ mod tests {
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
 
