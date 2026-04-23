@@ -56,6 +56,13 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum message size (256 KB — generous for chat messages).
 const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
+/// Maximum concurrent WebSocket connections (global). Prevents fd/memory
+/// exhaustion from connection floods.
+const MAX_WS_CONNECTIONS: usize = 1024;
+
+/// Global counter of active WebSocket connections.
+static WS_CONNECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Heartbeat interval for keep-alive pings.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -288,6 +295,16 @@ pub(super) async fn ws_chat_handler(
     query: Query<WsUpgradeQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // Reject if at connection limit
+    let current = WS_CONNECTION_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if current >= MAX_WS_CONNECTIONS {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "too many WebSocket connections",
+        )
+            .into_response();
+    }
+
     let token = query.token.clone();
     let session_id = query.session_id.clone();
     let forward_headers = collect_forward_headers(&headers);
@@ -296,6 +313,7 @@ pub(super) async fn ws_chat_handler(
         .on_upgrade(move |socket| {
             ws_connection_loop(socket, state, token, session_id, forward_headers)
         })
+        .into_response()
 }
 
 /// Main WebSocket connection loop.
@@ -310,6 +328,15 @@ async fn ws_connection_loop(
     initial_session_id: Option<String>,
     forward_headers: std::collections::HashMap<String, String>,
 ) {
+    WS_CONNECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    struct WsGuard;
+    impl Drop for WsGuard {
+        fn drop(&mut self) {
+            WS_CONNECTION_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _guard = WsGuard;
+
     // Phase 1: Authenticate
     let conn = match authenticate(
         &mut socket,
@@ -4140,14 +4167,29 @@ mod tests {
     #[test]
     fn message_loop_echoes_close_frame() {
         let source = include_str!("ws_handler.rs");
-        // Find the Close arm and ensure a `socket.send(Message::Close(None))`
-        // appears in it before the `break`.
         let needle = "Some(Ok(Message::Close(_))) | None =>";
         let idx = source.find(needle).expect("close arm present");
         let arm = &source[idx..idx + 400];
         assert!(
             arm.contains("socket.send(Message::Close(None))"),
             "WS message_loop must echo a Close frame before breaking"
+        );
+    }
+
+    /// U4: ws_chat_handler must enforce a connection limit to prevent
+    /// fd/memory exhaustion from connection floods.
+    #[test]
+    fn ws_handler_has_connection_limit() {
+        let source = include_str!("ws_handler.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("MAX_WS_CONNECTIONS"),
+            "ws_chat_handler must check a connection limit"
+        );
+        assert!(
+            prod_code.contains("WS_CONNECTION_COUNT"),
+            "ws_connection_loop must track active connections"
         );
     }
 }

@@ -88,6 +88,7 @@ pub fn build_app(state: AppState) -> Router {
         .expose_headers([HeaderName::from_static("x-request-id")]);
 
     router_builder::build_router(state)
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB
         .layer(axum::middleware::from_fn(
             request_trace::request_trace_middleware,
         ))
@@ -229,4 +230,22 @@ fn spawn_data_cleanup(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// U1: build_app must set a DefaultBodyLimit to prevent OOM from
+    /// oversized request bodies. The raw `Bytes` extractor on /chat/turn
+    /// has no built-in limit — without an explicit layer, the server
+    /// buffers the entire request into memory.
+    #[test]
+    fn build_app_has_body_size_limit() {
+        let source = include_str!("mod.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("DefaultBodyLimit"),
+            "build_app must apply DefaultBodyLimit layer to prevent OOM"
+        );
+    }
 }

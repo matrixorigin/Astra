@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Default cooldown duration (2 minutes) when retry-after is unknown or too long.
-const DEFAULT_COOLDOWN_MS: u64 = 2 * 60 * 1000; // 2 minutes
+/// Default cooldown duration (30 seconds) when retry-after is unknown or too long.
+/// Most LLM API rate limits reset in 10-60s; 2 minutes was excessive.
+const DEFAULT_COOLDOWN_MS: u64 = 30 * 1000; // 30 seconds
 
-/// Maximum cooldown duration (5 minutes).
-const MAX_COOLDOWN_MS: u64 = 5 * 60 * 1000; // 5 minutes
+/// Maximum cooldown duration (2 minutes).
+const MAX_COOLDOWN_MS: u64 = 2 * 60 * 1000; // 2 minutes
 
 /// If retry-after is less than this, retry immediately without entering cooldown.
 const SHORT_RETRY_THRESHOLD_MS: u64 = 20 * 1000; // 20 seconds
@@ -1049,5 +1050,13 @@ mod tests {
             rl.state.store(STATE_ACTIVE, Ordering::SeqCst);
             *rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
+    }
+
+    /// O2: DEFAULT_COOLDOWN_MS must be ≤ 30s. Most LLM API rate limits
+    /// reset in 10-60s. A 2-minute cooldown wastes 60-110s of user time
+    /// when no Retry-After header is provided.
+    #[test]
+    fn default_cooldown_is_at_most_30_seconds() {
+        const _: () = assert!(DEFAULT_COOLDOWN_MS <= 30_000);
     }
 }
