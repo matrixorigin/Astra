@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use astra_core::sync_poison::recover_mutex_lock;
@@ -17,14 +17,21 @@ const DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD: u64 = 3;
 /// sustained cloud outages trigger fast-reject instead of 240 s timeouts.
 #[derive(Debug)]
 pub struct CircuitBreaker {
-    state: AtomicU8,
+    /// Guards all state transitions: state, consecutive_failures, last_failure_time.
+    /// Counters (failure_count, success_count) remain atomic for lock-free reads.
+    transition: Mutex<TransitionState>,
     failure_count: AtomicU64,
     success_count: AtomicU64,
-    consecutive_failures: AtomicU64,
-    last_failure_time: Mutex<Option<Instant>>,
     failure_threshold: u64,
     recovery_timeout: Duration,
     half_open_success_threshold: u64,
+}
+
+#[derive(Debug)]
+struct TransitionState {
+    state: u8,
+    consecutive_failures: u64,
+    last_failure_time: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,11 +49,13 @@ impl CircuitBreaker {
         half_open_success_threshold: u64,
     ) -> Self {
         Self {
-            state: AtomicU8::new(STATE_CLOSED),
+            transition: Mutex::new(TransitionState {
+                state: STATE_CLOSED,
+                consecutive_failures: 0,
+                last_failure_time: None,
+            }),
             failure_count: AtomicU64::new(0),
             success_count: AtomicU64::new(0),
-            consecutive_failures: AtomicU64::new(0),
-            last_failure_time: Mutex::new(None),
             failure_threshold,
             recovery_timeout,
             half_open_success_threshold,
@@ -63,20 +72,18 @@ impl CircuitBreaker {
 
     /// Returns `true` if the request should be allowed through.
     pub fn allow_request(&self) -> bool {
-        match self.state.load(Ordering::SeqCst) {
+        let mut ts = recover_mutex_lock(&self.transition);
+        match ts.state {
             STATE_CLOSED => true,
             STATE_OPEN => {
-                // Check whether we've waited long enough to try half-open.
-                let should_try = self
+                let should_try = ts
                     .last_failure_time
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
                     .map(|t| t.elapsed() >= self.recovery_timeout)
                     .unwrap_or(false);
 
                 if should_try {
-                    self.state.store(STATE_HALF_OPEN, Ordering::SeqCst);
-                    self.consecutive_failures.store(0, Ordering::SeqCst);
+                    ts.state = STATE_HALF_OPEN;
+                    ts.consecutive_failures = 0;
                     true
                 } else {
                     false
@@ -90,36 +97,33 @@ impl CircuitBreaker {
     pub fn record_success(&self) {
         self.success_count.fetch_add(1, Ordering::SeqCst);
 
-        let current = self.state.load(Ordering::SeqCst);
-        if current == STATE_HALF_OPEN {
-            // In half-open mode, `consecutive_failures` is repurposed as a
-            // half-open success counter (reset to 0 on entry in allow_request).
-            let half_open_successes = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-            if half_open_successes >= self.half_open_success_threshold {
-                self.state.store(STATE_CLOSED, Ordering::SeqCst);
-                self.consecutive_failures.store(0, Ordering::SeqCst);
+        let mut ts = recover_mutex_lock(&self.transition);
+        if ts.state == STATE_HALF_OPEN {
+            ts.consecutive_failures += 1;
+            if ts.consecutive_failures >= self.half_open_success_threshold {
+                ts.state = STATE_CLOSED;
+                ts.consecutive_failures = 0;
             }
         } else {
-            // In closed state, reset consecutive failure counter on success.
-            self.consecutive_failures.store(0, Ordering::SeqCst);
+            ts.consecutive_failures = 0;
         }
     }
 
     pub fn record_failure(&self) {
         self.failure_count.fetch_add(1, Ordering::SeqCst);
-        *recover_mutex_lock(&self.last_failure_time) = Some(Instant::now());
 
-        let current = self.state.load(Ordering::SeqCst);
-        match current {
+        let mut ts = recover_mutex_lock(&self.transition);
+        ts.last_failure_time = Some(Instant::now());
+
+        match ts.state {
             STATE_HALF_OPEN => {
-                // Any failure in half-open immediately reopens.
-                self.state.store(STATE_OPEN, Ordering::SeqCst);
-                self.consecutive_failures.store(0, Ordering::SeqCst);
+                ts.state = STATE_OPEN;
+                ts.consecutive_failures = 0;
             }
             STATE_CLOSED => {
-                let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-                if failures >= self.failure_threshold {
-                    self.state.store(STATE_OPEN, Ordering::SeqCst);
+                ts.consecutive_failures += 1;
+                if ts.consecutive_failures >= self.failure_threshold {
+                    ts.state = STATE_OPEN;
                 }
             }
             _ => {}
@@ -127,7 +131,8 @@ impl CircuitBreaker {
     }
 
     pub fn state(&self) -> &'static str {
-        match self.state.load(Ordering::SeqCst) {
+        let ts = recover_mutex_lock(&self.transition);
+        match ts.state {
             STATE_CLOSED => "closed",
             STATE_OPEN => "open",
             STATE_HALF_OPEN => "half_open",
@@ -136,11 +141,17 @@ impl CircuitBreaker {
     }
 
     pub fn metrics(&self) -> CircuitBreakerMetrics {
+        let ts = recover_mutex_lock(&self.transition);
         CircuitBreakerMetrics {
-            state: self.state(),
+            state: match ts.state {
+                STATE_CLOSED => "closed",
+                STATE_OPEN => "open",
+                STATE_HALF_OPEN => "half_open",
+                _ => "unknown",
+            },
             failure_count: self.failure_count.load(Ordering::SeqCst),
             success_count: self.success_count.load(Ordering::SeqCst),
-            consecutive_failures: self.consecutive_failures.load(Ordering::SeqCst),
+            consecutive_failures: ts.consecutive_failures,
         }
     }
 }
@@ -449,7 +460,7 @@ mod tests {
     fn circuit_breaker_unknown_state_denies_request() {
         let cb = CircuitBreaker::with_defaults();
         // Force an invalid state value
-        cb.state.store(255, Ordering::SeqCst);
+        recover_mutex_lock(&cb.transition).state = 255;
         assert!(!cb.allow_request());
         assert_eq!(cb.state(), "unknown");
     }
@@ -539,5 +550,70 @@ mod tests {
         m.record_request(42, true, false);
         let s = m.snapshot();
         assert_eq!(s.p99_latency_ms, 42);
+    }
+
+    /// P0-B: In half-open state, a failure must always reopen the circuit,
+    /// even when a concurrent success is being recorded. The design intent
+    /// is "any failure in half-open → reopen". This test verifies that
+    /// interleaved success + failure in half-open never results in CLOSED.
+    #[test]
+    fn half_open_failure_always_reopens_despite_concurrent_success() {
+        use std::sync::{Arc, Barrier};
+
+        // threshold=1 so a single half-open success would close the circuit
+        let cb = Arc::new(CircuitBreaker::new(
+            1,
+            Duration::from_millis(1),
+            1, // half_open_success_threshold = 1
+        ));
+
+        // Run many iterations to catch the race
+        for _ in 0..1000 {
+            // Drive to OPEN
+            cb.record_failure();
+            assert_eq!(cb.state(), "open");
+
+            // Wait for recovery timeout
+            std::thread::sleep(Duration::from_millis(2));
+
+            // Transition to half-open
+            assert!(cb.allow_request());
+            assert_eq!(cb.state(), "half_open");
+
+            let barrier = Arc::new(Barrier::new(2));
+            let cb1 = Arc::clone(&cb);
+            let b1 = Arc::clone(&barrier);
+            let cb2 = Arc::clone(&cb);
+            let b2 = Arc::clone(&barrier);
+
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                cb1.record_success();
+            });
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                cb2.record_failure();
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // After a failure in half-open, circuit MUST be open (not closed).
+            // The design intent is: failure in half-open always wins.
+            let state = cb.state();
+            assert_ne!(
+                state, "closed",
+                "circuit must not close when a failure occurred in half-open"
+            );
+
+            // Reset for next iteration
+            {
+                let mut ts = recover_mutex_lock(&cb.transition);
+                ts.state = STATE_CLOSED;
+                ts.consecutive_failures = 0;
+            }
+            cb.failure_count.store(0, Ordering::SeqCst);
+            cb.success_count.store(0, Ordering::SeqCst);
+        }
     }
 }

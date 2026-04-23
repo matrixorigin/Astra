@@ -172,9 +172,21 @@ pub(crate) async fn call_llm_stream(
     let url = llm_completions_url_for_provider(base_url, provider);
     let req_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
 
+    // Total budget guard: abort if retries + cooldown delays exceed the budget.
+    let total_budget = crate::turn::llm_client::llm_total_budget();
+    let started = std::time::Instant::now();
+
     // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
     let mut last_err = String::new();
     for attempt in 0..=LLM_MAX_RETRIES {
+        // Check total budget before each attempt
+        if attempt > 0 && started.elapsed() > total_budget {
+            return Err(format!(
+                "LLM total budget exhausted ({:.0}s): {last_err}",
+                total_budget.as_secs_f64()
+            ));
+        }
+
         if attempt > 0 {
             let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
             sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
@@ -634,5 +646,28 @@ mod tests {
             json!({"name": "<invoke>", "arguments": ""}),
         );
         assert!(tool_call_start_event(&mut tc).is_none());
+    }
+
+    /// P1-F: call_llm_stream must have a total budget guard to prevent
+    /// unbounded blocking when the provider returns repeated 429s with
+    /// long retry-after headers.
+    #[test]
+    fn call_llm_stream_has_total_budget_guard() {
+        let source = include_str!("bridge_llm_stream.rs");
+        let fn_start = source
+            .find("pub(crate) async fn call_llm_stream(")
+            .expect("call_llm_stream must exist");
+        // Find the next function after call_llm_stream
+        let rest = &source[fn_start + 50..];
+        let fn_end = rest
+            .find("\npub")
+            .or_else(|| rest.find("\nfn "))
+            .or_else(|| rest.find("\n#[cfg(test)]"))
+            .unwrap_or(rest.len());
+        let body = &rest[..fn_end];
+        assert!(
+            body.contains("total_budget") || body.contains("budget"),
+            "call_llm_stream must check total budget to prevent unbounded blocking"
+        );
     }
 }

@@ -120,7 +120,6 @@ pub fn record_server_tool_signatures(
     window: usize,
 ) {
     if tool_calls.is_empty() {
-        tool_sigs.clear();
         return;
     }
 
@@ -1785,10 +1784,14 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn record_sigs_empty_tool_calls_clears_history() {
+    fn record_sigs_empty_tool_calls_preserves_history() {
         let mut sigs = vec![BTreeSet::from(["bash:{}".to_string()])];
         record_server_tool_signatures(&mut sigs, &[], 5);
-        assert!(sigs.is_empty());
+        assert_eq!(
+            sigs.len(),
+            1,
+            "text-only turn (empty tool_calls) must preserve stall history"
+        );
     }
 
     #[test]
@@ -2251,5 +2254,40 @@ mod tests {
         let (sigs, names) = round_tool_call_sig_and_names(&calls);
         assert_eq!(sigs.len(), 1);
         assert!(names.contains(""));
+    }
+
+    /// P0-A: A text-only turn (empty tool_calls) between repeated tool turns
+    /// must NOT wipe stall detection history. The stall window should survive
+    /// interleaved text responses.
+    #[test]
+    fn text_only_turn_does_not_wipe_stall_history() {
+        let bash_ls = vec![serde_json::json!({
+            "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+        })];
+        let window = 3;
+        let mut sigs = Vec::new();
+
+        // Turn 1: bash ls
+        record_server_tool_signatures(&mut sigs, &bash_ls, window);
+        assert_eq!(sigs.len(), 1);
+
+        // Turn 2: bash ls
+        record_server_tool_signatures(&mut sigs, &bash_ls, window);
+        assert_eq!(sigs.len(), 2);
+
+        // Turn 3: text-only (empty tool_calls) — must NOT clear history
+        record_server_tool_signatures(&mut sigs, &[], window);
+        assert_eq!(sigs.len(), 2, "text-only turn must not wipe stall history");
+
+        // Turn 4: bash ls — this is the 3rd identical tool turn
+        record_server_tool_signatures(&mut sigs, &bash_ls, window);
+        assert_eq!(sigs.len(), 3);
+
+        // Stall should be detected: 3 identical tool turns in window of 3
+        let stalled = detect_server_stall(&sigs, window).unwrap();
+        assert!(
+            stalled,
+            "stall must be detected despite interleaved text turn"
+        );
     }
 }

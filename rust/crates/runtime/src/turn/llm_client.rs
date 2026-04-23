@@ -22,8 +22,7 @@ use super::sse_data_lines::{
     drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
 };
 use crate::bridge::rate_limit_cooldown::{
-    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
-    parse_retry_after_ms,
+    RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
 use crate::output_style::current_output_style;
 use crate::prompts;
@@ -58,11 +57,8 @@ const LLM_TOTAL_BUDGET_S: u64 = 300;
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 use std::sync::OnceLock;
 
-/// Per-model rate-limit cooldown tracker.
-fn rate_limit_cooldown() -> &'static PerModelCooldown {
-    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(PerModelCooldown::new)
-}
+/// Per-model rate-limit cooldown tracker — shared with bridge_llm_stream.
+use super::bridge_llm_stream::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
@@ -326,7 +322,7 @@ pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
 }
 
 /// Total budget across all retries + fallback for a single LLM call.
-fn llm_total_budget() -> std::time::Duration {
+pub(crate) fn llm_total_budget() -> std::time::Duration {
     let s = std::env::var("MO_LLM_TOTAL_BUDGET_S")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -3314,6 +3310,22 @@ mod tests {
         assert!(
             !body.contains(".expect("),
             "global_llm_client must not use .expect(); use .unwrap_or_else with fallback"
+        );
+    }
+
+    /// P1-E: llm_client must NOT define its own rate_limit_cooldown singleton.
+    /// There must be exactly one PerModelCooldown singleton shared across all
+    /// LLM call paths, otherwise a 429 recorded by one path is invisible to
+    /// the other, causing duplicate rate-limit hits.
+    #[test]
+    fn llm_client_does_not_define_own_cooldown_singleton() {
+        let source = include_str!("llm_client.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains("static COOLDOWN"),
+            "llm_client.rs must not define its own COOLDOWN singleton; \
+             use the shared one from bridge_llm_stream"
         );
     }
 }

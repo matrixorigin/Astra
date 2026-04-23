@@ -144,15 +144,16 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitAction::Proceed,
             STATE_COOLDOWN => {
-                let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+                let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref cooldown) = *info {
                     if Instant::now() >= cooldown.reset_at {
-                        // Cooldown expired
-                        drop(info);
-                        self.exit_cooldown();
+                        // Cooldown expired — exit inline (already holding lock)
+                        self.state.store(STATE_ACTIVE, Ordering::SeqCst);
+                        self.consecutive_errors.store(0, Ordering::SeqCst);
+                        self.consecutive_529_errors.store(0, Ordering::SeqCst);
+                        *info = None;
                         RateLimitAction::Proceed
                     } else if has_fallback {
-                        // Fallback available - use it regardless of fallback_triggered
                         RateLimitAction::UseFallback {
                             reason: cooldown.reason,
                         }
@@ -269,15 +270,12 @@ impl RateLimitCooldown {
         self.cooldowns_triggered.fetch_add(1, Ordering::SeqCst);
         let reset_at = Instant::now() + Duration::from_millis(duration_ms);
 
-        {
-            let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
-            *info = Some(CooldownInfo {
-                reset_at,
-                reason,
-                fallback_triggered: false,
-            });
-        }
-
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        *info = Some(CooldownInfo {
+            reset_at,
+            reason,
+            fallback_triggered: false,
+        });
         self.state.store(STATE_COOLDOWN, Ordering::SeqCst);
     }
 
@@ -288,25 +286,23 @@ impl RateLimitCooldown {
 
         let reset_at = Instant::now() + Duration::from_millis(DEFAULT_COOLDOWN_MS);
 
-        {
-            let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
-            *info = Some(CooldownInfo {
-                reset_at,
-                reason,
-                fallback_triggered: true,
-            });
-        }
-
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        *info = Some(CooldownInfo {
+            reset_at,
+            reason,
+            fallback_triggered: true,
+        });
         self.state.store(STATE_COOLDOWN, Ordering::SeqCst);
     }
 
-    /// Exit cooldown state.
+    /// Exit cooldown state. Only used in tests now — check_request inlines
+    /// the exit logic to avoid releasing and re-acquiring the Mutex.
+    #[cfg(test)]
     fn exit_cooldown(&self) {
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
-
-        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         *info = None;
     }
 
@@ -998,5 +994,60 @@ mod tests {
         rl.record_success();
         let m = rl.metrics();
         assert_eq!(m.state, "active");
+    }
+
+    /// P1-D: Concurrent enter_cooldown + exit_cooldown must never leave
+    /// state=COOLDOWN with cooldown_info=None. That combination triggers
+    /// the "shouldn't happen" fallback in check_request, silently dropping
+    /// the cooldown and allowing requests through to a rate-limited API.
+    #[test]
+    fn cooldown_enter_exit_race_never_leaves_inconsistent_state() {
+        use std::sync::{Arc, Barrier};
+
+        let rl = Arc::new(RateLimitCooldown::new());
+
+        for _ in 0..2000 {
+            let barrier = Arc::new(Barrier::new(2));
+            let rl1 = Arc::clone(&rl);
+            let b1 = Arc::clone(&barrier);
+            let rl2 = Arc::clone(&rl);
+            let b2 = Arc::clone(&barrier);
+
+            // Thread 1: enter cooldown
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                rl1.enter_cooldown(60_000, CooldownReason::RateLimit);
+            });
+
+            // Thread 2: exit cooldown
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                rl2.exit_cooldown();
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Invariant: state and cooldown_info must be consistent.
+            // COOLDOWN → info must be Some. ACTIVE → info must be None.
+            let state_val = rl.state.load(Ordering::SeqCst);
+            let info = rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+            match (state_val, info.is_some()) {
+                (STATE_COOLDOWN, true) => {} // consistent: cooldown active
+                (STATE_ACTIVE, false) => {}  // consistent: no cooldown
+                (STATE_COOLDOWN, false) => {
+                    panic!("INCONSISTENT: state=COOLDOWN but cooldown_info=None");
+                }
+                (STATE_ACTIVE, true) => {
+                    panic!("INCONSISTENT: state=ACTIVE but cooldown_info=Some");
+                }
+                _ => {}
+            }
+            drop(info);
+
+            // Reset
+            rl.state.store(STATE_ACTIVE, Ordering::SeqCst);
+            *rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 }
