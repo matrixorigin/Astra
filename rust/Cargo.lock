@@ -583,6 +583,7 @@ dependencies = [
  "dirs 6.0.0",
  "fastrand",
  "futures-util",
+ "proptest",
  "regex",
  "reqwest 0.12.28",
  "serde",
