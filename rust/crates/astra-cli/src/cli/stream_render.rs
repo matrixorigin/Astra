@@ -1449,6 +1449,28 @@ fn could_become_thinking_tag(partial: &str) -> bool {
         .any(|p| p.starts_with(partial) || partial.starts_with(p))
 }
 
+/// D-9 correctness guard: decide whether a speculative result may be
+/// reused as-is in place of a real tool execution.
+///
+/// A speculative tool invocation returns `(output, success)`. A `success=false`
+/// outcome means the speculation **errored** (permission-denied mid-stream,
+/// tool panic surfaced as error string, bash non-zero exit, grep pattern not
+/// found reported as error, etc.). Silently substituting an errored output as
+/// if it were a successful tool_result causes the LLM to reason on an
+/// error-as-success and cascades into hallucinated next steps.
+///
+/// When `success=false`, callers must fall through to the normal execution
+/// path so the tool re-runs and the real outcome (success or genuine error)
+/// surfaces through the standard journal/observability pipeline.
+///
+/// Returns `Some(output)` only when the speculation was a genuine success.
+pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<String> {
+    match r {
+        Some((output, true)) => Some(output),
+        _ => None,
+    }
+}
+
 impl CliSseStreamHost<'_> {
     /// D-9: Harvest speculative results for the upcoming concurrent batch.
     ///
@@ -2603,7 +2625,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let sem = sem.clone();
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
                     async move {
-                        if let Some((output, _ok)) = speculative {
+                        if let Some(output) = reusable_speculative_output(speculative) {
                             return (
                                 crate::edge_tools::ToolExecutionOutcome {
                                     output,
@@ -6040,6 +6062,46 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── D-9 regression: speculative success flag must gate reuse ──
+    //
+    // Guards against the cascade bug where a speculative tool execution that
+    // failed (semaphore saturated, permission denied mid-stream, tool errored
+    // with non-empty error message) was silently reused as a successful
+    // tool_result because the consumer discarded `success` with `_ok`.
+    // See `reusable_speculative_output` for the fix rationale.
+
+    #[test]
+    fn reusable_speculative_output_accepts_successful_result() {
+        let out = reusable_speculative_output(Some(("real grep hit: line 42".to_string(), true)));
+        assert_eq!(out, Some("real grep hit: line 42".to_string()));
+    }
+
+    #[test]
+    fn reusable_speculative_output_rejects_failed_result_even_with_content() {
+        // A failed speculation may carry a non-empty error message. That
+        // message MUST NOT be reused as a successful tool_result — the real
+        // execution path must re-run so genuine status surfaces.
+        let out = reusable_speculative_output(Some((
+            "Error: permission denied on /etc/shadow".to_string(),
+            false,
+        )));
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn reusable_speculative_output_rejects_none() {
+        let out = reusable_speculative_output(None);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn reusable_speculative_output_rejects_failed_empty_content() {
+        // Semaphore-saturated speculation returns empty content + success=false.
+        // Must not be reused (would surface empty output as successful tool_result).
+        let out = reusable_speculative_output(Some((String::new(), false)));
+        assert_eq!(out, None);
+    }
 
     fn init_temp_git_repo() -> tempfile::TempDir {
         let dir = tempdir().expect("temp repo");
