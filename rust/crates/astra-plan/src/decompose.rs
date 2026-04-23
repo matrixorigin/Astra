@@ -7515,6 +7515,29 @@ Done!"#;
         assert!(classify_plan_suggestion("fix bug").is_none());
     }
 
+    // Regression: "review local changes" / "review staged" must NOT trigger
+    // plan mode auto-suggest — these are code-review skill invocations.
+    // (classify_plan_suggestion may still classify them as Analytical for /plan
+    // command purposes, but the auto-suggest prompt must not fire.)
+    #[test]
+    fn review_commands_do_not_trigger_plan_mode() {
+        let cases = [
+            "review local changes",
+            "review staged",
+            "review commit:abc1234",
+            "review branch:main",
+            "review the latest commit",
+            "review changes",
+            "review https://github.com/org/repo/pull/42",
+        ];
+        for input in cases {
+            assert!(
+                should_suggest_plan_mode(input).is_none(),
+                "'{input}' must not trigger plan mode auto-suggest"
+            );
+        }
+    }
+
     #[test]
     fn matches_workspace_accepts_same_dir_and_subdirs_rejects_unrelated() {
         // B8: Saved plan_state.json must not silently restore in a foreign
