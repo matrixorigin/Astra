@@ -861,10 +861,20 @@ impl JournalWriter {
     }
 
     /// Append a single event to the journal file.
+    ///
+    /// **Concurrency:** the line + trailing `\n` are written via a single
+    /// `write_all` call so concurrent appenders cannot interleave the newline
+    /// with another writer's payload. On Linux, writes to a regular file
+    /// opened with `O_APPEND` of size <= `PIPE_BUF` (4096 bytes) are atomic;
+    /// `writeln!` would issue the `\n` as a separate syscall and lose
+    /// atomicity, producing concatenated records like `{a}{b}\n\n` that the
+    /// reader cannot parse. See `JournalWriter::append` test
+    /// `concurrent_appends_remain_record_separated`.
     pub fn append(&self, event: &JournalEvent) -> std::io::Result<()> {
         use std::io::Write;
-        let line = serde_json::to_string(event)
+        let mut buf = serde_json::to_vec(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push(b'\n');
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -876,7 +886,7 @@ impl JournalWriter {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        if let Err(e) = writeln!(file, "{line}") {
+        if let Err(e) = file.write_all(&buf) {
             if e.kind() == std::io::ErrorKind::Other
                 || e.raw_os_error() == Some(28) // ENOSPC
                 || e.to_string().contains("No space")
@@ -6043,6 +6053,49 @@ mod turn_event_buffer_tests {
         let content = std::fs::read_to_string(writer.path()).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3);
+    }
+
+    /// Concurrent appends from multiple threads must remain record-separated.
+    ///
+    /// Regression for cancel-shutdown audit #2 fix: when the in-process
+    /// `edge_callback_ledger` mutex was narrowed (so it no longer wrapped the
+    /// journal write), two HTTP approval handlers could call
+    /// `JournalWriter::append` simultaneously. The old implementation used
+    /// `writeln!`, which issues the line and the trailing `\n` as **two**
+    /// syscalls. With `O_APPEND`, that lost atomicity: two writers produced
+    /// `{a}{b}\n\n` instead of `{a}\n{b}\n`, and the parser saw zero valid
+    /// events. The fix is a single `write_all` of `line + "\n"`.
+    #[test]
+    fn concurrent_appends_remain_record_separated() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let session_id = "sess-concurrent-append";
+        let n_threads = 8usize;
+        let n_per_thread = 16usize;
+
+        std::thread::scope(|scope| {
+            for t in 0..n_threads {
+                let dir = dir.clone();
+                scope.spawn(move || {
+                    let _guard = JournalDirGuard::new(&dir);
+                    let writer = JournalWriter::new(session_id).unwrap();
+                    for i in 0..n_per_thread {
+                        let mut event =
+                            JournalEvent::base_public(JournalEventType::Turn, Some(session_id));
+                        event.user_input = Some(format!("t{t}-i{i}"));
+                        writer.append(&event).unwrap();
+                    }
+                });
+            }
+        });
+
+        let _guard = JournalDirGuard::new(&dir);
+        let events = read_journal(session_id).unwrap();
+        assert_eq!(
+            events.len(),
+            n_threads * n_per_thread,
+            "every concurrent append should produce one parseable record"
+        );
     }
 
     /// E2E regression test using real session data (a33177cc).

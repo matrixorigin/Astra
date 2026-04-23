@@ -188,6 +188,11 @@ pub(crate) enum RegisterDuplicateDecision {
 ///
 /// Compares `skill_definition` JSON and `code_hash` of the stored row against the values
 /// that would be produced by the incoming request.  Identical → idempotent success; different → 409.
+///
+/// JSON is compared **structurally** (parse-then-compare via [`serde_json::Value`]) because
+/// MatrixOne — like many JSON-typed columns — does not guarantee that the read-back textual form
+/// preserves the on-write key ordering or whitespace. A textual `==` would falsely return
+/// `Conflict` on identical retries when the storage engine canonicalised the JSON on insert.
 pub(crate) fn classify_register_duplicate(
     existing: Option<ExistingRegisterRow>,
     skill_id: &str,
@@ -197,7 +202,7 @@ pub(crate) fn classify_register_duplicate(
     let Some(row) = existing else {
         return RegisterDuplicateDecision::Insert;
     };
-    let same_def = row.skill_definition == new_definition_json;
+    let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
     let same_hash = row.code_hash == new_code_hash;
     if same_def && same_hash {
         let metadata: Option<serde_json::Value> = serde_json::from_str(&row.skill_definition).ok();
@@ -233,7 +238,8 @@ pub(crate) enum PublishDuplicateDecision {
 
 /// Classify whether a duplicate `publish_skill` call is an idempotent retry or a real conflict.
 ///
-/// Compares `skill_definition` and `manifest` of the stored row against what was being inserted.
+/// Compares `skill_definition` and `manifest` of the stored row against what was being inserted,
+/// using structural JSON equality (see [`classify_register_duplicate`] for rationale).
 pub(crate) fn classify_publish_duplicate(
     existing: Option<ExistingPublishRow>,
     skill_id: &str,
@@ -243,8 +249,8 @@ pub(crate) fn classify_publish_duplicate(
     let Some(row) = existing else {
         return PublishDuplicateDecision::Conflict;
     };
-    let same_def = row.skill_definition == new_definition_json;
-    let same_manifest = row.manifest == new_manifest_json;
+    let same_def = json_structurally_equal(&row.skill_definition, new_definition_json);
+    let same_manifest = json_structurally_equal(&row.manifest, new_manifest_json);
     if same_def && same_manifest {
         PublishDuplicateDecision::IdempotentReplay(serde_json::json!({
             "skill_id": skill_id,
@@ -254,6 +260,23 @@ pub(crate) fn classify_publish_duplicate(
         }))
     } else {
         PublishDuplicateDecision::Conflict
+    }
+}
+
+/// Compare two JSON strings for **structural** equality.
+///
+/// Returns `true` iff both strings parse to the same `serde_json::Value` tree.
+/// Falls back to byte-equality when either side fails to parse — that way
+/// non-JSON columns (or schema-evolved free-form text) still behave like a
+/// strict `==` comparison instead of silently collapsing to "equal" on a
+/// parser error.
+pub(crate) fn json_structurally_equal(a: &str, b: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(a),
+        serde_json::from_str::<serde_json::Value>(b),
+    ) {
+        (Ok(va), Ok(vb)) => va == vb,
+        _ => a == b,
     }
 }
 
@@ -1308,6 +1331,23 @@ mod tests {
         assert_eq!(decision, RegisterDuplicateDecision::Conflict);
     }
 
+    /// Regression: MatrixOne (and most JSON-typed columns) reorders object
+    /// keys on persist/read-back. The classifier must compare structurally,
+    /// not byte-for-byte, otherwise an identical retry returns 409 instead
+    /// of the idempotent 200. Caught by
+    /// `it_register_skill_idempotent_retry_returns_200`.
+    #[test]
+    fn classify_register_duplicate_reordered_keys_returns_idempotent_replay() {
+        let new_def = r#"{"skill_type":"local","instructions":"fn run() {}"}"#;
+        let stored_def = r#"{"instructions":"fn run() {}","skill_type":"local"}"#;
+        let row = make_existing_register_row(stored_def, "abc");
+        let decision = classify_register_duplicate(Some(row), "my-skill@1.0.0", new_def, "abc");
+        assert!(
+            matches!(decision, RegisterDuplicateDecision::IdempotentReplay(_)),
+            "reordered-keys retry must be idempotent replay, got {decision:?}"
+        );
+    }
+
     // ── classify_publish_duplicate unit tests ─────────────────────────────────
 
     fn make_existing_publish_row(def: &str, manifest: &str) -> ExistingPublishRow {
@@ -1363,5 +1403,36 @@ mod tests {
             r#"{"priority":10}"#,
         );
         assert_eq!(decision, PublishDuplicateDecision::Conflict);
+    }
+
+    /// Regression: same as `classify_register_duplicate_reordered_keys_*`,
+    /// but on the publish path. Caught by
+    /// `it_publish_skill_idempotent_retry_returns_200`.
+    #[test]
+    fn classify_publish_duplicate_reordered_keys_returns_idempotent_replay() {
+        let new_def = r#"{"skill_type":"local","priority":5}"#;
+        let stored_def = r#"{"priority":5,"skill_type":"local"}"#;
+        let new_manifest = r#"{"a":1,"b":2}"#;
+        let stored_manifest = r#"{"b":2,"a":1}"#;
+        let row = make_existing_publish_row(stored_def, stored_manifest);
+        let decision =
+            classify_publish_duplicate(Some(row), "pub-skill@2.0.0", new_def, new_manifest);
+        assert!(
+            matches!(decision, PublishDuplicateDecision::IdempotentReplay(_)),
+            "reordered-keys retry must be idempotent replay, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn json_structurally_equal_ignores_key_order_and_whitespace() {
+        assert!(json_structurally_equal(
+            r#"{"a":1,"b":2}"#,
+            r#"{ "b": 2, "a": 1 }"#
+        ));
+        assert!(json_structurally_equal(r#"[1,2,3]"#, r#"[ 1, 2, 3 ]"#));
+        assert!(!json_structurally_equal(r#"{"a":1}"#, r#"{"a":2}"#));
+        // Non-JSON falls back to byte equality, not silent "equal".
+        assert!(json_structurally_equal("not-json", "not-json"));
+        assert!(!json_structurally_equal("not-json-a", "not-json-b"));
     }
 }

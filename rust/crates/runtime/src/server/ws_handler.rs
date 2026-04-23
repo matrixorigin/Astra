@@ -576,6 +576,10 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                         let _ = socket.send(Message::Pong(data)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
+                        // audit-#9: echo a Close frame so the peer knows we
+                        // observed the closure and isn't left waiting on a
+                        // reciprocal frame before tearing down the TCP socket.
+                        let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
                     Some(Ok(_)) => {
@@ -4128,6 +4132,22 @@ mod tests {
         assert_eq!(
             ledger["user:req-1"], original,
             "conflicting update must not overwrite the first decision"
+        );
+    }
+
+    /// audit-#9: the message loop must echo a Close frame back to the peer
+    /// before tearing the socket down so the WebSocket close handshake completes.
+    #[test]
+    fn message_loop_echoes_close_frame() {
+        let source = include_str!("ws_handler.rs");
+        // Find the Close arm and ensure a `socket.send(Message::Close(None))`
+        // appears in it before the `break`.
+        let needle = "Some(Ok(Message::Close(_))) | None =>";
+        let idx = source.find(needle).expect("close arm present");
+        let arm = &source[idx..idx + 400];
+        assert!(
+            arm.contains("socket.send(Message::Close(None))"),
+            "WS message_loop must echo a Close frame before breaking"
         );
     }
 }

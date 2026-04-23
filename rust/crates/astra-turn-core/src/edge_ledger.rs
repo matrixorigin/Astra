@@ -4,19 +4,89 @@
 //! (poll + take) so each callback is delivered at most once.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-/// Cap in-memory map size; evicted wholesale when exceeded (handlers + design tradeoff).
+/// Cap in-memory map size. New entries are REJECTED (not evicted) when this
+/// limit is reached, unless the durable-fallback path is active. Callers
+/// receive `LedgerInsertError::CapacityExceeded`. See
+/// `super::edge_callback_handlers::insert_approval_ledger_entry` for details.
 pub const LEDGER_MAX_ENTRIES: usize = 4096;
 
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 
+/// audit-#6: maximum age for an entry in the §5.5 callback ledger before
+/// the lazy sweeper inside [`take_ledger_entry`] reclaims it. Without this,
+/// orphaned tool-result / approval entries (e.g. when a turn aborts after
+/// the edge POST landed) accumulate until they fill `LEDGER_MAX_ENTRIES`
+/// and force a wholesale eviction.
+pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(300);
+
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
+
+/// Side-channel of "first-observed" timestamps for the ledger. We cannot
+/// modify the §5.5 insert helpers (locked down by PR #233) to embed an
+/// inserted_at field on the value, so we lazily snapshot keys here on
+/// every `take_ledger_entry` poll. Any key that has been observed for
+/// longer than [`MAX_LEDGER_ENTRY_AGE`] is reclaimed from the ledger and
+/// dropped from this side-table during the sweep.
+fn ledger_timestamps() -> &'static StdMutex<HashMap<String, Instant>> {
+    static TIMESTAMPS: std::sync::OnceLock<StdMutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    TIMESTAMPS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Pure helper used by both [`sweep_expired_entries`] and the unit tests.
+/// Registers any newly-observed keys with `now`, evicts ledger entries
+/// whose first-observed timestamp is older than `max_age`, and prunes
+/// timestamps for keys that no longer exist in the ledger.
+///
+/// Returns the number of ledger entries that were evicted.
+pub(crate) fn sweep_expired_entries_inner(
+    ledger: &mut HashMap<String, Value>,
+    timestamps: &mut HashMap<String, Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> usize {
+    for k in ledger.keys() {
+        timestamps.entry(k.clone()).or_insert(now);
+    }
+    let expired: Vec<String> = timestamps
+        .iter()
+        .filter(|(_, t)| now.saturating_duration_since(**t) > max_age)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut removed = 0usize;
+    for k in &expired {
+        if ledger.remove(k).is_some() {
+            removed += 1;
+        }
+        timestamps.remove(k);
+    }
+    timestamps.retain(|k, _| ledger.contains_key(k));
+    removed
+}
+
+/// Sweep stale entries from the §5.5 ledger.
+///
+/// Lazy housekeeping: invoked from [`take_ledger_entry`] before each poll
+/// so any take-call cleans up entries whose responses arrived but whose
+/// turn was cancelled (or otherwise never harvested) before
+/// [`MAX_LEDGER_ENTRY_AGE`] elapsed.
+pub async fn sweep_expired_entries(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+) -> usize {
+    let mut g = ledger.lock().await;
+    let mut ts = match ledger_timestamps().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    sweep_expired_entries_inner(&mut g, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE)
+}
 
 /// Returns `true` if any assistant message in `messages` carries a
 /// `reasoning_content` field, indicating a thinking-enabled model session.
@@ -53,9 +123,15 @@ pub async fn take_ledger_entry(
     let poll = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
     let started = Instant::now();
     loop {
+        // audit-#6: opportunistically reclaim stale entries before each poll
+        // so an idle ledger never silently fills to LEDGER_MAX_ENTRIES.
+        let _ = sweep_expired_entries(ledger).await;
         {
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
+                if let Ok(mut ts) = ledger_timestamps().lock() {
+                    ts.remove(key);
+                }
                 return Some(v);
             }
         }
@@ -944,6 +1020,73 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(300),
             "should wake within one poll interval + jitter; elapsed={elapsed:?}"
+        );
+    }
+
+    /// audit-#6: stale entries (older than [`MAX_LEDGER_ENTRY_AGE`]) must be
+    /// reclaimed by the inner sweep helper.
+    #[test]
+    fn sweep_expired_entries_inner_evicts_old_keys() {
+        let mut ledger: HashMap<String, Value> = HashMap::new();
+        let mut ts: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let max_age = Duration::from_secs(60);
+
+        ledger.insert("fresh".into(), json!(1));
+        ledger.insert("stale".into(), json!(2));
+        // Backdate the "stale" key by an hour; "fresh" is unseen and will
+        // be registered with `now` during the sweep.
+        ts.insert("stale".into(), now - Duration::from_secs(3600));
+
+        let removed = sweep_expired_entries_inner(&mut ledger, &mut ts, now, max_age);
+        assert_eq!(removed, 1, "only the stale entry should be evicted");
+        assert!(!ledger.contains_key("stale"));
+        assert!(ledger.contains_key("fresh"));
+        assert_eq!(ts.get("fresh"), Some(&now));
+        assert!(!ts.contains_key("stale"));
+    }
+
+    /// audit-#6: the timestamps side-table must not retain entries for keys
+    /// that are no longer in the ledger (e.g. a successful take).
+    #[test]
+    fn sweep_expired_entries_inner_prunes_orphan_timestamps() {
+        let mut ledger: HashMap<String, Value> = HashMap::new();
+        let mut ts: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        ts.insert("orphan".into(), now);
+
+        let removed = sweep_expired_entries_inner(&mut ledger, &mut ts, now, MAX_LEDGER_ENTRY_AGE);
+        assert_eq!(removed, 0);
+        assert!(ts.is_empty(), "orphan timestamps must be pruned");
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_entries_runs_via_take() {
+        // Smoke test: invoking `sweep_expired_entries` must not deadlock with
+        // the ledger's tokio mutex and must return the eviction count.
+        let ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        ledger.lock().await.insert("x".into(), json!(1));
+        let removed = sweep_expired_entries(&ledger).await;
+        assert_eq!(removed, 0, "fresh entry should not be evicted");
+        assert_eq!(ledger.lock().await.len(), 1);
+    }
+
+    /// audit-#16: the `LEDGER_MAX_ENTRIES` doc comment must accurately
+    /// describe rejection (not eviction) of new entries when the cap is hit.
+    #[test]
+    fn edge_ledger_cap_comment_reflects_rejection_not_eviction() {
+        let source = include_str!("edge_ledger.rs");
+        // Build the misleading needle dynamically so this test's own message
+        // doesn't accidentally satisfy the substring search.
+        let bad_needle = format!("evicted{}wholesale", " ");
+        assert!(
+            !source.contains(bad_needle.as_str()),
+            "edge_ledger comment must not describe entries as wholesale-evicted"
+        );
+        assert!(
+            source.contains("REJECTED (not evicted)"),
+            "edge_ledger comment must explicitly state entries are REJECTED on capacity"
         );
     }
 }

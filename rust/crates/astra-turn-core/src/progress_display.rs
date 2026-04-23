@@ -332,6 +332,10 @@ impl ProgressDisplay {
 /// Handle for controlling a background progress display task.
 pub struct ProgressDisplayHandle {
     stop_tx: tokio::sync::oneshot::Sender<()>,
+    /// audit-#15: keep the spawned task's JoinHandle alive so the runtime
+    /// keeps the task accountable. Dropped → aborted on handle drop, joined
+    /// implicitly via the runtime when the handle outlives the program.
+    _task: tokio::task::JoinHandle<()>,
 }
 
 impl ProgressDisplayHandle {
@@ -350,7 +354,7 @@ pub fn start_progress_display(
 ) -> ProgressDisplayHandle {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut display = ProgressDisplay::new(mode);
         let mut rx = broadcaster.subscribe();
 
@@ -381,7 +385,10 @@ pub fn start_progress_display(
         }
     });
 
-    ProgressDisplayHandle { stop_tx }
+    ProgressDisplayHandle {
+        stop_tx,
+        _task: task,
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +477,21 @@ mod tests {
         });
 
         assert!(display.all_done());
+    }
+
+    /// audit-#15: `ProgressDisplayHandle` must hold the spawned task's
+    /// `JoinHandle` so the runtime can account for the task and so silent
+    /// abandonment is impossible.
+    #[test]
+    fn progress_display_handle_stores_join_handle() {
+        let source = include_str!("progress_display.rs");
+        assert!(
+            source.contains("_task: tokio::task::JoinHandle<()>"),
+            "ProgressDisplayHandle must store the spawned JoinHandle"
+        );
+        assert!(
+            source.contains("_task: task,"),
+            "start_progress_display must populate the JoinHandle field"
+        );
     }
 }

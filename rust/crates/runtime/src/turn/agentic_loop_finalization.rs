@@ -244,6 +244,11 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
             "checkpoint",
             "Failed to write step checkpoint {ckpt_num}: {e}"
         );
+        // Disk write failed: do not commit composite snapshot state, otherwise
+        // resume logic would read state pointing at a non-existent checkpoint
+        // file. Leave `state.last_composite_snapshot` and the stall heavy
+        // checkpoint cache untouched so the next iteration retries cleanly.
+        return;
     }
 
     let turn = session_turn_number(state);
@@ -261,6 +266,9 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     }
     if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
         astra_core::agent_warn!("checkpoint", "Failed to write snapshot index: {e}");
+        // Index write failed: leave snapshot state untouched so a subsequent
+        // checkpoint can re-attempt without referencing a half-written index.
+        return;
     }
 
     state.last_composite_snapshot = Some(snapshot);

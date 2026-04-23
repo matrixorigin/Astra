@@ -81,7 +81,9 @@ pub struct ProgressBroadcaster {
 
 impl Default for ProgressBroadcaster {
     fn default() -> Self {
-        Self::new(256)
+        // Bumped from 256 → 1024 so high-fanout multi-agent runs do not silently
+        // overflow the broadcast buffer between drains in `take_emitted_events`.
+        Self::new(1024)
     }
 }
 
