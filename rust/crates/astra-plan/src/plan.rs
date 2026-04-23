@@ -1076,10 +1076,7 @@ mod tests {
         // English punctuation — bare "continue" is too ambiguous; must
         // pair with "plan" (or use the `@resume-plan` tag).
         assert_eq!(PlanCommand::parse("resume!"), Some(PlanCommand::Resume));
-        assert_eq!(
-            PlanCommand::parse("continue plan!"),
-            Some(PlanCommand::Resume)
-        );
+        assert_eq!(PlanCommand::parse("continue plan!"), Some(PlanCommand::Resume));
         assert_eq!(PlanCommand::parse("continue!"), None);
         assert_eq!(
             PlanCommand::parse("go!"),
