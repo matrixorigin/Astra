@@ -164,3 +164,95 @@ pub fn init_from_env_or_ignores_duplicate(config: LogInitConfig<'_>) {
         eprintln!("[astra-logging] logging init failed: {e}");
     }
 }
+
+// ─── Secret<T> newtype (S5 stub) ─────────────────────────────────────────────
+
+/// A wrapper that redacts the inner value in `Debug` and `Display` output.
+///
+/// Use this to store secret values (API keys, passwords, tokens) in structs
+/// where you want to derive `Debug` without leaking the secret in logs or
+/// panic messages.
+///
+/// A full `tracing` subscriber layer for field-level scrubbing is deferred to
+/// a follow-up; this stub only provides the newtype wrapper.
+///
+/// # Example
+/// ```
+/// use astra_logging::Secret;
+/// let s = Secret::new("my-api-key".to_string());
+/// assert_eq!(format!("{s:?}"), "[REDACTED]");
+/// assert_eq!(format!("{s}"), "[REDACTED]");
+/// assert_eq!(s.expose(), "my-api-key");
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret<T: AsRef<str>>(T);
+
+impl<T: AsRef<str>> Secret<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Returns the inner secret value. Avoid logging the result.
+    pub fn expose(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl<T: AsRef<str>> std::fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl<T: AsRef<str>> std::fmt::Display for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl From<String> for Secret<String> {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Secret<String> {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::Secret;
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = Secret::new("my-api-key-abc123".to_string());
+        let debug = format!("{s:?}");
+        assert_eq!(debug, "[REDACTED]");
+        assert!(!debug.contains("my-api-key-abc123"));
+    }
+
+    #[test]
+    fn secret_display_is_redacted() {
+        let s = Secret::new("super-secret".to_string());
+        let display = format!("{s}");
+        assert_eq!(display, "[REDACTED]");
+    }
+
+    #[test]
+    fn secret_expose_returns_value() {
+        let s = Secret::new("actual-value".to_string());
+        assert_eq!(s.expose(), "actual-value");
+    }
+
+    #[test]
+    fn secret_from_str_and_string() {
+        let a: Secret<String> = "hello".into();
+        let b: Secret<String> = String::from("hello").into();
+        assert_eq!(a.expose(), "hello");
+        assert_eq!(b.expose(), "hello");
+        assert_eq!(format!("{a:?}"), "[REDACTED]");
+    }
+}
