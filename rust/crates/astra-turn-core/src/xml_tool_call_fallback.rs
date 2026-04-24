@@ -12,18 +12,19 @@
 //! pattern, this module extracts them into the same `Vec<Value>` shape the rest
 //! of the pipeline expects.
 //!
-//! **False-positive guard**: if the non-tag portion of the text exceeds 20% of
-//! the total length, the content is likely a normal response that *mentions*
-//! the format rather than a degraded tool call.
-//! In that case the parsers return `None`.
+//! **False-positive guard** (applies to `<tool_call>` only): if the non-tag
+//! portion of the text exceeds 20% of the total length, the content is likely
+//! a normal response that *mentions* the format rather than a degraded tool
+//! call.  In that case `parse_tool_call_tags` returns `None`.  The `<invoke>`
+//! format is unambiguous and does not need this guard.
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Maximum ratio of non-XML text to total text before we refuse to treat the
-/// content as degraded tool calls.  0.20 = if more than 20% of the content is
-/// plain prose surrounding the `<invoke>` blocks, it's probably a normal
-/// response that happens to contain XML examples.
+/// content as degraded `<tool_call>` blocks.  0.20 = if more than 20% of the
+/// content is plain prose surrounding the tags, it's probably a normal
+/// response that happens to mention the format.
 const MAX_NON_XML_RATIO: f64 = 0.20;
 
 /// Try to extract tool calls from XML `<invoke>` blocks in `text`.
@@ -158,7 +159,7 @@ pub fn parse_tool_call_tags(text: &str) -> Option<Vec<Value>> {
         return None;
     }
 
-    // Same false-positive guard as <invoke>
+    // False-positive guard: reject if prose dominates the text.
     let total = text.trim().len();
     if total > 0 {
         let non_tag = total.saturating_sub(tag_bytes);
