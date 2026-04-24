@@ -1,0 +1,14 @@
+# Cargo build artifacts.
+target/
+
+# Extracted skill corpus (re-create with `tar -xzf skills.tar.gz -C skills/`).
+skills/
+
+# Run artifacts that should not be committed.
+results/*-rows.jsonl
+results/*-run.jsonl
+results/embedding-cache/
+
+# Python cruft.
+__pycache__/
+*.pyc

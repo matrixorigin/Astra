@@ -1,0 +1,16 @@
+{
+  "record_count": 1000,
+  "top_k": 50,
+  "tokenizer": "jieba",
+  "methods": {
+    "tokenized_selector": {
+      "evaluated_records": 1000,
+      "hit_at_1_rate": 0.099,
+      "hit_at_10_rate": 0.293,
+      "hit_at_30_rate": 0.422,
+      "hit_at_50_rate": 0.496,
+      "avg_best_rank_on_hit": 12.903225806451612,
+      "misses_not_shortlisted": 504
+    }
+  }
+}

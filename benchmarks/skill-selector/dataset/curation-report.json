@@ -1,0 +1,353 @@
+{
+  "base_dir": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries",
+  "curated_dir": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/astra-curated-skills",
+  "quarantine_dir": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/astra-quarantine",
+  "sample_dir": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/astra-benchmark-1000",
+  "raw_skill_md_count": 5033,
+  "after_content_dedup": 1754,
+  "after_name_dedup": 1690,
+  "curated_count": 1662,
+  "quarantined_count": 28,
+  "benchmark_sample_count": 1000,
+  "curated_parse_mode_breakdown": {
+    "recovered": 1641,
+    "synthesized": 21
+  },
+  "quarantine_reason_breakdown": {
+    "dangerous_rm_rf": 5,
+    "destructive_git": 3,
+    "explicit_secret_exfiltration": 1,
+    "ignore_system_instructions": 3,
+    "offensive-security": 16,
+    "shell_eval_obfuscation": 1
+  },
+  "quarantine_examples": [
+    {
+      "name": "skill-security-auditor",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/claude-skills/engineering/skill-security-auditor/SKILL.md",
+      "repo": "claude-skills",
+      "reasons": [
+        "ignore_system_instructions"
+      ]
+    },
+    {
+      "name": "autoresearch-agent",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/claude-skills/engineering/autoresearch-agent/SKILL.md",
+      "repo": "claude-skills",
+      "reasons": [
+        "destructive_git"
+      ]
+    },
+    {
+      "name": "docker-development",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/claude-skills/engineering/docker-development/SKILL.md",
+      "repo": "claude-skills",
+      "reasons": [
+        "dangerous_rm_rf"
+      ]
+    },
+    {
+      "name": "red-team",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/claude-skills/engineering-team/red-team/SKILL.md",
+      "repo": "claude-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "xss-html-injection",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/xss-html-injection/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "aws-penetration-testing",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/aws-penetration-testing/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "metasploit-framework",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/metasploit-framework/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "ssh-penetration-testing",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/ssh-penetration-testing/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "audit-skills",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/audit-skills/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "dangerous_rm_rf"
+      ]
+    },
+    {
+      "name": "privilege-escalation-methods",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/privilege-escalation-methods/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "red-team-tools",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/red-team-tools/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "linux-privilege-escalation",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/linux-privilege-escalation/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "gcp-cloud-run",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/gcp-cloud-run/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "dangerous_rm_rf"
+      ]
+    },
+    {
+      "name": "agent-evaluation",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/agent-evaluation/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "ignore_system_instructions"
+      ]
+    },
+    {
+      "name": "smtp-penetration-testing",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/smtp-penetration-testing/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "frontend-mobile-security-xss-scan",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/frontend-mobile-security-xss-scan/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "sql-injection-testing",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/sql-injection-testing/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "malware-analyst",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/malware-analyst/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "manage-skills",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/manage-skills/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "dangerous_rm_rf"
+      ]
+    },
+    {
+      "name": "claude-in-chrome-troubleshooting",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/claude-in-chrome-troubleshooting/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "dangerous_rm_rf"
+      ]
+    },
+    {
+      "name": "windows-privilege-escalation",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/windows-privilege-escalation/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "bash-pro",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/bash-pro/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "shell_eval_obfuscation"
+      ]
+    },
+    {
+      "name": "cloud-penetration-testing",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/cloud-penetration-testing/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "telegram",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/telegram/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "explicit_secret_exfiltration"
+      ]
+    },
+    {
+      "name": "git-advanced-workflows",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/git-advanced-workflows/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "destructive_git"
+      ]
+    },
+    {
+      "name": "red-team-tactics",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/red-team-tactics/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security"
+      ]
+    },
+    {
+      "name": "wordpress-penetration-testing",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/wordpress-penetration-testing/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "offensive-security",
+        "ignore_system_instructions"
+      ]
+    },
+    {
+      "name": "conductor-revert",
+      "source_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/antigravity-awesome-skills/skills/conductor-revert/SKILL.md",
+      "repo": "antigravity-awesome-skills",
+      "reasons": [
+        "destructive_git"
+      ]
+    }
+  ],
+  "sample_names": [
+    "xlsx",
+    "docx",
+    "claude-api",
+    "pptx",
+    "pdf",
+    "doc-coauthoring",
+    "frontend-design",
+    "internal-comms",
+    "algorithmic-art",
+    "skill-creator",
+    "canvas-design",
+    "web-artifacts-builder",
+    "mcp-builder",
+    "theme-factory",
+    "brand-guidelines",
+    "slack-gif-creator",
+    "webapp-testing",
+    "template-skill",
+    "taste-design",
+    "stitch-design",
+    "enhance-prompt",
+    "shadcn-ui",
+    "react-components",
+    "remotion",
+    "stitch-loop",
+    "design-md",
+    "epic-design",
+    "code-to-prd",
+    "regulatory-affairs-head",
+    "senior-data-scientist",
+    "senior-pm",
+    "competitive-teardown",
+    "team-communications",
+    "analytics-tracking",
+    "meeting-analyzer",
+    "scrum-master",
+    "landing-page-generator",
+    "pricing-strategy",
+    "senior-secops",
+    "isms-audit-expert",
+    "cold-email",
+    "marketing-demand-acquisition",
+    "site-architecture",
+    "sales-engineer",
+    "competitor-alternatives",
+    "customer-success-manager",
+    "confluence-expert",
+    "senior-qa",
+    "quality-manager-qms-iso13485",
+    "founder-coach",
+    "senior-ml-engineer",
+    "marketing-strategy-pmm",
+    "company-os",
+    "prompt-governance",
+    "app-store-optimization",
+    "schema-markup",
+    "llm-wiki",
+    "content-creator",
+    "ai-seo",
+    "strategic-alignment",
+    "churn-prevention",
+    "paywall-upgrade-cro",
+    "page-cro",
+    "product-strategist",
+    "change-management",
+    "social-media-manager",
+    "internal-narrative",
+    "senior-backend",
+    "ms365-tenant-manager",
+    "senior-fullstack",
+    "ciso-advisor",
+    "saas-scaffolder",
+    "prompt-engineer-toolkit",
+    "content-humanizer",
+    "x-twitter-growth",
+    "video-content-strategist",
+    "culture-architect",
+    "free-tool-strategy",
+    "senior-architect",
+    "atlassian-admin",
+    "senior-computer-vision",
+    "content-production",
+    "terraform-patterns",
+    "form-cro",
+    "research-summarizer",
+    "ad-creative",
+    "llm-cost-optimizer",
+    "financial-analyst",
+    "cpo-advisor",
+    "referral-program",
+    "cto-advisor",
+    "helm-chart-builder",
+    "cro-advisor",
+    "agenthub",
+    "senior-security",
+    "revenue-operations",
+    "cfo-advisor",
+    "self-improving-agent",
+    "onboarding-cro",
+    "risk-management-specialist"
+  ]
+}

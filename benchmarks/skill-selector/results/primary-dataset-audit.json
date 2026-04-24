@@ -1,0 +1,17 @@
+{
+  "summary": {
+    "raw_rows": 1019,
+    "unique_target_skills": 1000,
+    "duplicate_targets": 16,
+    "max_versions_per_target": 3,
+    "semantic_fit_distribution": {
+      "4": 198,
+      "5": 802
+    },
+    "judge_leakage_true": 0,
+    "local_leaked_terms_nonempty": 0,
+    "passes_false_after_dedupe": 0,
+    "low_quality_count": 0
+  },
+  "low_quality_examples": []
+}

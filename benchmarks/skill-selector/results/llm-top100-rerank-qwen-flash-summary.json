@@ -1,0 +1,25 @@
+{
+  "rerank_model": "qwen-flash",
+  "embed_model": "BAAI/bge-m3",
+  "record_count": 1000,
+  "candidate_top_k": 100,
+  "llm_return_top_k": 30,
+  "methods": {
+    "embedding_only": {
+      "hit_at_1_rate": 0.381,
+      "hit_at_10_rate": 0.68,
+      "hit_at_20_rate": 0.757,
+      "hit_at_30_rate": 0.801,
+      "avg_best_rank_on_hit": 11.040614709110868,
+      "misses_not_shortlisted": 199
+    },
+    "llm_rerank": {
+      "hit_at_1_rate": 0.624,
+      "hit_at_10_rate": 0.832,
+      "hit_at_20_rate": 0.846,
+      "hit_at_30_rate": 0.851,
+      "avg_best_rank_on_hit": 1.9142185663924793,
+      "misses_not_shortlisted": 149
+    }
+  }
+}

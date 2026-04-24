@@ -1,0 +1,12 @@
+[package]
+name = "selector-skill-validator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+astra-skills = { path = "../../../rust/crates/astra-skills" }
+walkdir = "2.5"
+serde_json = "1"

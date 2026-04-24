@@ -1,0 +1,49 @@
+{
+  "rerank_model": "qwen-flash",
+  "embed_model": "BAAI/bge-m3",
+  "record_count": 100,
+  "candidate_top_k": 100,
+  "llm_return_top_k": 30,
+  "strategy": "shard-final",
+  "strategy_params": {
+    "shard_count": 4,
+    "shard_return": 8,
+    "anchor_count": 0
+  },
+  "methods": {
+    "embedding_only": {
+      "hit_at_1_rate": 0.5,
+      "hit_at_10_rate": 0.72,
+      "hit_at_20_rate": 0.77,
+      "hit_at_30_rate": 0.85,
+      "avg_best_rank_on_hit": 8.373626373626374,
+      "misses_not_shortlisted": 15
+    },
+    "llm_rerank": {
+      "hit_at_1_rate": 0.77,
+      "hit_at_10_rate": 0.86,
+      "hit_at_20_rate": 0.88,
+      "hit_at_30_rate": 0.89,
+      "avg_best_rank_on_hit": 1.8089887640449438,
+      "misses_not_shortlisted": 11
+    }
+  },
+  "latency": {
+    "api_calls_avg": 5.0,
+    "end_to_end_sec": {
+      "avg": 2.5503028225700834,
+      "p50": 2.3800179589889012,
+      "p95": 3.749777582997922
+    },
+    "stage1_sec": {
+      "avg": 1.0451539621362462,
+      "p50": 0.8783102500019595,
+      "p95": 2.381874041981064
+    },
+    "final_sec": {
+      "avg": 1.5050196957262232,
+      "p50": 1.4467503749765456,
+      "p95": 1.9071585839847103
+    }
+  }
+}

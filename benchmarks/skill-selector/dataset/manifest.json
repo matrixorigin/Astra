@@ -1,0 +1,10 @@
+{
+  "sample_dir": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/astra-benchmark-1000",
+  "catalog_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/selector-benchmark-dataset/catalog.jsonl",
+  "primary_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/selector-benchmark-dataset/primary.jsonl",
+  "hard_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/selector-benchmark-dataset/hard.jsonl",
+  "no_skill_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/selector-benchmark-dataset/no_skill.jsonl",
+  "errors_path": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/selector-benchmark-dataset/errors.jsonl",
+  "skill_count": 1000,
+  "generated_at": "2026-04-23T04:33:01Z"
+}

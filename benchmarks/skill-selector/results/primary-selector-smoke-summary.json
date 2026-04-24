@@ -1,0 +1,17 @@
+{
+  "sample_dir": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/astra-benchmark-1000",
+  "dataset": "/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries/selector-benchmark-dataset/primary.jsonl",
+  "catalog_size": 1000,
+  "total_records_in_dataset": 1019,
+  "skipped_unpassed_records": 2,
+  "evaluated_records": 20,
+  "hit_at_1_rate": 0.05,
+  "hit_at_3_rate": 0.15,
+  "hit_at_5_rate": 0.25,
+  "hit_at_14_rate": 0.5,
+  "avg_best_rank_on_hit": 6.0,
+  "misses_not_shortlisted": 10,
+  "misses_rank_2_to_3": 2,
+  "misses_rank_4_to_5": 2,
+  "misses_rank_6_to_14": 5
+}
