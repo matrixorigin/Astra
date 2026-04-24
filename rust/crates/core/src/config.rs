@@ -24,7 +24,7 @@ impl Default for SkillSearchSettings {
         Self {
             dynamic_surface: true,
             min_catalog_size: 8,
-            surface_cap: 14,
+            surface_cap: 20,
         }
     }
 }
@@ -34,6 +34,12 @@ impl SkillSearchSettings {
     #[inline]
     pub fn use_full_catalog(&self, skill_count: usize) -> bool {
         !self.dynamic_surface || skill_count <= self.min_catalog_size
+    }
+
+    /// Maximum surfaced skills after selector confidence logic is applied.
+    #[inline]
+    pub fn effective_surface_cap(&self) -> usize {
+        self.surface_cap.clamp(5, 20)
     }
 }
 

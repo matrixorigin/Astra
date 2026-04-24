@@ -111,6 +111,7 @@ pub(crate) mod services;
 pub mod session_cache;
 pub mod session_replay_harness;
 pub mod skill_instructions_merge;
+pub mod skill_selector;
 pub mod skill_tool;
 pub mod snapshot;
 pub mod sse_blocks;

@@ -43,6 +43,7 @@ use crate::skills::manifest::{
     EffortLevel, ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind,
 };
 use crate::skills::traits::{SkillExecutionContext, SkillExecutor};
+use crate::turn::skill_selector;
 
 // ─── Skill resolution types (re-exported from astra_skills) ──────────────────
 
@@ -298,81 +299,6 @@ fn format_skills_within_budget(
     (entries, all_names)
 }
 
-fn tokenize_query(q: &str) -> Vec<String> {
-    q.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| s.len() > 1)
-        .map(std::string::ToString::to_string)
-        .collect()
-}
-
-fn haystack_for_scoring(s: &SkillToolInfo) -> String {
-    let mut h = format!("{} {}", s.name, s.description);
-    if let Some(w) = &s.when_to_use {
-        h.push(' ');
-        h.push_str(w);
-    }
-    if let Some(c) = &s.category {
-        h.push(' ');
-        h.push_str(c);
-    }
-    for t in &s.tags {
-        h.push(' ');
-        h.push_str(t);
-    }
-    for t in &s.triggers {
-        h.push(' ');
-        h.push_str(t);
-    }
-    for a in &s.aliases {
-        h.push(' ');
-        h.push_str(a);
-    }
-    h.to_lowercase()
-}
-
-fn score_skill_for_query(
-    s: &SkillToolInfo,
-    query_lower: &str,
-    query_tokens: &[String],
-    quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
-) -> f32 {
-    let mut score: f32 = 0.0;
-    let hay = haystack_for_scoring(s);
-    let name_l = s.name.to_lowercase();
-
-    if !query_lower.is_empty() {
-        if name_l == query_lower {
-            score += 12.0;
-        } else if hay.contains(query_lower) {
-            score += 6.0;
-        }
-        if query_lower.contains(&name_l) || name_l.contains(query_lower) {
-            score += 4.0;
-        }
-    }
-
-    for t in query_tokens {
-        if name_l == *t || s.aliases.iter().any(|a| a.to_lowercase() == *t) {
-            score += 5.0;
-        } else if s.triggers.iter().any(|tr| tr.to_lowercase().contains(t)) {
-            score += 4.0;
-        } else if hay.contains(t) {
-            score += 1.5;
-        }
-    }
-
-    if matches!(s.source, SkillSourceKind::Bundled) {
-        score += 1.25;
-    }
-
-    if let Some(qt) = quality_tracker {
-        score += qt.selection_boost(&s.name) as f32 * 0.5;
-    }
-
-    score
-}
-
 /// Pick a small relevant subset for the current user message when dynamic surfacing applies.
 pub fn select_skills_for_turn(
     all_skills: &[SkillToolInfo],
@@ -396,47 +322,26 @@ pub fn select_skills_for_turn(
         }
     }
 
-    let query_lower = user_message.trim().to_lowercase();
-    let tokens = tokenize_query(user_message);
-
-    let mut scored: Vec<(f32, &SkillToolInfo)> = all_skills
+    let filtered: Vec<SkillToolInfo> = all_skills
         .iter()
         .filter(|s| !picked_names.contains(&s.name))
-        .map(|s| {
-            let sc = score_skill_for_query(s, &query_lower, &tokens, quality_tracker);
-            (sc, s)
-        })
+        .cloned()
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let threshold = 0.8_f32;
-    let top_score = scored.first().map(|(s, _)| *s).unwrap_or(0.0);
-    let weak = top_score < threshold;
-
-    if !weak {
-        for (sc, s) in scored {
-            if picked.len() >= cfg.surface_cap {
-                break;
-            }
-            if sc >= threshold {
-                picked_names.insert(s.name.clone());
-                picked.push(s.clone());
-            }
+    let selected_indices =
+        skill_selector::select_skill_indices(&filtered, user_message, quality_tracker, cfg);
+    for idx in selected_indices {
+        if picked.len() >= cfg.effective_surface_cap() {
+            break;
+        }
+        if let Some(skill) = filtered.get(idx)
+            && picked_names.insert(skill.name.clone())
+        {
+            picked.push(skill.clone());
         }
     }
 
-    if weak || picked.len() < 3 {
-        picked.clear();
-        picked_names.clear();
-        if let Some(pinned) = pinned_skills {
-            for s in all_skills {
-                if pinned.contains(&s.name) {
-                    picked_names.insert(s.name.clone());
-                    picked.push(s.clone());
-                }
-            }
-        }
-        let mut rest: Vec<&SkillToolInfo> = all_skills
+    if picked.len() < 3 {
+        let mut rest: Vec<&SkillToolInfo> = filtered
             .iter()
             .filter(|s| !picked_names.contains(&s.name))
             .collect();
@@ -450,9 +355,10 @@ pub fn select_skills_for_turn(
             })
         });
         for s in rest {
-            if picked.len() >= cfg.surface_cap {
+            if picked.len() >= cfg.effective_surface_cap() {
                 break;
             }
+            picked_names.insert(s.name.clone());
             picked.push((*s).clone());
         }
     }
@@ -593,28 +499,14 @@ pub fn execute_discover_skills(
     mut excluded_lowercase: HashSet<String>,
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
 ) -> (String, Vec<String>) {
-    let query_lower = query.trim().to_lowercase();
-    let tokens = tokenize_query(query);
-
-    let mut candidates: Vec<(&SkillToolInfo, f32)> = catalog
-        .iter()
-        .filter(|s| {
-            !excluded_lowercase.contains(&s.name.to_lowercase())
-                && !s
-                    .aliases
-                    .iter()
-                    .any(|a| excluded_lowercase.contains(&a.to_lowercase()))
-        })
-        .map(|s| {
-            let sc = score_skill_for_query(s, &query_lower, &tokens, quality_tracker);
-            (s, sc)
-        })
-        .filter(|(_, sc)| *sc > 0.01)
-        .collect();
-
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    if candidates.is_empty() {
+    let candidate_indices = skill_selector::discover_skill_indices(
+        catalog,
+        query,
+        &excluded_lowercase,
+        quality_tracker,
+        DISCOVER_SKILLS_MAX_RESULTS,
+    );
+    if candidate_indices.is_empty() {
         return (
             "No additional skills matched that query. Try different keywords, or proceed with general tools.".to_string(),
             Vec::new(),
@@ -623,7 +515,8 @@ pub fn execute_discover_skills(
 
     let mut lines = Vec::new();
     let mut new_names = Vec::new();
-    for (s, _) in candidates.iter().take(DISCOVER_SKILLS_MAX_RESULTS) {
+    for idx in candidate_indices {
+        let s = &catalog[idx];
         lines.push(format!("- **{}**: {}", s.name, format_skill_description(s)));
         new_names.push(s.name.clone());
         excluded_lowercase.insert(s.name.to_lowercase());
