@@ -2,6 +2,7 @@ use super::*;
 
 // ── Multi-file integration tests ────────────────────────────────────────────
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_definition_multifile_rust_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,6 +98,7 @@ pub fn handle_request(config: &AppConfig) -> String {
     );
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_definition_multifile_python_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -162,6 +164,7 @@ def get_user_view(user_id: int):
     );
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_definition_python_parent_relative_import_is_import_resolved() {
     let dir = tempfile::tempdir().unwrap();
@@ -210,6 +213,7 @@ def load_config() -> AppConfig:
     );
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_definition_multifile_typescript_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -283,6 +287,7 @@ function startApp(config: UserConfig): void {
     }
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_definition_multifile_go_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -331,6 +336,7 @@ func main() {
     );
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_definition_cross_directory_with_path_filter() {
     let dir = tempfile::tempdir().unwrap();
@@ -381,6 +387,7 @@ async fn find_definition_cross_directory_with_path_filter() {
     );
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_references_multifile_finds_all_usages() {
     // Test find_references across a multi-file Rust project
@@ -416,6 +423,7 @@ async fn find_references_multifile_finds_all_usages() {
     }
 }
 
+#[ignore] // requires real LSP server (rust-analyzer/pyright/tsserver/gopls)
 #[tokio::test]
 async fn find_references_categorizes_imports_and_definitions() {
     let root = {
