@@ -947,11 +947,12 @@ mod tests {
         assert!(p.contains("## Git Workflow"));
         assert!(p.contains("## Memory Rules"));
         // Budget: full prompt should still be reasonable (allows for Executor rule addition
-        // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex).
+        // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex,
+        // Batching read-only tool calls).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 18200,
-            "full toolset prompt should be under 18200 chars, got {}",
+            p.len() < 19000,
+            "full toolset prompt should be under 19000 chars, got {}",
             p.len()
         );
     }

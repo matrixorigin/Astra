@@ -106,10 +106,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
 
-        let mut executor = edge_tools::ToolExecutor::new(&effective_root)
+        let executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &self.token);
         if let Some(session_id) = self.active_session_id.as_deref() {
-            executor = executor.with_active_session_id(session_id.to_string());
+            executor.set_active_session_id(session_id.to_string());
         }
 
         let mut host = SubRunHost {
@@ -117,7 +117,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             token: self.token.clone(),
             model: Some(config.model.clone()),
             project_root: effective_root.clone(),
-            executor,
+            executor: std::sync::Arc::new(executor),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
@@ -207,6 +207,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             max_turns,
             remaining_turns: max_turns,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
@@ -290,7 +291,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         };
 

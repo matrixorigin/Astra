@@ -12,6 +12,7 @@ use crate::prompts;
 use crate::skill_instructions;
 use crate::slash_team;
 use astra_runtime::plan_decompose;
+use astra_runtime::tool_registry;
 use astra_services::session_journal;
 
 /// Verbosity level for explain mode.
@@ -71,6 +72,9 @@ pub(crate) struct ReplState {
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
     pub file_journal:
         std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    /// Session-scoped file-state cache — shared with ToolExecutors so
+    /// read-before-write tracking persists across turns.
+    pub file_state: crate::edge_tools::SharedFileState,
     /// Session-scoped MatrixOne snapshot journal — shared with ToolExecutors for
     /// bounded database rollback support across turns.
     pub database_snapshot_journal:
@@ -136,6 +140,10 @@ pub(crate) struct ReplState {
     pub tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
     pub synced_tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    /// Cross-session quality tracker shared with the tool selector so REPL
+    /// save path can export cumulative per-tool selection/quality counters.
+    pub tool_quality_tracker:
+        Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
     pub chat_plan_only: bool,
     /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
@@ -215,10 +223,6 @@ pub(crate) struct ReplState {
     pub plan_run_task_last_progress: Option<(u32, u32, u32)>,
     /// Set when the executor exits with [`PlanUpdate::PlanError`].
     pub plan_run_task_last_error: Option<String>,
-
-    /// Set by `handle_plan_command(Resume)` so the main loop re-enters
-    /// the blocking plan monitor after `handle_plan_mode_input` returns.
-    pub plan_resume_pending: bool,
 
     /// When Some, a plan-executor tool is waiting for user approval.
     /// In blocking mode this is handled inline; kept for edge-case fallback.
@@ -316,6 +320,9 @@ impl Default for ReplState {
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
             )),
+            file_state: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
@@ -369,6 +376,7 @@ impl Default for ReplState {
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
+            tool_quality_tracker: None,
             chat_plan_only: false,
             plan_mode: None,
             executing_plan: None,
@@ -405,7 +413,6 @@ impl Default for ReplState {
             plan_run_task_id: None,
             plan_run_task_last_progress: None,
             plan_run_task_last_error: None,
-            plan_resume_pending: false,
             pending_approval: None,
             plan_in_token_stream: false,
             plan_md_renderer: None,

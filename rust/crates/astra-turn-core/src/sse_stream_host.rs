@@ -212,6 +212,18 @@ pub trait SseStreamHost: Send {
     /// Headless: no-op.
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>);
 
+    /// Called when a complete tool_call entry has been accumulated from the
+    /// SSE stream. Default: no-op.
+    ///
+    /// CLI host uses this to kick speculative read-only tool execution
+    /// (see [`crate::streaming_tool_exec::StreamingToolExecutor`]), overlapping
+    /// tool I/O with the remaining LLM stream. Gated behind
+    /// `ASTRA_STREAMING_TOOL_EXEC=1` for rollout safety.
+    ///
+    /// `index` is the position in `accum.tool_calls`; `tool_call` is the
+    /// normalized OpenAI-shaped call object (`{id, type, function: {name, arguments}}`).
+    async fn on_tool_call_complete(&mut self, _index: usize, _tool_call: &Value) {}
+
     /// Called when the SSE stream ends. Host should clean up any active UI state.
     fn on_stream_complete(&mut self);
 
@@ -408,6 +420,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 first_sse_frame_seen = true;
                 host.on_first_sse_frame();
             }
+            let tc_len_before = accum.tool_calls.len();
             let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
             if accum.session_id.as_deref() != reported_session_id.as_deref()
                 && let Some(session_id) = accum.session_id.as_deref()
@@ -416,6 +429,19 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 reported_session_id = Some(session_id.to_string());
             }
             host.on_render_effects(effects);
+            // Notify host of newly-complete tool_call entries (D-9 speculative
+            // streaming hook). Snapshot the values to avoid holding a borrow
+            // across the `await`.
+            if accum.tool_calls.len() > tc_len_before {
+                let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
+                    .iter()
+                    .enumerate()
+                    .map(|(off, v)| (tc_len_before + off, v.clone()))
+                    .collect();
+                for (idx, tc) in new_calls {
+                    host.on_tool_call_complete(idx, &tc).await;
+                }
+            }
             // Skill-exclusivity: reorder so skill calls execute before
             // non-skill calls within the same batch.
             prioritize_skill_tools(&mut pending);
@@ -464,6 +490,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         if !first_sse_frame_seen {
             host.on_first_sse_frame();
         }
+        let tc_len_before = accum.tool_calls.len();
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         if accum.session_id.as_deref() != reported_session_id.as_deref()
             && let Some(session_id) = accum.session_id.as_deref()
@@ -471,6 +498,16 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             host.on_session_id(session_id);
         }
         host.on_render_effects(effects);
+        if accum.tool_calls.len() > tc_len_before {
+            let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
+                .iter()
+                .enumerate()
+                .map(|(off, v)| (tc_len_before + off, v.clone()))
+                .collect();
+            for (idx, tc) in new_calls {
+                host.on_tool_call_complete(idx, &tc).await;
+            }
+        }
         prioritize_skill_tools(&mut pending);
         flush_pending_via_host(
             &mut pending,
@@ -480,6 +517,26 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             &mut approval_results,
         )
         .await;
+    }
+
+    // Degraded tool-call fallback: if the model emitted <invoke> or <tool_call>
+    // XML in text instead of native tool_call events, recover them here.
+    //
+    // NOTE: keep in sync with bridge_llm_stream.rs (server-side equivalent).
+    //
+    // This only fires when tool_calls is empty (pure XML output). When the
+    // model emits *both* native tool_call events and degraded XML text, the
+    // native calls are already in accum.tool_calls and the XML stays in
+    // full_text. The CLI strips that residual XML in consume_turn_sse
+    // (stream_render.rs) when has_tool_calls is true.
+    if accum.tool_calls.is_empty() {
+        if let Some(parsed) =
+            crate::xml_tool_call_fallback::parse_degraded_tool_calls(&accum.full_text)
+        {
+            accum.full_text =
+                crate::xml_tool_call_fallback::strip_degraded_tool_calls(&accum.full_text);
+            accum.tool_calls = parsed;
+        }
     }
 
     host.on_stream_complete();
@@ -1697,5 +1754,51 @@ mod tests {
         assert_eq!(result.approval_results[0].decision, "allow");
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].request_id, "shared-1");
+    }
+
+    // ── XML invoke fallback ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn xml_invoke_in_text_is_recovered_as_tool_calls() {
+        // Model degrades to <invoke> XML instead of native tool_call events.
+        // consume_sse_stream must parse these and move them into accum.tool_calls.
+        let xml_text = concat!(
+            "I'll create the file now.\n",
+            "<invoke name=\"write_file\">\n",
+            "<parameter name=\"path\">server.js</parameter>\n",
+            "<parameter name=\"content\">console.log('hi');</parameter>\n",
+            "</invoke>",
+        );
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "text_delta",
+                &format!(",\"content\":{}", serde_json::json!(xml_text))
+            ),
+            sse_event("usage", ",\"prompt_tokens\":100,\"completion_tokens\":50"),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+        let mut host = NoopSseStreamHost;
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
+        assert_eq!(
+            result.accum.tool_calls.len(),
+            1,
+            "expected 1 recovered tool call, got: {:?}",
+            result.accum.tool_calls
+        );
+        assert_eq!(result.accum.tool_calls[0]["function"]["name"], "write_file");
+        assert!(
+            !result.accum.full_text.contains("<invoke"),
+            "XML should be stripped from full_text, got: {}",
+            result.accum.full_text
+        );
+        assert!(result.accum.full_text.contains("create the file"));
     }
 }

@@ -57,7 +57,7 @@ pub(crate) struct SubRunHost {
     pub(crate) token: String,
     pub(crate) model: Option<String>,
     pub(crate) project_root: PathBuf,
-    pub(crate) executor: edge_tools::ToolExecutor,
+    pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
     pub(crate) valid_tool_names: HashSet<String>,
     pub(crate) perm_manager: PermissionManager,
@@ -233,7 +233,7 @@ impl AgenticLoopHost for SubRunHost {
             api: &self.api,
             token: &self.token,
             executor_id: "subrun",
-            executor: &mut self.executor,
+            executor: std::sync::Arc::clone(&self.executor),
             render_policy: RenderPolicy::Silent,
             perm_manager: Some(&mut self.perm_manager),
             cancel_token: self.cancel_token.as_ref().map(|t| t.as_ref()),
@@ -243,6 +243,7 @@ impl AgenticLoopHost for SubRunHost {
             skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut self.tool_cache,
+            observability_hub: None,
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
@@ -405,10 +406,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let perm_manager =
             PermissionManager::with_project_mode(self.permission_mode, &self.project_root);
 
-        let mut executor = edge_tools::ToolExecutor::new(&self.project_root)
+        let executor = edge_tools::ToolExecutor::new(&self.project_root)
             .with_cloud(self.api.api_origin(), &self.token);
         if let Some(session_id) = self.active_session_id.as_deref() {
-            executor = executor.with_active_session_id(session_id.to_string());
+            executor.set_active_session_id(session_id.to_string());
         }
 
         let mut host = SubRunHost {
@@ -416,7 +417,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             token: self.token.clone(),
             model: effective_model,
             project_root: self.project_root.clone(),
-            executor,
+            executor: std::sync::Arc::new(executor),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
@@ -497,6 +498,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
@@ -575,7 +577,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         };
 
@@ -620,7 +621,7 @@ mod tests {
             token: String::new(),
             model: None,
             project_root: root.clone(),
-            executor: edge_tools::ToolExecutor::new(&root),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
@@ -645,7 +646,7 @@ mod tests {
             token: String::new(),
             model: None,
             project_root: root.clone(),
-            executor: edge_tools::ToolExecutor::new(&root),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
@@ -669,7 +670,7 @@ mod tests {
             token: String::new(),
             model: None,
             project_root: root.clone(),
-            executor: edge_tools::ToolExecutor::new(&root),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
@@ -744,5 +745,25 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("recursion depth 3 reached maximum 3"));
+    }
+
+    // ── Phase-R10 adversarial contract pins (CLI-side constants) ────────
+    //
+    // These pin the exact values of [`SUBRUN_MAX_TURNS`] and
+    // [`SUBRUN_MAX_CUMULATIVE_TOKENS`] so silent drift (e.g. a typo
+    // bumping 25→35 or 120_000→12_000) breaks this test loudly.
+    // The server-side equivalents are pinned in
+    // `rust/crates/astra-cli/tests/phase_r10_skill_subrun_contracts.rs`
+    // via the now-`pub` constants in
+    // [`astra_runtime::server::server_skill_subrun`].
+
+    #[test]
+    fn cli_subrun_max_turns_is_exactly_25() {
+        assert_eq!(SUBRUN_MAX_TURNS, 25);
+    }
+
+    #[test]
+    fn cli_subrun_max_cumulative_tokens_is_exactly_120_000() {
+        assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
     }
 }

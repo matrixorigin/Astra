@@ -12,10 +12,9 @@
 //! `execute_tool` function is supplied by the caller (CLI's stream_render.rs
 //! or any other host).
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -23,10 +22,47 @@ use tokio::sync::Semaphore;
 /// Maximum number of read-only tools that can execute concurrently.
 pub const MAX_CONCURRENT_READ_ONLY: usize = 10;
 
+/// Alias used by the CLI-side batch path (`stream_render::execute_tools_batch`).
+/// Kept equal to [`MAX_CONCURRENT_READ_ONLY`] so the in-turn cap matches
+/// claude-code semantics (10) across both speculative and batched paths.
+pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = MAX_CONCURRENT_READ_ONLY;
+
+/// Process-wide semaphore shared across every tool-execution batch.
+///
+/// Previously, each call to `execute_parallel_round` and each CLI batch in
+/// `stream_render::execute_tools_batch` allocated its own `Semaphore::new(10)`.
+/// That made the 10-concurrent cap **per batch**, not shared — N overlapping
+/// batches allowed 10·N concurrent tools, contradicting the "shared semaphore"
+/// contract stated in prompts and code comments. On large sessions or when
+/// the runtime server multiplexes turns, this could saturate edge I/O or
+/// exhaust file descriptors.
+///
+/// The single process-wide instance below enforces the true cap across all
+/// batches, turns, and concurrent sessions sharing the same process.
+///
+/// Intended usage:
+///
+/// ```ignore
+/// let permit = shared_tool_semaphore().acquire_owned().await?;
+/// // run the tool, holding the permit
+/// ```
+pub fn shared_tool_semaphore() -> Arc<Semaphore> {
+    static CELL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    CELL.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TOOL_EXECUTIONS)))
+        .clone()
+}
+
 // ───────────────────────────── Tool Classification ──────────────────────
 
 /// Read-only tool names that are safe for parallel execution.
 /// These tools do not modify the filesystem or have side-effects.
+///
+/// NOTE: This list should stay in sync with
+/// `astra_turn_core::sse_stream_host::is_tool_concurrency_safe` for the tools
+/// advertised in the prompt's "Batching read-only tool calls" section. The two
+/// lists are not forcibly unified (different scopes: concurrency safety vs
+/// strict read-only classification), but the prompt-advertised set must appear
+/// in both.
 static READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "file_read",
@@ -48,11 +84,34 @@ static READ_ONLY_TOOLS: &[&str] = &[
     "list_files",
     "find_files",
     "view_file",
+    // git read-only inspection tools (no mutation)
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+    // code-intelligence read-only queries
+    "find_definition",
+    "find_references",
 ];
 
-/// Classify a tool call as read-only or mutating.
+/// Classify a tool call as read-only or mutating. Consults the canonical
+/// static list first; for names not in the list, falls back to the
+/// process-wide [`crate::concurrency_safety`] registry so MCP / dynamic
+/// tools that have declared `ConcurrencySafety::ReadOnly` are recognized
+/// by the parallel dispatcher.
 pub fn is_read_only_tool(tool_name: &str) -> bool {
-    READ_ONLY_TOOLS.contains(&tool_name)
+    if READ_ONLY_TOOLS.contains(&tool_name) {
+        return true;
+    }
+    crate::concurrency_safety::global_is_parallelizable(tool_name)
+}
+
+/// Iterate the canonical read-only tool names. Provided so the
+/// [`crate::concurrency_safety`] registry can seed itself from the same
+/// authoritative list.
+pub fn read_only_tool_names() -> impl Iterator<Item = &'static str> {
+    READ_ONLY_TOOLS.iter().copied()
 }
 
 /// Partition tool calls into (read_only, mutating) groups, preserving
@@ -137,7 +196,7 @@ pub async fn execute_parallel_round(
     // Phase 1: Execute read-only tools in parallel
     let parallel_count = read_only.len();
     if !read_only.is_empty() {
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_READ_ONLY));
+        let semaphore = shared_tool_semaphore();
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, tc) in read_only {
@@ -199,14 +258,18 @@ pub async fn execute_parallel_round(
         }
     }
 
-    // Phase 2: Execute mutating tools sequentially
+    // Phase 2: Execute mutating tools sequentially.
+    // Sibling-abort fires on ANY mutating-tool failure (not just bash): a
+    // batched sequence of mutations is typically a coherent plan (write →
+    // commit → push) where later steps become meaningless once an earlier
+    // one fails, and continuing can partially apply destructive state.
     let sequential_count = mutating.len();
-    let bash_names: HashSet<&str> = ["bash", "BashTool", "shell", "execute_command"]
-        .iter()
-        .copied()
-        .collect();
+    let mut mutating_executed: usize = 0;
+    let mut aborted_count: usize = 0;
+    let mut trigger_tool: Option<String> = None;
+    let mut trigger_position: Option<usize> = None;
 
-    for (idx, tc) in mutating {
+    for (mut_pos, (idx, tc)) in mutating.into_iter().enumerate() {
         if sibling_aborted {
             let call_id = tc
                 .get("id")
@@ -220,6 +283,7 @@ pub async fn execute_parallel_round(
                 .or_else(|| tc.get("name").and_then(|n| n.as_str()))
                 .unwrap_or("")
                 .to_string();
+            aborted_count += 1;
             results[idx] = Some(ToolExecResult {
                 original_index: idx,
                 call_id,
@@ -231,10 +295,13 @@ pub async fn execute_parallel_round(
         }
 
         let (call_id, tool_name, content, success) = executor(tc.clone()).await;
+        mutating_executed += 1;
 
-        // Sibling abort: if a bash tool fails, skip remaining mutating tools
-        if !success && bash_names.contains(tool_name.as_str()) {
+        // Sibling abort: any mutating-tool failure aborts remaining siblings.
+        if !success {
             sibling_aborted = true;
+            trigger_tool = Some(tool_name.clone());
+            trigger_position = Some(mut_pos);
         }
 
         results[idx] = Some(ToolExecResult {
@@ -244,6 +311,53 @@ pub async fn execute_parallel_round(
             content,
             success,
         });
+    }
+
+    // Structured signal for the "signals to watch" section of
+    // docs/design/sibling-abort-policy.md. One event per round lets log
+    // aggregation answer: how often are mutating batches ≥ 2? which tool
+    // triggers aborts? at what position (early vs late) does the trigger
+    // sit in the queue?
+    tracing::info!(
+        target: "astra::parallel_tool_exec::round",
+        parallel_count,
+        sequential_count,
+        mutating_executed,
+        aborted_count,
+        sibling_aborted,
+        trigger_tool = trigger_tool.as_deref().unwrap_or(""),
+        trigger_position = trigger_position
+            .map(|p| p as i64)
+            .unwrap_or(-1),
+        "parallel_tool_exec round completed"
+    );
+
+    // Fill any remaining None entries with synthetic error results.
+    // This handles the case where an outer JoinSet task panicked and
+    // the result was lost — the LLM must receive a result for every tool call.
+    for (idx, slot) in results.iter_mut().enumerate() {
+        if slot.is_none() {
+            let tc = &tool_calls[idx];
+            let call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .or_else(|| tc.get("name").and_then(|n| n.as_str()))
+                .unwrap_or("")
+                .to_string();
+            *slot = Some(ToolExecResult {
+                original_index: idx,
+                call_id,
+                tool_name,
+                content: "internal error: tool task panicked and result was lost".into(),
+                success: false,
+            });
+        }
     }
 
     ParallelRoundOutcome {
@@ -430,5 +544,41 @@ mod tests {
         assert_eq!(outcome.results.len(), 0);
         assert_eq!(outcome.parallel_count, 0);
         assert_eq!(outcome.sequential_count, 0);
+    }
+
+    /// P1-E: Results count must always equal tool_calls count, even if a task panics.
+    /// Verifies that panicked tasks produce synthetic error results instead of being dropped.
+    #[tokio::test]
+    async fn result_count_equals_tool_call_count() {
+        // 3 read-only tool calls: one will "fail" (return error), but all must produce results
+        let calls = vec![
+            json!({"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "c2", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "c3", "function": {"name": "read_file", "arguments": "{}"}}),
+        ];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let exec: ToolExecutorFn = Arc::new(move |_tc| {
+            let n = counter_clone.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 1 {
+                    // Simulate an error (not a panic — panics are caught by inner spawn)
+                    (
+                        "c2".into(),
+                        "read_file".into(),
+                        "error: file not found".into(),
+                        false,
+                    )
+                } else {
+                    ("ok".into(), "read_file".into(), "content".into(), true)
+                }
+            })
+        });
+        let outcome = execute_parallel_round(&calls, exec).await;
+        assert_eq!(
+            outcome.results.len(),
+            calls.len(),
+            "result count must equal tool_call count — no results may be silently dropped"
+        );
     }
 }

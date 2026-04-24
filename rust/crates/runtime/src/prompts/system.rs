@@ -147,6 +147,9 @@ fn parallel_and_efficiency_section() -> &'static str {
       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
+      ## Batching read-only tool calls\n\
+      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
+      Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
      - Use glob to narrow candidates before grep.\n\
@@ -1113,8 +1116,8 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
 ///
 /// These constants are defaults; callers should prefer
 /// `ToolSelectionConfig::effective_round_budget_warning/limit` for runtime overrides.
-pub const ROUND_BUDGET_THRESHOLD: u32 = 3;
-pub const ROUND_BUDGET_HARD_LIMIT: u32 = 6;
+pub const ROUND_BUDGET_THRESHOLD: u32 = 8;
+pub const ROUND_BUDGET_HARD_LIMIT: u32 = 15;
 
 pub fn round_budget_directive(round_index: u32) -> String {
     round_budget_directive_with(round_index, ROUND_BUDGET_THRESHOLD, ROUND_BUDGET_HARD_LIMIT)
@@ -1147,8 +1150,12 @@ pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -
 ///
 /// This is generic and history-based: it looks only at the current round index
 /// plus whether the visible conversation ends with tool results.
-pub fn synthesize_or_batch_directive(messages: &[serde_json::Value], round_index: u32) -> String {
-    if round_index < ROUND_BUDGET_THRESHOLD {
+pub fn synthesize_or_batch_directive(
+    messages: &[serde_json::Value],
+    round_index: u32,
+    warning: u32,
+) -> String {
+    if round_index < warning {
         return String::new();
     }
 
@@ -1203,14 +1210,14 @@ pub fn tool_round_guidance_trace_with(
         .rev()
         .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
         .count();
-    let synthesize_or_batch = round_index >= ROUND_BUDGET_THRESHOLD && trailing_tool_count > 0;
+    let synthesize_or_batch = round_index >= warning && trailing_tool_count > 0;
     let parallel_feedback = trailing_tool_count > 1;
 
     (
         format!(
             "{}{}{}",
             round_budget_directive_with(round_index, warning, limit),
-            synthesize_or_batch_directive(messages, round_index),
+            synthesize_or_batch_directive(messages, round_index, warning),
             parallel_execution_feedback(messages)
         ),
         PromptGuidanceSignals {
@@ -2620,11 +2627,13 @@ mod tests {
         let early = synthesize_or_batch_directive(
             &[serde_json::json!({"role": "tool", "content": "a"})],
             ROUND_BUDGET_THRESHOLD - 1,
+            ROUND_BUDGET_THRESHOLD,
         );
         assert!(early.is_empty(), "early rounds should not get the nudge");
 
         let no_trailing_tools = synthesize_or_batch_directive(
             &[serde_json::json!({"role": "assistant", "content": "done"})],
+            ROUND_BUDGET_THRESHOLD,
             ROUND_BUDGET_THRESHOLD,
         );
         assert!(
@@ -2813,5 +2822,31 @@ mod tests {
 
         assert!(breakdown.context_signals.system_prompt_override);
         assert!(breakdown.guidance_signals.round_budget_warning);
+    }
+
+    #[test]
+    fn round_budget_defaults_allow_at_least_8_rounds_before_warning() {
+        // With the raised defaults, round 7 should NOT trigger a warning.
+        let directive = round_budget_directive(7);
+        assert!(
+            directive.is_empty(),
+            "round 7 should not trigger budget warning with raised defaults, got: {directive}"
+        );
+    }
+
+    #[test]
+    fn round_budget_defaults_hard_limit_at_15() {
+        // Round 15 should trigger the hard stop.
+        let at_limit = round_budget_directive(15);
+        assert!(
+            at_limit.contains("Round Budget Exceeded"),
+            "round 15 should trigger hard stop"
+        );
+        // Round 14 should only be a warning, not hard stop.
+        let before_limit = round_budget_directive(14);
+        assert!(
+            !before_limit.contains("Round Budget Exceeded"),
+            "round 14 should not trigger hard stop"
+        );
     }
 }

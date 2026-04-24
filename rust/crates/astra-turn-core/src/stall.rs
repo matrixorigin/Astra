@@ -50,6 +50,23 @@ const EXPLORATION_TOOLS: &[&str] = &[
     "symbols",
 ];
 
+/// Tools that NEVER mutate the filesystem — they are purely consultative.
+/// A stream of repeated calls to these, without any interleaved mutating tool
+/// (`write_file`, `str_replace`, `create_file`, bash-with-side-effects, etc.),
+/// is diagnostic of an agent narrating implementation as prose instead of
+/// emitting real edits (observed in session 26f73ee4 where 12 `skill` calls
+/// produced 0 write_file/str_replace calls across an entire plan).
+///
+/// We keep this LIST SEPARATE from `EXPLORATION_TOOLS` because the two signals
+/// serve different detectors:
+///   * `EXPLORATION_TOOLS` drives single-round "all-exploration chain"
+///     detection (reward-hacking guard). Adding `skill` there would
+///     over-aggressively hard-block deferred follow-ups like `read_file`
+///     after a productive skill consultation — a legitimate pattern.
+///   * `CONSULTATIVE_TOOLS` drives the multi-round top-tool diagnostic below,
+///     where repetition across ≥3 rounds is the actual anti-pattern.
+const CONSULTATIVE_TOOLS: &[&str] = &["skill", "discover_skills"];
+
 /// Maximum consecutive exploration-only rounds before triggering correction.
 /// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
 /// read) and EdgeToolCache dedup, agents need fewer exploration rounds.
@@ -103,7 +120,6 @@ pub fn record_server_tool_signatures(
     window: usize,
 ) {
     if tool_calls.is_empty() {
-        tool_sigs.clear();
         return;
     }
 
@@ -630,7 +646,13 @@ pub fn build_stall_reflection(
 }
 
 fn is_exploration_tool(name: &str) -> bool {
-    EXPLORATION_TOOLS.contains(&name)
+    // For the top-tool diagnostic in `build_stall_reflection`, treat
+    // consultative tools (skill/discover_skills) as exploration too so that
+    // an agent repeatedly calling `skill` without writing files triggers the
+    // same "stop exploring, take direct action" nudge that repeat `grep` /
+    // `read_file` triggers. This is scoped to the top-tool diagnostic and
+    // does NOT affect single-round reward-hacking chain classification.
+    EXPLORATION_TOOLS.contains(&name) || CONSULTATIVE_TOOLS.contains(&name)
 }
 
 /// Detect if the LLM ignored a previous stall nudge by using tools
@@ -654,6 +676,13 @@ pub fn detect_nudge_ignored(
 
 /// Adaptive stall detection thresholds that can be tuned based on
 /// accumulated correction effectiveness data.
+///
+/// Wired into [`crate::turn_guard::TurnGuard::evaluate()`] — after each
+/// correction outcome is resolved, `adjust_from_effectiveness` is called
+/// with the current follow_rate and effective_rate. The adjusted
+/// `stall_window` overrides the static `TaskExecutionProfile::stall_window`
+/// when corrections have been ineffective (window widens to reduce false
+/// positives).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveStallThresholds {
     /// Repetition window for stall detection (default: SERVER_STALL_WINDOW).
@@ -1269,6 +1298,48 @@ mod tests {
         assert!(r1.confidence <= r0.confidence);
     }
 
+    /// Regression (2026-04-23, session 26f73ee4): three consecutive rounds
+    /// of `skill` calls with zero file mutations must trigger the
+    /// "exploration stall" diagnostic just like three `bash` / `grep` rounds
+    /// do. Before adding `skill`/`discover_skills` to the consultative
+    /// classifier, an agent could consult skills forever while narrating
+    /// implementation as markdown code blocks without ever tripping the
+    /// stall detector.
+    #[test]
+    fn reflection_triggers_on_skill_obsession() {
+        let sigs = make_sigs(&[&["skill"], &["skill"], &["skill"]]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(
+            reflection.what_happened.contains("skill"),
+            "expected 'skill' in diagnosis, got: {}",
+            reflection.what_happened
+        );
+        assert!(
+            reflection.confidence >= 0.7,
+            "skill-obsession must be classified as high-confidence \
+             exploration stall, got {}",
+            reflection.confidence
+        );
+        assert!(
+            reflection.avoid_tools.contains(&"skill".to_string()),
+            "avoid_tools should include `skill`, got: {:?}",
+            reflection.avoid_tools
+        );
+    }
+
+    /// `discover_skills` is the other consultative tool — same contract.
+    #[test]
+    fn reflection_triggers_on_discover_skills_loop() {
+        let sigs = make_sigs(&[
+            &["discover_skills"],
+            &["discover_skills"],
+            &["discover_skills"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+        assert!(reflection.what_happened.contains("discover_skills"));
+        assert!(reflection.confidence >= 0.7);
+    }
+
     #[test]
     fn reflection_includes_error_tools() {
         let sigs = make_sigs(&[&["read_file"], &["bash"], &["read_file"]]);
@@ -1394,6 +1465,57 @@ mod tests {
         ]);
         let result = detect_intent_drift("review 最新的commit", &turns);
         assert_eq!(result, IntentDrift::OnTask);
+    }
+
+    /// P1-G: Realistic scenario — user asks to fix a specific bug, agent
+    /// goes off to refactor unrelated code for 4 turns.
+    #[test]
+    fn intent_drift_correction_references_original_request() {
+        let turns = make_intent_turns(&[
+            // Agent drifts to refactoring unrelated module
+            (&["write_file"], r#"{"path":"src/telemetry.rs"}"#),
+            (&["str_replace"], r#"{"path":"src/telemetry.rs"}"#),
+            (&["write_file"], r#"{"path":"src/metrics.rs"}"#),
+            (&["bash"], r#"{"command":"cargo clippy"}"#),
+        ]);
+        let result =
+            detect_intent_drift("fix authentication timeout when password expires", &turns);
+        match result {
+            IntentDrift::Drifting {
+                consecutive_off_task,
+                correction,
+            } => {
+                assert!(
+                    consecutive_off_task >= 3,
+                    "must detect 3+ off-task turns, got {consecutive_off_task}"
+                );
+                assert!(
+                    correction.contains("authentication") || correction.contains("password"),
+                    "correction must reference original request: {correction}"
+                );
+            }
+            IntentDrift::OnTask => {
+                panic!(
+                    "drift must be detected when agent refactors telemetry instead of fixing auth"
+                )
+            }
+        }
+    }
+
+    /// P1-G: Chinese query — intent drift detection must work with CJK.
+    #[test]
+    fn intent_drift_works_with_chinese_query() {
+        let turns = make_intent_turns(&[
+            (&["read_file"], r#"{"path":"src/database.rs"}"#),
+            (&["write_file"], r#"{"path":"docs/readme.md"}"#),
+            (&["write_file"], r#"{"path":"docs/guide.md"}"#),
+            (&["bash"], r#"{"command":"mdbook build"}"#),
+        ]);
+        let result = detect_intent_drift("修复数据库连接超时的问题", &turns);
+        assert!(
+            matches!(result, IntentDrift::Drifting { .. }),
+            "drift must be detected for Chinese query when agent writes docs instead of fixing DB"
+        );
     }
 
     #[test]
@@ -1720,10 +1842,14 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn record_sigs_empty_tool_calls_clears_history() {
+    fn record_sigs_empty_tool_calls_preserves_history() {
         let mut sigs = vec![BTreeSet::from(["bash:{}".to_string()])];
         record_server_tool_signatures(&mut sigs, &[], 5);
-        assert!(sigs.is_empty());
+        assert_eq!(
+            sigs.len(),
+            1,
+            "text-only turn (empty tool_calls) must preserve stall history"
+        );
     }
 
     #[test]
@@ -2186,5 +2312,154 @@ mod tests {
         let (sigs, names) = round_tool_call_sig_and_names(&calls);
         assert_eq!(sigs.len(), 1);
         assert!(names.contains(""));
+    }
+
+    /// P0-A: A text-only turn (empty tool_calls) between repeated tool turns
+    /// must NOT wipe stall detection history. The stall window should survive
+    /// interleaved text responses.
+    #[test]
+    fn text_only_turn_does_not_wipe_stall_history() {
+        let bash_ls = vec![serde_json::json!({
+            "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+        })];
+        let window = 3;
+        let mut sigs = Vec::new();
+
+        // Turn 1: bash ls
+        record_server_tool_signatures(&mut sigs, &bash_ls, window);
+        assert_eq!(sigs.len(), 1);
+
+        // Turn 2: bash ls
+        record_server_tool_signatures(&mut sigs, &bash_ls, window);
+        assert_eq!(sigs.len(), 2);
+
+        // Turn 3: text-only (empty tool_calls) — must NOT clear history
+        record_server_tool_signatures(&mut sigs, &[], window);
+        assert_eq!(sigs.len(), 2, "text-only turn must not wipe stall history");
+
+        // Turn 4: bash ls — this is the 3rd identical tool turn
+        record_server_tool_signatures(&mut sigs, &bash_ls, window);
+        assert_eq!(sigs.len(), 3);
+
+        // Stall should be detected: 3 identical tool turns in window of 3
+        let stalled = detect_server_stall(&sigs, window).unwrap();
+        assert!(
+            stalled,
+            "stall must be detected despite interleaved text turn"
+        );
+    }
+
+    // ── P0-D: Adaptive stall threshold behavioral tests ─────────────
+
+    /// When corrections are frequently ignored (low follow_rate), the stall
+    /// window should widen to reduce false positives.
+    #[test]
+    fn adaptive_thresholds_widen_on_low_follow_rate() {
+        let mut thresholds = AdaptiveStallThresholds::default();
+        let original_window = thresholds.stall_window;
+
+        // Low follow rate + decent effectiveness → widen
+        thresholds.adjust_from_effectiveness(0.2, 0.5);
+        assert!(
+            thresholds.stall_window > original_window,
+            "stall window must widen when follow_rate < 0.3"
+        );
+        assert!(
+            thresholds.max_exploration_rounds > MAX_EXPLORATION_ROUNDS,
+            "exploration budget must also widen"
+        );
+    }
+
+    /// When corrections are effective, thresholds should NOT change.
+    #[test]
+    fn adaptive_thresholds_stable_when_effective() {
+        let mut thresholds = AdaptiveStallThresholds::default();
+        let original = thresholds.clone();
+
+        // High follow rate + high effectiveness → no change
+        thresholds.adjust_from_effectiveness(0.8, 0.7);
+        assert_eq!(
+            thresholds.stall_window, original.stall_window,
+            "effective corrections should not change thresholds"
+        );
+    }
+
+    /// Thresholds have an upper bound — they can't widen indefinitely.
+    #[test]
+    fn adaptive_thresholds_have_upper_bound() {
+        let mut thresholds = AdaptiveStallThresholds::default();
+
+        // Repeatedly adjust with low rates
+        for _ in 0..20 {
+            thresholds.adjust_from_effectiveness(0.1, 0.1);
+        }
+
+        assert!(
+            thresholds.stall_window <= 6,
+            "stall window must not exceed 6, got {}",
+            thresholds.stall_window
+        );
+    }
+
+    // ── P1-E: Reward-hacking detection behavioral tests ─────────────
+
+    /// Scenario: Agent calls the same tool with the same args 3 times in one
+    /// turn, and reports high quality. This is classic reward hacking.
+    #[test]
+    fn reward_hacking_detected_on_identical_calls_with_high_quality() {
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+        ];
+        let assessment = assess_reward_hacking(&calls, 0.9, None).unwrap();
+        assert!(
+            assessment.risk >= ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
+            "3 identical calls + high quality must trigger reward hacking (risk={})",
+            assessment.risk
+        );
+        assert!(!assessment.flags.is_empty(), "must have diagnostic flags");
+
+        // Quality must be dampened
+        let dampened = dampen_quality_for_reward_hacking(0.9, &assessment);
+        assert!(
+            dampened < 0.9,
+            "quality must be dampened from 0.9, got {dampened}"
+        );
+    }
+
+    /// Scenario: Agent calls the same tool with DIFFERENT args (e.g.,
+    /// str_replace on 4 different files). This is legitimate work.
+    #[test]
+    fn no_reward_hacking_on_same_tool_different_args() {
+        let calls = vec![
+            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+        ];
+        let assessment = assess_reward_hacking(&calls, 0.8, None).unwrap();
+        assert!(
+            assessment.risk < ACTIVE_REWARD_HACKING_RISK_THRESHOLD,
+            "same tool with different args is legitimate (risk={})",
+            assessment.risk
+        );
+    }
+
+    /// Scenario: Low user feedback score on repetitive actions should
+    /// increase reward hacking risk.
+    #[test]
+    fn low_user_feedback_amplifies_reward_hacking_risk() {
+        let calls = vec![
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+        ];
+        let without_feedback = assess_reward_hacking(&calls, 0.5, None).unwrap();
+        let with_low_feedback = assess_reward_hacking(&calls, 0.5, Some(20)).unwrap();
+        assert!(
+            with_low_feedback.risk > without_feedback.risk,
+            "low user feedback must amplify risk ({} vs {})",
+            with_low_feedback.risk,
+            without_feedback.risk
+        );
     }
 }

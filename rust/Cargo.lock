@@ -439,6 +439,7 @@ name = "astra-services"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-logging",
  "async-trait",
  "axum 0.8.9",
  "base64",
@@ -456,11 +457,13 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "serial_test",
  "sha2",
  "sqlx",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -583,6 +586,7 @@ dependencies = [
  "dirs 6.0.0",
  "fastrand",
  "futures-util",
+ "proptest",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -4572,9 +4576,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.12"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "ring",
  "rustls-pki-types",

@@ -1557,10 +1557,6 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "pattern": {
                             "type": "string",
                             "description": "Regex pattern for search (case-insensitive)"
-                        },
-                        "show_values": {
-                            "type": "boolean",
-                            "description": "Show full values in list/search (default: false, shows char count instead)"
                         }
                     },
                     "required": ["operation"]

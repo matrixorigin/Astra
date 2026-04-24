@@ -356,22 +356,22 @@ impl ToolSelectionConfig {
         }
     }
 
-    /// Resolved round budget warning threshold (0 → default of 3).
+    /// Resolved round budget warning threshold (0 → default of 8).
     pub fn effective_round_budget_warning(&self) -> u32 {
         if self.round_budget_warning > 0 {
             self.round_budget_warning
         } else {
-            3
+            8
         }
     }
 
-    /// Resolved round budget hard limit (0 → default of 6).
+    /// Resolved round budget hard limit (0 → default of 15).
     pub fn effective_round_budget_limit(&self) -> u32 {
         if self.round_budget_limit > 0 {
             self.round_budget_limit
                 .max(self.effective_round_budget_warning() + 1)
         } else {
-            6
+            15
         }
     }
 }
@@ -1558,8 +1558,8 @@ selector_model = "qwen-flash"
     #[test]
     fn round_budget_defaults() {
         let cfg = ToolSelectionConfig::default();
-        assert_eq!(cfg.effective_round_budget_warning(), 3);
-        assert_eq!(cfg.effective_round_budget_limit(), 6);
+        assert_eq!(cfg.effective_round_budget_warning(), 8);
+        assert_eq!(cfg.effective_round_budget_limit(), 15);
     }
 
     #[test]
@@ -1591,6 +1591,6 @@ selector_model = "qwen-flash"
             round_budget_limit: 0,
             ..Default::default()
         };
-        assert_eq!(cfg.effective_round_budget_limit(), 6);
+        assert_eq!(cfg.effective_round_budget_limit(), 15);
     }
 }

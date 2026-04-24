@@ -967,6 +967,165 @@ fn strip_json_comments(s: &str) -> String {
     out
 }
 
+/// Replace Unicode "smart" quotes with ASCII equivalents.
+///
+/// LLMs (especially Chinese-tuned models) sometimes emit `"` (U+201C/D) or
+/// `'` (U+2018/9) instead of plain ASCII quotes. This converts them to the
+/// JSON-compatible form. Only operates outside of already-balanced ASCII
+/// strings — a quoted string that legitimately contains a smart quote keeps
+/// it because we don't enter the escape; the conversion is best-effort
+/// applied uniformly here, which is acceptable because any subsequent
+/// `serde_json::from_str` re-validates.
+fn normalize_smart_quotes(s: &str) -> String {
+    s.replace(['\u{201C}', '\u{201D}', '\u{FF02}'], "\"")
+        .replace(['\u{2018}', '\u{2019}', '\u{FF07}'], "'")
+}
+
+/// Convert single-quoted JSON strings to double-quoted. The walker tracks
+/// whether it is inside a (possibly already double-quoted) string region so
+/// it never disturbs a legitimate apostrophe inside a value like
+/// `"don't"`. Inside a single-quoted region, any embedded ASCII `"` is
+/// escaped to `\"` so the resulting double-quoted string remains valid.
+fn fix_single_quoted_strings(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_dq = false;
+    while i < len {
+        let c = chars[i];
+        if c == '\\' && in_dq && i + 1 < len {
+            out.push(c);
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            in_dq = !in_dq;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_dq && c == '\'' {
+            // Only treat this as a single-quoted string if it is followed,
+            // somewhere on the same logical token, by a closing `'`. Avoid
+            // converting bare apostrophes mid-identifier (we should not see
+            // those in valid JSON anyway).
+            let mut j = i + 1;
+            let mut found_close = false;
+            while j < len {
+                if chars[j] == '\\' && j + 1 < len {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '\'' {
+                    found_close = true;
+                    break;
+                }
+                if chars[j] == '\n' {
+                    break;
+                }
+                j += 1;
+            }
+            if found_close {
+                out.push('"');
+                let mut k = i + 1;
+                while k < j {
+                    if chars[k] == '"' {
+                        out.push('\\');
+                        out.push('"');
+                    } else if chars[k] == '\\' && k + 1 < j {
+                        out.push(chars[k]);
+                        out.push(chars[k + 1]);
+                        k += 2;
+                        continue;
+                    } else {
+                        out.push(chars[k]);
+                    }
+                    k += 1;
+                }
+                out.push('"');
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Replace Python-style literals with their JSON equivalents.
+///
+/// LLMs that have been heavily fine-tuned on Python sometimes emit `True`,
+/// `False`, or `None` even inside an otherwise valid JSON document. We
+/// rewrite these only when they appear outside of any string and are
+/// surrounded by non-identifier characters, so identifiers like `"True"`
+/// inside a string are untouched.
+fn fix_python_literals(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let lits: [(&[char], &str); 3] = [
+        (&['T', 'r', 'u', 'e'], "true"),
+        (&['F', 'a', 'l', 's', 'e'], "false"),
+        (&['N', 'o', 'n', 'e'], "null"),
+    ];
+    while i < len {
+        let c = chars[i];
+        if escape {
+            out.push(c);
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                out.push(c);
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        let mut matched = false;
+        for (lit_chars, repl) in &lits {
+            let n = lit_chars.len();
+            if i + n <= len && chars[i..i + n] == **lit_chars {
+                let prev_ok = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '_');
+                let next_ok =
+                    i + n == len || (!chars[i + n].is_alphanumeric() && chars[i + n] != '_');
+                if prev_ok && next_ok {
+                    out.push_str(repl);
+                    i += n;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Strip LLM thinking/reasoning tags: `<think>…</think>`, `<thinking>…</thinking>`, etc.
 ///
 /// Many models wrap their reasoning in XML-like tags before the actual JSON output.
@@ -1008,27 +1167,32 @@ pub fn extract_json_robust(response: &str) -> String {
     let cleaned = strip_thinking_tags(response);
     let extracted = extract_json(&cleaned);
 
-    // Fast path: already valid
-    if serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
-        return extracted;
-    }
-
-    // Try trailing comma fix
-    let fixed_commas = fix_trailing_commas(&extracted);
-    if serde_json::from_str::<serde_json::Value>(&fixed_commas).is_ok() {
-        return fixed_commas;
-    }
-
-    // Try comment stripping
-    let stripped = strip_json_comments(&extracted);
-    if serde_json::from_str::<serde_json::Value>(&stripped).is_ok() {
-        return stripped;
-    }
-
-    // Try both
-    let both = fix_trailing_commas(&stripped);
-    if serde_json::from_str::<serde_json::Value>(&both).is_ok() {
-        return both;
+    // Each repair stage is checked in order, returning early on success so
+    // the cheapest fix wins. The list grows over time as we encounter new
+    // LLM-emitted variants — keep the order roughly cheapest-to-most-
+    // invasive so we don't aggressively rewrite valid input.
+    let candidates = [
+        extracted.clone(),
+        normalize_smart_quotes(&extracted),
+        fix_trailing_commas(&extracted),
+        strip_json_comments(&extracted),
+        fix_single_quoted_strings(&extracted),
+        fix_python_literals(&extracted),
+        // Composed: strip comments → trailing commas (common pair).
+        fix_trailing_commas(&strip_json_comments(&extracted)),
+        // Composed: smart quotes → trailing commas → comments.
+        fix_trailing_commas(&strip_json_comments(&normalize_smart_quotes(&extracted))),
+        // Composed: smart quotes → single quotes → trailing commas → comments.
+        // This is the heaviest path — applied last when a Python-tuned LLM
+        // returns single-quoted dicts inside markdown fences.
+        fix_python_literals(&fix_trailing_commas(&strip_json_comments(
+            &fix_single_quoted_strings(&normalize_smart_quotes(&extracted)),
+        ))),
+    ];
+    for cand in &candidates {
+        if serde_json::from_str::<serde_json::Value>(cand).is_ok() {
+            return cand.clone();
+        }
     }
 
     extracted
@@ -1571,9 +1735,128 @@ Keep responses concise. The plan JSON must be valid if provided."#,
 
 // ─── Auto Plan Detection ─────────────────────────────────────────────────────
 
+/// Returns true when the input clearly asks an analytical/evaluative
+/// question rather than requesting executable work.
+///
+/// These questions should go to a normal chat turn, not plan mode, because
+/// `/plan` builds a `TaskPlan` with executable subtasks and an analytical
+/// response would either fail JSON parsing or produce useless make-work
+/// subtasks like "research the answer".
+fn looks_analytical(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let trimmed = input.trim();
+
+    // Question marks at the end strongly signal an inquiry.
+    let ends_with_question = trimmed.ends_with('?')
+        || trimmed.ends_with('？')
+        || trimmed.ends_with("吗")
+        || trimmed.ends_with("吗？")
+        || trimmed.ends_with("吗?");
+
+    // Lead-ins that almost always mean "answer me" not "do for me".
+    let analytical_leads_en = [
+        "what is",
+        "what are",
+        "why ",
+        "why is",
+        "how do",
+        "how does",
+        "should i",
+        "should we",
+        "is it",
+        "are there",
+        "explain ",
+        "compare ",
+        "evaluate ",
+        "review ",
+        "assess ",
+        "analyze ",
+        "analyse ",
+        "thoughts on",
+    ];
+    let analytical_leads_cjk = [
+        "是不是",
+        "是否",
+        "可不可以",
+        "可以吗",
+        "能不能",
+        "为什么",
+        "怎么理解",
+        "如何看待",
+        "如何评价",
+        "评价",
+        "评估",
+        "分析",
+        "客观评价",
+        "客观评估",
+        "解释",
+        "对比",
+        "比较",
+        "吗？",
+        "吗?",
+    ];
+    let has_en = analytical_leads_en
+        .iter()
+        .any(|kw| lower.starts_with(kw) || lower.contains(&format!(" {kw}")));
+    // CJK has no word boundaries — substring match is the right semantic.
+    let has_cjk = analytical_leads_cjk.iter().any(|kw| input.contains(kw));
+
+    ends_with_question || has_en || has_cjk
+}
+
+/// What kind of plan an input maps to.
+///
+/// Executable plans drive the orchestrator (subtasks → executor steps).
+/// Analytical plans are research/evaluation questions where the user wants
+/// structured thinking rather than file mutations. The CLI may handle them
+/// differently (e.g. richer prompts, no executor invocation), but the
+/// classifier itself is purely lexical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanKind {
+    Executable,
+    Analytical,
+}
+
+/// Outcome of suggesting whether to enter plan mode for a free-form input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSuggestion {
+    pub kind: PlanKind,
+    pub reason: &'static str,
+}
+
 /// Heuristics to detect if user input likely needs a plan.
 /// Returns Some(reason) if plan mode should be suggested.
+///
+/// Returns `None` for analytical/evaluative inputs even when they otherwise
+/// match the length/keyword heuristics, because /plan only knows how to
+/// build executable TaskPlans.
 pub fn should_suggest_plan_mode(input: &str) -> Option<&'static str> {
+    classify_plan_suggestion(input).and_then(|s| match s.kind {
+        PlanKind::Executable => Some(s.reason),
+        // Analytical inputs intentionally do NOT trigger the auto-suggest
+        // prompt today — the CLI has no analytical generator yet, so
+        // suggesting plan mode would lead the user back to the empty-plan
+        // dead-end this refactor is designed to eliminate.
+        PlanKind::Analytical => None,
+    })
+}
+
+/// Classify an input into an executable or analytical plan suggestion.
+/// Returns `None` if the input is too short / too vague to suggest at all.
+pub fn classify_plan_suggestion(input: &str) -> Option<PlanSuggestion> {
+    if looks_analytical(input) {
+        return Some(PlanSuggestion {
+            kind: PlanKind::Analytical,
+            reason: "Analytical / evaluative question detected",
+        });
+    }
+    classify_executable(input).map(|reason| PlanSuggestion {
+        kind: PlanKind::Executable,
+        reason,
+    })
+}
+
+fn classify_executable(input: &str) -> Option<&'static str> {
     let lower = input.to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
 
@@ -1768,10 +2051,59 @@ impl PlanModeState {
 
     /// Default path for plan state persistence.
     pub fn state_path() -> std::path::PathBuf {
+        Self::state_path_for_cwd(&std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    }
+
+    /// P6: Workspace-scoped persistence path.
+    ///
+    /// Each unique cwd gets its own state file under
+    /// `~/.astra/plans/<8-char-hash>/plan_state.json`. The hash is a stable
+    /// short blake3 of the canonicalized cwd. Falling back to the hashed
+    /// path means two repos open at the same time no longer race to
+    /// overwrite a single global file, and the workspace guard added in B8
+    /// becomes a defense-in-depth check rather than the only line of
+    /// safety.
+    pub fn state_path_for_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let key = canon.to_string_lossy();
+        // Use the first 16 hex chars of the SHA-1 of the cwd. We avoid
+        // pulling in a new crypto dep by using the std hasher — collisions
+        // here only mean two unrelated repos share a state file (which the
+        // workspace guard then catches) and reduce the path length to
+        // something readable.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        let digest = format!("{:016x}", h.finish());
         std::path::PathBuf::from(home)
             .join(".astra")
+            .join("plans")
+            .join(digest)
             .join("plan_state.json")
+    }
+
+    /// Return true when this saved plan state was captured in (or beneath)
+    /// the current working directory.
+    ///
+    /// B8: prior to this guard, `~/.astra/plan_state.json` was a single
+    /// global file. Opening `astra` in repo B after working in repo A
+    /// would silently restore A's plan and `@resume-plan` would attempt
+    /// to drive A's subtasks against B's project context. We now require
+    /// the saved `context.root` to either equal `current_cwd` or be an
+    /// ancestor of it (so subdirectories of the same project still match).
+    pub fn matches_workspace(&self, current_cwd: &std::path::Path) -> bool {
+        if self.context.root.is_empty() {
+            // Older state files may pre-date this field — be permissive
+            // but log via the caller so it's traceable.
+            return true;
+        }
+        let saved = std::path::Path::new(&self.context.root);
+        let saved_canon = saved.canonicalize().unwrap_or_else(|_| saved.to_path_buf());
+        let cwd_canon = current_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| current_cwd.to_path_buf());
+        cwd_canon == saved_canon || cwd_canon.starts_with(&saved_canon)
     }
 
     /// Load plan state with recovery — falls back to last good version
@@ -1818,11 +2150,22 @@ impl PlanModeState {
         self.save_to_file(path)
     }
 
-    /// Remove the saved state file.
+    /// Remove the saved state file and its backup.
+    ///
+    /// The backup is written as `{path}.json.bak` (see `save_with_backup`),
+    /// not `{path}.bak`. The previous implementation deleted the wrong file,
+    /// leaving a recoverable backup behind that resurrected "ghost" plans on
+    /// the next REPL start.
     pub fn clear_saved_state() {
         let path = Self::state_path();
-        let _ = std::fs::remove_file(&path);
-        let backup = path.with_extension("bak");
+        Self::clear_saved_state_at(&path);
+    }
+
+    /// Remove the saved state file and its backup at an explicit path
+    /// (test-friendly variant of [`clear_saved_state`]).
+    pub fn clear_saved_state_at(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let backup = path.with_extension("json.bak");
         let _ = std::fs::remove_file(backup);
     }
 
@@ -2516,12 +2859,16 @@ pub fn plan_modification_prompt(state: &PlanModeState, user_request: &str) -> St
 }
 
 /// Check if user input is a resume command for paused plan execution.
+///
+/// Delegates to [`crate::plan_resume::message_signals_resume`] so that all
+/// three historical detectors (this one, `PlanCommand::parse` Resume branch,
+/// and `message_signals_resume` itself) share a single source of truth.
+///
+/// The legacy aliases `go` and `next` were intentionally dropped:
+/// `go` overlaps with the Execute alias and `next` was ambiguous with
+/// "next subtask" semantics.
 pub fn is_resume_command(input: &str) -> bool {
-    let trimmed = input.trim().to_lowercase();
-    matches!(
-        trimmed.as_str(),
-        "continue" | "resume" | "继续" | "go" | "next"
-    )
+    crate::plan_resume::message_signals_resume(input)
 }
 
 // ── Paused plan: operator corrections + rewind ─────────────────────────────
@@ -2751,7 +3098,20 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
         "\nPlease implement this change. Read the relevant files first, \
          make the changes, and verify they compile/pass tests.\n\
          Before referencing any project type, function, struct, or API in new code, \
-         confirm it exists using read_file, grep, or LSP tools. Do not assume symbol names.",
+         confirm it exists using read_file, grep, or LSP tools. Do not assume symbol names.\n\
+         \n\
+         IMPORTANT — how to produce code:\n\
+         - Emit actual file mutations as tool_calls: `write_file`, `str_replace`, \
+           `create_file`, or `bash` (for mkdir / scaffolding). DO NOT paste \
+           implementation code inside the assistant response as markdown code blocks \
+           — markdown is inert and does not modify the filesystem.\n\
+         - After writing any new file, confirm it exists (`read_file` or `bash ls`) \
+           before declaring the subtask done.\n\
+         - `skill` and `discover_skills` are advisory: consulting a skill does NOT \
+           satisfy the subtask. The subtask is only complete when concrete files \
+           have been written and any acceptance check passes.\n\
+         - Do not invoke `github_create_pr` (or any PR-creation skill) before you \
+           have actually written and committed the changes this subtask requires.",
     );
 
     prompt
@@ -5398,15 +5758,16 @@ Done!"#;
 
     #[test]
     fn is_resume_command_detects_keywords() {
-        assert!(is_resume_command("continue"));
-        assert!(is_resume_command("Continue"));
+        assert!(is_resume_command("continue plan"));
+        assert!(is_resume_command("Continue plan"));
         assert!(is_resume_command("resume"));
-        assert!(is_resume_command("go"));
-        assert!(is_resume_command("next"));
         assert!(is_resume_command("继续"));
+        assert!(is_resume_command("继续计划"));
         // Whitespace
-        assert!(is_resume_command("  continue  "));
+        assert!(is_resume_command("  resume  "));
         assert!(is_resume_command(" RESUME "));
+        // Explicit tag works anywhere
+        assert!(is_resume_command("please @resume-plan now"));
     }
 
     #[test]
@@ -5415,6 +5776,44 @@ Done!"#;
         assert!(!is_resume_command("fix the bug"));
         assert!(!is_resume_command("continue with something else"));
         assert!(!is_resume_command(""));
+        // Dropped aliases — they were too broad. "go" overlaps with Execute,
+        // "next" is ambiguous with "next subtask".
+        assert!(!is_resume_command("go"));
+        assert!(!is_resume_command("next"));
+        // Bare "continue" alone is no longer enough — must be paired with
+        // "plan" or use the @resume-plan tag.
+        assert!(!is_resume_command("continue"));
+    }
+
+    #[test]
+    fn clear_saved_state_at_removes_both_state_and_json_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan_state.json");
+        let backup = path.with_extension("json.bak");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::write(&backup, "{}").unwrap();
+        assert!(path.exists() && backup.exists());
+
+        PlanModeState::clear_saved_state_at(&path);
+
+        assert!(!path.exists(), "primary state file must be removed");
+        assert!(
+            !backup.exists(),
+            "backup .json.bak must be removed (B7 — was deleting wrong .bak)"
+        );
+    }
+
+    #[test]
+    fn state_path_for_cwd_is_workspace_scoped() {
+        // P6: different cwds map to different files. Same cwd is stable.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let pa1 = PlanModeState::state_path_for_cwd(a.path());
+        let pa2 = PlanModeState::state_path_for_cwd(a.path());
+        let pb = PlanModeState::state_path_for_cwd(b.path());
+        assert_eq!(pa1, pa2, "same cwd → same path");
+        assert_ne!(pa1, pb, "different cwds → different paths");
+        assert!(pa1.to_string_lossy().contains("plans"));
     }
 
     #[test]
@@ -7059,6 +7458,112 @@ Done!"#;
     }
 
     #[test]
+    fn should_suggest_plan_mode_skips_analytical_questions() {
+        // B1: Analytical / evaluative questions are answered by chat, not by
+        // building a TaskPlan with executable subtasks.
+        // The user's actual failing input from session 5544bc3b:
+        assert!(
+            should_suggest_plan_mode(
+                "当前memoria的接口对context管理来说，客观评价是正确的方向吗？需要看内部实现啊"
+            )
+            .is_none(),
+            "evaluative '吗？' question must NOT auto-trigger plan mode"
+        );
+
+        // English equivalents
+        assert!(
+            should_suggest_plan_mode("should we refactor the authentication module to use JWT?")
+                .is_none()
+        );
+        assert!(
+            should_suggest_plan_mode(
+                "evaluate whether the current implementation of services is correct"
+            )
+            .is_none()
+        );
+        assert!(
+            should_suggest_plan_mode("compare the build system with cargo for the new module")
+                .is_none()
+        );
+        assert!(should_suggest_plan_mode("分析当前模块的设计是否合理").is_none());
+        assert!(should_suggest_plan_mode("如何评价这个重构方案").is_none());
+
+        // Sanity: actionable instructions still trigger
+        assert!(
+            should_suggest_plan_mode("refactor the auth module and add comprehensive tests")
+                .is_some(),
+            "imperative instructions still route to plan mode"
+        );
+    }
+
+    #[test]
+    fn classify_plan_suggestion_distinguishes_kinds() {
+        // Analytical: classifier identifies kind even though
+        // should_suggest_plan_mode would suppress the auto-prompt.
+        let s = classify_plan_suggestion("客观评价是正确的方向吗？")
+            .expect("analytical input should classify");
+        assert_eq!(s.kind, PlanKind::Analytical);
+
+        let s = classify_plan_suggestion(
+            "refactor the auth module and add comprehensive tests for login/logout",
+        )
+        .expect("executable input should classify");
+        assert_eq!(s.kind, PlanKind::Executable);
+
+        // Too short or too vague returns None for both kinds.
+        assert!(classify_plan_suggestion("hi").is_none());
+        assert!(classify_plan_suggestion("fix bug").is_none());
+    }
+
+    // Regression: "review local changes" / "review staged" must NOT trigger
+    // plan mode auto-suggest — these are code-review skill invocations.
+    // (classify_plan_suggestion may still classify them as Analytical for /plan
+    // command purposes, but the auto-suggest prompt must not fire.)
+    #[test]
+    fn review_commands_do_not_trigger_plan_mode() {
+        let cases = [
+            "review local changes",
+            "review staged",
+            "review commit:abc1234",
+            "review branch:main",
+            "review the latest commit",
+            "review changes",
+            "review https://github.com/org/repo/pull/42",
+        ];
+        for input in cases {
+            assert!(
+                should_suggest_plan_mode(input).is_none(),
+                "'{input}' must not trigger plan mode auto-suggest"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_workspace_accepts_same_dir_and_subdirs_rejects_unrelated() {
+        // B8: Saved plan_state.json must not silently restore in a foreign
+        // workspace.
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let dir_b = tempfile::tempdir().expect("tempdir B");
+        let sub_a = dir_a.path().join("crates/foo");
+        std::fs::create_dir_all(&sub_a).unwrap();
+
+        let mut state = PlanModeState::new("g".into(), ProjectContext::default());
+        state.context.root = dir_a.path().to_string_lossy().into_owned();
+
+        // Same dir matches.
+        assert!(state.matches_workspace(dir_a.path()));
+        // Subdirectory of saved root matches (e.g. running astra from
+        // crates/foo of the original repo).
+        assert!(state.matches_workspace(&sub_a));
+        // Unrelated workspace must NOT match.
+        assert!(!state.matches_workspace(dir_b.path()));
+
+        // Empty saved root → permissive (older state files).
+        state.context.root.clear();
+        assert!(state.matches_workspace(dir_b.path()));
+    }
+
+    #[test]
     fn detect_replan_deadlock() {
         use astra_services::task_orchestrator::{SubtaskPlan, TaskPlan, TaskStatus};
 
@@ -7387,6 +7892,78 @@ Done!"#;
         let input = r#"{"url": "https://example.com"}"#;
         let stripped = strip_json_comments(input);
         assert_eq!(stripped, input);
+    }
+
+    #[test]
+    fn extract_json_robust_handles_smart_quotes() {
+        let input = "{\u{201C}id\u{201D}: \u{201C}t1\u{201D}}";
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("smart-quote payload should parse");
+        assert_eq!(v["id"], "t1");
+    }
+
+    #[test]
+    fn extract_json_robust_handles_single_quoted_strings() {
+        let input = "{'id': 'task-1', 'title': 'first'}";
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("single-quoted JSON should parse");
+        assert_eq!(v["id"], "task-1");
+        assert_eq!(v["title"], "first");
+    }
+
+    #[test]
+    fn extract_json_robust_handles_python_literals() {
+        let input = r#"{"done": True, "skip": False, "note": None}"#;
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("python literals should be normalized");
+        assert_eq!(v["done"], true);
+        assert_eq!(v["skip"], false);
+        assert!(v["note"].is_null());
+    }
+
+    #[test]
+    fn extract_json_robust_handles_combined_errors() {
+        // Smart quotes + single quotes + trailing comma + Python literal +
+        // JS comment all in one payload — pathological but observed in
+        // real LLM output.
+        let input = "```json\n{\u{201C}items\u{201D}: ['a', 'b',], \
+                     // trailing comment\n  \"done\": True,}\n```";
+        let result = extract_json_robust(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&result).expect("combined repair should parse: {result}");
+        assert_eq!(v["items"][0], "a");
+        assert_eq!(v["items"][1], "b");
+        assert_eq!(v["done"], true);
+    }
+
+    #[test]
+    fn fix_python_literals_preserves_strings() {
+        // The literal `True` inside a string must NOT be rewritten.
+        let input = r#"{"label": "True positive", "flag": True}"#;
+        let out = fix_python_literals(input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must parse");
+        assert_eq!(v["label"], "True positive");
+        assert_eq!(v["flag"], true);
+    }
+
+    #[test]
+    fn fix_single_quoted_strings_preserves_apostrophes_in_double_quoted() {
+        // An apostrophe inside a double-quoted string must survive intact.
+        let input = r#"{"msg": "don't break me"}"#;
+        let out = fix_single_quoted_strings(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn fix_single_quoted_strings_escapes_embedded_double_quote() {
+        let input = r#"{'msg': 'she said "hi"'}"#;
+        let out = fix_single_quoted_strings(input);
+        let v: serde_json::Value =
+            serde_json::from_str(&out).expect("escaped embedded quote should parse");
+        assert_eq!(v["msg"], "she said \"hi\"");
     }
 
     #[test]
@@ -8147,5 +8724,80 @@ Done!"#;
         let loaded = PlanModeState::load_from_file(&path).unwrap();
         assert_eq!(loaded.goal, ps.goal);
         assert_eq!(loaded.history.len(), 1);
+    }
+
+    // ─── Regression: plan regeneration path shows clarification questions as JSON parse failure
+    //
+    // After the user answers clarification questions, the LLM may return another
+    // round of clarification questions instead of a plan.  The plan regeneration
+    // paths in plan_interaction.rs must call detect_clarification_questions()
+    // BEFORE parse_plan_response(), otherwise the questions are shown as
+    // "Plan response was not structured JSON".
+
+    /// Exact JSON from the user-reported session (session 47ff190c).
+    const SESSION_CLARIFICATION_JSON: &str = r#"[
+ {
+ "question": "What does 'tmp directory' mean - should I use /tmp or create a 'tmp' folder in the project root?",
+ "options": ["Use /tmp folder", "Create tmp/ in project root"],
+ "default": 0,
+ "category": "technical"
+ },
+ {
+ "question": "Which React framework should I use?",
+ "options": ["React (existing react-app folder)", "Vue"],
+ "default": 0,
+ "category": "technical"
+ },
+ {
+ "question": "What agent status information should the dashboard display?",
+ "options": ["Basic status indicator", "Detailed metrics with charts", "Full pipeline status"],
+ "default": 0,
+ "category": "scope"
+ }
+]"#;
+
+    #[test]
+    fn detect_clarification_questions_parses_session_json() {
+        // The exact JSON from the user session must be detected as clarification questions,
+        // not fall through to parse_plan_response as a JSON parse failure.
+        let questions = detect_clarification_questions(SESSION_CLARIFICATION_JSON);
+        assert!(
+            questions.is_some(),
+            "session clarification JSON must be detected by detect_clarification_questions"
+        );
+        let qs = questions.unwrap();
+        assert_eq!(qs.len(), 3);
+        assert!(qs[0].question.contains("tmp directory"));
+        assert_eq!(qs[0].options.len(), 2);
+        assert!(qs[1].question.contains("React framework"));
+        assert!(qs[2].question.contains("agent status"));
+    }
+
+    #[test]
+    fn parse_plan_response_rejects_session_clarification_json() {
+        // parse_plan_response must reject this — it's not a plan.
+        // The caller must check detect_clarification_questions first.
+        let result = parse_plan_response(SESSION_CLARIFICATION_JSON);
+        assert!(
+            result.is_err(),
+            "clarification JSON array must not parse as a plan"
+        );
+    }
+
+    #[test]
+    fn detect_clarification_questions_takes_priority_over_parse_plan_response() {
+        // This test documents the required call order in plan regeneration paths:
+        // detect_clarification_questions() must be called before parse_plan_response().
+        // If detect returns Some, the caller must handle it as clarification, not as a parse error.
+        let text = SESSION_CLARIFICATION_JSON;
+        assert!(
+            detect_clarification_questions(text).is_some(),
+            "detect_clarification_questions must return Some for this input"
+        );
+        assert!(
+            parse_plan_response(text).is_err(),
+            "parse_plan_response must return Err for this input"
+        );
+        // Correct handling: detect first, then parse only if detect returns None.
     }
 }

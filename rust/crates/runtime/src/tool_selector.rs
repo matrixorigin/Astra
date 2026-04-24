@@ -423,7 +423,7 @@ impl TfIdfSelector {
                 Ok(p) => p,
                 Err(e) => e.into_inner(),
             };
-            for pattern in patterns.suggest(routing.task_type, routing.domain_hint, 2) {
+            for pattern in patterns.top_patterns(routing.task_type, routing.domain_hint, 2) {
                 learned.pattern_hints.push(format!(
                     "Successful tool chain for {:?}/{:?}: {} (success {:.0}%, quality {:.2})",
                     pattern.task_type,
@@ -2941,7 +2941,7 @@ mod tests {
         // Verify PatternLibrary recorded the outcome
         {
             let l = lib.lock().unwrap();
-            let suggestions = l.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+            let suggestions = l.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
             assert!(
                 !suggestions.is_empty(),
                 "pattern library should have recorded the outcome"
@@ -3049,7 +3049,7 @@ mod tests {
         }
         {
             let l = lib.lock().unwrap();
-            let suggestions = l.suggest(TaskType::Fetch, None, 5);
+            let suggestions = l.top_patterns(TaskType::Fetch, None, 5);
             assert!(
                 !suggestions.is_empty(),
                 "pattern library should still record chains without domain"

@@ -27,10 +27,11 @@ help:
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - test-offline + test-online (MatrixOne + Redis required for online portion)"
-	@echo "  make test-offline       - Workspace tests + astra-runtime bridge-e2e-hooks only (no #[ignore] online/Matrix suites)"
-	@echo "  make test-online        - Ignored Matrix HTTP E2E + astra-services multi_agent_integration (exports opt-in env vars)"
+	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
+	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (typecheck, Jest+coverage+Mode A in-process, build)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (set ASTRA_SDK_ONLINE_E2E=1 + API to also run make test-sdk-online)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
+	@echo "  (also: test-sdk-offline, test-sdk-online — @astra/sdk; offline in test-offline; remote E2E opt-in on test-online)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type)"
@@ -435,11 +436,11 @@ clean-incremental:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online
+.PHONY: test test-offline test-online test-sdk-offline test-sdk-online
 test: test-offline test-online
 
 .PHONY: test-offline
-test-offline: test-workspace test-runtime-bridge-hooks
+test-offline: test-workspace test-runtime-bridge-hooks test-sdk-offline
 
 .PHONY: test-workspace
 test-workspace:
@@ -494,6 +495,7 @@ test-ignored-integration:
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
+# @astra/sdk remote E2E is opt-in (ASTRA_SDK_ONLINE_E2E=1) so CI make test-online has no API on :8000.
 .PHONY: test-online
 test-online:
 	@if [ ! -f .env ]; then \
@@ -503,6 +505,30 @@ test-online:
 	@echo "Running astra-runtime ignored unit tests (live DB)..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored
 	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
+	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
+		$(MAKE) test-sdk-online; \
+	else \
+		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
+	fi
+
+# @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
+.PHONY: test-sdk-offline
+test-sdk-offline:
+	@echo "Running @astra/sdk offline (typecheck, Jest with coverage + Mode A E2E, build)..."
+	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
+	@cd packages/sdk && npm run typecheck
+	@cd packages/sdk && ASTRA_SDK_E2E=1 npm run test:coverage
+	@cd packages/sdk && npm run build
+
+# @astra/sdk — Jest Mode B (ASTRA_SDK_BASE_URL) + sdk-online-smoke; requires astra-server (e.g. make dev-start)
+.PHONY: test-sdk-online
+test-sdk-online:
+	@echo "Running @astra/sdk online (Jest integration + test:online) — ensure API is up (e.g. make dev-start)..."
+	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
+	@bash -ec 'set -a; [ -f "$(CURDIR)/.env" ] && . "$(CURDIR)/.env"; set +a; \
+		export ASTRA_SDK_E2E=1; \
+		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${API_PORT:-8000}}"; \
+		cd "$(CURDIR)/packages/sdk" && npm run test:integration:local && npm run test:online'
 
 .PHONY: test-contract
 test-contract:

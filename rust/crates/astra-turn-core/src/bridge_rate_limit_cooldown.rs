@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Default cooldown duration (2 minutes) when retry-after is unknown or too long.
-const DEFAULT_COOLDOWN_MS: u64 = 2 * 60 * 1000; // 2 minutes
+/// Default cooldown duration (30 seconds) when retry-after is unknown or too long.
+/// Most LLM API rate limits reset in 10-60s; 2 minutes was excessive.
+const DEFAULT_COOLDOWN_MS: u64 = 30 * 1000; // 30 seconds
 
-/// Maximum cooldown duration (5 minutes).
-const MAX_COOLDOWN_MS: u64 = 5 * 60 * 1000; // 5 minutes
+/// Maximum cooldown duration (2 minutes).
+const MAX_COOLDOWN_MS: u64 = 2 * 60 * 1000; // 2 minutes
 
 /// If retry-after is less than this, retry immediately without entering cooldown.
 const SHORT_RETRY_THRESHOLD_MS: u64 = 20 * 1000; // 20 seconds
@@ -144,15 +145,16 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitAction::Proceed,
             STATE_COOLDOWN => {
-                let info = self.cooldown_info.lock().expect("cooldown mutex");
+                let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref cooldown) = *info {
                     if Instant::now() >= cooldown.reset_at {
-                        // Cooldown expired
-                        drop(info);
-                        self.exit_cooldown();
+                        // Cooldown expired — exit inline (already holding lock)
+                        self.state.store(STATE_ACTIVE, Ordering::SeqCst);
+                        self.consecutive_errors.store(0, Ordering::SeqCst);
+                        self.consecutive_529_errors.store(0, Ordering::SeqCst);
+                        *info = None;
                         RateLimitAction::Proceed
                     } else if has_fallback {
-                        // Fallback available - use it regardless of fallback_triggered
                         RateLimitAction::UseFallback {
                             reason: cooldown.reason,
                         }
@@ -269,15 +271,12 @@ impl RateLimitCooldown {
         self.cooldowns_triggered.fetch_add(1, Ordering::SeqCst);
         let reset_at = Instant::now() + Duration::from_millis(duration_ms);
 
-        {
-            let mut info = self.cooldown_info.lock().expect("cooldown mutex");
-            *info = Some(CooldownInfo {
-                reset_at,
-                reason,
-                fallback_triggered: false,
-            });
-        }
-
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        *info = Some(CooldownInfo {
+            reset_at,
+            reason,
+            fallback_triggered: false,
+        });
         self.state.store(STATE_COOLDOWN, Ordering::SeqCst);
     }
 
@@ -288,25 +287,23 @@ impl RateLimitCooldown {
 
         let reset_at = Instant::now() + Duration::from_millis(DEFAULT_COOLDOWN_MS);
 
-        {
-            let mut info = self.cooldown_info.lock().expect("cooldown mutex");
-            *info = Some(CooldownInfo {
-                reset_at,
-                reason,
-                fallback_triggered: true,
-            });
-        }
-
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+        *info = Some(CooldownInfo {
+            reset_at,
+            reason,
+            fallback_triggered: true,
+        });
         self.state.store(STATE_COOLDOWN, Ordering::SeqCst);
     }
 
-    /// Exit cooldown state.
+    /// Exit cooldown state. Only used in tests now — check_request inlines
+    /// the exit logic to avoid releasing and re-acquiring the Mutex.
+    #[cfg(test)]
     fn exit_cooldown(&self) {
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
-
-        let mut info = self.cooldown_info.lock().expect("cooldown mutex");
         *info = None;
     }
 
@@ -315,7 +312,7 @@ impl RateLimitCooldown {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitState::Active,
             STATE_COOLDOWN => {
-                let info = self.cooldown_info.lock().expect("cooldown mutex");
+                let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref cooldown) = *info {
                     // Convert Instant to epoch ms for external use
                     let now = Instant::now();
@@ -368,7 +365,7 @@ impl RateLimitCooldown {
             return 0;
         }
 
-        let info = self.cooldown_info.lock().expect("cooldown mutex");
+        let info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref cooldown) = *info {
             cooldown
                 .reset_at
@@ -384,7 +381,7 @@ impl RateLimitCooldown {
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
         self.consecutive_529_errors.store(0, Ordering::SeqCst);
-        let mut info = self.cooldown_info.lock().expect("cooldown mutex");
+        let mut info = self.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
         *info = None;
     }
 }
@@ -974,5 +971,92 @@ mod tests {
         rl.state.store(255, Ordering::SeqCst);
         let m = rl.metrics();
         assert_eq!(m.state, "unknown");
+    }
+
+    /// audit-B1: cooldown_info mutex must recover from poison instead of
+    /// cascading panics. This test poisons the mutex by panicking inside a
+    /// lock scope, then verifies subsequent operations still work.
+    #[test]
+    fn cooldown_mutex_recovers_from_poison() {
+        let rl = std::sync::Arc::new(RateLimitCooldown::new());
+        let rl2 = rl.clone();
+
+        // Poison the mutex by panicking while holding the lock.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = rl2.cooldown_info.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err(), "should have panicked");
+        assert!(rl.cooldown_info.lock().is_err(), "mutex should be poisoned");
+
+        // Despite the poison, all operations must still work.
+        assert!(matches!(rl.check_request(false), RateLimitAction::Proceed));
+        rl.record_429(None, false);
+        rl.record_success();
+        let m = rl.metrics();
+        assert_eq!(m.state, "active");
+    }
+
+    /// P1-D: Concurrent enter_cooldown + exit_cooldown must never leave
+    /// state=COOLDOWN with cooldown_info=None. That combination triggers
+    /// the "shouldn't happen" fallback in check_request, silently dropping
+    /// the cooldown and allowing requests through to a rate-limited API.
+    #[test]
+    fn cooldown_enter_exit_race_never_leaves_inconsistent_state() {
+        use std::sync::{Arc, Barrier};
+
+        let rl = Arc::new(RateLimitCooldown::new());
+
+        for _ in 0..2000 {
+            let barrier = Arc::new(Barrier::new(2));
+            let rl1 = Arc::clone(&rl);
+            let b1 = Arc::clone(&barrier);
+            let rl2 = Arc::clone(&rl);
+            let b2 = Arc::clone(&barrier);
+
+            // Thread 1: enter cooldown
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                rl1.enter_cooldown(60_000, CooldownReason::RateLimit);
+            });
+
+            // Thread 2: exit cooldown
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                rl2.exit_cooldown();
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            // Invariant: state and cooldown_info must be consistent.
+            // COOLDOWN → info must be Some. ACTIVE → info must be None.
+            let state_val = rl.state.load(Ordering::SeqCst);
+            let info = rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner());
+            match (state_val, info.is_some()) {
+                (STATE_COOLDOWN, true) => {} // consistent: cooldown active
+                (STATE_ACTIVE, false) => {}  // consistent: no cooldown
+                (STATE_COOLDOWN, false) => {
+                    panic!("INCONSISTENT: state=COOLDOWN but cooldown_info=None");
+                }
+                (STATE_ACTIVE, true) => {
+                    panic!("INCONSISTENT: state=ACTIVE but cooldown_info=Some");
+                }
+                _ => {}
+            }
+            drop(info);
+
+            // Reset
+            rl.state.store(STATE_ACTIVE, Ordering::SeqCst);
+            *rl.cooldown_info.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// O2: DEFAULT_COOLDOWN_MS must be ≤ 30s. Most LLM API rate limits
+    /// reset in 10-60s. A 2-minute cooldown wastes 60-110s of user time
+    /// when no Retry-After header is provided.
+    #[test]
+    fn default_cooldown_is_at_most_30_seconds() {
+        const _: () = assert!(DEFAULT_COOLDOWN_MS <= 30_000);
     }
 }

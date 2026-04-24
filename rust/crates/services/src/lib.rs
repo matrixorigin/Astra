@@ -193,7 +193,10 @@ pub use session_fork::{
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };
-pub use skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService};
+pub use skills::{
+    DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillRegisterRequestData,
+    SkillService, UnconfiguredSkillService,
+};
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService,
     SyncDirection, SyncResult, SyncStatus,

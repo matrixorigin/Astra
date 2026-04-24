@@ -1,0 +1,26 @@
+name: tool_hooks_baseline
+description: "Pre/post 工具 hook 基线 (gap #1)：global ToolHookRegistry 在未注册任何 hook 的情况下应对工具分发无副作用。本用例守护空 hook 链路不引入额外事件、不打断工具调用。待后续接入 cloud_tool_delivery 后再补 hook-mutating / hook-blocked 两类正负向案例。"
+requires: [llm]
+
+turns:
+  - user: "简单一点：列出当前目录下的文件就行。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应包含真实的文件列表摘要，且整体工具调用路径未因 hook 基础设施的存在而失败或被阻断。"
+        pass_threshold: 0.6
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid AND event_type = 'tool_call'"
+        assert:
+          count: ">=1"

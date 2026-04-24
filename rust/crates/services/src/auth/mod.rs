@@ -122,7 +122,9 @@ pub struct DatabaseUserRecord {
     pub is_active: bool,
 }
 
-#[derive(Clone, Debug)]
+use std::fmt;
+
+#[derive(Clone)]
 struct TrustedMoiJwtSettings {
     secret_key: String,
     algorithm: Algorithm,
@@ -131,9 +133,29 @@ struct TrustedMoiJwtSettings {
     leeway_seconds: u64,
 }
 
-#[derive(Clone, Debug)]
+impl fmt::Debug for TrustedMoiJwtSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrustedMoiJwtSettings")
+            .field("secret_key", &"[REDACTED]")
+            .field("algorithm", &self.algorithm)
+            .field("expected_issuer", &self.expected_issuer)
+            .field("expected_audience", &self.expected_audience)
+            .field("leeway_seconds", &self.leeway_seconds)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct TrustedMoiAuthService {
     settings: TrustedMoiJwtSettings,
+}
+
+impl fmt::Debug for TrustedMoiAuthService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrustedMoiAuthService")
+            .field("settings", &self.settings)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -903,6 +925,54 @@ impl AuthService for UnconfiguredAuthService {
     }
 }
 
+/// Stub auth service that accepts any Bearer token and returns a fixed test user.
+/// Intended for integration/contract tests where JWT validation is not under test.
+pub struct StubAuthService;
+
+#[async_trait]
+impl AuthService for StubAuthService {
+    async fn register(
+        &self,
+        _request: AuthRegisterRequestData,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn login(
+        &self,
+        _request: AuthLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn refresh(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn logout(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        let _token = bearer_token(headers)?;
+        Ok(AuthUserRecord {
+            user_id: "test-user".into(),
+            username: "test-user".into(),
+            email: "test@test.com".into(),
+            display_name: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,5 +1189,20 @@ mod tests {
             .await
             .expect_err("logout should be disabled");
         assert_eq!(logout.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn trusted_moi_jwt_settings_debug_redacts_secret() {
+        let service = TrustedMoiAuthService::new("supersecret", "HS256", None, None, 30)
+            .expect("construct service");
+        let debug_str = format!("{:?}", service);
+        assert!(
+            !debug_str.contains("supersecret"),
+            "secret should be redacted: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should show [REDACTED]: {debug_str}"
+        );
     }
 }

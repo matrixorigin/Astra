@@ -74,12 +74,25 @@ pub enum SseRenderEffect {
 }
 
 fn normalize_tool_call_for_accum(event: &Value) -> Option<Value> {
+    // Prefer the top-level `id` / `call_id`; providers that wrap the tool
+    // call under `function` (nested) set `function.id` / `function.call_id`
+    // instead. Fall back to those before minting a synthetic UUID so
+    // downstream `tool_call_id` matching keeps working with providers that
+    // only surface the id under `function`.
+    let nested_id = event.get("function").and_then(|f| {
+        f.get("id")
+            .or_else(|| f.get("call_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
     let call_id = event
         .get("id")
         .or_else(|| event.get("call_id"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+        .or(nested_id)
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
     if let Some(function) = event.get("function").and_then(Value::as_object) {
@@ -301,8 +314,21 @@ fn apply_one_event(
             }
         }
         "usage" => {
-            let prompt = event.get("prompt_tokens").and_then(|v| v.as_u64());
-            let completion = event.get("completion_tokens").and_then(|v| v.as_u64());
+            // Providers either expose usage fields flat on the event or wrap
+            // them inside a nested `"usage": {...}` object. Flat wins if
+            // present; nested is consulted only as a fallback so a provider
+            // that switches shape mid-stream never silently zeroes these
+            // counters. All four fields (prompt/completion/cache_read/
+            // cache_creation) share this precedence.
+            let nested = event.get("usage");
+            let read_u64 = |field: &str| -> Option<u64> {
+                event
+                    .get(field)
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| nested.and_then(|u| u.get(field)).and_then(|v| v.as_u64()))
+            };
+            let prompt = read_u64("prompt_tokens");
+            let completion = read_u64("completion_tokens");
             if prompt.is_none() && completion.is_none() {
                 if accum.error_message.is_none() {
                     accum.error_message = Some("Error: invalid usage payload".to_string());
@@ -311,14 +337,8 @@ fn apply_one_event(
             }
             accum.prompt_tokens = prompt.unwrap_or(0);
             accum.completion_tokens = completion.unwrap_or(0);
-            accum.cache_read_tokens = event
-                .get("cache_read_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            accum.cache_creation_tokens = event
-                .get("cache_creation_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            accum.cache_read_tokens = read_u64("cache_read_tokens").unwrap_or(0);
+            accum.cache_creation_tokens = read_u64("cache_creation_tokens").unwrap_or(0);
             accum.has_usage = true;
         }
         "error" => {
@@ -1469,5 +1489,180 @@ mod tests {
         assert_eq!(a.tool_calls.len(), 1);
         assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-new"));
         assert_eq!(a.tool_call_id_index.get("tc-new"), Some(&0));
+    }
+
+    // ── Phase-R adversarial regression: usage nested fallback (Bug B) ──
+
+    /// Regression: a provider that nests usage counters under
+    /// `"usage": {...}` must still be decoded correctly. Before the fix,
+    /// these counters silently zeroed out.
+    #[test]
+    fn usage_nested_fallback_captures_all_four_counters() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"usage\",\"usage\":{\"prompt_tokens\":101,\"completion_tokens\":42,\"cache_read_tokens\":7,\"cache_creation_tokens\":13}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert!(a.has_usage);
+        assert_eq!(a.prompt_tokens, 101);
+        assert_eq!(a.completion_tokens, 42);
+        assert_eq!(a.cache_read_tokens, 7);
+        assert_eq!(a.cache_creation_tokens, 13);
+        assert!(
+            a.error_message.is_none(),
+            "no invalid-usage error for nested shape"
+        );
+    }
+
+    /// Contract pin: when BOTH flat and nested are present, flat wins.
+    #[test]
+    fn usage_flat_wins_over_nested() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"usage\",\"prompt_tokens\":1,\"completion_tokens\":2,\"cache_read_tokens\":3,\"cache_creation_tokens\":4,\"usage\":{\"prompt_tokens\":999,\"completion_tokens\":999,\"cache_read_tokens\":999,\"cache_creation_tokens\":999}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.prompt_tokens, 1);
+        assert_eq!(a.completion_tokens, 2);
+        assert_eq!(a.cache_read_tokens, 3);
+        assert_eq!(a.cache_creation_tokens, 4);
+    }
+
+    /// Mixed shape: flat prompt/completion, nested cache_* still decoded.
+    #[test]
+    fn usage_mixed_flat_and_nested_per_field() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"usage\",\"prompt_tokens\":50,\"completion_tokens\":10,\"usage\":{\"cache_read_tokens\":11,\"cache_creation_tokens\":22}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.prompt_tokens, 50);
+        assert_eq!(a.completion_tokens, 10);
+        assert_eq!(a.cache_read_tokens, 11);
+        assert_eq!(a.cache_creation_tokens, 22);
+    }
+
+    // ── Phase-R adversarial regression: nested function.id (Bug C) ──
+
+    /// Regression: `tool_call` with only nested `function.id` (no top-level
+    /// id/call_id) must preserve that id instead of minting a UUID.
+    /// Downstream tool_call_id matching breaks if a UUID is synthesized.
+    #[test]
+    fn tool_call_uses_nested_function_id_when_top_level_missing() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"tool_call\",\"function\":{\"id\":\"real-id-42\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(
+            a.tool_calls[0]["id"].as_str(),
+            Some("real-id-42"),
+            "nested function.id must be preserved, not replaced by a UUID"
+        );
+        assert_eq!(a.tool_call_id_index.get("real-id-42"), Some(&0));
+    }
+
+    #[test]
+    fn tool_call_uses_nested_function_call_id_when_top_level_missing() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"tool_call\",\"function\":{\"call_id\":\"real-call-7\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(a.tool_calls[0]["id"].as_str(), Some("real-call-7"));
+    }
+
+    /// Contract pin: top-level `id` still wins over nested function.id —
+    /// guarding against a regression introduced by the Bug-C fix.
+    #[test]
+    fn tool_call_top_level_id_wins_over_nested_function_id() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"tool_call\",\"id\":\"top-id\",\"function\":{\"id\":\"nested-id\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(a.tool_calls[0]["id"].as_str(), Some("top-id"));
+    }
+
+    /// Contract pin: no id anywhere → UUID is minted (not left empty /
+    /// not rejected). Preserves pre-fix behavior for purely id-less events.
+    #[test]
+    fn tool_call_with_no_id_anywhere_still_mints_uuid() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"tool_call\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        let id = a.tool_calls[0]["id"].as_str().expect("id present");
+        assert!(!id.is_empty(), "id must be minted, not empty");
+        // UUID v7 is 36 chars (8-4-4-4-12) with dashes.
+        assert_eq!(id.len(), 36, "minted id should be a UUID string");
+    }
+
+    // ── SSE dispatch contract pins ─────────────────────────────────────
+
+    /// Current contract: `[DONE]` is NOT terminal — subsequent `data:`
+    /// lines in the same block are still processed. This is arguably a
+    /// bug (a real `[DONE]` should stop parsing) but is preserved here
+    /// deliberately for now; changing it is out of scope for this PR.
+    /// TODO(astra-stream-protocol): decide whether `[DONE]` should stop
+    /// dispatch of subsequent lines in the same block.
+    #[test]
+    fn done_marker_is_non_terminal_subsequent_lines_still_processed() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = "data: [DONE]\ndata: {\"type\":\"text_delta\",\"content\":\"after-done\"}\n\n";
+        dispatch_chat_turn_sse_event_block(block, &mut a, &mut vec![]);
+        assert_eq!(
+            a.full_text, "after-done",
+            "data lines after [DONE] in the same block are currently still processed"
+        );
+    }
+
+    /// Contract pin: only the FIRST malformed JSON line sets
+    /// `error_message`. Later malformed lines must NOT overwrite the
+    /// earlier message — the consumer surfaces the first symptom.
+    #[test]
+    fn malformed_json_only_first_sets_error_message() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = "data: {not json one}\ndata: {not json two}\n\n";
+        dispatch_chat_turn_sse_event_block(block, &mut a, &mut vec![]);
+        assert_eq!(
+            a.error_message.as_deref(),
+            Some("Error: invalid JSON in SSE data"),
+            "first malformed line sets the canonical error"
+        );
+        // Now simulate a subsequent block with another malformed line and
+        // verify the prior error_message is preserved (not overwritten).
+        let before = a.error_message.clone();
+        dispatch_chat_turn_sse_event_block("data: {still not}\n\n", &mut a, &mut vec![]);
+        assert_eq!(a.error_message, before);
+    }
+
+    /// Contract pin: a `tool_call` event that supplies only the top-level
+    /// `id` (no `function.id`, no `call_id`) still works — not regressed
+    /// by the Bug-C nested fallback.
+    #[test]
+    fn tool_call_with_only_top_level_id_still_works() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"tool_call\",\"id\":\"classic-1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(a.tool_calls[0]["id"].as_str(), Some("classic-1"));
+        assert_eq!(a.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+        assert_eq!(a.tool_call_id_index.get("classic-1"), Some(&0));
     }
 }

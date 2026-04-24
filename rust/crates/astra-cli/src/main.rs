@@ -77,8 +77,7 @@ mod command_registry;
 mod command_router;
 #[path = "cli/command_usage.rs"]
 mod command_usage;
-#[path = "cli/context_prefetch.rs"]
-mod context_prefetch;
+
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
 #[path = "cli/diagnostic_log.rs"]
@@ -105,6 +104,8 @@ mod mock_llm;
 mod permission_manager;
 #[path = "cli/picker_echo.rs"]
 mod picker_echo;
+#[path = "cli/plan_auto_suggest.rs"]
+mod plan_auto_suggest;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]
@@ -274,7 +275,7 @@ pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, Ver
 use idle_agent_messages::drain_root_mailbox_into_idle_queue;
 use plan_monitor::{
     finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
-    run_blocking_plan_monitor, sync_plan_run_task_progress,
+    sync_plan_run_task_progress,
 };
 pub(crate) use plan_monitor::{format_duration_short, format_plan_progress};
 pub(crate) use plan_runtime::build_learning_bridge;
@@ -501,6 +502,7 @@ async fn run_chat_repl(
                         || maybe_restore_pending_plan_mode(&line, &mut state)
                     {
                         // Plan mode: handle input as plan editing
+                        let mut plan_monitor_started = false;
                         match handle_plan_mode_input(
                             line.clone(),
                             current_token.as_deref(),
@@ -539,6 +541,7 @@ async fn run_chat_repl(
                                         profile,
                                     )
                                     .await?;
+                                    plan_monitor_started = true;
                                 }
                             }
                             Ok(plan_interaction::PlanInputResult::SendAsChat(msg)) => {
@@ -556,13 +559,13 @@ async fn run_chat_repl(
                                 .await?;
                             }
                             Err(e) => {
-                                state.plan_resume_pending = false;
                                 return Err(e);
                             }
                         }
 
-                        // If plan execution was just triggered, start the executor (blocking).
-                        if state.executing_plan.is_some() {
+                        // If plan execution was just triggered, start the blocking monitor (once
+                        // per readline event — DispatchSlash may have already run it).
+                        if state.executing_plan.is_some() && !plan_monitor_started {
                             start_and_monitor_plan(
                                 &mut state,
                                 current_token.as_deref(),
@@ -570,10 +573,6 @@ async fn run_chat_repl(
                                 profile,
                             )
                             .await?;
-                        } else if state.plan_resume_pending {
-                            // Resume was sent to a paused executor — re-enter blocking monitor.
-                            state.plan_resume_pending = false;
-                            run_blocking_plan_monitor(&mut state).await;
                         }
                     } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
                         && plan_decompose::is_resume_command(&line)
@@ -589,8 +588,6 @@ async fn run_chat_repl(
                                     Some(std::mem::take(&mut state.plan_execution_corrections))
                                 },
                             });
-                            // Re-enter blocking monitor until done/paused/error
-                            run_blocking_plan_monitor(&mut state).await;
                         } else {
                             start_and_monitor_plan(
                                 &mut state,
@@ -688,19 +685,13 @@ async fn run_chat_repl(
                         let mut should_proceed_normal = true;
                         let line_for_plan = line.clone(); // Clone early to avoid borrow issues
                         if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
-                            eprintln!();
-                            eprintln!("{}  {}", "📋".yellow(), reason);
-                            eprintln!(
-                                "{}  This task might benefit from planning. Enter plan mode? (y/n)",
-                                "💡".cyan()
+                            let banner = format!("{reason} (execution plan)");
+                            let decision = plan_auto_suggest::prompt_auto_suggest(
+                                &banner,
+                                plan_auto_suggest::DEFAULT_TIMEOUT,
                             );
-
-                            // Read user response
-                            let mut response = String::new();
-                            if std::io::stdin().read_line(&mut response).is_ok() {
-                                let resp = response.trim().to_lowercase();
-                                if resp == "y" || resp == "yes" || resp == "是" {
-                                    // Enter plan mode with the goal
+                            match decision {
+                                plan_auto_suggest::AutoSuggestDecision::Accepted => {
                                     let project_root = std::env::current_dir()
                                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
                                     let context = plan_decompose::analyze_project(&project_root);
@@ -710,7 +701,6 @@ async fn run_chat_repl(
                                         context,
                                     );
 
-                                    eprintln!();
                                     eprintln!(
                                         "{}  Entering plan mode for: {}",
                                         "📋".green(),
@@ -718,11 +708,9 @@ async fn run_chat_repl(
                                     );
                                     eprintln!("{}  Generating plan...", "⋯".dim());
 
-                                    // Trigger plan generation (set goal, plan will be generated in plan mode)
                                     state.plan_mode = Some(plan_state);
                                     should_proceed_normal = false;
 
-                                    // Call handle_plan_mode_input to generate the plan
                                     handle_plan_mode_input(
                                         line_for_plan,
                                         current_token.as_deref(),
@@ -730,8 +718,12 @@ async fn run_chat_repl(
                                         api,
                                     )
                                     .await?;
-                                } else {
-                                    eprintln!("{}  Proceeding with normal chat...", "→".dim());
+                                }
+                                plan_auto_suggest::AutoSuggestDecision::Declined
+                                | plan_auto_suggest::AutoSuggestDecision::TimedOut
+                                | plan_auto_suggest::AutoSuggestDecision::Interrupted => {
+                                    // Fall through to normal chat. Decision banner
+                                    // already printed by prompt_auto_suggest.
                                 }
                             }
                         }
@@ -892,12 +884,19 @@ async fn run_chat_repl(
         .await;
 
         let profile_name = profile.unwrap_or("default");
-        if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_with_health(
+        let tool_quality_entries = state
+            .tool_quality_tracker
+            .as_ref()
+            .and_then(|t| t.lock().ok().map(|g| g.export()))
+            .unwrap_or_default();
+        if let Err(e) = astra_runtime::pipeline::persistence::save_learning_state_full(
             profile_name,
             &pipeline_modules.entity_graph,
             &pipeline_modules.pattern_library,
             &pipeline_modules.calibrator,
             &state.tool_health_entries,
+            &tool_quality_entries,
+            None,
         ) {
             eprintln!(
                 "{}",
@@ -1028,6 +1027,7 @@ async fn main() {
         session_name,
         bare,
         no_instructions,
+        no_journal_content,
         startup_trace,
         diagnostic_log: _,
         log_file: _,
@@ -1052,6 +1052,12 @@ async fn main() {
     if no_instructions {
         unsafe {
             std::env::set_var("ASTRA_NO_INSTRUCTIONS", "1");
+        }
+    }
+
+    if no_journal_content {
+        unsafe {
+            std::env::set_var(session_journal::ASTRA_JOURNAL_CONTENT_REDACT_ENV, "1");
         }
     }
 
@@ -1446,7 +1452,6 @@ mod tests {
             api: &api,
             token: "fake-token",
             message: "hi",
-            prefetched_context_override: None,
             session_id: None,
             model: None,
             explain: ExplainMode::Off,
@@ -1478,6 +1483,7 @@ mod tests {
             observability_hub: None,
             observability_session: None,
             file_journal: None,
+            file_state: None,
             database_snapshot_journal: None,
             git_stash_journal: None,
             git_commit_journal: None,
@@ -1517,7 +1523,6 @@ mod tests {
             api: &api,
             token: "fake-token",
             message: "hi",
-            prefetched_context_override: None,
             session_id: None,
             model: None,
             explain: ExplainMode::Off,
@@ -1549,6 +1554,7 @@ mod tests {
             observability_hub: None,
             observability_session: None,
             file_journal: None,
+            file_state: None,
             database_snapshot_journal: None,
             git_stash_journal: None,
             git_commit_journal: None,
@@ -1604,7 +1610,6 @@ mod tests {
             api: &api,
             token: "fake-token",
             message: "run echo hi",
-            prefetched_context_override: None,
             session_id: None,
             model: None,
             explain: ExplainMode::Off,
@@ -1636,6 +1641,7 @@ mod tests {
             observability_hub: None,
             observability_session: None,
             file_journal: None,
+            file_state: None,
             database_snapshot_journal: None,
             git_stash_journal: None,
             git_commit_journal: None,

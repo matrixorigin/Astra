@@ -151,8 +151,16 @@ pub fn apply_agentic_post_tool_policy(
                     remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL);
             }
             VerdictSeverity::Warning => {
-                *remaining_turns =
-                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING);
+                // Progressive (linear) penalty: each consecutive warning adds
+                // one base penalty on top of the previous one — 1st warning
+                // costs -2, 2nd -4, 3rd -6, etc. Capped at MAX_MULT to keep
+                // the penalty bounded and prevent u32 overflow on pathological
+                // sessions; we also use saturating_mul defensively.
+                const MAX_MULT: usize = 16;
+                let multiplier = turn_guard.consecutive_warnings.clamp(1, MAX_MULT);
+                let penalty =
+                    CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING.saturating_mul(multiplier);
+                *remaining_turns = remaining_turns.saturating_sub(penalty);
             }
             _ => {}
         }

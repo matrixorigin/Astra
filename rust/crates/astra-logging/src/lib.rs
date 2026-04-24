@@ -164,3 +164,151 @@ pub fn init_from_env_or_ignores_duplicate(config: LogInitConfig<'_>) {
         eprintln!("[astra-logging] logging init failed: {e}");
     }
 }
+
+// ─── Secret<T> newtype (S5 stub) ─────────────────────────────────────────────
+
+/// A wrapper that redacts the inner value in `Debug` and `Display` output.
+///
+/// Use this to store secret values (API keys, passwords, tokens) in structs
+/// where you want to derive `Debug` without leaking the secret in logs or
+/// panic messages.
+///
+/// A full `tracing` subscriber layer for field-level scrubbing is deferred to
+/// a follow-up; this stub only provides the newtype wrapper.
+///
+/// # Example
+/// ```
+/// use astra_logging::Secret;
+/// let s = Secret::new("my-api-key".to_string());
+/// assert_eq!(format!("{s:?}"), "[REDACTED]");
+/// assert_eq!(format!("{s}"), "[REDACTED]");
+/// assert_eq!(s.expose(), "my-api-key");
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret<T: AsRef<str>>(T);
+
+impl<T: AsRef<str>> Secret<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Returns the inner secret value. Avoid logging the result.
+    pub fn expose(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+/// Redact inline secret values that appear after well-known prefixes.
+///
+/// Replaces the value following prefixes like `sk-`, `Bearer `, and `key-`
+/// with `[REDACTED]`. This is intended for sanitizing provider or verifier
+/// error strings before they are logged or surfaced to users.
+pub fn redact_known_secret_patterns(s: &str) -> String {
+    fn boundary(c: char) -> bool {
+        c.is_whitespace() || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}'
+    }
+
+    let prefixes = ["sk-", "Bearer ", "key-"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut best: Option<(usize, &str)> = None;
+        for p in &prefixes {
+            if let Some(idx) = rest.find(p)
+                && best.map(|(b, _)| idx < b).unwrap_or(true)
+            {
+                best = Some((idx, p));
+            }
+        }
+        match best {
+            Some((idx, p)) => {
+                out.push_str(&rest[..idx]);
+                out.push_str(p);
+                out.push_str("[REDACTED]");
+                let tail = &rest[idx + p.len()..];
+                let cut = tail.find(boundary).unwrap_or(tail.len());
+                rest = &tail[cut..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+impl<T: AsRef<str>> std::fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl<T: AsRef<str>> std::fmt::Display for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl From<String> for Secret<String> {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Secret<String> {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::{Secret, redact_known_secret_patterns};
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = Secret::new("my-api-key-abc123".to_string());
+        let debug = format!("{s:?}");
+        assert_eq!(debug, "[REDACTED]");
+        assert!(!debug.contains("my-api-key-abc123"));
+    }
+
+    #[test]
+    fn secret_display_is_redacted() {
+        let s = Secret::new("super-secret".to_string());
+        let display = format!("{s}");
+        assert_eq!(display, "[REDACTED]");
+    }
+
+    #[test]
+    fn secret_expose_returns_value() {
+        let s = Secret::new("actual-value".to_string());
+        assert_eq!(s.expose(), "actual-value");
+    }
+
+    #[test]
+    fn secret_from_str_and_string() {
+        let a: Secret<String> = "hello".into();
+        let b: Secret<String> = String::from("hello").into();
+        assert_eq!(a.expose(), "hello");
+        assert_eq!(b.expose(), "hello");
+        assert_eq!(format!("{a:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_known_secret_patterns_masks_well_known_prefixes() {
+        let redacted =
+            redact_known_secret_patterns("auth failed: sk-abc12345 used Bearer tok_xyz key-pqrs9");
+        assert!(!redacted.contains("abc12345"));
+        assert!(!redacted.contains("tok_xyz"));
+        assert!(!redacted.contains("pqrs9"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_known_secret_patterns_passthrough_for_clean_text() {
+        let input = "internal error: timeout";
+        assert_eq!(redact_known_secret_patterns(input), input);
+    }
+}

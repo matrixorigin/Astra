@@ -69,8 +69,6 @@ pub(super) async fn get_task_handler(
     headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<Json<astra_services::TaskRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
-
     let user = state.auth_service.current_user(&headers).await?;
 
     let task = state
@@ -384,7 +382,15 @@ fn parse_task_status(s: &str) -> Option<astra_services::TaskStatus> {
 fn extract_plan_progress_events(session_id: &str) -> Vec<PlanProgressEventResponse> {
     let events = match session_journal::read_journal(session_id) {
         Ok(events) => events,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                target: "astra_runtime::task_progress",
+                session_id,
+                err = %err,
+                "failed to read plan progress journal"
+            );
+            return Vec::new();
+        }
     };
 
     events

@@ -137,25 +137,31 @@ impl ToolExecutor {
             }
         }
 
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
         {
-            return validate_path(policy, path).map_err(|e| {
-                if e.is_boundary_violation() {
-                    // Use structured prefix so the agentic loop can detect sandbox
-                    // denials and prompt the user for authorization instead of
-                    // letting the model silently fall back to bash.
-                    format!(
-                        "{}Path '{}' is outside the project directory '{}'. \
-                         Ask the user for permission before accessing files outside the project.",
-                        super::SANDBOX_DENIED_PREFIX,
-                        path,
-                        policy.project_root.display(),
-                    )
-                } else {
-                    format!("Sandbox: {e}")
-                }
-            });
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+            {
+                return validate_path(policy, path).map_err(|e| {
+                    if e.is_boundary_violation() {
+                        // Use structured prefix so the agentic loop can detect sandbox
+                        // denials and prompt the user for authorization instead of
+                        // letting the model silently fall back to bash.
+                        format!(
+                            "{}Path '{}' is outside the project directory '{}'. \
+                             Ask the user for permission before accessing files outside the project.",
+                            super::SANDBOX_DENIED_PREFIX,
+                            path,
+                            policy.project_root.display(),
+                        )
+                    } else {
+                        format!("Sandbox: {e}")
+                    }
+                });
+            }
         }
         Ok(resolved)
     }

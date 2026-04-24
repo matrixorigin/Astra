@@ -159,6 +159,7 @@ mod tests {
             max_turns: 10,
             remaining_turns: 10,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
@@ -214,7 +215,6 @@ mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }

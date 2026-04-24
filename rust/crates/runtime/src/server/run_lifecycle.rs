@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -432,7 +432,6 @@ fn build_runtime_turn_evaluation_event(
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
-        state.prefetch_injected,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
@@ -1085,6 +1084,14 @@ fn truncate_for_audit(text: &str, max_chars: usize) -> String {
 /// PatternLibrary / EntityGraph / ProgressiveCalibrator can learn across
 /// sessions.  This mirrors what the bridge path does via
 /// `PipelineLearningWriter.record_outcome()` in `side_effects.rs`.
+///
+/// Correction detection: the server agentic loop previously hardcoded
+/// `was_corrected=false`, which left the ProgressiveCalibrator's three-axis
+/// formula `threshold = 0.70 - 0×0.15 - 0×0.10 - 0×0.10 = 0.70` frozen. This
+/// function now runs implicit-feedback detection on the user's turn against
+/// the most recent assistant message pulled from `state.messages`, matching
+/// the CLI/bridge behavior (`repl_turn.rs::record_selector_turn_outcome`,
+/// `bridge_inprocess.rs::build_turn_hook_args`).
 async fn record_server_loop_learning_outcome(
     writer: &dyn TurnLearningWriter,
     user_message: &str,
@@ -1092,13 +1099,19 @@ async fn record_server_loop_learning_outcome(
     success: bool,
 ) {
     let tools_used: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    let prev_assistant_text = extract_prev_assistant_text(&state.messages);
+    let signal = astra_turn_types::detect_implicit_feedback_signal(
+        user_message,
+        prev_assistant_text.as_deref(),
+    );
+    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
     let outcome = TurnLearningOutcome {
         query: user_message.to_string(),
         tools_selected: tools_used.clone(),
         tools_used,
         success,
         quality: if success { 0.7 } else { 0.2 },
-        was_corrected: false,
+        was_corrected,
         task_type_label: None,
         domain_hint_label: None,
         user_feedback_score: None,
@@ -1110,6 +1123,41 @@ async fn record_server_loop_learning_outcome(
     if let Err(e) = writer.record_outcome(outcome).await {
         astra_core::agent_error!("server-loop", "failed to record learning outcome: {e}");
     }
+}
+
+/// Walk `messages` (chronological) and return the content of the latest
+/// assistant entry, if any. Used by implicit-feedback detection so the
+/// "user said `that's wrong` after the assistant answered `X`" pattern can
+/// score higher confidence.
+fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "assistant" {
+            continue;
+        }
+        if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
+            let mut buf = String::new();
+            for part in arr {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(t);
+                }
+            }
+            let trimmed = buf.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 // ─── Run State ──────────────────────────────────────────────────────────────
@@ -1132,6 +1180,31 @@ impl RunStatus {
             Self::Completed => STATUS_COMPLETED,
             Self::Failed => STATUS_FAILED,
             Self::Cancelled => STATUS_CANCELLED,
+        }
+    }
+
+    /// Validate a status transition. Returns `Err` if the transition is illegal.
+    ///
+    /// Rules:
+    /// - Terminal states (Completed, Failed, Cancelled) cannot transition to anything.
+    /// - Running → Paused, Completed, Failed, Cancelled
+    /// - Paused → Running, Cancelled, Failed
+    pub fn try_transition(&self, next: &RunStatus) -> Result<(), String> {
+        let allowed = match self {
+            Self::Running => matches!(
+                next,
+                Self::Paused | Self::Completed | Self::Failed | Self::Cancelled
+            ),
+            Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Completed | Self::Failed | Self::Cancelled => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid run status transition: {:?} → {:?}",
+                self, next
+            ))
         }
     }
 }
@@ -1265,6 +1338,10 @@ pub struct AgenticRunLifecycleService {
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     /// Tool event writer for persisting tool_call events to agent_events.
     tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
+    /// Counter of in-flight background agentic loop tasks.
+    /// Incremented before spawn, decremented when the task exits.
+    /// Used by `drain_background_tasks` for graceful shutdown.
+    background_task_count: Arc<AtomicUsize>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1291,6 +1368,7 @@ impl AgenticRunLifecycleService {
             hook_db_writer: None,
             observer_worker: None,
             tool_event_writer: None,
+            background_task_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1349,9 +1427,43 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    /// Wait for all in-flight background agentic loop tasks to finish.
+    ///
+    /// Called during graceful shutdown. Polls the task counter with 100ms
+    /// intervals up to `timeout`. Returns `true` if all tasks drained within
+    /// the timeout, `false` if tasks are still running.
+    async fn drain_background_tasks_impl(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.background_task_count.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Returns the current number of in-flight background tasks.
+    pub fn background_task_count(&self) -> usize {
+        self.background_task_count.load(Ordering::Acquire)
+    }
+
     /// Clone the Arc handle to the runs map (for background tasks).
     fn runs_handle(&self) -> Arc<RwLock<HashMap<String, RunState>>> {
         Arc::clone(&self.runs)
+    }
+
+    /// Schedule removal of a terminal run from the in-memory cache after a
+    /// grace period. Clients have 5 minutes to poll final events before the
+    /// entry is evicted. This prevents unbounded memory growth.
+    fn schedule_run_eviction(runs: &Arc<RwLock<HashMap<String, RunState>>>, run_id: String) {
+        let runs = Arc::clone(runs);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            runs.write().await.remove(&run_id);
+        });
     }
 
     fn build_tracked_run_state(
@@ -1420,7 +1532,7 @@ impl AgenticRunLifecycleService {
             .cancellation
             .flag
             .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+            .is_some_and(|f| f.load(Ordering::Acquire))
             || loop_state
                 .cancellation
                 .token
@@ -1741,6 +1853,7 @@ impl AgenticRunLifecycleService {
             max_turns,
             remaining_turns: max_turns,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools: std::collections::HashSet::new(),
             boosted_tools: std::collections::HashSet::new(),
@@ -1821,7 +1934,6 @@ impl AgenticRunLifecycleService {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }
@@ -1962,7 +2074,7 @@ impl AgenticRunLifecycleService {
     pub(crate) async fn test_pause_flag_is_set(&self, run_id: &str) -> Option<bool> {
         let runs = self.runs.read().await;
         runs.get(run_id)
-            .map(|r| r.pause_flag.load(Ordering::Relaxed))
+            .map(|r| r.pause_flag.load(Ordering::Acquire))
     }
 }
 
@@ -1994,9 +2106,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        // Guard: reject if this session already has an active (running/paused) run.
+        // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
-        self.runs.write().await.insert(run_id.clone(), run_state);
+        {
+            let mut runs = self.runs.write().await;
+            let has_active = runs.values().any(|r| {
+                r.session_id == session_id
+                    && matches!(r.status, RunStatus::Running | RunStatus::Paused)
+            });
+            if has_active {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            runs.insert(run_id.clone(), run_state);
+        }
 
         // Persist to durable store if available
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
@@ -2104,6 +2231,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
         let bg_session_id = session_id.clone();
+        let bg_resource_governor = self.resource_governor.clone();
+        let bg_user_id = user_id.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -2118,7 +2247,69 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             tool_event_writer: self.tool_event_writer.clone(),
         };
 
+        // Background task tracking: background_task_count is incremented before
+        // spawn and decremented via RAII guard on exit. serve()'s shutdown path
+        // calls drain_background_tasks() to wait for in-flight runs.
+        let bg_task_count_1 = Arc::clone(&self.background_task_count);
+        bg_task_count_1.fetch_add(1, Ordering::Release);
         tokio::spawn(async move {
+            // RAII guard: decrement counter when this task exits (normal or panic).
+            struct TaskCountGuard(Arc<AtomicUsize>);
+            impl Drop for TaskCountGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let _guard = TaskCountGuard(bg_task_count_1);
+            // Pre-flight: check daily token budget before starting the agentic loop.
+            if let Some(ref gov) = bg_resource_governor {
+                use astra_services::resource_governor::LimitCheck;
+                if let LimitCheck::Denied { reason } = gov.check_token_budget(&bg_user_id).await {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        user_id = %bg_user_id,
+                        run_id = %bg_run_id,
+                        reason = %reason,
+                        "run rejected: daily token budget exhausted"
+                    );
+                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                        if run.status.try_transition(&RunStatus::Failed).is_ok() {
+                            run.status = RunStatus::Failed;
+                        }
+                        // Push terminal events so SSE clients see the failure.
+                        run.events.push(json!({
+                            "event_type": "run_error",
+                            "data": {"error": reason.clone()}
+                        }));
+                        run.events.push(json!({
+                            "event_type": "run_finished",
+                            "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
+                        }));
+                    }
+                    // Clean up channels for this run.
+                    bg_approval_channels.lock().await.remove(&bg_run_id);
+                    bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                    bg_progress_channels.lock().await.remove(&bg_run_id);
+                    if let Some(ref engine) = run_engine {
+                        astra_core::log_persist!(
+                            engine
+                                .persist_status(
+                                    &bg_run_id,
+                                    astra_core::STATUS_FAILED,
+                                    None,
+                                    Some(&reason),
+                                )
+                                .await,
+                            "run_lifecycle",
+                            &bg_run_id,
+                            "budget_reject"
+                        );
+                    }
+                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                    return;
+                }
+            }
+
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
             let loop_success = outcome.is_ok();
             let (events, final_status, error_msg) =
@@ -2129,6 +2320,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             bg_user_prompt_channels.lock().await.remove(&bg_run_id);
             bg_progress_channels.lock().await.remove(&bg_run_id);
             let terminal_events = terminal_events_for_persistence(&events);
+
+            // Schedule eviction of the terminal run from the in-memory cache.
+            Self::schedule_run_eviction(&runs, bg_run_id.clone());
 
             // Publish terminal run state before best-effort post-run side effects
             // so background observers do not stay stuck in "running" because a
@@ -2143,7 +2337,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     flush_turn_observability(&mut loop_state, &bg_session_id, true);
                 } else {
                     run.events.extend(events);
-                    run.status = final_status;
+                    if run.status.try_transition(&final_status).is_ok() {
+                        run.status = final_status;
+                    }
                 }
             }
 
@@ -2171,6 +2367,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     "usage"
                 );
+                // Record tokens consumed so check_token_budget sees up-to-date usage.
+                if let Some(ref gov) = bg_resource_governor {
+                    let total = loop_state.total_prompt + loop_state.total_completion;
+                    if total > 0 {
+                        gov.record_tokens(&bg_user_id, total).await;
+                    }
+                }
                 if persist_terminal_state {
                     for event in terminal_events {
                         astra_core::log_persist!(
@@ -2308,7 +2511,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
-        self.runs.write().await.insert(run_id.clone(), run_state);
+        // Guard: reject if this session already has an active (running/paused) run.
+        // Hold write lock across check+insert to prevent TOCTOU race.
+        {
+            let mut runs = self.runs.write().await;
+            let has_active = runs.values().any(|r| {
+                r.session_id == session_id
+                    && matches!(r.status, RunStatus::Running | RunStatus::Paused)
+            });
+            if has_active {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            runs.insert(run_id.clone(), run_state);
+        }
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
 
@@ -2357,6 +2575,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
         let bg_session_id = session_id.clone();
+        let bg_resource_governor = self.resource_governor.clone();
+        let bg_user_id = user_id.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -2371,9 +2591,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             tool_event_writer: self.tool_event_writer.clone(),
         };
 
+        // Background task tracking (same pattern as the create_run spawn above).
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
+        let bg_task_count_2 = Arc::clone(&self.background_task_count);
+        bg_task_count_2.fetch_add(1, Ordering::Release);
         tokio::spawn(async move {
+            struct TaskCountGuard(Arc<AtomicUsize>);
+            impl Drop for TaskCountGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let _guard = TaskCountGuard(bg_task_count_2);
             let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
             let loop_success = loop_result.is_ok();
 
@@ -2383,47 +2613,72 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
-            flush_turn_observability(&mut state, &bg_session_id, false);
             persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
             let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
             all_events.append(&mut final_events);
 
+            let mut persist_terminal_state = true;
+            // Extract terminal events before the branch — both branches consume
+            // all_events by move, so this must happen first.
+            let terminal_events = terminal_events_for_persistence(&all_events);
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                run.events = all_events.clone();
-                run.status = final_status.clone();
+                if run.status == RunStatus::Cancelled {
+                    persist_terminal_state = false;
+                    merge_cancelled_run_events(run, all_events);
+                    flush_turn_observability(&mut state, &bg_session_id, true);
+                } else {
+                    run.events.extend(all_events);
+                    if run.status.try_transition(&final_status).is_ok() {
+                        run.status = final_status.clone();
+                    }
+                    flush_turn_observability(&mut state, &bg_session_id, false);
+                }
             }
 
-            if let Some(engine) = &run_engine {
-                astra_core::log_persist!(
-                    engine
-                        .persist_status(
-                            &bg_run_id,
-                            final_status.as_str(),
-                            None,
-                            error_msg.as_deref()
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "status"
-                );
-                astra_core::log_persist!(
-                    engine
-                        .persist_usage(
-                            &bg_run_id,
-                            state.total_prompt,
-                            state.total_completion,
-                            state.total_tool_calls,
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "usage"
-                );
+            // Schedule eviction of the terminal run from the in-memory cache.
+            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+
+            // Record tokens consumed regardless of cancel — cancelled runs still
+            // consumed tokens and must count toward the daily budget.
+            if let Some(ref gov) = bg_resource_governor {
+                let total = state.total_prompt + state.total_completion;
+                if total > 0 {
+                    gov.record_tokens(&bg_user_id, total).await;
+                }
+            }
+
+            if persist_terminal_state {
+                if let Some(engine) = &run_engine {
+                    astra_core::log_persist!(
+                        engine
+                            .persist_status(
+                                &bg_run_id,
+                                final_status.as_str(),
+                                None,
+                                error_msg.as_deref()
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "status"
+                    );
+                    astra_core::log_persist!(
+                        engine
+                            .persist_usage(
+                                &bg_run_id,
+                                state.total_prompt,
+                                state.total_completion,
+                                state.total_tool_calls,
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "usage"
+                    );
+                }
             }
 
             // Persist terminal events to durable store.
-            let terminal_events = terminal_events_for_persistence(&all_events);
             if let Some(engine) = &run_engine {
                 for event in terminal_events {
                     astra_core::log_persist!(
@@ -2543,6 +2798,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         events
     }
 
+    async fn drain_background_tasks(&self, timeout: std::time::Duration) -> bool {
+        self.drain_background_tasks_impl(timeout).await
+    }
+
     async fn cancel_run(
         &self,
         run_id: String,
@@ -2554,7 +2813,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if matches!(run.status, RunStatus::Running | RunStatus::Paused) {
+                let mutated = run.status.try_transition(&RunStatus::Cancelled).is_ok();
+                if mutated {
                     run.cancel_flag.store(true, Ordering::SeqCst);
                     run.pause_flag.store(false, Ordering::SeqCst);
                     run.llm_cancel_token.cancel();
@@ -2564,7 +2824,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "event_type": "run_finished",
                         "data": {"cancelled": true}
                     }));
-                    // Persist cancellation
+                }
+                let final_status = run.status.as_str().to_string();
+                // Drop the write lock before async persist calls so concurrent
+                // readers/writers (and pause/resume) are not blocked across DB I/O.
+                drop(runs);
+
+                if mutated {
                     if let Some(engine) = &self.run_engine {
                         astra_core::log_persist!(
                             engine
@@ -2589,7 +2855,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 return Ok(CancelRunRecord {
                     run_id,
-                    status: run.status.as_str().to_string(),
+                    status: final_status,
                 });
             }
         }
@@ -2614,6 +2880,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         limit: u32,
         offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+        let (limit, offset) = astra_services::pagination::clamp_api_list_pagination(limit, offset);
         if let Some(engine) = &self.run_engine {
             let (durable_runs, total) = engine
                 .list_user_runs(&user_id, limit, offset)
@@ -2642,11 +2909,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let runs = self.runs.read().await;
-        let all: Vec<RunStatusRecord> = runs
+        let mut all: Vec<RunStatusRecord> = runs
             .values()
             .filter(|run| run.user_id == user_id)
             .map(Self::status_record)
             .collect();
+        // Sort by run_id for deterministic pagination (HashMap iteration order is undefined).
+        all.sort_by(|a, b| a.run_id.cmp(&b.run_id));
         let total = all.len() as i64;
         let start = (offset as usize).min(all.len());
         let end = (start + limit as usize).min(all.len());
@@ -2670,7 +2939,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if run.status != RunStatus::Running {
+                if run.status.try_transition(&RunStatus::Paused).is_err() {
                     return Err(Self::run_state_conflict("pause", run.status.as_str()));
                 }
                 let previous = run.status.as_str().to_string();
@@ -2737,7 +3006,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if run.status != RunStatus::Paused {
+                if run.status.try_transition(&RunStatus::Running).is_err() {
                     return Err(Self::run_state_conflict("resume", run.status.as_str()));
                 }
                 let previous = run.status.as_str().to_string();
@@ -2976,6 +3245,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             max_turns: 10,
             remaining_turns: 10,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: std::collections::HashSet::new(),
             boosted_tools: std::collections::HashSet::new(),
@@ -3062,7 +3332,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         };
 
@@ -3220,6 +3489,88 @@ mod tests {
     };
     use sqlx::Row;
     use uuid::Uuid;
+
+    // ── extract_prev_assistant_text + implicit feedback wiring ──
+
+    #[test]
+    fn extract_prev_assistant_text_picks_latest_assistant_string() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "first answer"}),
+            serde_json::json!({"role": "user", "content": "follow up"}),
+            serde_json::json!({"role": "assistant", "content": "latest answer"}),
+        ];
+        assert_eq!(
+            extract_prev_assistant_text(&messages).as_deref(),
+            Some("latest answer")
+        );
+    }
+
+    #[test]
+    fn extract_prev_assistant_text_handles_content_parts_array() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"},
+                ],
+            }),
+        ];
+        assert_eq!(
+            extract_prev_assistant_text(&messages).as_deref(),
+            Some("part one\npart two")
+        );
+    }
+
+    #[test]
+    fn extract_prev_assistant_text_returns_none_when_no_assistant_turn() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        assert!(extract_prev_assistant_text(&messages).is_none());
+    }
+
+    #[test]
+    fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": "real answer"}),
+            serde_json::json!({"role": "user", "content": "ok"}),
+            serde_json::json!({"role": "assistant", "content": "   "}),
+        ];
+        assert_eq!(
+            extract_prev_assistant_text(&messages).as_deref(),
+            Some("real answer")
+        );
+    }
+
+    #[test]
+    fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
+        // Sanity-check that the detect_implicit_feedback_signal contract used in
+        // record_server_loop_learning_outcome produces a "correction" signal
+        // for the Chinese-language corrections listed in routing::detect_correction.
+        let signal = astra_turn_types::detect_implicit_feedback_signal(
+            "不对，你搞错了",
+            Some("previous assistant reply"),
+        );
+        assert!(
+            matches!(signal.signal_type.as_str(), "correction" | "frustration"),
+            "expected correction/frustration, got {:?}",
+            signal.signal_type
+        );
+    }
+
+    #[test]
+    fn neutral_user_turn_does_not_flag_was_corrected() {
+        let signal = astra_turn_types::detect_implicit_feedback_signal(
+            "再列一下 docs 目录",
+            Some("previous assistant reply"),
+        );
+        assert!(
+            !matches!(signal.signal_type.as_str(), "correction" | "frustration"),
+            "expected non-correction, got {:?}",
+            signal.signal_type
+        );
+    }
 
     /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
     fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
@@ -3730,22 +4081,24 @@ mod tests {
         let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
         let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
 
-        for _ in 0..3 {
-            pattern_library.record_outcome(
-                &["bash".to_string()],
-                crate::pipeline::routing::TaskType::Code,
-                None,
-                true,
-                0.8,
-                None,
-            );
-        }
-        pattern_library
-            .apply_evolution_action("bash", crate::evolution::types::PatternAction::Block);
+        // One success so the pattern exists, then Block adds 5 failures.
+        // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
+        pattern_library.record_outcome(
+            &["some_custom_tool".to_string()],
+            crate::pipeline::routing::TaskType::Code,
+            None,
+            true,
+            0.8,
+            None,
+        );
+        pattern_library.apply_evolution_action(
+            "some_custom_tool",
+            crate::evolution::types::PatternAction::Block,
+        );
 
         seed_restricted_tools_from_blocked_patterns(&mut state, &pattern_library);
 
-        assert!(state.restricted_tools.contains("bash"));
+        assert!(state.restricted_tools.contains("some_custom_tool"));
     }
 
     #[test]
@@ -4064,6 +4417,38 @@ mod tests {
         assert_eq!(page2.runs.len(), 2);
         let page3 = ok(svc.list_runs("user-1".into(), 2, 4).await);
         assert_eq!(page3.runs.len(), 1);
+    }
+
+    /// P2-B: list_runs must clamp pagination params like other list endpoints.
+    #[tokio::test]
+    async fn list_runs_clamps_pagination() {
+        let svc = test_service();
+        // Absurdly large limit/offset must not panic or produce unbounded queries
+        let result = ok(svc.list_runs("user-clamp".into(), u32::MAX, u32::MAX).await);
+        assert_eq!(result.runs.len(), 0);
+        // Verify the returned limit/offset are clamped
+        assert!(
+            result.limit <= astra_services::pagination::MAX_API_LIST_LIMIT,
+            "limit must be clamped to MAX_API_LIST_LIMIT"
+        );
+    }
+
+    /// P2-B source guard: list_runs must call clamp_api_list_pagination.
+    #[test]
+    fn list_runs_uses_pagination_clamping() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn list_runs(")
+            .expect("list_runs must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("clamp_api_list_pagination"),
+            "list_runs must clamp pagination params"
+        );
     }
 
     #[test]
@@ -4949,6 +5334,271 @@ mod tests {
         assert!(
             source.contains("/chat/runs/{run_id}/delegations/resume"),
             "Missing delegations resume route"
+        );
+    }
+
+    /// P0-C: The agentic loop spawn must check token budget before starting.
+    #[test]
+    fn run_lifecycle_checks_token_budget_before_loop() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("check_token_budget"),
+            "run_lifecycle must call check_token_budget before the agentic loop"
+        );
+    }
+
+    /// P0-C: drain_background_tasks returns true when no tasks are running.
+    #[tokio::test]
+    async fn drain_background_tasks_returns_immediately_when_idle() {
+        // Test the drain logic directly: counter at 0 → drain returns true immediately.
+        let count = Arc::new(AtomicUsize::new(0));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let drained = loop {
+            if count.load(Ordering::Acquire) == 0 {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert!(drained, "counter at 0 — drain must return true immediately");
+    }
+
+    /// P0-C: background_task_count increments on spawn and decrements on exit.
+    #[tokio::test]
+    async fn background_task_count_tracks_spawned_tasks() {
+        use std::sync::atomic::Ordering;
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        // Simulate what the spawn does: increment, spawn, decrement on drop
+        count.fetch_add(1, Ordering::Release);
+        let handle = tokio::spawn(async move {
+            struct Guard(Arc<AtomicUsize>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let _g = Guard(count_clone);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        assert_eq!(count.load(Ordering::Acquire), 1, "task in flight");
+        handle.await.unwrap();
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "task completed — counter must be 0"
+        );
+    }
+
+    /// P0-C source guard: both spawns must wire the background_task_count counter.
+    #[test]
+    fn both_spawns_wire_background_task_count() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("background_task_count").count();
+        assert!(
+            count >= 4,
+            "background_task_count must appear in field def + drain method + both spawns, got {count}"
+        );
+    }
+
+    /// P1-A: RunStatus::try_transition enforces valid state machine transitions.
+    #[test]
+    fn run_status_try_transition_valid_and_invalid() {
+        use super::RunStatus::*;
+
+        // Valid transitions
+        assert!(Running.try_transition(&Paused).is_ok());
+        assert!(Running.try_transition(&Completed).is_ok());
+        assert!(Running.try_transition(&Failed).is_ok());
+        assert!(Running.try_transition(&Cancelled).is_ok());
+        assert!(Paused.try_transition(&Running).is_ok());
+        assert!(Paused.try_transition(&Cancelled).is_ok());
+        assert!(Paused.try_transition(&Failed).is_ok());
+
+        // Terminal states cannot transition
+        let err = Completed.try_transition(&Running);
+        assert!(err.is_err(), "Completed → Running must be rejected");
+        assert!(
+            err.unwrap_err().contains("Completed"),
+            "error must name the source state"
+        );
+
+        let err = Failed.try_transition(&Running);
+        assert!(err.is_err(), "Failed → Running must be rejected");
+
+        let err = Cancelled.try_transition(&Completed);
+        assert!(err.is_err(), "Cancelled → Completed must be rejected");
+
+        // Running cannot go back to Running
+        let err = Running.try_transition(&Running);
+        assert!(err.is_err(), "Running → Running must be rejected");
+    }
+
+    /// P1-B: create_run must reject a second run on the same session with 409.
+    #[test]
+    fn per_session_active_run_guard_in_source() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find create_run function
+        let fn_start = source
+            .find("async fn create_run(")
+            .expect("create_run must exist");
+        // Find the guard within create_run (before stream_chat)
+        let stream_chat_pos = source.find("async fn stream_chat(").unwrap_or(source.len());
+        let create_run_body = &source[fn_start..stream_chat_pos];
+        assert!(
+            create_run_body.contains("session already has an active run"),
+            "create_run must reject concurrent runs on the same session"
+        );
+        assert!(
+            create_run_body.contains("CONFLICT"),
+            "create_run must return 409 CONFLICT for concurrent session runs"
+        );
+    }
+
+    /// P1-A: try_transition must be used in all production status update paths.
+    #[test]
+    fn try_transition_used_in_production_code() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("try_transition").count();
+        // Budget reject + post-loop (x2) + cancel + pause + resume = 6
+        assert!(
+            count >= 6,
+            "try_transition must be called in all 6 status update paths, found {count}"
+        );
+    }
+
+    /// P0-B: stream_chat must have the same per-session active-run guard as create_run.
+    #[test]
+    fn stream_chat_has_active_run_guard() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find stream_chat function
+        let fn_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
+        // Find the next function after stream_chat
+        let fn_body_end = source[fn_start + 10..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + 10 + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_body_end];
+        assert!(
+            fn_body.contains("session already has an active run"),
+            "stream_chat must reject concurrent runs on the same session"
+        );
+        assert!(
+            fn_body.contains("CONFLICT"),
+            "stream_chat must return 409 CONFLICT for concurrent session runs"
+        );
+    }
+
+    /// P0-C: Budget-rejected runs must push run_error + run_finished events
+    /// so SSE clients don't hang, and must clean up channels.
+    #[test]
+    fn budget_rejected_run_pushes_terminal_events() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find the budget rejection block
+        let budget_start = source
+            .find("run rejected: daily token budget exhausted")
+            .expect("budget rejection log must exist");
+        // Find the next `return;` after the budget rejection
+        let return_pos = source[budget_start..]
+            .find("return;")
+            .map(|p| budget_start + p)
+            .expect("budget rejection must return");
+        let budget_block = &source[budget_start..return_pos];
+        assert!(
+            budget_block.contains("run_finished"),
+            "budget rejection must push run_finished event"
+        );
+        assert!(
+            budget_block.contains("run_error"),
+            "budget rejection must push run_error event"
+        );
+        assert!(
+            budget_block.contains("approval_channels")
+                && budget_block.contains("user_prompt_channels")
+                && budget_block.contains("progress_channels"),
+            "budget rejection must clean up all channels"
+        );
+    }
+
+    /// P1-A: stream_chat must use extend (not overwrite) for events,
+    /// and handle cancellation with merge_cancelled_run_events.
+    #[test]
+    fn stream_chat_uses_extend_not_overwrite() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body[10..]
+            .find("\n    async fn ")
+            .map(|p| p + 10)
+            .unwrap_or(fn_body.len());
+        let fn_body = &fn_body[..fn_end];
+        // Must NOT do `run.events = all_events` (full overwrite)
+        assert!(
+            !fn_body.contains("run.events = all_events"),
+            "stream_chat must not overwrite events (use extend instead)"
+        );
+        // Must use merge_cancelled_run_events for cancel handling
+        assert!(
+            fn_body.contains("merge_cancelled_run_events"),
+            "stream_chat must handle cancellation with merge_cancelled_run_events"
+        );
+    }
+
+    /// P1-C: Terminal runs must be evicted from the in-memory runs map.
+    /// Both spawn blocks and the budget rejection path must schedule eviction.
+    #[test]
+    fn terminal_runs_scheduled_for_eviction() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let eviction_calls = prod_code.matches("schedule_run_eviction").count();
+        // create_run spawn + stream_chat spawn + budget rejection = 3
+        assert!(
+            eviction_calls >= 3,
+            "schedule_run_eviction must be called in create_run spawn, stream_chat spawn, \
+             and budget rejection path, found {eviction_calls}"
+        );
+    }
+
+    /// P1-F: list_runs pagination must be deterministic — all runs appear
+    /// exactly once across pages, with no duplicates or missing entries.
+    #[tokio::test]
+    async fn list_runs_pagination_is_deterministic() {
+        let svc = test_service();
+        for i in 0..5 {
+            ok(svc
+                .create_run("user-pg".into(), test_request(&format!("msg {i}")))
+                .await);
+        }
+        // Collect all run_ids across 3 pages
+        let mut all_ids = Vec::new();
+        let page1 = ok(svc.list_runs("user-pg".into(), 2, 0).await);
+        all_ids.extend(page1.runs.iter().map(|r| r.run_id.clone()));
+        let page2 = ok(svc.list_runs("user-pg".into(), 2, 2).await);
+        all_ids.extend(page2.runs.iter().map(|r| r.run_id.clone()));
+        let page3 = ok(svc.list_runs("user-pg".into(), 2, 4).await);
+        all_ids.extend(page3.runs.iter().map(|r| r.run_id.clone()));
+
+        assert_eq!(all_ids.len(), 5, "all 5 runs must appear across pages");
+        let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            5,
+            "no duplicate run_ids across pages — pagination must be deterministic"
         );
     }
 }

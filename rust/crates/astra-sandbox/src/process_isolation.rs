@@ -318,6 +318,17 @@ pub async fn execute_isolated(
     let wants_ns = config.pid_namespace || config.mount_namespace || config.net_namespace;
     let ns_available = wants_ns && unshare_available();
 
+    // Warn operators when namespace isolation was requested but is unavailable.
+    // This prevents silent security degradation in Strict mode.
+    if wants_ns && !ns_available {
+        tracing::warn!(
+            target: "astra_sandbox::process_isolation",
+            "namespace isolation unavailable (unshare not found or not permitted); \
+             running without PID/mount/network namespace isolation. \
+             If this is a Strict-mode sandbox, security guarantees are NOT met."
+        );
+    }
+
     // ── Build the command ────────────────────────────────────────────
     let (program, args) = if ns_available {
         let mut unshare_flags = Vec::new();
@@ -624,5 +635,48 @@ mod tests {
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let out = execute_isolated("exit 42", &env, &config).await;
         assert_eq!(out.exit_code, Some(42));
+    }
+
+    /// P1-K: execute_isolated must log a warning when namespace isolation
+    /// is requested but unavailable (Strict mode silent degradation).
+    #[test]
+    fn namespace_fallback_warning_in_source() {
+        let source = include_str!("process_isolation.rs");
+        // Find the execute_isolated function
+        let fn_start = source
+            .find("pub async fn execute_isolated")
+            .expect("execute_isolated must exist");
+        let fn_body = &source[fn_start..];
+        // The warning must appear before the command is built
+        let warn_pos = fn_body.find("namespace isolation unavailable");
+        let cmd_build_pos = fn_body.find("let (program, args)");
+        assert!(
+            warn_pos.is_some(),
+            "execute_isolated must log a warning when namespace isolation is unavailable"
+        );
+        assert!(
+            warn_pos.unwrap() < cmd_build_pos.unwrap_or(usize::MAX),
+            "namespace fallback warning must appear before command construction"
+        );
+    }
+
+    /// P1-K: IsolationConfig::strict() requests namespace isolation.
+    /// When unshare is unavailable, namespace_active must be false in output.
+    #[tokio::test]
+    async fn strict_mode_without_unshare_sets_namespace_active_false() {
+        // This test runs on any machine. If unshare IS available, namespace_active
+        // will be true (correct). If not, it must be false (not silently true).
+        let config = IsolationConfig::strict(PathBuf::from("/tmp"));
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let out = execute_isolated("echo ok", &env, &config).await;
+        // namespace_active must accurately reflect whether unshare was used
+        assert_eq!(
+            out.namespace_active,
+            unshare_available(),
+            "namespace_active must match unshare_available()"
+        );
+        // Either way, the command must have run
+        assert!(out.stdout.contains("ok") || out.exit_code == Some(0));
     }
 }

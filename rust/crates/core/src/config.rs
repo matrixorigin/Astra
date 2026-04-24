@@ -43,7 +43,7 @@ impl SkillSearchSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
     pub application: ApplicationSettings,
@@ -53,6 +53,27 @@ pub struct AppSettings {
     pub memoria_master_key: Option<String>,
     pub chat_turn_bridge_url: Option<String>,
     pub chat_turn_bridge_secret: String,
+}
+
+impl fmt::Debug for AppSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppSettings")
+            .field("matrixone", &self.matrixone)
+            .field("application", &self.application)
+            .field("jwt", &self.jwt)
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("memoria_base_url", &self.memoria_base_url)
+            .field(
+                "memoria_master_key",
+                &self.memoria_master_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("chat_turn_bridge_url", &self.chat_turn_bridge_url)
+            .field("chat_turn_bridge_secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl AppSettings {
@@ -74,37 +95,33 @@ impl AppSettings {
                 host: value_or_default(&lookup, "MATRIXONE_HOST", "localhost"),
                 port: parse_or_default(&lookup, "MATRIXONE_PORT", 6001)?,
                 user: value_or_default(&lookup, "MATRIXONE_USER", "root"),
-                password: value_or_default(
-                    &lookup,
-                    "MATRIXONE_PASSWORD",
-                    super::runtime_limits::DEV_MATRIXONE_PASSWORD,
-                ),
+                password: required_value(&lookup, "MATRIXONE_PASSWORD", "111")?,
                 database: resolve_database_name(&lookup),
             },
             application: ApplicationSettings {
                 app_env: value_or_default(&lookup, "APP_ENV", "development"),
                 log_level: value_or_default(&lookup, "LOG_LEVEL", "DEBUG"),
-                secret_key: value_or_default(
+                secret_key: required_value(
                     &lookup,
                     "SECRET_KEY",
                     "dev-secret-key-change-in-production",
-                ),
+                )?,
             },
             jwt: JwtSettings::from_lookup(&lookup)?,
             github_token: optional_value(&lookup, "GITHUB_TOKEN"),
             memoria_base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
             memoria_master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
             chat_turn_bridge_url: optional_value(&lookup, "CHAT_TURN_BRIDGE_URL"),
-            chat_turn_bridge_secret: value_or_default(
+            chat_turn_bridge_secret: required_value(
                 &lookup,
                 "CHAT_TURN_BRIDGE_SECRET",
                 "dev-bridge-secret-change-me",
-            ),
+            )?,
         })
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MatrixOneSettings {
     pub host: String,
     pub port: u16,
@@ -113,8 +130,33 @@ pub struct MatrixOneSettings {
     pub database: String,
 }
 
+impl fmt::Debug for MatrixOneSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatrixOneSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
 impl MatrixOneSettings {
+    /// Returns the database URL with password REDACTED — safe for logging.
+    ///
+    /// Use [`MatrixOneSettings::database_url_with_password`] when an actual
+    /// connection string is required (e.g. constructing a sqlx pool).
     pub fn database_url(&self) -> String {
+        format!(
+            "mysql://{}:[REDACTED]@{}:{}/{}",
+            self.user, self.host, self.port, self.database
+        )
+    }
+
+    /// Returns the database URL with the actual password — use ONLY for DB
+    /// connection construction. Never log the result.
+    pub fn database_url_with_password(&self) -> String {
         format!(
             "mysql://{}:{}@{}:{}/{}",
             self.user, self.password, self.host, self.port, self.database
@@ -122,11 +164,21 @@ impl MatrixOneSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApplicationSettings {
     pub app_env: String,
     pub log_level: String,
     pub secret_key: String,
+}
+
+impl fmt::Debug for ApplicationSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplicationSettings")
+            .field("app_env", &self.app_env)
+            .field("log_level", &self.log_level)
+            .field("secret_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ApplicationSettings {
@@ -139,7 +191,7 @@ impl ApplicationSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JwtSettings {
     pub secret_key: String,
     pub algorithm: String,
@@ -147,12 +199,26 @@ pub struct JwtSettings {
     pub refresh_token_expire_days: u32,
 }
 
+impl fmt::Debug for JwtSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JwtSettings")
+            .field("secret_key", &"[REDACTED]")
+            .field("algorithm", &self.algorithm)
+            .field(
+                "access_token_expire_minutes",
+                &self.access_token_expire_minutes,
+            )
+            .field("refresh_token_expire_days", &self.refresh_token_expire_days)
+            .finish()
+    }
+}
+
 impl JwtSettings {
     fn from_lookup<F>(lookup: &F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
     {
-        let secret = value_or_default(lookup, "JWT_SECRET_KEY", "change-me-in-production");
+        let secret = required_value(lookup, "JWT_SECRET_KEY", "change-me-in-production")?;
         Ok(Self {
             secret_key: normalize_jwt_secret(&secret),
             algorithm: value_or_default(lookup, "JWT_ALGORITHM", "HS256"),
@@ -173,6 +239,7 @@ impl JwtSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     InvalidInteger { key: &'static str, value: String },
+    MissingRequiredKey { name: &'static str },
 }
 
 impl fmt::Display for ConfigError {
@@ -180,6 +247,14 @@ impl fmt::Display for ConfigError {
         match self {
             Self::InvalidInteger { key, value } => {
                 write!(f, "invalid integer for {key}: {value}")
+            }
+            Self::MissingRequiredKey { name } => {
+                write!(
+                    f,
+                    "required configuration key `{name}` is unset; set the env var or \
+                     opt into bundled insecure defaults with ASTRA_ALLOW_INSECURE_DEFAULTS=1 \
+                     (NOT for production)"
+                )
             }
         }
     }
@@ -219,6 +294,40 @@ where
     F: Fn(&str) -> Option<String>,
 {
     lookup(key).unwrap_or_else(|| default.to_string())
+}
+
+/// Returns the value from the lookup, or an insecure default if
+/// `ASTRA_ALLOW_INSECURE_DEFAULTS=1` is set in the same lookup.
+///
+/// In production (no opt-in), missing required keys return
+/// `Err(ConfigError::MissingRequiredKey)`.
+///
+/// # Dev escape hatch
+/// Set `ASTRA_ALLOW_INSECURE_DEFAULTS=1` to permit the bundled defaults.
+/// This emits a `tracing::error!` warning once and MUST NOT be used in production.
+fn required_value<F>(
+    lookup: &F,
+    key: &'static str,
+    insecure_default: &str,
+) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(val) = lookup(key) {
+        return Ok(val);
+    }
+    if lookup("ASTRA_ALLOW_INSECURE_DEFAULTS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        tracing::error!(
+            key = key,
+            "INSECURE DEFAULTS — DO NOT USE IN PRODUCTION: {} is using bundled default",
+            key
+        );
+        return Ok(insecure_default.to_string());
+    }
+    Err(ConfigError::MissingRequiredKey { name: key })
 }
 
 fn optional_value<F>(lookup: &F, key: &'static str) -> Option<String>
@@ -286,9 +395,89 @@ mod tests {
             database: "agent".into(),
         };
 
+        // Default `database_url()` returns the masked form for safe logging.
         assert_eq!(
             settings.database_url(),
+            "mysql://alice:[REDACTED]@db:3306/agent"
+        );
+        assert_eq!(
+            settings.database_url_with_password(),
             "mysql://alice:secret@db:3306/agent"
+        );
+    }
+
+    #[test]
+    fn jwt_settings_debug_redacts_secret() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let debug_str = format!("{:?}", settings.jwt);
+        assert!(
+            !debug_str.contains("change-me-in-production"),
+            "secret should be redacted: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should show [REDACTED]: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn matrixone_settings_debug_redacts_password() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let debug_str = format!("{:?}", settings.matrixone);
+        assert!(
+            !debug_str.contains("\"111\""),
+            "password should be redacted: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "should show [REDACTED]: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn matrixone_settings_database_url_is_masked() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let url = settings.matrixone.database_url();
+        assert!(
+            !url.contains(":111@"),
+            "masked url should not contain password: {url}"
+        );
+        assert!(
+            url.contains("[REDACTED]"),
+            "masked url should contain [REDACTED]: {url}"
+        );
+        let url_with_pw = settings.matrixone.database_url_with_password();
+        assert!(
+            url_with_pw.contains(":111@"),
+            "url_with_password should contain actual password: {url_with_pw}"
+        );
+    }
+
+    #[test]
+    fn app_settings_debug_redacts_optional_secrets() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        m.insert("GITHUB_TOKEN".into(), "ghp_supersecret_token".into());
+        m.insert("MEMORIA_MASTER_KEY".into(), "memoria-master-key-xyz".into());
+        let settings = AppSettings::from_map(&m).unwrap();
+        let debug_str = format!("{settings:?}");
+        assert!(
+            !debug_str.contains("ghp_supersecret_token"),
+            "github_token should be redacted: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("memoria-master-key-xyz"),
+            "memoria_master_key should be redacted: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("dev-bridge-secret-change-me"),
+            "chat_turn_bridge_secret should be redacted: {debug_str}"
         );
     }
 
@@ -313,7 +502,9 @@ mod tests {
 
     #[test]
     fn jwt_settings_match_runtime_defaults_and_padding() {
-        let settings = AppSettings::from_map(&HashMap::new()).expect("defaults should parse");
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).expect("defaults should parse");
 
         assert_eq!(settings.jwt.algorithm, "HS256");
         assert_eq!(settings.jwt.access_token_expire_minutes, 60);
@@ -328,8 +519,53 @@ mod tests {
     }
 
     #[test]
+    fn from_lookup_missing_required_keys_returns_error() {
+        let m = HashMap::new(); // no ASTRA_ALLOW_INSECURE_DEFAULTS
+        let result = AppSettings::from_map(&m);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::MissingRequiredKey { .. } => {}
+            other => panic!("expected MissingRequiredKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_explicit_required_values_work() {
+        let mut m = HashMap::new();
+        m.insert("MATRIXONE_PASSWORD".into(), "testpw".into());
+        m.insert("SECRET_KEY".into(), "test-secret".into());
+        m.insert("JWT_SECRET_KEY".into(), "my-test-jwt-secret-key-123".into());
+        m.insert("CHAT_TURN_BRIDGE_SECRET".into(), "bridge-secret".into());
+        let result = AppSettings::from_map(&m);
+        assert!(result.is_ok(), "explicit values should parse: {:?}", result);
+        let settings = result.unwrap();
+        assert!(
+            settings
+                .jwt
+                .secret_key
+                .starts_with("my-test-jwt-secret-key-123")
+        );
+        assert_eq!(settings.matrixone.password, "testpw");
+        assert_eq!(settings.application.secret_key, "test-secret");
+        assert_eq!(settings.chat_turn_bridge_secret, "bridge-secret");
+    }
+
+    #[test]
+    fn from_lookup_insecure_defaults_allowed_with_opt_in() {
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let result = AppSettings::from_map(&m);
+        assert!(
+            result.is_ok(),
+            "insecure defaults should parse with opt-in: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn app_settings_database_includes_prefix() {
         let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
         m.insert("ASTRA_DATABASE".into(), "agent_db".into());
         m.insert("ASTRA_DATABASE_PREFIX".into(), "ci_".into());
         let settings = AppSettings::from_map(&m).expect("parse");
@@ -395,7 +631,9 @@ mod settings_contract_tests {
     #[test]
     fn defaults_match_shared_contract() {
         let contract = load_contract();
-        let settings = AppSettings::from_map(&HashMap::new()).expect("defaults should parse");
+        let mut m = HashMap::new();
+        m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
+        let settings = AppSettings::from_map(&m).expect("defaults should parse");
 
         assert_eq!(flatten(settings), contract.defaults);
     }

@@ -1640,6 +1640,52 @@ mod tests {
         assert_eq!(r["name"], "");
     }
 
+    /// Phase-R9 contract pin: the synthetic tool_result produced for a
+    /// denied tool has EXACTLY three top-level fields (`tool_call_id`,
+    /// `name`, `result`) and `tool_call_id` equals the original tool
+    /// call's `id`. If a future change adds/removes fields or loses the
+    /// id round-trip, this assertion fails loudly.
+    #[test]
+    fn persist_denied_result_exact_shape_and_tool_call_id_round_trip() {
+        let tc = json!({
+            "id": "call_abc_xyz",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": "{\"path\":\"/tmp/x\"}"}
+        });
+        let r = persist_denied_tool_result(&tc, Some("path outside workspace"));
+        let obj = r.as_object().expect("result is a JSON object");
+
+        // Exact field set.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["name", "result", "tool_call_id"],
+            "persist_denied_tool_result exposes exactly these three fields"
+        );
+
+        // tool_call_id equals the original tool call's id.
+        assert_eq!(obj["tool_call_id"].as_str(), Some("call_abc_xyz"));
+        assert_eq!(obj["name"].as_str(), Some("write_file"));
+
+        // result is a STRING (JSON-encoded directive payload), not a
+        // nested object — this is the on-the-wire contract.
+        let result_str = obj["result"]
+            .as_str()
+            .expect("result must be a string (stringified JSON directive)");
+        let parsed: Value =
+            serde_json::from_str(result_str).expect("result is valid JSON string payload");
+        assert_eq!(parsed["error"].as_str(), Some("user_denied"));
+        assert_eq!(parsed["reason"].as_str(), Some("path outside workspace"));
+        assert!(
+            parsed["directive"]
+                .as_str()
+                .unwrap()
+                .starts_with("The user REJECTED this tool call."),
+            "directive must open with the canonical rejection sentence"
+        );
+    }
+
     // ──────────────────────────────────────────────────────────
     // sse_maps_through_tool_request
     // ──────────────────────────────────────────────────────────

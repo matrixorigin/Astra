@@ -73,6 +73,18 @@ pub struct ToolQualityEntry {
     pub quality_sum: f64,
 }
 
+/// Persistence-friendly view of a single tracker entry.
+///
+/// `ToolQualityTracker` stores entries in a `HashMap` (iteration order
+/// non-deterministic). For persisted snapshots we flatten into a stable
+/// sorted `Vec` so byte-for-byte comparisons and cloud-merge behave.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolQualityPersistEntry {
+    pub name: String,
+    #[serde(flatten)]
+    pub entry: ToolQualityEntry,
+}
+
 impl ToolQualityEntry {
     /// Effectiveness score: how often this tool is actually used when selected.
     /// Range: 0.0 to 1.0.
@@ -143,6 +155,40 @@ impl ToolQualityTracker {
     /// Get all tracked tool quality entries.
     pub fn all_entries(&self) -> &std::collections::HashMap<String, ToolQualityEntry> {
         &self.scores
+    }
+
+    /// Export all entries as a sorted list suitable for persistence.
+    ///
+    /// Sorted by tool name for deterministic byte output and stable diffs
+    /// when merging local/cloud snapshots.
+    pub fn export(&self) -> Vec<ToolQualityPersistEntry> {
+        let mut out: Vec<ToolQualityPersistEntry> = self
+            .scores
+            .iter()
+            .map(|(name, entry)| ToolQualityPersistEntry {
+                name: name.clone(),
+                entry: entry.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Additive merge of persisted entries into this tracker.
+    ///
+    /// For each incoming `(name, entry)` pair, counters (`selections`, `uses`,
+    /// `quality_sum`) are summed into the existing entry, or inserted if
+    /// unseen. This matches `record_selection` / `record_feedback` semantics:
+    /// historical observations accumulate across sessions.
+    pub fn merge(&mut self, entries: &[ToolQualityPersistEntry]) {
+        for incoming in entries {
+            let existing = self.scores.entry(incoming.name.clone()).or_default();
+            existing.selections = existing
+                .selections
+                .saturating_add(incoming.entry.selections);
+            existing.uses = existing.uses.saturating_add(incoming.entry.uses);
+            existing.quality_sum += incoming.entry.quality_sum;
+        }
     }
 }
 
@@ -289,5 +335,47 @@ mod tests {
             high_boost > low_boost,
             "high quality {high_boost} should beat low quality {low_boost}"
         );
+    }
+
+    #[test]
+    fn export_sorts_by_name_and_round_trips_through_merge() {
+        let mut tracker = ToolQualityTracker::new();
+        tracker.record_selection(&["grep".into(), "bash".into(), "apply_patch".into()]);
+        tracker.record_feedback(&SelectionFeedback {
+            tools_used: vec!["grep".into()],
+            unused_count: 2,
+            precision: 1.0 / 3.0,
+            recall: 1.0,
+        });
+        tracker.record_quality("grep", 0.9);
+
+        let exported = tracker.export();
+        let names: Vec<_> = exported.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["apply_patch", "bash", "grep"]);
+
+        let mut fresh = ToolQualityTracker::new();
+        fresh.merge(&exported);
+        let restored_grep = fresh.all_entries().get("grep").expect("grep entry");
+        assert_eq!(restored_grep.selections, 1);
+        assert_eq!(restored_grep.uses, 1);
+        assert!((restored_grep.quality_sum - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_is_additive_across_sessions() {
+        let mut session_one = ToolQualityTracker::new();
+        session_one.record_selection(&["bash".into()]);
+        session_one.record_selection(&["bash".into()]);
+        session_one.record_quality("bash", 0.8);
+
+        let mut session_two = ToolQualityTracker::new();
+        session_two.record_selection(&["bash".into()]);
+        session_two.record_quality("bash", 0.6);
+        // Rehydrate session_two from session_one's snapshot.
+        session_two.merge(&session_one.export());
+
+        let entry = session_two.all_entries().get("bash").expect("bash entry");
+        assert_eq!(entry.selections, 3);
+        assert!((entry.quality_sum - (0.8 + 0.6)).abs() < 1e-9);
     }
 }

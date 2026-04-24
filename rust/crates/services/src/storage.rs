@@ -1288,7 +1288,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             execution_id  VARCHAR(64)  PRIMARY KEY,
             team_id       VARCHAR(64)  NOT NULL,
             user_id       VARCHAR(64)  NOT NULL,
-            task          TEXT         NOT NULL,
+            `task`        TEXT         NOT NULL,
             status        VARCHAR(32)  NOT NULL DEFAULT 'pending',
             result_json   LONGTEXT,
             started_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -1430,7 +1430,7 @@ pub async fn log_session_audit(
     session_id: &str,
     details: serde_json::Value,
 ) {
-    let _ = query(
+    if let Err(e) = query(
         "INSERT INTO auth_audit_logs \
          (log_id, user_id, action, resource_type, resource_id, details, created_at) \
          VALUES (?, ?, ?, 'session', ?, ?, NOW())",
@@ -1441,7 +1441,17 @@ pub async fn log_session_audit(
     .bind(session_id)
     .bind(details.to_string())
     .execute(pool)
-    .await;
+    .await
+    {
+        tracing::warn!(
+            target: "astra_services::storage",
+            user_id = %user_id,
+            action = %action,
+            session_id = %session_id,
+            error = %e,
+            "failed to write auth audit log"
+        );
+    }
 }
 
 pub async fn update_turn_skill_selection_version(

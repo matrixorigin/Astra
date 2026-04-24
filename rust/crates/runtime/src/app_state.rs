@@ -102,6 +102,9 @@ pub struct AppState {
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool,
+    /// Shared HTTP client for upstream LLM proxy requests (completions handler).
+    /// Reuses connection pool and TLS state across requests.
+    pub(crate) http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -196,6 +199,12 @@ impl AppState {
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
             edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool::new(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("failed to build shared HTTP client"),
         }
     }
 
@@ -209,10 +218,7 @@ impl AppState {
         self.memoria_forwarder = if key.is_empty() {
             Arc::new(NoopMemoriaForwarder)
         } else {
-            Arc::new(ReqwestMemoriaForwarder {
-                base_url: base_url.clone(),
-                master_key: key,
-            })
+            Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
         self.memoria_base_url = base_url;
         self.memoria_master_key = master_key;
@@ -643,6 +649,23 @@ impl Default for ServiceInfo {
 pub struct ReqwestMemoriaForwarder {
     pub base_url: String,
     pub master_key: String,
+    client: reqwest::Client,
+}
+
+impl ReqwestMemoriaForwarder {
+    pub fn new(base_url: String, master_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build Memoria HTTP client");
+        Self {
+            base_url,
+            master_key,
+            client,
+        }
+    }
 }
 
 #[async_trait]
@@ -653,11 +676,8 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}{}", self.base_url, endpoint);
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|e| format!("Memoria client build error: {e}"))?;
-        let resp = client
+        let resp = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.master_key))
             .json(&body)
@@ -706,7 +726,7 @@ impl HealthChecker for MatrixOneHealthChecker {
         let pool = match MySqlPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(2))
-            .connect(&self.settings.database_url())
+            .connect(&self.settings.database_url_with_password())
             .await
         {
             Ok(pool) => pool,
@@ -756,5 +776,67 @@ mod tests {
         async fn database_healthy(&self) -> bool {
             true
         }
+    }
+
+    /// audit-A1: ReqwestMemoriaForwarder must set connect_timeout and timeout
+    /// so a hung Memoria server cannot block the Axum handler indefinitely.
+    /// This test starts a real TCP listener that accepts but never responds,
+    /// proving the client times out instead of hanging forever.
+    #[tokio::test]
+    async fn memoria_forwarder_times_out_on_unresponsive_server() {
+        // Black-hole server: accepts connections, never sends a response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                // Hold the connection open, never respond.
+                tokio::spawn(async move {
+                    let _ = tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let forwarder =
+            ReqwestMemoriaForwarder::new(format!("http://{addr}"), "test-key".to_string());
+
+        let start = std::time::Instant::now();
+        let result = forwarder
+            .forward(
+                "/v1/memories/retrieve",
+                serde_json::json!({"query": "test"}),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "should fail with timeout, got: {result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "should time out well before 60s, took {elapsed:?}"
+        );
+    }
+
+    /// P1-B: ReqwestMemoriaForwarder must NOT create a per-request client.
+    /// The `forward` method must reuse `self.client`.
+    #[test]
+    fn memoria_forwarder_reuses_client() {
+        let source = include_str!("app_state.rs");
+        let impl_start = source
+            .find("impl MemoriaForwarder for ReqwestMemoriaForwarder")
+            .expect("impl block must exist");
+        let impl_end = source[impl_start..]
+            .find("\n/// ")
+            .map(|p| impl_start + p)
+            .unwrap_or(source.len());
+        let impl_body = &source[impl_start..impl_end];
+        assert!(
+            !impl_body.contains("Client::builder"),
+            "forward() must not create a per-request client — use self.client"
+        );
+        assert!(
+            impl_body.contains("self.client") || impl_body.contains("self\n            .client"),
+            "forward() must use the shared self.client"
+        );
     }
 }

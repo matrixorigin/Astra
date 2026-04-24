@@ -37,7 +37,7 @@ pub(crate) enum ReadDedupKey {
 }
 
 /// Tracks the last-read state of a file for staleness detection and dedup.
-pub(super) struct FileState {
+pub(crate) struct FileState {
     /// mtime (milliseconds) at the time of last read/write.
     pub(super) timestamp_ms: u128,
     /// True if the last operation was a read (not a write/edit).
@@ -524,5 +524,92 @@ mod tests {
         let mut ranges = vec![(1, 100)];
         merge_range(&mut ranges, 103, 200);
         assert_eq!(ranges, vec![(1, 100), (103, 200)]);
+    }
+
+    // ── Shared file-state across subtask turns ───────────────────────────
+
+    /// Simulate plan executor: two ToolExecutors sharing the same file_state.
+    /// A file read in subtask 1 should allow editing in subtask 2.
+    #[test]
+    fn shared_file_state_read_in_turn1_edit_in_turn2() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("foo.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        // Subtask 1: create executor, read the file
+        let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe1.record_read(&file, false, ReadDedupKey::Full);
+
+        // Extract shared state
+        let shared = exe1.shared_file_state();
+
+        // Subtask 2: new executor wired with shared state
+        let exe2 = crate::edge_tools::ToolExecutor::new(dir.path()).with_shared_file_state(shared);
+
+        // Edit should succeed — file was read in subtask 1
+        assert!(
+            exe2.check_staleness(&file).is_ok(),
+            "file read in subtask 1 must be visible in subtask 2"
+        );
+    }
+
+    /// Without sharing, a fresh executor rejects edits on files read by a prior executor.
+    #[test]
+    fn unshared_file_state_rejects_edit_across_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bar.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe1.record_read(&file, false, ReadDedupKey::Full);
+
+        // Fresh executor without sharing — should reject
+        let exe2 = crate::edge_tools::ToolExecutor::new(dir.path());
+        assert!(
+            exe2.check_staleness(&file).is_err(),
+            "fresh executor must reject edit on unread file"
+        );
+    }
+
+    /// Write in subtask 1 should register the file so subtask 2 can edit it.
+    #[test]
+    fn shared_file_state_write_in_turn1_edit_in_turn2() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("new.rs");
+        std::fs::write(&file, "// created").unwrap();
+
+        let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe1.record_write(&file);
+
+        let shared = exe1.shared_file_state();
+        let exe2 = crate::edge_tools::ToolExecutor::new(dir.path()).with_shared_file_state(shared);
+
+        assert!(
+            exe2.check_staleness(&file).is_ok(),
+            "file written in subtask 1 must be editable in subtask 2"
+        );
+    }
+
+    /// External modification between subtasks should be detected even with shared state.
+    #[test]
+    fn shared_file_state_detects_external_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mod.rs");
+        std::fs::write(&file, "v1").unwrap();
+
+        let exe1 = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe1.record_read(&file, false, ReadDedupKey::Full);
+
+        // Simulate external modification (user edit, linter, etc.)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&file, "v2").unwrap();
+
+        let shared = exe1.shared_file_state();
+        let exe2 = crate::edge_tools::ToolExecutor::new(dir.path()).with_shared_file_state(shared);
+
+        assert!(
+            exe2.check_staleness(&file).is_err(),
+            "externally modified file must be rejected even with shared state"
+        );
     }
 }

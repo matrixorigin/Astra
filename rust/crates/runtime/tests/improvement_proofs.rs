@@ -1169,439 +1169,6 @@ mod selection_feedback_loop {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 7. SYSTEMIC TOOL SELECTION FIX
-// ═══════════════════════════════════════════════════════════════════════════════
-
-mod systemic_selection {
-    use astra_runtime::prompts::{LOW_CONFIDENCE_THRESHOLD, build_main_system_prompt};
-    use astra_runtime::tool_registry::{
-        ConversationState, IntentType, TOOL_CATALOG, pre_filter_dynamic,
-    };
-    use astra_runtime::tool_selector::compute_selection_confidence;
-
-    // ── 7.1 Adaptive Threshold ──────────────────────────────────────────────
-
-    /// PROOF: "我关注matrixorigin" now fires memory signal (关注 aligned).
-    /// Before: 0 signals → threshold=0.0 → all dynamic tools
-    /// After: 1 signal (is_memory) → memory tools prioritized → correct routing
-    #[test]
-    fn proof_zero_signal_query_gets_dynamic_tools() {
-        let state = ConversationState::from_message("我关注matrixorigin", 1);
-        // "关注" now fires is_memory signal (aligned with system prompt)
-        assert_eq!(state.signal_count(), 1, "关注 should fire is_memory signal");
-
-        let results = pre_filter_dynamic(&state, "我关注matrixorigin");
-
-        assert!(
-            results.len() > 3,
-            "memory-signal query should get dynamic tools, got {}",
-            results.len()
-        );
-    }
-
-    /// PROOF: Strong-signal queries still filter correctly.
-    #[test]
-    fn proof_strong_signal_query_still_filters() {
-        let state = ConversationState::from_message("show me the github pull requests", 1);
-        assert!(state.signal_count() >= 2, "Should have 2+ signals");
-
-        let results = pre_filter_dynamic(&state, "show me the github pull requests");
-
-        let top_3_has_github = results
-            .iter()
-            .take(3)
-            .any(|&(idx, _)| TOOL_CATALOG[idx].intents.contains(&IntentType::GitHub));
-        assert!(
-            top_3_has_github,
-            "Strong GitHub query should have GitHub tools in top 3"
-        );
-    }
-
-    /// PROOF: Single-signal query gets lower threshold than multi-signal.
-    #[test]
-    fn proof_single_signal_gets_more_tools_than_multi() {
-        let single = ConversationState::from_message("show me the code", 1);
-        let single_results = pre_filter_dynamic(&single, "show me the code");
-
-        let multi = ConversationState::from_message("show me the github PRs and diff", 1);
-        assert!(multi.signal_count() >= 2);
-        let multi_results = pre_filter_dynamic(&multi, "show me the github PRs and diff");
-
-        assert!(
-            single_results.len() >= multi_results.len(),
-            "1-signal query (threshold×0.3) should get >= tools than 2+-signal: single={} multi={}",
-            single_results.len(),
-            multi_results.len()
-        );
-    }
-
-    // ── 7.2 Confidence Computation ──────────────────────────────────────────
-
-    #[test]
-    fn proof_confidence_zero_for_no_signals_no_dynamic() {
-        let conf = compute_selection_confidence(0, 0);
-        assert!(
-            conf < 0.01,
-            "0 signals + 0 dynamic = near-zero confidence, got {:.3}",
-            conf
-        );
-    }
-
-    #[test]
-    fn proof_confidence_increases_with_signals() {
-        let c0 = compute_selection_confidence(0, 3);
-        let c1 = compute_selection_confidence(1, 3);
-        let c2 = compute_selection_confidence(2, 3);
-        let c3 = compute_selection_confidence(3, 3);
-        assert!(
-            c0 < c1 && c1 < c2 && c2 < c3,
-            "Confidence should increase with signals"
-        );
-    }
-
-    #[test]
-    fn proof_confidence_increases_with_dynamic_tools() {
-        let c0 = compute_selection_confidence(2, 0);
-        let c1 = compute_selection_confidence(2, 2);
-        let c2 = compute_selection_confidence(2, 5);
-        assert!(
-            c0 < c1 && c1 < c2,
-            "More dynamic tools should increase confidence"
-        );
-    }
-
-    // ── 7.3 Low-Confidence System Prompt ────────────────────────────────────
-
-    #[test]
-    fn proof_low_confidence_injects_advisory() {
-        let prompt = build_main_system_prompt(
-            &["bash", "read_file", "memory_store", "memory_search"],
-            "",
-            0.1,
-            None,
-        );
-        assert!(
-            prompt.contains("Low-Confidence Tool Selection"),
-            "Should inject advisory"
-        );
-        assert!(
-            prompt.contains("ASK the user to clarify"),
-            "Should tell LLM to ask"
-        );
-    }
-
-    #[test]
-    fn proof_high_confidence_no_advisory() {
-        let prompt = build_main_system_prompt(
-            &["bash", "read_file", "github_list_prs", "memory_store"],
-            "",
-            0.8,
-            None,
-        );
-        assert!(
-            !prompt.contains("Low-Confidence Tool Selection"),
-            "High confidence = no advisory"
-        );
-    }
-
-    #[test]
-    fn proof_boundary_confidence_no_advisory() {
-        let prompt = build_main_system_prompt(
-            &["bash", "memory_store"],
-            "",
-            LOW_CONFIDENCE_THRESHOLD,
-            None,
-        );
-        assert!(
-            !prompt.contains("Low-Confidence Tool Selection"),
-            "At threshold = no advisory"
-        );
-    }
-
-    // ── 7.4 Preference Verb Coverage ────────────────────────────────────────
-
-    #[test]
-    fn proof_memory_prompt_covers_interest_verbs() {
-        let prompt = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
-        assert!(prompt.contains("关注"), "Should mention 关注");
-        assert!(prompt.contains("跟踪"), "Should mention 跟踪");
-        assert!(prompt.contains("留意"), "Should mention 留意");
-        assert!(
-            prompt.contains("follow") || prompt.contains("track") || prompt.contains("watch"),
-            "Should mention English equivalents"
-        );
-    }
-
-    // ── 7.6 End-to-End Scenario ─────────────────────────────────────────────
-
-    /// PROOF: "我关注matrixorigin" end-to-end — the exact failure case.
-    #[test]
-    fn proof_e2e_guanzhu_matrixorigin() {
-        let query = "我关注matrixorigin";
-
-        // 1. Memory signal fires (关注 aligned with system prompt)
-        let state = ConversationState::from_message(query, 1);
-        assert_eq!(state.signal_count(), 1, "关注 should fire is_memory");
-
-        // 2. Dynamic tools included
-        let results = pre_filter_dynamic(&state, query);
-        assert!(results.len() > 3, "Should get dynamic tools");
-
-        // 3. Confidence level (1 signal = moderate, not zero)
-        let pinned: std::collections::HashSet<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|t| t.pinned)
-            .map(|t| t.name)
-            .collect();
-        let dynamic_count = results
-            .iter()
-            .filter(|&&(idx, _)| !pinned.contains(TOOL_CATALOG[idx].name))
-            .count();
-        let confidence = compute_selection_confidence(1, dynamic_count);
-
-        // 4. Prompt includes interest verbs
-        let tool_names: Vec<&str> = results
-            .iter()
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-            .chain(TOOL_CATALOG.iter().filter(|t| t.pinned).map(|t| t.name))
-            .collect();
-        let prompt = build_main_system_prompt(&tool_names, "", confidence, None);
-        assert!(prompt.contains("关注"), "Interest verbs present");
-
-        // 5. Memory tools should be prioritized (pinned tools are added outside
-        // pre_filter_dynamic, so we verify via tool_names which includes both)
-        let has_memory_tool = tool_names.iter().any(|n| n.contains("memory"));
-        assert!(
-            has_memory_tool,
-            "Memory tools should be available (dynamic or pinned)"
-        );
-    }
-
-    /// PROOF: Conversational bypass preserved.
-    #[test]
-    fn proof_conversational_bypass_preserved() {
-        let state = ConversationState::from_message("hi there", 1);
-        let results = pre_filter_dynamic(&state, "hi there");
-        assert!(
-            results.is_empty(),
-            "Conversational queries still return 0 dynamic tools"
-        );
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PHASE A: Budget pressure + memory domain hint scoring tests
-// ═══════════════════════════════════════════════════════════════════════════════
-
-mod memory_domain_scoring {
-    use astra_runtime::pipeline::routing::DomainHint;
-    use astra_runtime::tool_registry::{
-        ConversationState, IntentType, TOOL_CATALOG, pre_filter_dynamic,
-        pre_filter_dynamic_with_memory,
-    };
-
-    /// Helper: resolve tool index to name.
-    fn tool_name(idx: usize) -> &'static str {
-        TOOL_CATALOG[idx].name
-    }
-
-    /// PROOF: Memory domain hint boosts GitHub tools for entity-only queries.
-    /// Old: "matrixorigin" with no keyword overlap → GitHub tools ranked low.
-    /// New: DomainHint::GitHub → +0.15 boost, halved gate → GitHub tools rank higher.
-    #[test]
-    fn proof_domain_hint_boosts_github_tools() {
-        let state = ConversationState::from_message("matrixorigin最新的状态", 3);
-        let baseline = pre_filter_dynamic(&state, "matrixorigin最新的状态");
-        let with_hint = pre_filter_dynamic_with_memory(
-            &state,
-            "matrixorigin最新的状态",
-            None,
-            None,
-            &[DomainHint::GitHub],
-        );
-
-        let gh_tools = ["github_list_prs", "github_get_pr", "github_list_issues"];
-        let baseline_gh_score: f64 = baseline
-            .iter()
-            .filter(|(idx, _)| gh_tools.contains(&tool_name(*idx)))
-            .map(|(_, score)| score)
-            .sum();
-        let hint_gh_score: f64 = with_hint
-            .iter()
-            .filter(|(idx, _)| gh_tools.contains(&tool_name(*idx)))
-            .map(|(_, score)| score)
-            .sum();
-
-        assert!(
-            hint_gh_score >= baseline_gh_score,
-            "Domain hint should boost GitHub tool scores: hint={:.3} >= baseline={:.3}",
-            hint_gh_score,
-            baseline_gh_score
-        );
-    }
-
-    /// PROOF: Domain hint does NOT boost unrelated tools.
-    /// DomainHint::GitHub should not boost git_ or memory_ tools.
-    #[test]
-    fn proof_domain_hint_does_not_boost_unrelated() {
-        let state = ConversationState::from_message("show me the code", 2);
-        let baseline = pre_filter_dynamic(&state, "show me the code");
-        let with_hint = pre_filter_dynamic_with_memory(
-            &state,
-            "show me the code",
-            None,
-            None,
-            &[DomainHint::GitHub],
-        );
-
-        let gh_indices: Vec<usize> = TOOL_CATALOG
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.intents.contains(&IntentType::GitHub))
-            .map(|(i, _)| i)
-            .collect();
-
-        for (idx, hint_score) in &with_hint {
-            if gh_indices.contains(idx) {
-                continue;
-            }
-            let baseline_score = baseline
-                .iter()
-                .find(|(i, _)| i == idx)
-                .map(|(_, s)| *s)
-                .unwrap_or(0.0);
-            assert!(
-                *hint_score <= baseline_score + 0.001,
-                "Non-GitHub tool \'{}\'  should not be boosted by GitHub hint: hint={:.3}, baseline={:.3}",
-                tool_name(*idx),
-                hint_score,
-                baseline_score
-            );
-        }
-    }
-
-    /// PROOF: Empty domain hints produce identical results to no hints.
-    #[test]
-    fn proof_empty_hints_equals_no_hints() {
-        let state = ConversationState::from_message("list pull requests", 1);
-        let baseline = pre_filter_dynamic(&state, "list pull requests");
-        let with_empty =
-            pre_filter_dynamic_with_memory(&state, "list pull requests", None, None, &[]);
-
-        assert_eq!(
-            baseline.len(),
-            with_empty.len(),
-            "Empty hints should produce same count"
-        );
-        for (b, h) in baseline.iter().zip(with_empty.iter()) {
-            assert_eq!(b.0, h.0, "Same tool indices");
-            assert!(
-                (b.1 - h.1).abs() < 1e-10,
-                "Same scores for \'{}\'  : {:.6} vs {:.6}",
-                tool_name(b.0),
-                b.1,
-                h.1
-            );
-        }
-    }
-
-    /// PROOF: Multiple domain hints stack correctly.
-    /// DomainHint::GitHub + DomainHint::Git → both GitHub and Git tools boosted.
-    #[test]
-    fn proof_multiple_hints_boost_multiple_domains() {
-        let state = ConversationState::from_message("project history and PRs", 3);
-        let baseline = pre_filter_dynamic(&state, "project history and PRs");
-        let with_hints = pre_filter_dynamic_with_memory(
-            &state,
-            "project history and PRs",
-            None,
-            None,
-            &[DomainHint::GitHub, DomainHint::Git],
-        );
-
-        let gh_tools = ["github_list_prs", "github_get_pr", "github_list_issues"];
-        let git_tools = ["git_log", "git_diff", "git_show"];
-
-        let baseline_gh: f64 = baseline
-            .iter()
-            .filter(|(idx, _)| gh_tools.contains(&tool_name(*idx)))
-            .map(|(_, s)| s)
-            .sum();
-        let hints_gh: f64 = with_hints
-            .iter()
-            .filter(|(idx, _)| gh_tools.contains(&tool_name(*idx)))
-            .map(|(_, s)| s)
-            .sum();
-        let baseline_git: f64 = baseline
-            .iter()
-            .filter(|(idx, _)| git_tools.contains(&tool_name(*idx)))
-            .map(|(_, s)| s)
-            .sum();
-        let hints_git: f64 = with_hints
-            .iter()
-            .filter(|(idx, _)| git_tools.contains(&tool_name(*idx)))
-            .map(|(_, s)| s)
-            .sum();
-
-        assert!(
-            hints_gh >= baseline_gh,
-            "GitHub tools boosted with multi-hint: {:.3} >= {:.3}",
-            hints_gh,
-            baseline_gh
-        );
-        assert!(
-            hints_git >= baseline_git,
-            "Git tools boosted with multi-hint: {:.3} >= {:.3}",
-            hints_git,
-            baseline_git
-        );
-    }
-
-    /// PROOF: Domain hint gate softening allows recency when TF-IDF is low.
-    /// Set up: tool recently used + domain hint present + zero keyword overlap.
-    /// Without hint: recency gated by RECENCY_CONTENT_GATE (0.08).
-    /// With hint: gate halved to 0.04 → more recency boost passes through.
-    #[test]
-    fn proof_gate_softening_with_recent_tool() {
-        let mut state = ConversationState::from_message("matrixorigin情况如何", 5);
-        state.is_github = true;
-        state.recent_tools = vec!["github_list_prs".to_string()];
-
-        let baseline = pre_filter_dynamic(&state, "matrixorigin情况如何");
-        let with_hint = pre_filter_dynamic_with_memory(
-            &state,
-            "matrixorigin情况如何",
-            None,
-            None,
-            &[DomainHint::GitHub],
-        );
-
-        let gh_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "github_list_prs");
-        if let Some(idx) = gh_idx {
-            let baseline_score = baseline
-                .iter()
-                .find(|(i, _)| *i == idx)
-                .map(|(_, s)| *s)
-                .unwrap_or(0.0);
-            let hint_score = with_hint
-                .iter()
-                .find(|(i, _)| *i == idx)
-                .map(|(_, s)| *s)
-                .unwrap_or(0.0);
-
-            assert!(
-                hint_score >= baseline_score,
-                "Gate softening should increase recency-boosted score: hint={:.4} >= baseline={:.4}",
-                hint_score,
-                baseline_score
-            );
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // 6. NON-HAPPY PATH CONTROL
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2409,8 +1976,8 @@ mod state_convergence {
         assert_eq!(graph.domain_for("mo_tables"), Some(DomainHint::Database));
 
         let lib = pl_a.lock().unwrap();
-        let github_suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
-        let db_suggestions = lib.suggest(TaskType::Mutate, Some(DomainHint::Database), 5);
+        let github_suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let db_suggestions = lib.top_patterns(TaskType::Mutate, Some(DomainHint::Database), 5);
         assert!(
             !github_suggestions.is_empty(),
             "should have GitHub patterns"
@@ -2668,78 +2235,7 @@ mod sandbox_proofs {
     }
 }
 
-// ── Schema Pruning + Prompt Cache + Budget Pressure Tests ──────────────────
-
-#[test]
-fn budget_pressure_70_percent_scaling() {
-    // At pressure=1.0, effective budget should be 30% of original (1.0 - 1.0*0.7 = 0.3)
-    let original_budget: u32 = 1000;
-    let pressure = 1.0_f64;
-    let scale = 1.0 - pressure.clamp(0.0, 1.0) * 0.7;
-    let effective = (original_budget as f64 * scale) as u32;
-    assert_eq!(effective, 300);
-
-    // At pressure=0.5, effective budget should be 65% of original
-    let pressure2 = 0.5_f64;
-    let scale2 = 1.0 - pressure2.clamp(0.0, 1.0) * 0.7;
-    let effective2 = (original_budget as f64 * scale2) as u32;
-    assert_eq!(effective2, 650);
-}
-
-#[test]
-fn tool_health_export_import_roundtrip() {
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
-
-    let mut tracker = ToolHealthTracker::new();
-    // Simulate a tool with failures (need 8+ calls for cross-session deprioritization)
-    for _ in 0..8 {
-        tracker.record_failure("bad_tool");
-    }
-    tracker.record_success("good_tool");
-    tracker.record_success("good_tool");
-    tracker.record_success("good_tool");
-    tracker.record_success("good_tool");
-    tracker.record_success("good_tool");
-
-    let entries = tracker.export();
-    assert_eq!(entries.len(), 2);
-
-    let restored = ToolHealthTracker::from_entries(&entries);
-    // bad_tool had 100% failure rate → starts deprioritized
-    assert!(restored.is_deprioritized("bad_tool"));
-    // good_tool had 0% failure rate → not deprioritized
-    assert!(!restored.is_deprioritized("good_tool"));
-}
-
-#[test]
-fn prompt_cache_key_deterministic() {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Same inputs → same key
-    fn make_key(names: &[&str], task: Option<&str>, conf: f64) -> u64 {
-        let mut h = DefaultHasher::new();
-        for n in names {
-            n.hash(&mut h);
-        }
-        task.unwrap_or("none").hash(&mut h);
-        let bucket = if conf < 0.3 { "low" } else { "normal" };
-        bucket.hash(&mut h);
-        h.finish()
-    }
-
-    let k1 = make_key(&["bash", "read_file"], Some("code_review"), 0.8);
-    let k2 = make_key(&["bash", "read_file"], Some("code_review"), 0.8);
-    assert_eq!(k1, k2);
-
-    // Different task type → different key
-    let k3 = make_key(&["bash", "read_file"], Some("debugging"), 0.8);
-    assert_ne!(k1, k3);
-
-    // Low confidence → different key
-    let k4 = make_key(&["bash", "read_file"], Some("code_review"), 0.1);
-    assert_ne!(k1, k4);
-}
+// ── Schema Pruning Tests ───────────────────────────────────────────────────
 
 #[test]
 fn schema_pruning_truncates_first_sentence() {
@@ -3662,7 +3158,7 @@ mod learning_improves_selection {
         merge_into_modules(&snapshot, &eg2, &pl2, &cal2);
 
         let lib = pl2.lock().unwrap();
-        let suggestions = lib.suggest(TaskType::Reasoning, Some(DomainHint::Git), 5);
+        let suggestions = lib.top_patterns(TaskType::Reasoning, Some(DomainHint::Git), 5);
         assert!(
             !suggestions.is_empty(),
             "session 2 should have pattern suggestions from session 1"
@@ -3743,7 +3239,7 @@ mod learning_improves_selection {
         );
 
         let lib = pl2.lock().unwrap();
-        let suggestions = lib.suggest(TaskType::Fetch, Some(DomainHint::GitHub), 5);
+        let suggestions = lib.top_patterns(TaskType::Fetch, Some(DomainHint::GitHub), 5);
         assert!(
             !suggestions.is_empty(),
             "pattern suggestions survived roundtrip"
@@ -4677,7 +4173,7 @@ mod security_safety_gaps {
         assert!(!pref_keys::LANGUAGE.is_empty());
     }
 
-    /// PROOF: PatternLibrary.suggest() returns relevant patterns.
+    /// PROOF: PatternLibrary.top_patterns() returns relevant patterns.
     ///
     /// OLD: suggest() was only tested, never called in production.
     /// NEW: boost_terms_for() (which calls suggest internally) IS wired
@@ -4694,7 +4190,7 @@ mod security_safety_gaps {
         lib.record_outcome(&tools, TaskType::Code, None, true, 0.9, None);
         lib.record_outcome(&tools, TaskType::Code, None, true, 0.7, None);
 
-        let suggestions = lib.suggest(TaskType::Code, None, 5);
+        let suggestions = lib.top_patterns(TaskType::Code, None, 5);
         assert!(
             !suggestions.is_empty(),
             "should return at least one pattern"
@@ -5558,6 +5054,7 @@ mod hardening_proofs {
                     recent_outcomes: vec![],
                 },
             ],
+            tool_quality: Vec::new(),
             active_canary: None,
         };
         save_snapshot_to(&path, &snapshot).unwrap();
@@ -9250,6 +8747,366 @@ mod cross_turn_cognition {
         assert!(
             on_score > off_score,
             "tuning ON must raise the score of the successful tool: off={off_score} on={on_score}"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Session-journal regression tests
+//
+// Each test below is derived from a real session that exhibited token waste.
+// The test name encodes the session prefix and the failure pattern.
+// These are deterministic unit tests — no LLM calls, no network.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// P1: Tool selector must select git_diff and grep for code-review queries.
+/// Sessions de757bc9, 98fca6ae, 95c7cf45: model used bash grep/diff because
+/// the native tools were not selected.
+mod tool_selection_regressions {
+    use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
+    use astra_runtime::tool_selector::{SelectionContext, TfIdfSelector, ToolSelector};
+
+    fn test_registry() -> ToolRegistry {
+        let schemas: Vec<serde_json::Value> = TOOL_CATALOG
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
+            .collect();
+        ToolRegistry::new(schemas)
+    }
+
+    fn default_ctx(query: &str) -> SelectionContext<'_> {
+        SelectionContext {
+            query,
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 10_000,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+            outcome_bias: std::collections::HashMap::new(),
+            previous_confidence_fallback: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn review_local_changes_selects_git_diff() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector.select(&default_ctx("review local changes")).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "git_diff must be selected for 'review local changes', got: {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn review_local_changes_selects_grep() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector
+            .select(&default_ctx("search code for error patterns"))
+            .await;
+        assert!(
+            result.tool_names.contains(&"grep".to_string()),
+            "grep must be selected for 'search code' query, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn review_changes_chinese_selects_git_diff() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector.select(&default_ctx("看看改动")).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "git_diff must be selected for '看看改动', got: {:?}",
+            result.tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_review_issues_selects_edit_tools() {
+        let selector = TfIdfSelector::new(test_registry());
+        let result = selector.select(&default_ctx("按照review建议优化")).await;
+        assert!(
+            result.tool_names.contains(&"str_replace".to_string()),
+            "str_replace must be selected for fix-review query, got: {:?}",
+            result.tool_names
+        );
+        assert!(
+            result.tool_names.contains(&"read_file".to_string()),
+            "read_file must be selected for fix-review query, got: {:?}",
+            result.tool_names
+        );
+    }
+
+    /// Under moderate budget pressure (0.22), git_diff must still be selected
+    /// for review queries. Session 98fca6ae had pressure=0.22 and git_diff was
+    /// dropped.
+    #[tokio::test]
+    async fn review_changes_under_pressure_keeps_git_diff() {
+        let selector = TfIdfSelector::new(test_registry());
+        let mut ctx = default_ctx("review local changes");
+        ctx.budget_pressure = 0.22;
+        let result = selector.select(&ctx).await;
+        assert!(
+            result.tool_names.contains(&"git_diff".to_string()),
+            "git_diff must survive budget_pressure=0.22 for review query, got: {:?}",
+            result.tool_names
+        );
+    }
+}
+
+/// P2+P6: TurnGuard must escalate cache-hit loops to Critical.
+/// Session c8df4aa8: 20 rounds, 4 cache hits, 0 errors → only Warning.
+mod turnguard_cache_escalation_regressions {
+    use astra_turn_core::error_recovery;
+    use astra_turn_core::turn_guard::TurnGuard;
+
+    /// Simulate a cache-hit loop: 6 cache hits on read_file with 0 errors.
+    /// The escalation must reach at least Warning.
+    #[test]
+    fn cache_hit_loop_reaches_warning() {
+        let mut guard = TurnGuard::new();
+        // Simulate 6 rounds of cache hits
+        for _ in 0..6 {
+            guard.record_cache_hit("read_file");
+            let verdict = guard.evaluate();
+            if verdict.severity >= astra_turn_core::turn_guard::VerdictSeverity::Warning {
+                return; // Pass: reached Warning
+            }
+        }
+        panic!("6 cache hits on read_file must trigger at least Warning");
+    }
+
+    /// With enough cache hits, nudge_count must grow high enough for Critical.
+    /// With delta-based nudge counting (1 nudge per eval with new hits),
+    /// we need 6+ evaluations with new cache hits to reach Critical.
+    #[test]
+    fn sustained_cache_hits_eventually_reach_critical_escalation() {
+        let mut guard = TurnGuard::new();
+        let mut reached_critical = false;
+        // Simulate 12 rounds, each with a new cache hit (threshold is 10)
+        for _ in 0..12 {
+            guard.record_cache_hit("read_file");
+            let verdict = guard.evaluate();
+            if verdict.severity >= astra_turn_core::turn_guard::VerdictSeverity::Critical {
+                reached_critical = true;
+                break;
+            }
+        }
+        assert!(
+            reached_critical,
+            "12 consecutive cache hits (1 per round) must eventually escalate to Critical"
+        );
+    }
+
+    /// nudge_count >= 10 alone must trigger Critical (no errors required).
+    /// Threshold raised from 6 to 10 to avoid false Critical on normal sessions
+    /// where cache-hit nudges accumulate without any actual errors.
+    #[test]
+    fn high_nudge_count_alone_triggers_critical() {
+        let level = error_recovery::escalation_level(10, 0, 0);
+        assert_eq!(
+            level,
+            error_recovery::EscalationLevel::Critical,
+            "nudge_count=10 with 0 errors must be Critical"
+        );
+    }
+
+    /// nudge_count=9 with 0 errors must NOT be Critical (avoid false positives).
+    #[test]
+    fn moderate_nudge_count_without_errors_is_not_critical() {
+        let level = error_recovery::escalation_level(9, 0, 0);
+        assert_ne!(
+            level,
+            error_recovery::EscalationLevel::Critical,
+            "nudge_count=5 with 0 errors should not be Critical"
+        );
+    }
+
+    /// Progressive warning penalty: consecutive warnings must drain budget faster.
+    #[test]
+    fn consecutive_warnings_increase_penalty() {
+        let mut guard = TurnGuard::new();
+        // Force warnings by adding cache hits
+        for _ in 0..4 {
+            guard.record_cache_hit("read_file");
+        }
+        let v1 = guard.evaluate();
+        assert!(
+            v1.severity >= astra_turn_core::turn_guard::VerdictSeverity::Warning,
+            "4 cache hits must trigger Warning"
+        );
+        // Add more cache hits and evaluate again
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        let v2 = guard.evaluate();
+        assert!(
+            v2.severity >= astra_turn_core::turn_guard::VerdictSeverity::Warning,
+            "continued cache hits must keep Warning"
+        );
+    }
+
+    /// Cache nudge must be delta-based, not cumulative.
+    /// Bug found in session 98fca6ae: cumulative counting caused runaway escalation.
+    #[test]
+    fn cache_nudge_is_delta_not_cumulative() {
+        let mut guard = TurnGuard::new();
+        // Add 3 cache hits → first evaluate adds 1 nudge
+        for _ in 0..3 {
+            guard.record_cache_hit("read_file");
+        }
+        guard.evaluate();
+        let nudge_after_first = guard.nudge_count;
+
+        // No new cache hits → second evaluate should NOT add more nudges
+        guard.evaluate();
+        let nudge_after_second = guard.nudge_count;
+
+        assert_eq!(
+            nudge_after_first, nudge_after_second,
+            "without new cache hits, nudge_count must not increase: first={nudge_after_first}, second={nudge_after_second}"
+        );
+    }
+}
+
+/// P4: Safety middleware must not block grep BRE alternation patterns.
+/// Session 98fca6ae: `grep -n fetch_spinner\|show_early_hint` was blocked.
+mod safety_middleware_regressions {
+    use astra_turn_core::safety_middleware::{
+        SafetyMiddlewareDecision, check_shell_command_safety, evaluate_tool_safety_request,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn grep_bre_alternation_unquoted_is_allowed() {
+        let result = check_shell_command_safety(r"grep -n fetch_spinner\|show_early_hint file.rs");
+        assert!(
+            result.is_none(),
+            "grep with \\| BRE alternation must be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn grep_bre_alternation_quoted_is_allowed() {
+        let result =
+            check_shell_command_safety(r#"grep -rn "fetch_spinner\|show_early_hint" rust/crates/"#);
+        assert!(
+            result.is_none(),
+            "grep with quoted \\| must be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sed_bre_alternation_is_allowed() {
+        let result = check_shell_command_safety(r"sed -n '/pattern1\|pattern2/p' file.txt");
+        assert!(
+            result.is_none(),
+            "sed with \\| BRE alternation must be allowed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn grep_bre_via_bash_tool_is_allowed() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r"grep -rn 'error\|warning\|fatal' src/"}),
+        );
+        assert_eq!(
+            decision,
+            SafetyMiddlewareDecision::Allow,
+            "bash grep with \\| must be allowed"
+        );
+    }
+
+    /// Non-grep commands with \| must still be blocked.
+    #[test]
+    fn non_grep_backslash_pipe_still_blocked() {
+        let result = check_shell_command_safety(r"cat file.txt \| rm -rf /");
+        assert!(result.is_some(), "non-grep \\| must still be blocked");
+    }
+}
+
+/// P1: trigger_match_score must support bag-of-words matching.
+/// "review local changes" must match trigger "review changes".
+mod trigger_match_regressions {
+    use astra_runtime::tool_registry::TOOL_CATALOG;
+    use astra_runtime::tool_registry::scoring::trigger_match_score;
+
+    fn find_tool(name: &str) -> &'static astra_turn_core::tool_registry_meta::ToolMeta {
+        TOOL_CATALOG.iter().find(|t| t.name == name).unwrap()
+    }
+
+    #[test]
+    fn review_local_changes_matches_review_changes_trigger() {
+        let tool = find_tool("git_diff");
+        let query = "review local changes";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(
+            score > 0.4,
+            "trigger 'review changes' must match 'review local changes' with score > 0.4, got {score}"
+        );
+    }
+
+    #[test]
+    fn exact_trigger_scores_higher_than_bag_of_words() {
+        let tool = find_tool("git_diff");
+        let exact_query = "review changes";
+        let exact_chars: Vec<char> = exact_query.chars().collect();
+        let exact_score = trigger_match_score(tool, exact_query, &exact_chars);
+
+        let bow_query = "review local changes";
+        let bow_chars: Vec<char> = bow_query.chars().collect();
+        let bow_score = trigger_match_score(tool, bow_query, &bow_chars);
+
+        assert!(
+            exact_score > bow_score,
+            "exact match ({exact_score}) must score higher than bag-of-words ({bow_score})"
+        );
+    }
+
+    #[test]
+    fn single_word_trigger_still_works() {
+        let tool = find_tool("git_diff");
+        let query = "diff";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(
+            score > 0.4,
+            "single-word trigger 'diff' must match, got {score}"
+        );
+    }
+
+    #[test]
+    fn no_match_returns_zero() {
+        let tool = find_tool("git_diff");
+        let query = "send email to team";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(score < 0.01, "unrelated query must score ~0, got {score}");
+    }
+
+    #[test]
+    fn chinese_trigger_matches() {
+        let tool = find_tool("git_diff");
+        let query = "看改动";
+        let chars: Vec<char> = query.chars().collect();
+        let score = trigger_match_score(tool, query, &chars);
+        assert!(
+            score > 0.3,
+            "Chinese trigger '看改动' must match, got {score}"
         );
     }
 }

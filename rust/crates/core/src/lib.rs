@@ -25,9 +25,9 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
-pub use runtime_limits::{
-    DEV_MATRIXONE_PASSWORD, MAX_TOOL_ROUNDS_DEFAULT, RuntimeLimits, warn_default_credentials_once,
-};
+#[cfg(any(test, feature = "dev-defaults"))]
+pub use runtime_limits::{DEV_MATRIXONE_PASSWORD, warn_default_credentials_once};
+pub use runtime_limits::{MAX_TOOL_ROUNDS_DEFAULT, RuntimeLimits};
 pub use sqlx;
 
 /// Base directory name for per-agent git worktrees under `std::env::temp_dir()`.
@@ -177,7 +177,7 @@ pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySq
     MySqlPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(2))
-        .connect(&settings.database_url())
+        .connect(&settings.database_url_with_password())
         .await
 }
 
@@ -195,7 +195,7 @@ impl SharedPool {
             .min_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .idle_timeout(std::time::Duration::from_secs(300))
-            .connect(&settings.database_url())
+            .connect(&settings.database_url_with_password())
             .await?;
         Ok(Self {
             pool: Arc::new(pool),

@@ -1,0 +1,26 @@
+name: concurrency_safety_readonly_batch
+description: "并发安全 (gap #3)：同一轮里发起多个只读工具调用（read/list/glob 混合）应被 is_read_only_tool 识别并并发执行，不应因写侧元数据保守而串行化。本用例验证多读并发的事件流与结果一致性。"
+requires: [llm]
+
+turns:
+  - user: "请并发地告诉我：1) 当前目录下有哪些一级子目录；2) README.md 的第 1 行；3) Makefile 的第 1 行。尽量在同一回合内并行。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=2"
+      llm_judge:
+        criteria: "回复应同时给出三类信息：一级子目录、README.md 首行、Makefile 首行。三项都应来自真实读取结果，不应出现任意一项被省略或被编造。"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid AND event_type = 'tool_call'"
+        assert:
+          count: ">=2"

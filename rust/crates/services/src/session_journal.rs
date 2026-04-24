@@ -565,6 +565,18 @@ impl ToolCallRecord {
                 && result_preview.starts_with("Skill '")
                 && result_preview.contains(" was already loaded (turn "))
     }
+
+    /// True when this tool call was rejected by the pipeline before execution
+    /// (e.g. restricted_tools policy).  These calls should not count toward
+    /// `tools_used` for pattern learning — they never ran, so attributing
+    /// turn-level success/failure to them creates a self-reinforcing block loop.
+    pub fn was_blocked_by_policy(&self) -> bool {
+        !self.ok
+            && self
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("blocked_tool:"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +764,18 @@ pub struct JournalEvent {
     /// Total tool execution time in this turn (set on turn_completed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tool_ms: Option<u64>,
+    // ── Causal lineage (P5) ──────────────────────────────────────────────
+    /// Parent event ID for causal tree construction.
+    /// Turn → SessionStart, LlmRound → Turn, DelegationSubRunStarted → DelegationStarted, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    // ── Git snapshot (P0) ────────────────────────────────────────────────
+    /// Git HEAD commit hash at the time of this event (short or full SHA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    /// Git branch name at the time of this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
 }
 
 /// Event type discriminator.
@@ -861,10 +885,20 @@ impl JournalWriter {
     }
 
     /// Append a single event to the journal file.
+    ///
+    /// **Concurrency:** the line + trailing `\n` are written via a single
+    /// `write_all` call so concurrent appenders cannot interleave the newline
+    /// with another writer's payload. On Linux, writes to a regular file
+    /// opened with `O_APPEND` of size <= `PIPE_BUF` (4096 bytes) are atomic;
+    /// `writeln!` would issue the `\n` as a separate syscall and lose
+    /// atomicity, producing concatenated records like `{a}{b}\n\n` that the
+    /// reader cannot parse. See `JournalWriter::append` test
+    /// `concurrent_appends_remain_record_separated`.
     pub fn append(&self, event: &JournalEvent) -> std::io::Result<()> {
         use std::io::Write;
-        let line = serde_json::to_string(event)
+        let mut buf = serde_json::to_vec(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push(b'\n');
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -876,7 +910,7 @@ impl JournalWriter {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        if let Err(e) = writeln!(file, "{line}") {
+        if let Err(e) = file.write_all(&buf) {
             if e.kind() == std::io::ErrorKind::Other
                 || e.raw_os_error() == Some(28) // ENOSPC
                 || e.to_string().contains("No space")
@@ -1969,6 +2003,9 @@ impl JournalEvent {
             llm_rounds: None,
             total_llm_ms: None,
             total_tool_ms: None,
+            parent_event_id: None,
+            git_head: None,
+            git_branch: None,
         }
     }
 
@@ -1980,6 +2017,19 @@ impl JournalEvent {
 
     pub fn with_agentic_step(mut self, agentic_step: Option<u32>) -> Self {
         self.agentic_step = agentic_step;
+        self
+    }
+
+    /// Set the parent event ID for causal lineage.
+    pub fn with_parent_event_id(mut self, parent_event_id: Option<String>) -> Self {
+        self.parent_event_id = parent_event_id;
+        self
+    }
+
+    /// Attach git snapshot (HEAD commit + branch) to this event.
+    pub fn with_git_snapshot(mut self, head: Option<String>, branch: Option<String>) -> Self {
+        self.git_head = head;
+        self.git_branch = branch;
         self
     }
 
@@ -2284,8 +2334,13 @@ impl JournalEvent {
         let mut evt = Self::base(JournalEventType::Turn, session_id);
         evt.turn = Some(turn);
         evt.model = model.map(|s| s.to_string());
-        evt.user_input = Some(truncate(user_input, 500));
-        evt.assistant_output = Some(truncate(assistant_output, 10000));
+        if journal_content_redact_enabled() {
+            evt.user_input = Some(journal_content_marker(user_input));
+            evt.assistant_output = Some(journal_content_marker(assistant_output));
+        } else {
+            evt.user_input = Some(truncate(user_input, 500));
+            evt.assistant_output = Some(truncate(assistant_output, 10000));
+        }
         evt.tool_count = Some(tool_count);
         evt.tokens_in = Some(tokens_in);
         evt.tokens_out = Some(tokens_out);
@@ -2316,7 +2371,11 @@ impl JournalEvent {
         let mut evt = Self::base(JournalEventType::TurnError, session_id);
         evt.turn = Some(turn);
         evt.model = model.map(|s| s.to_string());
-        evt.user_input = Some(truncate(user_input, 500));
+        if journal_content_redact_enabled() {
+            evt.user_input = Some(journal_content_marker(user_input));
+        } else {
+            evt.user_input = Some(truncate(user_input, 500));
+        }
         evt.error = Some(truncate(error, 500));
         evt.duration_ms = Some(duration_ms);
         evt
@@ -3158,6 +3217,28 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
+}
+
+pub const ASTRA_JOURNAL_CONTENT_REDACT_ENV: &str = "ASTRA_JOURNAL_CONTENT_REDACT";
+
+/// Returns true when [`ASTRA_JOURNAL_CONTENT_REDACT_ENV`]=`1` is set in the
+/// environment. When enabled, the on-disk JSONL journal stores a privacy
+/// marker (`<redacted: len=N sha=...>`) in place of `user_input` and
+/// `assistant_output` fields.
+pub fn journal_content_redact_enabled() -> bool {
+    std::env::var(ASTRA_JOURNAL_CONTENT_REDACT_ENV).as_deref() == Ok("1")
+}
+
+/// Replace raw user content with a deterministic privacy marker.
+///
+/// Uses a non-cryptographic 64-bit hash for dedup/debugging only — not as
+/// a security primitive.
+pub fn journal_content_marker(raw: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    format!("<redacted: len={} sha={:016x}>", raw.len(), h.finish())
 }
 
 // ═══════════════════════════ Session Lifecycle ════════════════════════════
@@ -5548,6 +5629,133 @@ mod tests {
             "surgically_removed=true must classify as synthetic regardless of name"
         );
     }
+
+    #[test]
+    fn journal_content_marker_is_deterministic() {
+        let a = journal_content_marker("hello world");
+        let b = journal_content_marker("hello world");
+        assert_eq!(a, b);
+        assert!(a.starts_with("<redacted: len=11 sha="));
+        assert!(a.ends_with('>'));
+        assert!(!a.contains("hello"));
+    }
+
+    #[test]
+    fn journal_content_marker_differs_for_different_input() {
+        assert_ne!(
+            journal_content_marker("hello"),
+            journal_content_marker("world")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn journal_content_redact_enabled_reads_env_var() {
+        // SAFETY: serialized via #[serial] above.
+        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+        assert!(!journal_content_redact_enabled());
+        unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        assert!(journal_content_redact_enabled());
+        unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "0") };
+        assert!(!journal_content_redact_enabled());
+        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+    }
+
+    #[test]
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn turn_event_redacts_content_when_env_set() {
+        unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        let evt = JournalEvent::turn(
+            Some("s1"),
+            1,
+            Some("gpt-4"),
+            "secret query",
+            "secret answer",
+            0,
+            10,
+            5,
+            100,
+        );
+        let user = evt.user_input.as_deref().unwrap_or("");
+        let asst = evt.assistant_output.as_deref().unwrap_or("");
+        assert!(!user.contains("secret query"), "user_input leaked: {user}");
+        assert!(
+            !asst.contains("secret answer"),
+            "assistant_output leaked: {asst}"
+        );
+        assert!(user.starts_with("<redacted:"));
+        assert!(asst.starts_with("<redacted:"));
+        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+    }
+
+    #[test]
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn turn_event_keeps_content_when_env_unset() {
+        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+        let evt = JournalEvent::turn(
+            Some("s1"),
+            1,
+            Some("gpt-4"),
+            "hello",
+            "world",
+            0,
+            10,
+            5,
+            100,
+        );
+        assert_eq!(evt.user_input.as_deref(), Some("hello"));
+        assert_eq!(evt.assistant_output.as_deref(), Some("world"));
+    }
+
+    #[test]
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn turn_error_event_redacts_user_input_when_env_set() {
+        unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        let evt =
+            JournalEvent::turn_error(Some("s1"), 1, Some("gpt-4"), "secret query", "boom", 50);
+        let user = evt.user_input.as_deref().unwrap_or("");
+        assert!(!user.contains("secret query"));
+        assert!(user.starts_with("<redacted:"));
+        // Error message itself is system-generated, kept as-is.
+        assert_eq!(evt.error.as_deref(), Some("boom"));
+        unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+    }
+
+    #[test]
+    fn was_blocked_by_policy_detects_restricted_tool() {
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: false,
+            error: Some(
+                "blocked_tool: Tool 'read_file' is currently restricted and cannot be executed."
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(rec.was_blocked_by_policy());
+    }
+
+    #[test]
+    fn was_blocked_by_policy_ignores_normal_failures() {
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: false,
+            error: Some("Error: file not found".into()),
+            ..Default::default()
+        };
+        assert!(!rec.was_blocked_by_policy());
+    }
+
+    #[test]
+    fn was_blocked_by_policy_ignores_successful_calls() {
+        let rec = ToolCallRecord {
+            name: "read_file".to_string(),
+            ok: true,
+            error: None,
+            ..Default::default()
+        };
+        assert!(!rec.was_blocked_by_policy());
+    }
 }
 
 #[cfg(test)]
@@ -5922,6 +6130,49 @@ mod turn_event_buffer_tests {
         assert_eq!(lines.len(), 3);
     }
 
+    /// Concurrent appends from multiple threads must remain record-separated.
+    ///
+    /// Regression for cancel-shutdown audit #2 fix: when the in-process
+    /// `edge_callback_ledger` mutex was narrowed (so it no longer wrapped the
+    /// journal write), two HTTP approval handlers could call
+    /// `JournalWriter::append` simultaneously. The old implementation used
+    /// `writeln!`, which issues the line and the trailing `\n` as **two**
+    /// syscalls. With `O_APPEND`, that lost atomicity: two writers produced
+    /// `{a}{b}\n\n` instead of `{a}\n{b}\n`, and the parser saw zero valid
+    /// events. The fix is a single `write_all` of `line + "\n"`.
+    #[test]
+    fn concurrent_appends_remain_record_separated() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let session_id = "sess-concurrent-append";
+        let n_threads = 8usize;
+        let n_per_thread = 16usize;
+
+        std::thread::scope(|scope| {
+            for t in 0..n_threads {
+                let dir = dir.clone();
+                scope.spawn(move || {
+                    let _guard = JournalDirGuard::new(&dir);
+                    let writer = JournalWriter::new(session_id).unwrap();
+                    for i in 0..n_per_thread {
+                        let mut event =
+                            JournalEvent::base_public(JournalEventType::Turn, Some(session_id));
+                        event.user_input = Some(format!("t{t}-i{i}"));
+                        writer.append(&event).unwrap();
+                    }
+                });
+            }
+        });
+
+        let _guard = JournalDirGuard::new(&dir);
+        let events = read_journal(session_id).unwrap();
+        assert_eq!(
+            events.len(),
+            n_threads * n_per_thread,
+            "every concurrent append should produce one parseable record"
+        );
+    }
+
     /// E2E regression test using real session data (a33177cc).
     ///
     /// Before the fix, llm_round events used 0-based turn numbers while
@@ -6279,5 +6530,163 @@ mod observability_serde_tests {
         assert_eq!(deser.llm_rounds, Some(2));
         assert_eq!(deser.total_llm_ms, Some(4500));
         assert_eq!(deser.total_tool_ms, Some(500));
+    }
+
+    // ── P5: parent_event_id causal lineage ──────────────────────────────
+
+    #[test]
+    fn parent_event_id_round_trips_through_serde() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_parent_event_id(Some("evt-session-start-001".to_string()));
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("parent_event_id"));
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deser.parent_event_id.as_deref(),
+            Some("evt-session-start-001")
+        );
+    }
+
+    #[test]
+    fn parent_event_id_none_omitted_from_json() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
+        assert!(ev.parent_event_id.is_none());
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            !json.contains("parent_event_id"),
+            "None parent_event_id must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn parent_event_id_backward_compat_old_json_without_field() {
+        // Simulate reading a journal line written before parent_event_id existed.
+        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","turn":1,"tokens_in":10,"tokens_out":5,"duration_ms":100}"#;
+        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert!(
+            ev.parent_event_id.is_none(),
+            "old events without parent_event_id must deserialize as None"
+        );
+    }
+
+    #[test]
+    fn parent_event_id_chaining_with_other_builders() {
+        let ev = JournalEvent::turn(Some("s"), 2, Some("m"), "q", "a", 1, 50, 10, 200)
+            .with_parent_event_id(Some("parent-123".to_string()))
+            .with_agentic_step(Some(3));
+        assert_eq!(ev.parent_event_id.as_deref(), Some("parent-123"));
+        assert_eq!(ev.agentic_step, Some(3));
+    }
+
+    #[test]
+    fn parent_event_id_persists_through_writer_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-parent-id-00000000-0000-0000-0000-000000000001";
+        let writer = JournalWriter::new(sid).unwrap();
+
+        let ev = JournalEvent::session_start(Some(sid), Some("m"))
+            .with_parent_event_id(Some("root".to_string()));
+        writer.append(&ev).unwrap();
+
+        let (events, _, _) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].parent_event_id.as_deref(), Some("root"));
+    }
+
+    // ── P0: git snapshot on Turn events ─────────────────────────────────
+
+    #[test]
+    fn git_snapshot_round_trips_through_serde() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(
+                Some("abc1234".to_string()),
+                Some("feat/my-branch".to_string()),
+            );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("git_head"));
+        assert!(json.contains("git_branch"));
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.git_head.as_deref(), Some("abc1234"));
+        assert_eq!(deser.git_branch.as_deref(), Some("feat/my-branch"));
+    }
+
+    #[test]
+    fn git_snapshot_none_omitted_from_json() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("git_head"), "None git_head must be omitted");
+        assert!(
+            !json.contains("git_branch"),
+            "None git_branch must be omitted"
+        );
+    }
+
+    #[test]
+    fn git_snapshot_backward_compat_old_json_without_fields() {
+        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","turn":1}"#;
+        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert!(ev.git_head.is_none());
+        assert!(ev.git_branch.is_none());
+    }
+
+    #[test]
+    fn git_snapshot_partial_only_head_no_branch() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(Some("deadbeef".to_string()), None);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("git_head"));
+        assert!(!json.contains("git_branch"));
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.git_head.as_deref(), Some("deadbeef"));
+        assert!(deser.git_branch.is_none());
+    }
+
+    #[test]
+    fn git_snapshot_detached_head_no_branch() {
+        // Detached HEAD: git_head is set but git_branch is None (not on any branch).
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(Some("f36ae6b1".to_string()), None);
+        assert!(ev.git_branch.is_none());
+        assert_eq!(ev.git_head.as_deref(), Some("f36ae6b1"));
+    }
+
+    #[test]
+    fn git_snapshot_persists_through_writer_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "test-git-snap-00000000-0000-0000-0000-000000000001";
+        let writer = JournalWriter::new(sid).unwrap();
+
+        let ev = JournalEvent::turn(Some(sid), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_git_snapshot(Some("abc1234def5678".to_string()), Some("main".to_string()));
+        writer.append(&ev).unwrap();
+
+        let (events, _, _) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].git_head.as_deref(), Some("abc1234def5678"));
+        assert_eq!(events[0].git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn git_snapshot_and_parent_event_id_combined() {
+        let ev = JournalEvent::turn(Some("s"), 1, Some("m"), "hi", "yo", 0, 10, 5, 100)
+            .with_parent_event_id(Some("parent-abc".to_string()))
+            .with_git_snapshot(Some("cafe0123".to_string()), Some("dev".to_string()));
+        let json = serde_json::to_string(&ev).unwrap();
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.parent_event_id.as_deref(), Some("parent-abc"));
+        assert_eq!(deser.git_head.as_deref(), Some("cafe0123"));
+        assert_eq!(deser.git_branch.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn git_snapshot_on_non_turn_event_works() {
+        // git_snapshot can be attached to any event type (e.g., CompositeSnapshot).
+        let ev = JournalEvent::base_public(JournalEventType::CompositeSnapshot, Some("s"))
+            .with_git_snapshot(Some("1111aaaa".to_string()), Some("release".to_string()));
+        let json = serde_json::to_string(&ev).unwrap();
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.git_head.as_deref(), Some("1111aaaa"));
     }
 }

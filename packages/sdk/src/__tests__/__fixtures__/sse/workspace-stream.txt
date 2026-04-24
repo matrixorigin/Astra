@@ -1,0 +1,10 @@
+data: {"type":"session_info","session_id":"s-99","run_id":"r-1"}
+
+data: {"type":"text_delta","content":"Hel"}
+
+data: {"type":"text_delta","content":"lo"}
+
+data: {"type":"usage","prompt_tokens":1,"completion_tokens":2,"cache_creation_tokens":0,"cache_read_tokens":0}
+
+data: {"type":"turn_complete"}
+

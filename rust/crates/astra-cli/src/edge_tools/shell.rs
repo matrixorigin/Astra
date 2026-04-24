@@ -149,6 +149,33 @@ fn bash_command_segments(command: &str) -> Vec<&str> {
         }
 
         if !in_single_quote && !in_double_quote {
+            // Heredoc start: `<<WORD` / `<<-WORD` (but NOT here-string `<<<`).
+            // Without this skip, newlines in the heredoc body would split the
+            // body into separate "commands", and tags like `</title>` would be
+            // re-scanned as redirections — causing spurious SANDBOX_DENIED.
+            if ch == '<'
+                && chars.get(idx + 1).is_some_and(|(_, c)| *c == '<')
+                && chars.get(idx + 2).is_none_or(|(_, c)| *c != '<')
+            {
+                let mut hd_idx = idx + 2;
+                let strip_tabs = chars.get(hd_idx).is_some_and(|(_, c)| *c == '-');
+                if strip_tabs {
+                    hd_idx += 1;
+                }
+                // Emit the command line up to the `<<` operator as its own
+                // segment, then resume segmentation after the heredoc
+                // terminator. This ensures the heredoc body bytes never
+                // leak into any segment where absolute-path scanning
+                // would re-flag them.
+                let pre_segment = command[segment_start..byte_idx].trim();
+                if !pre_segment.is_empty() {
+                    segments.push(pre_segment);
+                }
+                idx = skip_heredoc_body(&chars, hd_idx, strip_tabs);
+                segment_start = chars.get(idx).map(|(b, _)| *b).unwrap_or(command.len());
+                continue;
+            }
+
             let is_double_separator =
                 matches!(ch, '&' | '|') && chars.get(idx + 1).is_some_and(|(_, next)| *next == ch);
             let is_single_separator = matches!(ch, '|' | ';' | '\n' | '\r');
@@ -1094,6 +1121,22 @@ fn check_redirection_path_boundary(
             }
 
             let (next_idx, consumes_path) = redirection_operator_details(&chars, idx);
+            // Heredoc (`<<WORD` or `<<-WORD`, but NOT here-string `<<<word`):
+            // skip the heredoc body so that `<`/`>` inside HTML / XML / template
+            // payloads aren't misparsed as further redirection operators.
+            let is_heredoc = ch == '<'
+                && (next_idx - idx) == 2
+                && chars.get(idx + 1).is_some_and(|(_, c)| *c == '<')
+                && chars.get(idx + 2).is_none_or(|(_, c)| *c != '<');
+            if is_heredoc {
+                let mut hd_idx = next_idx;
+                let strip_tabs = chars.get(hd_idx).is_some_and(|(_, c)| *c == '-');
+                if strip_tabs {
+                    hd_idx += 1;
+                }
+                idx = skip_heredoc_body(&chars, hd_idx, strip_tabs);
+                continue;
+            }
             idx = next_idx;
             if !consumes_path {
                 continue;
@@ -1189,6 +1232,117 @@ fn redirection_operator_details(chars: &[(usize, char)], idx: usize) -> (usize, 
         ('>', Some('&'), _) => (idx + 2, true),
         _ => (idx + 1, true),
     }
+}
+
+/// Skip past a heredoc body (`<<WORD` / `<<-WORD`, quoted or not) so that
+/// any `<` / `>` / shell meta inside the body can't be misparsed as further
+/// redirections. Called with `start_idx` pointing just after `<<` (or `<<-`).
+///
+/// Heredoc semantics we honour:
+/// * The delimiter word may be quoted (`'WORD'` / `"WORD"`) or unquoted; quotes
+///   or a leading backslash merely suppress expansion inside the body — here
+///   we only need the literal terminator.
+/// * `<<-WORD` strips leading tabs from terminator-line comparison.
+/// * Body runs from the next newline up to (and including) the line that
+///   equals the delimiter. If EOF is reached with no terminator we bail to
+///   end-of-input — further redirection scanning would be unsound anyway.
+fn skip_heredoc_body(chars: &[(usize, char)], start_idx: usize, strip_tabs: bool) -> usize {
+    let mut idx = start_idx;
+
+    // Skip any whitespace between `<<` and the delimiter word.
+    while idx < chars.len() && matches!(chars[idx].1, ' ' | '\t') {
+        idx += 1;
+    }
+
+    // Parse delimiter word (optionally quoted). Backslash escapes a single char.
+    let mut delim = String::new();
+    let quote = match chars.get(idx).map(|(_, c)| *c) {
+        Some('\'') => {
+            idx += 1;
+            Some('\'')
+        }
+        Some('"') => {
+            idx += 1;
+            Some('"')
+        }
+        _ => None,
+    };
+    while idx < chars.len() {
+        let c = chars[idx].1;
+        match quote {
+            Some(q) => {
+                if c == q {
+                    idx += 1;
+                    break;
+                }
+                delim.push(c);
+                idx += 1;
+            }
+            None => {
+                if c.is_whitespace() || matches!(c, '|' | ';' | '&' | '<' | '>') {
+                    break;
+                }
+                if c == '\\' {
+                    idx += 1;
+                    if let Some((_, next)) = chars.get(idx) {
+                        delim.push(*next);
+                        idx += 1;
+                    }
+                } else {
+                    delim.push(c);
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    if delim.is_empty() {
+        // Malformed `<<` with no delimiter — refuse to parse the rest rather
+        // than risk misclassifying body content as redirections.
+        return chars.len();
+    }
+
+    // Advance to the newline that starts the body. Anything between the
+    // delimiter word and that newline is either whitespace, another
+    // redirection target (e.g. `<< EOF > out.txt`), or a following command.
+    // We conservatively let it pass through — the outer validator will pick
+    // up `> out.txt` on the next iteration, but since we already `continue`d
+    // we need the caller to resume at the newline.
+    while idx < chars.len() && chars[idx].1 != '\n' {
+        idx += 1;
+    }
+    if idx < chars.len() {
+        idx += 1; // consume newline → body starts
+    }
+
+    // Scan body line-by-line for a line matching `delim` exactly
+    // (after optional leading-tab stripping for `<<-`).
+    while idx < chars.len() {
+        let line_start = idx;
+        while idx < chars.len() && chars[idx].1 != '\n' {
+            idx += 1;
+        }
+        let line_end = idx;
+        let mut line: String = chars[line_start..line_end]
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        if strip_tabs {
+            line = line.trim_start_matches('\t').to_string();
+        }
+        if line == delim {
+            if idx < chars.len() {
+                idx += 1; // consume terminating newline
+            }
+            return idx;
+        }
+        if idx < chars.len() {
+            idx += 1; // consume newline and continue
+        }
+    }
+
+    // EOF without terminator — bail to end so the outer scanner stops.
+    chars.len()
 }
 
 fn is_shell_interpreter_command(base: &str) -> bool {
@@ -2839,7 +2993,11 @@ impl ToolExecutor {
         harden_command: bool,
     ) -> Result<std::process::Output, String> {
         let effective_command = if harden_command {
-            if let Some(ref policy) = self.sandbox_policy {
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref policy) = *sp_guard {
                 if !matches!(policy.mode, SandboxMode::Permissive) {
                     wrap_command_with_limits(policy, command)
                 } else {
@@ -2872,12 +3030,18 @@ impl ToolExecutor {
         }
 
         // Apply sandbox environment filtering
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
-            && let Err(e) = sandbox_command(policy, &mut child_cmd)
         {
-            eprintln!("[sandbox] failed to apply policy: {e}");
-            return Err(format!("Error: sandbox policy application failed: {e}"));
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+                && let Err(e) = sandbox_command(policy, &mut child_cmd)
+            {
+                eprintln!("[sandbox] failed to apply policy: {e}");
+                return Err(format!("Error: sandbox policy application failed: {e}"));
+            }
         }
 
         let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
@@ -3114,11 +3278,17 @@ impl ToolExecutor {
         // and reject the command if any path escapes the project boundary.
         // This closes the loophole where read_file is blocked by the sandbox
         // but `cat /outside/path` bypasses it.
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
         {
-            if let Some(msg) = check_bash_path_boundary(policy, command) {
-                return msg;
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+            {
+                if let Some(msg) = check_bash_path_boundary(policy, command) {
+                    return msg;
+                }
             }
         }
 
@@ -3250,11 +3420,17 @@ impl ToolExecutor {
         };
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
 
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
         {
-            if let Some(msg) = check_powershell_path_boundary(policy, command) {
-                return msg;
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+            {
+                if let Some(msg) = check_powershell_path_boundary(policy, command) {
+                    return msg;
+                }
             }
         }
 
@@ -3606,11 +3782,17 @@ impl ToolExecutor {
         .current_dir(&self.project_root);
 
         // Apply sandbox environment filtering (same as bash)
-        if let Some(ref policy) = self.sandbox_policy
-            && !matches!(policy.mode, SandboxMode::Permissive)
-            && let Err(e) = sandbox_command(policy, &mut cmd)
         {
-            return format!("Error: sandbox policy application failed: {e}");
+            let sp_guard = self
+                .sandbox_policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref policy) = *sp_guard
+                && !matches!(policy.mode, SandboxMode::Permissive)
+                && let Err(e) = sandbox_command(policy, &mut cmd)
+            {
+                return format!("Error: sandbox policy application failed: {e}");
+            }
         }
 
         // Use timeout_secs + 5s buffer for our wrapper (curl has its own --max-time)
@@ -4366,8 +4548,8 @@ mod tests {
     fn resolve_checked_with_permissive_sandbox_allows_all() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
-        executor.sandbox_policy = Some(SandboxPolicy::permissive(dir.path()));
+        let executor = ToolExecutor::new(dir.path());
+        *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::permissive(dir.path()));
         let result = executor.resolve_checked("/etc/passwd");
         assert!(result.is_ok(), "should allow with permissive: {result:?}");
     }
@@ -4388,8 +4570,8 @@ mod tests {
     fn resolve_checked_boundary_violation_has_sandbox_denied_prefix() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
-        executor.sandbox_policy = Some(SandboxPolicy::for_project(dir.path()));
+        let executor = ToolExecutor::new(dir.path());
+        *executor.sandbox_policy.write().unwrap() = Some(SandboxPolicy::for_project(dir.path()));
         let err = executor.resolve_checked("/etc/passwd").unwrap_err();
         assert!(
             err.starts_with(super::SANDBOX_DENIED_PREFIX),
@@ -4694,6 +4876,117 @@ mod tests {
         assert!(
             result.is_none(),
             ">&2 should remain treated as file-descriptor duplication, not a path access"
+        );
+    }
+
+    // ── Heredoc body must not be misparsed as redirections ─────────────
+    // Regression: HTML/XML/template payloads inside `<< 'EOF' ... EOF` used
+    // to trigger SANDBOX_DENIED because tags like `</title>` had their `<`
+    // interpreted as a redirection operator with `/title` as the target.
+
+    #[test]
+    fn heredoc_body_with_html_tags_is_not_misparsed_as_redirection() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let cmd = "cat > page.html << 'EOF'\n\
+            <!DOCTYPE html>\n\
+            <html lang=\"en\"><head><title>hi</title></head>\n\
+            <body><a href=\"/admin\">x</a></body></html>\n\
+            EOF\n";
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(
+            result.is_none(),
+            "heredoc body with HTML tags must not be treated as redirection: {result:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_unquoted_delimiter_body_is_skipped() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let cmd = "cat > out.xml << EOF\n<root><child>/etc/shadow</child></root>\nEOF\n";
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(
+            result.is_none(),
+            "unquoted heredoc must also skip body (no expansion here matters to us): {result:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_double_quoted_delimiter_body_is_skipped() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let cmd = "cat > page.svg << \"DONE\"\n<svg><path d=\"M 0 0\"/></svg>\nDONE\n";
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(result.is_none(), "double-quoted delimiter: {result:?}");
+    }
+
+    #[test]
+    fn heredoc_dash_strips_tabs_before_terminator() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        // `<<-` terminator may be preceded by tabs.
+        let cmd = "cat > f.html <<-END\n\t<div>a</div>\n\tEND\n";
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(result.is_none(), "<<- tab-stripped terminator: {result:?}");
+    }
+
+    #[test]
+    fn redirection_after_heredoc_body_is_still_caught() {
+        // After the heredoc terminator, subsequent redirections must still
+        // be validated. Ensures we don't over-skip.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let cmd = "cat > page.html << 'EOF'\n<html></html>\nEOF\ncat > /etc/passwd";
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(
+            result.as_deref().is_some_and(|m| m.contains("/etc/passwd")),
+            "redirection after heredoc body should still be caught: {result:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_body_containing_redirection_like_text_does_not_deny() {
+        // Body has literal `> /etc/passwd` text — must not be validated as a redir.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let cmd = "cat > docs.txt << 'EOF'\nusage: foo > /etc/passwd\nEOF\n";
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(
+            result.is_none(),
+            "body text that *describes* a redirection must not trip sandbox: {result:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_herestring_is_not_confused_with_heredoc() {
+        // `<<<word` is a here-string, NOT a heredoc — the word is inline, no body.
+        // Ensure the here-string path isn't accidentally taking the heredoc branch.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "grep foo <<< hello");
+        assert!(
+            result.is_none(),
+            "here-string should not be mis-detected as heredoc: {result:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_without_terminator_stops_scanning_safely() {
+        // Malformed heredoc (no terminator). The validator must not panic;
+        // downstream redirections in the tail are unreachable (EOF hit).
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let cmd = "cat > x.html << 'EOF'\n<body>unterminated\n";
+        // Should either return None or a safety message — must not panic, must not
+        // report `/body` as a denied redirection.
+        let result = check_bash_path_boundary(&policy, cmd);
+        assert!(
+            result
+                .as_deref()
+                .map(|m| !m.contains("/body"))
+                .unwrap_or(true),
+            "unterminated heredoc must not surface body chars as a denied path: {result:?}"
         );
     }
 

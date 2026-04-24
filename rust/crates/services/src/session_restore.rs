@@ -1240,8 +1240,7 @@ async fn log_session_sync(
     // This prevents unbounded sync_log growth for long-running sessions.
     if inserted.rows_affected() > 0
         && let Some(retain) = crate::state_sync::sync_log_retain_limit(status)
-    {
-        let _ = sqlx::query(crate::state_sync::build_sync_log_prune_query())
+        && let Err(e) = sqlx::query(crate::state_sync::build_sync_log_prune_query())
             .bind(user_id)
             .bind(status)
             .bind(sync_type)
@@ -1250,7 +1249,15 @@ async fn log_session_sync(
             .bind(sync_type)
             .bind(retain as i64)
             .execute(pool)
-            .await;
+            .await
+    {
+        tracing::warn!(
+            target: "astra_services::session_restore",
+            user_id = %user_id,
+            sync_type = %sync_type,
+            error = %e,
+            "failed to prune sync logs"
+        );
     }
 
     Ok(())
@@ -1677,19 +1684,35 @@ pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetada
     // Defense: reject excessively large metadata to prevent DoS
     const MAX_METADATA_SIZE: usize = 512 * 1024; // 512 KB
     if metadata_json.len() > MAX_METADATA_SIZE {
-        eprintln!(
-            "[WARN] session metadata too large ({} bytes), skipping plan extraction",
-            metadata_json.len()
+        tracing::warn!(
+            target: "astra_services::session_restore",
+            size = metadata_json.len(),
+            "session metadata too large, skipping plan extraction"
         );
         return SessionMetadataState::default();
     }
     let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
         Ok(v) => v,
-        Err(_) => return SessionMetadataState::default(),
+        Err(e) => {
+            let prefix = &metadata_json[..metadata_json.len().min(200)];
+            tracing::error!(
+                target: "astra_services::session_restore",
+                err = %e,
+                payload_prefix = %prefix,
+                "metadata JSON parse failed; returning default state"
+            );
+            return SessionMetadataState::default();
+        }
     };
     let obj = match parsed.as_object() {
         Some(o) => o,
-        None => return SessionMetadataState::default(),
+        None => {
+            tracing::warn!(
+                target: "astra_services::session_restore",
+                "session metadata is not a JSON object; returning default state"
+            );
+            return SessionMetadataState::default();
+        }
     };
 
     SessionMetadataState {
@@ -2869,6 +2892,19 @@ mod tests {
         assert!(
             snippet.contains("cloud_step_checkpoint_number(checkpoint_number)?"),
             "step checkpoint cloud writes should use a disjoint number namespace"
+        );
+    }
+
+    /// audit-D10: session_restore must not silently drop DB write errors.
+    #[test]
+    fn session_restore_db_writes_are_not_silently_dropped() {
+        let source = include_str!("session_restore.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("let _ = sqlx::query").count();
+        assert_eq!(
+            count, 0,
+            "session_restore has {count} silently-dropped DB writes"
         );
     }
 }

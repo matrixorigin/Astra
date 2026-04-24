@@ -56,6 +56,13 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum message size (256 KB — generous for chat messages).
 const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
+/// Maximum concurrent WebSocket connections (global). Prevents fd/memory
+/// exhaustion from connection floods.
+const MAX_WS_CONNECTIONS: usize = 1024;
+
+/// Global counter of active WebSocket connections.
+static WS_CONNECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Heartbeat interval for keep-alive pings.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -288,6 +295,16 @@ pub(super) async fn ws_chat_handler(
     query: Query<WsUpgradeQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // Reject if at connection limit
+    let current = WS_CONNECTION_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if current >= MAX_WS_CONNECTIONS {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "too many WebSocket connections",
+        )
+            .into_response();
+    }
+
     let token = query.token.clone();
     let session_id = query.session_id.clone();
     let forward_headers = collect_forward_headers(&headers);
@@ -296,6 +313,7 @@ pub(super) async fn ws_chat_handler(
         .on_upgrade(move |socket| {
             ws_connection_loop(socket, state, token, session_id, forward_headers)
         })
+        .into_response()
 }
 
 /// Main WebSocket connection loop.
@@ -310,6 +328,15 @@ async fn ws_connection_loop(
     initial_session_id: Option<String>,
     forward_headers: std::collections::HashMap<String, String>,
 ) {
+    WS_CONNECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    struct WsGuard;
+    impl Drop for WsGuard {
+        fn drop(&mut self) {
+            WS_CONNECTION_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _guard = WsGuard;
+
     // Phase 1: Authenticate
     let conn = match authenticate(
         &mut socket,
@@ -576,6 +603,10 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                         let _ = socket.send(Message::Pong(data)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
+                        // audit-#9: echo a Close frame so the peer knows we
+                        // observed the closure and isn't left waiting on a
+                        // reciprocal frame before tearing down the TCP socket.
+                        let _ = socket.send(Message::Close(None)).await;
                         break;
                     }
                     Some(Ok(_)) => {
@@ -782,6 +813,54 @@ async fn handle_resume_run(
     }
 }
 
+/// Outcome of a dedup-insert into the edge-callback ledger.
+#[derive(Debug, PartialEq)]
+pub(crate) enum WsLedgerOutcome {
+    /// Key was absent; value has been inserted.
+    Inserted,
+    /// Key was present with an identical JSON value; no-op idempotent replay.
+    IdempotentReplay,
+    /// Key was present with a DIFFERENT value; the original decision is preserved.
+    ConflictIgnored,
+}
+
+/// Insert `value` under `key` in the ledger with at-most-once idempotency semantics.
+///
+/// - Key absent → insert, return `Inserted`.
+/// - Key present + same JSON value → no-op, return `IdempotentReplay`.
+/// - Key present + different JSON value → do NOT overwrite; emit a warning;
+///   return `ConflictIgnored`.
+pub(crate) fn ws_ledger_dedup_insert(
+    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) -> WsLedgerOutcome {
+    use std::collections::hash_map::Entry;
+    match ledger.entry(key.clone()) {
+        Entry::Vacant(e) => {
+            e.insert(value);
+            WsLedgerOutcome::Inserted
+        }
+        Entry::Occupied(e) => {
+            let existing = e.get();
+            if existing == &value {
+                WsLedgerOutcome::IdempotentReplay
+            } else {
+                let existing_repr = existing.to_string().chars().take(80).collect::<String>();
+                let new_repr = value.to_string().chars().take(80).collect::<String>();
+                tracing::warn!(
+                    target: "astra_runtime::ws_callback",
+                    key = %key,
+                    existing = %existing_repr,
+                    incoming = %new_repr,
+                    "WS ledger dedup: incoming value conflicts with stored decision; original preserved"
+                );
+                WsLedgerOutcome::ConflictIgnored
+            }
+        }
+    }
+}
+
 /// Store a tool approval response in the edge callback ledger.
 async fn handle_tool_approval(
     state: &AppState,
@@ -799,7 +878,7 @@ async fn handle_tool_approval(
     });
     let ledger = state.edge_callback_ledger.clone();
     let mut guard = ledger.lock().await;
-    guard.insert(key, value);
+    ws_ledger_dedup_insert(&mut guard, key, value);
 }
 
 /// Store an ask_user response in the edge callback ledger.
@@ -819,7 +898,7 @@ async fn handle_user_prompt_response(
     });
     let ledger = state.edge_callback_ledger.clone();
     let mut guard = ledger.lock().await;
-    guard.insert(key, value);
+    ws_ledger_dedup_insert(&mut guard, key, value);
 }
 
 #[cfg(test)]
@@ -4036,5 +4115,81 @@ mod tests {
 
         let json = r#"{"type":"user_prompt","request_id":"req-1"}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+    }
+
+    // ── ws_ledger_dedup_insert unit tests ──────────────────────────────────
+
+    #[test]
+    fn ws_ledger_dedup_insert_absent_key_inserts_and_returns_inserted() {
+        let mut ledger = std::collections::HashMap::new();
+        let outcome = ws_ledger_dedup_insert(
+            &mut ledger,
+            "user:req-1".to_string(),
+            serde_json::json!({"approved": true, "reason": null}),
+        );
+        assert_eq!(outcome, WsLedgerOutcome::Inserted);
+        assert_eq!(
+            ledger["user:req-1"],
+            serde_json::json!({"approved": true, "reason": null})
+        );
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_identical_value_is_idempotent_replay() {
+        let mut ledger = std::collections::HashMap::new();
+        let value = serde_json::json!({"approved": true, "reason": null});
+        ledger.insert("user:req-1".to_string(), value.clone());
+
+        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-1".to_string(), value.clone());
+        assert_eq!(outcome, WsLedgerOutcome::IdempotentReplay);
+        // original value unchanged
+        assert_eq!(ledger["user:req-1"], value);
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_different_value_is_conflict_ignored_and_preserves_original() {
+        let mut ledger = std::collections::HashMap::new();
+        let original = serde_json::json!({"approved": true, "reason": null});
+        let conflicting = serde_json::json!({"approved": false, "reason": "changed mind"});
+        ledger.insert("user:req-1".to_string(), original.clone());
+
+        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-1".to_string(), conflicting);
+        assert_eq!(outcome, WsLedgerOutcome::ConflictIgnored);
+        // original MUST NOT be overwritten
+        assert_eq!(
+            ledger["user:req-1"], original,
+            "conflicting update must not overwrite the first decision"
+        );
+    }
+
+    /// audit-#9: the message loop must echo a Close frame back to the peer
+    /// before tearing the socket down so the WebSocket close handshake completes.
+    #[test]
+    fn message_loop_echoes_close_frame() {
+        let source = include_str!("ws_handler.rs");
+        let needle = "Some(Ok(Message::Close(_))) | None =>";
+        let idx = source.find(needle).expect("close arm present");
+        let arm = &source[idx..idx + 400];
+        assert!(
+            arm.contains("socket.send(Message::Close(None))"),
+            "WS message_loop must echo a Close frame before breaking"
+        );
+    }
+
+    /// U4: ws_chat_handler must enforce a connection limit to prevent
+    /// fd/memory exhaustion from connection floods.
+    #[test]
+    fn ws_handler_has_connection_limit() {
+        let source = include_str!("ws_handler.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("MAX_WS_CONNECTIONS"),
+            "ws_chat_handler must check a connection limit"
+        );
+        assert!(
+            prod_code.contains("WS_CONNECTION_COUNT"),
+            "ws_connection_loop must track active connections"
+        );
     }
 }

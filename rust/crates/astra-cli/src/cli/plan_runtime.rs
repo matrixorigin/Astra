@@ -1,9 +1,12 @@
-//! Background plan execution wiring.
+//! Plan execution wiring: spawns a background executor task, then runs the
+//! in-process plan monitor in the current task until the run pauses, completes, or
+//! the user cancels. Progress is shown live; between-monitor idle time (if the REPL
+//! is reached again) may still use [`crate::plan_monitor::flush_plan_updates_between_prompts`]
+//! when applicable.
 
 use crate::durable_bridge;
 use crate::plan_executor;
 use crate::plan_interaction;
-use crate::plan_monitor::run_blocking_plan_monitor;
 use crate::repl_runtime::create_background_plan_selector;
 use crate::repl_state::ReplState;
 use crate::theme;
@@ -35,16 +38,16 @@ pub(crate) fn build_learning_bridge(
 
 /// Extract a [`BackgroundPlanContext`] from the current REPL state.
 ///
-/// Moves the active plan, durable task state, and corrections out of `state`
-/// (using `take()`), and clones the remaining fields needed by the background
-/// executor. On success `state.executing_plan` will be `None`.
+/// Clones the active plan for the background executor, moves durable task state
+/// and corrections out of `state`, and leaves an in-memory copy behind so
+/// `/plan status` can keep reporting progress after plan mode exits.
 fn take_plan_context(
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
     current_token: Option<&str>,
     profile: Option<&str>,
 ) -> Result<plan_executor::BackgroundPlanContext, String> {
-    let plan = state.executing_plan.take().ok_or("No plan to execute")?;
+    let plan = state.executing_plan.clone().ok_or("No plan to execute")?;
     let token = current_token
         .ok_or("Not logged in — cannot start background plan")?
         .to_string();
@@ -73,6 +76,7 @@ fn take_plan_context(
         observability_hub: state.observability_hub.clone(),
         observability_session: state.observability_session.clone(),
         file_journal: state.file_journal.clone(),
+        file_state: state.file_state.clone(),
         database_snapshot_journal: state.database_snapshot_journal.clone(),
         git_stash_journal: state.git_stash_journal.clone(),
         git_commit_journal: state.git_commit_journal.clone(),
@@ -102,12 +106,15 @@ fn create_background_selector(
     create_background_plan_selector(ctx)
 }
 
-/// Spawn a plan executor, then block until it finishes, pauses, or errors.
+/// Spawns a background plan executor, then **blocks the caller** in
+/// [`crate::plan_monitor::run_blocking_plan_monitor`] until the run pauses, finishes,
+/// or the user hits Ctrl+C (per monitor behavior).
 ///
-/// The executor runs as a `tokio` task; this function enters a monitoring
-/// loop that displays progress in real-time, handles Ctrl-C (→ pause), and
-/// resolves approval prompts inline. The REPL prompt is not shown until
-/// this function returns.
+/// The heavy work still runs in the executor’s `tokio` task. This function only
+/// returns after the blocking monitor loop exits, so the normal REPL prompt is not
+/// interleaved with that plan run. The in-memory `executing_plan` copy and
+/// `plan_handle` keep [`crate::plan_monitor::flush_plan_updates_between_prompts`] and
+/// `/plan status` useful when the user is at the prompt again.
 pub(crate) async fn start_and_monitor_plan(
     state: &mut ReplState,
     current_token: Option<&str>,
@@ -128,9 +135,15 @@ pub(crate) async fn start_and_monitor_plan(
     let handle = plan_executor::spawn_plan_executor(ctx, selector);
     state.plan_handle = Some(handle);
 
-    eprintln!("  {} {}", "▸".bold().cyan(), "Plan executing…".bold());
+    eprintln!(
+        "  {} {}",
+        "▸".bold().cyan(),
+        "Plan executing — Ctrl+C to pause.".bold()
+    );
 
-    run_blocking_plan_monitor(state).await;
+    // Run the blocking monitor so the user sees live progress.
+    // The monitor handles Ctrl+C (pause/cancel) and approval prompts inline.
+    super::plan_monitor::run_blocking_plan_monitor(state).await;
 
     Ok(())
 }

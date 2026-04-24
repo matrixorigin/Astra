@@ -23,11 +23,21 @@ if [ ! -f "${BACKUP_FILE}" ]; then
     exit 1
 fi
 
+# Load .env if present so local dev scripts pick up the same explicit secrets.
+if [ -f .env ]; then
+    set -a; source .env; set +a
+fi
+
+if [ -z "${MATRIXONE_PASSWORD:-}" ]; then
+    echo "❌ Error: MATRIXONE_PASSWORD is required (set it explicitly or source .env)"
+    exit 1
+fi
+
 # Database connection
 DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
-DB_PASSWORD="${MATRIXONE_PASSWORD:-111}"
+DB_PASSWORD="${MATRIXONE_PASSWORD}"
 DB_NAME="${ASTRA_DATABASE:-astra}"
 
 echo "⚠️  WARNING: This will replace all data in database '${DB_NAME}'"

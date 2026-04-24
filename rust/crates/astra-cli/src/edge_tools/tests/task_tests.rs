@@ -16,8 +16,19 @@ async fn task_create_returns_task_id() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
     let result = exe.task_create(&json!({"title": "Test task"})).await;
-    assert!(result.contains("task-1"));
-    assert!(result.contains("success"));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["success"], true,
+        "task_create must succeed — got: {result}"
+    );
+    assert_eq!(parsed["task_id"], "task-1", "first task id must be task-1");
+    let msg = parsed["message"]
+        .as_str()
+        .expect("message must be a string");
+    assert!(
+        msg.contains("Test task"),
+        "message must reference title — got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -25,13 +36,16 @@ async fn task_list_shows_created_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
 
-    // Create a task
     exe.task_create(&json!({"title": "First task"})).await;
 
-    // List should show it
     let list = exe.task_list(&json!({})).await;
-    assert!(list.contains("First task"));
-    assert!(list.contains("task-1"));
+    let parsed: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(parsed["count"], 1, "count must reflect created tasks");
+    let tasks = parsed["tasks"].as_array().expect("tasks must be array");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], "task-1");
+    assert_eq!(tasks[0]["title"], "First task");
+    assert_eq!(tasks[0]["status"], "pending");
 }
 
 #[tokio::test]
@@ -46,8 +60,11 @@ async fn task_get_returns_details() {
     .await;
 
     let details = exe.task_get(&json!({"task_id": "task-1"})).await;
-    assert!(details.contains("Detailed task"));
-    assert!(details.contains("This is a test"));
+    let parsed: serde_json::Value = serde_json::from_str(&details).unwrap();
+    assert_eq!(parsed["id"], "task-1");
+    assert_eq!(parsed["title"], "Detailed task");
+    assert_eq!(parsed["description"], "This is a test");
+    assert_eq!(parsed["status"], "pending");
 }
 
 #[tokio::test]

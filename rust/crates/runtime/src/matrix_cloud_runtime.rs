@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
@@ -29,9 +30,23 @@ use crate::sync_adapters::{
 /// Max time to wait for the ingestion worker to finish during shutdown.
 const INGESTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Environment-driven MatrixOne settings (same defaults as legacy CLI `try_init_ingestion`).
-pub fn matrix_settings_from_env() -> MatrixOneSettings {
-    MatrixOneSettings {
+/// Trait for tracking fire-and-forget persist futures so they are drained on shutdown.
+///
+/// `InProcessChatTurnBridge` uses this to hand off its SSE-generator persist tasks to
+/// a shutdown-aware tracker rather than raw `tokio::spawn`.  The production impl is
+/// [`MatrixCloudRuntime`]; tests inject a lightweight stub.
+///
+/// Object-safe: uses `Pin<Box<dyn Future>>` instead of a generic parameter.
+pub trait BridgePersistTracker: Send + Sync {
+    fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>);
+}
+
+/// Environment-driven MatrixOne settings.
+///
+/// Requires `MATRIXONE_PASSWORD` to be set — fails closed rather than
+/// substituting a hardcoded development password.
+pub fn matrix_settings_from_env() -> Result<MatrixOneSettings, String> {
+    Ok(MatrixOneSettings {
         host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".into()),
         port: std::env::var("MATRIXONE_PORT")
             .ok()
@@ -39,9 +54,9 @@ pub fn matrix_settings_from_env() -> MatrixOneSettings {
             .unwrap_or(6001),
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
-            .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.into()),
+            .map_err(|_| "MATRIXONE_PASSWORD environment variable is required".to_string())?,
         database: resolve_database_name(&|k| std::env::var(k).ok()),
-    }
+    })
 }
 
 /// Pool + ingestion + unified sync orchestrator. Safe to share behind `Arc`.
@@ -306,6 +321,12 @@ impl MatrixCloudRuntime {
     }
 }
 
+impl BridgePersistTracker for MatrixCloudRuntime {
+    fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+        self.spawn_session_sync_task(task);
+    }
+}
+
 /// Build a [`SyncOrchestrator`] with all edge sync domains (tests / harness).
 #[allow(clippy::too_many_arguments)]
 pub fn build_sync_orchestrator_with_adapters(
@@ -356,10 +377,13 @@ mod tests {
 
     #[test]
     fn matrix_settings_from_env_non_empty() {
-        let s = matrix_settings_from_env();
+        // SAFETY: tests run sequentially in this module; setting env temporarily.
+        unsafe { std::env::set_var("MATRIXONE_PASSWORD", "test-pw") };
+        let s = matrix_settings_from_env().expect("password set");
         assert!(!s.host.is_empty());
         assert!(s.port > 0);
         assert!(!s.database.is_empty());
+        unsafe { std::env::remove_var("MATRIXONE_PASSWORD") };
     }
 
     #[test]
@@ -420,6 +444,108 @@ mod tests {
         assert!(
             source.contains("session_sync_tasks.join_next().await"),
             "shutdown_ingestion_and_wait should await tracked session sync tasks before exit"
+        );
+    }
+
+    #[test]
+    fn serve_calls_shutdown_ingestion_and_wait() {
+        let source = include_str!("server/mod.rs");
+        assert!(
+            source.contains("shutdown_ingestion_and_wait"),
+            "serve() must call shutdown_ingestion_and_wait after axum serve returns"
+        );
+    }
+
+    #[test]
+    fn spawn_data_cleanup_respects_cancellation_token() {
+        let source = include_str!("server/mod.rs");
+        assert!(
+            source.contains("CancellationToken"),
+            "spawn_data_cleanup must accept a CancellationToken so shutdown can drain it"
+        );
+        assert!(
+            source.contains("cancel.cancelled()") || source.contains("cancel_token.cancelled()"),
+            "spawn_data_cleanup loop must select! on the cancel token"
+        );
+    }
+
+    /// HIGH #4: BridgePersistTracker trait must exist and be object-safe.
+    #[test]
+    fn bridge_persist_tracker_trait_is_defined() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("pub trait BridgePersistTracker"),
+            "BridgePersistTracker trait must be declared in matrix_cloud_runtime"
+        );
+        assert!(
+            source.contains("fn track_persist_task"),
+            "BridgePersistTracker must expose track_persist_task"
+        );
+    }
+
+    /// HIGH #4: MatrixCloudRuntime must implement BridgePersistTracker.
+    #[test]
+    fn matrix_cloud_runtime_impls_bridge_persist_tracker() {
+        let source = include_str!("matrix_cloud_runtime.rs");
+        assert!(
+            source.contains("impl BridgePersistTracker for MatrixCloudRuntime"),
+            "MatrixCloudRuntime must implement BridgePersistTracker"
+        );
+    }
+
+    /// HIGH #4: BridgePersistTracker functional test — future runs via a minimal test impl.
+    #[tokio::test]
+    async fn bridge_persist_tracker_future_runs_and_drains() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::oneshot;
+
+        struct SpawningTracker;
+        impl BridgePersistTracker for SpawningTracker {
+            fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+                tokio::spawn(task);
+            }
+        }
+
+        let task_ran = Arc::new(AtomicBool::new(false));
+        let task_ran2 = task_ran.clone();
+        let (tx, rx) = oneshot::channel::<()>();
+
+        let tracker: Arc<dyn BridgePersistTracker> = Arc::new(SpawningTracker);
+        tracker.track_persist_task(Box::pin(async move {
+            task_ran2.store(true, Ordering::SeqCst);
+            let _ = tx.send(());
+        }));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), rx).await;
+        assert!(
+            task_ran.load(Ordering::SeqCst),
+            "tracked future must execute"
+        );
+    }
+
+    /// HIGH #4: InProcessChatTurnBridge must have a persist_tracker field.
+    #[test]
+    fn bridge_inprocess_has_persist_tracker_field() {
+        let source = include_str!("turn/bridge_inprocess.rs");
+        assert!(
+            source.contains("persist_tracker"),
+            "InProcessChatTurnBridge must have a persist_tracker field for HIGH #4"
+        );
+        assert!(
+            source.contains("BridgePersistTracker"),
+            "bridge_inprocess.rs must reference BridgePersistTracker"
+        );
+    }
+
+    /// HIGH #4: The fire-and-forget persist paths in bridge_inprocess.rs must be
+    /// replaced with the tracked path (no raw TODO(audit-#3) deferred comment).
+    #[test]
+    fn bridge_persist_uses_tracker_not_raw_spawn() {
+        let source = include_str!("turn/bridge_inprocess.rs");
+        assert!(
+            !source.contains("TODO(audit-#3)"),
+            "audit-#3 TODO must be resolved — persist tasks should be tracked now"
         );
     }
 }

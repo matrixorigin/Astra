@@ -1,0 +1,41 @@
+name: self_awareness_scenario
+description: "SelfModel 自我感知：在使用过工具之后，询问 agent 近期做过什么、擅长哪些技能；SelfModel 的 skills/tool_health/scenario/recent_signals 注入应让模型给出与会话事实一致的回答"
+requires: [llm]
+
+turns:
+  - user: "帮我把当前目录的文件列出来，并读一下 README.md 的前 20 行。"
+    checks:
+      rules:
+        - db:
+            table: agent_events
+            where: "session_id = :sid AND event_type = 'tool_call'"
+            assert:
+              count: ">=1"
+        - db:
+            table: skill_selection_events
+            where: "session_id = :sid"
+            assert:
+              count: ">=1"
+              fields:
+                skill_name: {not_null: true}
+      llm_judge:
+        criteria: "回复应包含目录文件与 README 摘要"
+        pass_threshold: 0.6
+
+  - user: "回顾一下你刚才调用过哪些工具、用到了哪些技能？请只基于事实回答，不要编造没发生过的调用。"
+    checks:
+      rules:
+        - response_contains_any: ["list", "read", "目录", "文件", "README"]
+      llm_judge:
+        criteria: "回复应真实反映上一轮实际调用过的工具/技能，不应虚构未调用的工具（如 write/delete/shell）。体现 SelfModel 自省能力。"
+        pass_threshold: 0.7
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: skill_selection_events
+        where: "session_id = :sid AND execution_success = 1"
+        assert:
+          count: ">=1"

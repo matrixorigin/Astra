@@ -69,10 +69,13 @@ fn load_contract() -> HttpShellContract {
 }
 
 fn build_test_app(healthy: bool) -> Router {
-    build_app(AppState::new(
-        ServiceInfo::default(),
-        Arc::new(StubHealthChecker { healthy }),
-    ))
+    build_app(
+        AppState::new(
+            ServiceInfo::default(),
+            Arc::new(StubHealthChecker { healthy }),
+        )
+        .with_auth_service(Arc::new(astra_services::auth::StubAuthService)),
+    )
 }
 
 async fn read_json(app: Router, path: &str) -> (StatusCode, serde_json::Value) {

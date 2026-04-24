@@ -57,7 +57,7 @@ fn normalize_max_rounds(value: Option<&Value>) -> i64 {
             .as_i64()
             .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok()))
             .unwrap_or(10)
-            .min(20),
+            .clamp(1, 20),
         _ => 10,
     }
 }
@@ -266,5 +266,41 @@ mod tests {
         let out = normalize_execution_state(&data);
         let failures = out["tool_failures"].as_object().unwrap();
         assert_eq!(failures.len(), 2);
+    }
+
+    /// P0-C: max_rounds must have a floor of 1. Zero or negative values
+    /// would make the agentic loop condition `round < max_rounds` always
+    /// false, silently disabling the entire loop.
+    #[test]
+    fn max_rounds_zero_normalized_to_at_least_one() {
+        let data = Map::from_iter([("max_rounds".to_string(), json!(0))]);
+        let out = normalize_execution_state(&data);
+        let max = out["max_rounds"].as_i64().unwrap();
+        assert!(max >= 1, "max_rounds=0 must be normalized to ≥1, got {max}");
+    }
+
+    #[test]
+    fn max_rounds_negative_normalized_to_at_least_one() {
+        let data = Map::from_iter([("max_rounds".to_string(), json!(-5))]);
+        let out = normalize_execution_state(&data);
+        let max = out["max_rounds"].as_i64().unwrap();
+        assert!(
+            max >= 1,
+            "max_rounds=-5 must be normalized to ≥1, got {max}"
+        );
+    }
+
+    #[test]
+    fn max_rounds_one_is_valid() {
+        let data = Map::from_iter([("max_rounds".to_string(), json!(1))]);
+        let out = normalize_execution_state(&data);
+        assert_eq!(out["max_rounds"].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn max_rounds_upper_cap_still_works() {
+        let data = Map::from_iter([("max_rounds".to_string(), json!(100))]);
+        let out = normalize_execution_state(&data);
+        assert_eq!(out["max_rounds"].as_i64().unwrap(), 20);
     }
 }

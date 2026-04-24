@@ -220,10 +220,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             &self.project_root,
         );
 
-        let mut executor = edge_tools::ToolExecutor::new(&effective_root)
+        let executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &self.token);
         if !config.session_id.trim().is_empty() {
-            executor = executor.with_active_session_id(config.session_id.clone());
+            executor.set_active_session_id(config.session_id.clone());
         }
 
         let mut host = SubRunHost {
@@ -231,7 +231,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             token: self.token.clone(),
             model: effective_model,
             project_root: effective_root.clone(),
-            executor,
+            executor: std::sync::Arc::new(executor),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
@@ -308,6 +308,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             max_turns: DELEGATE_MAX_TURNS,
             remaining_turns: DELEGATE_MAX_TURNS,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
@@ -394,7 +395,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         };
 

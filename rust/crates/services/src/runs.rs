@@ -106,6 +106,13 @@ pub trait RunLifecycleService: Send + Sync {
     async fn drain_progress_events(&self, _run_id: &str) -> Vec<serde_json::Value> {
         vec![]
     }
+
+    /// Wait for in-flight background tasks to finish during graceful shutdown.
+    /// Returns `true` if all tasks drained within the timeout.
+    /// Default: no-op (returns true immediately).
+    async fn drain_background_tasks(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +337,9 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
+    /// Find runs in RUNNING status (for crash recovery — mark them failed on restart).
+    async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
+
     /// Find all sub-runs belonging to a delegation.
     async fn find_sub_runs(&self, delegation_id: &str) -> Result<Vec<DurableRunRecord>, String>;
 
@@ -343,6 +353,10 @@ pub struct InMemoryRunStateStore {
 }
 
 impl InMemoryRunStateStore {
+    /// Maximum number of runs kept in memory. When exceeded, the oldest
+    /// completed/failed runs are evicted on insert.
+    pub const MAX_RUNS: usize = 10_000;
+
     pub fn new() -> Self {
         Self {
             runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
@@ -361,6 +375,21 @@ impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
         let mut runs = self.runs.write().await;
         runs.insert(record.run_id.clone(), record);
+
+        // Evict oldest completed/failed runs when over capacity
+        if runs.len() > Self::MAX_RUNS {
+            let terminal = ["completed", "failed", "cancelled"];
+            let mut evictable: Vec<_> = runs
+                .iter()
+                .filter(|(_, r)| terminal.contains(&r.status.as_str()))
+                .map(|(id, r)| (id.clone(), r.updated_at.clone()))
+                .collect();
+            evictable.sort_by(|a, b| a.1.cmp(&b.1));
+            let to_remove = runs.len() - Self::MAX_RUNS;
+            for (id, _) in evictable.into_iter().take(to_remove) {
+                runs.remove(&id);
+            }
+        }
         Ok(())
     }
 
@@ -456,6 +485,15 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(runs
             .values()
             .filter(|r| r.status == "waiting")
+            .cloned()
+            .collect())
+    }
+
+    async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|r| r.status == "running")
             .cloned()
             .collect())
     }
@@ -967,6 +1005,47 @@ mod tests {
         assert_eq!(
             err.1.0.error_code.as_deref(),
             Some(RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE)
+        );
+    }
+
+    /// U2: InMemoryRunStateStore must evict old completed runs when the
+    /// store exceeds its capacity, preventing unbounded memory growth.
+    #[tokio::test]
+    async fn in_memory_run_store_evicts_completed_runs() {
+        let store = InMemoryRunStateStore::new();
+        let max = InMemoryRunStateStore::MAX_RUNS;
+
+        // Fill to capacity + 10 with completed runs
+        for i in 0..max + 10 {
+            let record = DurableRunRecord {
+                run_id: format!("run-{i}"),
+                session_id: "s1".into(),
+                user_id: "u1".into(),
+                status: "completed".into(),
+                parent_run_id: None,
+                delegation_id: None,
+                agent_id: None,
+                retry_of: None,
+                waiting_for: None,
+                checkpoint_json: None,
+                error_message: None,
+                retry_count: 0,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![],
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            store.insert_run(record).await.unwrap();
+        }
+
+        // Store must not exceed max capacity
+        let runs = store.runs.read().await;
+        assert!(
+            runs.len() <= max,
+            "store has {} runs, expected ≤ {max}",
+            runs.len()
         );
     }
 }

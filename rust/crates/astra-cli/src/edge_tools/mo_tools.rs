@@ -31,7 +31,8 @@ fn mo_current_account() -> &'static str {
     use std::sync::OnceLock;
     static ACCOUNT: OnceLock<String> = OnceLock::new();
     ACCOUNT.get_or_init(|| {
-        let out = mo_execute_sql("SELECT current_account_name() AS name", None);
+        let out =
+            mo_execute_sql("SELECT current_account_name() AS name", None).unwrap_or_else(|e| e);
         // Parse the value from mysql --table output.
         out.lines()
             .filter(|l| !l.starts_with('+') && !l.contains("name"))
@@ -182,13 +183,18 @@ fn is_mo_error(output: &str) -> bool {
 }
 
 /// Build a mysql Command with connection parameters from environment.
-fn mo_mysql_cmd(database: Option<&str>) -> Command {
-    astra_core::warn_default_credentials_once();
+///
+/// Requires `MATRIXONE_PASSWORD` to be set — returns an error message string
+/// when missing rather than falling back to a hardcoded development password.
+fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
     let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
     let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD")
-        .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string());
+    let password = std::env::var("MATRIXONE_PASSWORD").map_err(|_| {
+        "Error: MATRIXONE_PASSWORD environment variable is required. \
+         Set it before using MatrixOne tools."
+            .to_string()
+    })?;
     let db = database
         .map(String::from)
         .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
@@ -201,12 +207,15 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
         .arg(&db)
         .arg(format!("--connect-timeout={MO_CONNECT_TIMEOUT_SECS}"))
         .arg("--table"); // Pretty-print results
-    cmd
+    Ok(cmd)
 }
 
 /// Execute a SQL statement against MatrixOne via the mysql CLI.
-fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
-    let mut cmd = mo_mysql_cmd(database);
+///
+/// Returns `Err` with an explanatory message when `MATRIXONE_PASSWORD` is unset.
+/// Tool callers that need a `String` output should use `.unwrap_or_else(|e| e)`.
+fn mo_execute_sql(sql: &str, database: Option<&str>) -> Result<String, String> {
+    let mut cmd = mo_mysql_cmd(database)?;
     cmd.arg("-e").arg(sql);
 
     match cmd.output() {
@@ -228,9 +237,9 @@ fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
                     msg.push_str("\n--- auto-fetched schema ---\n");
                     msg.push_str(&hint);
                 }
-                msg
+                Ok(msg)
             } else if stdout.is_empty() {
-                "OK (no results)".to_string()
+                Ok("OK (no results)".to_string())
             } else {
                 let result = stdout.to_string();
                 if result.len() > 20_000 {
@@ -241,17 +250,17 @@ fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
                         "\n[truncated at 20KB: showing ~{} of {} rows. Use LIMIT to narrow results.]",
                         rows_shown, total_rows
                     ));
-                    t
+                    Ok(t)
                 } else {
-                    result
+                    Ok(result)
                 }
             }
         }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "Error: mysql client not found. Install mysql-client or mariadb-client to use MatrixOne tools.\nHint: apt install mariadb-client OR brew install mysql-client".to_string()
+                Ok("Error: mysql client not found. Install mysql-client or mariadb-client to use MatrixOne tools.\nHint: apt install mariadb-client OR brew install mysql-client".to_string())
             } else {
-                format!("Error: failed to execute mysql: {e}")
+                Ok(format!("Error: failed to execute mysql: {e}"))
             }
         }
     }
@@ -282,10 +291,9 @@ fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> 
     if lower_err.contains("column") && lower_err.contains("does not exist") {
         // Column not found → DESCRIBE the table
         if let Some(table) = extract_table_from_sql(sql) {
-            let desc = mo_execute_sql(&format!("DESCRIBE {table}"), database);
-            if !desc.starts_with("Error:") {
-                return Some(desc);
-            }
+            return mo_execute_sql(&format!("DESCRIBE {table}"), database)
+                .ok()
+                .filter(|desc| !desc.starts_with("Error:"));
         }
     } else if lower_err.contains("table") && lower_err.contains("does not exist") {
         // Table not found → SHOW TABLES in the database
@@ -293,10 +301,9 @@ fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> 
             .map(String::from)
             .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
         if !db.is_empty() {
-            let tables = mo_execute_sql(&format!("SHOW TABLES IN `{db}`"), None);
-            if !tables.starts_with("Error:") {
-                return Some(tables);
-            }
+            return mo_execute_sql(&format!("SHOW TABLES IN `{db}`"), None)
+                .ok()
+                .filter(|t| !t.starts_with("Error:"));
         }
     }
     None
@@ -411,7 +418,8 @@ impl ToolExecutor {
         let restore_output = mo_execute_sql(
             &mo_restore_snapshot_sql(&entry.snapshot_id, entry.database.as_deref()),
             None,
-        );
+        )
+        .unwrap_or_else(|e| e);
         if is_mo_error(&restore_output) {
             Err(restore_output)
         } else {
@@ -457,7 +465,8 @@ impl ToolExecutor {
         if mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
             let snapshot_id = mo_pre_state_snapshot_name();
             let snapshot_output =
-                mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None);
+                mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None)
+                    .unwrap_or_else(|e| e);
             if is_mo_error(&snapshot_output) {
                 return ToolExecutionOutcome::text(format!(
                     "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"
@@ -480,7 +489,7 @@ impl ToolExecutor {
         }
 
         ToolExecutionOutcome {
-            output: mo_execute_sql(sql, database),
+            output: mo_execute_sql(sql, database).unwrap_or_else(|e| e),
             tool_result_fields,
         }
     }
@@ -689,9 +698,9 @@ impl ToolExecutor {
                 };
                 // MatrixOne database-level snapshot
                 let sql = mo_create_snapshot_sql(name, database);
-                mo_execute_sql(&sql, None)
+                mo_execute_sql(&sql, None).unwrap_or_else(|e| e)
             }
-            "list" => mo_execute_sql("SHOW SNAPSHOTS", None),
+            "list" => mo_execute_sql("SHOW SNAPSHOTS", None).unwrap_or_else(|e| e),
             "drop" | "delete" => {
                 let name = match args.get("name").and_then(Value::as_str) {
                     Some(n) if is_valid_snapshot_name(n) => n,
@@ -704,7 +713,7 @@ impl ToolExecutor {
                     None => return "Error: missing 'name' for snapshot deletion".to_string(),
                 };
                 let sql = format!("DROP SNAPSHOT IF EXISTS `{}`", name);
-                mo_execute_sql(&sql, None)
+                mo_execute_sql(&sql, None).unwrap_or_else(|e| e)
             }
             "restore" => {
                 let name = match args.get("name").and_then(Value::as_str) {
@@ -718,7 +727,7 @@ impl ToolExecutor {
                     None => return "Error: missing 'name' for snapshot restore".to_string(),
                 };
                 let sql = mo_restore_snapshot_sql(name, database);
-                mo_execute_sql(&sql, None)
+                mo_execute_sql(&sql, None).unwrap_or_else(|e| e)
             }
             other => format!(
                 "Error: unknown action '{}'. Supported: create, list, drop, restore",
@@ -744,7 +753,7 @@ impl ToolExecutor {
                 }
 
                 // MatrixOne snapshots (serve as data branches)
-                let snapshots = mo_execute_sql("SHOW SNAPSHOTS", None);
+                let snapshots = mo_execute_sql("SHOW SNAPSHOTS", None).unwrap_or_else(|e| e);
                 result.push_str("## MatrixOne Snapshots (Data Branches)\n");
                 result.push_str(&snapshots);
 
@@ -781,12 +790,12 @@ impl ToolExecutor {
                             "Creating data branch '{}' aligned with git branch '{}'\n\n{}",
                             auto_name,
                             branch,
-                            mo_execute_sql(&sql, None)
+                            mo_execute_sql(&sql, None).unwrap_or_else(|e| e)
                         );
                     }
                 };
                 let sql = mo_create_snapshot_sql(name, None);
-                mo_execute_sql(&sql, None)
+                mo_execute_sql(&sql, None).unwrap_or_else(|e| e)
             }
             "sync" => {
                 // Show the relationship between git state and MO state
@@ -796,7 +805,7 @@ impl ToolExecutor {
                 let git_head = super::git_gix::head_short(&self.project_root);
                 result.push_str(&format!("Git: branch={}, head={}\n", git_branch, git_head));
 
-                let snapshots = mo_execute_sql("SHOW SNAPSHOTS", None);
+                let snapshots = mo_execute_sql("SHOW SNAPSHOTS", None).unwrap_or_else(|e| e);
                 result.push_str(&format!("MatrixOne snapshots:\n{}\n", snapshots));
 
                 // Check if there's a matching snapshot for current branch
@@ -1021,8 +1030,9 @@ mod tests {
         unsafe {
             std::env::set_var("MATRIXONE_HOST", "nonexistent-host-12345");
             std::env::set_var("MATRIXONE_PORT", "6001");
+            std::env::set_var("MATRIXONE_PASSWORD", "test-pw");
         }
-        let result = mo_execute_sql("SELECT 1", None);
+        let result = mo_execute_sql("SELECT 1", None).expect("password set, should be Ok");
         assert!(
             result.contains("Error") || result.contains("error") || result.contains("not found"),
             "should handle missing mysql gracefully: {result}"
@@ -1030,7 +1040,40 @@ mod tests {
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
             std::env::remove_var("MATRIXONE_PORT");
+            std::env::remove_var("MATRIXONE_PASSWORD");
         }
+    }
+
+    #[test]
+    fn mo_execute_sql_requires_matrixone_password() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::remove_var("MATRIXONE_PASSWORD");
+        }
+        let result = mo_execute_sql("SELECT 1", None);
+        assert!(
+            result.is_err(),
+            "should error when MATRIXONE_PASSWORD is unset"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("MATRIXONE_PASSWORD"),
+            "error should mention the missing var: {msg}"
+        );
+        assert!(
+            !msg.contains("111"),
+            "should not fall back to hardcoded password: {msg}"
+        );
+    }
+
+    #[test]
+    fn mo_mysql_cmd_requires_matrixone_password() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::remove_var("MATRIXONE_PASSWORD");
+        }
+        let result = mo_mysql_cmd(None);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1039,8 +1082,9 @@ mod tests {
         unsafe {
             std::env::set_var("MATRIXONE_HOST", "testhost");
             std::env::set_var("MATRIXONE_PORT", "7001");
+            std::env::set_var("MATRIXONE_PASSWORD", "test-pw");
         }
-        let cmd = mo_mysql_cmd(Some("testdb"));
+        let cmd = mo_mysql_cmd(Some("testdb")).expect("password set, should be Ok");
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -1071,6 +1115,7 @@ mod tests {
         unsafe {
             std::env::remove_var("MATRIXONE_HOST");
             std::env::remove_var("MATRIXONE_PORT");
+            std::env::remove_var("MATRIXONE_PASSWORD");
         }
     }
 
@@ -1080,8 +1125,9 @@ mod tests {
         unsafe {
             std::env::remove_var("ASTRA_DATABASE");
             std::env::remove_var("ASTRA_DATABASE_PREFIX");
+            std::env::set_var("MATRIXONE_PASSWORD", "test-pw");
         }
-        let cmd = mo_mysql_cmd(None);
+        let cmd = mo_mysql_cmd(None).expect("password set, should be Ok");
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -1091,6 +1137,9 @@ mod tests {
             "should default to astra_runtime: {:?}",
             args
         );
+        unsafe {
+            std::env::remove_var("MATRIXONE_PASSWORD");
+        }
     }
 
     #[test]
@@ -1100,8 +1149,9 @@ mod tests {
             std::env::remove_var("ASTRA_DATABASE_PREFIX");
             std::env::set_var("ASTRA_DATABASE_PREFIX", "it_");
             std::env::set_var("ASTRA_DATABASE", "astra_runtime");
+            std::env::set_var("MATRIXONE_PASSWORD", "test-pw");
         }
-        let cmd = mo_mysql_cmd(None);
+        let cmd = mo_mysql_cmd(None).expect("password set, should be Ok");
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -1114,6 +1164,7 @@ mod tests {
         unsafe {
             std::env::remove_var("ASTRA_DATABASE_PREFIX");
             std::env::remove_var("ASTRA_DATABASE");
+            std::env::remove_var("MATRIXONE_PASSWORD");
         }
     }
 

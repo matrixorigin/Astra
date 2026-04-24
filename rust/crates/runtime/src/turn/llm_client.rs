@@ -11,6 +11,7 @@ use std::{
     time::Instant,
 };
 
+use astra_logging::redact_known_secret_patterns;
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
@@ -21,11 +22,20 @@ use super::sse_data_lines::{
     drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
 };
 use crate::bridge::rate_limit_cooldown::{
-    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
-    parse_retry_after_ms,
+    RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
 use crate::output_style::current_output_style;
 use crate::prompts;
+
+/// Redact common provider secret patterns from a string before logging.
+///
+/// Replaces the value following well-known prefixes (`sk-`, `Bearer `, `key-`)
+/// with `[REDACTED]`. The scan stops at the first whitespace, quote, or comma,
+/// which is sufficient for the JSON / plaintext error bodies that providers
+/// commonly echo authorization material into.
+pub(crate) fn redact_provider_secrets(s: &str) -> String {
+    redact_known_secret_patterns(s)
+}
 
 /// Maximum retries for transient LLM errors (429, 5xx, network).
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
@@ -47,11 +57,8 @@ const LLM_TOTAL_BUDGET_S: u64 = 300;
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 use std::sync::OnceLock;
 
-/// Per-model rate-limit cooldown tracker.
-fn rate_limit_cooldown() -> &'static PerModelCooldown {
-    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(PerModelCooldown::new)
-}
+/// Per-model rate-limit cooldown tracker — shared with bridge_llm_stream.
+use super::bridge_llm_stream::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
@@ -59,14 +66,44 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
 fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        let connect = llm_connect_timeout();
+        let total = std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60);
+        match reqwest::Client::builder()
             .no_proxy()
-            .connect_timeout(llm_connect_timeout())
+            .connect_timeout(connect)
             // Use a generous timeout; per-request timeout handled via tokio::time::timeout
-            .timeout(std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60))
+            .timeout(total)
             .pool_max_idle_per_host(4)
             .build()
-            .expect("failed to build global LLM HTTP client")
+        {
+            Ok(client) => client,
+            Err(e) => {
+                // audit-C1: TLS / HTTP stack init failure should not crash the process.
+                // Retry with the same timeouts but without pool tuning so we still bound
+                // hung-upstream risk if this tier succeeds.
+                tracing::error!(
+                    target: "astra_runtime::llm_client",
+                    error = %e,
+                    "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
+                );
+                match reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(connect)
+                    .timeout(total)
+                    .build()
+                {
+                    Ok(client) => client,
+                    Err(e2) => {
+                        tracing::error!(
+                            target: "astra_runtime::llm_client",
+                            error = %e2,
+                            "failed to build minimal global LLM HTTP client; using reqwest::Client::new() without explicit timeouts"
+                        );
+                        reqwest::Client::new()
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -191,8 +228,8 @@ impl LlmCancel<'_> {
         match self {
             LlmCancel::None => false,
             LlmCancel::Token(t) => t.is_cancelled(),
-            LlmCancel::Flag(f) => f.load(Ordering::Relaxed),
-            LlmCancel::FlagAndToken(f, t) => f.load(Ordering::Relaxed) || t.is_cancelled(),
+            LlmCancel::Flag(f) => f.load(Ordering::Acquire),
+            LlmCancel::FlagAndToken(f, t) => f.load(Ordering::Acquire) || t.is_cancelled(),
         }
     }
 }
@@ -204,7 +241,7 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
         LlmCancel::Token(t) => t.cancelled().await,
         LlmCancel::Flag(f) => {
             const POLL: std::time::Duration = std::time::Duration::from_millis(50);
-            while !f.load(Ordering::Relaxed) {
+            while !f.load(Ordering::Acquire) {
                 tokio::time::sleep(POLL).await;
             }
         }
@@ -214,7 +251,7 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
                 biased;
                 _ = t.cancelled() => {}
                 _ = async {
-                    while !f.load(Ordering::Relaxed) {
+                    while !f.load(Ordering::Acquire) {
                         tokio::time::sleep(POLL).await;
                     }
                 } => {}
@@ -285,7 +322,7 @@ pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
 }
 
 /// Total budget across all retries + fallback for a single LLM call.
-fn llm_total_budget() -> std::time::Duration {
+pub(crate) fn llm_total_budget() -> std::time::Duration {
     let s = std::env::var("MO_LLM_TOTAL_BUDGET_S")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -813,8 +850,35 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
 
-        let text = response.text().await.unwrap_or_default();
-        last_err = format!("LLM error {status}: {text}");
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read error: {e}>"));
+
+        // Auth errors: redact the body in logs and return a generic message
+        // so provider-echoed secrets cannot leak through error propagation.
+        if status == 401 || status == 403 {
+            let truncated = &text[..text.len().min(80)];
+            let redacted = redact_provider_secrets(truncated);
+            tracing::warn!(
+                target: "astra_runtime::llm_client",
+                "LLM auth error ({status}) on {model_key}: {redacted}",
+            );
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Auth,
+                "LLM provider authentication failed".to_string(),
+            ));
+        }
+
+        // For other 4xx errors, suppress the raw response body to avoid
+        // leaking secrets that providers may echo back. Retain body for 5xx
+        // (helpful for diagnosing transient backend failures) and the 400
+        // context-window check below (which still needs to inspect text).
+        last_err = if (400..500).contains(&status) {
+            format!("LLM request rejected: {status}")
+        } else {
+            format!("LLM error {status}: {text}")
+        };
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
@@ -875,15 +939,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         if status == 400 && is_context_window_error(&text.to_lowercase()) {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
-                last_err,
-            ));
-        }
-
-        // Auth errors
-        if status == 401 || status == 403 {
-            return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Auth,
-                last_err,
+                format!("LLM error {status}: {text}"),
             ));
         }
 
@@ -2768,6 +2824,12 @@ mod tests {
         .await
         .expect_err("should fail with auth");
         assert_eq!(err.kind, astra_core::ErrorKind::Auth);
+        assert!(
+            !err.message.contains("Unauthorized"),
+            "auth error message must not echo provider body, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("authentication failed"));
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
@@ -3196,5 +3258,74 @@ mod tests {
         let (r, c) = extract_think_tags(text).unwrap();
         assert_eq!(r, "step 1");
         assert_eq!(c, "answer");
+    }
+
+    #[test]
+    fn redact_provider_secrets_strips_known_prefixes() {
+        let input = "sk-abc12345 and Bearer tok_xyz plus key-deadbeef end";
+        let out = redact_provider_secrets(input);
+        assert!(out.contains("[REDACTED]"), "missing redacted marker: {out}");
+        assert!(!out.contains("abc12345"), "leaked sk- secret: {out}");
+        assert!(!out.contains("tok_xyz"), "leaked bearer secret: {out}");
+        assert!(!out.contains("deadbeef"), "leaked key- secret: {out}");
+        assert!(out.contains("end"), "trailing text dropped: {out}");
+    }
+
+    #[test]
+    fn redact_provider_secrets_leaves_clean_text() {
+        let input = "Internal server error: upstream timeout";
+        assert_eq!(redact_provider_secrets(input), input);
+    }
+
+    #[test]
+    fn redact_provider_secrets_handles_quoted_json() {
+        let input = r#"{"error":"invalid api key sk-abcXYZ"}"#;
+        let out = redact_provider_secrets(input);
+        assert!(!out.contains("abcXYZ"), "leaked sk- secret in JSON: {out}");
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_provider_secrets_simulates_auth_log_path() {
+        // Simulate what the auth-error path logs: a truncated body containing a key.
+        let body = r#"{"error":{"message":"Incorrect API key sk-abc12345 provided"}}"#;
+        let truncated = &body[..body.len().min(80)];
+        let log_line = format!(
+            "LLM auth error (401): {}",
+            redact_provider_secrets(truncated)
+        );
+        assert!(!log_line.contains("sk-abc12345"));
+        assert!(log_line.contains("[REDACTED]"));
+    }
+
+    /// audit-C1: global_llm_client must not use .expect() — a TLS backend
+    /// failure should not crash the entire process.
+    #[test]
+    fn global_llm_client_does_not_panic_on_build() {
+        let source = include_str!("llm_client.rs");
+        let fn_start = source
+            .find("fn global_llm_client()")
+            .expect("global_llm_client must exist");
+        let body = &source[fn_start..(fn_start + 600).min(source.len())];
+        assert!(
+            !body.contains(".expect("),
+            "global_llm_client must not use .expect(); use .unwrap_or_else with fallback"
+        );
+    }
+
+    /// P1-E: llm_client must NOT define its own rate_limit_cooldown singleton.
+    /// There must be exactly one PerModelCooldown singleton shared across all
+    /// LLM call paths, otherwise a 429 recorded by one path is invisible to
+    /// the other, causing duplicate rate-limit hits.
+    #[test]
+    fn llm_client_does_not_define_own_cooldown_singleton() {
+        let source = include_str!("llm_client.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains("static COOLDOWN"),
+            "llm_client.rs must not define its own COOLDOWN singleton; \
+             use the shared one from bridge_llm_stream"
+        );
     }
 }

@@ -982,6 +982,8 @@ impl DatabaseEvaluationService {
 
         let client = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .default_headers(headers)
             .build()
             .map_err(internal_error)?;
@@ -2834,5 +2836,25 @@ mod tests {
         use super::super::utils::not_implemented;
         let (status, _) = not_implemented("test");
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// audit-A5: the Memoria evaluation client must have a timeout so a hung
+    /// Memoria server cannot block the Axum handler indefinitely.
+    #[test]
+    fn evaluation_memoria_client_has_timeout() {
+        let source = include_str!("database.rs");
+        let fn_start = source
+            .find("async fn retrieve_from_memoria")
+            .expect("retrieve_from_memoria must exist");
+        let end = (fn_start + 800).min(source.len());
+        let body = &source[fn_start..end];
+        assert!(
+            body.contains("connect_timeout("),
+            "evaluation Memoria client must set connect_timeout"
+        );
+        assert!(
+            body.contains(".timeout("),
+            "evaluation Memoria client must set request timeout"
+        );
     }
 }

@@ -312,6 +312,8 @@ impl HttpMemoriaClient {
             api_key,
             http: reqwest::Client::builder()
                 .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -326,6 +328,44 @@ impl HttpMemoriaClient {
             .ok()?;
         Some(Self::new(base_url, api_key))
     }
+}
+
+fn parse_retrieved_memories(data: &Value) -> Vec<MemoriaMemory> {
+    let Some(arr) = data
+        .get("memories")
+        .and_then(Value::as_array)
+        .or_else(|| data.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut memories = Vec::with_capacity(arr.len());
+    let mut dropped = 0usize;
+    let mut first_error = None;
+
+    for (index, value) in arr.iter().enumerate() {
+        match serde_json::from_value::<MemoriaMemory>(value.clone()) {
+            Ok(memory) => memories.push(memory),
+            Err(err) => {
+                dropped += 1;
+                if first_error.is_none() {
+                    first_error = Some(format!("index {index}: {err}"));
+                }
+            }
+        }
+    }
+
+    if dropped > 0 {
+        tracing::warn!(
+            target: "astra_runtime::memoria_compact",
+            parsed = memories.len(),
+            dropped,
+            first_error = first_error.as_deref().unwrap_or("unknown"),
+            "discarded malformed Memoria retrieve entries"
+        );
+    }
+
+    memories
 }
 
 #[async_trait::async_trait]
@@ -370,18 +410,7 @@ impl MemoriaClient for HttpMemoriaClient {
             .await
             .map_err(|e| format!("Memoria retrieve parse failed: {e}"))?;
 
-        let memories = data
-            .get("memories")
-            .and_then(Value::as_array)
-            .or_else(|| data.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(memories)
+        Ok(parse_retrieved_memories(&data))
     }
 
     async fn store(
@@ -1077,6 +1106,28 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn parse_retrieved_memories_skips_and_reports_malformed_entries() {
+        let data = json!({
+            "memories": [
+                {
+                    "memory_id": "m1",
+                    "content": "working memory",
+                    "memory_type": "working",
+                    "retrieval_score": 0.9
+                },
+                {
+                    "memory_id": "m2",
+                    "content": "missing type"
+                }
+            ]
+        });
+
+        let memories = parse_retrieved_memories(&data);
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, "m1");
     }
 
     fn with_env_paths<R>(
@@ -2563,6 +2614,25 @@ mod tests {
             semantic_entries.is_empty(),
             "should not store semantic entries when disabled, got {}",
             semantic_entries.len()
+        );
+    }
+
+    /// audit-A3: HttpMemoriaClient must have connect_timeout and timeout so a
+    /// hung Memoria server cannot block the compaction pipeline indefinitely.
+    #[test]
+    fn memoria_compact_client_has_timeout() {
+        let source = include_str!("memoria_compact.rs");
+        let fn_start = source
+            .find("pub fn new(base_url: String, api_key: String)")
+            .expect("HttpMemoriaClient::new must exist");
+        let body = &source[fn_start..fn_start + 400];
+        assert!(
+            body.contains("connect_timeout("),
+            "HttpMemoriaClient must set connect_timeout"
+        );
+        assert!(
+            body.contains(".timeout("),
+            "HttpMemoriaClient must set request timeout"
         );
     }
 }

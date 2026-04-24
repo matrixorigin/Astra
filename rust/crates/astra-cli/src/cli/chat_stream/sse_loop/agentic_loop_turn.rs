@@ -258,7 +258,7 @@ struct PrepareChatTurnRequest<'a> {
     message: &'a str,
     history: &'a [(String, String)],
     recent_tools: &'a [String],
-    executor: &'a mut ToolExecutor,
+    executor: Arc<ToolExecutor>,
     selector: &'a dyn tool_selector::ToolSelector,
     registry: &'a tool_registry::ToolRegistry,
     tool_results: &'a [Value],
@@ -284,6 +284,9 @@ struct PrepareChatTurnRequest<'a> {
     tool_budget_override: Option<u32>,
     interaction_mode: TurnInteractionMode,
     turn_policy: &'a mut TurnInteractionPolicy,
+    /// Skill-scoped tool allowlist — tools the active skill declared as needed.
+    /// After the selector picks tools, any allowed tools it missed are force-injected.
+    skill_allowed_tools: Option<Vec<String>>,
     previous_confidence_fallback:
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
@@ -295,6 +298,9 @@ struct PrepareChatTurnRequest<'a> {
     /// Snapshot of session-wide recent `(tool, reason)` rejections for
     /// SelfModel Gap 3 surface.
     recent_rejections: Vec<(String, String)>,
+    /// Optional shared observability hub, forwarded from the SSE fetch request
+    /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
+    observability_hub: Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -582,6 +588,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     };
     log_chat_turn_timing_phase(timing, "tool_selector_resolve_schemas", &mut mark);
 
+    // Force-inject any skill allowed_tools that the selector missed.
+    let mut turn_schemas = turn_schemas;
+    let mut selection_report = selection_report;
+    if let Some(ref allowed) = ctx.skill_allowed_tools {
+        astra_runtime::turn::tool_schema_prune::inject_skill_allowed_tools(
+            &mut turn_schemas,
+            &mut selection_report,
+            allowed,
+            ctx.all_schemas,
+        );
+    }
+
     let selected_tool_costs: Vec<(String, u32)> = selection_report
         .tools_selected
         .iter()
@@ -688,6 +706,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     },
                 )
                 .collect();
+
+            // Publish the four SelfModel inputs that were previously hard-coded
+            // to empty at `build_self_model_snapshot`.
+            // TODO: surface real skill names once the active-skill registry is
+            // reachable here; for now we mirror `all_selected_skills` which
+            // tracks skills actually chosen this session.
+            let skills = ctx.telem.all_selected_skills.clone();
+            let tool_health_entries = ctx.turn_guard.health.export();
+            let scenario = session.current_scenario();
+            let recent_signals = ctx
+                .observability_hub
+                .as_ref()
+                .map(|hub| hub.tuning().recent_signals())
+                .unwrap_or_default();
+            session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
@@ -700,6 +733,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 ep_obj.insert("self_awareness_text".to_string(), json!(text));
             }
         }
+    }
+    // ─── Recent-argument hints (gap #5): surface just-used paths + commands ───
+    if let Some(hints_text) =
+        astra_runtime::recent_arg_hints::prompt_block_from_messages(ctx.messages)
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert("recent_arg_hints_text".to_string(), json!(hints_text));
     }
     // ─── Memoria insights: inject recall digest into edge_profile ───
     if let Some(ref insights) = memoria_insights_text
@@ -823,7 +865,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
     pub project_root: &'a Path,
-    pub executor: &'a mut ToolExecutor,
+    pub executor: Arc<ToolExecutor>,
     pub selector: &'a dyn ToolSelector,
     pub registry: &'a ToolRegistry,
     pub messages: &'a [Value],
@@ -864,6 +906,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub tool_budget_override: Option<u32>,
     pub interaction_mode: TurnInteractionMode,
     pub turn_policy: &'a mut TurnInteractionPolicy,
+    /// Skill-scoped tool allowlist — tools the active skill declared as needed.
+    /// After the selector picks tools, any allowed tools it missed are force-injected.
+    pub skill_allowed_tools: Option<Vec<String>>,
     /// When true, this is a continuation turn after a skill has already produced output.
     /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
     pub skill_continuation: bool,
@@ -874,6 +919,12 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     pub round_index: u32,
+    /// Optional shared observability hub for reading the auto-tuning feedback
+    /// window when publishing SelfModel inputs. Threaded through so the
+    /// per-turn ingest can attach `recent_signals` to the session without
+    /// needing a global singleton.
+    pub observability_hub:
+        Option<&'a Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 }
 struct ChatTurnSseFetchUi {
     timing: bool,
@@ -991,10 +1042,12 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_budget_override,
         interaction_mode,
         turn_policy,
+        skill_allowed_tools,
         skill_continuation,
         tool_cache,
         previous_confidence_fallback,
         round_index,
+        observability_hub,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -1018,7 +1071,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             message,
             history,
             recent_tools,
-            executor,
+            executor: Arc::clone(&executor),
             selector,
             registry,
             tool_results,
@@ -1039,10 +1092,12 @@ pub(crate) async fn fetch_chat_turn_sse(
             tool_budget_override,
             interaction_mode,
             turn_policy,
+            skill_allowed_tools,
             previous_confidence_fallback,
             round_index,
             denial_pressure: perm_manager.denial_pressure(),
             recent_rejections: perm_manager.recent_rejections(),
+            observability_hub,
         },
     )
     .await?;
@@ -1078,6 +1133,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_continuation,
         turn_rollback_on_failure: is_plan_subtask,
         tool_cache,
+        observability_hub: observability_hub.cloned(),
     };
 
     let sse_mark = Instant::now();
@@ -1344,6 +1400,51 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
         assert!(policy.visible_tool_names.is_empty());
         assert!(policy.evidence_tool_names.is_empty());
         assert!(!policy.allow_ask_user);
+    }
+
+    // ── Regression: skill allowed_tools not force-included (session c3dea07a) ──
+    //
+    // When a skill declares allowed_tools (e.g. review-changes allows grep, glob),
+    // the selector may not pick them by relevance. The skill instructions reference
+    // these tools, so they must be present in the final selection.
+
+    #[test]
+    fn skill_allowed_tools_injected_into_selection() {
+        use astra_runtime::tool_registry::SelectionReport;
+        use astra_runtime::turn::tool_schema_prune::inject_skill_allowed_tools;
+
+        let all_schemas = [
+            schema("bash"),
+            schema("read_file"),
+            schema("grep"),
+            schema("glob"),
+        ];
+
+        // Selector picked bash and read_file, but not grep/glob
+        let mut turn_schemas = vec![schema("bash"), schema("read_file")];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into(), "read_file".into()],
+            selected_count: 2,
+            budget_used: 0,
+            budget_total: 0,
+        };
+
+        // Skill allows bash, read_file, grep, glob
+        let allowed: Vec<String> = vec![
+            "bash".into(),
+            "read_file".into(),
+            "grep".into(),
+            "glob".into(),
+        ];
+
+        let injected =
+            inject_skill_allowed_tools(&mut turn_schemas, &mut report, &allowed, &all_schemas);
+
+        assert_eq!(injected, 2);
+        assert_eq!(report.selected_count, 4);
+        assert!(report.tools_selected.contains(&"grep".into()));
+        assert!(report.tools_selected.contains(&"glob".into()));
+        assert_eq!(turn_schemas.len(), 4);
     }
 }
 

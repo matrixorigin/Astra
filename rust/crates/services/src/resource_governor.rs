@@ -53,6 +53,13 @@ pub struct ResourceUsage {
     pub active_sessions: u32,
 }
 
+/// Per-user usage with the date it was last reset.
+#[derive(Debug, Clone)]
+struct DatedUsage {
+    date: chrono::NaiveDate,
+    usage: ResourceUsage,
+}
+
 /// Result of a pre-execution limit check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LimitCheck {
@@ -86,6 +93,26 @@ pub trait ResourceGovernor: Send + Sync + 'static {
 
     /// Record tokens consumed.
     async fn record_tokens(&self, user_id: &str, tokens: u64);
+
+    /// Check whether the user's daily token budget allows further LLM calls.
+    /// Called before each LLM invocation for mid-session enforcement.
+    async fn check_token_budget(&self, user_id: &str) -> LimitCheck {
+        let limits = self.get_limits(user_id).await;
+        if limits.max_tokens_per_day == 0 {
+            return LimitCheck::Allowed;
+        }
+        let usage = self.get_usage(user_id).await;
+        if usage.tokens_consumed >= limits.max_tokens_per_day {
+            LimitCheck::Denied {
+                reason: format!(
+                    "daily token budget exhausted ({}/{})",
+                    usage.tokens_consumed, limits.max_tokens_per_day
+                ),
+            }
+        } else {
+            LimitCheck::Allowed
+        }
+    }
 }
 
 // ── Database implementation ──────────────────────────────────────────────
@@ -137,10 +164,15 @@ impl DatabaseResourceGovernor {
         Ok(())
     }
 
-    /// Count active sessions for a user from the `agent_sessions` table.
+    /// Count sessions that still "hold" the concurrent cap — open or idle, can be resumed
+    /// or listed, but not finished. **`ended` must be excluded**: runs are persisted with
+    /// `status = 'ended'` (see `event_ingestion`, `session_reaper`); counting those rows
+    /// made the limit hit (e.g. 19/5) as soon as the user had completed past runs.
     async fn count_active_sessions(&self, user_id: &str) -> u32 {
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND status NOT IN ('closed', 'cancelled')",
+            "SELECT COUNT(*) FROM agent_sessions \
+             WHERE user_id = ? \
+               AND status NOT IN ('ended', 'closed', 'cancelled')",
         )
         .bind(user_id)
         .fetch_optional(self.pool.get())
@@ -180,7 +212,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
     }
 
     async fn set_limits(&self, user_id: &str, limits: ResourceLimits) {
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_limits \
                 (user_id, max_concurrent_sessions, max_tokens_per_day, max_disk_bytes, \
                  max_concurrent_bash, max_sessions_per_day) \
@@ -200,7 +232,15 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(limits.max_concurrent_bash as i32)
         .bind(limits.max_sessions_per_day as i32)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to persist resource limits"
+            );
+        }
     }
 
     async fn get_usage(&self, user_id: &str) -> ResourceUsage {
@@ -270,7 +310,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
 
     async fn record_session_created(&self, user_id: &str) {
         let today = Self::today();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_usage (user_id, usage_date, sessions_created) \
              VALUES (?, ?, 1) \
              ON DUPLICATE KEY UPDATE sessions_created = sessions_created + 1",
@@ -278,12 +318,20 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(user_id)
         .bind(&today)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to record session creation"
+            );
+        }
     }
 
     async fn record_tool_calls(&self, user_id: &str, count: u64) {
         let today = Self::today();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_usage (user_id, usage_date, tool_calls) \
              VALUES (?, ?, ?) \
              ON DUPLICATE KEY UPDATE tool_calls = tool_calls + VALUES(tool_calls)",
@@ -292,12 +340,20 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(&today)
         .bind(count as i64)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to record tool calls"
+            );
+        }
     }
 
     async fn record_tokens(&self, user_id: &str, tokens: u64) {
         let today = Self::today();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO resource_usage (user_id, usage_date, tokens_consumed) \
              VALUES (?, ?, ?) \
              ON DUPLICATE KEY UPDATE tokens_consumed = tokens_consumed + VALUES(tokens_consumed)",
@@ -306,7 +362,15 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(&today)
         .bind(tokens as i64)
         .execute(self.pool.get())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                target: "astra_services::resource_governor",
+                user_id = %user_id,
+                error = %e,
+                "failed to record token usage"
+            );
+        }
     }
 }
 
@@ -314,7 +378,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
 
 pub struct InMemoryResourceGovernor {
     limits: Mutex<HashMap<String, ResourceLimits>>,
-    usage: Mutex<HashMap<String, ResourceUsage>>,
+    usage: Mutex<HashMap<String, DatedUsage>>,
 }
 
 impl InMemoryResourceGovernor {
@@ -323,6 +387,26 @@ impl InMemoryResourceGovernor {
             limits: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get or create usage for today, resetting daily counters if the date changed.
+    /// `active_sessions` is preserved across resets (it tracks live state, not daily aggregate).
+    fn get_or_reset(entry: &mut DatedUsage, today: chrono::NaiveDate) -> &mut ResourceUsage {
+        if entry.date != today {
+            let active = entry.usage.active_sessions;
+            entry.date = today;
+            entry.usage = ResourceUsage {
+                active_sessions: active,
+                ..Default::default()
+            };
+        }
+        &mut entry.usage
+    }
+
+    /// Evict stale entries: users with no active sessions whose usage is from a previous day.
+    /// Called lazily during reads to bound memory growth in multi-tenant deployments.
+    fn evict_stale(map: &mut HashMap<String, DatedUsage>, today: chrono::NaiveDate) {
+        map.retain(|_, entry| entry.date == today || entry.usage.active_sessions > 0);
     }
 }
 
@@ -351,12 +435,13 @@ impl ResourceGovernor for InMemoryResourceGovernor {
     }
 
     async fn get_usage(&self, user_id: &str) -> ResourceUsage {
-        self.usage
-            .lock()
-            .unwrap()
-            .get(user_id)
-            .cloned()
-            .unwrap_or_default()
+        let today = chrono::Utc::now().date_naive();
+        let mut map = self.usage.lock().unwrap();
+        Self::evict_stale(&mut map, today);
+        match map.get_mut(user_id) {
+            Some(entry) => Self::get_or_reset(entry, today).clone(),
+            None => ResourceUsage::default(),
+        }
     }
 
     async fn check_session_create(&self, user_id: &str) -> LimitCheck {
@@ -394,22 +479,41 @@ impl ResourceGovernor for InMemoryResourceGovernor {
     }
 
     async fn record_session_created(&self, user_id: &str) {
+        let today = chrono::Utc::now().date_naive();
         let mut map = self.usage.lock().unwrap();
-        let usage = map.entry(user_id.to_string()).or_default();
+        let entry = map
+            .entry(user_id.to_string())
+            .or_insert_with(|| DatedUsage {
+                date: today,
+                usage: ResourceUsage::default(),
+            });
+        let usage = Self::get_or_reset(entry, today);
         usage.sessions_created += 1;
         usage.active_sessions += 1;
     }
 
     async fn record_tool_calls(&self, user_id: &str, count: u64) {
+        let today = chrono::Utc::now().date_naive();
         let mut map = self.usage.lock().unwrap();
-        let usage = map.entry(user_id.to_string()).or_default();
-        usage.tool_calls += count;
+        let entry = map
+            .entry(user_id.to_string())
+            .or_insert_with(|| DatedUsage {
+                date: today,
+                usage: ResourceUsage::default(),
+            });
+        Self::get_or_reset(entry, today).tool_calls += count;
     }
 
     async fn record_tokens(&self, user_id: &str, tokens: u64) {
+        let today = chrono::Utc::now().date_naive();
         let mut map = self.usage.lock().unwrap();
-        let usage = map.entry(user_id.to_string()).or_default();
-        usage.tokens_consumed += tokens;
+        let entry = map
+            .entry(user_id.to_string())
+            .or_insert_with(|| DatedUsage {
+                date: today,
+                usage: ResourceUsage::default(),
+            });
+        Self::get_or_reset(entry, today).tokens_consumed += tokens;
     }
 }
 
@@ -432,9 +536,12 @@ mod tests {
             let mut map = gov.usage.lock().unwrap();
             map.insert(
                 "u1".into(),
-                ResourceUsage {
-                    active_sessions: 5,
-                    ..Default::default()
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        active_sessions: 5,
+                        ..Default::default()
+                    },
                 },
             );
         }
@@ -451,9 +558,12 @@ mod tests {
             let mut map = gov.usage.lock().unwrap();
             map.insert(
                 "u1".into(),
-                ResourceUsage {
-                    sessions_created: 50,
-                    ..Default::default()
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        sessions_created: 50,
+                        ..Default::default()
+                    },
                 },
             );
         }
@@ -470,9 +580,12 @@ mod tests {
             let mut map = gov.usage.lock().unwrap();
             map.insert(
                 "u1".into(),
-                ResourceUsage {
-                    tokens_consumed: 2_000_000,
-                    ..Default::default()
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        tokens_consumed: 2_000_000,
+                        ..Default::default()
+                    },
                 },
             );
         }
@@ -489,9 +602,12 @@ mod tests {
             let mut map = gov.usage.lock().unwrap();
             map.insert(
                 "u1".into(),
-                ResourceUsage {
-                    tokens_consumed: 1_999_999,
-                    ..Default::default()
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        tokens_consumed: 1_999_999,
+                        ..Default::default()
+                    },
                 },
             );
         }
@@ -513,9 +629,12 @@ mod tests {
             let mut map = gov.usage.lock().unwrap();
             map.insert(
                 "admin".into(),
-                ResourceUsage {
-                    tokens_consumed: 999_999_999,
-                    ..Default::default()
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        tokens_consumed: 999_999_999,
+                        ..Default::default()
+                    },
                 },
             );
         }
@@ -565,5 +684,234 @@ mod tests {
         gov.record_tool_calls("b", 20).await;
         assert_eq!(gov.get_usage("a").await.tool_calls, 10);
         assert_eq!(gov.get_usage("b").await.tool_calls, 20);
+    }
+
+    /// audit-D1/D2: DatabaseResourceGovernor must not silently drop DB write
+    /// errors. Every `sqlx::query(...).execute(...)` in production code must
+    /// be wrapped in error handling, not `let _ =`.
+    #[test]
+    fn resource_governor_db_writes_are_not_silently_dropped() {
+        let source = include_str!("resource_governor.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let silent_count = prod_code.matches("let _ = sqlx::query").count();
+        assert_eq!(
+            silent_count, 0,
+            "resource governor has {silent_count} silently-dropped DB writes; \
+             use `if let Err(e) = ... {{ tracing::warn!(...) }}` instead"
+        );
+    }
+
+    /// P0-C: A session that starts within budget must be DENIED further
+    /// tokens once the daily limit is exceeded mid-session.
+    /// This verifies the check_token_budget method exists and works.
+    #[tokio::test]
+    async fn mid_session_token_enforcement() {
+        let gov = InMemoryResourceGovernor::new();
+        let user = "u-budget-test";
+
+        // Set a low daily token limit
+        gov.set_limits(
+            user,
+            ResourceLimits {
+                max_tokens_per_day: 1000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Session starts fine
+        assert_eq!(gov.check_session_create(user).await, LimitCheck::Allowed);
+        gov.record_session_created(user).await;
+
+        // Consume 800 tokens — still within budget
+        gov.record_tokens(user, 800).await;
+        assert_eq!(
+            gov.check_token_budget(user).await,
+            LimitCheck::Allowed,
+            "800/1000 tokens should be allowed"
+        );
+
+        // Consume 300 more — now over budget (1100 > 1000)
+        gov.record_tokens(user, 300).await;
+        match gov.check_token_budget(user).await {
+            LimitCheck::Denied { reason } => {
+                assert!(
+                    reason.contains("token"),
+                    "denial reason must mention tokens: {reason}"
+                );
+            }
+            LimitCheck::Allowed => {
+                panic!("mid-session token check must deny when over budget (1100/1000)")
+            }
+        }
+    }
+
+    /// Zero limit means unlimited — check_token_budget must allow.
+    #[tokio::test]
+    async fn token_budget_zero_means_unlimited() {
+        let gov = InMemoryResourceGovernor::new();
+        let user = "u-unlimited";
+        gov.set_limits(
+            user,
+            ResourceLimits {
+                max_tokens_per_day: 0, // unlimited
+                ..Default::default()
+            },
+        )
+        .await;
+        gov.record_tokens(user, 999_999_999).await;
+        assert_eq!(
+            gov.check_token_budget(user).await,
+            LimitCheck::Allowed,
+            "zero limit means unlimited"
+        );
+    }
+
+    /// P0-A: record_tokens must be called after each run so check_token_budget
+    /// sees up-to-date usage. Simulates two runs consuming 600 tokens each
+    /// against a 1000-token daily cap.
+    #[tokio::test]
+    async fn token_cap_enforced_across_runs() {
+        let gov = InMemoryResourceGovernor::default();
+        let user = "user-cap-test";
+        gov.set_limits(
+            user,
+            ResourceLimits {
+                max_tokens_per_day: 1000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Simulate first run completing and recording tokens
+        gov.record_tokens(user, 600).await;
+        assert_eq!(
+            gov.check_token_budget(user).await,
+            LimitCheck::Allowed,
+            "600/1000 tokens — should still be allowed"
+        );
+
+        // Simulate second run completing and recording tokens
+        gov.record_tokens(user, 600).await;
+        match gov.check_token_budget(user).await {
+            LimitCheck::Denied { reason } => {
+                assert!(
+                    reason.contains("1200") || reason.contains("1000"),
+                    "denial reason must mention token counts, got: {reason}"
+                );
+            }
+            LimitCheck::Allowed => {
+                panic!("1200/1000 tokens consumed — must be Denied but got Allowed");
+            }
+        }
+    }
+
+    /// P0-A source guard: run_lifecycle must call record_tokens after the loop.
+    #[test]
+    fn run_lifecycle_records_tokens_after_loop() {
+        let source = include_str!("../../runtime/src/server/run_lifecycle.rs");
+        // Find the persist_usage call and verify record_tokens follows it
+        let persist_pos = source
+            .find("persist_usage")
+            .expect("persist_usage must exist");
+        let after_persist = &source[persist_pos..];
+        let record_pos = after_persist.find("record_tokens");
+        assert!(
+            record_pos.is_some(),
+            "record_tokens must be called after persist_usage in run_lifecycle"
+        );
+    }
+
+    /// P1-A: Daily counters must reset when the date changes.
+    /// A user denied yesterday must be allowed today.
+    /// active_sessions must survive the reset (it tracks live state).
+    #[tokio::test]
+    async fn daily_counters_reset_on_date_change() {
+        let gov = InMemoryResourceGovernor::new();
+        let user = "u-daily-reset";
+        let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+
+        // Simulate yesterday's usage: at the daily cap
+        {
+            let mut map = gov.usage.lock().unwrap();
+            map.insert(
+                user.into(),
+                DatedUsage {
+                    date: yesterday,
+                    usage: ResourceUsage {
+                        sessions_created: 50,
+                        tokens_consumed: 2_000_000,
+                        tool_calls: 999,
+                        active_sessions: 2, // live sessions survive reset
+                    },
+                },
+            );
+        }
+
+        // Today: daily counters must have reset, so session create is allowed
+        assert_eq!(
+            gov.check_session_create(user).await,
+            LimitCheck::Allowed,
+            "daily counters must reset — yesterday's usage must not block today"
+        );
+
+        // Verify counters actually reset
+        let usage = gov.get_usage(user).await;
+        assert_eq!(usage.sessions_created, 0, "sessions_created must reset");
+        assert_eq!(usage.tokens_consumed, 0, "tokens_consumed must reset");
+        assert_eq!(usage.tool_calls, 0, "tool_calls must reset");
+        assert_eq!(
+            usage.active_sessions, 2,
+            "active_sessions must survive daily reset (live state)"
+        );
+    }
+
+    /// Stale entries (previous day, no active sessions) must be evicted
+    /// to prevent unbounded memory growth in multi-tenant deployments.
+    #[tokio::test]
+    async fn stale_entries_evicted_on_read() {
+        let gov = InMemoryResourceGovernor::new();
+        let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+
+        {
+            let mut map = gov.usage.lock().unwrap();
+            // Stale user: yesterday, no active sessions → should be evicted
+            map.insert(
+                "stale".into(),
+                DatedUsage {
+                    date: yesterday,
+                    usage: ResourceUsage {
+                        sessions_created: 10,
+                        active_sessions: 0,
+                        ..Default::default()
+                    },
+                },
+            );
+            // Active user: yesterday but has active sessions → should survive
+            map.insert(
+                "active".into(),
+                DatedUsage {
+                    date: yesterday,
+                    usage: ResourceUsage {
+                        active_sessions: 1,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+
+        // Trigger eviction via get_usage
+        let _ = gov.get_usage("anyone").await;
+
+        let map = gov.usage.lock().unwrap();
+        assert!(
+            !map.contains_key("stale"),
+            "stale entry (yesterday, 0 active) must be evicted"
+        );
+        assert!(
+            map.contains_key("active"),
+            "entry with active sessions must survive eviction"
+        );
     }
 }

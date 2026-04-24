@@ -37,7 +37,10 @@ fn init_temp_git_repo() -> tempfile::TempDir {
 fn read_file_missing_path_returns_error() {
     let executor = test_executor();
     let result = executor.read_file(&json!({}));
-    assert!(result.contains("Error"), "got: {result}");
+    assert!(
+        result.contains("Error") && result.to_lowercase().contains("path"),
+        "error must mention missing `path` — got: {result}"
+    );
 }
 
 #[test]

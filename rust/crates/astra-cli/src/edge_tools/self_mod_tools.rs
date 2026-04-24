@@ -258,10 +258,10 @@ impl ToolExecutor {
             }
         }
 
-        if let Some(session_id) = self.active_session_id.as_deref()
+        if let Some(session_id) = self.active_session_id()
             && let Some(ref persisted_value) = new_value
             && let Err(error) = crate::self_command::persist_config_override(
-                session_id,
+                &session_id,
                 path,
                 persisted_value.clone(),
             )
@@ -319,9 +319,9 @@ impl ToolExecutor {
         pinned.sort();
         deprioritized.retain(|t| t != &tool);
 
-        if let Some(session_id) = self.active_session_id.as_deref()
+        if let Some(session_id) = self.active_session_id()
             && let Err(error) =
-                crate::self_command::persist_tool_preferences(session_id, &pinned, &deprioritized)
+                crate::self_command::persist_tool_preferences(&session_id, &pinned, &deprioritized)
         {
             *pinned = original_pinned;
             *deprioritized = original_deprioritized;
@@ -377,9 +377,9 @@ impl ToolExecutor {
         deprioritized.sort();
         pinned.retain(|t| t != &tool);
 
-        if let Some(session_id) = self.active_session_id.as_deref()
+        if let Some(session_id) = self.active_session_id()
             && let Err(error) =
-                crate::self_command::persist_tool_preferences(session_id, &pinned, &deprioritized)
+                crate::self_command::persist_tool_preferences(&session_id, &pinned, &deprioritized)
         {
             *pinned = original_pinned;
             *deprioritized = original_deprioritized;
@@ -430,8 +430,8 @@ impl ToolExecutor {
             .as_ref()
             .map(|tracker| tracker.goal().to_string())
             .or_else(|| session.original_query.clone());
-        if let Some(session_id) = self.active_session_id.as_deref()
-            && let Err(error) = crate::self_command::persist_goal_override(session_id, goal)
+        if let Some(session_id) = self.active_session_id()
+            && let Err(error) = crate::self_command::persist_goal_override(&session_id, goal)
         {
             return json!({
                 "error": "failed_to_persist_goal",
@@ -480,9 +480,9 @@ impl ToolExecutor {
         let previous_compression_count = session.compressed_turns.len();
         let already_compressed_this_turn = session.compressed_turns.contains(&turn);
 
-        if let Some(session_id) = self.active_session_id.as_deref()
+        if let Some(session_id) = self.active_session_id()
             && let Err(error) =
-                crate::self_command::persist_manual_compression(session_id, turn, reason)
+                crate::self_command::persist_manual_compression(&session_id, turn, reason)
         {
             return json!({
                 "error": "failed_to_persist_manual_compression",

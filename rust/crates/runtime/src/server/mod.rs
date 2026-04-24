@@ -88,6 +88,7 @@ pub fn build_app(state: AppState) -> Router {
         .expose_headers([HeaderName::from_static("x-request-id")]);
 
     router_builder::build_router(state)
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB
         .layer(axum::middleware::from_fn(
             request_trace::request_trace_middleware,
         ))
@@ -118,15 +119,48 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Spawn periodic expired data cleanup (runs every 6 hours)
+    // Cancellation token wired into background sweepers; cancelled after axum
+    // serve returns so we can drain them deterministically before tearing down
+    // the runtime / pool / OTLP exporter.
+    let bg_cancel = tokio_util::sync::CancellationToken::new();
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(ref pool) = state.shared_pool {
-        spawn_data_cleanup(pool.clone());
-        astra_services::session_reaper::spawn_session_reaper(pool.clone());
+        bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
+        bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
+            pool.clone(),
+            bg_cancel.clone(),
+        ));
     }
+
+    // Clone the matrix runtime handle before moving `state` into `build_app`
+    // so we can drain ingestion + sync sidecars after axum returns.
+    let matrix_runtime = state.matrix_cloud_runtime.clone();
+    let run_lifecycle = state.run_lifecycle_service.clone();
 
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(http_shutdown_signal())
         .await?;
+
+    // 1. Stop background sweepers and wait for them to exit.
+    bg_cancel.cancel();
+    for h in bg_handles {
+        let _ = h.await;
+    }
+    // 2. Drain in-flight agentic loop tasks (up to 30s).
+    if !run_lifecycle
+        .drain_background_tasks(std::time::Duration::from_secs(30))
+        .await
+    {
+        tracing::warn!(
+            target: "astra_runtime::serve",
+            "graceful shutdown: some background tasks did not finish within 30s"
+        );
+    }
+    // 3. Drain Matrix ingestion + tracked session sync tasks.
+    if let Some(rt) = matrix_runtime {
+        rt.shutdown_ingestion_and_wait().await;
+    }
+    // 4. Flush OTLP exporter last so the prior shutdown work is observable.
     astra_logging::shutdown_otel();
     Ok(())
 }
@@ -160,7 +194,10 @@ async fn http_shutdown_signal() {
 }
 
 /// Spawn a background task that periodically cleans up expired data.
-fn spawn_data_cleanup(pool: astra_core::SharedPool) {
+fn spawn_data_cleanup(
+    pool: astra_core::SharedPool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     use astra_services::RetentionPolicy;
     use std::time::Duration;
 
@@ -176,7 +213,16 @@ fn spawn_data_cleanup(pool: astra_core::SharedPool) {
         let mut interval = tokio::time::interval(cleanup_interval);
         interval.tick().await; // skip immediate first tick
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        "data cleanup received cancellation; exiting"
+                    );
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
             let results = astra_services::cleanup_expired_data(pool.get(), &policy).await;
             let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
             if total > 0 {
@@ -194,5 +240,35 @@ fn spawn_data_cleanup(pool: astra_core::SharedPool) {
                 );
             }
         }
-    });
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    /// U1: build_app must set a DefaultBodyLimit to prevent OOM from
+    /// oversized request bodies. The raw `Bytes` extractor on /chat/turn
+    /// has no built-in limit — without an explicit layer, the server
+    /// buffers the entire request into memory.
+    #[test]
+    fn build_app_has_body_size_limit() {
+        let source = include_str!("mod.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("DefaultBodyLimit"),
+            "build_app must apply DefaultBodyLimit layer to prevent OOM"
+        );
+    }
+
+    /// P0-C: serve() shutdown path must drain background agentic loop tasks.
+    #[test]
+    fn shutdown_drains_background_tasks() {
+        let source = include_str!("mod.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            prod_code.contains("drain_background_tasks"),
+            "serve() shutdown must call drain_background_tasks"
+        );
+    }
 }

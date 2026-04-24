@@ -13,20 +13,45 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use futures_util::stream::SplitSink;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Maximum concurrent edge WebSocket connections.
+const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
+
+/// Global counter of active edge WebSocket connections.
+static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Axum handler for edge WebSocket upgrade.
 pub(super) async fn edge_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let current = EDGE_WS_CONNECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+    if current >= MAX_EDGE_WS_CONNECTIONS {
+        EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Relaxed);
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "too many edge WebSocket connections",
+        )
+            .into_response();
+    }
     ws.max_message_size(256 * 1024)
         .on_upgrade(move |socket| handle_edge_connection(socket, state))
+        .into_response()
 }
 
 /// Main edge WebSocket connection loop.
 async fn handle_edge_connection(socket: WebSocket, state: AppState) {
+    // RAII guard: decrement on exit.
+    struct ConnGuard;
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _guard = ConnGuard;
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
 

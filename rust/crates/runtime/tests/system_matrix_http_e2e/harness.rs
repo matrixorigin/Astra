@@ -148,7 +148,7 @@ async fn build_state_with_mode(
 
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
     let matrixone_database = settings.matrixone.database.clone();
-    let url = settings.matrixone.database_url();
+    let url = settings.matrixone.database_url_with_password();
     let state = build_server_state(settings).await;
 
     restore_env_var_for_e2e("ASTRA_AUTH_MODE", prev_auth_mode);

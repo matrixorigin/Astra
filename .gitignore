@@ -37,11 +37,15 @@ htmlcov/
 
 # Node
 node_modules/
+coverage/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .npm
 .yarn-integrity
+# TypeScript incremental (monorepo-wide; per-package rules may also list this)
+*.tsbuildinfo
+.eslintcache
 
 # Rust
 rust/target/

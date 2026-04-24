@@ -148,6 +148,13 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Whether the host already injects round budget guidance into the system
+    /// prompt during `execute_turn`.  When true, the agentic loop skips its
+    /// own user-message guidance injection to avoid double injection.
+    fn injects_round_guidance(&self) -> bool {
+        false
+    }
+
     /// Execute a hidden reflection-only LLM subcall and return the raw text.
     ///
     /// Hosts that do not support this can keep the default implementation.
@@ -507,6 +514,9 @@ pub struct AgenticLoopState {
     /// Used by the CLI to inject `round_index` into the bridge payload so the
     /// system prompt can include round budget directives.
     pub current_round_index: u32,
+    /// Actual number of LLM calls completed in this turn (not inflated by
+    /// progressive penalty).  Used for round budget guidance injection.
+    pub llm_rounds_completed: u32,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
     /// Positive allowlist bias populated by pipeline `add_tools` strategy.
@@ -590,11 +600,6 @@ pub struct AgenticLoopState {
     /// turn. The CLI host reads this to suppress intermediate text rendering
     /// on subsequent iterations (prevents markdown leak from draft text).
     pub skill_produced_output: bool,
-
-    /// True when context_prefetch injected data into the user message before
-    /// the agentic loop started. Suppresses "no tool call on live query" warnings
-    /// because the LLM already has the data it needs.
-    pub prefetch_injected: bool,
 
     // ── Cumulative token budget ──
     /// Maximum cumulative (prompt + completion) tokens across all rounds.
@@ -850,7 +855,195 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
 // ─── CTX_ helpers ────────────────────────────────────────────────────────────
 
+/// Derive a sensible OpenAI-protocol `finish_reason` when upstream didn't
+/// supply one. Observed in the wild: qwen-turbo frequently omits
+/// `finish_reason` on tool-call rounds (72/92 rounds null in a production
+/// session), which tripped up journal analysers and learning signals that
+/// used the field to distinguish tool-call rounds from stops.
+///
+/// Rule follows the OpenAI Chat Completions spec:
+/// * upstream value wins when present (we don't lie about "length"-truncated
+///   responses — that would suppress the output-token escalation at
+///   `server_loop_host.rs:1715`);
+/// * absent + tool_calls present → `"tool_calls"`;
+/// * absent + no tool_calls → `"stop"`.
+///
+/// This is a pure function to keep it trivially testable. Callers that need
+/// to record a journal event can use it without mutating the upstream
+/// `LlmCallResult`.
+pub(crate) fn synthesise_finish_reason(
+    upstream: Option<&str>,
+    has_tool_calls: bool,
+) -> &'static str {
+    match upstream {
+        Some("stop") => "stop",
+        Some("length") => "length",
+        Some("tool_calls") => "tool_calls",
+        Some("content_filter") => "content_filter",
+        Some("function_call") => "function_call",
+        // Unknown / other upstream string: we can't return it borrowed as
+        // `&'static`, but at the journal layer callers already have the
+        // original String when needed. Any caller that feeds a non-None
+        // upstream here is using this helper *as a default* — so fall
+        // through to the rules below for deterministic output.
+        Some(_) => {
+            if has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+        None => {
+            if has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod synthesise_finish_reason_tests {
+    use super::synthesise_finish_reason;
+
+    #[test]
+    fn none_plus_tool_calls_becomes_tool_calls() {
+        assert_eq!(synthesise_finish_reason(None, true), "tool_calls");
+    }
+
+    #[test]
+    fn none_without_tool_calls_becomes_stop() {
+        assert_eq!(synthesise_finish_reason(None, false), "stop");
+    }
+
+    #[test]
+    fn upstream_length_is_preserved() {
+        // Critical: "length" is the signal that triggers max_output_tokens
+        // escalation in server_loop_host. We must never clobber it.
+        assert_eq!(synthesise_finish_reason(Some("length"), false), "length");
+        assert_eq!(synthesise_finish_reason(Some("length"), true), "length");
+    }
+
+    #[test]
+    fn upstream_known_values_are_preserved() {
+        assert_eq!(synthesise_finish_reason(Some("stop"), true), "stop");
+        assert_eq!(
+            synthesise_finish_reason(Some("tool_calls"), false),
+            "tool_calls"
+        );
+        assert_eq!(
+            synthesise_finish_reason(Some("content_filter"), false),
+            "content_filter"
+        );
+    }
+
+    #[test]
+    fn unknown_upstream_falls_back_to_rule() {
+        // Unknown reasons (forward-compatibility): treat as if absent so
+        // downstream consumers see consistent semantics.
+        assert_eq!(
+            synthesise_finish_reason(Some("something_new"), true),
+            "tool_calls"
+        );
+        assert_eq!(
+            synthesise_finish_reason(Some("something_new"), false),
+            "stop"
+        );
+    }
+}
+
 /// Extract repository name from a git remote URL.
+/// **Test-only.** Build a minimal [`AgenticLoopState`] suitable for driving
+/// the mock-LLM path in integration tests (feature `bridge-e2e-hooks`).
+///
+/// All fields use safe defaults; tests should mutate the returned state
+/// directly (e.g. push into `messages`, set `llm_rounds_completed`).
+#[cfg(feature = "bridge-e2e-hooks")]
+pub fn make_test_loop_state() -> AgenticLoopState {
+    AgenticLoopState {
+        messages: Vec::new(),
+        tool_results: Vec::new(),
+        current_session_id: None,
+        current_run_id: None,
+        recursion_depth: 0,
+        final_text: String::new(),
+        total_prompt: 0,
+        total_completion: 0,
+        total_cache_read: 0,
+        total_cache_creation: 0,
+        total_tool_calls: 0,
+        total_evidence_tool_calls: 0,
+        has_any_usage: false,
+        max_turns: 10,
+        remaining_turns: 10,
+        current_round_index: 0,
+        llm_rounds_completed: 0,
+        turn_guard: TurnGuard::new(),
+        restricted_tools: HashSet::new(),
+        boosted_tools: HashSet::new(),
+        widen_selection_pending: false,
+        step_recorder: StepRecorder::new("test-session", "test-task"),
+        idempotency_cache: InMemoryIdempotencyCache::new(),
+        semantic_dedup: SemanticDedup::new(0.95),
+        call_counts: HashMap::new(),
+        max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .effective_max_identical_calls(),
+        max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .effective_max_tools_per_turn(),
+        stall: Default::default(),
+        telemetry: Default::default(),
+        skills: SkillState {
+            quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+            improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+            ..Default::default()
+        },
+        hooks: Default::default(),
+        messaging: Default::default(),
+        cancellation: Default::default(),
+        error_recovery: Default::default(),
+        message: "test query".to_string(),
+        recent_tools: Vec::new(),
+        task_profile: TaskExecutionProfile::default(),
+        last_turn_policy: TurnInteractionPolicy::default(),
+        api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+        api_token: String::new(),
+        delegation_engine: None,
+        project_context: None,
+        checkpoint_gate: None,
+        evolution_service: None,
+        rate_limit_cooldown: Default::default(),
+        data_snapshot_provider: None,
+        last_composite_snapshot: None,
+        last_measured_prompt_tokens: None,
+        consecutive_context_window_errors: 0,
+        compaction_effectiveness: Default::default(),
+        max_turn_input_tokens: 0,
+        budget_wrapup_injected: false,
+        skill_produced_output: false,
+        max_cumulative_tokens: 0,
+        thinking_budget_tokens: None,
+        recent_file_reads: Vec::new(),
+        permission_context: None,
+        permission_handler: None,
+        tactical_adapter: None,
+        step_signal_collector: None,
+        tool_budget_override: None,
+        pending_reflection_signals: Vec::new(),
+        recent_tactical_actions: Vec::new(),
+        server_tool_executor: None,
+        interruption: None,
+        session_facts: Default::default(),
+        approval_overrides: None,
+        confidence_trend: Default::default(),
+        last_confidence_diagnosis: None,
+        session_turn: 0,
+        turn_event_buffer: None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1097,6 +1290,7 @@ pub(crate) mod tests {
             max_turns: 10,
             remaining_turns: 10,
             current_round_index: 0,
+            llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
@@ -1158,7 +1352,6 @@ pub(crate) mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            prefetch_injected: false,
             turn_event_buffer: None,
         }
     }
@@ -3750,13 +3943,13 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
 
-        // Verify env var was set
+        // Verify env var was set via session_env_overlay (not process env)
         assert_eq!(
-            std::env::var("ASTRA_TEST_HOOK_VAR").ok().as_deref(),
+            astra_core::session_env_overlay::get("ASTRA_TEST_HOOK_VAR").as_deref(),
             Some("session_active")
         );
         // Cleanup
-        unsafe { std::env::remove_var("ASTRA_TEST_HOOK_VAR") };
+        astra_core::session_env_overlay::remove("ASTRA_TEST_HOOK_VAR");
     }
 
     #[tokio::test]
@@ -6144,7 +6337,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             &[],
             &[],
             None,
-            (state.max_turns - state.remaining_turns) as u32,
+            state.max_turns.saturating_sub(state.remaining_turns) as u32,
             None,
             None,
             None,
@@ -6537,6 +6730,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 llm_rounds: None,
                 total_llm_ms: None,
                 total_tool_ms: None,
+                parent_event_id: None,
+                git_head: None,
+                git_branch: None,
             })
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")
@@ -7604,5 +7800,15 @@ mod parallel_execution_tests {
         assert!(matches!(&batches[0], ToolBatch::Concurrent(v) if v.len() == 2));
         assert!(matches!(&batches[1], ToolBatch::Serial(_)));
         assert!(matches!(&batches[2], ToolBatch::Concurrent(v) if v.len() == 2));
+    }
+
+    /// audit-#8: source-level guard against the panicking subtraction.
+    #[test]
+    fn turn_count_uses_saturating_sub() {
+        let source = include_str!("agentic_loop_host.rs");
+        assert!(
+            source.contains("state.max_turns.saturating_sub(state.remaining_turns)"),
+            "expected saturating_sub in agentic_loop_host"
+        );
     }
 }

@@ -55,6 +55,12 @@ pub enum PlanUpdate {
         pct: u32,
         remaining: usize,
         elapsed: Duration,
+        /// Subtask ids that blocked progress (empty for Ctrl+C interrupt pause).
+        /// When non-empty the monitor can show them so the user sees *why* the
+        /// plan paused instead of just a count. Added 2026-04-23 to close a
+        /// resume→re-pause loop where the user had no signal to diagnose the
+        /// dependency deadlock.
+        blocked_ids: Vec<String>,
     },
     PlanCompleted {
         pct: u32,
@@ -404,11 +410,21 @@ impl PlanOutputSink for ChannelSink {
         self.send(PlanUpdate::PlanCompleted { pct: 100, elapsed });
     }
 
-    fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, _blocked_ids: &str) {
+    fn plan_paused(&self, pct: u32, remaining: usize, elapsed: Duration, blocked_ids: &str) {
+        let blocked_ids = if blocked_ids.is_empty() {
+            Vec::new()
+        } else {
+            blocked_ids
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         self.send(PlanUpdate::PlanPaused {
             pct,
             remaining,
             elapsed,
+            blocked_ids,
         });
     }
 
@@ -443,6 +459,7 @@ impl PlanOutputSink for ChannelSink {
             pct,
             remaining,
             elapsed: Duration::ZERO,
+            blocked_ids: Vec::new(),
         });
     }
 
@@ -472,6 +489,54 @@ fn is_credential_error(msg: &str) -> bool {
         || lower.contains("authentication failed")
         || lower.contains("token expired")
         || lower.contains("401")
+}
+
+/// Pick the `plan_progress` action for end-of-plan emission.
+///
+/// Bug #3 regression: previously the executor emitted `plan_complete` at 100%
+/// unconditionally once all subtasks had their status flipped to `Completed`,
+/// even when the global verifier said the plan was incorrect or when
+/// individual subtasks had been force-completed after exhausting their retry
+/// budget (`verification_completed {passed:false, retries_exhausted:true}`).
+///
+/// This produced journals where an agent appeared to succeed while
+/// downstream learning signals and UI would misinterpret a failed plan as
+/// successful. Returning `plan_failed` in those cases lets consumers
+/// distinguish the two outcomes without changing the 100% progress_pct
+/// semantics callers already expect.
+fn plan_completion_action(
+    global_passed: bool,
+    any_subtask_verification_failed: bool,
+) -> &'static str {
+    if !global_passed || any_subtask_verification_failed {
+        "plan_failed"
+    } else {
+        "plan_complete"
+    }
+}
+
+/// Return true if any subtask has a `Failed` status *or* the durable contract
+/// records an unresolved `VerificationFailed` stage for any subtask. Used by
+/// [`plan_completion_action`] at end-of-plan emission.
+fn has_any_unresolved_verification_failure(
+    subtasks: &[astra_services::task_orchestrator::SubtaskPlan],
+    durable: Option<&super::durable_bridge::DurableTaskState>,
+) -> bool {
+    use astra_services::durable_task::SubtaskStage;
+    use astra_services::task_orchestrator::TaskStatus;
+
+    if subtasks
+        .iter()
+        .any(|s| matches!(s.status, TaskStatus::Failed))
+    {
+        return true;
+    }
+    durable.is_some_and(|d| {
+        d.contract
+            .subtasks
+            .iter()
+            .any(|s| matches!(s.stage, SubtaskStage::VerificationFailed { .. }))
+    })
 }
 
 /// Build a one-line evidence sentence naming the tools with the highest
@@ -652,6 +717,9 @@ pub(super) struct BackgroundPlanContext {
     >,
     pub file_journal:
         Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    /// Session-scoped file-state cache — shared across subtask turns so
+    /// read-before-write tracking persists.
+    pub file_state: crate::edge_tools::SharedFileState,
     pub database_snapshot_journal:
         Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
     pub git_stash_journal: Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
@@ -860,14 +928,29 @@ async fn plan_executor_task(
                     let _ = update_tx.send(PlanUpdate::DeliveryReport(report.clone()));
                 }
 
-                // Emit plan_completed journal + cloud event
+                // Emit plan completion journal + cloud event. Bug #3
+                // regression: previously this always emitted `plan_complete`
+                // at 100%, even when the global verifier rejected the plan
+                // (or individual subtasks had `retries_exhausted` and were
+                // force-marked Completed). That produced confusing journals
+                // where `plan_progress {action:"completed", progress_pct:100}`
+                // sat next to `verification_completed {passed:false}` for
+                // the same subtasks. Surface verification outcome in the
+                // action so downstream consumers (self_surface, UI, learning
+                // signals) can distinguish a genuinely finished plan from
+                // one that merely exhausted its retry budget.
                 let total = ctx.plan.subtasks.len();
+                let any_subtask_verification_failed = has_any_unresolved_verification_failure(
+                    &ctx.plan.subtasks,
+                    ctx.durable_task_state.as_ref(),
+                );
+                let action = plan_completion_action(global_passed, any_subtask_verification_failed);
                 let event = session_journal::JournalEvent::plan_progress(
                     ctx.session_id.as_deref(),
                     ctx.turn,
                     "",
                     ctx.plan_goal.as_deref().unwrap_or("plan"),
-                    "plan_complete",
+                    action,
                     100,
                     total,
                     total,
@@ -909,13 +992,79 @@ async fn plan_executor_task(
                 });
                 return; // Plan is done — exit the execution loop
             } else {
-                let blocked: Vec<_> = ctx
+                // ── Blocked-deps pause with auto-heal + resume-loop guard ──
+                //
+                // Bug fix 2026-04-23: Previously, if the ready set was empty
+                // and the plan was <100%, we paused and waited for Resume.
+                // Resume simply `continue`d the outer loop, which re-analysed
+                // deps with *identical* plan state — producing an infinite
+                // 继续→pause→继续→pause loop with no signal to the user
+                // about *why*. Observed in session 26f73ee4.
+                //
+                // Defences, cheapest first:
+                //   1. Auto-heal orphan `InProgress` subtasks (e.g. a crashed
+                //      worker left its subtask "running" — treat it as
+                //      retriable by resetting to `Pending`). This frequently
+                //      clears the deadlock without user intervention.
+                //   2. Surface the blocked ids in the `PlanPaused` UI event
+                //      so the user can diagnose at a glance.
+                //   3. If Resume is received and re-analysis produces the
+                //      *exact same* blocked set as before, abort with a
+                //      descriptive error rather than looping. The user can
+                //      always `rewind N`, edit the plan, or Cancel to recover.
+                let mut blocked: Vec<String> = ctx
                     .plan
                     .subtasks
                     .iter()
                     .filter(|s| s.status == TaskStatus::Pending)
-                    .map(|s| s.id.as_str())
+                    .map(|s| s.id.clone())
                     .collect();
+                blocked.sort();
+                let blocked_key = blocked.clone();
+
+                // Auto-heal InProgress orphans — they must have been
+                // abandoned (no live worker handle exists at this level of
+                // the executor) so resurrect them as Pending for another
+                // attempt. Log to journal so it's traceable.
+                let mut healed: Vec<String> = Vec::new();
+                for st in ctx.plan.subtasks.iter_mut() {
+                    if st.status == TaskStatus::InProgress {
+                        st.status = TaskStatus::Pending;
+                        healed.push(st.id.clone());
+                    }
+                }
+                if !healed.is_empty() {
+                    for id in &healed {
+                        let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                            id: id.clone(),
+                            status: TaskStatus::Pending,
+                        });
+                    }
+                    let healed_msg = format!(
+                        "Auto-healed {} orphan InProgress subtasks → Pending: {}",
+                        healed.len(),
+                        healed.join(", ")
+                    );
+                    let event = session_journal::JournalEvent::plan_progress(
+                        ctx.session_id.as_deref(),
+                        ctx.turn,
+                        "",
+                        ctx.plan_goal.as_deref().unwrap_or("plan"),
+                        "orphan_healed",
+                        pct,
+                        ctx.plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| s.status.is_terminal())
+                            .count(),
+                        ctx.plan.subtasks.len(),
+                    );
+                    emit_event(&update_tx, &ctx, event);
+                    eprintln!("  ℹ  {healed_msg}");
+                    // After healing, don't pause — jump back to re-analyse.
+                    continue;
+                }
+
                 sink.plan_paused(
                     pct,
                     blocked.len(),
@@ -938,6 +1087,59 @@ async fn plan_executor_task(
                             return;
                         }
                         _ => {}
+                    }
+                }
+
+                // Anti-loop check: after resume, re-compute ready + blocked.
+                // If the blocked set is identical to what we just paused on,
+                // we'd immediately re-pause. Abort with an actionable error
+                // message instead of producing a user-visible infinite loop.
+                let new_ready = ctx.plan.ready_subtasks();
+                if new_ready.is_empty() {
+                    let mut new_blocked: Vec<String> = ctx
+                        .plan
+                        .subtasks
+                        .iter()
+                        .filter(|s| s.status == TaskStatus::Pending)
+                        .map(|s| s.id.clone())
+                        .collect();
+                    new_blocked.sort();
+                    if new_blocked == blocked_key {
+                        // Build a concise "who-blocks-whom" summary so the
+                        // user can rewind/edit the right subtask.
+                        let summary: Vec<String> = ctx
+                            .plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| s.status == TaskStatus::Pending)
+                            .map(|s| {
+                                let unmet: Vec<&str> = s
+                                    .depends_on
+                                    .iter()
+                                    .filter(|dep| {
+                                        !ctx.plan.subtasks.iter().any(|d| {
+                                            d.id == **dep && d.status == TaskStatus::Completed
+                                        })
+                                    })
+                                    .map(|s| s.as_str())
+                                    .collect();
+                                if unmet.is_empty() {
+                                    format!("{} (no unmet deps — status stuck?)", s.id)
+                                } else {
+                                    format!("{} needs [{}]", s.id, unmet.join(", "))
+                                }
+                            })
+                            .collect();
+                        let _ = update_tx.send(PlanUpdate::PlanError {
+                            error: format!(
+                                "Plan deadlocked: resume would re-pause on the same blocked set. \
+                                 Blocked subtasks:\n  - {}\n\
+                                 Use `rewind <id>` to revise a completed dep, edit the plan, \
+                                 or Cancel to abort.",
+                                summary.join("\n  - ")
+                            ),
+                        });
+                        return;
                     }
                 }
             }
@@ -1132,7 +1334,6 @@ async fn plan_executor_task(
                     api: &ctx.api,
                     token: &ctx.token,
                     message: &prompt,
-                    prefetched_context_override: None,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
                     explain: crate::ExplainMode::Off,
@@ -1164,6 +1365,7 @@ async fn plan_executor_task(
                     observability_hub: ctx.observability_hub.clone(),
                     observability_session: ctx.observability_session.clone(),
                     file_journal: Some(ctx.file_journal.clone()),
+                    file_state: Some(ctx.file_state.clone()),
                     database_snapshot_journal: Some(ctx.database_snapshot_journal.clone()),
                     git_stash_journal: Some(ctx.git_stash_journal.clone()),
                     git_commit_journal: Some(ctx.git_commit_journal.clone()),
@@ -1211,6 +1413,17 @@ async fn plan_executor_task(
                         .with_tool_calls(result.tool_call_records.clone())
                         .with_ttft(result.ttft_ms);
                         turn_event.llm_rounds = result.llm_rounds;
+                        // Attach per-turn git snapshot.
+                        let git_root = ctx
+                            .session_id
+                            .as_deref()
+                            .and_then(|sid| {
+                                astra_services::session_workspace::read_workspace(sid).ok()
+                            })
+                            .and_then(|ws| ws.git_root);
+                        let (git_head, git_branch) =
+                            super::cli_utils::git_snapshot(git_root.as_deref());
+                        turn_event = turn_event.with_git_snapshot(git_head, git_branch);
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 
@@ -1615,6 +1828,9 @@ mod tests {
             file_journal: Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
             )),
+            file_state: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             database_snapshot_journal: Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
@@ -2293,5 +2509,150 @@ mod tests {
         assert!(is_credential_error("Authentication failed: token expired"));
         assert!(!is_credential_error("network timeout"));
         assert!(!is_credential_error("tool execution failed"));
+    }
+
+    // ── Bug #3 regression: plan_completion_action must reflect verification
+    // outcome, so downstream consumers (UI, learning signals, journal
+    // analysers) can distinguish a successful plan from one that merely
+    // exhausted retries. ─────────────────────────────────────────────────
+
+    #[test]
+    fn plan_completion_action_returns_complete_when_all_passed() {
+        assert_eq!(plan_completion_action(true, false), "plan_complete");
+    }
+
+    #[test]
+    fn plan_completion_action_returns_failed_when_global_verifier_failed() {
+        assert_eq!(plan_completion_action(false, false), "plan_failed");
+    }
+
+    #[test]
+    fn plan_completion_action_returns_failed_when_any_subtask_failed_verification() {
+        // Even if the global verifier was permissive (or absent), a single
+        // subtask with unresolved `VerificationFailed` must force the plan
+        // to report as failed. This prevents the "all subtasks Completed
+        // after retries_exhausted → plan_complete" false-positive observed
+        // in session 32c7c640.
+        assert_eq!(plan_completion_action(true, true), "plan_failed");
+    }
+
+    #[test]
+    fn plan_completion_action_failed_dominates_when_both_signals_bad() {
+        assert_eq!(plan_completion_action(false, true), "plan_failed");
+    }
+
+    #[test]
+    fn has_any_unresolved_verification_failure_detects_failed_status() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+        let subtasks = vec![SubtaskPlan {
+            id: "s1".into(),
+            title: "t".into(),
+            status: TaskStatus::Failed,
+            ..Default::default()
+        }];
+        assert!(has_any_unresolved_verification_failure(&subtasks, None));
+    }
+
+    #[test]
+    fn has_any_unresolved_verification_failure_returns_false_when_all_completed() {
+        use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+        let subtasks = vec![SubtaskPlan {
+            id: "s1".into(),
+            title: "t".into(),
+            status: TaskStatus::Completed,
+            ..Default::default()
+        }];
+        assert!(!has_any_unresolved_verification_failure(&subtasks, None));
+    }
+
+    // ─── Resume-loop / blocked-deps regression tests ──────────────────────
+    //
+    // These tests lock in the fixes from PR #216 for the deadlock where
+    // typing "继续" on a blocked-deps pause immediately re-paused with no
+    // diagnostic info. See bug write-up in the PR body; observed in session
+    // 26f73ee4-51a5-44e9-90c2-fc475b77f463.
+
+    /// The ChannelSink must parse the comma-separated blocked_ids string
+    /// the trait contract hands it, and forward it as a Vec<String> on
+    /// `PlanUpdate::PlanPaused`. Before the fix, the parameter was
+    /// underscore-prefixed and dropped on the floor, so the REPL monitor
+    /// could only show a count, not the actionable ids.
+    #[test]
+    fn channel_sink_plan_paused_forwards_blocked_ids() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.plan_paused(42, 3, Duration::from_secs(12), "step-4, step-5, step-6");
+
+        let update = rx.try_recv().expect("sink should have emitted");
+        match update {
+            PlanUpdate::PlanPaused {
+                pct,
+                remaining,
+                elapsed,
+                blocked_ids,
+            } => {
+                assert_eq!(pct, 42);
+                assert_eq!(remaining, 3);
+                assert_eq!(elapsed, Duration::from_secs(12));
+                assert_eq!(blocked_ids, vec!["step-4", "step-5", "step-6"]);
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+    }
+
+    /// Empty / whitespace-only blocked_ids must produce an empty vec, not
+    /// a vec containing the empty string (which would render as
+    /// "blocked by: " in the monitor).
+    #[test]
+    fn channel_sink_plan_paused_handles_empty_blocked() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.plan_paused(10, 0, Duration::from_secs(1), "");
+
+        match rx.try_recv().unwrap() {
+            PlanUpdate::PlanPaused { blocked_ids, .. } => {
+                assert!(blocked_ids.is_empty(), "got {:?}", blocked_ids);
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+
+        // Whitespace between commas must not produce empty entries.
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let sink2 = ChannelSink::new(tx2);
+        sink2.plan_paused(10, 1, Duration::from_secs(1), ",, step-1 ,,");
+        match rx2.try_recv().unwrap() {
+            PlanUpdate::PlanPaused { blocked_ids, .. } => {
+                assert_eq!(blocked_ids, vec!["step-1"]);
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
+    }
+
+    /// `interrupted_pause` (Ctrl+C pause) has no dependency-blocking
+    /// concept — it must emit an empty blocked_ids and zero elapsed so
+    /// the monitor knows not to render a misleading "blocked by" line.
+    #[test]
+    fn channel_sink_interrupted_pause_emits_empty_blocked() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.interrupted_pause(55, 4);
+
+        match rx.try_recv().unwrap() {
+            PlanUpdate::PlanPaused {
+                pct,
+                remaining,
+                elapsed,
+                blocked_ids,
+            } => {
+                assert_eq!(pct, 55);
+                assert_eq!(remaining, 4);
+                assert_eq!(elapsed, Duration::ZERO);
+                assert!(
+                    blocked_ids.is_empty(),
+                    "interrupted pause must not claim blocked ids"
+                );
+            }
+            other => panic!("expected PlanPaused, got {:?}", other),
+        }
     }
 }

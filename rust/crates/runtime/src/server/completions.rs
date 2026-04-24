@@ -71,7 +71,12 @@ pub(super) async fn completions_handler(
     let _user = state.auth_service.current_user(&headers).await?;
 
     // 2. Resolve LLM model
-    let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env();
+    let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("MatrixOne configuration unavailable: {e}"),
+        )
+    })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
     let resolved = astra_services::resolve_active_llm_model(
         &matrixone,
@@ -98,9 +103,9 @@ pub(super) async fn completions_handler(
 
     // Anthropic uses max_tokens; OpenAI prefers max_completion_tokens
     if resolved.provider != "anthropic" && !resolved.model_name.contains("claude") {
-        body.as_object_mut()
-            .expect("json object")
-            .remove("max_tokens");
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("max_tokens");
+        }
         body["max_completion_tokens"] = serde_json::json!(request.max_tokens);
     }
 
@@ -109,17 +114,7 @@ pub(super) async fn completions_handler(
         &resolved.provider,
     );
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("HTTP client error: {e}"),
-            )
-        })?;
+    let client = &state.http_client;
 
     // 4. Forward to upstream LLM provider
     let mut req = client.post(&url).header("content-type", "application/json");
@@ -232,6 +227,19 @@ mod tests {
         assert_eq!(
             json["choices"][0]["message"]["content"],
             r#"{"score": 0.85}"#
+        );
+    }
+
+    /// audit-C2: completions handler must not use .expect("json object") —
+    /// panicking in a request handler crashes the connection.
+    #[test]
+    fn completions_handler_does_not_expect_json_object() {
+        let source = include_str!("completions.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains(".expect(\"json object\")"),
+            "completions handler must not panic on json object access"
         );
     }
 }

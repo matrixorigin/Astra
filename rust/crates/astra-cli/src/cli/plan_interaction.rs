@@ -37,7 +37,9 @@ fn maybe_init_session_from_plan(state: &mut ReplState, outcome: &PlanLlmOutcome)
         ..
     } = outcome
     {
-        if state.session_id.is_none() {
+        // Always adopt the server-created session_id. The local session_id
+        // (generated at plan entry for journal) may differ from the server's.
+        if state.session_id.as_deref() != Some(sid.as_str()) {
             super::repl_turn::initialize_journal_pub(state, sid);
             state.session_id = Some(sid.clone());
         }
@@ -114,14 +116,13 @@ async fn plan_generate_with_retry(
     token: &str,
     goal: &str,
     context: &plan::ProjectContext,
-    session_id: Option<&str>,
+    _session_id: Option<&str>,
 ) -> PlanLlmOutcome {
     use astra_runtime::plan::decomposition_prompt;
 
     let prompt = decomposition_prompt(goal, context);
     let payload = serde_json::json!({
         "messages": [{"role": "user", "content": prompt}],
-        "session_id": session_id,
     });
 
     let result = plan_llm_call(api, token, &payload).await;
@@ -157,7 +158,6 @@ async fn plan_generate_with_retry(
             {"role": "assistant", "content": text},
             {"role": "user", "content": retry_prompt},
         ],
-        "session_id": session_id,
     });
 
     plan_llm_call(api, token, &retry_payload).await
@@ -817,6 +817,118 @@ fn journal_plan_event(
     let _ = writer.append(&event);
 }
 
+/// B6: Drop the in-memory plan_mode state and delete persisted state files
+/// after a generation failure or cancellation.
+///
+/// Without this, a cancelled outline left `state.plan_mode = Some(...)` with
+/// `plan.subtasks` empty. The user would then type "继续" expecting it to
+/// retry generation, but `PlanCommand::parse` routed it to Resume which —
+/// even after B4's EmptyNoSubtasks branch — still left them in plan-mode
+/// purgatory rather than back in normal chat.
+///
+/// We deliberately keep the journal event so the failure is auditable.
+fn abort_plan_mode_after_failure(state: &mut ReplState, stage: &'static str, reason: &str) {
+    journal_plan_event(
+        &mut state.journal,
+        session_journal::JournalEventType::PlanLifecycle,
+        &format!("Plan generation aborted at {stage}: {reason}"),
+        Some(serde_json::json!({
+            "stage": stage,
+            "reason": reason,
+            "outcome": "abort",
+        })),
+    );
+    state.plan_mode = None;
+    state.chat_plan_only = false;
+    state.pending_plan_resume_digest = None;
+    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+    let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
+}
+
+/// P2: Single-stage analytical-plan generation.
+///
+/// Runs one LLM call against `astra_plan::analytical::analytical_prompt`,
+/// renders the resulting `ResearchPlan`, and tears down plan_mode. Unlike
+/// the executable flow there is no outline/confirm/expand loop and no
+/// executor invocation — the deliverable is the rendered plan itself.
+async fn handle_analytical_goal(
+    goal: String,
+    tok: &str,
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+) -> Result<PlanInputResult, String> {
+    let context = state
+        .plan_mode
+        .as_ref()
+        .map(|ps| ps.context.clone())
+        .unwrap_or_default();
+
+    let prompt = astra_runtime::plan::analytical::analytical_prompt(&goal, &context);
+    let payload = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+    });
+
+    eprintln!();
+    eprintln!("  {} Analyzing question…", "⋯".dim());
+
+    let result = plan_llm_call(api, tok, &payload).await;
+    maybe_init_session_from_plan(state, &result);
+    let text = match result {
+        PlanLlmOutcome::Ok { text, .. } => text,
+        PlanLlmOutcome::Cancelled => {
+            eprintln!("  {} Analytical plan cancelled.", theme::icon_warn());
+            abort_plan_mode_after_failure(state, "analytical", "cancelled");
+            return Ok(PlanInputResult::Handled);
+        }
+        PlanLlmOutcome::Error(e) => {
+            eprintln!("  {} {}", theme::icon_err(), e.clone().red());
+            abort_plan_mode_after_failure(state, "analytical", &e);
+            return Ok(PlanInputResult::Handled);
+        }
+    };
+
+    match astra_runtime::plan::analytical::parse_analytical_response(&text) {
+        Ok(plan) => {
+            eprintln!();
+            eprintln!(
+                "{}",
+                astra_runtime::plan::analytical::format_research_plan(&plan)
+            );
+            journal_plan_event(
+                &mut state.journal,
+                session_journal::JournalEventType::PlanLifecycle,
+                &format!(
+                    "Analytical plan delivered ({} questions)",
+                    plan.questions.len()
+                ),
+                Some(serde_json::json!({
+                    "stage": "analytical_delivered",
+                    "kind": "analytical",
+                    "question_count": plan.questions.len(),
+                    "outcome": "ok",
+                })),
+            );
+            // Analytical is one-shot: drop plan_mode so the user falls
+            // back into normal chat to discuss any of the sub-questions.
+            state.plan_mode = None;
+            state.chat_plan_only = false;
+            state.pending_plan_resume_digest = None;
+            let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+            let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
+            Ok(PlanInputResult::Handled)
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to parse analytical plan: {}",
+                theme::icon_err(),
+                e.clone().red()
+            );
+            abort_plan_mode_after_failure(state, "analytical", &e);
+            Ok(PlanInputResult::Handled)
+        }
+    }
+}
+
 pub(super) fn journal_goal_steering_event(
     journal: &mut Option<session_journal::JournalWriter>,
     turn: u32,
@@ -888,7 +1000,8 @@ pub async fn handle_plan_mode_input(
 ) -> Result<PlanInputResult, String> {
     use plan::{
         ClarificationAnswer, PlanEntryChoice, PlanModeState, decomposition_prompt,
-        parse_clarification_response, parse_plan_entry_choice, parse_plan_response,
+        detect_clarification_questions, parse_clarification_response, parse_plan_entry_choice,
+        parse_plan_response,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -968,7 +1081,6 @@ pub async fn handle_plan_mode_input(
         let prompt = decomposition_prompt(&goal_with_context, &plan_state.context);
         let payload = serde_json::json!({
             "messages": [{"role": "user", "content": prompt}],
-            "session_id": state.session_id.clone(),
         });
 
         eprintln!();
@@ -999,6 +1111,12 @@ pub async fn handle_plan_mode_input(
                 return Ok(PlanInputResult::Handled);
             }
         };
+
+        // LLM may return another round of clarification questions instead of a plan.
+        if let Some(questions) = detect_clarification_questions(&full_text) {
+            let goal = plan_state.goal.clone();
+            return handle_outline_clarifications(questions, &goal, token, state, api).await;
+        }
 
         match parse_plan_response(&full_text) {
             Ok(plan) => {
@@ -1217,7 +1335,6 @@ pub async fn handle_plan_mode_input(
         }
         state.plan_handle = None;
         state.plan_mode = None;
-        state.plan_resume_pending = false;
         state.executing_plan = None;
         eprintln!(
             "  {} Plan abandoned. Sending as normal chat...",
@@ -1369,7 +1486,12 @@ enum PlanResumeRecovery {
     /// recovered plan ready for a new executor.
     Ready(astra_services::task_orchestrator::TaskPlan),
     /// All subtasks are already Completed — nothing to resume.
-    NothingToDo,
+    AllCompleted,
+    /// Plan has no subtasks at all — generation never produced any work.
+    /// (Previously misreported as `NothingToDo`/AllCompleted, surfacing the
+    /// confusing "All subtasks already completed" message on a fresh empty
+    /// plan after a failed generation.)
+    EmptyNoSubtasks,
 }
 
 /// Recover a plan for resume: reset Failed→Pending and return a clone if work remains.
@@ -1381,12 +1503,16 @@ fn recover_plan_for_resume(
 ) -> PlanResumeRecovery {
     use astra_services::task_orchestrator::TaskStatus;
 
+    if plan.subtasks.is_empty() {
+        return PlanResumeRecovery::EmptyNoSubtasks;
+    }
+
     let has_work = plan
         .subtasks
         .iter()
         .any(|s| s.status == TaskStatus::Pending || s.status == TaskStatus::Failed);
     if !has_work {
-        return PlanResumeRecovery::NothingToDo;
+        return PlanResumeRecovery::AllCompleted;
     }
     for st in &mut plan.subtasks {
         if st.status == TaskStatus::Failed {
@@ -1413,7 +1539,7 @@ async fn handle_plan_command(
                 &mut state.journal,
                 session_journal::JournalEventType::PlanLifecycle,
                 "Plan mode cancelled",
-                None,
+                Some(serde_json::json!({ "stage": "cancelled" })),
             );
 
             PlanModeState::clear_saved_state();
@@ -1583,9 +1709,8 @@ async fn handle_plan_command(
                     "⚙".cyan()
                 );
                 eprintln!(
-                    "  {} Prompt shows {} while the run is active.",
+                    "  {} The run continues in background; approvals and status stay available on the normal prompt.",
                     "→".dim(),
-                    "plan*[…]>".yellow()
                 );
                 eprintln!();
             }
@@ -1690,6 +1815,15 @@ async fn handle_plan_command(
             state.plan_execution_rounds = 0;
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);
+            state.plan_mode = None;
+            state.chat_plan_only = false;
+            state.pending_plan_resume_digest = None;
+            PlanModeState::clear_saved_state();
+            eprintln!(
+                "  {} Left plan mode — execution is now running in background. Use {} to inspect it.",
+                "←".cyan(),
+                "/plan status".cyan()
+            );
         }
 
         PlanCommand::Resume => {
@@ -1703,8 +1837,17 @@ async fn handle_plan_command(
                 match handle.send_command(crate::plan_executor::PlanCommand::Resume { corrections })
                 {
                     Ok(()) => {
-                        eprintln!("  {} Resuming plan execution...", "▶".cyan());
-                        state.plan_resume_pending = true;
+                        journal_plan_event(
+                            &mut state.journal,
+                            session_journal::JournalEventType::PlanLifecycle,
+                            "Plan execution resumed",
+                            Some(serde_json::json!({ "stage": "resumed" })),
+                        );
+                        eprintln!(
+                            "  {} Resuming plan execution in background. Use {} for progress.",
+                            "▶".cyan(),
+                            "/plan status".cyan()
+                        );
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
@@ -1714,11 +1857,21 @@ async fn handle_plan_command(
                         state.executing_plan = Some(plan);
                         eprintln!("  {} Resuming plan execution...", "▶".cyan());
                     }
-                    PlanResumeRecovery::NothingToDo => {
+                    PlanResumeRecovery::AllCompleted => {
                         eprintln!(
                             "  {} {}",
                             theme::icon_warn(),
                             "All subtasks already completed — nothing to resume".yellow()
+                        );
+                    }
+                    PlanResumeRecovery::EmptyNoSubtasks => {
+                        // Plan generation never produced subtasks (likely
+                        // failed JSON parse or cancelled). Don't lie that
+                        // everything is "completed" — guide the user back.
+                        eprintln!(
+                            "  {} {}",
+                            theme::icon_warn(),
+                            "Plan is empty — type a goal to generate one, or 'cancel' to exit plan mode".yellow()
                         );
                     }
                 }
@@ -1734,7 +1887,15 @@ async fn handle_plan_command(
         PlanCommand::Pause => {
             if let Some(ref handle) = state.plan_handle {
                 match handle.send_command(crate::plan_executor::PlanCommand::Pause) {
-                    Ok(()) => eprintln!("  {} Pause requested.", "⏸".cyan()),
+                    Ok(()) => {
+                        journal_plan_event(
+                            &mut state.journal,
+                            session_journal::JournalEventType::PlanLifecycle,
+                            "Plan execution pause requested",
+                            Some(serde_json::json!({ "stage": "pause_requested" })),
+                        );
+                        eprintln!("  {} Pause requested.", "⏸".cyan());
+                    }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
             } else {
@@ -1972,9 +2133,29 @@ async fn handle_goal_submission(
         return Ok(PlanInputResult::Handled);
     };
 
-    let Some(plan_state) = state.plan_mode.as_mut() else {
+    if state.plan_mode.is_none() {
         return Ok(PlanInputResult::Handled);
-    };
+    }
+
+    // B10: Initialise the journal writer eagerly so the "Plan mode started"
+    // event and any subsequent abort events are recorded even if the very
+    // first LLM call fails. Previously the journal writer was only attached
+    // when an LLM response carried a session_id, so a failure on the first
+    // outline call would silently drop every plan-mode event.
+    if state.session_id.is_none() {
+        let new_sid = uuid::Uuid::new_v4().to_string();
+        super::repl_turn::initialize_journal_pub(state, &new_sid);
+        state.session_id = Some(new_sid);
+    } else if state.journal.is_none() {
+        if let Some(sid) = state.session_id.clone() {
+            super::repl_turn::initialize_journal_pub(state, &sid);
+        }
+    }
+
+    let plan_state = state
+        .plan_mode
+        .as_mut()
+        .expect("plan_mode is_some checked above");
     plan_state.goal = goal.clone();
 
     journal_plan_event(
@@ -1986,6 +2167,21 @@ async fn handle_goal_submission(
         ),
         Some(serde_json::json!({
             "goal": goal,
+            "stage": "entered",
+            // P5: classify the goal at entry so downstream digesters can
+            // distinguish executable vs analytical without re-running the
+            // heuristic.
+            "kind": match astra_runtime::plan_decompose::classify_plan_suggestion(&goal)
+                .map(|s| s.kind)
+                .unwrap_or(astra_runtime::plan_decompose::PlanKind::Executable)
+            {
+                astra_runtime::plan_decompose::PlanKind::Executable => "executable",
+                astra_runtime::plan_decompose::PlanKind::Analytical => "analytical",
+            },
+            "started_at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
         })),
     );
 
@@ -2003,12 +2199,23 @@ async fn handle_goal_submission(
     )
     .await;
 
+    // P2: If the goal classifies as an analytical / evaluative question,
+    // route it through the single-stage research-plan generator instead of
+    // the outline → subtasks → executor pipeline. The research plan is a
+    // one-shot deliverable; we tear down plan_mode after rendering so the
+    // user falls back into normal chat to continue the discussion.
+    if matches!(
+        astra_runtime::plan_decompose::classify_plan_suggestion(&goal).map(|s| s.kind),
+        Some(astra_runtime::plan_decompose::PlanKind::Analytical)
+    ) {
+        return handle_analytical_goal(goal, tok, state, api).await;
+    }
+
     // ── Stage 1: Generate outline ───────────────────────────────────────
     eprintln!();
     let outline_prompt = outline::outline_prompt(&goal, &plan_state.context);
     let outline_payload = serde_json::json!({
         "messages": [{"role": "user", "content": outline_prompt}],
-        "session_id": state.session_id.clone(),
     });
 
     let outline_result = plan_llm_call(api, tok, &outline_payload).await;
@@ -2017,10 +2224,12 @@ async fn handle_goal_submission(
         PlanLlmOutcome::Ok { text, .. } => text,
         PlanLlmOutcome::Cancelled => {
             eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+            abort_plan_mode_after_failure(state, "outline", "cancelled");
             return Ok(PlanInputResult::Handled);
         }
         PlanLlmOutcome::Error(e) => {
-            eprintln!("  {} {}", theme::icon_err(), e.red());
+            eprintln!("  {} {}", theme::icon_err(), e.clone().red());
+            abort_plan_mode_after_failure(state, "outline", &e);
             return Ok(PlanInputResult::Handled);
         }
     };
@@ -2109,10 +2318,12 @@ async fn handle_goal_submission(
         PlanLlmOutcome::Ok { text, .. } => text,
         PlanLlmOutcome::Cancelled => {
             eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+            abort_plan_mode_after_failure(state, "full_plan", "cancelled");
             return Ok(PlanInputResult::Handled);
         }
         PlanLlmOutcome::Error(e) => {
-            eprintln!("  {} {}", theme::icon_err(), e.red());
+            eprintln!("  {} {}", theme::icon_err(), e.clone().red());
+            abort_plan_mode_after_failure(state, "full_plan", &e);
             return Ok(PlanInputResult::Handled);
         }
     };
@@ -2125,6 +2336,7 @@ async fn handle_goal_submission(
         Ok(plan) => accept_generated_plan(plan, token, state, api).await,
         Err(e) => {
             eprint_plan_json_parse_failed(&full_text, &e.to_string());
+            abort_plan_mode_after_failure(state, "full_plan_parse", &e.to_string());
             Ok(PlanInputResult::Handled)
         }
     }
@@ -2244,6 +2456,24 @@ async fn handle_outline_clarifications(
                 }
             };
 
+            // LLM may return another round of clarification questions instead of a plan.
+            if let Some(questions) = plan::detect_clarification_questions(&full_text) {
+                // Store the new questions and show the first one — the user will answer
+                // in the next turn, which re-enters handle_outline_clarifications naturally.
+                if let Some(plan_state) = state.plan_mode.as_mut() {
+                    let pending = plan::PendingClarifications {
+                        questions: questions.clone(),
+                        answers: Vec::new(),
+                    };
+                    plan_state.pending_clarifications = Some(pending);
+                    let _ = plan_state.save_to_file(&plan::PlanModeState::state_path());
+                }
+                if let Some(first) = questions.first() {
+                    eprint_clarification_question(first);
+                }
+                return Ok(PlanInputResult::Handled);
+            }
+
             match plan::parse_plan_response(&full_text) {
                 Ok(plan) => return accept_generated_plan(plan, token, state, api).await,
                 Err(e) => {
@@ -2334,7 +2564,6 @@ async fn expand_outline_to_plan(
             outline::phase_detail_prompt(goal, ol, phase, &completed_phases, &plan_ctx);
         let payload = serde_json::json!({
             "messages": [{"role": "user", "content": detail_prompt}],
-            "session_id": state.session_id.clone(),
         });
 
         let expand_result = plan_llm_call(api, tok, &payload).await;
@@ -2396,7 +2625,6 @@ async fn expand_outline_to_plan(
                         {"role": "assistant", "content": text},
                         {"role": "user", "content": retry_prompt},
                     ],
-                    "session_id": state.session_id.clone(),
                 });
                 let retry_result = plan_llm_call(api, tok, &retry_payload).await;
                 maybe_init_session_from_plan(state, &retry_result);
@@ -2747,6 +2975,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn execute_exits_plan_mode_and_leaves_background_state() {
+        let mut state = ReplState::default();
+        state.chat_plan_only = true;
+        let mut ps = plan::PlanModeState::new("goal".into(), plan::ProjectContext::default());
+        ps.plan.subtasks.push(SubtaskPlan {
+            id: "s1".into(),
+            title: "one".into(),
+            ..Default::default()
+        });
+        state.plan_mode = Some(ps);
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+
+        let result = handle_plan_mode_input("go".into(), None, &mut state, &api)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, PlanInputResult::Handled));
+        assert!(state.plan_mode.is_none(), "execute should leave plan mode");
+        assert!(
+            state.executing_plan.is_some(),
+            "execute should preserve plan for background status"
+        );
+        assert_eq!(state.executing_plan_goal.as_deref(), Some("goal"));
+        assert!(
+            !state.chat_plan_only,
+            "execute should restore normal chat after leaving plan mode"
+        );
+    }
+
     #[test]
     fn extract_goal_pattern_empty_string_returns_wildcard() {
         assert_eq!(extract_goal_pattern(""), "*");
@@ -2952,7 +3211,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_plan_for_resume_all_completed_returns_nothing() {
+    fn recover_plan_for_resume_all_completed_returns_all_completed() {
         use astra_services::task_orchestrator::TaskPlan;
         let mut plan = TaskPlan {
             subtasks: vec![
@@ -2973,7 +3232,23 @@ mod tests {
         };
         assert!(matches!(
             super::recover_plan_for_resume(&mut plan),
-            super::PlanResumeRecovery::NothingToDo
+            super::PlanResumeRecovery::AllCompleted
+        ));
+    }
+
+    #[test]
+    fn recover_plan_for_resume_empty_subtasks_returns_empty_no_subtasks() {
+        // B4: An empty subtasks list means generation never produced a plan.
+        // Previously this fell into the "AllCompleted" branch and confused the
+        // user with "All subtasks already completed — nothing to resume".
+        use astra_services::task_orchestrator::TaskPlan;
+        let mut plan = TaskPlan {
+            subtasks: vec![],
+            notes: None,
+        };
+        assert!(matches!(
+            super::recover_plan_for_resume(&mut plan),
+            super::PlanResumeRecovery::EmptyNoSubtasks
         ));
     }
 
@@ -3009,5 +3284,58 @@ mod tests {
         } else {
             panic!("expected Ready");
         }
+    }
+
+    // ── Plan session_id fixes ────────────────────────────────────────────
+
+    #[test]
+    fn maybe_init_session_from_plan_adopts_server_session_even_when_local_exists() {
+        let mut state = ReplState::default();
+        // Simulate local session_id generated at plan entry
+        state.session_id = Some("local-uuid-1234".to_string());
+
+        let outcome = PlanLlmOutcome::Ok {
+            text: "plan text".to_string(),
+            session_id: Some("server-session-5678".to_string()),
+        };
+        maybe_init_session_from_plan(&mut state, &outcome);
+
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("server-session-5678"),
+            "should adopt server session_id even when local one exists"
+        );
+    }
+
+    #[test]
+    fn maybe_init_session_from_plan_noop_when_already_matching() {
+        let mut state = ReplState::default();
+        state.session_id = Some("same-id".to_string());
+
+        let outcome = PlanLlmOutcome::Ok {
+            text: "text".to_string(),
+            session_id: Some("same-id".to_string()),
+        };
+        maybe_init_session_from_plan(&mut state, &outcome);
+
+        assert_eq!(state.session_id.as_deref(), Some("same-id"));
+    }
+
+    #[test]
+    fn maybe_init_session_from_plan_noop_on_no_server_session() {
+        let mut state = ReplState::default();
+        state.session_id = Some("local-id".to_string());
+
+        let outcome = PlanLlmOutcome::Ok {
+            text: "text".to_string(),
+            session_id: None,
+        };
+        maybe_init_session_from_plan(&mut state, &outcome);
+
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("local-id"),
+            "should keep local id when server returns no session"
+        );
     }
 }

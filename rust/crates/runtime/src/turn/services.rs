@@ -329,6 +329,8 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         });
         let response = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|error| error.to_string())?
             .post(format!(
@@ -366,6 +368,8 @@ impl TurnReflectionLessonWriter for DatabaseTurnReflectionLessonWriter {
         });
         let response = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|error| error.to_string())?
             .post(format!(

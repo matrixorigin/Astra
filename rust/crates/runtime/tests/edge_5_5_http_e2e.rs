@@ -256,15 +256,21 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
 
         let (first_status, first_body) = first.join().unwrap();
         let (second_status, second_body) = second.join().unwrap();
+        // Post-Phase-R fix: identical-payload duplicate callbacks are
+        // treated as idempotent HTTP retries — both return 200. The
+        // at-most-once ledger still records the value exactly once, and
+        // the journal still writes exactly one approval decision.
+        // (A *distinct-payload* duplicate would return 409 and is
+        // covered by `concurrent_distinct_payload_approval_conflicts_on_second`.)
         assert_eq!(
             first_status,
             StatusCode::OK,
-            "first duplicate approval: {first_body}"
+            "identical-payload duplicate should be idempotent 200: {first_body:?}"
         );
         assert_eq!(
             second_status,
             StatusCode::OK,
-            "second duplicate approval: {second_body}"
+            "identical-payload duplicate should be idempotent 200: {second_body:?}"
         );
     });
 
@@ -290,6 +296,64 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
 
     let key = approval_callback_key("e2e-user", "ap-concurrent-dup");
     assert!(ledger.blocking_lock().contains_key(&key));
+}
+
+/// Complement of the identical-payload idempotency test above: when two
+/// approval callbacks arrive for the same `request_id` with *different*
+/// decisions, the second one must be rejected with 409 CONFLICT so a
+/// delayed/malicious replay cannot flip an already-recorded decision.
+#[tokio::test]
+async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let (app, ledger) = e2e_app();
+
+    let (st1, j1) = post_json(
+        app.clone(),
+        "/approval/respond",
+        json!({
+            "request_id": "ap-conflict",
+            "decision": "allow",
+            "reason": "first",
+            "session_id": "sess-conflict",
+            "tool_name": "write_file",
+            "approval_kind": "standard"
+        }),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+    assert_eq!(j1["ok"], true);
+
+    let (st2, j2) = post_json(
+        app.clone(),
+        "/approval/respond",
+        json!({
+            "request_id": "ap-conflict",
+            "decision": "deny",
+            "reason": "second",
+            "session_id": "sess-conflict",
+            "tool_name": "write_file",
+            "approval_kind": "standard"
+        }),
+    )
+    .await;
+    assert_eq!(
+        st2,
+        StatusCode::CONFLICT,
+        "distinct-payload duplicate must return 409: {j2:?}"
+    );
+
+    let key = approval_callback_key("e2e-user", "ap-conflict");
+    let stored = ledger
+        .lock()
+        .await
+        .get(&key)
+        .cloned()
+        .expect("first approval stored");
+    assert_eq!(
+        stored["body"]["decision"], "allow",
+        "original ledger value must not be overwritten: {stored:?}"
+    );
 }
 
 #[tokio::test]

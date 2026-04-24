@@ -91,6 +91,35 @@ describe('useAstraChat', () => {
     expect(result.current.messages[1].streaming).toBe(true);
   });
 
+  test('sendMessage passes allowSkills, allowTools, and skillSearch to streamChat', () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, []);
+
+    const skillSearch = { dynamicSurface: true, minCatalogSize: 8, surfaceCap: 14 };
+    const { result } = renderHook(() =>
+      useAstraChat({
+        client,
+        allowSkills: ['s1'],
+        allowTools: ['bash'],
+        skillSearch,
+      }),
+    );
+
+    act(() => {
+      result.current.sendMessage('Hello');
+    });
+
+    expect(streamChatMock).toHaveBeenCalledTimes(1);
+    const req = streamChatMock.mock.calls[0][0] as {
+      allowSkills?: string[];
+      allowTools?: string[];
+      skillSearch?: typeof skillSearch;
+    };
+    expect(req.allowSkills).toEqual(['s1']);
+    expect(req.allowTools).toEqual(['bash']);
+    expect(req.skillSearch).toEqual(skillSearch);
+  });
+
   test('processes session_info event', () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
@@ -126,6 +155,36 @@ describe('useAstraChat', () => {
 
     const assistantMsg = result.current.messages.find((m) => m.role === 'assistant');
     expect(assistantMsg?.content).toBe('Hello World');
+  });
+
+  /** Aligns with real-world-scenarios / streamChat ordering (session → text → usage → complete). */
+  test('processes session_info → text_deltas → usage → turn_complete', () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: 'session_info', session_id: 's-w', run_id: 'r-w' } as StreamEvent,
+      { type: 'text_delta', content: 'Ok' } as StreamEvent,
+      {
+        type: 'usage',
+        prompt_tokens: 1,
+        completion_tokens: 2,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+      } as StreamEvent,
+      { type: 'turn_complete' } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client }));
+
+    act(() => {
+      result.current.sendMessage('Go');
+    });
+
+    expect(result.current.sessionId).toBe('s-w');
+    expect(result.current.runId).toBe('r-w');
+    const assistant = result.current.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toBe('Ok');
+    expect(assistant?.streaming).toBe(false);
+    expect(result.current.usage.totalTokens).toBe(3);
   });
 
   test('processes tool_call_start and tool_call_end', () => {

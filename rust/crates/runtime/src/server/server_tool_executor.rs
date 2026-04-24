@@ -874,13 +874,11 @@ fn is_mo_error(output: &str) -> bool {
     output.trim_start().starts_with("Error:")
 }
 
-fn mo_mysql_cmd(database: Option<&str>) -> Command {
-    astra_core::warn_default_credentials_once();
+fn mo_mysql_cmd(database: Option<&str>) -> Result<Command, String> {
     let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
     let port = std::env::var("MATRIXONE_PORT").unwrap_or_else(|_| "6001".to_string());
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
-    let password = std::env::var("MATRIXONE_PASSWORD")
-        .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string());
+    let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
     let db = database
         .map(ToString::to_string)
         .unwrap_or_else(|| astra_core::resolve_database_name(&|k| std::env::var(k).ok()));
@@ -893,11 +891,14 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
         .arg(db)
         .arg(format!("--connect-timeout={MO_CONNECT_TIMEOUT_SECS}"))
         .arg("--table");
-    cmd
+    Ok(cmd)
 }
 
 fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
-    let mut cmd = mo_mysql_cmd(database);
+    let mut cmd = match mo_mysql_cmd(database) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     cmd.arg("-e").arg(sql);
 
     match cmd.output() {
@@ -2098,6 +2099,11 @@ impl ServerToolExecutor {
         let Some(observability_session) = self.observability_session.as_ref() else {
             return json!({"error": "No observability session available"}).to_string();
         };
+        // LOCK ORDER: observability_session → self_mod_mutation_counter.
+        // The session guard is held across the counter lock because the
+        // mutation paths below require atomic read-modify-write of session
+        // config based on the counter check. All call sites that need both
+        // locks MUST take them in this order to avoid deadlock.
         let mut session = match observability_session.write() {
             Ok(guard) => guard,
             Err(_) => {

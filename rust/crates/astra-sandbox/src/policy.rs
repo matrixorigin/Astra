@@ -95,7 +95,11 @@ impl SandboxPolicy {
         Self {
             mode: SandboxMode::Standard,
             project_root: root,
-            allowed_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")],
+            allowed_paths: vec![
+                PathBuf::from("/tmp"),
+                PathBuf::from("/var/tmp"),
+                PathBuf::from("/dev/null"),
+            ],
             env_allowlist: None,
             max_execution_secs: 30.0,
             max_output_bytes: 20_000,
@@ -122,7 +126,7 @@ impl SandboxPolicy {
         Self {
             mode: SandboxMode::Strict,
             project_root: root,
-            allowed_paths: vec![PathBuf::from("/tmp")],
+            allowed_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/dev/null")],
             env_allowlist: Some(Vec::new()), // Only baseline vars
             max_execution_secs: 15.0,
             max_output_bytes: 10_000,
@@ -362,5 +366,30 @@ mod tests {
         let p = SandboxPolicy::for_trust_tier(&TrustTier::Community, "/proj");
         // Community uses Standard mode which allows network
         assert!(p.network_allowed);
+    }
+
+    // ── Regression: /dev/null blocked by sandbox (session 5f21382b) ──
+    //
+    // `2>/dev/null` in bash commands was flagged as SANDBOX_DENIED because
+    // /dev/null is outside the project root and not in allowed_paths.
+    // /dev/null is a standard Unix device — safe to redirect to (discards
+    // data) and safe to read from (returns EOF).
+
+    #[test]
+    fn standard_allows_dev_null() {
+        let p = SandboxPolicy::for_project("/proj");
+        assert!(
+            p.is_path_allowed(std::path::Path::new("/dev/null")),
+            "/dev/null must be allowed in Standard mode"
+        );
+    }
+
+    #[test]
+    fn strict_allows_dev_null() {
+        let p = SandboxPolicy::strict("/proj");
+        assert!(
+            p.is_path_allowed(std::path::Path::new("/dev/null")),
+            "/dev/null must be allowed even in Strict mode"
+        );
     }
 }

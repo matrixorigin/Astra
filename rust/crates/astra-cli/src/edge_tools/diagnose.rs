@@ -278,21 +278,27 @@ impl ToolExecutor {
             );
 
             // Sandbox policy
-            if let Some(ref policy) = self.sandbox_policy {
-                session_info.insert(
-                    "sandbox_mode".to_string(),
-                    json!(format!("{:?}", policy.mode)),
-                );
-                if verbose {
-                    let paths: Vec<String> = policy
-                        .allowed_paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect();
-                    session_info.insert("allowed_paths".to_string(), json!(paths));
+            {
+                let sp_guard = self
+                    .sandbox_policy
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(ref policy) = *sp_guard {
+                    session_info.insert(
+                        "sandbox_mode".to_string(),
+                        json!(format!("{:?}", policy.mode)),
+                    );
+                    if verbose {
+                        let paths: Vec<String> = policy
+                            .allowed_paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect();
+                        session_info.insert("allowed_paths".to_string(), json!(paths));
+                    }
+                } else {
+                    session_info.insert("sandbox_mode".to_string(), json!("disabled"));
                 }
-            } else {
-                session_info.insert("sandbox_mode".to_string(), json!("disabled"));
             }
 
             result.insert("session".to_string(), json!(session_info));

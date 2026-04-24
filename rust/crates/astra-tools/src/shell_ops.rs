@@ -316,11 +316,55 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         return ToolResult::error(truncate_output(result, output_limit));
     }
 
+    if command_has_background_operator(command) {
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(
+            "\n⚠ Background process (`&`) started. Background processes do not persist \
+             across bash tool calls — each call runs in an isolated shell. If you need \
+             the process running for a subsequent call, start it and test it within the \
+             same command.",
+        );
+    }
+
     if result.is_empty() {
         ToolResult::text("(command completed with no output)".into())
     } else {
         ToolResult::text(truncate_output(result, output_limit))
     }
+}
+
+/// Returns true if the command uses `&` to background a process (not `&&`).
+fn command_has_background_operator(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if !in_single => {
+                i += 2;
+                continue;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '&' if !in_single && !in_double => {
+                let prev_amp = i > 0 && chars[i - 1] == '&';
+                let next_amp = chars.get(i + 1) == Some(&'&');
+                if !prev_amp && !next_amp {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Search files with bounded, cancellable subprocess execution.
@@ -3328,18 +3372,33 @@ printf 'probe.txt:1:needle\n'
         let dir = tempdir().unwrap();
         let token = Arc::new(CancellationToken::new());
         let trigger = token.clone();
+
+        // Use a sentinel file so we cancel only after output has started,
+        // eliminating the race condition with a fixed timer.
+        let sentinel = dir.path().join(".cancel_sentinel");
+        let sentinel_path = sentinel.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Wait until the bash command has produced output and created the sentinel
+            for _ in 0..200 {
+                if sentinel_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             trigger.cancel();
         });
 
         let mut ctx = crate::ToolContext::test(dir.path());
         ctx.cancel_token = Some(token);
 
+        // The command creates a sentinel file after the first echo, then sleeps.
+        let sentinel_str = sentinel.display();
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
-                "command": "for i in $(seq 1 5); do echo line_$i; sleep 0.1; done; sleep 5"
+                "command": format!(
+                    "echo line_1; touch {sentinel_str}; sleep 0.1; echo line_2; sleep 10"
+                )
             }),
         )
         .await;
@@ -3477,5 +3536,23 @@ printf 'probe.txt:1:needle\n'
         assert!(glob_matches_path("**/*.{ts,tsx}", "src/app/main.ts"));
         assert!(glob_matches_path("**/*.{ts,tsx}", "src/app/main.tsx"));
         assert!(!glob_matches_path("**/*.{ts,tsx}", "src/app/main.js"));
+    }
+
+    // ── background process warning ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bash_background_process_appends_warning() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "echo started & echo done"}),
+        )
+        .await;
+        assert!(
+            result.output.to_lowercase().contains("background"),
+            "expected background process warning, got: {}",
+            result.output
+        );
     }
 }

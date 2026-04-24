@@ -53,15 +53,43 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
             tool_name
         );
     }
-    truncate_tool_result(&sanitized.content, MAX_TOOL_RESULT_CHARS)
+    truncate_tool_result(tool_name, &sanitized.content, MAX_TOOL_RESULT_CHARS)
 }
 
 /// Truncate a tool result to `max_chars`, keeping head and tail with a notice.
 /// Returns the original string if within limits.
-fn truncate_tool_result(content: &str, max_chars: usize) -> String {
-    // Count chars once — used for both the early-exit guard and the truncation math.
-    // content.len() is bytes; for UTF-8 content len() >= chars().count(), so we must
-    // use chars().count() to correctly decide whether truncation is needed.
+///
+/// Before the final char-level truncation, we delegate to
+/// [`crate::tool_result_compression::compress_result_for_context`] which applies
+/// semantic compression (JSON array/object elision, listing head+tail, error
+/// head+tail) tuned to the content type. If the result still exceeds the char
+/// budget after semantic compression, we fall back to the historical head+tail
+/// byte-boundary truncation so overall behavior remains bounded.
+fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> String {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
+        return content.to_string();
+    }
+
+    // First pass: semantic compression. Budget at ~70% of the raw char cap so
+    // there's headroom for the compression marker text itself and for CJK /
+    // emoji that expand byte counts per char.
+    let compression_budget = max_chars * 7 / 10;
+    let compressed = crate::tool_result_compression::compress_result_for_context(
+        tool_name,
+        content,
+        compression_budget,
+    );
+    // If compression brought us under the hard cap, return it as-is.
+    if compressed.chars().count() <= max_chars {
+        return compressed;
+    }
+
+    // Second pass: legacy head+tail char truncation as ultimate fallback.
+    legacy_head_tail_truncate(&compressed, max_chars)
+}
+
+fn legacy_head_tail_truncate(content: &str, max_chars: usize) -> String {
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
         return content.to_string();
@@ -91,7 +119,7 @@ fn truncate_tool_result(content: &str, max_chars: usize) -> String {
     let head = &content[..head_end];
     let tail = &content[tail_start..];
     format!(
-        "{head}\n\n[… truncated {omitted} characters — output too large for context window …]\n\n{tail}"
+        "{head}\n\n[… truncated {omitted} characters — use start_line/end_line to read specific sections …]\n\n{tail}"
     )
 }
 
@@ -206,30 +234,29 @@ mod tests {
     #[test]
     fn small_result_not_truncated() {
         let content = "a".repeat(1000);
-        let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
+        let out = super::truncate_tool_result("t", &content, MAX_TOOL_RESULT_CHARS);
         assert_eq!(out.len(), 1000);
     }
 
     #[test]
     fn exact_limit_not_truncated() {
         let content = "x".repeat(MAX_TOOL_RESULT_CHARS);
-        let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
+        let out = super::truncate_tool_result("t", &content, MAX_TOOL_RESULT_CHARS);
         assert_eq!(out.len(), MAX_TOOL_RESULT_CHARS);
     }
 
     #[test]
     fn oversized_result_truncated() {
         let content = "A".repeat(MAX_TOOL_RESULT_CHARS + 10_000);
-        let out = super::truncate_tool_result(&content, MAX_TOOL_RESULT_CHARS);
+        let out = super::truncate_tool_result("t", &content, MAX_TOOL_RESULT_CHARS);
         assert!(
             out.len() < content.len(),
             "should be smaller after truncation"
         );
         assert!(
-            out.contains("truncated"),
-            "should contain truncation notice"
+            out.contains("truncated") || out.contains("elided"),
+            "should contain truncation or compression notice"
         );
-        assert!(out.contains("characters"), "should mention chars truncated");
         // Head and tail preserved
         assert!(out.starts_with("AAA"), "head preserved");
         assert!(out.ends_with("AAA"), "tail preserved");
@@ -240,7 +267,10 @@ mod tests {
         let big = "B".repeat(MAX_TOOL_RESULT_CHARS + 5_000);
         let out = tool_result_content_for_model("bash", &big);
         assert!(out.len() < big.len(), "should truncate large bash output");
-        assert!(out.contains("truncated"), "truncation notice present");
+        assert!(
+            out.contains("truncated") || out.contains("elided"),
+            "truncation or compression notice present"
+        );
     }
 
     #[test]
@@ -249,33 +279,35 @@ mod tests {
         // Slicing at byte offset head_chars would panic without the fix.
         let content = "你好世界".repeat(5_000); // 20_000 chars, 60_000 bytes
         let max = 10_000;
-        let out = super::truncate_tool_result(&content, max);
-        // Must not panic, must be valid UTF-8, must contain truncation notice.
-        assert!(out.contains("truncated"));
+        let out = super::truncate_tool_result("t", &content, max);
+        // Must not panic, must be valid UTF-8, must contain some shortening notice.
+        assert!(out.contains("truncated") || out.contains("elided"));
         // Output must be valid UTF-8 (no panic on chars().count()).
         let _ = out.chars().count();
-        // Head and tail must start/end on valid char boundaries.
+        // Head must start on valid char boundaries.
         assert!(out.starts_with('你'));
     }
 
     #[test]
     fn truncation_char_count_not_byte_count() {
         // 3-byte chars: content has 100 chars but 300 bytes.
-        // With max_chars=50, should truncate (100 chars > 50), not skip.
+        // With max_chars=50, should shorten (100 chars > 50), not skip.
         let content = "é".repeat(100); // 'é' is 2 bytes in UTF-8
-        let out = super::truncate_tool_result(&content, 50);
+        let out = super::truncate_tool_result("t", &content, 50);
         assert!(
-            out.contains("truncated"),
-            "should truncate by char count, not byte count"
+            out.contains("truncated") || out.contains("elided"),
+            "should shorten by char count, not byte count"
         );
     }
 
     #[test]
-    fn truncation_omitted_count_is_chars_not_bytes() {
-        // 3-byte CJK chars: omitted count should be in chars, not bytes.
+    fn legacy_head_tail_truncate_reports_omitted_chars_not_bytes() {
+        // Calling the legacy helper directly so we keep verifying that
+        // the char-accounting math is correct even if the outer wrapper
+        // now prefers semantic compression.
         let content = "中".repeat(10_100); // 10_100 chars, 30_300 bytes
         let max = 10_000;
-        let out = super::truncate_tool_result(&content, max);
+        let out = super::legacy_head_tail_truncate(&content, max);
         // head=4000 chars, tail=4000 chars, omitted=2100 chars (not 6300 bytes)
         assert!(
             out.contains("2100 characters"),

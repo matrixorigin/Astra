@@ -36,7 +36,7 @@ pub(super) fn enqueue_ingestion_pub(state: &ReplState, event: &session_journal::
 fn stall_type_confidence(stall_type: &str) -> f64 {
     match stall_type {
         "sig_stall" => 1.0,
-        s if s.starts_with("skill_lockout") => 1.0,
+        s if s == "skill_lockout" || s.starts_with("skill_lockout:") => 1.0,
         _ => 0.0,
     }
 }
@@ -878,7 +878,6 @@ async fn maybe_auto_compact(
         api: ctx.api,
         token,
         message: prompts::COMPACT_SUMMARY_REQUEST,
-        prefetched_context_override: None,
         session_id: state.session_id.as_deref(),
         model: state.model.as_deref(),
         explain: ExplainMode::Off,
@@ -910,6 +909,7 @@ async fn maybe_auto_compact(
         observability_hub: obs_hub,
         observability_session: obs_session,
         file_journal: Some(state.file_journal.clone()),
+        file_state: Some(state.file_state.clone()),
         database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
         git_stash_journal: Some(state.git_stash_journal.clone()),
         git_commit_journal: Some(state.git_commit_journal.clone()),
@@ -1155,7 +1155,6 @@ async fn run_chat_turn(
             api: ctx.api,
             token,
             message,
-            prefetched_context_override: None,
             session_id,
             model: state.model.as_deref(),
             explain: state.explain,
@@ -1187,6 +1186,7 @@ async fn run_chat_turn(
             observability_hub: obs_hub,
             observability_session: obs_session,
             file_journal: Some(state.file_journal.clone()),
+            file_state: Some(state.file_state.clone()),
             database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
             git_stash_journal: Some(state.git_stash_journal.clone()),
             git_commit_journal: Some(state.git_commit_journal.clone()),
@@ -1255,6 +1255,17 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_memoria_time(result.memoria_ms)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
 
+        // Attach per-turn git snapshot for rewind/fork/sync lineage.
+        {
+            let git_root = state
+                .session_id
+                .as_deref()
+                .and_then(|sid| astra_services::session_workspace::read_workspace(sid).ok())
+                .and_then(|ws| ws.git_root);
+            let (git_head, git_branch) = super::cli_utils::git_snapshot(git_root.as_deref());
+            turn_event = turn_event.with_git_snapshot(git_head, git_branch);
+        }
+
         // Add turn observability summary.
         turn_event.llm_rounds = result.llm_rounds;
         let tool_ms: u64 = result
@@ -1278,20 +1289,7 @@ fn commit_turn_journal_workspace_and_sidecars(
 
         // Emit deferred context_assembly_recorded — only on successful turn commit.
         if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
-            let mut trace = trace_json.clone();
-            // Annotate with prefetch info so token audits can account for it.
-            if result.prefetch_injected {
-                if let Some(obj) = trace.as_object_mut() {
-                    let mut pf = serde_json::json!({ "injected": true });
-                    if let Some(tt) = &result.prefetch_task_type {
-                        pf["task_type"] = serde_json::json!(tt);
-                    }
-                    if let Some(bb) = result.prefetch_body_bytes {
-                        pf["body_bytes"] = serde_json::json!(bb);
-                    }
-                    obj.insert("prefetch".into(), pf);
-                }
-            }
+            let trace = trace_json.clone();
             // Use the REPL's user-visible turn number, not the internal agentic
             // loop counter that was stored in the trace.
             let assembly_event = session_journal::JournalEvent::context_assembly_recorded(
@@ -1607,7 +1605,6 @@ pub(super) fn analyze_repl_turn_learning(
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
-        result.prefetch_injected,
     );
 
     ReplTurnLearningSnapshot { routing, eval }
@@ -1768,9 +1765,7 @@ fn apply_turn_success_sync(
         );
     }
 
-    if result.tool_calls_count == 0
-        && !result.prefetch_injected
-        && looks_like_live_query_with_context(line, &state.recent_tools)
+    if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
     {
         eprintln!(
             "{}",
@@ -1859,10 +1854,6 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
     }
 
     // Prefetch indicator
-    if let Some(ref task_type) = result.prefetch_task_type {
-        parts.push(format!("prefetch:{task_type}"));
-    }
-
     let line = format!("  ─ {} ─", parts.join(" │ "));
     eprintln!("{}", line.dim());
 
@@ -4216,9 +4207,6 @@ mod tests {
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
-            prefetch_injected: false,
-            prefetch_task_type: None,
-            prefetch_body_bytes: None,
             llm_rounds: None,
         }
     }
@@ -5275,6 +5263,7 @@ mod tests {
             super::stall_type_confidence("skill_lockout:any-other-skill"),
             1.0
         );
+        assert_eq!(super::stall_type_confidence("skill_lockout:"), 1.0);
 
         // Heuristic / unknown types must stay at 0.0 so journal write-through
         // skips emission (avoids polluting downstream reflection pipelines).
@@ -5284,5 +5273,7 @@ mod tests {
         assert_eq!(super::stall_type_confidence("unknown_type"), 0.0);
         // Near-miss must not match — prefix is literal.
         assert_eq!(super::stall_type_confidence("skill_lockou"), 0.0);
+        // Underscore suffix must not match — only exact or colon suffix.
+        assert_eq!(super::stall_type_confidence("skill_lockout_v2"), 0.0);
     }
 }

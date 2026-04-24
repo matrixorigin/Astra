@@ -153,6 +153,25 @@ pub struct ObservabilitySession {
     /// Populated by the adaptive-tuning cycle; consumed by the SelfModel snapshot
     /// builder. Replaced (not appended to) on each publish.
     pub low_confidence_tools: Vec<(String, f64, u32)>,
+
+    /// Scenario cached from the user profile for SelfModel rendering.
+    /// Mirrors `profile.current_scenario` so the snapshot builder can consume
+    /// it without reaching back through the profile store.
+    pub active_scenario: Option<Scenario>,
+
+    /// Skill names surfaced for SelfModel's `capabilities.skills` list.
+    /// Published per-turn by the agentic loop from the active skill source
+    /// (registry / selection log). Empty when no skill source is reachable.
+    pub cached_skill_names: Vec<String>,
+
+    /// Per-turn export of `ToolHealthTracker::export()` so SelfModel can
+    /// reconstruct summaries + deprioritized/outcome memory without holding
+    /// a reference to the live tracker.
+    pub last_tool_health_export: Vec<astra_pipeline::ToolHealthEntry>,
+
+    /// Recent `AutoTuningEngine` feedback signals mirrored onto the session so
+    /// SelfModel can render them. Bounded to the most recent 16 entries.
+    pub last_feedback_signals: Vec<FeedbackSignal>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +270,10 @@ impl ObservabilitySession {
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
+            active_scenario: None,
+            cached_skill_names: Vec::new(),
+            last_tool_health_export: Vec::new(),
+            last_feedback_signals: Vec::new(),
         }
     }
 
@@ -290,12 +313,41 @@ impl ObservabilitySession {
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
             low_confidence_tools: Vec::new(),
+            active_scenario: None,
+            cached_skill_names: Vec::new(),
+            last_tool_health_export: Vec::new(),
+            last_feedback_signals: Vec::new(),
         }
     }
 
     /// Get the current scenario (if detected).
     pub fn current_scenario(&self) -> Option<Scenario> {
         self.profile.current_scenario
+    }
+
+    /// Publish the four SelfModel inputs that were previously hard-coded to
+    /// empty at the `build_self_model_snapshot` call site. `recent_signals`
+    /// is bounded to the most recent 16 entries (tail-preserving) so the
+    /// SelfModel does not balloon when the tuning engine retains a long
+    /// window.
+    pub fn ingest_self_model_inputs(
+        &mut self,
+        skills: Vec<String>,
+        tool_health_entries: Vec<astra_pipeline::ToolHealthEntry>,
+        scenario: Option<Scenario>,
+        recent_signals: Vec<FeedbackSignal>,
+    ) {
+        const MAX_SIGNALS: usize = 16;
+        self.cached_skill_names = skills;
+        self.last_tool_health_export = tool_health_entries;
+        self.active_scenario = scenario;
+        let trimmed = if recent_signals.len() > MAX_SIGNALS {
+            let start = recent_signals.len() - MAX_SIGNALS;
+            recent_signals.into_iter().skip(start).collect()
+        } else {
+            recent_signals
+        };
+        self.last_feedback_signals = trimmed;
     }
 
     /// Record a context assembly trace.
@@ -776,6 +828,39 @@ impl ObservabilityHub {
     /// Record a feedback signal for auto-tuning.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
         self.tuning_engine.record_feedback(signal);
+    }
+
+    /// Record a batch of streaming speculative tool execution metrics.
+    ///
+    /// Forwards the cumulative counters into the
+    /// [`astra_learning::auto_tuning::AutoTuningEngine`] so that speculation
+    /// hit rate can be tracked across a session and used to auto-gate
+    /// `ASTRA_STREAMING_TOOL_EXEC` via
+    /// [`AutoTuningEngine::should_disable_streaming_speculation`].
+    ///
+    /// Also emits a structured `tracing::info!` event on target
+    /// `astra::streaming_speculation::metrics` for downstream log consumers.
+    pub fn record_streaming_speculation_metrics(
+        &self,
+        metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
+    ) {
+        self.tuning_engine.record_streaming_speculation(
+            metrics.started,
+            metrics.hit,
+            metrics.discarded,
+            metrics.total_saved_ms,
+        );
+        tracing::info!(
+            target: "astra::streaming_speculation::metrics",
+            started = metrics.started,
+            hit = metrics.hit,
+            discarded = metrics.discarded,
+            inflight = metrics.inflight,
+            wasted = metrics.wasted(),
+            total_saved_ms = metrics.total_saved_ms,
+            hit_rate = metrics.hit_rate(),
+            "hub.record_streaming_speculation_metrics"
+        );
     }
 
     fn signal_with_session_context(
@@ -1621,5 +1706,27 @@ mod tests {
         assert_eq!(s.outcome_bias.get("bash"), Some(&0.25));
         s.set_outcome_bias(std::collections::BTreeMap::new());
         assert!(s.outcome_bias.is_empty());
+    }
+
+    #[test]
+    fn hub_forwards_streaming_speculation_metrics() {
+        use astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics;
+
+        let hub = ObservabilityHub::new();
+        let metrics = StreamingSpeculationMetrics {
+            started: 8,
+            hit: 4,
+            discarded: 1,
+            inflight: 0,
+            total_saved_ms: 240,
+        };
+        hub.record_streaming_speculation_metrics(&metrics);
+
+        let stats = hub.tuning().streaming_speculation_stats();
+        assert_eq!(stats.started, 8);
+        assert_eq!(stats.hit, 4);
+        assert_eq!(stats.discarded, 1);
+        assert_eq!(stats.total_saved_ms, 240);
+        assert!((stats.hit_rate() - 0.5).abs() < 1e-9);
     }
 }

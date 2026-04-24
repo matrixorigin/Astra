@@ -322,16 +322,35 @@ export type WorkspaceState = {
   agentEvents: StreamEvent[];
 };
 
+/** Matches `astra_core::SkillSearchSettings` (JSON uses snake_case on the wire). */
+export type SkillSearchSettings = {
+  dynamicSurface: boolean;
+  minCatalogSize: number;
+  surfaceCap: number;
+};
+
 export type ChatConfig = {
   sessionId?: string;
   agentId?: string;
   model?: string;
+  /** When set and non-empty, sent as `allow_skills` on chat requests. */
+  allowSkills?: string[];
+  /** When set and non-empty, sent as `allow_tools` on chat requests. */
+  allowTools?: string[];
+  /** Catalog surfacing — sent as `skill_search` (snake_case fields on the wire). */
+  skillSearch?: SkillSearchSettings;
 };
 
 // ─── Client Configuration ──────────────────────────────────────────
 
 export type AstraClientConfig = {
   baseUrl: string;
+  /**
+   * Optional path prefix before thin-client routes (e.g. `/api` when a gateway mounts
+   * the runtime at `https://host/api/...`). Default: empty — paths match `astra-thin-client` /
+   * `astra-server` (`/auth/login`, `/chat/stream`, …).
+   */
+  pathPrefix?: string;
   accessToken?: string;
   refreshToken?: string;
   onTokenRefresh?: (tokens: { accessToken: string; refreshToken: string }) => void;
@@ -359,36 +378,61 @@ export type SSEClientOptions = {
 export type ChatRequest = {
   message: string;
   sessionId?: string;
+  agentId?: string;
   model?: string;
   maxCandidates?: number;
   context?: Record<string, unknown>;
+  explain?: boolean;
+  planSubtaskId?: string;
+  isPlanSubtask?: boolean;
+  /** §5.5 — edge executor that will receive `tool_request` callbacks. */
+  edgeExecutorId?: string;
+  capabilities?: string[];
+  /** When set and non-empty, sent as `allow_skills`. */
+  allowSkills?: string[];
+  /** When set and non-empty, sent as `allow_tools`. */
+  allowTools?: string[];
+  skillSearch?: SkillSearchSettings;
 };
 
 export type RunStatus = {
   runId: string;
   sessionId: string;
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | string;
   eventsCount: number;
+  waitingFor?: string | null;
 };
 
 export type SessionInfo = {
   sessionId: string;
   createdAt: string;
   lastActive: string;
+  title?: string;
+  status?: string;
+  userId?: string;
+  agentId?: string | null;
 };
 
 // ─── Auth Types ────────────────────────────────────────────────────
 
+/** Login / refresh token payload (`AuthTokenResponse` on the server). */
 export type AuthResult = {
   access_token: string;
   refresh_token: string;
-  user_id: string;
+  token_type: string;
+  expires_in: number;
+  /** Set on `register` (`AuthRegisterResponse`). */
+  user_id?: string;
+  username?: string;
+  email?: string;
+  display_name?: string | null;
 };
 
 export type UserInfo = {
   user_id: string;
   username: string;
-  created_at: string;
+  email: string;
+  display_name?: string | null;
 };
 
 // ─── Memory Types ──────────────────────────────────────────────────
@@ -417,6 +461,42 @@ export type SkillInfo = {
   status: string;
 };
 
+/** JSON body for `POST /skills` — matches services `RegisterSkillRequest`. */
+export type RegisterSkillBody = {
+  skill_id?: string;
+  skill_name: string;
+  skill_version: string;
+  skill_code?: string;
+  skill_type?: string;
+  remote_url?: string | null;
+  description?: string | null;
+  metadata?: unknown;
+};
+
+/** JSON body for `POST /skills/publish` — matches services `PublishSkillRequest`. */
+export type PublishSkillBody = {
+  name: string;
+  version: string;
+  description: string;
+  triggers?: string[];
+  dependencies?: string[];
+  manifest?: unknown;
+  skill_type?: string;
+  remote_url?: string | null;
+  category?: string;
+  priority?: number;
+};
+
+/** `GET /skills/{id}` response — matches services `SkillRecord`. */
+export type SkillRecord = {
+  skill_id: string;
+  skill_name: string;
+  version: string;
+  description?: string | null;
+  metadata?: unknown;
+  created_at?: string | null;
+};
+
 // ─── Audit Types ───────────────────────────────────────────────────
 
 export type SessionActivity = {
@@ -425,9 +505,204 @@ export type SessionActivity = {
   details: Record<string, unknown>;
 };
 
-export type SessionAudit = {
+/** `GET /sessions/{id}/audit/summary` — matches `SessionAuditSummary` in the services crate. */
+export type SessionAuditSummary = {
   session_id: string;
-  events: SessionActivity[];
-  tool_calls: number;
-  turns: number;
+  status: string;
+  turn_count: number;
+  tokens_in: number;
+  tokens_out: number;
+  tool_calls_total: number;
+  tool_calls_failed: number;
+  error_count: number;
+  stall_count: number;
+  checkpoint_count: number;
+  compact_count: number;
+  execution_boundary_opened_count: number;
+  execution_boundary_committed_count: number;
+  execution_boundary_aborted_count: number;
+  approval_required_count: number;
+  approval_decision_count: number;
+  approval_timeout_count: number;
+  models_used: string[];
+  duration_secs: number;
+  created_at: string;
+  ended_at?: string | null;
+};
+
+// ─── Session lifecycle (HTTP) ─────────────────────────────────────
+
+export type SessionUpdateBody = {
+  title?: string;
+  metadata?: Record<string, unknown>;
+  status?: string;
+};
+
+/** `GET /sessions/{id}/activity` — matches `SessionActivityResponse`. */
+export type SessionActivityEntryResponse = {
+  log_id: string;
+  action: string;
+  details: Record<string, unknown>;
+  created_at: string;
+};
+
+export type SessionActivityResponse = {
+  session_id: string;
+  activities: SessionActivityEntryResponse[];
+  total: number;
+};
+
+// ─── Run list ─────────────────────────────────────────────────────
+
+export type RunListResponse = {
+  runs: RunStatus[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+// ─── Delegation (multi-agent) ─────────────────────────────────────
+
+/** `POST /chat/runs/{run_id}/delegate` body — matches `coordination::DelegationRequest`. */
+export type DelegationRequestBody = {
+  delegation_id: string;
+  parent_run_id: string;
+  task: string;
+  /** `CoordinationPattern` — use structured JSON per server schema. */
+  pattern: unknown;
+  user_id: string;
+  depth: number;
+  context?: Record<string, unknown>;
+};
+
+export type DelegationAgentResultResponse = {
+  agent_id: string;
+  status: string;
+  output?: string | null;
+  error?: string | null;
+};
+
+export type DelegationResponse = {
+  delegation_id: string;
+  status: string;
+  agent_results: DelegationAgentResultResponse[];
+  aggregated_output?: string | null;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tool_calls: number;
+};
+
+export type DelegationListResponse = {
+  parent_run_id: string;
+  sub_run_ids: string[];
+};
+
+export type DelegationMutationResponse = {
+  parent_run_id: string;
+  affected: number;
+};
+
+// ─── Reflect / decision trace ───────────────────────────────────
+
+export type ReflectQueryParams = {
+  focus?: string;
+  last_n?: number;
+  question?: string;
+};
+
+/** Subset of `ReflectReport` — extended fields parsed as JSON. */
+export type ReflectReport = {
+  session_id: string;
+  focus: string;
+  overview: Record<string, unknown>;
+  diagnoses: unknown[];
+  insights: unknown[];
+  recommendations: string[];
+  reflection_context?: unknown;
+  prompt_preview?: string | null;
+  evidence_graph?: unknown;
+};
+
+// ─── Events (pipeline / audit trail) ──────────────────────────────
+
+export type EventResponse = {
+  event_id: string;
+  user_id: string;
+  session_id: string;
+  event_type: string;
+  content: string;
+  agent_id?: string | null;
+  agent_version?: string | null;
+  parent_event_id?: string | null;
+  parent_event_ids?: string[];
+  causal_chain_id: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+export type EventListResponse = {
+  events: EventResponse[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type EventListFilters = {
+  sessionId?: string;
+  eventType?: string;
+  agentId?: string;
+  causalChainId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+// ─── Edge status ───────────────────────────────────────────────────
+
+export type EdgeInfo = {
+  edge_agent_id: string;
+  hostname?: string | null;
+  workspace_dir?: string | null;
+  connected_secs: number;
+};
+
+export type EdgeStatusResponse = {
+  edges: EdgeInfo[];
+};
+
+// ─── §5.5 Thin protocol request bodies ─────────────────────────────
+
+export type ToolResultRequestBody = {
+  request_id: string;
+  status: string;
+  output?: string;
+  duration_ms?: number;
+};
+
+export type ApprovalDecision = 'allow' | 'deny' | 'allow_session';
+
+export type ApprovalKind = 'standard' | 'explicit';
+
+export type ApprovalRespondRequestBody = {
+  request_id: string;
+  decision: ApprovalDecision;
+  reason?: string;
+  session_id?: string;
+  tool_name?: string;
+  approval_kind?: ApprovalKind;
+};
+
+export type EdgeRegisterRequestBody = {
+  edge_agent_id: string;
+  hostname?: string;
+  worktree_path?: string;
+  capabilities?: Record<string, unknown>;
+};
+
+export type EdgeHeartbeatRequestBody = {
+  edge_agent_id: string;
+};
+
+export type TaskLeaseMutationRequestBody = {
+  edge_agent_id: string;
+  ttl_sec?: number;
 };

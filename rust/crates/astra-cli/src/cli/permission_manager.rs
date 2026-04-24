@@ -35,7 +35,7 @@ pub(super) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     {
         Some(
             "Invoke the binary directly with explicit arguments instead of wrapping in \
-             `eval`/backticks/`$(...)`; avoid chained control operators (`;`, `&&`, `||`).",
+             `eval`/backticks/`$(...)`. The sandbox validates each command segment independently.",
         )
     } else if lower.contains("blocked by default") {
         Some(
@@ -1818,6 +1818,12 @@ mod tests {
             out.contains("eval"),
             "safe alt must mention eval specifically: {out}"
         );
+        // The hint must NOT tell the user to avoid `&&` — chained operators are
+        // perfectly legal and the sandbox validates each segment independently.
+        assert!(
+            !out.contains("&&"),
+            "safe alt must not discourage legal `&&` chains: {out}"
+        );
     }
 
     #[test]
@@ -3405,5 +3411,357 @@ mod tests {
         let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
         let local_decision = pm.check_nonblocking("str_replace", &args);
         assert!(matches!(local_decision, PermissionDecision::Allow));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase H — Permission rule change mid-session in-flight race
+    //
+    // Audit gap 3.5: while a tool approval is "in flight" (the engine has
+    // already returned NeedApproval but the user has not responded), the rule
+    // set may mutate (e.g., via `/allow` or `/mode auto` or a settings reload).
+    // The invariants being pinned down here:
+    //   1. set_mode takes effect on the NEXT check only, never retroactively.
+    //   2. add_allow_rule mid-session is honored on the next check for the
+    //      same tool+args, with no further prompting.
+    //   3. Adding a deny rule after a NeedApproval was issued overrides that
+    //      pending approval on the next authoritative check (deny wins).
+    //   4. A session override recorded while one tool is in-flight does not
+    //      cross-contaminate a different tool's decision.
+    //   5. Flipping mode Auto→Deny mid-session does not retroactively revoke
+    //      decisions already taken, but does apply strictly going forward.
+    //   6. add_allow_rule is idempotent: the second call is a no-op.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn phase_h_set_mode_applies_only_to_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // First check in Prompt mode → NeedApproval.
+        let args = serde_json::json!({"path": "src/x.rs", "content": "x"});
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d1, PermissionDecision::NeedApproval { .. }),
+            "expected NeedApproval in Prompt mode, got {d1:?}",
+        );
+
+        // Mid-session: user types `/mode auto`. The decision for d1 (already
+        // returned) is not retroactively mutated — that's structurally true
+        // because PermissionDecision is a value type with no back-reference
+        // to the manager. What we pin down is that the NEXT check sees the
+        // new mode.
+        pm.set_mode(PermissionMode::Auto);
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Allow),
+            "next check after set_mode(Auto) must Allow, got {d2:?}",
+        );
+
+        // And the old decision object is untouched.
+        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+    }
+
+    #[test]
+    fn phase_h_add_allow_rule_applies_immediately_to_next_check() {
+        // Pick a tool that is NOT in the explicit-approval-required set
+        // (which would bypass allow rules by design). `str_replace` is
+        // bounded + reversible so it falls through to step 6 (allow rules).
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
+        let d1 = pm.check_nonblocking("str_replace", &args);
+        assert!(
+            matches!(d1, PermissionDecision::NeedApproval { .. }),
+            "expected NeedApproval before rule add, got {d1:?}",
+        );
+
+        pm.add_allow_rule("str_replace");
+
+        let d2 = pm.check_nonblocking("str_replace", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Allow),
+            "next str_replace check must Allow after add_allow_rule, got {d2:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_add_allow_rule_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.add_allow_rule("Bash(ls:*)");
+        let first = pm.settings.allow.clone();
+        pm.add_allow_rule("Bash(ls:*)");
+        let second = pm.settings.allow.clone();
+        assert_eq!(
+            first, second,
+            "add_allow_rule must dedup: {first:?} vs {second:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_deny_rule_added_mid_session_overrides_pending_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let args = serde_json::json!({"path": "secrets.env", "content": "x"});
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(matches!(d1, PermissionDecision::NeedApproval { .. }));
+
+        // Operator adds a deny rule mid-session.
+        pm.settings.deny.push("write_file".into());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Deny(_)),
+            "deny rule must win over pending NeedApproval, got {d2:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_session_override_for_one_tool_does_not_affect_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate user approving `bash ls` for the session (allow-once).
+        let bash_args = serde_json::json!({"command": "ls"});
+        let bash_fp = content_aware_fingerprint("bash", &bash_args);
+        pm.session_overrides.insert(bash_fp, true);
+
+        let d_bash = pm.check_nonblocking("bash", &bash_args);
+        assert!(
+            matches!(d_bash, PermissionDecision::Allow),
+            "bash must allow after session override, got {d_bash:?}",
+        );
+
+        // A completely different tool must NOT inherit that approval.
+        let write_args = serde_json::json!({"path": "a.txt", "content": "y"});
+        let d_write = pm.check_nonblocking("write_file", &write_args);
+        assert!(
+            matches!(d_write, PermissionDecision::NeedApproval { .. }),
+            "unrelated tool must still require approval, got {d_write:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_mode_flip_auto_to_deny_applies_to_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let args = serde_json::json!({"path": "src/a.rs", "content": "x"});
+        let d1 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d1, PermissionDecision::Allow),
+            "Auto mode must allow write_file, got {d1:?}",
+        );
+
+        pm.set_mode(PermissionMode::Deny);
+        let d2 = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(d2, PermissionDecision::Deny(_)),
+            "Deny mode must reject write_file after flip, got {d2:?}",
+        );
+
+        // The earlier Allow decision is not retroactively mutated.
+        assert!(matches!(d1, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn phase_h_multiple_concurrent_in_flight_decisions_are_independent() {
+        // Simulates two parallel NeedApproval decisions issued back-to-back
+        // in Prompt mode. A mode change between them must only affect the
+        // second, not retroactively the first, and both PermissionDecision
+        // values are independent.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let a = serde_json::json!({"path": "a.txt", "content": "A"});
+        let b = serde_json::json!({"path": "b.txt", "content": "B"});
+
+        let da = pm.check_nonblocking("write_file", &a);
+        assert!(matches!(da, PermissionDecision::NeedApproval { .. }));
+
+        pm.set_mode(PermissionMode::Auto);
+
+        let db = pm.check_nonblocking("write_file", &b);
+        assert!(matches!(db, PermissionDecision::Allow));
+
+        // `da` object remains NeedApproval — it's a snapshot by value.
+        assert!(matches!(da, PermissionDecision::NeedApproval { .. }));
+    }
+
+    #[test]
+    fn phase_h_allow_rule_then_deny_rule_deny_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.add_allow_rule("Bash(rm:*)");
+        // Operator realizes mistake, adds a specific deny for dangerous rm.
+        pm.settings.deny.push("Bash(rm:*)".into());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let args = serde_json::json!({"command": "rm -rf /tmp/foo"});
+        let d = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(d, PermissionDecision::Deny(_)),
+            "deny rule must override prior allow rule, got {d:?}",
+        );
+    }
+
+    // ── Phase H v2 — REAL concurrency + reverse-order scenarios ──────────────
+    //
+    // Addresses two review findings on the original Phase H:
+    //   1. "Concurrent in-flight" test was actually serial `&mut pm` calls.
+    //   2. Missing reverse test: operator adds a deny rule AFTER a previous
+    //      allow → subsequent checks in the same manager instance must see
+    //      the deny (simulates "operator bans a tool mid-session, old sessions
+    //      must stop using it").
+
+    #[test]
+    fn phase_h_real_concurrent_parallel_checks_no_state_corruption() {
+        // Wrap PermissionManager in Arc<Mutex<>> and hammer it from many
+        // native threads with interleaved check_nonblocking + mutation ops.
+        // Passing this test doesn't prove ABSENCE of all races (unsafe/interior
+        // mutability could still break it), but it DOES prove that the Mutex-
+        // serialized interface maintains consistency under actual parallel
+        // load — which the original `phase_h_multiple_concurrent_*` test did
+        // not demonstrate.
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Arc::new(Mutex::new(PermissionManager::with_project_mode(
+            PermissionMode::Auto,
+            dir.path(),
+        )));
+        let iterations = 200_usize;
+
+        let mut handles = Vec::new();
+        // Writer thread: alternates add_allow_rule / push deny / set_mode.
+        {
+            let pm = Arc::clone(&pm);
+            handles.push(thread::spawn(move || {
+                for i in 0..iterations {
+                    let mut g = pm.lock().unwrap();
+                    match i % 3 {
+                        0 => g.add_allow_rule("Bash(echo:*)"),
+                        1 => {
+                            g.settings.deny.push("Bash(rm:*)".into());
+                            g.cached_deny = g.settings.parsed_deny_rules();
+                        }
+                        _ => g.set_mode(if i % 2 == 0 {
+                            PermissionMode::Auto
+                        } else {
+                            PermissionMode::Prompt
+                        }),
+                    }
+                }
+            }));
+        }
+        // 4 reader threads hammering check_nonblocking against varying tools.
+        for tid in 0..4 {
+            let pm = Arc::clone(&pm);
+            handles.push(thread::spawn(move || {
+                let tools: &[(&str, serde_json::Value)] = &[
+                    ("bash", serde_json::json!({"command": "echo hi"})),
+                    ("bash", serde_json::json!({"command": "rm -rf /tmp/x"})),
+                    (
+                        "write_file",
+                        serde_json::json!({"path": "a.txt", "content": "x"}),
+                    ),
+                ];
+                for i in 0..iterations {
+                    let (name, args) = &tools[(tid + i) % tools.len()];
+                    let mut g = pm.lock().unwrap();
+                    let _ = g.check_nonblocking(name, args);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread must not panic");
+        }
+
+        // After the storm, deny rule for `rm:*` MUST still bind.
+        let mut g = pm.lock().unwrap();
+        let d = g.check_nonblocking("bash", &serde_json::json!({"command": "rm -rf /"}));
+        assert!(
+            matches!(d, PermissionDecision::Deny(_)),
+            "deny rule survived concurrent churn → got {d:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_deny_added_after_previous_allow_bites_next_check() {
+        // Reverse of `phase_h_deny_rule_added_mid_session_overrides_pending_approval`:
+        // here the FIRST check was Allow (under an installed allow-rule), the
+        // operator then installs a deny for the same tool, and the NEXT check
+        // must see Deny. This is the "operator bans mid-session" scenario
+        // that was missing from Phase H.
+        //
+        // Uses `str_replace` which is bounded+reversible and therefore falls
+        // through to the rule tier (see phase_h_add_allow_rule_applies_...).
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        pm.add_allow_rule("str_replace");
+        let args = serde_json::json!({"path": "src/foo.rs", "old_str": "a", "new_str": "b"});
+        let first = pm.check_nonblocking("str_replace", &args);
+        assert!(
+            matches!(first, PermissionDecision::Allow),
+            "first check with allow-rule installed must Allow, got {first:?}",
+        );
+
+        // Operator realizes mistake and bans str_replace at deny tier.
+        pm.settings.deny.push("str_replace".into());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        // The very NEXT check must see the deny — no allow-cache, no stale
+        // decision reuse.
+        let second = pm.check_nonblocking("str_replace", &args);
+        assert!(
+            matches!(second, PermissionDecision::Deny(_)),
+            "deny added after a prior allow must bite next check, got {second:?}",
+        );
+    }
+
+    #[test]
+    fn phase_h_deny_added_between_two_tools_only_affects_denied_tool() {
+        // Orthogonality: adding a deny for tool A must not flip tool B's
+        // decision. Guards against over-broad cache invalidation bugs.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let sr_args = serde_json::json!({"path": "a.rs", "old_str": "x", "new_str": "y"});
+        let rf_args = serde_json::json!({"path": "a.rs"});
+
+        pm.add_allow_rule("str_replace");
+        pm.add_allow_rule("read_file");
+
+        assert!(matches!(
+            pm.check_nonblocking("str_replace", &sr_args),
+            PermissionDecision::Allow
+        ));
+        assert!(matches!(
+            pm.check_nonblocking("read_file", &rf_args),
+            PermissionDecision::Allow
+        ));
+
+        // Ban str_replace only.
+        pm.settings.deny.push("str_replace".into());
+        pm.cached_deny = pm.settings.parsed_deny_rules();
+
+        let sr_decision = pm.check_nonblocking("str_replace", &sr_args);
+        assert!(
+            matches!(sr_decision, PermissionDecision::Deny(_)),
+            "str_replace must be denied after rule added, got {sr_decision:?}"
+        );
+        let rf_decision = pm.check_nonblocking("read_file", &rf_args);
+        assert!(
+            matches!(rf_decision, PermissionDecision::Allow),
+            "read_file must still Allow, got {rf_decision:?}"
+        );
     }
 }

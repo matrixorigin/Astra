@@ -159,6 +159,33 @@ describe('useChatStream', () => {
     );
   });
 
+  it('sendMessage includes allow_skills, allow_tools, and skill_search when configured', async () => {
+    fetchMock.mockResolvedValueOnce(sseResponse([{ type: 'turn_complete' }]));
+
+    const config: ChatConfig = {
+      ...baseConfig,
+      allowSkills: ['review'],
+      allowTools: ['grep'],
+      skillSearch: { dynamicSurface: false, minCatalogSize: 10, surfaceCap: 20 },
+    };
+    const { result } = renderHook(() => useChatStream(config));
+
+    await act(async () => {
+      result.current.sendMessage('Hi');
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    const init = fetchMock.mock.calls[0][1] as { body: string };
+    const parsed = JSON.parse(init.body) as Record<string, unknown>;
+    expect(parsed.allow_skills).toEqual(['review']);
+    expect(parsed.allow_tools).toEqual(['grep']);
+    expect(parsed.skill_search).toEqual({
+      dynamic_surface: false,
+      min_catalog_size: 10,
+      surface_cap: 20,
+    });
+  });
+
   it('accumulates text deltas into assistant content', async () => {
     fetchMock.mockResolvedValueOnce(
       sseResponse([
@@ -249,7 +276,8 @@ describe('useChatStream', () => {
     });
 
     expect(result.current.connectionState).toBe('error');
-    expect(result.current.error).toContain('500');
+    // readHttpErrorMessage surfaces body text; SDK wraps as Connection error: …
+    expect(result.current.error).toMatch(/500|Connection error|Internal Error/);
   });
 
   it('does not send when already streaming', async () => {
@@ -413,6 +441,9 @@ describe('useChatStream', () => {
     expect(result.current.error).toBe('Something went wrong');
     expect(result.current.connectionState).toBe('error');
     expect(result.current.isStreaming).toBe(false);
+    const assistant = result.current.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toMatch(/Something went wrong/);
+    expect(assistant?.content).toMatch(/The run failed|Error \(from run\)/);
   });
 
   it('keeps error state when turn_complete follows an error event', async () => {
@@ -435,5 +466,66 @@ describe('useChatStream', () => {
     expect(result.current.connectionState).toBe('error');
     expect(result.current.followupSuggestion).toBeNull();
     expect(result.current.isStreaming).toBe(false);
+  });
+
+  /**
+   * Regression: if we only applied SSE `error` when `m.streaming` was true, a server
+   * that sent `turn_complete` first (clears streaming) and then `error` left a blank
+   * assistant bubble. The assistant message must still show the formatted error.
+   */
+  it('writes assistant error text when turn_complete is sent before error', async () => {
+    fetchMock.mockResolvedValueOnce(
+      sseResponse([
+        { type: 'turn_complete' },
+        { type: 'error', message: 'Resource limit exceeded: concurrent session (9/5)' },
+      ]),
+    );
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('hi');
+      await new Promise((r) => setTimeout(r, 80));
+    });
+
+    expect(result.current.error).toContain('Resource limit');
+    const assistant = result.current.messages[1];
+    expect(assistant.role).toBe('assistant');
+    expect(assistant.content).toContain('Resource limit');
+    expect(assistant.content).toMatch(/The run failed|Error \(from run\)/);
+  });
+
+  /**
+   * `turn_complete` with no `text_delta` and no `error` — client cannot infer the cause; copy must
+   * steer the user to banner / Settings / Network (not a fake “success”).
+   */
+  it('shows stream-ended copy when the server sends only turn_complete with no text', async () => {
+    fetchMock.mockResolvedValueOnce(sseResponse([{ type: 'turn_complete' }]));
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('hi');
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    const assistant = result.current.messages[1];
+    expect(assistant.content).toMatch(/The stream ended with no assistant text/);
+    expect(assistant.content).toMatch(/Network/);
+  });
+
+  it('surfaces HTTP error body in the assistant message when the stream never opens (non-2xx)', async () => {
+    fetchMock.mockResolvedValueOnce(failResponse(500, JSON.stringify({ detail: 'over capacity' })));
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('hi');
+      await new Promise((r) => setTimeout(r, 80));
+    });
+
+    expect(result.current.connectionState).toBe('error');
+    const assistant = result.current.messages[1];
+    expect(assistant.content).toMatch(/over capacity|Request did not return|500/);
   });
 });

@@ -4,19 +4,89 @@
 //! (poll + take) so each callback is delivered at most once.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-/// Cap in-memory map size; evicted wholesale when exceeded (handlers + design tradeoff).
+/// Cap in-memory map size. New entries are REJECTED (not evicted) when this
+/// limit is reached, unless the durable-fallback path is active. Callers
+/// receive `LedgerInsertError::CapacityExceeded`. See
+/// `super::edge_callback_handlers::insert_approval_ledger_entry` for details.
 pub const LEDGER_MAX_ENTRIES: usize = 4096;
 
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 
+/// audit-#6: maximum age for an entry in the §5.5 callback ledger before
+/// the lazy sweeper inside [`take_ledger_entry`] reclaims it. Without this,
+/// orphaned tool-result / approval entries (e.g. when a turn aborts after
+/// the edge POST landed) accumulate until they fill `LEDGER_MAX_ENTRIES`
+/// and force a wholesale eviction.
+pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(300);
+
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
+
+/// Side-channel of "first-observed" timestamps for the ledger. We cannot
+/// modify the §5.5 insert helpers (locked down by PR #233) to embed an
+/// inserted_at field on the value, so we lazily snapshot keys here on
+/// every `take_ledger_entry` poll. Any key that has been observed for
+/// longer than [`MAX_LEDGER_ENTRY_AGE`] is reclaimed from the ledger and
+/// dropped from this side-table during the sweep.
+fn ledger_timestamps() -> &'static StdMutex<HashMap<String, Instant>> {
+    static TIMESTAMPS: std::sync::OnceLock<StdMutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    TIMESTAMPS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Pure helper used by both [`sweep_expired_entries`] and the unit tests.
+/// Registers any newly-observed keys with `now`, evicts ledger entries
+/// whose first-observed timestamp is older than `max_age`, and prunes
+/// timestamps for keys that no longer exist in the ledger.
+///
+/// Returns the number of ledger entries that were evicted.
+pub(crate) fn sweep_expired_entries_inner(
+    ledger: &mut HashMap<String, Value>,
+    timestamps: &mut HashMap<String, Instant>,
+    now: Instant,
+    max_age: Duration,
+) -> usize {
+    for k in ledger.keys() {
+        timestamps.entry(k.clone()).or_insert(now);
+    }
+    let expired: Vec<String> = timestamps
+        .iter()
+        .filter(|(_, t)| now.saturating_duration_since(**t) > max_age)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut removed = 0usize;
+    for k in &expired {
+        if ledger.remove(k).is_some() {
+            removed += 1;
+        }
+        timestamps.remove(k);
+    }
+    timestamps.retain(|k, _| ledger.contains_key(k));
+    removed
+}
+
+/// Sweep stale entries from the §5.5 ledger.
+///
+/// Lazy housekeeping: invoked from [`take_ledger_entry`] before each poll
+/// so any take-call cleans up entries whose responses arrived but whose
+/// turn was cancelled (or otherwise never harvested) before
+/// [`MAX_LEDGER_ENTRY_AGE`] elapsed.
+pub async fn sweep_expired_entries(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+) -> usize {
+    let mut g = ledger.lock().await;
+    let mut ts = match ledger_timestamps().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    sweep_expired_entries_inner(&mut g, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE)
+}
 
 /// Returns `true` if any assistant message in `messages` carries a
 /// `reasoning_content` field, indicating a thinking-enabled model session.
@@ -53,9 +123,15 @@ pub async fn take_ledger_entry(
     let poll = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
     let started = Instant::now();
     loop {
+        // audit-#6: opportunistically reclaim stale entries before each poll
+        // so an idle ledger never silently fills to LEDGER_MAX_ENTRIES.
+        let _ = sweep_expired_entries(ledger).await;
         {
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
+                if let Ok(mut ts) = ledger_timestamps().lock() {
+                    ts.remove(key);
+                }
                 return Some(v);
             }
         }
@@ -66,18 +142,20 @@ pub async fn take_ledger_entry(
     }
 }
 
-/// Fill missing or empty `id` on each tool call so SSE + `POST /tools/result` agree.
+/// Fill missing, empty, or duplicate `id` on each tool call so SSE +
+/// `POST /tools/result` agree and the edge callback ledger never sees
+/// colliding keys (which would cause HTTP 409).
 pub fn ensure_tool_call_ids(tool_calls: &mut [Value]) {
+    let mut seen = std::collections::HashSet::with_capacity(tool_calls.len());
     for tc in tool_calls.iter_mut() {
         let Some(obj) = tc.as_object_mut() else {
             continue;
         };
-        let id_empty = obj
-            .get("id")
-            .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(true))
-            .unwrap_or(true);
-        if id_empty {
-            obj.insert("id".to_string(), Value::String(Uuid::now_v7().to_string()));
+        let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            let new_id = Uuid::now_v7().to_string();
+            seen.insert(new_id.clone());
+            obj.insert("id".to_string(), Value::String(new_id));
         }
     }
 }
@@ -307,6 +385,29 @@ mod tests {
             "body": {"request_id": "c1", "status": "ok", "output": "done"}
         });
         assert_eq!(tool_content_from_ledger_entry(&entry), "done");
+    }
+
+    #[test]
+    fn ensure_tool_call_ids_deduplicates_non_empty_ids() {
+        let mut calls = vec![
+            json!({"id": "read_file:0", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "read_file:0", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "bash:0", "function": {"name": "bash", "arguments": "{}"}}),
+        ];
+        ensure_tool_call_ids(&mut calls);
+        let id0 = calls[0].get("id").and_then(Value::as_str).unwrap();
+        let id1 = calls[1].get("id").and_then(Value::as_str).unwrap();
+        let id2 = calls[2].get("id").and_then(Value::as_str).unwrap();
+        // First occurrence keeps its ID
+        assert_eq!(id0, "read_file:0");
+        // Duplicate gets a new unique ID
+        assert_ne!(id1, "read_file:0");
+        assert!(!id1.is_empty());
+        // Non-duplicate keeps its ID
+        assert_eq!(id2, "bash:0");
+        // All IDs are unique
+        assert_ne!(id0, id1);
+        assert_ne!(id1, id2);
     }
 
     #[test]
@@ -858,5 +959,159 @@ mod tests {
         strip_stale_reasoning(&mut msgs, "other", "kimi-k2.5");
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
+    }
+
+    // ── Phase-R edge ledger contract pins ────────────────────────────────
+
+    /// Destructive-take: two concurrent pollers on the same key — exactly
+    /// one gets `Some`, the other gets `None`. Pins the at-most-once
+    /// delivery contract at the ledger level (the HTTP handler-side
+    /// at-most-once INSERT contract is pinned separately in the runtime
+    /// crate's edge_callback handler tests).
+    #[tokio::test]
+    async fn take_ledger_entry_destructive_exactly_one_poller_wins() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", "dup");
+        ledger
+            .lock()
+            .await
+            .insert(key.clone(), json!({"value": "once"}));
+
+        let l1 = ledger.clone();
+        let k1 = key.clone();
+        let h1 =
+            tokio::spawn(
+                async move { take_ledger_entry(&l1, &k1, Duration::from_millis(500)).await },
+            );
+        let l2 = ledger.clone();
+        let k2 = key.clone();
+        let h2 =
+            tokio::spawn(
+                async move { take_ledger_entry(&l2, &k2, Duration::from_millis(500)).await },
+            );
+
+        let (a, b) = (h1.await.unwrap(), h2.await.unwrap());
+        let some_count = usize::from(a.is_some()) + usize::from(b.is_some());
+        assert_eq!(some_count, 1, "exactly one poller must receive the entry");
+        let winner = a.or(b).unwrap();
+        assert_eq!(winner, json!({"value": "once"}));
+        assert!(ledger.lock().await.is_empty(), "entry removed after take");
+    }
+
+    /// In-memory only: a "restart" (new HashMap) loses all prior entries.
+    /// Pinned explicitly so future refactors toward durable storage have
+    /// to update this test and document the contract change.
+    #[tokio::test]
+    async fn ledger_is_in_memory_only_restart_loses_data() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", "restart");
+        ledger.lock().await.insert(key.clone(), json!({"v": 1}));
+        assert_eq!(ledger.lock().await.len(), 1);
+
+        // "Restart": drop the old Arc, spin up a fresh ledger. Any real
+        // process restart behaves identically — there is no persistence.
+        let fresh: Arc<tokio::sync::Mutex<HashMap<String, Value>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        assert!(
+            take_ledger_entry(&fresh, &key, Duration::from_millis(20))
+                .await
+                .is_none(),
+            "fresh ledger must not see the old entry"
+        );
+    }
+
+    /// Polling wakes on new insert within roughly one poll interval (~50ms).
+    /// Assert wait time is at least the poll interval (proof of polling)
+    /// but well below timeout (proof of prompt wake).
+    #[tokio::test]
+    async fn take_ledger_entry_wakes_within_one_poll_interval() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", "wake");
+
+        let l2 = ledger.clone();
+        let k2 = key.clone();
+        // Insert after ~10ms — well under one poll interval.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(k2, json!("ok"));
+        });
+
+        let started = Instant::now();
+        let got = take_ledger_entry(&ledger, &key, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(got, Some(json!("ok")));
+        // Upper bound: must wake within ~1 poll interval + jitter.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "should wake within one poll interval + jitter; elapsed={elapsed:?}"
+        );
+    }
+
+    /// audit-#6: stale entries (older than [`MAX_LEDGER_ENTRY_AGE`]) must be
+    /// reclaimed by the inner sweep helper.
+    #[test]
+    fn sweep_expired_entries_inner_evicts_old_keys() {
+        let mut ledger: HashMap<String, Value> = HashMap::new();
+        let mut ts: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let max_age = Duration::from_secs(60);
+
+        ledger.insert("fresh".into(), json!(1));
+        ledger.insert("stale".into(), json!(2));
+        // Backdate the "stale" key by an hour; "fresh" is unseen and will
+        // be registered with `now` during the sweep.
+        ts.insert("stale".into(), now - Duration::from_secs(3600));
+
+        let removed = sweep_expired_entries_inner(&mut ledger, &mut ts, now, max_age);
+        assert_eq!(removed, 1, "only the stale entry should be evicted");
+        assert!(!ledger.contains_key("stale"));
+        assert!(ledger.contains_key("fresh"));
+        assert_eq!(ts.get("fresh"), Some(&now));
+        assert!(!ts.contains_key("stale"));
+    }
+
+    /// audit-#6: the timestamps side-table must not retain entries for keys
+    /// that are no longer in the ledger (e.g. a successful take).
+    #[test]
+    fn sweep_expired_entries_inner_prunes_orphan_timestamps() {
+        let mut ledger: HashMap<String, Value> = HashMap::new();
+        let mut ts: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        ts.insert("orphan".into(), now);
+
+        let removed = sweep_expired_entries_inner(&mut ledger, &mut ts, now, MAX_LEDGER_ENTRY_AGE);
+        assert_eq!(removed, 0);
+        assert!(ts.is_empty(), "orphan timestamps must be pruned");
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_entries_runs_via_take() {
+        // Smoke test: invoking `sweep_expired_entries` must not deadlock with
+        // the ledger's tokio mutex and must return the eviction count.
+        let ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        ledger.lock().await.insert("x".into(), json!(1));
+        let removed = sweep_expired_entries(&ledger).await;
+        assert_eq!(removed, 0, "fresh entry should not be evicted");
+        assert_eq!(ledger.lock().await.len(), 1);
+    }
+
+    /// audit-#16: the `LEDGER_MAX_ENTRIES` doc comment must accurately
+    /// describe rejection (not eviction) of new entries when the cap is hit.
+    #[test]
+    fn edge_ledger_cap_comment_reflects_rejection_not_eviction() {
+        let source = include_str!("edge_ledger.rs");
+        // Build the misleading needle dynamically so this test's own message
+        // doesn't accidentally satisfy the substring search.
+        let bad_needle = format!("evicted{}wholesale", " ");
+        assert!(
+            !source.contains(bad_needle.as_str()),
+            "edge_ledger comment must not describe entries as wholesale-evicted"
+        );
+        assert!(
+            source.contains("REJECTED (not evicted)"),
+            "edge_ledger comment must explicitly state entries are REJECTED on capacity"
+        );
     }
 }

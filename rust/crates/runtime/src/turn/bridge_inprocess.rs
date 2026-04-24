@@ -254,8 +254,10 @@ async fn await_with_client_disconnect<T, F>(
 where
     F: std::future::Future<Output = T>,
 {
+    // audit-#11: do not bias toward the cancel arm. If the caller's token is
+    // already set when we reach the select! a biased poll would always pick
+    // it and starve real work that completes synchronously.
     tokio::select! {
-        biased;
         _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cancel) => Err(
             build_stream_error_event(
                 "Request cancelled (client disconnected)",
@@ -435,6 +437,9 @@ pub struct InProcessChatTurnBridge {
     /// Shared session facts for facts-first compaction. Updated by the agentic loop
     /// at each turn end; read by the bridge during compaction.
     pub session_facts: Arc<std::sync::Mutex<crate::turn::cloud::session_facts::SessionFacts>>,
+    /// Shutdown-aware tracker for fire-and-forget SSE persist tasks (HIGH #4).
+    /// When `None` the bridge falls back to raw `tokio::spawn` (dev / test mode).
+    pub persist_tracker: Option<Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>>,
 }
 
 impl InProcessChatTurnBridge {
@@ -448,6 +453,7 @@ impl InProcessChatTurnBridge {
             feedback_store: Arc::new(crate::pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
+            persist_tracker: None,
         }
     }
 
@@ -466,6 +472,17 @@ impl InProcessChatTurnBridge {
         ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     ) -> Self {
         self.edge_callback_ledger = ledger;
+        self
+    }
+
+    /// Attach a shutdown-aware persist tracker (HIGH #4).
+    /// When set, SSE-generator persist tasks are tracked and drained on shutdown
+    /// rather than being fire-and-forgot via raw `tokio::spawn`.
+    pub fn with_persist_tracker(
+        mut self,
+        tracker: Arc<dyn crate::matrix_cloud_runtime::BridgePersistTracker>,
+    ) -> Self {
+        self.persist_tracker = Some(tracker);
         self
     }
 }
@@ -589,6 +606,7 @@ impl InProcessChatTurnBridge {
         let feedback_store_capture = self.feedback_store.clone();
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
+        let persist_tracker_shared = self.persist_tracker.clone();
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
@@ -857,6 +875,14 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
+            // ── Recent tool-call arg hints (injected by CLI via edge_profile) ──
+            let recent_arg_hints_hint = edge_profile
+                .get("recent_arg_hints_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|text| format!("\n\n{text}"))
+                .unwrap_or_default();
+
             // ── Memory lifecycle: detect tracking/store signals in user input ──
             // Injects a priority hint into the system prompt so the LLM stores
             // the user's interest immediately rather than exploring the codebase.
@@ -1091,6 +1117,14 @@ impl InProcessChatTurnBridge {
                         },
                         ..Default::default()
                     }),
+                );
+            }
+            if !recent_arg_hints_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        recent_arg_hints_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    ),
                 );
             }
             if !session_anchor.is_empty() {
@@ -1910,7 +1944,10 @@ impl InProcessChatTurnBridge {
                 .map(|plan| plan.events.len())
                 .unwrap_or(0);
 
-            tokio::spawn(async move {
+            // audit-#3 resolved: tasks are now routed through the shutdown-aware
+            // BridgePersistTracker so they drain on SIGTERM instead of being fire-and-forget.
+            let persist_tracker_for_main = persist_tracker_shared.clone();
+            let persist_future = async move {
                 let persist_start = std::time::Instant::now();
                 let core_outcome = match writer.persist(persist_plan).await {
                     Ok(outcome) => outcome,
@@ -1934,6 +1971,16 @@ impl InProcessChatTurnBridge {
                                 count = tool_event_count,
                                 elapsed = format!("{:?}", persist_start.elapsed()),
                                 error = e
+                            );
+                            // audit-#6: core events are durable but tool events
+                            // are lost. Emit a structured forensic marker so
+                            // log-based reconciliation can find the orphans.
+                            tracing::error!(
+                                target: "astra_runtime::persist",
+                                session_id = %sid,
+                                tool_event_count = tool_event_count,
+                                marker = "tool_events_orphaned",
+                                "CRITICAL: core events persisted but tool events lost; journal needs forensic recovery"
                             );
                             false
                         } else {
@@ -1965,7 +2012,13 @@ impl InProcessChatTurnBridge {
                         error = e
                     );
                 }
-            });
+            };
+            // HIGH #4: route through shutdown-aware tracker when available.
+            if let Some(tracker) = persist_tracker_for_main {
+                tracker.track_persist_task(Box::pin(persist_future));
+            } else {
+                tokio::spawn(persist_future);
+            }
 
             if !session_id.is_empty()
                 && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())
@@ -2081,7 +2134,6 @@ impl InProcessChatTurnBridge {
                     0, // No stall events in single-call mode.
                     verdict_warning,
                     budget_pressure,
-                    false, // No prefetch in bridge single-call mode.
                 )
             });
             let tool_execution_ms: u64 = merged_tool_results
@@ -2117,7 +2169,8 @@ impl InProcessChatTurnBridge {
                 let aux_trace_signal = trace_signal.clone();
                 let aux_evaluation = evaluation.clone();
                 let aux_step_count = tool_call_records.len();
-                tokio::spawn(async move {
+                let persist_tracker_for_aux = persist_tracker_shared.clone();
+                let aux_future = async move {
                     // Routing decision event (inprocess uses default router)
                     let routing_event = crate::TurnAuxiliaryEventRecord {
                         event_id: Uuid::now_v7().to_string(),
@@ -2133,9 +2186,11 @@ impl InProcessChatTurnBridge {
                         reasoning_content: None,
                     };
                     if let Err(e) = aux_writer.persist_events(vec![routing_event]).await {
-                        eprintln!(
-                            "PERSIST_FAIL session={} stage=auxiliary error={}",
-                            aux_sid, e
+                        tracing::error!(
+                            target: "astra_runtime::bridge_inprocess",
+                            aux_session_id = %aux_sid,
+                            err = %e,
+                            "auxiliary routing event persist failed"
                         );
                     }
                     persist_legacy_bridge_trace_and_quality(
@@ -2150,7 +2205,13 @@ impl InProcessChatTurnBridge {
                         aux_step_count,
                     )
                     .await;
-                });
+                };
+                // HIGH #4: route through shutdown-aware tracker when available.
+                if let Some(tracker) = persist_tracker_for_aux {
+                    tracker.track_persist_task(Box::pin(aux_future));
+                } else {
+                    tokio::spawn(aux_future);
+                }
             }
 
             if explain {
@@ -4913,5 +4974,34 @@ mod tests {
                     > 10
             });
         assert!(!is_cjk, "should not detect CJK in English content");
+    }
+
+    /// audit-#6: when tool events fail to persist after core events succeed,
+    /// the spawned persist task must emit a structured `tool_events_orphaned`
+    /// marker so log-based reconciliation can recover the lost data.
+    #[test]
+    fn persist_task_emits_orphan_marker_on_tool_failure() {
+        let source = include_str!("bridge_inprocess.rs");
+        assert!(
+            source.contains("marker = \"tool_events_orphaned\""),
+            "bridge persist task must emit a `tool_events_orphaned` marker when \
+             tool_writer.persist fails after core events were already committed"
+        );
+    }
+
+    /// audit-#11: `await_with_client_disconnect` must not use `biased;` —
+    /// biasing toward the cancellation arm starves real work whenever the
+    /// caller's cancel token is already set when the future is polled.
+    #[test]
+    fn await_with_client_disconnect_is_not_biased() {
+        let source = include_str!("bridge_inprocess.rs");
+        let fn_start = source
+            .find("async fn await_with_client_disconnect")
+            .expect("await_with_client_disconnect must exist");
+        let body = &source[fn_start..fn_start + 700];
+        assert!(
+            !body.contains("biased;"),
+            "await_with_client_disconnect must not use biased select (starvation risk)"
+        );
     }
 }

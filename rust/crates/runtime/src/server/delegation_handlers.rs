@@ -12,7 +12,12 @@ pub(super) async fn delegate_run_handler(
     headers: HeaderMap,
     Json(mut request): Json<DelegationRequest>,
 ) -> Result<Json<DelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
+    // Verify the authenticated user owns this run (IDOR prevention).
+    state
+        .run_lifecycle_service
+        .get_run_status(run_id.clone(), user.user_id)
+        .await?;
     let forward_headers = collect_forward_headers(&headers);
     request
         .context
@@ -57,7 +62,11 @@ pub(super) async fn list_delegations_handler(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<DelegationListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .run_lifecycle_service
+        .get_run_status(run_id.clone(), user.user_id)
+        .await?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -139,7 +148,11 @@ pub(super) async fn pause_delegations_handler(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .run_lifecycle_service
+        .get_run_status(run_id.clone(), user.user_id)
+        .await?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -163,7 +176,11 @@ pub(super) async fn resume_delegations_handler(
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .run_lifecycle_service
+        .get_run_status(run_id.clone(), user.user_id)
+        .await?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -177,4 +194,29 @@ pub(super) async fn resume_delegations_handler(
         parent_run_id: run_id,
         affected,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    /// P0-A: All delegation handlers must verify run ownership via
+    /// get_run_status (not just authenticate). No `let _user =` patterns.
+    #[test]
+    fn delegation_handlers_verify_run_ownership() {
+        let source = include_str!("delegation_handlers.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+
+        // Must NOT have discarded user identity
+        assert!(
+            !prod_code.contains("let _user"),
+            "delegation handlers must use user identity, not discard it"
+        );
+
+        // All 4 handlers must call get_run_status for ownership verification
+        let ownership_checks = prod_code.matches("get_run_status").count();
+        assert!(
+            ownership_checks >= 4,
+            "all 4 delegation handlers must verify run ownership via get_run_status, found {ownership_checks}"
+        );
+    }
 }

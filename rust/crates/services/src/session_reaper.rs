@@ -155,7 +155,12 @@ pub async fn reap_sessions(pool: &Pool<MySql>, policy: &SessionReaperPolicy) -> 
 /// Spawn the session reaper as a long-lived background task.
 ///
 /// Call once from `server/mod.rs` during startup, alongside `spawn_data_cleanup`.
-pub fn spawn_session_reaper(pool: astra_core::SharedPool) {
+/// The returned `JoinHandle` lets the caller drain the task during graceful
+/// shutdown by triggering `cancel` and awaiting the handle.
+pub fn spawn_session_reaper(
+    pool: astra_core::SharedPool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     let reaper_interval = Duration::from_secs(
         std::env::var("MO_REAPER_INTERVAL_SECS")
             .ok()
@@ -168,7 +173,16 @@ pub fn spawn_session_reaper(pool: astra_core::SharedPool) {
         let mut interval = tokio::time::interval(reaper_interval);
         interval.tick().await; // skip immediate first tick
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "astra_services::session_reaper",
+                        "session reaper received cancellation; exiting"
+                    );
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
             let r = reap_sessions(pool.get(), &policy).await;
             let total = r.marked_idle + r.marked_ended + r.deleted;
             if total > 0 {
@@ -182,7 +196,7 @@ pub fn spawn_session_reaper(pool: astra_core::SharedPool) {
                 );
             }
         }
-    });
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -207,5 +221,14 @@ mod tests {
         assert_eq!(r.marked_ended, 0);
         assert_eq!(r.deleted, 0);
         assert_eq!(r.workspaces_removed, 0);
+    }
+
+    #[test]
+    fn spawn_session_reaper_accepts_cancel_token() {
+        let source = include_str!("session_reaper.rs");
+        assert!(
+            source.contains("pub fn spawn_session_reaper(\n    pool: astra_core::SharedPool,\n    cancel: tokio_util::sync::CancellationToken,\n) -> tokio::task::JoinHandle<()>"),
+            "spawn_session_reaper must accept a CancellationToken and return a JoinHandle"
+        );
     }
 }

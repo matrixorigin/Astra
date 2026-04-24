@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Suspense, useActionState } from 'react';
+import { Suspense, useActionState, useEffect } from 'react';
 import { loginAction } from '@/lib/auth/actions';
 
 function LoginForm() {
@@ -11,9 +11,18 @@ function LoginForm() {
   const next = searchParams.get('next') || '/overview';
   const [state, formAction, isPending] = useActionState(loginAction, { ok: false });
 
+  useEffect(() => {
+    if (state.ok) {
+      router.push(next);
+    }
+  }, [state.ok, next, router]);
+
   if (state.ok) {
-    router.push(next);
-    return null;
+    return (
+      <p className="text-center text-sm text-slate-400" role="status">
+        Signed in. Redirecting…
+      </p>
+    );
   }
 
   return (

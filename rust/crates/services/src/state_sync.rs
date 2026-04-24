@@ -29,6 +29,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
+use sqlx::Row;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -45,6 +47,37 @@ const MAX_BACKOFF_MS: u64 = 2000;
 const SYNC_LOG_SUCCESS_RETAIN: usize = 200;
 /// Retain a smaller bounded tail of error rows per user.
 const SYNC_LOG_ERROR_RETAIN: usize = 50;
+
+// ─── Learning snapshot idempotency classifier ───────────────────────────────
+
+/// Decision returned by [`classify_learning_insert_duplicate`].
+#[derive(Debug, PartialEq)]
+pub(crate) enum LearningDuplicateDecision {
+    /// The stored snapshot is identical to what was inserted; return success.
+    Idempotent,
+    /// The stored snapshot differs; treat as a real conflict.
+    Conflict,
+}
+
+/// Classify a duplicate-key hit during a new-snapshot INSERT.
+///
+/// Compares SHA-256 hashes of the original (uncompressed) snapshot JSON.
+/// If the stored hash matches what we computed before insertion the request
+/// was a retryable-insert retry and should succeed; otherwise it is a real conflict.
+pub(crate) fn classify_learning_insert_duplicate(
+    existing_hash: Option<&[u8]>,
+    new_hash: &[u8],
+) -> LearningDuplicateDecision {
+    match existing_hash {
+        Some(h) if h == new_hash => LearningDuplicateDecision::Idempotent,
+        _ => LearningDuplicateDecision::Conflict,
+    }
+}
+
+/// Compute the SHA-256 digest of a string slice as a fixed-size byte array.
+fn sha256_bytes(input: &str) -> [u8; 32] {
+    sha2::Sha256::digest(input.as_bytes()).into()
+}
 
 /// Check if an error is likely transient and worth retrying.
 fn is_retryable_error(err: &sqlx::Error) -> bool {
@@ -549,7 +582,7 @@ impl MatrixOneSyncService {
     }
 
     async fn prune_sync_logs(&self, user_id: &str, sync_type: &str, status: &str, retain: usize) {
-        let _ = sqlx::query(build_sync_log_prune_query())
+        if let Err(e) = sqlx::query(build_sync_log_prune_query())
             .bind(user_id)
             .bind(status)
             .bind(sync_type)
@@ -558,7 +591,16 @@ impl MatrixOneSyncService {
             .bind(sync_type)
             .bind(retain as i64)
             .execute(&self.pool)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                target: "astra_services::state_sync",
+                user_id = %user_id,
+                sync_type = %sync_type,
+                error = %e,
+                "failed to prune sync logs"
+            );
+        }
     }
 }
 
@@ -580,6 +622,8 @@ impl StateSyncService for MatrixOneSyncService {
             Ok(value) => value,
             Err(e) => return SyncResult::err(SyncDirection::Push, "learning", e),
         };
+        // Pre-compute hash of the original JSON for idempotency comparison on dup-key retry.
+        let new_snapshot_hash = sha256_bytes(snapshot_json);
 
         // Retry loop with exponential backoff for transient network errors
         let mut backoff_ms = INITIAL_BACKOFF_MS;
@@ -726,6 +770,51 @@ impl StateSyncService for MatrixOneSyncService {
                         Err(e) => {
                             let msg = format!("push_learning_versioned (new): {e}");
                             if is_duplicate_key_error(&e) {
+                                // Re-query the stored snapshot to determine if this is an
+                                // idempotent retry (connection dropped after first INSERT committed)
+                                // or a genuine conflict (different payload under same key).
+                                let stored_row = sqlx::query(
+                                    "SELECT snapshot_json FROM learning_snapshots \
+                                     WHERE user_id = ? AND profile_name = ?",
+                                )
+                                .bind(user_id)
+                                .bind(profile)
+                                .fetch_optional(&self.pool)
+                                .await;
+
+                                let decision = if let Ok(Some(row)) = stored_row {
+                                    let stored_compressed: String =
+                                        row.try_get("snapshot_json").unwrap_or_default();
+                                    let existing_hash = decompress_json_payload(&stored_compressed)
+                                        .ok()
+                                        .map(|json| sha256_bytes(&json));
+                                    classify_learning_insert_duplicate(
+                                        existing_hash.as_ref().map(|h| h.as_slice()),
+                                        &new_snapshot_hash,
+                                    )
+                                } else {
+                                    LearningDuplicateDecision::Conflict
+                                };
+
+                                if decision == LearningDuplicateDecision::Idempotent {
+                                    self.log_sync(
+                                        user_id,
+                                        "",
+                                        "learning_versioned",
+                                        SyncDirection::Push,
+                                        compressed_snapshot.len(),
+                                        "success",
+                                        None,
+                                    )
+                                    .await;
+                                    return SyncResult::ok_with_version(
+                                        SyncDirection::Push,
+                                        "learning",
+                                        1,
+                                        1,
+                                    );
+                                }
+
                                 self.log_sync(
                                     user_id,
                                     "",
@@ -933,7 +1022,7 @@ impl StateSyncService for MatrixOneSyncService {
         // Write audit trail (best-effort, don't fail the push)
         if result.is_ok() {
             let history_id = uuid::Uuid::new_v4().to_string();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO user_preference_history \
                  (history_id, user_id, pref_key, old_value, new_value, old_version, new_version, source) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, 'edge')",
@@ -946,7 +1035,16 @@ impl StateSyncService for MatrixOneSyncService {
             .bind(old_version)
             .bind(new_version)
             .execute(&self.pool)
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    target: "astra_services::state_sync",
+                    user_id = %user_id,
+                    pref_key = %key,
+                    error = %e,
+                    "failed to write preference history audit trail"
+                );
+            }
         }
 
         match result {
@@ -1834,5 +1932,64 @@ mod tests {
         assert!((1000..=5000).contains(&max_backoff_ms));
         // Ensure max backoff is greater than initial
         assert!(max_backoff_ms > initial_backoff_ms);
+    }
+
+    // ── classify_learning_insert_duplicate unit tests ────────────────────────
+
+    #[test]
+    fn classify_learning_insert_dup_matching_hash_is_idempotent() {
+        let hash = sha256_bytes(r#"{"entities":[]}"#);
+        let decision = classify_learning_insert_duplicate(Some(hash.as_slice()), hash.as_slice());
+        assert_eq!(
+            decision,
+            LearningDuplicateDecision::Idempotent,
+            "same hash must be idempotent"
+        );
+    }
+
+    #[test]
+    fn classify_learning_insert_dup_different_hash_is_conflict() {
+        let hash_a = sha256_bytes(r#"{"entities":[]}"#);
+        let hash_b = sha256_bytes(r#"{"entities":[{"id":"x"}]}"#);
+        let decision =
+            classify_learning_insert_duplicate(Some(hash_a.as_slice()), hash_b.as_slice());
+        assert_eq!(
+            decision,
+            LearningDuplicateDecision::Conflict,
+            "different hashes must be a conflict"
+        );
+    }
+
+    #[test]
+    fn classify_learning_insert_dup_no_stored_row_is_conflict() {
+        let hash = sha256_bytes(r#"{"entities":[]}"#);
+        let decision = classify_learning_insert_duplicate(None, hash.as_slice());
+        assert_eq!(
+            decision,
+            LearningDuplicateDecision::Conflict,
+            "missing stored row must be treated as conflict"
+        );
+    }
+
+    #[test]
+    fn sha256_bytes_is_deterministic() {
+        let h1 = sha256_bytes("hello");
+        let h2 = sha256_bytes("hello");
+        assert_eq!(h1, h2);
+        let h3 = sha256_bytes("world");
+        assert_ne!(h1, h3);
+    }
+
+    /// audit-D7/D8: state_sync must not silently drop DB write errors.
+    #[test]
+    fn state_sync_db_writes_are_not_silently_dropped() {
+        let source = include_str!("state_sync.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let count = prod_code.matches("let _ = sqlx::query").count();
+        assert_eq!(
+            count, 0,
+            "state_sync has {count} silently-dropped DB writes"
+        );
     }
 }

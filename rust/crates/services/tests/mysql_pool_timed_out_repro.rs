@@ -39,7 +39,7 @@ fn matrixone_from_env() -> MatrixOneSettings {
 #[ignore = "requires real MySQL/MatrixOne instance; run with `--ignored`"]
 async fn pool_timed_out_when_exhausted() {
     let settings = matrixone_from_env();
-    let url = settings.database_url();
+    let url = settings.database_url_with_password();
     eprintln!(
         "connecting mysql://{}:***@{}:{}/{}",
         settings.user, settings.host, settings.port, settings.database

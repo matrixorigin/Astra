@@ -149,7 +149,20 @@ fn build_resolved_active_llm_from_row(
         let quirks_json: String = row
             .try_get("quirks_json")
             .unwrap_or_else(|_| "{}".to_string());
-        let quirks: QuirksData = serde_json::from_str(&quirks_json).unwrap_or_default();
+        let quirks: QuirksData = match serde_json::from_str(&quirks_json) {
+            Ok(q) => q,
+            Err(e) => {
+                let prefix = &quirks_json[..quirks_json.len().min(200)];
+                tracing::error!(
+                    target: "astra_services::models",
+                    column = "quirks_json",
+                    err = %e,
+                    payload_prefix = %prefix,
+                    "malformed JSON column, using default"
+                );
+                QuirksData::default()
+            }
+        };
         // Env var overrides DB config
         std::env::var("MO_LLM_FALLBACK_MODEL")
             .ok()
@@ -186,7 +199,7 @@ pub async fn resolve_active_llm_model(
         None => {
             ephemeral = sqlx::mysql::MySqlPoolOptions::new()
                 .max_connections(1)
-                .connect(&matrixone.database_url())
+                .connect(&matrixone.database_url_with_password())
                 .await
                 .map_err(|e| format!("DB connect: {e}"))?;
             &ephemeral
@@ -286,6 +299,32 @@ pub struct DatabaseModelService {
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
 }
 
+/// Parse a JSON column with explicit error logging on malformed payloads.
+///
+/// Replaces silent `serde_json::from_str(..).unwrap_or_default()` patterns so
+/// data corruption in MatrixOne JSON columns is observable in logs (target
+/// `astra_services::models`) instead of degrading silently to defaults.
+fn parse_json_column<T, F>(column: &'static str, raw: &str, default: F) -> T
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce() -> T,
+{
+    match serde_json::from_str::<T>(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            let prefix = &raw[..raw.len().min(200)];
+            tracing::error!(
+                target: "astra_services::models",
+                column,
+                err = %e,
+                payload_prefix = %prefix,
+                "malformed JSON column, using default"
+            );
+            default()
+        }
+    }
+}
+
 impl DatabaseModelService {
     pub fn new(
         matrixone: MatrixOneSettings,
@@ -330,15 +369,23 @@ impl DatabaseModelService {
             is_active: is_active_int != 0,
             context_window: row.try_get("context_window").unwrap_or(128000),
             max_completion_tokens: row.try_get("max_completion_tokens").ok(),
-            input_modalities: serde_json::from_str(&input_mod_json)
-                .unwrap_or_else(|_| vec!["text".to_string()]),
-            output_modalities: serde_json::from_str(&output_mod_json)
-                .unwrap_or_else(|_| vec!["text".to_string()]),
-            supported_parameters: serde_json::from_str(&supported_json).unwrap_or_default(),
-            pricing: serde_json::from_str(&pricing_json).unwrap_or_default(),
+            input_modalities: parse_json_column("input_modalities_json", &input_mod_json, || {
+                vec!["text".to_string()]
+            }),
+            output_modalities: parse_json_column(
+                "output_modalities_json",
+                &output_mod_json,
+                || vec!["text".to_string()],
+            ),
+            supported_parameters: parse_json_column(
+                "supported_parameters_json",
+                &supported_json,
+                Default::default,
+            ),
+            pricing: parse_json_column("pricing_json", &pricing_json, Default::default),
             architecture: row.try_get("architecture").ok(),
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            quirks: serde_json::from_str(&quirks_json).unwrap_or_default(),
+            tags: parse_json_column("tags_json", &tags_json, Default::default),
+            quirks: parse_json_column("quirks_json", &quirks_json, Default::default),
             connectivity: None,
         })
     }

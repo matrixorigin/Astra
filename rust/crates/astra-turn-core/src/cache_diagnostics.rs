@@ -21,9 +21,16 @@ pub enum CacheBreakReason {
     /// System prompt text changed (e.g., profile, task type).
     SystemPromptChanged,
     /// Tool schemas changed (added, removed, or modified).
+    ///
+    /// `changed` lists tools whose name is present in both snapshots but
+    /// whose per-tool schema hash differs — this catches same-name schema
+    /// churn (e.g., an agent/skill tool embedding a dynamic list), which
+    /// empirically dominates tool-break causes yet was previously invisible
+    /// because only add/remove by name was surfaced.
     ToolSchemasChanged {
         added: Vec<String>,
         removed: Vec<String>,
+        changed: Vec<String>,
     },
     /// Model changed between turns.
     ModelChanged { from: String, to: String },
@@ -132,6 +139,15 @@ pub struct CacheBreakDetector {
     previous: Option<PromptStateSnapshot>,
     /// Cumulative stats.
     pub stats: CacheStats,
+    /// Optional directory where per-break diagnostic JSON artifacts are
+    /// written. When `None` (default) no artifact is emitted. Intended for
+    /// developer debugging: when a cache break fires, an artifact named
+    /// `cache-break-{timestamp_secs}-{seq}.json` is dropped into this dir
+    /// containing the prev/curr snapshot fingerprints, classified reason,
+    /// and remediation suggestion. Lets a developer answer "why did my
+    /// cache just break?" without re-running the session.
+    diff_dir: Option<std::path::PathBuf>,
+    diff_seq: u32,
 }
 
 /// Running cache hit/miss statistics.
@@ -159,6 +175,15 @@ impl CacheStats {
 impl CacheBreakDetector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable per-break diagnostic artifact emission to `dir`. The directory
+    /// is created lazily on the first break. Errors during directory create
+    /// or file write are swallowed to avoid perturbing the live turn — this
+    /// is a developer aid, not a correctness signal.
+    pub fn with_diff_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.diff_dir = Some(dir.into());
+        self
     }
 
     /// Record a new turn's prompt state and detect cache breaks.
@@ -189,6 +214,11 @@ impl CacheBreakDetector {
             self.stats.recent_breaks.push(evt.clone());
             if self.stats.recent_breaks.len() > 10 {
                 self.stats.recent_breaks.remove(0);
+            }
+            if let Some(dir) = self.diff_dir.clone() {
+                self.diff_seq = self.diff_seq.wrapping_add(1);
+                let _ =
+                    write_diff_artifact(&dir, self.diff_seq, self.previous.as_ref(), &current, evt);
             }
         } else if self.previous.is_some() {
             self.stats.cache_hits += 1;
@@ -222,27 +252,43 @@ impl CacheBreakDetector {
 
         // 3. Tool schemas change — diff which tools changed
         if prev.tools_hash != curr.tools_hash {
-            let prev_names: std::collections::HashSet<&str> = prev
+            let prev_map: std::collections::HashMap<&str, u64> = prev
                 .per_tool_hashes
                 .iter()
-                .map(|(n, _)| n.as_str())
+                .map(|(n, h)| (n.as_str(), *h))
                 .collect();
-            let curr_names: std::collections::HashSet<&str> = curr
+            let curr_map: std::collections::HashMap<&str, u64> = curr
                 .per_tool_hashes
                 .iter()
-                .map(|(n, _)| n.as_str())
+                .map(|(n, h)| (n.as_str(), *h))
                 .collect();
 
-            let added: Vec<String> = curr_names
-                .difference(&prev_names)
+            let mut added: Vec<String> = curr_map
+                .keys()
+                .filter(|n| !prev_map.contains_key(*n))
                 .map(|s| s.to_string())
                 .collect();
-            let removed: Vec<String> = prev_names
-                .difference(&curr_names)
+            let mut removed: Vec<String> = prev_map
+                .keys()
+                .filter(|n| !curr_map.contains_key(*n))
                 .map(|s| s.to_string())
                 .collect();
+            let mut changed: Vec<String> = curr_map
+                .iter()
+                .filter_map(|(n, h)| match prev_map.get(n) {
+                    Some(prev_h) if prev_h != h => Some(n.to_string()),
+                    _ => None,
+                })
+                .collect();
+            added.sort();
+            removed.sort();
+            changed.sort();
 
-            reasons.push(CacheBreakReason::ToolSchemasChanged { added, removed });
+            reasons.push(CacheBreakReason::ToolSchemasChanged {
+                added,
+                removed,
+                changed,
+            });
         }
 
         // 4. If hashes match but API says cache miss → TTL expiry
@@ -284,25 +330,25 @@ impl CacheBreakDetector {
                             .into(),
                     );
                 }
-                CacheBreakReason::ToolSchemasChanged { added, removed } => {
+                CacheBreakReason::ToolSchemasChanged {
+                    added,
+                    removed,
+                    changed,
+                } => {
                     let parts: Vec<String> = [
-                        if !added.is_empty() {
-                            Some(format!("added: {}", added.join(", ")))
-                        } else {
-                            None
-                        },
-                        if !removed.is_empty() {
-                            Some(format!("removed: {}", removed.join(", ")))
-                        } else {
-                            None
-                        },
+                        (!added.is_empty()).then(|| format!("added: {}", added.join(", "))),
+                        (!removed.is_empty()).then(|| format!("removed: {}", removed.join(", "))),
+                        (!changed.is_empty())
+                            .then(|| format!("schema changed: {}", changed.join(", "))),
                     ]
                     .into_iter()
                     .flatten()
                     .collect();
                     return Some(format!(
                         "Tool schemas changed ({}). Consider pinning tool order and \
-                         avoiding dynamic tool registration mid-session.",
+                         avoiding dynamic tool registration mid-session; same-name schema \
+                         churn (e.g. dynamic agent/skill lists embedded in a tool description) \
+                         also breaks cache.",
                         parts.join("; ")
                     ));
                 }
@@ -462,6 +508,48 @@ fn hash_str(s: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Diff artifact writer
+// ---------------------------------------------------------------------------
+
+fn write_diff_artifact(
+    dir: &std::path::Path,
+    seq: u32,
+    prev: Option<&PromptStateSnapshot>,
+    curr: &PromptStateSnapshot,
+    event: &CacheBreakEvent,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!(
+        "cache-break-{:010}-{:04}.json",
+        curr.timestamp_secs, seq
+    ));
+    let snapshot_summary = |s: Option<&PromptStateSnapshot>| {
+        s.map(|s| {
+            serde_json::json!({
+                "system_prompt_hash": s.system_prompt_hash,
+                "tools_hash": s.tools_hash,
+                "per_tool_hashes": s.per_tool_hashes,
+                "model": s.model,
+                "timestamp_secs": s.timestamp_secs,
+                "cache_eligible_tokens": s.cache_eligible_tokens,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
+    };
+    let payload = serde_json::json!({
+        "seq": seq,
+        "prev": snapshot_summary(prev),
+        "curr": snapshot_summary(Some(curr)),
+        "event": event,
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"{}".to_vec()),
+    )?;
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -534,12 +622,54 @@ mod tests {
 
         let e = event.unwrap();
         match &e.reason {
-            CacheBreakReason::ToolSchemasChanged { added, removed } => {
+            CacheBreakReason::ToolSchemasChanged {
+                added,
+                removed,
+                changed,
+            } => {
                 assert!(added.contains(&"grep".to_string()));
                 assert!(removed.contains(&"edit".to_string()));
+                assert!(changed.is_empty(), "no same-name schema churn expected");
             }
             other => panic!("expected ToolSchemasChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_tool_schema_content_change_same_name() {
+        // Regression test: a tool whose name is unchanged but whose schema
+        // JSON content differs (e.g., a dynamic description) must be reported
+        // as `changed`. Previously this fell through as invisible because
+        // only add/remove by name was diffed.
+        let mut det = CacheBreakDetector::new();
+
+        let t1 = vec![serde_json::json!({
+            "function": {"name": "agent", "description": "original"}
+        })];
+        let t2 = vec![serde_json::json!({
+            "function": {"name": "agent", "description": "rewritten dynamically"}
+        })];
+
+        det.record_turn(snap("prompt", &t1, "claude"), None);
+        let event = det.record_turn(snap("prompt", &t2, "claude"), None);
+        let e = event.expect("break should fire on same-name schema churn");
+        match &e.reason {
+            CacheBreakReason::ToolSchemasChanged {
+                added,
+                removed,
+                changed,
+            } => {
+                assert!(added.is_empty());
+                assert!(removed.is_empty());
+                assert_eq!(changed, &vec!["agent".to_string()]);
+            }
+            other => panic!("expected ToolSchemasChanged, got {other:?}"),
+        }
+        let suggestion = e.suggestion.unwrap_or_default();
+        assert!(
+            suggestion.contains("schema changed: agent"),
+            "remediation must name the churning tool, got: {suggestion}"
+        );
     }
 
     #[test]
@@ -896,5 +1026,44 @@ mod tests {
 
         // Even overlapping range is fine since cache is already broken
         assert!(!det.would_break_cache(0, 5, 2));
+    }
+
+    #[test]
+    fn diff_artifact_written_on_break() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut det = CacheBreakDetector::new().with_diff_dir(tmp.path());
+
+        det.record_turn(snap("v1", &make_tools(&["bash"]), "claude"), None);
+        det.record_turn(snap("v2", &make_tools(&["bash"]), "claude"), None);
+
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one artifact expected: {files:?}");
+        assert!(
+            files[0].starts_with("cache-break-"),
+            "name should be stable-prefixed, got {}",
+            files[0]
+        );
+        let body = std::fs::read_to_string(tmp.path().join(&files[0])).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["prev"].is_object(), "prev snapshot missing");
+        assert!(v["curr"].is_object(), "curr snapshot missing");
+        assert!(v["event"]["reason"].is_string() || v["event"]["reason"].is_object());
+    }
+
+    #[test]
+    fn no_diff_artifact_on_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = make_tools(&["bash"]);
+        let mut det = CacheBreakDetector::new().with_diff_dir(tmp.path());
+
+        det.record_turn(snap("p", &tools, "claude"), None);
+        det.record_turn(snap("p", &tools, "claude"), None); // hit, no artifact
+
+        let count = std::fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(count, 0, "no artifacts should be written on hits");
     }
 }

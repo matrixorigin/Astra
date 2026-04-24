@@ -675,7 +675,16 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     apply_auto_reflection_usage(state, &reflection_result);
 
     // Record the auto-reflection LLM call so turn.tokens_in breakdown is complete.
+    // Compute agentic_step before the mutable borrow of state.turn_event_buffer;
+    // otherwise we'd need two overlapping borrows of `state`.
+    let agentic_step = super::agentic_loop_lifecycle::current_agentic_step(state);
     if let Some(ref mut buf) = state.turn_event_buffer {
+        // Populate agentic_step so journal llm_round events carry the turn's
+        // iteration index even for auto-reflection rounds. Before 2026-04-23
+        // this was hardcoded `None`, which made downstream analysis (telemetry
+        // grouping, self-surface reporting) unable to attribute an auto-reflect
+        // LLM call to its agentic iteration. Observed in session 26f73ee4
+        // where 32 llm_round events all had `agentic_step: None`.
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             ttft_ms: None,
             duration_ms: 0,
@@ -685,7 +694,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: Some("auto_reflection".into()),
-            agentic_step: None,
+            agentic_step: Some(agentic_step),
             source: Some("auto_reflection".into()),
             run_id: state.current_run_id.clone(),
         });

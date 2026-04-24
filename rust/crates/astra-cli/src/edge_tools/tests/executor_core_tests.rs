@@ -23,8 +23,18 @@ fn executor_tool_names_match_schemas() {
 async fn execute_unknown_tool_returns_error() {
     let executor = test_executor();
     let result = executor.execute("nonexistent_tool", &json!({})).await;
-    assert!(result.contains("nonexistent_tool"), "got: {result}");
-    assert!(result.contains("not available"), "got: {result}");
+    assert!(
+        result.starts_with("Error:"),
+        "unknown tool must return an Error: prefix (plain-text error contract) — got: {result}"
+    );
+    assert!(
+        result.contains("'nonexistent_tool'"),
+        "error must quote the rejected tool name — got: {result}"
+    );
+    assert!(
+        result.contains("not available"),
+        "error must use the canonical 'not available' phrasing so dispatchers can pattern-match — got: {result}"
+    );
 }
 
 #[tokio::test]
@@ -135,6 +145,9 @@ async fn execute_reflect_uses_local_surface_with_session() {
             llm_rounds: None,
             total_llm_ms: None,
             total_tool_ms: None,
+            parent_event_id: None,
+            git_head: None,
+            git_branch: None,
         })
         .unwrap();
 
