@@ -384,6 +384,7 @@ fn build_server_skill_executor(
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
+    cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
     use crate::skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
@@ -400,7 +401,8 @@ fn build_server_skill_executor(
     .with_edge_profile(edge_profile.clone())
     .with_forward_headers(forward_headers.clone())
     .with_request_constraints(request_constraints)
-    .with_skill_resolver(skill_resolver);
+    .with_skill_resolver(skill_resolver)
+    .with_cancel_token(cancel_token);
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
     }
@@ -1736,6 +1738,7 @@ impl AgenticRunLifecycleService {
         session_id: &str,
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
+        cancel_token: Option<Arc<CancellationToken>>,
     ) -> AgenticLoopState {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
@@ -1807,6 +1810,7 @@ impl AgenticRunLifecycleService {
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
+            cancel_token,
         );
 
         AgenticLoopState {
@@ -2119,8 +2123,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             None
         };
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
-        let mut loop_state =
-            self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
+        let mut loop_state = self.build_initial_state(
+            &request,
+            &session_id,
+            &run_id,
+            server_workspace.as_deref(),
+            Some(llm_cancel_token.clone()),
+        );
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
@@ -2477,11 +2486,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         const SSE_CHANNEL_CAPACITY: usize = 512;
         let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
 
-        let mut state =
-            self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
-        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+
+        let mut state = self.build_initial_state(
+            &request,
+            &session_id,
+            &run_id,
+            server_workspace.as_deref(),
+            Some(llm_cancel_token.clone()),
+        );
+        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         host.set_event_tx(event_tx.clone());
@@ -3739,7 +3754,8 @@ mod tests {
         }
 
         let svc = test_service().with_skill_service(Arc::new(MockSkillService));
-        let state = svc.build_initial_state(&test_request("hello"), "session-1", "run-1", None);
+        let state =
+            svc.build_initial_state(&test_request("hello"), "session-1", "run-1", None, None);
         let resolver = state
             .skills
             .resolver
@@ -3773,7 +3789,8 @@ mod tests {
 
         let mut filtered_request = test_request("hello");
         filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
-        let filtered_state = svc.build_initial_state(&filtered_request, "session-1", "run-1", None);
+        let filtered_state =
+            svc.build_initial_state(&filtered_request, "session-1", "run-1", None, None);
         assert!(
             filtered_state.skills.registry_for_activation.is_none(),
             "request-scoped allow_skills should disable automatic conditional activation"
@@ -3812,7 +3829,7 @@ mod tests {
     fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
         let svc = test_service();
         let request = test_request("git status");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         state.recent_tools = vec!["git_status".into()];
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
@@ -3866,7 +3883,7 @@ mod tests {
     fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
         let svc = test_service();
         let request = test_request("inspect blocked tools");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
 
         // One success so the pattern exists, then Block adds 5 failures.
@@ -3893,7 +3910,7 @@ mod tests {
     fn finalize_run_events_appends_run_finished_for_failures() {
         let svc = test_service();
         let request = test_request("boom");
-        let state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
 
         let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
             Ok(AgenticLoopOutcome::Error("boom".into())),
@@ -3912,7 +3929,7 @@ mod tests {
     fn finalize_run_events_cancellation_beats_completed_outcome() {
         let svc = test_service();
         let request = test_request("done");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let cancel_token = Arc::new(CancellationToken::new());
         cancel_token.cancel();
@@ -4419,7 +4436,7 @@ mod tests {
     fn build_initial_state_sets_user_message() {
         let svc = test_service();
         let req = test_request("write a test");
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None);
+        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0]["role"], "user");
         assert_eq!(state.messages[0]["content"], "write a test");
@@ -4436,7 +4453,7 @@ mod tests {
         let svc = test_service();
         let mut req = test_request("go");
         req.max_candidates = 0;
-        let state = svc.build_initial_state(&req, "s", "r", None);
+        let state = svc.build_initial_state(&req, "s", "r", None, None);
         assert_eq!(state.max_turns, 1);
     }
 
@@ -4462,7 +4479,7 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r", None);
+        let state = svc.build_initial_state(&req, "s", "r", None, None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
         assert_eq!(
@@ -4485,7 +4502,7 @@ mod tests {
         let svc = test_service();
         // Request with NO edge_profile.cwd — simulates web-agent mode.
         let req = test_request("fix a bug");
-        let state = svc.build_initial_state(&req, "s", "r", Some(dir.path()));
+        let state = svc.build_initial_state(&req, "s", "r", Some(dir.path()), None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
         assert_eq!(
@@ -4526,7 +4543,7 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r", Some(override_dir.path()));
+        let state = svc.build_initial_state(&req, "s", "r", Some(override_dir.path()), None);
         // Edge profile's cwd wins over the workspace override.
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "edge_hook");
@@ -5505,6 +5522,88 @@ mod tests {
         assert!(
             fn_body.contains("persist_usage"),
             "stream_chat must call persist_usage"
+        );
+    }
+
+    /// P1-C: build_server_skill_executor must accept and wire a cancel_token.
+    /// Without this, skill sub-runs ignore parent cancellation.
+    #[test]
+    fn build_server_skill_executor_accepts_cancel_token() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("fn build_server_skill_executor(")
+            .expect("build_server_skill_executor must exist");
+        let fn_end = source[fn_start..]
+            .find("\npub(crate) fn ")
+            .or_else(|| source[fn_start..].find("\nfn "))
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_token"),
+            "build_server_skill_executor must accept a cancel_token parameter"
+        );
+        assert!(
+            fn_body.contains("with_cancel_token"),
+            "build_server_skill_executor must wire cancel_token via with_cancel_token"
+        );
+    }
+
+    /// P1-C: build_initial_state must pass cancel_token to skill executor builder.
+    #[test]
+    fn build_initial_state_passes_cancel_token_to_skill_executor() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("fn build_initial_state(")
+            .expect("build_initial_state must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    fn ")
+            .or_else(|| source[fn_start..].find("\n    pub"))
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_token"),
+            "build_initial_state must accept and pass cancel_token to skill executor"
+        );
+    }
+
+    /// Waiting runs must NOT be evicted from the in-memory cache.
+    /// If evicted, they cannot be resumed (no in-memory state to transition).
+    #[test]
+    fn waiting_runs_skip_eviction_in_both_spawn_paths() {
+        let source = include_str!("run_lifecycle.rs");
+        let prod_code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        // Find the two guarded eviction sites (create_run normal exit + stream_chat normal exit).
+        // The cancelled-run path doesn't need a Waiting guard (cancelled != Waiting).
+        // Each guarded site has `if final_status != RunStatus::Waiting` before the call.
+        let waiting_guards = prod_code
+            .matches("final_status != RunStatus::Waiting")
+            .count();
+        assert!(
+            waiting_guards >= 2,
+            "at least 2 schedule_run_eviction sites must be guarded by Waiting check, found {waiting_guards}"
+        );
+    }
+
+    /// cancel_run durable fallback must include STATUS_WAITING in cancellable states.
+    /// A Waiting run persisted in durable store must be cancellable.
+    #[test]
+    fn cancel_run_durable_fallback_includes_waiting() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn cancel_run(")
+            .expect("cancel_run must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        // The durable fallback match must include STATUS_WAITING
+        assert!(
+            fn_body.contains("STATUS_WAITING"),
+            "cancel_run durable fallback must include STATUS_WAITING"
         );
     }
 }

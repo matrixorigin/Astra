@@ -971,17 +971,19 @@ impl DelegationTracker {
         }
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
 
-        // Acquire locks in consistent order: delegations → parents → pause_flags → progress
+        // Acquire locks in consistent order: delegations → parents → pause_flags → cancel_tokens → progress
         // (same order as load_from_run_records to prevent deadlock)
         let mut delegations = self.delegations.write().await;
         let mut parents = self.parents.write().await;
         let mut pause_flags = self.pause_flags.write().await;
+        let mut cancel_tokens = self.cancel_tokens.write().await;
         let mut progress_map = self.progress.write().await;
 
         delegations.remove(delegation_id);
         for rid in &run_ids {
             parents.remove(rid);
             pause_flags.remove(rid);
+            cancel_tokens.remove(rid);
         }
         progress_map.remove(delegation_id);
         Ok(())
@@ -3410,9 +3412,11 @@ impl DelegationEngine {
         count
     }
 
-    /// Cancel all sub-runs spawned by a parent run.
+    /// Cancel all non-terminal sub-runs spawned by a parent run.
+    /// Returns the number of sub-runs whose status was persisted as cancelled.
     pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
-        let count = self.tracker.cancel_children_of(parent_run_id).await;
+        self.tracker.cancel_children_of(parent_run_id).await;
+        let mut persisted = 0;
         for child_id in self.tracker.get_children(parent_run_id).await {
             // Only persist cancelled status for non-terminal sub-runs to avoid
             // overwriting completed/failed status in the durable store.
@@ -3430,9 +3434,10 @@ impl DelegationEngine {
                     &child_id,
                     "cancel"
                 );
+                persisted += 1;
             }
         }
-        count
+        persisted
     }
 
     /// Extract budget awareness prompt from delegation context.
@@ -6319,6 +6324,64 @@ mod tests {
         assert!(
             fn_body.contains("cancel_children_of"),
             "cancel_run must cascade cancellation to delegation sub-runs"
+        );
+    }
+
+    /// cancel_tokens must be cleaned up in cleanup_delegation to prevent memory leaks.
+    #[tokio::test]
+    async fn cleanup_delegation_removes_cancel_tokens() {
+        let tracker = DelegationTracker::new();
+        let deleg_id = "deleg-cleanup";
+        let child = "child-cleanup";
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: child.into(),
+                parent_run_id: "parent".into(),
+                delegation_id: deleg_id.into(),
+                agent_id: "agent".into(),
+                depth: 0,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker.register_cancel_token(child, token.clone()).await;
+        assert!(tracker.cancel_tokens.read().await.contains_key(child));
+
+        // Complete the sub-run so cleanup_delegation can proceed
+        tracker
+            .complete_sub_run(child, SubRunState::Completed)
+            .await;
+
+        tracker.cleanup_delegation(deleg_id).await.unwrap();
+        assert!(
+            !tracker.cancel_tokens.read().await.contains_key(child),
+            "cancel_tokens must be cleaned up after delegation cleanup"
+        );
+    }
+
+    /// Source guard: cleanup_delegation must clean cancel_tokens alongside pause_flags.
+    #[test]
+    fn cleanup_delegation_cleans_cancel_tokens_source_guard() {
+        let source = include_str!("delegation_engine.rs");
+        let impl_start = source
+            .find("impl DelegationTracker {")
+            .expect("impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find("async fn cleanup_delegation(")
+            .expect("cleanup_delegation must exist");
+        let fn_end = impl_source[fn_start..]
+            .find("\n    pub async fn ")
+            .or_else(|| impl_source[fn_start..].find("\n    async fn "))
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        let fn_body = &impl_source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_tokens"),
+            "cleanup_delegation must clean up cancel_tokens map"
         );
     }
 }
