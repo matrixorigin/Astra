@@ -1,0 +1,18 @@
+{
+  "sample_dir": "skills",
+  "dataset": "dataset/primary.jsonl",
+  "catalog_size": 1000,
+  "total_records_in_dataset": 1019,
+  "unique_target_skills_in_dataset": 1000,
+  "skipped_unpassed_records": 0,
+  "evaluated_records": 50,
+  "hit_at_1_rate": 0.58,
+  "hit_at_3_rate": 0.7,
+  "hit_at_5_rate": 0.72,
+  "hit_at_14_rate": 0.78,
+  "avg_best_rank_on_hit": 1.8974358974358974,
+  "misses_not_shortlisted": 11,
+  "misses_rank_2_to_3": 6,
+  "misses_rank_4_to_5": 1,
+  "misses_rank_6_to_14": 3
+}

@@ -3503,6 +3503,7 @@ dependencies = [
  "astra-turn-core",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

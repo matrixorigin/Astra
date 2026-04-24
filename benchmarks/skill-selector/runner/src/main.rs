@@ -229,6 +229,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let embed_url = std::env::var("MEMORIA_EMBEDDING_BASE_URL").ok();
+    let embed_key = std::env::var("MEMORIA_EMBEDDING_API_KEY").ok();
+    match (embed_url.as_deref(), embed_key.as_deref()) {
+        (Some(url), Some(_)) if !url.is_empty() => {
+            eprintln!(
+                "selector embedding fusion ENABLED via MEMORIA_EMBEDDING_* (model={})",
+                std::env::var("MEMORIA_EMBEDDING_MODEL").unwrap_or_else(|_| "bge-m3".into())
+            );
+        }
+        _ => eprintln!(
+            "selector embedding fusion DISABLED (set MEMORIA_EMBEDDING_BASE_URL + MEMORIA_EMBEDDING_API_KEY to enable)"
+        ),
+    }
+
+    // Embedding fusion in skill_selector requires a Tokio runtime; without it
+    // the call silently falls back to lexical-only via `unwrap_or_default`.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _guard = runtime.enter();
+
     let catalog = load_catalog(&fs::canonicalize(&args.sample_dir)?)?;
     let (raw_record_count, total_records) = load_records(&args.dataset)?;
     let tracker = SkillQualityTracker::new();
