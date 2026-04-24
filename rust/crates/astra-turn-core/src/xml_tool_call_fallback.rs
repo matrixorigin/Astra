@@ -491,7 +491,10 @@ mod tests {
 This format is used when the model degrades under context pressure.
 You can see the invoke block contains parameter elements."#;
         let calls = parse_xml_tool_calls(text);
-        assert!(calls.is_some(), "valid invoke block should always be parsed");
+        assert!(
+            calls.is_some(),
+            "valid invoke block should always be parsed"
+        );
         assert_eq!(calls.unwrap()[0]["function"]["name"], "read_file");
     }
 
