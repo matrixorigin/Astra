@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+use std::time::Instant;
 
 use astra_core::SkillSearchSettings;
 use astra_skills::traits::SkillToolInfo;
@@ -9,19 +10,12 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tracing::{debug, warn};
 
 use crate::skills::quality::SkillQualityTracker;
 use crate::text_tokenize::tokenize;
 
-const EMBEDDING_POOL: usize = 100;
-const LEXICAL_POOL: usize = 50;
-const RERANK_POOL_MIN: usize = 30;
-const RRF_K_EMBED: f64 = 60.0;
-const RRF_K_LEXICAL: f64 = 20.0;
-const LEXICAL_RANK_WEIGHT: f64 = 0.6;
-const EXACT_NAME_BONUS: f64 = 0.20;
-const EXACT_ALIAS_BONUS: f64 = 0.12;
-const EXACT_TRIGGER_BONUS: f64 = 0.08;
+const EMBEDDING_POOL: usize = 150;
 const BUNDLED_SOURCE_BONUS: f64 = 0.10;
 const EMBEDDING_BATCH_SIZE: usize = 32;
 
@@ -298,6 +292,7 @@ struct LexicalCandidate {
 struct FinalCandidate {
     idx: usize,
     final_score: f64,
+    #[allow(dead_code)]
     lexical_score: f64,
     exact: ExactSignals,
 }
@@ -655,13 +650,6 @@ fn embed_service_from_env() -> Option<EmbeddingServiceConfig> {
 }
 
 fn rerank_service_from_env() -> Option<RerankServiceConfig> {
-    let enabled = std::env::var("ASTRA_SKILL_SELECTOR_ENABLE_RERANK")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
-        .unwrap_or(false);
-    if !enabled {
-        return None;
-    }
     let base_url = std::env::var("ASTRA_SKILL_SELECTOR_RERANK_BASE_URL").ok()?;
     let api_key = std::env::var("ASTRA_SKILL_SELECTOR_RERANK_API_KEY").ok()?;
     let model = std::env::var("ASTRA_SKILL_SELECTOR_RERANK_MODEL").ok()?;
@@ -779,6 +767,7 @@ fn embedding_rank_map(
     let Some(config) = embed_service_from_env() else {
         return Ok(HashMap::new());
     };
+    let started = Instant::now();
     let index = catalog_index(skills);
     let skill_embeddings = ensure_skill_embeddings(&index, &config)?;
     let mut query_vecs = block_on_future(request_embeddings(config, vec![query.to_string()]))?;
@@ -791,74 +780,20 @@ fn embedding_rank_map(
         .map(|(idx, vec)| (idx, dot_similarity(&query_vec, vec)))
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(ranked
+    let map: HashMap<usize, usize> = ranked
         .into_iter()
         .take(EMBEDDING_POOL)
         .enumerate()
         .map(|(rank, (idx, _))| (idx, rank + 1))
-        .collect())
-}
-
-fn lexical_rank_map(lexical: &[LexicalCandidate]) -> HashMap<usize, usize> {
-    lexical
-        .iter()
-        .take(LEXICAL_POOL)
-        .enumerate()
-        .map(|(rank, cand)| (cand.idx, rank + 1))
-        .collect()
-}
-
-fn fused_candidates(
-    lexical: &[LexicalCandidate],
-    embedding_ranks: &HashMap<usize, usize>,
-) -> Vec<FinalCandidate> {
-    let lexical_ranks = lexical_rank_map(lexical);
-    let lexical_map: HashMap<usize, &LexicalCandidate> =
-        lexical.iter().map(|cand| (cand.idx, cand)).collect();
-    let mut pool: HashSet<usize> = lexical_ranks.keys().copied().collect();
-    pool.extend(embedding_ranks.keys().copied());
-    let mut out = pool
-        .into_iter()
-        .map(|idx| {
-            let lexical_cand = lexical_map.get(&idx).copied();
-            let exact = lexical_cand.map(|c| c.exact.clone()).unwrap_or_default();
-            let lexical_score = lexical_cand.map(|c| c.score).unwrap_or(0.0);
-            let mut final_score = 0.0;
-            if let Some(rank) = embedding_ranks.get(&idx) {
-                final_score += 1.0 / (RRF_K_EMBED + *rank as f64);
-            }
-            if let Some(rank) = lexical_ranks.get(&idx) {
-                final_score += LEXICAL_RANK_WEIGHT / (RRF_K_LEXICAL + *rank as f64);
-            }
-            if exact.name_hit {
-                final_score += EXACT_NAME_BONUS;
-            }
-            if exact.alias_hit {
-                final_score += EXACT_ALIAS_BONUS;
-            }
-            if exact.trigger_hit {
-                final_score += EXACT_TRIGGER_BONUS;
-            }
-            FinalCandidate {
-                idx,
-                final_score,
-                lexical_score,
-                exact,
-            }
-        })
-        .collect::<Vec<_>>();
-    out.sort_by(|a, b| {
-        b.final_score
-            .partial_cmp(&a.final_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.lexical_score
-                    .partial_cmp(&a.lexical_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.idx.cmp(&b.idx))
-    });
-    out
+        .collect();
+    debug!(
+        target: "astra::skill_selector",
+        catalog_size = skills.len(),
+        pool_size = map.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "skill_selector embedding rank built",
+    );
+    Ok(map)
 }
 
 fn rerank_candidates(
@@ -870,10 +805,10 @@ fn rerank_candidates(
     let Some(config) = rerank_service_from_env() else {
         return Ok(candidates.iter().take(top_k).map(|c| c.idx).collect());
     };
-    let pool = candidates
-        .iter()
-        .take((top_k * 3).clamp(RERANK_POOL_MIN, 100))
-        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let model_label = config.model.clone();
+    // Use the full embedding-recall pool as rerank input; the cheap LLM compresses it to top_k.
+    let pool = candidates.iter().take(EMBEDDING_POOL).collect::<Vec<_>>();
     let candidate_text = pool
         .iter()
         .enumerate()
@@ -907,8 +842,10 @@ fn rerank_candidates(
         ],
         "temperature": 0,
         "max_tokens": 256,
+        // DashScope/Qwen-specific knob to disable chain-of-thought; ignored by other OpenAI-compatible providers.
+        "enable_thinking": false,
     });
-    let body = block_on_future(async move {
+    let body = match block_on_future(async move {
         let response = selector_http_client()
             .post(chat_completions_url(&config.base_url))
             .bearer_auth(config.api_key)
@@ -932,7 +869,21 @@ fn rerank_candidates(
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| "selector rerank response missing message content".to_string())
-    })?;
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                target: "astra::skill_selector",
+                model = %model_label,
+                pool_size = pool.len(),
+                top_k,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "skill_selector rerank failed; falling back to embedding order",
+            );
+            return Ok(candidates.iter().take(top_k).map(|c| c.idx).collect());
+        }
+    };
     let parsed = serde_json::from_str::<serde_json::Value>(body.trim())
         .ok()
         .and_then(|value| value["ranked_candidate_numbers"].as_array().cloned())
@@ -952,8 +903,25 @@ fn rerank_candidates(
         }
     }
     if reranked.is_empty() {
+        warn!(
+            target: "astra::skill_selector",
+            model = %model_label,
+            pool_size = pool.len(),
+            top_k,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "skill_selector rerank returned empty ranking; falling back to embedding order",
+        );
         return Ok(candidates.iter().take(top_k).map(|c| c.idx).collect());
     }
+    debug!(
+        target: "astra::skill_selector",
+        model = %model_label,
+        pool_size = pool.len(),
+        returned = reranked.len(),
+        top_k,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "skill_selector rerank ok",
+    );
     Ok(reranked)
 }
 
@@ -963,12 +931,34 @@ pub fn select_skill_indices(
     quality_tracker: Option<&SkillQualityTracker>,
     cfg: &SkillSearchSettings,
 ) -> Vec<usize> {
+    let started = Instant::now();
     let lexical = lexical_candidates(all_skills, user_message, quality_tracker);
     if lexical.is_empty() {
+        debug!(
+            target: "astra::skill_selector",
+            catalog_size = all_skills.len(),
+            "skill_selector lexical produced no candidates; returning empty",
+        );
         return Vec::new();
     }
-    let embedding_ranks = embedding_rank_map(all_skills, user_message).unwrap_or_default();
+    let embedding_ranks = embedding_rank_map(all_skills, user_message).unwrap_or_else(|e| {
+        warn!(
+            target: "astra::skill_selector",
+            error = %e,
+            "skill_selector embedding ranking failed; falling back to lexical",
+        );
+        HashMap::new()
+    });
+    let rerank_enabled = rerank_service_from_env().is_some();
+    let tier = if embedding_ranks.is_empty() {
+        "lexical"
+    } else if rerank_enabled {
+        "embedding+rerank"
+    } else {
+        "embedding"
+    };
     let ranked = if embedding_ranks.is_empty() {
+        // Tier 1: no embedding service available — fall back to pure lexical ranking.
         lexical
             .iter()
             .map(|cand| FinalCandidate {
@@ -979,11 +969,77 @@ pub fn select_skill_indices(
             })
             .collect::<Vec<_>>()
     } else {
-        fused_candidates(&lexical, &embedding_ranks)
+        // Tier 2/3: embedding available — rank purely by embedding similarity.
+        // If the cheap-LLM reranker is configured, it will further compress this pool below.
+        let mut pool = embedding_only_candidates(&embedding_ranks);
+        // Apply learned quality boost so embedding/rerank tiers honor SkillQualityTracker
+        // (lexical tier already absorbs the boost inside lexical_score).
+        apply_quality_boost(all_skills, &mut pool, quality_tracker);
+        pool
     };
     let top_k = choose_top_k(all_skills.len(), cfg.effective_surface_cap(), &ranked);
-    rerank_candidates(user_message, all_skills, &ranked, top_k)
-        .unwrap_or_else(|_| ranked.iter().take(top_k).map(|c| c.idx).collect())
+    let result = rerank_candidates(user_message, all_skills, &ranked, top_k)
+        .unwrap_or_else(|_| ranked.iter().take(top_k).map(|c| c.idx).collect());
+    debug!(
+        target: "astra::skill_selector",
+        tier,
+        catalog_size = all_skills.len(),
+        ranked_pool = ranked.len(),
+        returned = result.len(),
+        top_k,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "skill_selector select_skill_indices done",
+    );
+    result
+}
+
+fn embedding_only_candidates(embedding_ranks: &HashMap<usize, usize>) -> Vec<FinalCandidate> {
+    let mut by_rank: Vec<(usize, usize)> = embedding_ranks
+        .iter()
+        .map(|(idx, rank)| (*idx, *rank))
+        .collect();
+    by_rank.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    by_rank
+        .into_iter()
+        .map(|(idx, rank)| FinalCandidate {
+            idx,
+            final_score: 1.0 / (rank as f64 + 1.0),
+            lexical_score: 0.0,
+            exact: Default::default(),
+        })
+        .collect()
+}
+
+/// Apply per-skill quality boost to a ranked candidate pool and re-sort.
+///
+/// `selection_boost` returns [0.5, 1.5] (1.0 = neutral, <3 invocations = neutral),
+/// so this is an effective no-op for cold-start skills while letting learned
+/// success/failure history reshape the embedding/rerank tier orderings — closing
+/// the regression where the embedding path silently bypassed quality tracking.
+fn apply_quality_boost(
+    catalog: &[SkillToolInfo],
+    candidates: &mut [FinalCandidate],
+    quality_tracker: Option<&SkillQualityTracker>,
+) {
+    let Some(tracker) = quality_tracker else {
+        return;
+    };
+    let mut adjusted = false;
+    for cand in candidates.iter_mut() {
+        let boost = tracker.selection_boost(&catalog[cand.idx].name);
+        if (boost - 1.0).abs() > f64::EPSILON {
+            cand.final_score *= boost;
+            adjusted = true;
+        }
+    }
+    if adjusted {
+        candidates.sort_by(|a, b| {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.idx.cmp(&b.idx))
+        });
+    }
 }
 
 pub fn discover_skill_indices(
@@ -993,8 +1049,21 @@ pub fn discover_skill_indices(
     quality_tracker: Option<&SkillQualityTracker>,
     limit: usize,
 ) -> Vec<usize> {
+    let started = Instant::now();
     let lexical = lexical_candidates(catalog, query, quality_tracker);
-    let embedding_ranks = embedding_rank_map(catalog, query).unwrap_or_default();
+    let embedding_ranks = embedding_rank_map(catalog, query).unwrap_or_else(|e| {
+        warn!(
+            target: "astra::skill_selector",
+            error = %e,
+            "skill_selector discover embedding ranking failed; falling back to lexical",
+        );
+        HashMap::new()
+    });
+    let tier = if embedding_ranks.is_empty() {
+        "lexical"
+    } else {
+        "embedding"
+    };
     let ranked = if embedding_ranks.is_empty() {
         lexical
             .into_iter()
@@ -1006,9 +1075,11 @@ pub fn discover_skill_indices(
             })
             .collect::<Vec<_>>()
     } else {
-        fused_candidates(&lexical, &embedding_ranks)
+        let mut pool = embedding_only_candidates(&embedding_ranks);
+        apply_quality_boost(catalog, &mut pool, quality_tracker);
+        pool
     };
-    ranked
+    let result: Vec<usize> = ranked
         .into_iter()
         .filter(|cand| {
             let skill = &catalog[cand.idx];
@@ -1021,7 +1092,17 @@ pub fn discover_skill_indices(
         .filter(|cand| cand.final_score > 0.0)
         .take(limit)
         .map(|cand| cand.idx)
-        .collect()
+        .collect();
+    debug!(
+        target: "astra::skill_selector",
+        tier,
+        catalog_size = catalog.len(),
+        returned = result.len(),
+        limit,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "skill_selector discover_skill_indices done",
+    );
+    result
 }
 
 #[cfg(test)]
@@ -1110,5 +1191,70 @@ mod tests {
         excluded.insert("ship-it".to_string());
         let found = discover_skill_indices(&catalog, "debug issue", &excluded, None, 8);
         assert_eq!(found, vec![1]);
+    }
+
+    #[test]
+    fn apply_quality_boost_reorders_embedding_pool() {
+        use crate::skills::quality::{SkillOutcome, SkillQualityTracker};
+        let catalog = vec![skill("alpha", "first"), skill("beta", "second")];
+        let mut tracker = SkillQualityTracker::new();
+        // 5 failures for alpha → boost < 1.0; 5 successes for beta → boost > 1.0.
+        for _ in 0..5 {
+            tracker.record_outcome(&SkillOutcome {
+                skill_name: "alpha".into(),
+                tokens_used: 0,
+                duration_ms: 0,
+                all_required_passed: false,
+                partial: false,
+            });
+            tracker.record_outcome(&SkillOutcome {
+                skill_name: "beta".into(),
+                tokens_used: 0,
+                duration_ms: 0,
+                all_required_passed: true,
+                partial: false,
+            });
+        }
+        // Simulate embedding tier: alpha ranked first, beta second, similar scores.
+        let mut pool = vec![
+            FinalCandidate {
+                idx: 0,
+                final_score: 1.0,
+                lexical_score: 0.0,
+                exact: Default::default(),
+            },
+            FinalCandidate {
+                idx: 1,
+                final_score: 0.95,
+                lexical_score: 0.0,
+                exact: Default::default(),
+            },
+        ];
+        apply_quality_boost(&catalog, &mut pool, Some(&tracker));
+        // beta's quality boost (>1.0) should overcome alpha's small lead (and alpha is penalized <1.0).
+        assert_eq!(pool[0].idx, 1, "high-quality beta should be reranked first");
+        assert_eq!(pool[1].idx, 0);
+    }
+
+    #[test]
+    fn apply_quality_boost_no_tracker_is_noop() {
+        let catalog = vec![skill("a", "x"), skill("b", "y")];
+        let mut pool = vec![
+            FinalCandidate {
+                idx: 0,
+                final_score: 1.0,
+                lexical_score: 0.0,
+                exact: Default::default(),
+            },
+            FinalCandidate {
+                idx: 1,
+                final_score: 0.5,
+                lexical_score: 0.0,
+                exact: Default::default(),
+            },
+        ];
+        apply_quality_boost(&catalog, &mut pool, None);
+        assert_eq!(pool[0].idx, 0);
+        assert_eq!(pool[1].idx, 1);
     }
 }
