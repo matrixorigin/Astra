@@ -3328,18 +3328,33 @@ printf 'probe.txt:1:needle\n'
         let dir = tempdir().unwrap();
         let token = Arc::new(CancellationToken::new());
         let trigger = token.clone();
+
+        // Use a sentinel file so we cancel only after output has started,
+        // eliminating the race condition with a fixed timer.
+        let sentinel = dir.path().join(".cancel_sentinel");
+        let sentinel_path = sentinel.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            // Wait until the bash command has produced output and created the sentinel
+            for _ in 0..200 {
+                if sentinel_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             trigger.cancel();
         });
 
         let mut ctx = crate::ToolContext::test(dir.path());
         ctx.cancel_token = Some(token);
 
+        // The command creates a sentinel file after the first echo, then sleeps.
+        let sentinel_str = sentinel.display();
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
-                "command": "for i in $(seq 1 5); do echo line_$i; sleep 0.1; done; sleep 5"
+                "command": format!(
+                    "echo line_1; touch {sentinel_str}; sleep 0.1; echo line_2; sleep 10"
+                )
             }),
         )
         .await;
