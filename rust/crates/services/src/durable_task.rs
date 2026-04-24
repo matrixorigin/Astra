@@ -2554,29 +2554,58 @@ impl MatrixOneDurableTaskLifecycle {
         let criteria_json = serde_json::to_string(&contract.global_verification)
             .map_err(|e| format!("criteria json: {e}"))?;
 
-        sqlx::query(
-            "INSERT INTO task_contracts \
-             (contract_id, task_id, session_id, user_id, goal, scope_json, \
-              subtasks_json, criteria_json, version, status, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE \
-             subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
-             scope_json = VALUES(scope_json), version = VALUES(version), \
-             status = VALUES(status), updated_at = NOW()",
+        // Optimistic locking: try UPDATE with version guard first.
+        // If no row matched (new contract or version mismatch), fall back to INSERT.
+        let prev_version = contract.version.saturating_sub(1) as i32;
+        let updated = sqlx::query(
+            "UPDATE task_contracts SET \
+             subtasks_json = ?, criteria_json = ?, scope_json = ?, \
+             version = ?, status = ?, updated_at = NOW() \
+             WHERE contract_id = ? AND version = ?",
         )
-        .bind(&contract.contract_id)
-        .bind(&contract.task_id)
-        .bind("") // session_id filled by caller context
-        .bind("") // user_id filled by caller context
-        .bind(&contract.goal)
-        .bind(&scope_json)
         .bind(&subtasks_json)
         .bind(&criteria_json)
+        .bind(&scope_json)
         .bind(contract.version as i32)
         .bind(contract.status.as_str())
+        .bind(&contract.contract_id)
+        .bind(prev_version)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("persist_contract: {e}"))?;
+        .map_err(|e| format!("persist_contract update: {e}"))?;
+
+        if updated.rows_affected() == 0 {
+            // Either new contract or version conflict. Try INSERT; if duplicate, it's a conflict.
+            let insert_result = sqlx::query(
+                "INSERT INTO task_contracts \
+                 (contract_id, task_id, session_id, user_id, goal, scope_json, \
+                  subtasks_json, criteria_json, version, status, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+            )
+            .bind(&contract.contract_id)
+            .bind(&contract.task_id)
+            .bind("") // session_id
+            .bind("") // user_id
+            .bind(&contract.goal)
+            .bind(&scope_json)
+            .bind(&subtasks_json)
+            .bind(&criteria_json)
+            .bind(contract.version as i32)
+            .bind(contract.status.as_str())
+            .execute(&self.pool)
+            .await;
+
+            match insert_result {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("Duplicate") => {
+                    return Err(format!(
+                        "persist_contract: version conflict for {} (expected version {})",
+                        contract.contract_id, prev_version
+                    ));
+                }
+                Err(e) => return Err(format!("persist_contract insert: {e}")),
+            }
+        }
         Ok(())
     }
 
@@ -2593,29 +2622,57 @@ impl MatrixOneDurableTaskLifecycle {
         let criteria_json = serde_json::to_string(&contract.global_verification)
             .map_err(|e| format!("criteria json: {e}"))?;
 
-        sqlx::query(
-            "INSERT INTO task_contracts \
-             (contract_id, task_id, session_id, user_id, goal, scope_json, \
-              subtasks_json, criteria_json, version, status, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE \
-             subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
-             scope_json = VALUES(scope_json), version = VALUES(version), \
-             status = VALUES(status), updated_at = NOW()",
+        let prev_version = contract.version.saturating_sub(1) as i32;
+        let updated = sqlx::query(
+            "UPDATE task_contracts SET \
+             subtasks_json = ?, criteria_json = ?, scope_json = ?, \
+             version = ?, status = ?, session_id = ?, user_id = ?, updated_at = NOW() \
+             WHERE contract_id = ? AND version = ?",
         )
-        .bind(&contract.contract_id)
-        .bind(&contract.task_id)
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&contract.goal)
-        .bind(&scope_json)
         .bind(&subtasks_json)
         .bind(&criteria_json)
+        .bind(&scope_json)
         .bind(contract.version as i32)
         .bind(contract.status.as_str())
+        .bind(session_id)
+        .bind(user_id)
+        .bind(&contract.contract_id)
+        .bind(prev_version)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("persist_contract: {e}"))?;
+        .map_err(|e| format!("persist_contract update: {e}"))?;
+
+        if updated.rows_affected() == 0 {
+            let insert_result = sqlx::query(
+                "INSERT INTO task_contracts \
+                 (contract_id, task_id, session_id, user_id, goal, scope_json, \
+                  subtasks_json, criteria_json, version, status, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+            )
+            .bind(&contract.contract_id)
+            .bind(&contract.task_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(&contract.goal)
+            .bind(&scope_json)
+            .bind(&subtasks_json)
+            .bind(&criteria_json)
+            .bind(contract.version as i32)
+            .bind(contract.status.as_str())
+            .execute(&self.pool)
+            .await;
+
+            match insert_result {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("Duplicate") => {
+                    return Err(format!(
+                        "persist_contract: version conflict for {} (expected version {})",
+                        contract.contract_id, prev_version
+                    ));
+                }
+                Err(e) => return Err(format!("persist_contract insert: {e}")),
+            }
+        }
         Ok(())
     }
 
@@ -3032,29 +3089,29 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             let criteria_json = serde_json::to_string(&contract.global_verification)
                 .map_err(|e| format!("criteria json: {e}"))?;
 
-            sqlx::query(
-                "INSERT INTO task_contracts \
-                 (contract_id, task_id, session_id, user_id, goal, scope_json, \
-                  subtasks_json, criteria_json, version, status, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
-                 ON DUPLICATE KEY UPDATE \
-                 subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
-                 scope_json = VALUES(scope_json), version = VALUES(version), \
-                 status = VALUES(status), updated_at = NOW()",
+            let updated = sqlx::query(
+                "UPDATE task_contracts SET \
+                 subtasks_json = ?, criteria_json = ?, scope_json = ?, \
+                 version = ?, status = ?, updated_at = NOW() \
+                 WHERE contract_id = ? AND version = ?",
             )
-            .bind(&contract.contract_id)
-            .bind(&contract.task_id)
-            .bind("")
-            .bind("")
-            .bind(&contract.goal)
-            .bind(&scope_json)
             .bind(&subtasks_json)
             .bind(&criteria_json)
+            .bind(&scope_json)
             .bind(contract.version as i32)
             .bind(contract.status.as_str())
+            .bind(&contract.contract_id)
+            .bind((contract.version.saturating_sub(1)) as i32)
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("persist_contract in tx: {e}"))?;
+            if updated.rows_affected() == 0 {
+                return Err(format!(
+                    "persist_contract in tx: version conflict for {} (expected version {})",
+                    contract.contract_id,
+                    contract.version.saturating_sub(1)
+                ));
+            }
         }
 
         tx.commit()
@@ -7620,6 +7677,58 @@ Time:        3.456 s
         assert!(
             body.contains("tokio::time::timeout") || body.contains("time::timeout"),
             "run_shell_cmd_buffered must wrap spawn_blocking in tokio::time::timeout"
+        );
+    }
+
+    /// P1-E: persist_contract must use optimistic locking (WHERE version = ?).
+    /// No ON DUPLICATE KEY UPDATE without version guard.
+    #[test]
+    fn persist_contract_uses_optimistic_locking() {
+        let source = include_str!("durable_task.rs");
+        let impl_start = source
+            .find("impl MatrixOneDurableTaskLifecycle {")
+            .expect("impl must exist");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let impl_source = &source[impl_start..test_start];
+
+        // No persist_contract should use ON DUPLICATE KEY UPDATE (no version guard)
+        let persist_fns: Vec<&str> = impl_source
+            .match_indices("fn persist_contract")
+            .map(|(i, _)| {
+                let end = impl_source[i..]
+                    .find("\n    async fn ")
+                    .map(|p| i + p)
+                    .unwrap_or(impl_source.len());
+                &impl_source[i..end]
+            })
+            .collect();
+        for body in &persist_fns {
+            assert!(
+                !body.contains("ON DUPLICATE KEY UPDATE"),
+                "persist_contract must not use ON DUPLICATE KEY UPDATE — use UPDATE WHERE version = ? instead"
+            );
+        }
+
+        // All persist_contract variants must include version guard
+        for body in &persist_fns {
+            assert!(
+                body.contains("AND version = ?"),
+                "persist_contract must use optimistic locking (WHERE ... AND version = ?)"
+            );
+        }
+
+        // Also check the verify_subtask transaction path
+        let verify_start = impl_source
+            .find("async fn verify_subtask")
+            .expect("verify_subtask must exist");
+        let verify_end = impl_source[verify_start..]
+            .find("\n    async fn ")
+            .map(|p| verify_start + p)
+            .unwrap_or(impl_source.len());
+        let verify_body = &impl_source[verify_start..verify_end];
+        assert!(
+            !verify_body.contains("ON DUPLICATE KEY UPDATE"),
+            "verify_subtask must not use ON DUPLICATE KEY UPDATE"
         );
     }
 }

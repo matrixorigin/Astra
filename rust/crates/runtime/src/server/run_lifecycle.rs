@@ -1140,6 +1140,7 @@ fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String>
 pub enum RunStatus {
     Running,
     Paused,
+    Waiting,
     Completed,
     Failed,
     Cancelled,
@@ -1150,6 +1151,7 @@ impl RunStatus {
         match self {
             Self::Running => STATUS_RUNNING,
             Self::Paused => STATUS_PAUSED,
+            Self::Waiting => STATUS_WAITING,
             Self::Completed => STATUS_COMPLETED,
             Self::Failed => STATUS_FAILED,
             Self::Cancelled => STATUS_CANCELLED,
@@ -1160,15 +1162,17 @@ impl RunStatus {
     ///
     /// Rules:
     /// - Terminal states (Completed, Failed, Cancelled) cannot transition to anything.
-    /// - Running → Paused, Completed, Failed, Cancelled
+    /// - Running → Paused, Waiting, Completed, Failed, Cancelled
     /// - Paused → Running, Cancelled, Failed
+    /// - Waiting → Running, Cancelled, Failed (external input resumes to Running)
     pub fn try_transition(&self, next: &RunStatus) -> Result<(), String> {
         let allowed = match self {
             Self::Running => matches!(
                 next,
-                Self::Paused | Self::Completed | Self::Failed | Self::Cancelled
+                Self::Paused | Self::Waiting | Self::Completed | Self::Failed | Self::Cancelled
             ),
             Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Waiting => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
             Self::Completed | Self::Failed | Self::Cancelled => false,
         };
         if allowed {
@@ -1552,14 +1556,10 @@ impl AgenticRunLifecycleService {
                 Ok(AgenticLoopOutcome::Waiting(w)) => {
                     let msg = format!("waiting: {w}");
                     events.push(json!({
-                        "event_type": "run_error",
-                        "data": {"error": msg.clone()}
+                        "event_type": "run_waiting",
+                        "data": {"reason": msg.clone()}
                     }));
-                    events.push(json!({
-                        "event_type": "run_finished",
-                        "data": usage.clone(),
-                    }));
-                    (RunStatus::Failed, Some(msg))
+                    (RunStatus::Waiting, Some(msg))
                 }
                 Err(err) => {
                     let msg = err.to_string();
@@ -2295,7 +2295,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let terminal_events = terminal_events_for_persistence(&events);
 
             // Schedule eviction of the terminal run from the in-memory cache.
-            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            // Waiting runs are NOT evicted — they need to remain in memory for resume.
+            if final_status != RunStatus::Waiting {
+                Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            }
 
             // Publish terminal run state before best-effort post-run side effects
             // so background observers do not stay stuck in "running" because a
@@ -2609,7 +2612,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Schedule eviction of the terminal run from the in-memory cache.
-            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            // Waiting runs are NOT evicted — they need to remain in memory for resume.
+            if final_status != RunStatus::Waiting {
+                Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            }
 
             // Record tokens consumed regardless of cancel — cancelled runs still
             // consumed tokens and must count toward the daily budget.
@@ -2635,20 +2641,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &bg_run_id,
                         "status"
                     );
-                    astra_core::log_persist!(
-                        engine
-                            .persist_usage(
-                                &bg_run_id,
-                                state.total_prompt,
-                                state.total_completion,
-                                state.total_tool_calls,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "usage"
-                    );
                 }
+            }
+
+            // Persist usage unconditionally — cancelled runs still consumed tokens
+            // and must have accurate usage in durable store for billing/audit.
+            if let Some(engine) = &run_engine {
+                astra_core::log_persist!(
+                    engine
+                        .persist_usage(
+                            &bg_run_id,
+                            state.total_prompt,
+                            state.total_completion,
+                            state.total_tool_calls,
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "usage"
+                );
             }
 
             // Persist terminal events to durable store.
@@ -2826,6 +2837,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         );
                     }
                 }
+                // Cascade cancellation to delegation sub-runs.
+                if mutated {
+                    if let Some(de) = &self.delegation_engine {
+                        de.cancel_children_of(&run_id).await;
+                    }
+                }
                 return Ok(CancelRunRecord {
                     run_id,
                     status: final_status,
@@ -2834,7 +2851,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return if matches!(run.status.as_str(), STATUS_RUNNING | STATUS_PAUSED) {
+            return if matches!(
+                run.status.as_str(),
+                STATUS_RUNNING | STATUS_PAUSED | STATUS_WAITING
+            ) {
                 Err(Self::run_control_state_unavailable("cancellation"))
             } else {
                 Ok(CancelRunRecord {
@@ -5367,6 +5387,124 @@ mod tests {
             unique.len(),
             5,
             "no duplicate run_ids across pages — pagination must be deterministic"
+        );
+    }
+
+    /// P1-A: RunStatus must have a Waiting variant that is non-terminal.
+    /// Runs needing external input must not be killed as Failed.
+    #[test]
+    fn waiting_is_non_terminal_status() {
+        // Running → Waiting is valid
+        assert!(
+            RunStatus::Running
+                .try_transition(&RunStatus::Waiting)
+                .is_ok(),
+            "Running → Waiting must be allowed"
+        );
+        // Waiting → Running is valid (resume after input)
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::Running)
+                .is_ok(),
+            "Waiting → Running must be allowed (resume)"
+        );
+        // Waiting → Cancelled is valid
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::Cancelled)
+                .is_ok(),
+            "Waiting → Cancelled must be allowed"
+        );
+        // Waiting → Failed is valid (timeout)
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::Failed)
+                .is_ok(),
+            "Waiting → Failed must be allowed"
+        );
+        // Waiting serializes as "waiting"
+        assert_eq!(RunStatus::Waiting.as_str(), "waiting");
+    }
+
+    /// P1-A: finalize_run_events must NOT map Waiting to Failed.
+    #[test]
+    fn finalize_run_events_does_not_kill_waiting_runs() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("fn finalize_run_events(")
+            .expect("finalize_run_events must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+
+        // The Waiting arm must NOT produce RunStatus::Failed
+        let waiting_arm = fn_body
+            .find("Waiting(w)")
+            .expect("Waiting arm must exist in finalize_run_events");
+        let arm_body = &fn_body[waiting_arm..waiting_arm + 300.min(fn_body.len() - waiting_arm)];
+        assert!(
+            !arm_body.contains("RunStatus::Failed"),
+            "Waiting outcome must NOT be mapped to Failed — use RunStatus::Waiting"
+        );
+        assert!(
+            arm_body.contains("RunStatus::Waiting"),
+            "Waiting outcome must map to RunStatus::Waiting"
+        );
+        // Must NOT emit run_error for Waiting (it's not an error)
+        assert!(
+            !arm_body.contains("run_error"),
+            "Waiting outcome must not emit run_error event"
+        );
+    }
+
+    /// P1-F: stream_chat must persist usage unconditionally (not gated by persist_terminal_state).
+    /// Cancelled runs still consumed tokens and must have accurate durable records.
+    #[test]
+    fn stream_chat_persists_usage_unconditionally() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find the stream_chat method
+        let fn_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+
+        // persist_usage must NOT be inside the persist_terminal_state block.
+        // Find the persist_terminal_state block and verify persist_usage is outside it.
+        let guard_pos = fn_body
+            .find("if persist_terminal_state {")
+            .expect("persist_terminal_state guard must exist");
+        // Find the closing brace of the guard block
+        let guard_block = &fn_body[guard_pos..];
+        let mut depth = 0;
+        let mut guard_end = 0;
+        for (i, c) in guard_block.char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    guard_end = guard_pos + i + 1;
+                    break;
+                }
+            }
+        }
+        let guard_body = &fn_body[guard_pos..guard_end];
+        assert!(
+            !guard_body.contains("persist_usage"),
+            "persist_usage must NOT be inside persist_terminal_state guard — \
+             cancelled stream_chat runs must still persist usage for billing/audit"
+        );
+
+        // persist_usage must exist somewhere in stream_chat
+        assert!(
+            fn_body.contains("persist_usage"),
+            "stream_chat must call persist_usage"
         );
     }
 }

@@ -23,6 +23,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use crate::verification::VerifierKind;
 
@@ -122,10 +123,13 @@ impl TaskPlan {
         if self.subtasks.is_empty() {
             return 0;
         }
+        // Only count successfully completed subtasks as progress.
+        // Failed/Cancelled subtasks are NOT progress — they represent work that
+        // needs to be retried or was abandoned.
         let done = self
             .subtasks
             .iter()
-            .filter(|st| st.status.is_terminal())
+            .filter(|st| st.status == TaskStatus::Completed)
             .count();
         ((done as f64 / self.subtasks.len() as f64) * 100.0) as u32
     }
@@ -599,28 +603,52 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
-        if status.is_terminal() {
-            sqlx::query(
+        // Atomic transition guard: the WHERE clause rejects updates from terminal states,
+        // eliminating the TOCTOU race of a separate SELECT + UPDATE.
+        let terminal_guard = "AND status NOT IN ('completed', 'failed', 'cancelled')";
+
+        let result = if status.is_terminal() {
+            sqlx::query(&format!(
                 "UPDATE agent_tasks \
                  SET status = ?, updated_at = NOW(), completed_at = NOW() \
-                 WHERE task_id = ?",
-            )
+                 WHERE task_id = ? {terminal_guard}",
+            ))
             .bind(status.as_str())
             .bind(task_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("update_status: {e}"))?;
+            .map_err(|e| format!("update_status: {e}"))?
         } else {
-            sqlx::query(
+            sqlx::query(&format!(
                 "UPDATE agent_tasks \
                  SET status = ?, updated_at = NOW(), completed_at = NULL \
-                 WHERE task_id = ?",
-            )
+                 WHERE task_id = ? {terminal_guard}",
+            ))
             .bind(status.as_str())
             .bind(task_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("update_status: {e}"))?;
+            .map_err(|e| format!("update_status: {e}"))?
+        };
+
+        if result.rows_affected() == 0 {
+            // Either task doesn't exist or is in a terminal state.
+            let current_row = sqlx::query("SELECT status FROM agent_tasks WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("update_status check: {e}"))?;
+            if let Some(row) = current_row {
+                let current_str: String = row.try_get("status").unwrap_or_default();
+                let current = TaskStatus::parse_status(&current_str);
+                if current.is_terminal() && status != current {
+                    return Err(format!(
+                        "invalid task status transition: {} → {} (terminal states are immutable)",
+                        current.as_str(),
+                        status.as_str()
+                    ));
+                }
+            }
         }
         if status.is_terminal() {
             tracing::info!(
@@ -2512,9 +2540,10 @@ mod tests {
             ],
             notes: None,
         };
-        // Failed is terminal, so progress is 50%
-        assert_eq!(plan.progress_pct(), 50);
-        // But items_done only counts Completed
+        // Failed is NOT progress — only Completed counts.
+        // A failed subtask needs retry or manual intervention.
+        assert_eq!(plan.progress_pct(), 0);
+        // items_done only counts Completed
         assert_eq!(plan.items_done(), 0);
     }
 
@@ -2632,5 +2661,73 @@ mod tests {
         assert!(ls.avg_rating.is_none());
         assert_eq!(ls.avg_replan_count, 0.0);
         assert_eq!(ls.inferred_success_rate, 0.0);
+    }
+
+    /// P2-B: update_status must validate state transitions.
+    /// Terminal states (Completed, Failed, Cancelled) must be immutable.
+    #[test]
+    fn update_status_validates_transitions() {
+        let source = include_str!("task_orchestrator.rs");
+        let impl_start = source
+            .find("impl TaskOrchestrator for MatrixOneTaskOrchestrator")
+            .expect("impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find("async fn update_status")
+            .expect("update_status must exist");
+        let fn_end = impl_source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        let fn_body = &impl_source[fn_start..fn_end];
+        // Must use atomic WHERE guard to prevent terminal state overwrites
+        assert!(
+            fn_body.contains("NOT IN"),
+            "update_status must use atomic WHERE guard against terminal states"
+        );
+        assert!(
+            fn_body.contains("invalid task status transition"),
+            "update_status must reject invalid transitions with descriptive error"
+        );
+    }
+
+    /// P2-C: progress_pct must only count Completed subtasks, not Failed/Cancelled.
+    #[test]
+    fn progress_pct_excludes_failed_and_cancelled() {
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "1".into(),
+                    title: "a".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "2".into(),
+                    title: "b".into(),
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "3".into(),
+                    title: "c".into(),
+                    status: TaskStatus::Cancelled,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "4".into(),
+                    title: "d".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Only 1 of 4 is Completed → 25%
+        assert_eq!(
+            plan.progress_pct(),
+            25,
+            "only Completed subtasks count as progress (not Failed/Cancelled)"
+        );
     }
 }
