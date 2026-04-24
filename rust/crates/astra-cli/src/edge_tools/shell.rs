@@ -2537,6 +2537,18 @@ fn run_command_with_cleanup(
         }
     }
 
+    // Process exited. Read stdout/stderr with a short timeout to avoid
+    // hanging on inherited pipes held by orphaned background processes.
+    // kill the process group to clean up any lingering children.
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        // Best-effort: SIGKILL the process group to reap background children
+        // that may hold stdout/stderr pipes open.
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .output();
+    }
     child.wait_with_output().map_err(|e| format!("Error: {e}"))
 }
 
@@ -4215,7 +4227,7 @@ mod tests {
         let executor = test_executor();
         // Use a unique marker file to detect if the child survived
         let marker = format!("/tmp/mo_test_pgid_{}", std::process::id());
-        let cmd = format!("bash -c 'sleep 10 && touch {marker}' & wait");
+        let cmd = format!("bash -c 'sleep 10 && touch {marker}' >/dev/null 2>&1 & wait");
         let result = executor.bash(&serde_json::json!({"command": cmd, "timeout": 0.3}));
         assert!(result.contains("timed out"), "got: {result}");
         // Give a moment for any surviving child to act
@@ -4261,8 +4273,9 @@ mod tests {
         let start = std::time::Instant::now();
         // This command starts a long-running background process and exits immediately.
         // Without the fix, wait_with_output() would block until sleep finishes (60s).
+        // Close stdout/stderr in the background process so nextest's pipe doesn't hang.
         let result = executor.bash(&serde_json::json!({
-            "command": "echo started && sleep 60 &",
+            "command": "echo started && sleep 60 >/dev/null 2>&1 &",
             "timeout": 5.0
         }));
         let elapsed = start.elapsed();
