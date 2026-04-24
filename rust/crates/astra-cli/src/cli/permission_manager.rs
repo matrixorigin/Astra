@@ -35,7 +35,7 @@ pub(super) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     {
         Some(
             "Invoke the binary directly with explicit arguments instead of wrapping in \
-             `eval`/backticks/`$(...)`; avoid chained control operators (`;`, `&&`, `||`).",
+             `eval`/backticks/`$(...)`. The sandbox validates each command segment independently.",
         )
     } else if lower.contains("blocked by default") {
         Some(
@@ -1817,6 +1817,12 @@ mod tests {
         assert!(
             out.contains("eval"),
             "safe alt must mention eval specifically: {out}"
+        );
+        // The hint must NOT tell the user to avoid `&&` — chained operators are
+        // perfectly legal and the sandbox validates each segment independently.
+        assert!(
+            !out.contains("&&"),
+            "safe alt must not discourage legal `&&` chains: {out}"
         );
     }
 

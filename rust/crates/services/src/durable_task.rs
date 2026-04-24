@@ -958,7 +958,9 @@ impl VerificationRunner {
                 };
                 let content =
                     std::fs::read_to_string(&resolved).map_err(|e| format!("read {file}: {e}"))?;
-                let found = content.contains(pattern);
+                let found = regex::Regex::new(pattern)
+                    .map(|re| re.is_match(&content))
+                    .unwrap_or_else(|_| content.contains(pattern));
                 let passed = found == *should_match;
                 let evidence = if found {
                     format!("pattern '{pattern}' found in {file}")
@@ -4627,6 +4629,70 @@ mod tests {
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed);
+    }
+
+    // ── Regression: GrepCheck uses literal contains() instead of regex ──
+    //
+    // Acceptance criteria patterns like '@keyframes|animation' use | as OR
+    // but contains() treats it literally.  The verifier must interpret the
+    // pattern as a regex so that alternation works.
+
+    #[tokio::test]
+    async fn verification_runner_grep_check_regex_alternation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("style.css"),
+            ".box { animation: fadeIn 0.3s ease; }",
+        )
+        .unwrap();
+
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+
+        // Pattern uses | as regex OR — should match 'animation'
+        let criterion = VerificationCriterion {
+            id: "regex1".into(),
+            description: "has keyframes or animation".into(),
+            verifier: VerifierKind::GrepCheck {
+                file: "style.css".into(),
+                pattern: "@keyframes|animation".into(),
+                should_match: true,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(
+            result.passed,
+            "regex alternation '@keyframes|animation' must match 'animation': {:?}",
+            result.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_runner_grep_check_regex_no_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("plain.txt"), "hello world").unwrap();
+
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+
+        let criterion = VerificationCriterion {
+            id: "regex2".into(),
+            description: "no foo or bar".into(),
+            verifier: VerifierKind::GrepCheck {
+                file: "plain.txt".into(),
+                pattern: "foo|bar".into(),
+                should_match: true,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(
+            !result.passed,
+            "regex 'foo|bar' must NOT match 'hello world'"
+        );
     }
 
     #[tokio::test]

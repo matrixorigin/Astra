@@ -246,6 +246,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             tool_budget_override: state.tool_budget_override,
             interaction_mode,
             turn_policy: &mut state.last_turn_policy,
+            skill_allowed_tools: state
+                .skills
+                .allowed_tools
+                .as_ref()
+                .map(|s| s.iter().cloned().collect::<Vec<_>>()),
             skill_continuation: state.skill_produced_output,
             tool_cache: &mut self.tool_cache,
             previous_confidence_fallback: state

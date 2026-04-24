@@ -284,6 +284,9 @@ struct PrepareChatTurnRequest<'a> {
     tool_budget_override: Option<u32>,
     interaction_mode: TurnInteractionMode,
     turn_policy: &'a mut TurnInteractionPolicy,
+    /// Skill-scoped tool allowlist — tools the active skill declared as needed.
+    /// After the selector picks tools, any allowed tools it missed are force-injected.
+    skill_allowed_tools: Option<Vec<String>>,
     previous_confidence_fallback:
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
@@ -584,6 +587,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         )
     };
     log_chat_turn_timing_phase(timing, "tool_selector_resolve_schemas", &mut mark);
+
+    // Force-inject any skill allowed_tools that the selector missed.
+    let mut turn_schemas = turn_schemas;
+    let mut selection_report = selection_report;
+    if let Some(ref allowed) = ctx.skill_allowed_tools {
+        astra_runtime::turn::tool_schema_prune::inject_skill_allowed_tools(
+            &mut turn_schemas,
+            &mut selection_report,
+            allowed,
+            ctx.all_schemas,
+        );
+    }
 
     let selected_tool_costs: Vec<(String, u32)> = selection_report
         .tools_selected
@@ -891,6 +906,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub tool_budget_override: Option<u32>,
     pub interaction_mode: TurnInteractionMode,
     pub turn_policy: &'a mut TurnInteractionPolicy,
+    /// Skill-scoped tool allowlist — tools the active skill declared as needed.
+    /// After the selector picks tools, any allowed tools it missed are force-injected.
+    pub skill_allowed_tools: Option<Vec<String>>,
     /// When true, this is a continuation turn after a skill has already produced output.
     /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
     pub skill_continuation: bool,
@@ -1024,6 +1042,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_budget_override,
         interaction_mode,
         turn_policy,
+        skill_allowed_tools,
         skill_continuation,
         tool_cache,
         previous_confidence_fallback,
@@ -1073,6 +1092,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             tool_budget_override,
             interaction_mode,
             turn_policy,
+            skill_allowed_tools,
             previous_confidence_fallback,
             round_index,
             denial_pressure: perm_manager.denial_pressure(),
@@ -1380,6 +1400,51 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
         assert!(policy.visible_tool_names.is_empty());
         assert!(policy.evidence_tool_names.is_empty());
         assert!(!policy.allow_ask_user);
+    }
+
+    // ── Regression: skill allowed_tools not force-included (session c3dea07a) ──
+    //
+    // When a skill declares allowed_tools (e.g. review-changes allows grep, glob),
+    // the selector may not pick them by relevance. The skill instructions reference
+    // these tools, so they must be present in the final selection.
+
+    #[test]
+    fn skill_allowed_tools_injected_into_selection() {
+        use astra_runtime::tool_registry::SelectionReport;
+        use astra_runtime::turn::tool_schema_prune::inject_skill_allowed_tools;
+
+        let all_schemas = [
+            schema("bash"),
+            schema("read_file"),
+            schema("grep"),
+            schema("glob"),
+        ];
+
+        // Selector picked bash and read_file, but not grep/glob
+        let mut turn_schemas = vec![schema("bash"), schema("read_file")];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into(), "read_file".into()],
+            selected_count: 2,
+            budget_used: 0,
+            budget_total: 0,
+        };
+
+        // Skill allows bash, read_file, grep, glob
+        let allowed: Vec<String> = vec![
+            "bash".into(),
+            "read_file".into(),
+            "grep".into(),
+            "glob".into(),
+        ];
+
+        let injected =
+            inject_skill_allowed_tools(&mut turn_schemas, &mut report, &allowed, &all_schemas);
+
+        assert_eq!(injected, 2);
+        assert_eq!(report.selected_count, 4);
+        assert!(report.tools_selected.contains(&"grep".into()));
+        assert!(report.tools_selected.contains(&"glob".into()));
+        assert_eq!(turn_schemas.len(), 4);
     }
 }
 

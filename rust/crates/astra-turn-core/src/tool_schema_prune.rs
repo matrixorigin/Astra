@@ -227,6 +227,35 @@ pub fn pin_invoked_tool_schemas(
     pinned
 }
 
+/// Force-inject skill `allowed_tools` that the selector missed.
+///
+/// The selector picks tools by relevance, but a skill's `allowed_tools` are
+/// contractual — the skill instructions reference them, so they must be present.
+/// Mutates `selected` and `report` in-place, returning the count of injected schemas.
+pub fn inject_skill_allowed_tools(
+    selected: &mut Vec<Value>,
+    report: &mut SelectionReport,
+    allowed_tools: &[String],
+    all_schemas: &[Value],
+) -> u32 {
+    let selected_names: HashSet<String> = report.tools_selected.iter().cloned().collect();
+    let mut injected = 0u32;
+    for name in allowed_tools {
+        if !selected_names.contains(name.as_str()) {
+            if let Some(schema) = all_schemas
+                .iter()
+                .find(|s| schema_tool_name(s) == Some(name))
+            {
+                selected.push(schema.clone());
+                report.tools_selected.push(name.clone());
+                report.selected_count += 1;
+                injected += 1;
+            }
+        }
+    }
+    injected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +563,49 @@ mod tests {
             1,
             "git_diff should appear once in report"
         );
+    }
+
+    // ── inject_skill_allowed_tools ────────────────────────────
+
+    #[test]
+    fn inject_skill_tools_adds_missing() {
+        let all = vec![
+            make_tool_schema("bash", "run", false),
+            make_tool_schema("grep", "search", false),
+            make_tool_schema("glob", "find", false),
+        ];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let allowed: Vec<String> = vec!["bash".into(), "grep".into(), "glob".into()];
+
+        let injected = inject_skill_allowed_tools(&mut selected, &mut report, &allowed, &all);
+
+        assert_eq!(injected, 2);
+        assert_eq!(selected.len(), 3);
+        assert!(report.tools_selected.contains(&"grep".to_string()));
+        assert!(report.tools_selected.contains(&"glob".to_string()));
+    }
+
+    #[test]
+    fn inject_skill_tools_skips_unknown() {
+        let all = vec![make_tool_schema("bash", "run", false)];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = SelectionReport {
+            tools_selected: vec!["bash".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 100,
+        };
+        let allowed: Vec<String> = vec!["bash".into(), "nonexistent_tool".into()];
+
+        let injected = inject_skill_allowed_tools(&mut selected, &mut report, &allowed, &all);
+
+        assert_eq!(injected, 0);
+        assert_eq!(selected.len(), 1);
     }
 }
