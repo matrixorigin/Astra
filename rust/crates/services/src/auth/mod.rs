@@ -925,6 +925,54 @@ impl AuthService for UnconfiguredAuthService {
     }
 }
 
+/// Stub auth service that accepts any Bearer token and returns a fixed test user.
+/// Intended for integration/contract tests where JWT validation is not under test.
+pub struct StubAuthService;
+
+#[async_trait]
+impl AuthService for StubAuthService {
+    async fn register(
+        &self,
+        _request: AuthRegisterRequestData,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn login(
+        &self,
+        _request: AuthLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn refresh(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn logout(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(StatusCode::NOT_IMPLEMENTED, "stub"))
+    }
+
+    async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        let _token = bearer_token(headers)?;
+        Ok(AuthUserRecord {
+            user_id: "test-user".into(),
+            username: "test-user".into(),
+            email: "test@test.com".into(),
+            display_name: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -114,17 +114,7 @@ pub(super) async fn completions_handler(
         &resolved.provider,
     );
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("HTTP client error: {e}"),
-            )
-        })?;
+    let client = &state.http_client;
 
     // 4. Forward to upstream LLM provider
     let mut req = client.post(&url).header("content-type", "application/json");

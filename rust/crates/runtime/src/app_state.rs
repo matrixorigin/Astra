@@ -102,6 +102,9 @@ pub struct AppState {
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool,
+    /// Shared HTTP client for upstream LLM proxy requests (completions handler).
+    /// Reuses connection pool and TLS state across requests.
+    pub(crate) http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -196,6 +199,12 @@ impl AppState {
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
             edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool::new(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("failed to build shared HTTP client"),
         }
     }
 

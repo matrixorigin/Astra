@@ -1,18 +1,5 @@
 use super::*;
 
-pub(super) fn require_bearer_auth(
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if bearer_token(headers).is_ok() {
-        Ok(())
-    } else {
-        Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "Not authenticated",
-        ))
-    }
-}
-
 pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
     let body = events
         .into_iter()

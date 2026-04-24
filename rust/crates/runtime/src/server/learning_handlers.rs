@@ -10,9 +10,10 @@ pub(super) async fn learning_health_handler() -> Json<LearningHealthResponse> {
 }
 
 pub(super) async fn learning_signals_handler(
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<LearningSignalsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_bearer_auth(&headers)?;
+    let _user = state.auth_service.current_user(&headers).await?;
 
     Ok(Json(LearningSignalsResponse {
         signal_types: vec![
@@ -31,9 +32,10 @@ pub(super) async fn learning_signals_handler(
 }
 
 pub(super) async fn learning_stats_handler(
+    State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<LearningStatsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_bearer_auth(&headers)?;
+    let _user = state.auth_service.current_user(&headers).await?;
 
     Ok(Json(LearningStatsResponse {
         total_learnings: 0,
@@ -55,10 +57,11 @@ pub(super) async fn learning_stats_handler(
 }
 
 pub(super) async fn learning_trigger_handler(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<LearningTriggerRequest>,
 ) -> Result<Json<LearningTriggerResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_bearer_auth(&headers)?;
+    let _user = state.auth_service.current_user(&headers).await?;
 
     if !(1..=30).contains(&payload.days) {
         return Err((
@@ -82,4 +85,25 @@ pub(super) async fn learning_trigger_handler(
         message: None,
         model_version: "v1.0",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    /// P0-D: Learning handlers must use current_user (JWT validation),
+    /// not require_bearer_auth (header-only check).
+    #[test]
+    fn learning_handlers_use_current_user() {
+        let source = include_str!("learning_handlers.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains("require_bearer_auth"),
+            "learning handlers must not use require_bearer_auth (no JWT validation)"
+        );
+        let current_user_count = prod_code.matches("current_user").count();
+        assert!(
+            current_user_count >= 3,
+            "all 3 authenticated learning handlers must use current_user, found {current_user_count}"
+        );
+    }
 }

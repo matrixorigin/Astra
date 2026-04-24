@@ -118,7 +118,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
             );
         }
         for (key, value) in hook_output.env_vars {
-            unsafe { std::env::set_var(&key, &value) };
+            astra_core::session_env_overlay::set(&key, &value);
         }
     }
 
@@ -803,5 +803,23 @@ mod tests {
 
         assert_eq!(current_agentic_step(&state), 50);
         assert_eq!(session_turn_number(&state), 1);
+    }
+
+    /// P1-D: Production code must not use unsafe set_var.
+    /// Hook env vars must go through session_env_overlay instead.
+    #[test]
+    fn no_unsafe_set_var_in_production() {
+        let source = include_str!("agentic_loop_lifecycle.rs");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        assert!(
+            !prod_code.contains("std::env::set_var"),
+            "production code must not use std::env::set_var (UB in multi-threaded context); \
+             use astra_core::session_env_overlay::set instead"
+        );
+        assert!(
+            prod_code.contains("session_env_overlay::set"),
+            "hook env vars must be set via session_env_overlay"
+        );
     }
 }

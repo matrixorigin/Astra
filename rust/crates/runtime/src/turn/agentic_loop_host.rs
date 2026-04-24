@@ -3940,13 +3940,13 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
 
-        // Verify env var was set
+        // Verify env var was set via session_env_overlay (not process env)
         assert_eq!(
-            std::env::var("ASTRA_TEST_HOOK_VAR").ok().as_deref(),
+            astra_core::session_env_overlay::get("ASTRA_TEST_HOOK_VAR").as_deref(),
             Some("session_active")
         );
         // Cleanup
-        unsafe { std::env::remove_var("ASTRA_TEST_HOOK_VAR") };
+        astra_core::session_env_overlay::remove("ASTRA_TEST_HOOK_VAR");
     }
 
     #[tokio::test]

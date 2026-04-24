@@ -332,6 +332,34 @@ pub async fn execute_parallel_round(
         "parallel_tool_exec round completed"
     );
 
+    // Fill any remaining None entries with synthetic error results.
+    // This handles the case where an outer JoinSet task panicked and
+    // the result was lost — the LLM must receive a result for every tool call.
+    for (idx, slot) in results.iter_mut().enumerate() {
+        if slot.is_none() {
+            let tc = &tool_calls[idx];
+            let call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .or_else(|| tc.get("name").and_then(|n| n.as_str()))
+                .unwrap_or("")
+                .to_string();
+            *slot = Some(ToolExecResult {
+                original_index: idx,
+                call_id,
+                tool_name,
+                content: "internal error: tool task panicked and result was lost".into(),
+                success: false,
+            });
+        }
+    }
+
     ParallelRoundOutcome {
         results: results.into_iter().flatten().collect(),
         parallel_count,
@@ -516,5 +544,41 @@ mod tests {
         assert_eq!(outcome.results.len(), 0);
         assert_eq!(outcome.parallel_count, 0);
         assert_eq!(outcome.sequential_count, 0);
+    }
+
+    /// P1-E: Results count must always equal tool_calls count, even if a task panics.
+    /// Verifies that panicked tasks produce synthetic error results instead of being dropped.
+    #[tokio::test]
+    async fn result_count_equals_tool_call_count() {
+        // 3 read-only tool calls: one will "fail" (return error), but all must produce results
+        let calls = vec![
+            json!({"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "c2", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "c3", "function": {"name": "read_file", "arguments": "{}"}}),
+        ];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let exec: ToolExecutorFn = Arc::new(move |_tc| {
+            let n = counter_clone.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 1 {
+                    // Simulate an error (not a panic — panics are caught by inner spawn)
+                    (
+                        "c2".into(),
+                        "read_file".into(),
+                        "error: file not found".into(),
+                        false,
+                    )
+                } else {
+                    ("ok".into(), "read_file".into(), "content".into(), true)
+                }
+            })
+        });
+        let outcome = execute_parallel_round(&calls, exec).await;
+        assert_eq!(
+            outcome.results.len(),
+            calls.len(),
+            "result count must equal tool_call count — no results may be silently dropped"
+        );
     }
 }

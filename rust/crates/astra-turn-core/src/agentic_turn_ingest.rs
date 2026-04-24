@@ -247,6 +247,12 @@ pub fn ingest_agentic_turn_stream(
     }
     *st.has_any_usage = *st.has_any_usage || snap.has_usage;
 
+    // Reset context window error counter on successful turn — prevents
+    // stale counter from escalating compaction on a later unrelated error.
+    if snap.error_message.is_none() {
+        *st.consecutive_context_window_errors = 0;
+    }
+
     if let Some(err) = snap.error_message {
         // Use pre-classified error_kind when available (from HostTurnResult),
         // falling back to string-based classification for SSE-path errors.
@@ -1100,5 +1106,77 @@ mod tests {
         );
         assert_eq!(pack.total_cache_read, 90); // only from turn 1
         assert_eq!(pack.total_cache_creation, 75); // only from turn 2
+    }
+
+    /// P1-B: consecutive_context_window_errors must reset to 0 on a successful
+    /// turn. Without this, a context error → success → later context error
+    /// escalates compaction unnecessarily.
+    #[test]
+    fn consecutive_context_window_errors_resets_on_success() {
+        let mut pack = Pack::new();
+        let session_id = None;
+        let run_id = None;
+
+        // Turn 1: context window error → counter should be 1
+        let err_msg = Some("maximum context length exceeded".to_string());
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &session_id,
+            run_id: &run_id,
+            full_text: "",
+            tool_calls: &[],
+            prompt_tokens: 100,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &err_msg,
+            error_kind: None,
+        };
+        let outcome = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));
+        assert_eq!(
+            pack.consecutive_context_window_errors, 1,
+            "counter must be 1 after context window error"
+        );
+
+        // Turn 2: successful turn (no error) → counter must reset to 0
+        let no_err: Option<String> = None;
+        let snap_ok = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &session_id,
+            run_id: &run_id,
+            full_text: "done",
+            tool_calls: &[],
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &no_err,
+            error_kind: None,
+        };
+        let outcome = ingest_agentic_turn_stream(
+            &snap_ok,
+            0,
+            |_| String::new(),
+            "done",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert!(matches!(outcome, AgenticTurnIngestOutcome::Break));
+        assert_eq!(
+            pack.consecutive_context_window_errors, 0,
+            "counter must reset to 0 after successful turn"
+        );
     }
 }

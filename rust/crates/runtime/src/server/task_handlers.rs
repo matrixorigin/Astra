@@ -69,8 +69,6 @@ pub(super) async fn get_task_handler(
     headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<Json<astra_services::TaskRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
-
     let user = state.auth_service.current_user(&headers).await?;
 
     let task = state

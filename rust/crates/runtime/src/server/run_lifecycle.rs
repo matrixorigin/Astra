@@ -1428,6 +1428,17 @@ impl AgenticRunLifecycleService {
         Arc::clone(&self.runs)
     }
 
+    /// Schedule removal of a terminal run from the in-memory cache after a
+    /// grace period. Clients have 5 minutes to poll final events before the
+    /// entry is evicted. This prevents unbounded memory growth.
+    fn schedule_run_eviction(runs: &Arc<RwLock<HashMap<String, RunState>>>, run_id: String) {
+        let runs = Arc::clone(runs);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            runs.write().await.remove(&run_id);
+        });
+    }
+
     fn build_tracked_run_state(
         run_id: String,
         session_id: String,
@@ -2238,7 +2249,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if run.status.try_transition(&RunStatus::Failed).is_ok() {
                             run.status = RunStatus::Failed;
                         }
+                        // Push terminal events so SSE clients see the failure.
+                        run.events.push(json!({
+                            "event_type": "run_error",
+                            "data": {"error": reason.clone()}
+                        }));
+                        run.events.push(json!({
+                            "event_type": "run_finished",
+                            "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
+                        }));
                     }
+                    // Clean up channels for this run.
+                    bg_approval_channels.lock().await.remove(&bg_run_id);
+                    bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                    bg_progress_channels.lock().await.remove(&bg_run_id);
                     if let Some(ref engine) = run_engine {
                         astra_core::log_persist!(
                             engine
@@ -2254,6 +2278,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             "budget_reject"
                         );
                     }
+                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
                     return;
                 }
             }
@@ -2268,6 +2293,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             bg_user_prompt_channels.lock().await.remove(&bg_run_id);
             bg_progress_channels.lock().await.remove(&bg_run_id);
             let terminal_events = terminal_events_for_persistence(&events);
+
+            // Schedule eviction of the terminal run from the in-memory cache.
+            Self::schedule_run_eviction(&runs, bg_run_id.clone());
 
             // Publish terminal run state before best-effort post-run side effects
             // so background observers do not stay stuck in "running" because a
@@ -2456,7 +2484,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
 
-        self.runs.write().await.insert(run_id.clone(), run_state);
+        // Guard: reject if this session already has an active (running/paused) run.
+        // Hold write lock across check+insert to prevent TOCTOU race.
+        {
+            let mut runs = self.runs.write().await;
+            let has_active = runs.values().any(|r| {
+                r.session_id == session_id
+                    && matches!(r.status, RunStatus::Running | RunStatus::Paused)
+            });
+            if has_active {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            runs.insert(run_id.clone(), run_state);
+        }
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
 
@@ -2543,56 +2586,72 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
-            flush_turn_observability(&mut state, &bg_session_id, false);
             persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
             let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
             all_events.append(&mut final_events);
 
+            let mut persist_terminal_state = true;
+            // Extract terminal events before the branch — both branches consume
+            // all_events by move, so this must happen first.
+            let terminal_events = terminal_events_for_persistence(&all_events);
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                run.events = all_events.clone();
-                if run.status.try_transition(&final_status).is_ok() {
-                    run.status = final_status.clone();
+                if run.status == RunStatus::Cancelled {
+                    persist_terminal_state = false;
+                    merge_cancelled_run_events(run, all_events);
+                    flush_turn_observability(&mut state, &bg_session_id, true);
+                } else {
+                    run.events.extend(all_events);
+                    if run.status.try_transition(&final_status).is_ok() {
+                        run.status = final_status.clone();
+                    }
+                    flush_turn_observability(&mut state, &bg_session_id, false);
                 }
             }
 
-            if let Some(engine) = &run_engine {
-                astra_core::log_persist!(
-                    engine
-                        .persist_status(
-                            &bg_run_id,
-                            final_status.as_str(),
-                            None,
-                            error_msg.as_deref()
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "status"
-                );
-                astra_core::log_persist!(
-                    engine
-                        .persist_usage(
-                            &bg_run_id,
-                            state.total_prompt,
-                            state.total_completion,
-                            state.total_tool_calls,
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "usage"
-                );
-                // Record tokens consumed so check_token_budget sees up-to-date usage.
-                if let Some(ref gov) = bg_resource_governor {
-                    let total = state.total_prompt + state.total_completion;
-                    if total > 0 {
-                        gov.record_tokens(&bg_user_id, total).await;
-                    }
+            // Schedule eviction of the terminal run from the in-memory cache.
+            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+
+            // Record tokens consumed regardless of cancel — cancelled runs still
+            // consumed tokens and must count toward the daily budget.
+            if let Some(ref gov) = bg_resource_governor {
+                let total = state.total_prompt + state.total_completion;
+                if total > 0 {
+                    gov.record_tokens(&bg_user_id, total).await;
+                }
+            }
+
+            if persist_terminal_state {
+                if let Some(engine) = &run_engine {
+                    astra_core::log_persist!(
+                        engine
+                            .persist_status(
+                                &bg_run_id,
+                                final_status.as_str(),
+                                None,
+                                error_msg.as_deref()
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "status"
+                    );
+                    astra_core::log_persist!(
+                        engine
+                            .persist_usage(
+                                &bg_run_id,
+                                state.total_prompt,
+                                state.total_completion,
+                                state.total_tool_calls,
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "usage"
+                    );
                 }
             }
 
             // Persist terminal events to durable store.
-            let terminal_events = terminal_events_for_persistence(&all_events);
             if let Some(engine) = &run_engine {
                 for event in terminal_events {
                     astra_core::log_persist!(
@@ -2822,11 +2881,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let runs = self.runs.read().await;
-        let all: Vec<RunStatusRecord> = runs
+        let mut all: Vec<RunStatusRecord> = runs
             .values()
             .filter(|run| run.user_id == user_id)
             .map(Self::status_record)
             .collect();
+        // Sort by run_id for deterministic pagination (HashMap iteration order is undefined).
+        all.sort_by(|a, b| a.run_id.cmp(&b.run_id));
         let total = all.len() as i64;
         let start = (offset as usize).min(all.len());
         let end = (start + limit as usize).min(all.len());
@@ -5148,6 +5209,131 @@ mod tests {
         assert!(
             count >= 6,
             "try_transition must be called in all 6 status update paths, found {count}"
+        );
+    }
+
+    /// P0-B: stream_chat must have the same per-session active-run guard as create_run.
+    #[test]
+    fn stream_chat_has_active_run_guard() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find stream_chat function
+        let fn_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
+        // Find the next function after stream_chat
+        let fn_body_end = source[fn_start + 10..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + 10 + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_body_end];
+        assert!(
+            fn_body.contains("session already has an active run"),
+            "stream_chat must reject concurrent runs on the same session"
+        );
+        assert!(
+            fn_body.contains("CONFLICT"),
+            "stream_chat must return 409 CONFLICT for concurrent session runs"
+        );
+    }
+
+    /// P0-C: Budget-rejected runs must push run_error + run_finished events
+    /// so SSE clients don't hang, and must clean up channels.
+    #[test]
+    fn budget_rejected_run_pushes_terminal_events() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find the budget rejection block
+        let budget_start = source
+            .find("run rejected: daily token budget exhausted")
+            .expect("budget rejection log must exist");
+        // Find the next `return;` after the budget rejection
+        let return_pos = source[budget_start..]
+            .find("return;")
+            .map(|p| budget_start + p)
+            .expect("budget rejection must return");
+        let budget_block = &source[budget_start..return_pos];
+        assert!(
+            budget_block.contains("run_finished"),
+            "budget rejection must push run_finished event"
+        );
+        assert!(
+            budget_block.contains("run_error"),
+            "budget rejection must push run_error event"
+        );
+        assert!(
+            budget_block.contains("approval_channels")
+                && budget_block.contains("user_prompt_channels")
+                && budget_block.contains("progress_channels"),
+            "budget rejection must clean up all channels"
+        );
+    }
+
+    /// P1-A: stream_chat must use extend (not overwrite) for events,
+    /// and handle cancellation with merge_cancelled_run_events.
+    #[test]
+    fn stream_chat_uses_extend_not_overwrite() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
+        let fn_body = &source[fn_start..];
+        let fn_end = fn_body[10..]
+            .find("\n    async fn ")
+            .map(|p| p + 10)
+            .unwrap_or(fn_body.len());
+        let fn_body = &fn_body[..fn_end];
+        // Must NOT do `run.events = all_events` (full overwrite)
+        assert!(
+            !fn_body.contains("run.events = all_events"),
+            "stream_chat must not overwrite events (use extend instead)"
+        );
+        // Must use merge_cancelled_run_events for cancel handling
+        assert!(
+            fn_body.contains("merge_cancelled_run_events"),
+            "stream_chat must handle cancellation with merge_cancelled_run_events"
+        );
+    }
+
+    /// P1-C: Terminal runs must be evicted from the in-memory runs map.
+    /// Both spawn blocks and the budget rejection path must schedule eviction.
+    #[test]
+    fn terminal_runs_scheduled_for_eviction() {
+        let source = include_str!("run_lifecycle.rs");
+        let test_start = source.find("mod tests {").unwrap_or(source.len());
+        let prod_code = &source[..test_start];
+        let eviction_calls = prod_code.matches("schedule_run_eviction").count();
+        // create_run spawn + stream_chat spawn + budget rejection = 3
+        assert!(
+            eviction_calls >= 3,
+            "schedule_run_eviction must be called in create_run spawn, stream_chat spawn, \
+             and budget rejection path, found {eviction_calls}"
+        );
+    }
+
+    /// P1-F: list_runs pagination must be deterministic — all runs appear
+    /// exactly once across pages, with no duplicates or missing entries.
+    #[tokio::test]
+    async fn list_runs_pagination_is_deterministic() {
+        let svc = test_service();
+        for i in 0..5 {
+            ok(svc
+                .create_run("user-pg".into(), test_request(&format!("msg {i}")))
+                .await);
+        }
+        // Collect all run_ids across 3 pages
+        let mut all_ids = Vec::new();
+        let page1 = ok(svc.list_runs("user-pg".into(), 2, 0).await);
+        all_ids.extend(page1.runs.iter().map(|r| r.run_id.clone()));
+        let page2 = ok(svc.list_runs("user-pg".into(), 2, 2).await);
+        all_ids.extend(page2.runs.iter().map(|r| r.run_id.clone()));
+        let page3 = ok(svc.list_runs("user-pg".into(), 2, 4).await);
+        all_ids.extend(page3.runs.iter().map(|r| r.run_id.clone()));
+
+        assert_eq!(all_ids.len(), 5, "all 5 runs must appear across pages");
+        let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            5,
+            "no duplicate run_ids across pages — pagination must be deterministic"
         );
     }
 }
