@@ -35,6 +35,8 @@ pub struct ProjectDetection {
     pub has_jest_config: bool,
     /// True when `test_*.py` or `*_test.py` files exist (bare Python project)
     pub has_test_py: bool,
+    /// Scripts defined in package.json (empty if no package.json or no scripts key).
+    pub npm_scripts: Vec<String>,
     /// Override: if set, used as-is
     pub build_cmd_override: Option<String>,
     /// Override: if set, used as-is
@@ -68,11 +70,27 @@ impl ProjectDetection {
             has_jest_config: root.join("jest.config.js").exists()
                 || root.join("jest.config.ts").exists(),
             has_test_py,
+            npm_scripts: read_npm_scripts(&root.join("package.json")),
             build_cmd_override: None,
             test_cmd_override: None,
             lint_cmd_override: None,
         }
     }
+}
+
+/// Read the script names from a `package.json` file. Returns an empty vec on
+/// any error (missing file, invalid JSON, no `scripts` key).
+fn read_npm_scripts(path: &std::path::Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    val.get("scripts")
+        .and_then(|s| s.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Infer the project build command from detection results.
@@ -82,7 +100,7 @@ pub fn detect_build_command(det: &ProjectDetection) -> Option<String> {
     }
     if det.has_cargo_toml {
         Some("cargo build".into())
-    } else if det.has_package_json {
+    } else if det.has_package_json && det.npm_scripts.iter().any(|s| s == "build") {
         Some("npm run build".into())
     } else if det.has_go_mod {
         Some("go build ./...".into())
@@ -103,8 +121,10 @@ pub fn detect_test_command(det: &ProjectDetection) -> Option<String> {
     } else if det.has_package_json {
         if det.has_jest_config {
             Some("npx jest".into())
-        } else {
+        } else if det.npm_scripts.iter().any(|s| s == "test") {
             Some("npm test".into())
+        } else {
+            None
         }
     } else if det.has_pyproject_toml || det.has_setup_py || det.has_test_py {
         Some("pytest".into())
@@ -122,8 +142,8 @@ pub fn detect_lint_command(det: &ProjectDetection) -> Option<String> {
     }
     if det.has_cargo_toml {
         Some("cargo clippy --workspace -- -D warnings".into())
-    } else if det.has_package_json {
-        Some("npx eslint .".into())
+    } else if det.has_package_json && det.npm_scripts.iter().any(|s| s == "lint") {
+        Some("npm run lint".into())
     } else if det.has_pyproject_toml || det.has_setup_py {
         Some("ruff check .".into())
     } else if det.has_go_mod {
@@ -439,6 +459,7 @@ mod tests {
         ProjectDetection {
             has_package_json: true,
             has_jest_config: true,
+            npm_scripts: vec!["build".into(), "lint".into()],
             ..Default::default()
         }
     }
@@ -502,7 +523,7 @@ mod tests {
         let det = node_detection();
         assert_eq!(detect_build_command(&det), Some("npm run build".into()));
         assert_eq!(detect_test_command(&det), Some("npx jest".into()));
-        assert_eq!(detect_lint_command(&det), Some("npx eslint .".into()));
+        assert_eq!(detect_lint_command(&det), Some("npm run lint".into()));
     }
 
     #[test]
@@ -945,5 +966,55 @@ mod tests {
             }
             _ => panic!("expected GrepCheck"),
         }
+    }
+
+    // ── npm_scripts-gated detection ───────────────────────────────────────────
+
+    fn npm_det_with_scripts(scripts: &[&str]) -> ProjectDetection {
+        ProjectDetection {
+            has_package_json: true,
+            npm_scripts: scripts.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn npm_no_scripts_produces_no_build_or_test_command() {
+        // Regression: astra root package.json has no scripts — must not emit
+        // npm run build / npm test as global checks.
+        let det = npm_det_with_scripts(&[]);
+        assert_eq!(detect_build_command(&det), None);
+        assert_eq!(detect_test_command(&det), None);
+    }
+
+    #[test]
+    fn npm_with_build_script_produces_build_command() {
+        let det = npm_det_with_scripts(&["build", "test"]);
+        assert_eq!(detect_build_command(&det), Some("npm run build".into()));
+        assert_eq!(detect_test_command(&det), Some("npm test".into()));
+    }
+
+    #[test]
+    fn npm_with_lint_script_uses_npm_run_lint() {
+        let det = npm_det_with_scripts(&["lint"]);
+        assert_eq!(detect_lint_command(&det), Some("npm run lint".into()));
+    }
+
+    #[test]
+    fn npm_without_lint_script_produces_no_lint_command() {
+        let det = npm_det_with_scripts(&["build"]);
+        assert_eq!(detect_lint_command(&det), None);
+    }
+
+    #[test]
+    fn npm_jest_config_overrides_test_script_requirement() {
+        // jest_config present → npx jest even without a "test" script
+        let det = ProjectDetection {
+            has_package_json: true,
+            has_jest_config: true,
+            npm_scripts: vec![],
+            ..Default::default()
+        };
+        assert_eq!(detect_test_command(&det), Some("npx jest".into()));
     }
 }

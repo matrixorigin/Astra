@@ -181,6 +181,17 @@ const SUPPRESSED_TAGS: &[SuppressedTag] = &[
     SuppressedTag::Simple("inner_monologue"),
 ];
 
+/// Tags that should be held back during streaming (buffered, not rendered) but
+/// NOT stripped by `strip_xml_tags_inplace`. These are cleaned up post-stream
+/// by `strip_degraded_tool_calls` in `consume_turn_sse` when tool calls are
+/// present. Kept separate from `SUPPRESSED_TAGS` because stripping `<invoke>`
+/// from all text would corrupt content that *discusses* these tags (e.g. code
+/// reviews).
+const BUFFERED_TAGS: &[SuppressedTag] = &[
+    SuppressedTag::WithAttrs("invoke"),
+    SuppressedTag::WithAttrs("tool_call"),
+];
+
 /// Strip all suppressed XML tags (and their content) from `text` in-place.
 ///
 /// Handles:
@@ -346,7 +357,7 @@ pub(super) fn strip_leading_narration(text: &mut String) {
 /// rendering of text that will be stripped once the closing tag arrives.
 #[allow(dead_code)]
 pub(super) fn has_open_xml_tag(text: &str) -> bool {
-    for tag in SUPPRESSED_TAGS {
+    for tag in SUPPRESSED_TAGS.iter().chain(BUFFERED_TAGS) {
         let (name, has_attrs) = match tag {
             SuppressedTag::Simple(n) => (*n, false),
             SuppressedTag::WithAttrs(n) => (*n, true),
@@ -374,12 +385,13 @@ pub(super) fn has_open_xml_tag(text: &str) -> bool {
 /// the suppressed XML tags. Used during streaming to hold back text that might
 /// be the start of a tag we want to suppress.
 ///
-/// Prefixes are auto-derived from [`SUPPRESSED_TAGS`] — no manual list needed.
+/// Prefixes are auto-derived from [`SUPPRESSED_TAGS`] and [`BUFFERED_TAGS`] —
+/// no manual list needed.
 pub(super) fn could_become_suppressed_tag(partial: &str) -> bool {
     if partial == "<" || partial == "</" {
         return true;
     }
-    for tag in SUPPRESSED_TAGS {
+    for tag in SUPPRESSED_TAGS.iter().chain(BUFFERED_TAGS) {
         let name = match tag {
             SuppressedTag::Simple(n) | SuppressedTag::WithAttrs(n) => *n,
         };
@@ -678,18 +690,26 @@ mod tests {
     }
 
     #[test]
-    fn has_open_xml_tag_ignores_invoke() {
-        // <invoke> is not in SUPPRESSED_TAGS, so has_open_xml_tag should not detect it.
+    fn has_open_xml_tag_detects_invoke_via_buffered_tags() {
+        // <invoke> is in BUFFERED_TAGS — has_open_xml_tag holds it back during
+        // streaming so it doesn't render before strip_degraded_tool_calls runs.
+        assert!(has_open_xml_tag("<invoke name=\"write_file\">\n<parameter"));
+        // Closed invoke is not open.
         assert!(!has_open_xml_tag(
-            "<invoke name=\"write_file\">\n<parameter"
+            "<invoke name=\"x\">\n<parameter name=\"p\">v</parameter>\n</invoke>"
         ));
+        // <invoker> is not <invoke>.
+        assert!(!has_open_xml_tag("<invoker>stuff"));
     }
 
     #[test]
-    fn could_become_suppressed_rejects_invoke() {
-        // <invoke> is not in SUPPRESSED_TAGS.
-        assert!(!could_become_suppressed_tag("<inv"));
-        assert!(!could_become_suppressed_tag("<invoke"));
+    fn could_become_suppressed_matches_invoke_prefixes() {
+        // <invoke> is in BUFFERED_TAGS — partial prefixes must be held back.
+        assert!(could_become_suppressed_tag("<inv"));
+        assert!(could_become_suppressed_tag("<invoke"));
+        assert!(could_become_suppressed_tag("</invoke"));
+        assert!(could_become_suppressed_tag("<tool"));
+        assert!(could_become_suppressed_tag("<tool_call"));
     }
 
     #[test]
