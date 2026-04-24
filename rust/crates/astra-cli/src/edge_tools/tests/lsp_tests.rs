@@ -1203,6 +1203,7 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_diagnostics_returns_file_snapshot_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1318,6 +1319,7 @@ fn lsp_surfaces_rust_lsp_startup_errors_for_supported_workspaces() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_implementation_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1357,6 +1359,7 @@ fn lsp_implementation_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_prepare_rename_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1396,6 +1399,7 @@ fn lsp_prepare_rename_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_declaration_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1432,6 +1436,7 @@ fn lsp_declaration_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_type_definition_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1471,6 +1476,7 @@ fn lsp_type_definition_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_document_highlight_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1507,6 +1513,7 @@ fn lsp_document_highlight_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_document_links_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1541,6 +1548,7 @@ fn lsp_document_links_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_inlay_hints_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1572,6 +1580,7 @@ fn lsp_inlay_hints_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_folding_ranges_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1603,6 +1612,7 @@ fn lsp_folding_ranges_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_document_colors_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1637,6 +1647,7 @@ fn lsp_document_colors_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_color_presentations_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1673,6 +1684,7 @@ fn lsp_color_presentations_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_semantic_tokens_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1707,6 +1719,7 @@ fn lsp_semantic_tokens_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_supertypes_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1740,6 +1753,7 @@ fn lsp_supertypes_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_subtypes_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1776,6 +1790,7 @@ fn lsp_subtypes_use_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_code_lenses_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -1987,6 +2002,7 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_selection_ranges_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2026,6 +2042,7 @@ fn lsp_selection_ranges_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_linked_editing_range_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2065,6 +2082,7 @@ fn lsp_linked_editing_range_uses_real_lsp_when_available() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_format_document_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2128,6 +2146,7 @@ fn lsp_format_document_applies_text_edits_when_dry_run_false() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_format_range_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2202,6 +2221,7 @@ fn lsp_format_range_applies_text_edits_when_dry_run_false() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_format_on_type_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2274,6 +2294,7 @@ fn lsp_format_on_type_applies_text_edits_when_dry_run_false() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_code_actions_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2460,6 +2481,7 @@ fn lsp_code_actions_apply_selected_snippet_workspace_edit_when_dry_run_false() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_completions_use_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2570,6 +2592,7 @@ fn lsp_completions_apply_selected_item_when_dry_run_false() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_signature_help_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2786,6 +2809,7 @@ fn lsp_code_lenses_execute_native_rust_analyzer_code_lens_when_dry_run_false() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_document_symbols_prefers_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
@@ -2891,6 +2915,7 @@ fn write_file_syncs_lsp_once_before_followup_query() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires real LSP server
 #[serial_test::serial]
 fn lsp_rename_uses_real_lsp_preview_when_available() {
     let dir = tempfile::tempdir().unwrap();
