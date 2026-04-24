@@ -636,6 +636,33 @@ mod tests {
     }
 
     #[test]
+    fn strip_preserves_review_discussing_invoke_regression() {
+        // Regression: a code review that *discusses* <invoke> was truncated
+        // because strip_xml_tags_inplace treated the unclosed <invoke> mention
+        // as a real tag and truncated everything after it.
+        //
+        // META: test text taken from a real astra code review (session b91b4051)
+        // that was truncated by strip_xml_tags_inplace when <invoke> was in
+        // SUPPRESSED_TAGS. Do not add <invoke>/<tool_call> to SUPPRESSED_TAGS.
+        let mut s = concat!(
+            "### 🟡 Important\n",
+            "- **test coverage gap** — The test `xml_invoke_in_text_is_recovered_as_tool_calls` ",
+            "only covers the `<invoke name=\"write_file\">` case. ",
+            "Consider adding a test for `<tool_call>` as well.\n",
+            "\n",
+            "### ✅ Looks Good\n",
+            "LGTM overall.",
+        )
+        .to_string();
+        let original = s.clone();
+        strip_xml_tags_inplace(&mut s);
+        assert_eq!(
+            s, original,
+            "review text discussing <invoke> must not be altered"
+        );
+    }
+
+    #[test]
     fn find_attr_tag_open_basic() {
         // Unit test for the helper — used by WithAttrs variant.
         assert_eq!(

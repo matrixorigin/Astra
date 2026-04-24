@@ -5984,6 +5984,15 @@ pub(super) async fn consume_turn_sse(
         edge_tool_round,
     };
     super::streaming_md::strip_xml_tags_inplace(&mut result.full_text);
+    // When the model emits both native tool calls AND <invoke> XML text in the
+    // same turn (degraded mixed output), strip the XML from full_text. We only
+    // do this when tool calls are present — if there are no tool calls, the text
+    // might legitimately discuss <invoke> (e.g. code reviews).
+    if result.has_tool_calls || !result.edge_tool_round.is_empty() {
+        result.full_text = astra_runtime::turn::xml_tool_call_fallback::strip_degraded_tool_calls(
+            &result.full_text,
+        );
+    }
     super::streaming_md::strip_leading_narration(&mut result.full_text);
 
     if render_policy.suppress_text() {
