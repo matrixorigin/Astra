@@ -567,7 +567,11 @@ fn truncate_text(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         text.to_string()
     } else {
-        text[..limit].to_string()
+        let mut end = limit;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
     }
 }
 
