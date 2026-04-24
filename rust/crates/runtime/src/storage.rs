@@ -153,11 +153,15 @@ pub(crate) async fn insert_turn_skill_selector_metric(
     tx: &mut sqlx::Transaction<'_, MySql>,
     record: &TurnSkillSelectorMetricRecord,
 ) -> Result<(), sqlx::Error> {
+    let extra_json = record
+        .extra
+        .as_ref()
+        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "null".into()));
     query(
         "INSERT INTO skill_selector_turn_metrics \
          (event_id, session_id, user_id, turn_number, visible_skill_count, chosen_skill_count, \
-          shortlisted_chosen_count, missed_chosen_count, best_chosen_rank, hit_at_1, hit_at_3, \
-          hit_at_5, hit_at_14, created_at) \
+          shortlisted_chosen_count, missed_chosen_count, best_chosen_rank, \
+          selector_tier, elapsed_ms, total_catalog_size, extra, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&record.event_id)
@@ -169,10 +173,10 @@ pub(crate) async fn insert_turn_skill_selector_metric(
     .bind(record.shortlisted_chosen_count)
     .bind(record.missed_chosen_count)
     .bind(record.best_chosen_rank)
-    .bind(record.hit_at_1)
-    .bind(record.hit_at_3)
-    .bind(record.hit_at_5)
-    .bind(record.hit_at_14)
+    .bind(record.selector_tier.as_deref())
+    .bind(record.elapsed_ms)
+    .bind(record.total_catalog_size)
+    .bind(extra_json)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -1052,7 +1052,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         if any_newly_activated && let Some(resolver) = &state.skills.resolver {
             let full = resolver.available_skills();
             if !full.is_empty() {
-                let (visible, open_skill_name) =
+                let (visible, open_skill_name, _telemetry) =
                     crate::turn::skill_tool::visible_skills_for_host_turn(
                         &full,
                         state.message.as_str(),

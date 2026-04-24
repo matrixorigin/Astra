@@ -530,6 +530,7 @@ mod tests {
                     source: "bundled".into(),
                     category: Some("dev".into()),
                 }],
+                telemetry: Default::default(),
             },
         );
         collector.record_skill_selector(
@@ -544,6 +545,7 @@ mod tests {
                     source: "local".into(),
                     category: None,
                 }],
+                telemetry: Default::default(),
             },
         );
 

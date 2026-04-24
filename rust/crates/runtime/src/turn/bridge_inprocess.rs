@@ -2370,7 +2370,6 @@ mod tests {
         assert_eq!(metric["turn_number"], 7);
         assert_eq!(metric["visible_skill_count"], 2);
         assert_eq!(metric["best_chosen_rank"], 2);
-        assert_eq!(metric["hit_at_3"], true);
     }
 
     #[test]

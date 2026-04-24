@@ -1,0 +1,15 @@
+{
+  "sample_dir": "benchmarks/skill-selector/skills",
+  "dataset": "benchmarks/skill-selector/dataset/primary.jsonl",
+  "catalog_size": 1000,
+  "total_records_in_dataset": 1019,
+  "unique_target_skills_in_dataset": 1000,
+  "skipped_unpassed_records": 0,
+  "evaluated_records": 200,
+  "hit_at_1_rate": 0.635,
+  "hit_at_5_rate": 0.785,
+  "hit_at_10_rate": 0.805,
+  "hit_at_20_rate": 0.805,
+  "avg_best_rank_on_hit": 1.5341614906832297,
+  "misses_not_shortlisted": 39
+}

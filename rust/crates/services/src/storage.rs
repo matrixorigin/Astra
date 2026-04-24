@@ -526,8 +526,13 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // Brand-new table on this branch — drop+recreate so dev DBs always pick up the
+    // current schema. No production migration concerns yet.
+    query("DROP TABLE IF EXISTS skill_selector_turn_metrics")
+        .execute(&pool)
+        .await?;
     query(
-        "CREATE TABLE IF NOT EXISTS skill_selector_turn_metrics (
+        "CREATE TABLE skill_selector_turn_metrics (
             event_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(64) NULL,
@@ -537,13 +542,14 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             shortlisted_chosen_count BIGINT NOT NULL,
             missed_chosen_count BIGINT NOT NULL,
             best_chosen_rank BIGINT NULL,
-            hit_at_1 BOOLEAN NOT NULL DEFAULT FALSE,
-            hit_at_3 BOOLEAN NOT NULL DEFAULT FALSE,
-            hit_at_5 BOOLEAN NOT NULL DEFAULT FALSE,
-            hit_at_14 BOOLEAN NOT NULL DEFAULT FALSE,
+            selector_tier VARCHAR(64) NULL,
+            elapsed_ms BIGINT NULL,
+            total_catalog_size BIGINT NULL,
+            extra JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_skill_selector_metrics_created (created_at),
-            INDEX idx_skill_selector_metrics_session_turn (session_id, turn_number)
+            INDEX idx_skill_selector_metrics_session_turn (session_id, turn_number),
+            INDEX idx_skill_selector_metrics_tier (selector_tier)
         )",
     )
     .execute(&pool)
@@ -1485,15 +1491,43 @@ pub async fn resolve_active_skill_versions(
     Ok(versions)
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillSelectorMetricSummary {
+/// Aggregated hit-rate / recall stats for either the overall recent window or
+/// one selector tier inside it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SkillSelectorTierStats {
     pub sample_size: i64,
     pub hit_at_1_rate: f64,
-    pub hit_at_3_rate: f64,
     pub hit_at_5_rate: f64,
-    pub hit_at_14_rate: f64,
+    pub hit_at_10_rate: f64,
+    pub hit_at_20_rate: f64,
+    pub hit_at_30_rate: f64,
     pub shortlist_recall_rate: f64,
     pub avg_best_chosen_rank: Option<f64>,
+    pub avg_elapsed_ms: Option<f64>,
+    pub avg_total_catalog_size: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillSelectorTierEntry {
+    /// Selector tier label (e.g. "lexical", "embedding", "embedding+rerank").
+    /// Empty string represents rows with NULL `selector_tier`.
+    pub tier: String,
+    pub stats: SkillSelectorTierStats,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SkillSelectorMetricSummary {
+    /// Aggregate over all rows in the recent window (across tiers).
+    pub overall: SkillSelectorTierStats,
+    /// Per-tier breakdown, ordered by sample_size desc.
+    pub per_tier: Vec<SkillSelectorTierEntry>,
+}
+
+impl SkillSelectorMetricSummary {
+    /// Convenience accessor for total sample size in the recent window.
+    pub fn sample_size(&self) -> i64 {
+        self.overall.sample_size
+    }
 }
 
 fn row_f64_or_zero(row: &sqlx::mysql::MySqlRow, column: &str) -> f64 {
@@ -1537,37 +1571,72 @@ pub async fn load_recent_skill_selector_metric_summary(
     limit: i64,
 ) -> Result<SkillSelectorMetricSummary, sqlx::Error> {
     let limit = limit.max(1);
-    let row = query(
-        "SELECT COUNT(*) AS sample_size,
-                CAST(AVG(CASE WHEN hit_at_1 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_1_rate,
-                CAST(AVG(CASE WHEN hit_at_3 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_3_rate,
-                CAST(AVG(CASE WHEN hit_at_5 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_5_rate,
-                CAST(AVG(CASE WHEN hit_at_14 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_14_rate,
+    // Aggregate query: GROUP BY selector_tier inside the recent window. We compute
+    // the "overall" row by adding a NULL grouping marker via WITH ROLLUP — but
+    // MatrixOne support for ROLLUP is uneven, so we issue two queries instead:
+    // one ungrouped overall, one GROUP BY tier.
+    const SELECT_LIST: &str = "COUNT(*) AS sample_size,
+                CAST(AVG(CASE WHEN best_chosen_rank IS NOT NULL AND best_chosen_rank <= 1  THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_1_rate,
+                CAST(AVG(CASE WHEN best_chosen_rank IS NOT NULL AND best_chosen_rank <= 5  THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_5_rate,
+                CAST(AVG(CASE WHEN best_chosen_rank IS NOT NULL AND best_chosen_rank <= 10 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_10_rate,
+                CAST(AVG(CASE WHEN best_chosen_rank IS NOT NULL AND best_chosen_rank <= 20 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_20_rate,
+                CAST(AVG(CASE WHEN best_chosen_rank IS NOT NULL AND best_chosen_rank <= 30 THEN 1.0 ELSE 0.0 END) AS CHAR) AS hit_at_30_rate,
                 CAST(AVG(CASE
                         WHEN chosen_skill_count > 0
                         THEN (1.0 * shortlisted_chosen_count) / chosen_skill_count
                     END) AS CHAR) AS shortlist_recall_rate,
-                CAST(AVG(best_chosen_rank) AS CHAR) AS avg_best_chosen_rank
+                CAST(AVG(best_chosen_rank) AS CHAR) AS avg_best_chosen_rank,
+                CAST(AVG(elapsed_ms) AS CHAR) AS avg_elapsed_ms,
+                CAST(AVG(total_catalog_size) AS CHAR) AS avg_total_catalog_size";
+
+    let overall_sql = format!(
+        "SELECT {SELECT_LIST}
          FROM (
              SELECT *
              FROM skill_selector_turn_metrics
              ORDER BY created_at DESC, event_id DESC
              LIMIT ?
-         ) recent",
-    )
-    .bind(limit)
-    .fetch_one(pool)
-    .await?;
+         ) recent"
+    );
+    let overall_row = query(&overall_sql).bind(limit).fetch_one(pool).await?;
+    let overall = decode_tier_stats(&overall_row);
 
-    Ok(SkillSelectorMetricSummary {
+    let per_tier_sql = format!(
+        "SELECT COALESCE(selector_tier, '') AS tier, {SELECT_LIST}
+         FROM (
+             SELECT *
+             FROM skill_selector_turn_metrics
+             ORDER BY created_at DESC, event_id DESC
+             LIMIT ?
+         ) recent
+         GROUP BY tier
+         ORDER BY sample_size DESC"
+    );
+    let tier_rows = query(&per_tier_sql).bind(limit).fetch_all(pool).await?;
+    let per_tier = tier_rows
+        .iter()
+        .map(|row| SkillSelectorTierEntry {
+            tier: row.try_get::<String, _>("tier").unwrap_or_default(),
+            stats: decode_tier_stats(row),
+        })
+        .collect();
+
+    Ok(SkillSelectorMetricSummary { overall, per_tier })
+}
+
+fn decode_tier_stats(row: &sqlx::mysql::MySqlRow) -> SkillSelectorTierStats {
+    SkillSelectorTierStats {
         sample_size: row.try_get("sample_size").unwrap_or(0),
-        hit_at_1_rate: row_f64_or_zero(&row, "hit_at_1_rate"),
-        hit_at_3_rate: row_f64_or_zero(&row, "hit_at_3_rate"),
-        hit_at_5_rate: row_f64_or_zero(&row, "hit_at_5_rate"),
-        hit_at_14_rate: row_f64_or_zero(&row, "hit_at_14_rate"),
-        shortlist_recall_rate: row_f64_or_zero(&row, "shortlist_recall_rate"),
-        avg_best_chosen_rank: row_optional_f64(&row, "avg_best_chosen_rank"),
-    })
+        hit_at_1_rate: row_f64_or_zero(row, "hit_at_1_rate"),
+        hit_at_5_rate: row_f64_or_zero(row, "hit_at_5_rate"),
+        hit_at_10_rate: row_f64_or_zero(row, "hit_at_10_rate"),
+        hit_at_20_rate: row_f64_or_zero(row, "hit_at_20_rate"),
+        hit_at_30_rate: row_f64_or_zero(row, "hit_at_30_rate"),
+        shortlist_recall_rate: row_f64_or_zero(row, "shortlist_recall_rate"),
+        avg_best_chosen_rank: row_optional_f64(row, "avg_best_chosen_rank"),
+        avg_elapsed_ms: row_optional_f64(row, "avg_elapsed_ms"),
+        avg_total_catalog_size: row_optional_f64(row, "avg_total_catalog_size"),
+    }
 }
 
 // ─── Expired Data Cleanup ────────────────────────────────────────────────────

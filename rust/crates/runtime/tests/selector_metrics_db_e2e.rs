@@ -253,8 +253,7 @@ async fn wait_for_metric_rows(
 ) -> Vec<sqlx::mysql::MySqlRow> {
     for _ in 0..50 {
         let rows = sqlx::query(
-            "SELECT turn_number, chosen_skill_count, shortlisted_chosen_count, best_chosen_rank, \
-                    hit_at_1, hit_at_3, hit_at_14 \
+            "SELECT turn_number, chosen_skill_count, shortlisted_chosen_count, best_chosen_rank \
              FROM skill_selector_turn_metrics WHERE session_id = ? ORDER BY turn_number ASC",
         )
         .bind(session_id)
@@ -374,8 +373,6 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
             .flatten(),
         Some(2)
     );
-    assert!(!rows[0].try_get::<bool, _>("hit_at_1").unwrap_or(false));
-    assert!(rows[0].try_get::<bool, _>("hit_at_3").unwrap_or(false));
 
     assert_eq!(
         rows[1].try_get::<i64, _>("turn_number").unwrap_or_default(),
@@ -388,7 +385,6 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
             .flatten(),
         Some(1)
     );
-    assert!(rows[1].try_get::<bool, _>("hit_at_1").unwrap_or(false));
 
     assert_eq!(
         rows[2].try_get::<i64, _>("turn_number").unwrap_or_default(),
@@ -413,18 +409,15 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
             .flatten(),
         None
     );
-    assert!(!rows[2].try_get::<bool, _>("hit_at_3").unwrap_or(true));
-    assert!(!rows[2].try_get::<bool, _>("hit_at_14").unwrap_or(true));
 
     let summary = load_recent_skill_selector_metric_summary(&pool, 3)
         .await
         .expect("load selector metric summary");
-    assert_eq!(summary.sample_size, 3);
-    assert!((summary.hit_at_1_rate - (1.0 / 3.0)).abs() < 1e-6);
-    assert!((summary.hit_at_3_rate - (2.0 / 3.0)).abs() < 1e-6);
-    assert!((summary.hit_at_14_rate - (2.0 / 3.0)).abs() < 1e-6);
-    assert!((summary.shortlist_recall_rate - (2.0 / 3.0)).abs() < 1e-6);
-    assert_eq!(summary.avg_best_chosen_rank, Some(1.5));
+    assert_eq!(summary.sample_size(), 3);
+    assert!((summary.overall.hit_at_1_rate - (1.0 / 3.0)).abs() < 1e-6);
+    assert!((summary.overall.hit_at_5_rate - (2.0 / 3.0)).abs() < 1e-6);
+    assert!((summary.overall.shortlist_recall_rate - (2.0 / 3.0)).abs() < 1e-6);
+    assert_eq!(summary.overall.avg_best_chosen_rank, Some(1.5));
 
     cleanup_session_rows(&pool, &session_id).await;
     shared_pool.close().await;
@@ -474,7 +467,7 @@ async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
     let summary = load_recent_skill_selector_metric_summary(&pool, 10)
         .await
         .expect("load selector metric summary");
-    assert_eq!(summary.sample_size, 0);
+    assert_eq!(summary.sample_size(), 0);
 
     cleanup_session_rows(&pool, &session_id).await;
     shared_pool.close().await;
@@ -531,18 +524,16 @@ async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
             .flatten(),
         Some(2)
     );
-    assert!(!row.try_get::<bool, _>("hit_at_1").unwrap_or(true));
-    assert!(row.try_get::<bool, _>("hit_at_3").unwrap_or(false));
-    assert!(row.try_get::<bool, _>("hit_at_14").unwrap_or(false));
+    // hit columns no longer exist; rely on best_chosen_rank above.
 
     let summary = load_recent_skill_selector_metric_summary(&pool, 1)
         .await
         .expect("load selector metric summary");
-    assert_eq!(summary.sample_size, 1);
-    assert_eq!(summary.hit_at_1_rate, 0.0);
-    assert_eq!(summary.hit_at_3_rate, 1.0);
-    assert!((summary.shortlist_recall_rate - 0.5).abs() < 1e-6);
-    assert_eq!(summary.avg_best_chosen_rank, Some(2.0));
+    assert_eq!(summary.sample_size(), 1);
+    assert_eq!(summary.overall.hit_at_1_rate, 0.0);
+    assert_eq!(summary.overall.hit_at_5_rate, 1.0);
+    assert!((summary.overall.shortlist_recall_rate - 0.5).abs() < 1e-6);
+    assert_eq!(summary.overall.avg_best_chosen_rank, Some(2.0));
 
     cleanup_session_rows(&pool, &session_id).await;
     shared_pool.close().await;
@@ -575,10 +566,10 @@ async fn selector_metric_e2e_trims_global_window_to_recent_rows() {
                     shortlisted_chosen_count: 1,
                     missed_chosen_count: 0,
                     best_chosen_rank: Some(1),
-                    hit_at_1: true,
-                    hit_at_3: true,
-                    hit_at_5: true,
-                    hit_at_14: true,
+                    selector_tier: Some("lexical".to_string()),
+                    elapsed_ms: Some(1),
+                    total_catalog_size: Some(2),
+                    extra: None,
                 }),
                 ..Default::default()
             })
@@ -610,10 +601,10 @@ async fn selector_metric_e2e_trims_global_window_to_recent_rows() {
         load_recent_skill_selector_metric_summary(&pool, SKILL_SELECTOR_RECENT_WINDOW_SIZE)
             .await
             .expect("load trimmed selector metric summary");
-    assert_eq!(summary.sample_size, SKILL_SELECTOR_RECENT_WINDOW_SIZE);
-    assert_eq!(summary.hit_at_1_rate, 1.0);
-    assert_eq!(summary.hit_at_3_rate, 1.0);
-    assert_eq!(summary.shortlist_recall_rate, 1.0);
+    assert_eq!(summary.sample_size(), SKILL_SELECTOR_RECENT_WINDOW_SIZE);
+    assert_eq!(summary.overall.hit_at_1_rate, 1.0);
+    assert_eq!(summary.overall.hit_at_5_rate, 1.0);
+    assert_eq!(summary.overall.shortlist_recall_rate, 1.0);
 
     cleanup_session_rows(&pool, &session_id).await;
     shared_pool.close().await;

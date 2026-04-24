@@ -300,15 +300,21 @@ fn format_skills_within_budget(
 }
 
 /// Pick a small relevant subset for the current user message when dynamic surfacing applies.
+///
+/// Returns the picked skills plus optional selector telemetry. Telemetry is `None`
+/// only when the full catalog is used and the selector is bypassed.
 pub fn select_skills_for_turn(
     all_skills: &[SkillToolInfo],
     user_message: &str,
     quality_tracker: Option<&crate::skills::quality::SkillQualityTracker>,
     pinned_skills: Option<&HashSet<String>>,
     cfg: &SkillSearchSettings,
-) -> Vec<SkillToolInfo> {
+) -> (
+    Vec<SkillToolInfo>,
+    Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
+) {
     if cfg.use_full_catalog(all_skills.len()) {
-        return all_skills.to_vec();
+        return (all_skills.to_vec(), None);
     }
 
     let mut picked: Vec<SkillToolInfo> = Vec::new();
@@ -327,7 +333,7 @@ pub fn select_skills_for_turn(
         .filter(|s| !picked_names.contains(&s.name))
         .cloned()
         .collect();
-    let selected_indices =
+    let (selected_indices, telemetry) =
         skill_selector::select_skill_indices(&filtered, user_message, quality_tracker, cfg);
     for idx in selected_indices {
         if picked.len() >= cfg.effective_surface_cap() {
@@ -340,30 +346,11 @@ pub fn select_skills_for_turn(
         }
     }
 
-    if picked.len() < 3 {
-        let mut rest: Vec<&SkillToolInfo> = filtered
-            .iter()
-            .filter(|s| !picked_names.contains(&s.name))
-            .collect();
-        rest.sort_by(|a, b| {
-            let pa = matches!(a.source, SkillSourceKind::Bundled);
-            let pb = matches!(b.source, SkillSourceKind::Bundled);
-            pb.cmp(&pa).then_with(|| {
-                let qa = quality_tracker.map_or(0.0, |q| q.selection_boost(&a.name));
-                let qb = quality_tracker.map_or(0.0, |q| q.selection_boost(&b.name));
-                qb.partial_cmp(&qa).unwrap_or(std::cmp::Ordering::Equal)
-            })
-        });
-        for s in rest {
-            if picked.len() >= cfg.effective_surface_cap() {
-                break;
-            }
-            picked_names.insert(s.name.clone());
-            picked.push((*s).clone());
-        }
+    if picked.len() >= cfg.effective_surface_cap() {
+        picked.truncate(cfg.effective_surface_cap());
     }
 
-    picked
+    (picked, Some(telemetry))
 }
 
 /// Skills visible this session: auto-surface ∪ user-pinned ∪ previously discovered.
@@ -403,7 +390,8 @@ fn filter_already_invoked_skills(
         .collect()
 }
 
-/// Visible skills + whether dynamic surfacing is active (open `skill_name` + `discover_skills`).
+/// Visible skills + whether dynamic surfacing is active (open `skill_name` + `discover_skills`)
+/// + selector telemetry (`None` when full catalog bypasses the selector).
 pub fn visible_skills_for_host_turn(
     full: &[SkillToolInfo],
     user_message: &str,
@@ -412,20 +400,26 @@ pub fn visible_skills_for_host_turn(
     discovered: &HashSet<String>,
     invoked: &HashMap<String, InvokedSkill>,
     cfg: &SkillSearchSettings,
-) -> (Vec<SkillToolInfo>, bool) {
+) -> (
+    Vec<SkillToolInfo>,
+    bool,
+    Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
+) {
     if cfg.use_full_catalog(full.len()) {
         let filtered = filter_already_invoked_skills(full.to_vec(), invoked);
-        return (filtered, false);
+        return (filtered, false, None);
     }
-    let base = select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned), cfg);
+    let (base, telemetry) =
+        select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned), cfg);
     let visible = merge_discovered_skills_into_visible(base, full, discovered);
     let filtered = filter_already_invoked_skills(visible, invoked);
-    (filtered, true)
+    (filtered, true, telemetry)
 }
 
 pub fn build_skill_selector_shortlist_trace(
     visible: &[SkillToolInfo],
     open_catalog: bool,
+    telemetry: Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
 ) -> astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
     astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
         open_catalog,
@@ -444,6 +438,7 @@ pub fn build_skill_selector_shortlist_trace(
                 }
             })
             .collect(),
+        telemetry: telemetry.unwrap_or_default(),
     }
 }
 
@@ -760,6 +755,7 @@ pub fn parse_skill_selector_shortlist_from_text(
             open_catalog: content.contains("discover_skills"),
             visible_skill_count: i32::try_from(skills.len()).unwrap_or(i32::MAX),
             skills,
+            telemetry: Default::default(),
         },
     )
 }
@@ -841,10 +837,10 @@ pub fn build_turn_skill_selector_metric_record(
         shortlisted_chosen_count: computed.shortlisted_chosen_count,
         missed_chosen_count: computed.missed_chosen_count,
         best_chosen_rank: computed.best_chosen_rank,
-        hit_at_1: computed.hit_at_1,
-        hit_at_3: computed.hit_at_3,
-        hit_at_5: computed.hit_at_5,
-        hit_at_14: computed.hit_at_14,
+        selector_tier: computed.telemetry.selector_tier.clone(),
+        elapsed_ms: computed.telemetry.elapsed_ms,
+        total_catalog_size: computed.telemetry.total_catalog_size,
+        extra: computed.telemetry.extra.clone(),
     })
 }
 
@@ -2326,7 +2322,7 @@ mod tests {
             },
         )]);
 
-        let (visible, _open_skill_name) = visible_skills_for_host_turn(
+        let (visible, _open_skill_name, _telemetry) = visible_skills_for_host_turn(
             &skills,
             "review local changes",
             &crate::skills::quality::SkillQualityTracker::default(),
@@ -2384,7 +2380,7 @@ mod tests {
             ),
         ]);
 
-        let (visible, _open_skill_name) = visible_skills_for_host_turn(
+        let (visible, _open_skill_name, _telemetry) = visible_skills_for_host_turn(
             &skills,
             "review local changes",
             &crate::skills::quality::SkillQualityTracker::default(),
@@ -5654,6 +5650,7 @@ Normal.
                 },
             ],
             true,
+            None,
         );
 
         let metric = build_turn_skill_selector_metric_record(
@@ -5675,10 +5672,6 @@ Normal.
         assert_eq!(metric.shortlisted_chosen_count, 1);
         assert_eq!(metric.missed_chosen_count, 1);
         assert_eq!(metric.best_chosen_rank, Some(2));
-        assert!(!metric.hit_at_1);
-        assert!(metric.hit_at_3);
-        assert!(metric.hit_at_5);
-        assert!(metric.hit_at_14);
     }
 
     #[test]

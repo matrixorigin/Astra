@@ -133,7 +133,7 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skills.resolver {
         let full = resolver.available_skills();
         if !full.is_empty() {
-            let (visible, open_skill_name) = crate::turn::skill_tool::visible_skills_for_host_turn(
+            let (visible, open_skill_name, _telemetry) = crate::turn::skill_tool::visible_skills_for_host_turn(
                 &full,
                 state.message.as_str(),
                 &state.skills.quality_tracker,
@@ -536,7 +536,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
-            let (visible, open_skill_name) = crate::turn::skill_tool::visible_skills_for_host_turn(
+            let (visible, open_skill_name, telemetry) = crate::turn::skill_tool::visible_skills_for_host_turn(
                 &full,
                 state.message.as_str(),
                 &state.skills.quality_tracker,
@@ -548,6 +548,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
                 &visible,
                 open_skill_name,
+                telemetry,
             );
             if state.telemetry.initial_skill_selector_shortlist.is_none() {
                 if let Some(ref collector) = state.telemetry.turn_trace_collector {

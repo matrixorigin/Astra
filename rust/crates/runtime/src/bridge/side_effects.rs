@@ -1029,10 +1029,9 @@ mod inprocess_hook_contract_tests {
                 "shortlisted_chosen_count": 1,
                 "missed_chosen_count": 0,
                 "best_chosen_rank": 2,
-                "hit_at_1": false,
-                "hit_at_3": true,
-                "hit_at_5": true,
-                "hit_at_14": true
+                "selector_tier": "embedding",
+                "elapsed_ms": 12,
+                "total_catalog_size": 4
             }),
         );
         Value::Object(payload)
@@ -1427,7 +1426,7 @@ mod inprocess_hook_contract_tests {
         assert_eq!(metric.event_id, "metric-1");
         assert_eq!(metric.turn_number, 5);
         assert_eq!(metric.best_chosen_rank, Some(2));
-        assert!(metric.hit_at_3);
+        assert_eq!(metric.selector_tier.as_deref(), Some("embedding"));
     }
 
     #[tokio::test]
@@ -1452,7 +1451,6 @@ mod inprocess_hook_contract_tests {
         assert_eq!(metric.turn_number, 6);
         assert_eq!(metric.visible_skill_count, 2);
         assert_eq!(metric.best_chosen_rank, Some(2));
-        assert!(metric.hit_at_3);
     }
 
     #[tokio::test]

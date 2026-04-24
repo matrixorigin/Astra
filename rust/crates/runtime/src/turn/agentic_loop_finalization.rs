@@ -830,6 +830,7 @@ mod tests {
                         category: Some("ops".to_string()),
                     },
                 ],
+                telemetry: Default::default(),
             },
         );
         state.telemetry.turn_trace_collector = Some(collector);

@@ -3398,6 +3398,12 @@ mod tests {
                     category: Some("ops".to_string()),
                 },
             ],
+            telemetry: astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
+                selector_tier: Some("lexical".to_string()),
+                elapsed_ms: Some(7),
+                total_catalog_size: Some(2),
+                extra: None,
+            },
         });
 
         let writer = DatabaseTurnHookDbWriter::new(settings.clone()).with_pool(shared_pool.clone());
@@ -3413,7 +3419,7 @@ mod tests {
 
         let row = sqlx::query(
             "SELECT turn_number, visible_skill_count, chosen_skill_count, shortlisted_chosen_count, \
-                    best_chosen_rank, hit_at_1, hit_at_3 \
+                    best_chosen_rank, selector_tier, elapsed_ms, total_catalog_size \
              FROM skill_selector_turn_metrics WHERE session_id = ?",
         )
         .bind(&session_id)
@@ -3442,16 +3448,34 @@ mod tests {
                 .flatten(),
             Some(2)
         );
-        assert!(!row.try_get::<bool, _>("hit_at_1").unwrap_or(false));
-        assert!(row.try_get::<bool, _>("hit_at_3").unwrap_or(false));
+        assert_eq!(
+            row.try_get::<Option<String>, _>("selector_tier")
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("lexical")
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("elapsed_ms").ok().flatten(),
+            Some(7)
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("total_catalog_size")
+                .ok()
+                .flatten(),
+            Some(2)
+        );
 
         let summary = load_recent_skill_selector_metric_summary(&pool, 1)
             .await
             .expect("load server selector summary");
-        assert_eq!(summary.sample_size, 1);
-        assert_eq!(summary.hit_at_1_rate, 0.0);
-        assert_eq!(summary.hit_at_3_rate, 1.0);
-        assert_eq!(summary.avg_best_chosen_rank, Some(2.0));
+        assert_eq!(summary.sample_size(), 1);
+        assert_eq!(summary.overall.hit_at_1_rate, 0.0);
+        assert_eq!(summary.overall.hit_at_5_rate, 1.0);
+        assert_eq!(summary.overall.avg_best_chosen_rank, Some(2.0));
+        assert_eq!(summary.per_tier.len(), 1);
+        assert_eq!(summary.per_tier[0].tier, "lexical");
+        assert_eq!(summary.per_tier[0].stats.sample_size, 1);
 
         cleanup_runtime_selector_rows(&pool, &session_id).await;
         shared_pool.close().await;

@@ -328,7 +328,7 @@ async fn intercept_skill_calls(
     let skill_ctx = build_skill_context(state);
     let composition_ctx = crate::skills::composition::CompositionContext::root();
     let full_catalog = resolver.available_skills();
-    let (visible_for_mask, _) = crate::turn::skill_tool::visible_skills_for_host_turn(
+    let (visible_for_mask, _, _) = crate::turn::skill_tool::visible_skills_for_host_turn(
         &full_catalog,
         state.message.as_str(),
         &state.skills.quality_tracker,

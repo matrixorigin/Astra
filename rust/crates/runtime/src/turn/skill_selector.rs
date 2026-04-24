@@ -15,7 +15,17 @@ use tracing::{debug, warn};
 use crate::skills::quality::SkillQualityTracker;
 use crate::text_tokenize::tokenize;
 
-const EMBEDDING_POOL: usize = 150;
+const EMBEDDING_POOL: usize = 100;
+/// Lexical recall ceiling before unified shortlist trim.
+const LEXICAL_POOL: usize = 20;
+/// Cheap-LLM rerank fixed shortlist size (per y.md).
+const CHEAP_LLM_TOP_K: usize = 5;
+/// Minimum top-1 cosine/dot similarity required to trust embedding ranking.
+/// Below this we treat embedding as "no signal" (e.g. greetings like "hi" produce
+/// near-uniform low similarity against every skill description).
+const EMBEDDING_MIN_TOP_SIM: f64 = 0.30;
+/// Minimum top-1 lexical score required to trust the lexical tier.
+const LEXICAL_MIN_TOP_SCORE: f64 = 0.0;
 const BUNDLED_SOURCE_BONUS: f64 = 0.10;
 const EMBEDDING_BATCH_SIZE: usize = 32;
 
@@ -285,16 +295,12 @@ struct ExactSignals {
 struct LexicalCandidate {
     idx: usize,
     score: f64,
-    exact: ExactSignals,
 }
 
 #[derive(Clone, Debug)]
 struct FinalCandidate {
     idx: usize,
     final_score: f64,
-    #[allow(dead_code)]
-    lexical_score: f64,
-    exact: ExactSignals,
 }
 
 #[derive(Clone, Debug)]
@@ -563,7 +569,6 @@ fn lexical_candidates(
             LexicalCandidate {
                 idx,
                 score: lexical_score(&query_tokens, entry, quality_tracker, &exact),
-                exact,
             }
         })
         .collect::<Vec<_>>();
@@ -580,34 +585,6 @@ fn select_base_top_k(skill_count: usize, surface_cap: usize) -> usize {
     let cap = surface_cap.clamp(5, 20);
     let base = (skill_count * 2).div_ceil(100);
     base.clamp(5, cap)
-}
-
-fn choose_top_k(skill_count: usize, surface_cap: usize, ranked: &[FinalCandidate]) -> usize {
-    let cap = surface_cap.clamp(5, 20);
-    let base = select_base_top_k(skill_count, surface_cap);
-    let exact_unique = ranked.first().is_some_and(|top| {
-        let exact_count = ranked
-            .iter()
-            .filter(|c| c.exact.name_hit || c.exact.alias_hit || c.exact.trigger_hit)
-            .take(2)
-            .count();
-        exact_count == 1 && (top.exact.name_hit || top.exact.alias_hit || top.exact.trigger_hit)
-    });
-    if exact_unique {
-        return 5.min(cap);
-    }
-    if ranked.len() > base {
-        let top = ranked
-            .first()
-            .map(|c| c.final_score)
-            .unwrap_or(0.0)
-            .max(1e-6);
-        let boundary_gap = (ranked[base - 1].final_score - ranked[base].final_score) / top;
-        if boundary_gap < 0.05 {
-            return cap;
-        }
-    }
-    base
 }
 
 fn l2_normalize(mut vector: Vec<f32>) -> Vec<f32> {
@@ -780,6 +757,18 @@ fn embedding_rank_map(
         .map(|(idx, vec)| (idx, dot_similarity(&query_vec, vec)))
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_sim = ranked.first().map(|(_, sim)| *sim).unwrap_or(0.0);
+    if top_sim < EMBEDDING_MIN_TOP_SIM {
+        debug!(
+            target: "astra::skill_selector",
+            catalog_size = skills.len(),
+            top_sim,
+            threshold = EMBEDDING_MIN_TOP_SIM,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "skill_selector embedding top similarity below threshold; treating as no signal",
+        );
+        return Ok(HashMap::new());
+    }
     let map: HashMap<usize, usize> = ranked
         .into_iter()
         .take(EMBEDDING_POOL)
@@ -790,6 +779,7 @@ fn embedding_rank_map(
         target: "astra::skill_selector",
         catalog_size = skills.len(),
         pool_size = map.len(),
+        top_sim,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "skill_selector embedding rank built",
     );
@@ -930,67 +920,102 @@ pub fn select_skill_indices(
     user_message: &str,
     quality_tracker: Option<&SkillQualityTracker>,
     cfg: &SkillSearchSettings,
-) -> Vec<usize> {
+) -> (Vec<usize>, astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry) {
     let started = Instant::now();
-    let lexical = lexical_candidates(all_skills, user_message, quality_tracker);
-    if lexical.is_empty() {
-        debug!(
-            target: "astra::skill_selector",
-            catalog_size = all_skills.len(),
-            "skill_selector lexical produced no candidates; returning empty",
-        );
-        return Vec::new();
-    }
-    let embedding_ranks = embedding_rank_map(all_skills, user_message).unwrap_or_else(|e| {
-        warn!(
-            target: "astra::skill_selector",
-            error = %e,
-            "skill_selector embedding ranking failed; falling back to lexical",
-        );
-        HashMap::new()
-    });
+    let catalog_size = all_skills.len();
+    let surface_cap = cfg.effective_surface_cap();
+    let embedding_configured = embed_service_from_env().is_some();
     let rerank_enabled = rerank_service_from_env().is_some();
-    let tier = if embedding_ranks.is_empty() {
-        "lexical"
-    } else if rerank_enabled {
-        "embedding+rerank"
-    } else {
-        "embedding"
-    };
-    let ranked = if embedding_ranks.is_empty() {
-        // Tier 1: no embedding service available — fall back to pure lexical ranking.
-        lexical
-            .iter()
-            .map(|cand| FinalCandidate {
-                idx: cand.idx,
-                final_score: cand.score,
-                lexical_score: cand.score,
-                exact: cand.exact.clone(),
-            })
-            .collect::<Vec<_>>()
-    } else {
-        // Tier 2/3: embedding available — rank purely by embedding similarity.
-        // If the cheap-LLM reranker is configured, it will further compress this pool below.
+
+    // Strategy (see y.md):
+    //   1) embedding configured → embedding_top100; if top1 sim ≤ threshold → empty.
+    //      If cheap LLM rerank also configured → cheap_llm_top10 over the pool.
+    //   2) Otherwise → lexical_top20; if top1 score ≤ threshold → empty.
+    //   3) Final unified trim: if non-empty, truncate to x = max(5, min(20, ⌈2% × catalog⌉)).
+    //   Never pad with arbitrary skills.
+    let mut tier: &'static str = "lexical";
+    let (skill_list, ranked_pool_len): (Vec<usize>, usize) = if embedding_configured {
+        let embedding_ranks = embedding_rank_map(all_skills, user_message).unwrap_or_else(|e| {
+            warn!(
+                target: "astra::skill_selector",
+                error = %e,
+                "skill_selector embedding ranking failed; treating as no signal",
+            );
+            HashMap::new()
+        });
+        if embedding_ranks.is_empty() {
+            tier = "embedding";
+            let telemetry = astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
+                selector_tier: Some(tier.to_string()),
+                elapsed_ms: Some(started.elapsed().as_millis() as i64),
+                total_catalog_size: Some(catalog_size as i64),
+                extra: Some(serde_json::json!({"reason": "no_signal"})),
+            };
+            return (Vec::new(), telemetry);
+        }
         let mut pool = embedding_only_candidates(&embedding_ranks);
-        // Apply learned quality boost so embedding/rerank tiers honor SkillQualityTracker
-        // (lexical tier already absorbs the boost inside lexical_score).
         apply_quality_boost(all_skills, &mut pool, quality_tracker);
-        pool
+        let pool_len = pool.len();
+        if rerank_enabled {
+            tier = "embedding+rerank";
+            // cheap_llm_top10(ll): fixed top-10 per y.md.
+            let reranked = rerank_candidates(user_message, all_skills, &pool, CHEAP_LLM_TOP_K)
+                .unwrap_or_else(|_| pool.iter().take(CHEAP_LLM_TOP_K).map(|c| c.idx).collect());
+            (reranked, pool_len)
+        } else {
+            tier = "embedding";
+            (pool.iter().map(|c| c.idx).collect(), pool_len)
+        }
+    } else {
+        let lexical = lexical_candidates(all_skills, user_message, quality_tracker);
+        let no_signal = lexical
+            .first()
+            .map(|c| c.score <= LEXICAL_MIN_TOP_SCORE)
+            .unwrap_or(true);
+        if no_signal {
+            let telemetry = astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
+                selector_tier: Some("lexical".to_string()),
+                elapsed_ms: Some(started.elapsed().as_millis() as i64),
+                total_catalog_size: Some(catalog_size as i64),
+                extra: Some(serde_json::json!({"reason": "no_signal"})),
+            };
+            return (Vec::new(), telemetry);
+        }
+        // 分词策略_top20 per y.md.
+        let pool: Vec<usize> = lexical.iter().take(LEXICAL_POOL).map(|c| c.idx).collect();
+        let pool_len = pool.len();
+        (pool, pool_len)
     };
-    let top_k = choose_top_k(all_skills.len(), cfg.effective_surface_cap(), &ranked);
-    let result = rerank_candidates(user_message, all_skills, &ranked, top_k)
-        .unwrap_or_else(|_| ranked.iter().take(top_k).map(|c| c.idx).collect());
+
+    // Final unified trim: x = max(5, min(20, ⌈2% × catalog⌉)).
+    let x = select_base_top_k(catalog_size, surface_cap);
+    let mut result = skill_list;
+    if result.len() > x {
+        result.truncate(x);
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as i64;
     debug!(
         target: "astra::skill_selector",
         tier,
-        catalog_size = all_skills.len(),
-        ranked_pool = ranked.len(),
+        catalog_size,
+        ranked_pool = ranked_pool_len,
         returned = result.len(),
-        top_k,
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        final_cap = x,
+        elapsed_ms = elapsed_ms as u64,
         "skill_selector select_skill_indices done",
     );
-    result
+    let telemetry = astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
+        selector_tier: Some(tier.to_string()),
+        elapsed_ms: Some(elapsed_ms),
+        total_catalog_size: Some(catalog_size as i64),
+        extra: Some(serde_json::json!({
+            "ranked_pool": ranked_pool_len,
+            "returned": result.len(),
+            "final_cap": x,
+        })),
+    };
+    (result, telemetry)
 }
 
 fn embedding_only_candidates(embedding_ranks: &HashMap<usize, usize>) -> Vec<FinalCandidate> {
@@ -1004,8 +1029,6 @@ fn embedding_only_candidates(embedding_ranks: &HashMap<usize, usize>) -> Vec<Fin
         .map(|(idx, rank)| FinalCandidate {
             idx,
             final_score: 1.0 / (rank as f64 + 1.0),
-            lexical_score: 0.0,
-            exact: Default::default(),
         })
         .collect()
 }
@@ -1070,8 +1093,6 @@ pub fn discover_skill_indices(
             .map(|cand| FinalCandidate {
                 idx: cand.idx,
                 final_score: cand.score,
-                lexical_score: cand.score,
-                exact: cand.exact,
             })
             .collect::<Vec<_>>()
     } else {
@@ -1138,36 +1159,13 @@ mod tests {
             },
             skill("debug", "Debug issues"),
         ];
-        let ranked = select_skill_indices(
+        let (ranked, _telemetry) = select_skill_indices(
             &skills,
             "请帮我 deploy 一下",
             None,
             &SkillSearchSettings::default(),
         );
         assert_eq!(ranked.first().copied(), Some(0));
-    }
-
-    #[test]
-    fn choose_top_k_prefers_small_exact_hit() {
-        let ranked = vec![
-            FinalCandidate {
-                idx: 0,
-                final_score: 1.0,
-                lexical_score: 30.0,
-                exact: ExactSignals {
-                    name_hit: true,
-                    alias_hit: false,
-                    trigger_hit: false,
-                },
-            },
-            FinalCandidate {
-                idx: 1,
-                final_score: 0.2,
-                lexical_score: 2.0,
-                exact: ExactSignals::default(),
-            },
-        ];
-        assert_eq!(choose_top_k(1000, 20, &ranked), 5);
     }
 
     #[test]
@@ -1220,14 +1218,10 @@ mod tests {
             FinalCandidate {
                 idx: 0,
                 final_score: 1.0,
-                lexical_score: 0.0,
-                exact: Default::default(),
             },
             FinalCandidate {
                 idx: 1,
                 final_score: 0.95,
-                lexical_score: 0.0,
-                exact: Default::default(),
             },
         ];
         apply_quality_boost(&catalog, &mut pool, Some(&tracker));
@@ -1243,14 +1237,10 @@ mod tests {
             FinalCandidate {
                 idx: 0,
                 final_score: 1.0,
-                lexical_score: 0.0,
-                exact: Default::default(),
             },
             FinalCandidate {
                 idx: 1,
                 final_score: 0.5,
-                lexical_score: 0.0,
-                exact: Default::default(),
             },
         ];
         apply_quality_boost(&catalog, &mut pool, None);

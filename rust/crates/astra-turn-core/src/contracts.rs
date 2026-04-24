@@ -101,10 +101,18 @@ pub struct TurnSkillSelectorMetricRecord {
     pub shortlisted_chosen_count: i64,
     pub missed_chosen_count: i64,
     pub best_chosen_rank: Option<i64>,
-    pub hit_at_1: bool,
-    pub hit_at_3: bool,
-    pub hit_at_5: bool,
-    pub hit_at_14: bool,
+    /// Selector tier label: "lexical", "embedding", "embedding+rerank".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_tier: Option<String>,
+    /// Selector pass wall-clock time in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<i64>,
+    /// Total skill catalog size visible to the selector before truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_catalog_size: Option<i64>,
+    /// Free-form forward-compatible attributes (JSON in MO).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

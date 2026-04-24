@@ -30,9 +30,10 @@ struct Args {
     summary: PathBuf,
     limit: Option<usize>,
     include_unpassed: bool,
+    concurrency: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct PrimaryRecord {
     record_id: String,
     prompt_id: String,
@@ -53,9 +54,9 @@ struct ResultRow {
     open_catalog: bool,
     best_rank: Option<i64>,
     hit_at_1: bool,
-    hit_at_3: bool,
     hit_at_5: bool,
-    hit_at_14: bool,
+    hit_at_10: bool,
+    hit_at_20: bool,
     top_skill: Option<String>,
     shortlist: Vec<String>,
 }
@@ -70,14 +71,11 @@ struct Summary {
     skipped_unpassed_records: usize,
     evaluated_records: usize,
     hit_at_1_rate: f64,
-    hit_at_3_rate: f64,
     hit_at_5_rate: f64,
-    hit_at_14_rate: f64,
+    hit_at_10_rate: f64,
+    hit_at_20_rate: f64,
     avg_best_rank_on_hit: Option<f64>,
     misses_not_shortlisted: usize,
-    misses_rank_2_to_3: usize,
-    misses_rank_4_to_5: usize,
-    misses_rank_6_to_14: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -88,11 +86,21 @@ fn parse_args() -> Result<Args, String> {
         summary: PathBuf::from(DEFAULT_SUMMARY),
         limit: None,
         include_unpassed: false,
+        concurrency: 1,
     };
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--concurrency" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--concurrency requires a value".to_string())?;
+                args.concurrency = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --concurrency value: {raw}"))?
+                    .max(1);
+            }
             "--sample-dir" => {
                 args.sample_dir = PathBuf::from(
                     iter.next()
@@ -248,105 +256,121 @@ fn main() -> Result<(), Box<dyn Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let _guard = runtime.enter();
+    runtime.block_on(run(args))
+}
 
-    let catalog = load_catalog(&fs::canonicalize(&args.sample_dir)?)?;
+async fn run(args: Args) -> Result<(), Box<dyn Error>> {
+    let catalog = std::sync::Arc::new(load_catalog(&fs::canonicalize(&args.sample_dir)?)?);
     let (raw_record_count, total_records) = load_records(&args.dataset)?;
-    let tracker = SkillQualityTracker::new();
-    let search = SkillSearchSettings::default();
-    let pinned = HashSet::new();
-    let discovered = HashSet::new();
-    let invoked: HashMap<String, InvokedSkill> = HashMap::new();
+    let tracker = std::sync::Arc::new(SkillQualityTracker::new());
+    let search = std::sync::Arc::new(SkillSearchSettings::default());
+    let pinned = std::sync::Arc::new(HashSet::<String>::new());
+    let discovered = std::sync::Arc::new(HashSet::<String>::new());
+    let invoked = std::sync::Arc::new(HashMap::<String, InvokedSkill>::new());
 
+    let eligible: Vec<&PrimaryRecord> = total_records
+        .iter()
+        .filter(|r| args.include_unpassed || r.passes)
+        .collect();
+    let skipped_unpassed = total_records.len() - eligible.len();
+    let to_run: Vec<PrimaryRecord> = eligible
+        .into_iter()
+        .take(args.limit.unwrap_or(usize::MAX))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "evaluating {} records with concurrency={}",
+        to_run.len(),
+        args.concurrency
+    );
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+    let mut tasks = futures::stream::FuturesUnordered::new();
+    for record in to_run.into_iter() {
+        let catalog = catalog.clone();
+        let tracker = tracker.clone();
+        let search = search.clone();
+        let pinned = pinned.clone();
+        let discovered = discovered.clone();
+        let invoked = invoked.clone();
+        let semaphore = semaphore.clone();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let _permit = futures::executor::block_on(semaphore.acquire_owned()).unwrap();
+            let (visible, open_catalog, telemetry) = visible_skills_for_host_turn(
+                &catalog,
+                &record.prompt,
+                &tracker,
+                &pinned,
+                &discovered,
+                &invoked,
+                &search,
+            );
+            let shortlist =
+                build_skill_selector_shortlist_trace(&visible, open_catalog, telemetry);
+            let metric = compute_skill_selector_metric(
+                &shortlist,
+                std::slice::from_ref(&record.target_skill),
+            )
+            .expect("metric");
+            let h1 = metric.hit_at(1);
+            let h5 = metric.hit_at(5);
+            let h10 = metric.hit_at(10);
+            let h20 = metric.hit_at(20);
+            ResultRow {
+                record_id: record.record_id.clone(),
+                prompt_id: record.prompt_id.clone(),
+                difficulty: record.difficulty.clone(),
+                target_skill: record.target_skill.clone(),
+                visible_skill_count: metric.visible_skill_count,
+                open_catalog: shortlist.open_catalog,
+                best_rank: metric.best_chosen_rank,
+                hit_at_1: h1,
+                hit_at_5: h5,
+                hit_at_10: h10,
+                hit_at_20: h20,
+                top_skill: shortlist
+                    .skills
+                    .first()
+                    .map(|e| e.skill_name.clone()),
+                shortlist: shortlist
+                    .skills
+                    .iter()
+                    .map(|e| e.skill_name.clone())
+                    .collect(),
+            }
+        }));
+    }
+
+    use futures::StreamExt;
     let mut results = Vec::new();
-    let mut skipped_unpassed = 0usize;
     let mut hit1 = 0usize;
-    let mut hit3 = 0usize;
     let mut hit5 = 0usize;
-    let mut hit14 = 0usize;
+    let mut hit10 = 0usize;
+    let mut hit20 = 0usize;
     let mut best_rank_sum = 0f64;
     let mut best_rank_count = 0usize;
     let mut misses_not_shortlisted = 0usize;
-    let mut misses_rank_2_to_3 = 0usize;
-    let mut misses_rank_4_to_5 = 0usize;
-    let mut misses_rank_6_to_14 = 0usize;
-
-    for record in total_records.iter() {
-        if !args.include_unpassed && !record.passes {
-            skipped_unpassed += 1;
-            continue;
-        }
-        if let Some(limit) = args.limit
-            && results.len() >= limit {
-                break;
-            }
-
-        let (visible, open_catalog) = visible_skills_for_host_turn(
-            &catalog,
-            &record.prompt,
-            &tracker,
-            &pinned,
-            &discovered,
-            &invoked,
-            &search,
-        );
-        let shortlist = build_skill_selector_shortlist_trace(&visible, open_catalog);
-        let metric =
-            compute_skill_selector_metric(&shortlist, std::slice::from_ref(&record.target_skill))
-                .ok_or_else(|| format!("no metric produced for target {}", record.target_skill))?;
-
-        if metric.hit_at_1 {
-            hit1 += 1;
-        }
-        if metric.hit_at_3 {
-            hit3 += 1;
-            if let Some(rank) = metric.best_chosen_rank
-                && rank > 1 {
-                    misses_rank_2_to_3 += 1;
-                }
-        }
-        if metric.hit_at_5 {
-            hit5 += 1;
-            if let Some(rank) = metric.best_chosen_rank
-                && (4..=5).contains(&rank) {
-                    misses_rank_4_to_5 += 1;
-                }
-        }
-        if metric.hit_at_14 {
-            hit14 += 1;
-            if let Some(rank) = metric.best_chosen_rank {
-                if (6..=14).contains(&rank) {
-                    misses_rank_6_to_14 += 1;
-                }
+    let mut done = 0usize;
+    while let Some(joined) = tasks.next().await {
+        let row = joined?;
+        if row.hit_at_1 { hit1 += 1; }
+        if row.hit_at_5 { hit5 += 1; }
+        if row.hit_at_10 { hit10 += 1; }
+        if row.hit_at_20 {
+            hit20 += 1;
+            if let Some(rank) = row.best_rank {
                 best_rank_sum += rank as f64;
                 best_rank_count += 1;
             }
         } else {
             misses_not_shortlisted += 1;
         }
-
-        results.push(ResultRow {
-            record_id: record.record_id.clone(),
-            prompt_id: record.prompt_id.clone(),
-            difficulty: record.difficulty.clone(),
-            target_skill: record.target_skill.clone(),
-            visible_skill_count: metric.visible_skill_count,
-            open_catalog: shortlist.open_catalog,
-            best_rank: metric.best_chosen_rank,
-            hit_at_1: metric.hit_at_1,
-            hit_at_3: metric.hit_at_3,
-            hit_at_5: metric.hit_at_5,
-            hit_at_14: metric.hit_at_14,
-            top_skill: shortlist
-                .skills
-                .first()
-                .map(|entry| entry.skill_name.clone()),
-            shortlist: shortlist
-                .skills
-                .iter()
-                .map(|entry| entry.skill_name.clone())
-                .collect(),
-        });
+        results.push(row);
+        done += 1;
+        if done % 50 == 0 {
+            eprintln!("  progress {}", done);
+        }
     }
 
     let evaluated = results.len();
@@ -360,18 +384,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         skipped_unpassed_records: skipped_unpassed,
         evaluated_records: evaluated,
         hit_at_1_rate: hit1 as f64 / denom,
-        hit_at_3_rate: hit3 as f64 / denom,
         hit_at_5_rate: hit5 as f64 / denom,
-        hit_at_14_rate: hit14 as f64 / denom,
+        hit_at_10_rate: hit10 as f64 / denom,
+        hit_at_20_rate: hit20 as f64 / denom,
         avg_best_rank_on_hit: if best_rank_count == 0 {
             None
         } else {
             Some(best_rank_sum / best_rank_count as f64)
         },
         misses_not_shortlisted,
-        misses_rank_2_to_3,
-        misses_rank_4_to_5,
-        misses_rank_6_to_14,
     };
 
     write_jsonl(&args.output, &results)?;

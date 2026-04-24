@@ -4,6 +4,25 @@ use serde::{Deserialize, Serialize};
 
 pub const SKILL_SELECTOR_RECENT_WINDOW_SIZE: i64 = 1000;
 
+/// Telemetry captured by the runtime skill selector for one turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSelectorTelemetry {
+    /// Tier label used for the final ranking pass:
+    /// `"lexical"`, `"embedding"`, `"embedding+rerank"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_tier: Option<String>,
+    /// Wall-clock time of the selector pass, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<i64>,
+    /// Total skill catalog size visible to the selector before truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_catalog_size: Option<i64>,
+    /// Free-form forward-compatible attributes (embedding model, rerank model,
+    /// quality-boost counts, A/B tags, etc.). Stored as JSON in MO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSelectorShortlistEntry {
     pub rank: i32,
@@ -23,6 +42,16 @@ pub struct SkillSelectorShortlistTrace {
     pub visible_skill_count: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillSelectorShortlistEntry>,
+    /// Selector telemetry attached to this shortlist (tier, latency, catalog size, …).
+    #[serde(default, skip_serializing_if = "telemetry_is_empty")]
+    pub telemetry: SkillSelectorTelemetry,
+}
+
+fn telemetry_is_empty(t: &SkillSelectorTelemetry) -> bool {
+    t.selector_tier.is_none()
+        && t.elapsed_ms.is_none()
+        && t.total_catalog_size.is_none()
+        && t.extra.is_none()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,10 +61,17 @@ pub struct SkillSelectorMetricComputation {
     pub shortlisted_chosen_count: i64,
     pub missed_chosen_count: i64,
     pub best_chosen_rank: Option<i64>,
-    pub hit_at_1: bool,
-    pub hit_at_3: bool,
-    pub hit_at_5: bool,
-    pub hit_at_14: bool,
+    /// Telemetry forwarded from the shortlist trace (passes through to storage).
+    #[serde(default)]
+    pub telemetry: SkillSelectorTelemetry,
+}
+
+impl SkillSelectorMetricComputation {
+    /// True when the LLM's chosen skill appears at rank ≤ k in the shortlist.
+    /// Returns false when no chosen skill was shortlisted.
+    pub fn hit_at(&self, k: i64) -> bool {
+        self.best_chosen_rank.is_some_and(|rank| rank <= k)
+    }
 }
 
 pub fn compute_skill_selector_metric(
@@ -92,10 +128,7 @@ pub fn compute_skill_selector_metric(
         shortlisted_chosen_count,
         missed_chosen_count,
         best_chosen_rank: best_rank,
-        hit_at_1: best_rank.is_some_and(|rank| rank <= 1),
-        hit_at_3: best_rank.is_some_and(|rank| rank <= 3),
-        hit_at_5: best_rank.is_some_and(|rank| rank <= 5),
-        hit_at_14: best_rank.is_some_and(|rank| rank <= 14),
+        telemetry: shortlist.telemetry.clone(),
     })
 }
 
@@ -126,6 +159,7 @@ mod tests {
                     category: None,
                 })
                 .collect(),
+            telemetry: SkillSelectorTelemetry::default(),
         }
     }
 
@@ -153,10 +187,10 @@ mod tests {
         assert_eq!(metric.shortlisted_chosen_count, 2);
         assert_eq!(metric.missed_chosen_count, 1);
         assert_eq!(metric.best_chosen_rank, Some(2));
-        assert!(!metric.hit_at_1);
-        assert!(metric.hit_at_3);
-        assert!(metric.hit_at_5);
-        assert!(metric.hit_at_14);
+        assert!(!metric.hit_at(1));
+        assert!(metric.hit_at(3));
+        assert!(metric.hit_at(5));
+        assert!(metric.hit_at(14));
     }
 
     #[test]
@@ -177,7 +211,7 @@ mod tests {
         assert_eq!(metric.shortlisted_chosen_count, 1);
         assert_eq!(metric.missed_chosen_count, 0);
         assert_eq!(metric.best_chosen_rank, Some(1));
-        assert!(metric.hit_at_1);
+        assert!(metric.hit_at(1));
     }
 
     #[test]

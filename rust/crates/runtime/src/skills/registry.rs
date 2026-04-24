@@ -22,6 +22,25 @@ struct CachedSkill {
 
 // ── UnifiedSkillRegistry ─────────────────────────────────────────────────────
 
+/// Default metadata-token budget for skill registration.
+const DEFAULT_METADATA_BUDGET: u32 = 10_000;
+
+/// Read the metadata budget from `ASTRA_SKILL_METADATA_BUDGET`.
+///
+/// When unset, returns `DEFAULT_METADATA_BUDGET` (10_000 tokens — roughly
+/// 100 skills at 100 tokens each). Setting the value to `0` disables the
+/// cap entirely (useful for benchmarking large skill catalogs).
+fn default_metadata_budget() -> u32 {
+    match std::env::var("ASTRA_SKILL_METADATA_BUDGET") {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(0) => u32::MAX,
+            Ok(n) => n,
+            Err(_) => DEFAULT_METADATA_BUDGET,
+        },
+        Err(_) => DEFAULT_METADATA_BUDGET,
+    }
+}
+
 /// Aggregates skills from multiple providers with priority-ordered resolution.
 pub struct UnifiedSkillRegistry {
     providers: Vec<Box<dyn SkillProvider>>,
@@ -42,7 +61,7 @@ impl UnifiedSkillRegistry {
             cache: RwLock::new(HashMap::new()),
             conditional_skills: RwLock::new(Vec::new()),
             conditional_tracker: RwLock::new(ConditionalSkillTracker::new()),
-            metadata_budget: 10_000,
+            metadata_budget: default_metadata_budget(),
             mcp_provider: mcp,
         }
     }
