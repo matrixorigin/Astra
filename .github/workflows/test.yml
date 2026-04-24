@@ -60,6 +60,14 @@ jobs:
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
           --profile ci --bins -E 'not test(/edge_tools::/)'
+      - name: "Diagnose CI environment"
+        run: |
+          which rust-analyzer 2>/dev/null && rust-analyzer --version || echo "rust-analyzer: not found"
+          which typescript-language-server 2>/dev/null && echo "tsserver: found" || echo "tsserver: not found"
+          which pyright 2>/dev/null && echo "pyright: found" || echo "pyright: not found"
+          which gopls 2>/dev/null && echo "gopls: found" || echo "gopls: not found"
+          which node 2>/dev/null && node --version || echo "node: not found"
+          ulimit -a | grep -E "open files|processes"
       - name: "Test astra-cli (edge_tools)"
         timeout-minutes: 15
         run: >-
