@@ -465,7 +465,7 @@ impl<'a> CliSseStreamHost<'a> {
         // Only hold back if the tail could plausibly become one of our known tags.
         if let Some(last_lt) = self.xml_tag_buffer.rfind('<') {
             let tail = &self.xml_tag_buffer[last_lt..];
-            if !tail.contains('>') && could_become_thinking_tag(tail) {
+            if !tail.contains('>') && super::streaming_md::could_become_suppressed_tag(tail) {
                 // Potential partial tag — split: flush before, hold tail.
                 let before = self.xml_tag_buffer[..last_lt].to_string();
                 let held = self.xml_tag_buffer[last_lt..].to_string();
@@ -1397,56 +1397,6 @@ fn extract_first_absolute_path(command: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Returns true if `partial` could become one of our known thinking tags.
-/// E.g., "<", "<t", "<th", "<thi", "</", "</t", "</think" etc.
-fn could_become_thinking_tag(partial: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "<t",
-        "<th",
-        "<thi",
-        "<thin",
-        "<think",
-        "<r",
-        "<re",
-        "<ref",
-        "<refl",
-        "<refle",
-        "<reflec",
-        "<reflect",
-        "<i",
-        "<in",
-        "<inn",
-        "<inne",
-        "<inner",
-        "<inner_",
-        "</t",
-        "</th",
-        "</thi",
-        "</thin",
-        "</think",
-        "</r",
-        "</re",
-        "</ref",
-        "</refl",
-        "</refle",
-        "</reflec",
-        "</reflect",
-        "</i",
-        "</in",
-        "</inn",
-        "</inne",
-        "</inner",
-        "</inner_",
-    ];
-    // Also match bare "<" or "</" which could become anything
-    if partial == "<" || partial == "</" {
-        return true;
-    }
-    PREFIXES
-        .iter()
-        .any(|p| p.starts_with(partial) || partial.starts_with(p))
 }
 
 /// D-9 correctness guard: decide whether a speculative result may be
@@ -6475,30 +6425,31 @@ mod tests {
     // ── Partial tag detection ────────────────────────────────────────
 
     #[test]
-    fn could_become_thinking_tag_matches_known_prefixes() {
-        assert!(could_become_thinking_tag("<"));
-        assert!(could_become_thinking_tag("</"));
-        assert!(could_become_thinking_tag("<t"));
-        assert!(could_become_thinking_tag("<th"));
-        assert!(could_become_thinking_tag("<thi"));
-        assert!(could_become_thinking_tag("<thin"));
-        assert!(could_become_thinking_tag("<think"));
-        assert!(could_become_thinking_tag("</think"));
-        assert!(could_become_thinking_tag("<r"));
-        assert!(could_become_thinking_tag("<ref"));
-        assert!(could_become_thinking_tag("</reflect"));
+    fn could_become_suppressed_tag_matches_known_prefixes() {
+        use super::super::streaming_md::could_become_suppressed_tag;
+        assert!(could_become_suppressed_tag("<"));
+        assert!(could_become_suppressed_tag("</"));
+        assert!(could_become_suppressed_tag("<t"));
+        assert!(could_become_suppressed_tag("<th"));
+        assert!(could_become_suppressed_tag("<thi"));
+        assert!(could_become_suppressed_tag("<thin"));
+        assert!(could_become_suppressed_tag("<think"));
+        assert!(could_become_suppressed_tag("</think"));
+        assert!(could_become_suppressed_tag("<r"));
+        assert!(could_become_suppressed_tag("<ref"));
+        assert!(could_become_suppressed_tag("</reflect"));
     }
 
     #[test]
-    fn could_become_thinking_tag_rejects_other_tags() {
-        // HTML tags that aren't thinking tags
-        assert!(!could_become_thinking_tag("<co")); // <code>
-        assert!(!could_become_thinking_tag("<p"));
-        assert!(!could_become_thinking_tag("<div"));
-        assert!(!could_become_thinking_tag("<span"));
-        assert!(!could_become_thinking_tag("</code"));
-        assert!(!could_become_thinking_tag("<a"));
-        assert!(!could_become_thinking_tag("<b"));
+    fn could_become_suppressed_tag_rejects_other_tags() {
+        use super::super::streaming_md::could_become_suppressed_tag;
+        assert!(!could_become_suppressed_tag("<co")); // <code>
+        assert!(!could_become_suppressed_tag("<p"));
+        assert!(!could_become_suppressed_tag("<div"));
+        assert!(!could_become_suppressed_tag("<span"));
+        assert!(!could_become_suppressed_tag("</code"));
+        assert!(!could_become_suppressed_tag("<a"));
+        assert!(!could_become_suppressed_tag("<b"));
     }
 
     #[test]

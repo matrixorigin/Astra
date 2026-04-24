@@ -158,22 +158,57 @@ fn rendered_to_lines(rendered: &str) -> Vec<String> {
     lines
 }
 
-/// Strip LLM thinking/reflect XML tags from text in-place.
+// ── Suppressed XML tag registry ──────────────────────────────────────────────
+//
+// Single source of truth for XML tags that should be stripped from model output.
+// All filtering functions (`strip_xml_tags_inplace`, `has_open_xml_tag`,
+// `could_become_suppressed_tag`) derive from this list.
+//
+// To add a new tag: add one entry here. Everything else auto-derives.
+
+/// A tag that should be suppressed in model output.
+enum SuppressedTag {
+    /// `<tag>…</tag>` — no attributes on the opening tag.
+    Simple(&'static str),
+    /// `<tag …>…</tag>` — opening tag may carry attributes.
+    WithAttrs(&'static str),
+}
+
+const SUPPRESSED_TAGS: &[SuppressedTag] = &[
+    SuppressedTag::Simple("reflect"),
+    SuppressedTag::Simple("thinking"),
+    SuppressedTag::Simple("think"),
+    SuppressedTag::Simple("inner_monologue"),
+];
+
+/// Strip all suppressed XML tags (and their content) from `text` in-place.
 ///
 /// Handles:
-/// - Matched pairs: `<think>content</think>` → removed entirely
-/// - Unclosed opening tags: `<think>trailing` → truncated at tag start
-/// - Lone closing tags: `</think>` without matching open → removed
+/// - Matched pairs: `<tag>…</tag>` or `<tag attr="…">…</tag>` → removed
+/// - Unclosed opening tags: `<tag>trailing` → truncated at tag start
+/// - Lone closing tags: `</tag>` without matching open → removed
 pub(super) fn strip_xml_tags_inplace(text: &mut String) {
-    const TAGS: &[&str] = &["reflect", "thinking", "think", "inner_monologue"];
     let mut changed = false;
-    for tag in TAGS {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        // Strip matched pairs first.
-        while let Some(start) = text.find(&open) {
-            if let Some(end) = text[start..].find(&close) {
-                let remove_end = start + end + close.len();
+
+    for tag in SUPPRESSED_TAGS {
+        let (name, has_attrs) = match tag {
+            SuppressedTag::Simple(n) => (*n, false),
+            SuppressedTag::WithAttrs(n) => (*n, true),
+        };
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+
+        // Strip matched pairs.
+        loop {
+            let start = if has_attrs {
+                find_attr_tag_open(text, name, 0)
+            } else {
+                text.find(&open)
+            };
+            let Some(start) = start else { break };
+
+            if let Some(end_rel) = text[start..].find(&close) {
+                let remove_end = start + end_rel + close.len();
                 let remove_end = if text.as_bytes().get(remove_end) == Some(&b'\n') {
                     remove_end + 1
                 } else {
@@ -182,13 +217,14 @@ pub(super) fn strip_xml_tags_inplace(text: &mut String) {
                 text.drain(start..remove_end);
                 changed = true;
             } else {
+                // Unclosed — truncate everything from the tag start.
                 text.truncate(start);
                 changed = true;
                 break;
             }
         }
-        // Strip any remaining lone closing tags (model may leak `</think>`
-        // without a matching opening tag in the same text block).
+
+        // Strip lone closing tags.
         while let Some(pos) = text.find(&close) {
             let remove_end = pos + close.len();
             let remove_end = if text.as_bytes().get(remove_end) == Some(&b'\n') {
@@ -200,10 +236,28 @@ pub(super) fn strip_xml_tags_inplace(text: &mut String) {
             changed = true;
         }
     }
+
     if changed {
         while text.contains("\n\n\n") {
             *text = text.replace("\n\n\n", "\n\n");
         }
+    }
+}
+
+/// Find the start of `<name` followed by a word boundary (space, `>`, newline,
+/// or end-of-string) at or after `from`. Returns `None` if not found.
+fn find_attr_tag_open(text: &str, name: &str, from: usize) -> Option<usize> {
+    let prefix = format!("<{name}");
+    let mut search_from = from;
+    loop {
+        let pos = text[search_from..].find(&prefix)?;
+        let abs = search_from + pos;
+        let after = text.as_bytes().get(abs + prefix.len()).copied();
+        if matches!(after, Some(b' ') | Some(b'>') | Some(b'\n') | None) {
+            return Some(abs);
+        }
+        // Not a real tag (e.g. <invoker>), skip past.
+        search_from = abs + prefix.len();
     }
 }
 
@@ -292,18 +346,50 @@ pub(super) fn strip_leading_narration(text: &mut String) {
 /// rendering of text that will be stripped once the closing tag arrives.
 #[allow(dead_code)]
 pub(super) fn has_open_xml_tag(text: &str) -> bool {
-    const TAGS: &[&str] = &["reflect", "thinking", "think", "inner_monologue"];
-    for tag in TAGS {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        // Walk all opens; if any isn't matched by a close, we have an open tag.
+    for tag in SUPPRESSED_TAGS {
+        let (name, has_attrs) = match tag {
+            SuppressedTag::Simple(n) => (*n, false),
+            SuppressedTag::WithAttrs(n) => (*n, true),
+        };
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
         let mut search_from = 0;
-        while let Some(start) = text[search_from..].find(&open) {
-            let abs = search_from + start;
+        loop {
+            let start = if has_attrs {
+                find_attr_tag_open(text, name, search_from)
+            } else {
+                text[search_from..].find(&open).map(|p| search_from + p)
+            };
+            let Some(abs) = start else { break };
             if text[abs..].find(&close).is_none() {
                 return true;
             }
-            search_from = abs + open.len();
+            search_from = abs + name.len() + 1; // skip past `<name`
+        }
+    }
+    false
+}
+
+/// Check if a partial tag fragment (e.g. `<inv`, `</tool`) could become one of
+/// the suppressed XML tags. Used during streaming to hold back text that might
+/// be the start of a tag we want to suppress.
+///
+/// Prefixes are auto-derived from [`SUPPRESSED_TAGS`] — no manual list needed.
+pub(super) fn could_become_suppressed_tag(partial: &str) -> bool {
+    if partial == "<" || partial == "</" {
+        return true;
+    }
+    for tag in SUPPRESSED_TAGS {
+        let name = match tag {
+            SuppressedTag::Simple(n) | SuppressedTag::WithAttrs(n) => *n,
+        };
+        // Check both `<name` and `</name` prefixes.
+        for prefix_base in [format!("<{name}"), format!("</{name}")] {
+            // Either partial is a prefix of the full tag, or the full tag
+            // starts with partial.
+            if partial.starts_with(&prefix_base) || prefix_base.starts_with(partial) {
+                return true;
+            }
         }
     }
     false
@@ -527,5 +613,62 @@ mod tests {
         let mut s = "Based on my analysis:\n\n- Item 1\n- Item 2".to_string();
         strip_leading_narration(&mut s);
         assert_eq!(s, "- Item 1\n- Item 2");
+    }
+
+    // ── unified suppressed tag registry ───────────────────────────────────
+
+    // Note: <invoke> and <tool_call> are intentionally NOT in SUPPRESSED_TAGS.
+    // Stripping them from text would corrupt legitimate content that *discusses*
+    // these tags (e.g. code reviews, documentation). Instead, XML tool call
+    // recovery is handled by consume_sse_stream's fallback when tool_calls is
+    // empty (see sse_stream_host.rs).
+
+    #[test]
+    fn strip_does_not_touch_invoke_in_text() {
+        // Model text that discusses <invoke> should be preserved.
+        let mut s = "The test `xml_invoke_in_text` covers `<invoke name=\"write_file\">` recovery."
+            .to_string();
+        strip_xml_tags_inplace(&mut s);
+        assert!(
+            s.contains("<invoke"),
+            "invoke in prose should be preserved, got: {s}"
+        );
+    }
+
+    #[test]
+    fn find_attr_tag_open_basic() {
+        // Unit test for the helper — used by WithAttrs variant.
+        assert_eq!(
+            super::find_attr_tag_open("<invoke name=\"x\">", "invoke", 0),
+            Some(0)
+        );
+        assert_eq!(
+            super::find_attr_tag_open("text <invoke name=\"x\">", "invoke", 0),
+            Some(5)
+        );
+        // <invoker> should not match.
+        assert_eq!(super::find_attr_tag_open("<invoker>", "invoke", 0), None);
+    }
+
+    #[test]
+    fn has_open_xml_tag_ignores_invoke() {
+        // <invoke> is not in SUPPRESSED_TAGS, so has_open_xml_tag should not detect it.
+        assert!(!has_open_xml_tag(
+            "<invoke name=\"write_file\">\n<parameter"
+        ));
+    }
+
+    #[test]
+    fn could_become_suppressed_rejects_invoke() {
+        // <invoke> is not in SUPPRESSED_TAGS.
+        assert!(!could_become_suppressed_tag("<inv"));
+        assert!(!could_become_suppressed_tag("<invoke"));
+    }
+
+    #[test]
+    fn could_become_suppressed_rejects_html() {
+        assert!(!could_become_suppressed_tag("<div"));
+        assert!(!could_become_suppressed_tag("<span"));
+        assert!(!could_become_suppressed_tag("<code"));
     }
 }
