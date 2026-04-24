@@ -69,10 +69,14 @@ jobs:
           which node 2>/dev/null && node --version || echo "node: not found"
           ulimit -a | grep -E "open files|processes"
       - name: "Test astra-cli (edge_tools)"
-        timeout-minutes: 25
-        run: >-
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
-          --profile ci --bins -E 'test(/edge_tools::/)'  --test-threads 1
+        run: |
+          timeout 900 cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli \
+            --profile ci --bins -E 'test(/edge_tools::/)' --test-threads 1; EC=$?
+          if [ $EC -ne 0 ]; then
+            echo "=== HANGING PROCESSES ==="
+            ps -ef | grep -E 'sleep|lsp|rust.analyzer|node|nextest|bash' || true
+          fi
+          exit $EC
       - name: Dump processes on failure
         if: failure()
         run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
