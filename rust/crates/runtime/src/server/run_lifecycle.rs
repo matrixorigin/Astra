@@ -2853,6 +2853,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         limit: u32,
         offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+        let (limit, offset) = astra_services::pagination::clamp_api_list_pagination(limit, offset);
         if let Some(engine) = &self.run_engine {
             let (durable_runs, total) = engine
                 .list_user_runs(&user_id, limit, offset)
@@ -4184,6 +4185,38 @@ mod tests {
         assert_eq!(page2.runs.len(), 2);
         let page3 = ok(svc.list_runs("user-1".into(), 2, 4).await);
         assert_eq!(page3.runs.len(), 1);
+    }
+
+    /// P2-B: list_runs must clamp pagination params like other list endpoints.
+    #[tokio::test]
+    async fn list_runs_clamps_pagination() {
+        let svc = test_service();
+        // Absurdly large limit/offset must not panic or produce unbounded queries
+        let result = ok(svc.list_runs("user-clamp".into(), u32::MAX, u32::MAX).await);
+        assert_eq!(result.runs.len(), 0);
+        // Verify the returned limit/offset are clamped
+        assert!(
+            result.limit <= astra_services::pagination::MAX_API_LIST_LIMIT,
+            "limit must be clamped to MAX_API_LIST_LIMIT"
+        );
+    }
+
+    /// P2-B source guard: list_runs must call clamp_api_list_pagination.
+    #[test]
+    fn list_runs_uses_pagination_clamping() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn list_runs(")
+            .expect("list_runs must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("clamp_api_list_pagination"),
+            "list_runs must clamp pagination params"
+        );
     }
 
     #[test]

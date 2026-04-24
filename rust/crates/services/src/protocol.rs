@@ -149,7 +149,8 @@ pub struct DeltaBatch {
 }
 
 impl DeltaBatch {
-    /// Create a new empty delta batch.
+    /// Create a new empty delta batch. The batch is not valid until at least one
+    /// operation is added via [`push`](Self::push), which auto-adjusts `target_version`.
     pub fn new(source_version: i64, checkpoint_id: impl Into<String>) -> Self {
         Self {
             source_version,
@@ -197,7 +198,11 @@ impl DeltaBatch {
             ));
         }
         if self.operations.len() as i64 != self.target_version - self.source_version {
-            // This is a warning condition, not necessarily an error
+            return Err(DeltaError::ValidationFailed(format!(
+                "operation count ({}) does not match version delta ({})",
+                self.operations.len(),
+                self.target_version - self.source_version,
+            )));
         }
         if self.checkpoint_id.is_empty() {
             return Err(DeltaError::InvalidCheckpoint(
@@ -540,7 +545,7 @@ impl DeltaError {
         match self {
             Self::InvalidVersion(_) | Self::InvalidCheckpoint(_) | Self::ValidationFailed(_) => 400,
             Self::VersionConflict { .. } => 409,
-            Self::DeltaTooLarge { .. } => 409,
+            Self::DeltaTooLarge { .. } => 413,
             Self::VersionExpired { .. } => 410,
             Self::CheckpointNotFound(_) => 404,
             Self::OperationNotAllowed(_) => 403,
@@ -552,11 +557,11 @@ impl DeltaError {
         matches!(self, Self::VersionConflict { .. })
     }
 
-    /// Convert to error response JSON.
+    /// Convert to error response JSON (matches standard `ErrorResponse` envelope).
     pub fn to_error_response(&self) -> serde_json::Value {
         serde_json::json!({
-            "error": self.error_code(),
-            "message": self.to_string(),
+            "detail": self.to_string(),
+            "error_code": self.error_code(),
         })
     }
 
@@ -1249,7 +1254,7 @@ mod tests {
             size: 100,
             threshold: 50,
         };
-        assert_eq!(err.status_code(), 409);
+        assert_eq!(err.status_code(), 413);
         assert!(!err.is_retryable());
         assert_eq!(err.error_code(), "delta_too_large");
 
@@ -1295,7 +1300,7 @@ mod tests {
                 threshold: 50
             }
             .status_code(),
-            409
+            413
         );
         assert_eq!(
             DeltaError::VersionExpired {
@@ -1342,8 +1347,8 @@ mod tests {
             actual: 2,
         };
         let resp = err.to_error_response();
-        assert_eq!(resp["error"], "version_conflict");
-        assert!(resp["message"].as_str().unwrap().contains("expected 1"));
+        assert_eq!(resp["error_code"], "version_conflict");
+        assert!(resp["detail"].as_str().unwrap().contains("expected 1"));
     }
 
     #[test]
@@ -1365,5 +1370,58 @@ mod tests {
         let mut batch2 = DeltaBatch::new(1, "cp1");
         batch2.push(DeltaOp::add("/a", serde_json::json!("x")));
         assert!(batch2.approx_size() > initial);
+    }
+
+    /// P1-D: validate() must reject batches where op count doesn't match version delta.
+    #[test]
+    fn validate_rejects_op_count_version_mismatch() {
+        // DeltaBatch::new(1, "cp") creates source=1, target=2, 0 ops → mismatch
+        let batch = DeltaBatch::new(1, "cp1");
+        assert!(
+            batch.validate().is_err(),
+            "0 ops for version delta 1 must fail"
+        );
+
+        // Correct: 1 op for version delta 1
+        let mut batch = DeltaBatch::new(0, "cp1");
+        batch.push(DeltaOp::add("/a", serde_json::json!("x")));
+        assert!(
+            batch.validate().is_ok(),
+            "1 op for version delta 1 must pass"
+        );
+    }
+
+    /// P2-C: to_error_response must use standard ErrorResponse field names.
+    #[test]
+    fn error_response_uses_standard_envelope() {
+        let err = DeltaError::InvalidVersion("bad".into());
+        let json = err.to_error_response();
+        assert!(json.get("detail").is_some(), "must use 'detail' field");
+        assert!(
+            json.get("error_code").is_some(),
+            "must use 'error_code' field"
+        );
+        assert!(
+            json.get("error").is_none(),
+            "must not use legacy 'error' field"
+        );
+        assert!(
+            json.get("message").is_none(),
+            "must not use legacy 'message' field"
+        );
+    }
+
+    /// P2-D: DeltaTooLarge must return 413, not 409.
+    #[test]
+    fn delta_too_large_returns_413() {
+        let err = DeltaError::DeltaTooLarge {
+            size: 100,
+            threshold: 50,
+        };
+        assert_eq!(
+            err.status_code(),
+            413,
+            "DeltaTooLarge must be 413 Payload Too Large"
+        );
     }
 }

@@ -442,7 +442,10 @@ impl EventService for DatabaseEventService {
         Self::hydrate_parent_event_ids(&pool, &mut records).await?;
         let record = records.pop().expect("single event record");
         if record.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Event {} not found", event_id),
+            ));
         }
         Ok(record)
     }
@@ -496,7 +499,10 @@ impl EventService for DatabaseEventService {
         })?;
         let owner: String = session_row.try_get("user_id").map_err(internal_error)?;
         if owner != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {} not found", session_id),
+            ));
         }
 
         let count_row =
@@ -556,7 +562,10 @@ impl EventService for DatabaseEventService {
         })?;
         let record = Self::event_record_from_row(row)?;
         if record.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Event {} not found", event_id),
+            ));
         }
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
@@ -569,6 +578,13 @@ impl EventService for DatabaseEventService {
         query("DELETE FROM agent_events WHERE event_id = ?")
             .bind(&event_id)
             .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        // Reconcile session event_count after deletion to prevent permanent drift.
+        let event_count = load_agent_event_count(&mut *tx, &record.session_id)
+            .await
+            .map_err(internal_error)?;
+        upsert_agent_session_event_count(&mut *tx, &record.session_id, &user_id, event_count)
             .await
             .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
@@ -644,7 +660,7 @@ pub struct EventCreateRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct EventListQuery {
     pub session_id: Option<String>,
     pub event_type: Option<String>,
@@ -656,16 +672,38 @@ pub struct EventListQuery {
     pub offset: u32,
 }
 
+impl Default for EventListQuery {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            event_type: None,
+            agent_id: None,
+            causal_chain_id: None,
+            limit: default_event_limit(),
+            offset: 0,
+        }
+    }
+}
+
 pub fn default_event_limit() -> u32 {
     50
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct SessionEventQuery {
     #[serde(default = "default_session_event_limit")]
     pub limit: u32,
     #[serde(default)]
     pub offset: u32,
+}
+
+impl Default for SessionEventQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_session_event_limit(),
+            offset: 0,
+        }
+    }
 }
 
 pub fn default_session_event_limit() -> u32 {
@@ -895,6 +933,103 @@ mod tests {
         assert_eq!(
             request.parent_event_ids.expect("parent_event_ids"),
             vec!["p0".to_string(), "p1".to_string()]
+        );
+    }
+
+    /// P1-C: delete_event must reconcile session event_count after deletion.
+    #[test]
+    fn delete_event_reconciles_event_count() {
+        let source = include_str!("events.rs");
+        // Find the DatabaseEventService impl of delete_event (contains actual SQL)
+        let impl_start = source
+            .find("impl EventService for DatabaseEventService")
+            .expect("DatabaseEventService impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find("async fn delete_event")
+            .expect("delete_event must exist in DatabaseEventService");
+        let fn_end = impl_source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        let fn_body = &impl_source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("load_agent_event_count"),
+            "delete_event must recount events after deletion"
+        );
+        assert!(
+            fn_body.contains("upsert_agent_session_event_count"),
+            "delete_event must update session event_count"
+        );
+    }
+
+    /// P2-A: get_event and delete_event must return 404 (not 403) for
+    /// non-owner access to prevent IDOR information leakage.
+    #[test]
+    fn event_access_returns_not_found_for_non_owner() {
+        let source = include_str!("events.rs");
+        let impl_start = source
+            .find("impl EventService for DatabaseEventService")
+            .expect("impl must exist");
+        let impl_source = &source[impl_start..];
+        // Check get_event
+        let get_start = impl_source
+            .find("async fn get_event")
+            .expect("get_event must exist");
+        let get_end = impl_source[get_start..]
+            .find("\n    async fn ")
+            .map(|p| get_start + p)
+            .unwrap_or(impl_source.len());
+        let get_body = &impl_source[get_start..get_end];
+        assert!(
+            !get_body.contains("StatusCode::FORBIDDEN"),
+            "get_event must return NOT_FOUND (not FORBIDDEN) for non-owner"
+        );
+        // Check delete_event
+        let del_start = impl_source
+            .find("async fn delete_event")
+            .expect("delete_event must exist");
+        let del_end = impl_source[del_start..]
+            .find("\n    async fn ")
+            .map(|p| del_start + p)
+            .unwrap_or(impl_source.len());
+        let del_body = &impl_source[del_start..del_end];
+        assert!(
+            !del_body.contains("StatusCode::FORBIDDEN"),
+            "delete_event must return NOT_FOUND (not FORBIDDEN) for non-owner"
+        );
+        // Check get_session_events
+        let ses_start = impl_source
+            .find("async fn get_session_events")
+            .expect("get_session_events must exist");
+        let ses_end = impl_source[ses_start..]
+            .find("\n    async fn ")
+            .map(|p| ses_start + p)
+            .unwrap_or(impl_source.len());
+        let ses_body = &impl_source[ses_start..ses_end];
+        assert!(
+            !ses_body.contains("StatusCode::FORBIDDEN"),
+            "get_session_events must return NOT_FOUND (not FORBIDDEN) for non-owner"
+        );
+    }
+
+    /// P2-E: EventListQuery::default() must use the same limit as serde deserialization.
+    #[test]
+    fn event_list_query_default_matches_serde() {
+        let q = EventListQuery::default();
+        assert_eq!(
+            q.limit, 50,
+            "EventListQuery::default().limit must be 50 (matching serde default)"
+        );
+    }
+
+    /// P2-E: SessionEventQuery::default() must use the same limit as serde deserialization.
+    #[test]
+    fn session_event_query_default_matches_serde() {
+        let q = SessionEventQuery::default();
+        assert_eq!(
+            q.limit, 100,
+            "SessionEventQuery::default().limit must be 100 (matching serde default)"
         );
     }
 }

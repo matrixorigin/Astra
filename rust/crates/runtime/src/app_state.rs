@@ -218,10 +218,7 @@ impl AppState {
         self.memoria_forwarder = if key.is_empty() {
             Arc::new(NoopMemoriaForwarder)
         } else {
-            Arc::new(ReqwestMemoriaForwarder {
-                base_url: base_url.clone(),
-                master_key: key,
-            })
+            Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
         self.memoria_base_url = base_url;
         self.memoria_master_key = master_key;
@@ -652,6 +649,23 @@ impl Default for ServiceInfo {
 pub struct ReqwestMemoriaForwarder {
     pub base_url: String,
     pub master_key: String,
+    client: reqwest::Client,
+}
+
+impl ReqwestMemoriaForwarder {
+    pub fn new(base_url: String, master_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build Memoria HTTP client");
+        Self {
+            base_url,
+            master_key,
+            client,
+        }
+    }
 }
 
 #[async_trait]
@@ -662,13 +676,8 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}{}", self.base_url, endpoint);
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("Memoria client build error: {e}"))?;
-        let resp = client
+        let resp = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.master_key))
             .json(&body)
@@ -789,10 +798,8 @@ mod tests {
             }
         });
 
-        let forwarder = ReqwestMemoriaForwarder {
-            base_url: format!("http://{addr}"),
-            master_key: "test-key".to_string(),
-        };
+        let forwarder =
+            ReqwestMemoriaForwarder::new(format!("http://{addr}"), "test-key".to_string());
 
         let start = std::time::Instant::now();
         let result = forwarder
@@ -807,6 +814,29 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(60),
             "should time out well before 60s, took {elapsed:?}"
+        );
+    }
+
+    /// P1-B: ReqwestMemoriaForwarder must NOT create a per-request client.
+    /// The `forward` method must reuse `self.client`.
+    #[test]
+    fn memoria_forwarder_reuses_client() {
+        let source = include_str!("app_state.rs");
+        let impl_start = source
+            .find("impl MemoriaForwarder for ReqwestMemoriaForwarder")
+            .expect("impl block must exist");
+        let impl_end = source[impl_start..]
+            .find("\n/// ")
+            .map(|p| impl_start + p)
+            .unwrap_or(source.len());
+        let impl_body = &source[impl_start..impl_end];
+        assert!(
+            !impl_body.contains("Client::builder"),
+            "forward() must not create a per-request client — use self.client"
+        );
+        assert!(
+            impl_body.contains("self.client") || impl_body.contains("self\n            .client"),
+            "forward() must use the shared self.client"
         );
     }
 }
