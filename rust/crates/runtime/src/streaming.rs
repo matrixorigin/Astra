@@ -22,7 +22,7 @@ pub async fn stream_chat_handler(
                 session_id: request.session_id,
                 message: request.message,
                 context: request.context,
-                max_candidates: request.max_candidates,
+                execution_budget: request.execution_budget,
             },
         )
         .await?;

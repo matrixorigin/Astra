@@ -147,6 +147,14 @@ impl From<LlmTokenServiceConfig> for LlmTokenServiceRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_turn_limit: Option<u32>,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
@@ -159,7 +167,7 @@ pub struct ChatRequestData {
     pub allow_tools: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub forward_headers: std::collections::HashMap<String, String>,
-    pub max_candidates: u32,
+    pub execution_budget: Option<ExecutionBudget>,
     pub explain: bool,
     pub interactive_client: bool,
 }
@@ -202,7 +210,7 @@ impl std::fmt::Debug for ChatRequestData {
                 "forward_headers",
                 &RedactedForwardHeadersDebug(&self.forward_headers),
             )
-            .field("max_candidates", &self.max_candidates)
+            .field("execution_budget", &self.execution_budget)
             .field("explain", &self.explain)
             .field("interactive_client", &self.interactive_client)
             .finish()
@@ -964,7 +972,10 @@ mod tests {
             allow_tools: None,
             context: None,
             forward_headers,
-            max_candidates: 10,
+            execution_budget: Some(ExecutionBudget {
+                initial_turns: Some(10),
+                hard_turn_limit: Some(18),
+            }),
             explain: false,
             interactive_client: false,
         };
@@ -994,7 +1005,10 @@ mod tests {
                     allow_tools: None,
                     context: None,
                     forward_headers: std::collections::HashMap::new(),
-                    max_candidates: 25,
+                    execution_budget: Some(ExecutionBudget {
+                        initial_turns: Some(25),
+                        hard_turn_limit: Some(40),
+                    }),
                     explain: false,
                     interactive_client: false,
                 },

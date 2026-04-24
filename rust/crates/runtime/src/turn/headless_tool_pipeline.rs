@@ -549,6 +549,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_edge_status_marks_execution_error_even_without_error_text() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round[0].output = "permission denied".to_string();
+        harness.edge_tool_round[0].status = "partial_failure".to_string();
+        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([
+            (
+                "status".to_string(),
+                Value::String("partial_failure".to_string()),
+            ),
+            (
+                "output".to_string(),
+                Value::String("permission denied".to_string()),
+            ),
+        ]));
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted execution"),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(executed.is_err, "got: {}", executed.execution.result_str);
+    }
+
+    #[tokio::test]
     async fn server_fallback_sets_turn_index_for_current_turn_rollback() {
         let mut harness = PipelineHarness::new();
         let dir = tempfile::TempDir::new().unwrap();

@@ -455,8 +455,9 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 ) {
     finalize_turn_trace(state).await;
     try_write_heavy_checkpoint(state);
-    if !state.final_text.is_empty() {
+    if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
+        state.final_text_streamed = true;
     }
 }
 

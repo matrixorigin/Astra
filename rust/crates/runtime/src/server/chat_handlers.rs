@@ -94,7 +94,7 @@ fn chat_stream_bridge_fallback_payload(
         "allow_skills": allow_skills,
         "allow_tools": allow_tools,
         "context": chat_data.context.as_ref(),
-        "max_candidates": chat_data.max_candidates,
+        "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
         "messages": [
             {
@@ -487,14 +487,18 @@ mod tests {
             allow_tools: Some(vec!["bash".to_string()]),
             context: None,
             forward_headers: std::collections::HashMap::new(),
-            max_candidates: 3,
+            execution_budget: Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(3),
+                hard_turn_limit: Some(7),
+            }),
             explain: true,
             interactive_client: false,
         });
         let obj = payload.as_object().unwrap();
         assert!(obj.contains_key("messages"));
         assert!(obj.contains_key("session_id"));
-        assert_eq!(obj["max_candidates"], 3);
+        assert_eq!(obj["execution_budget"]["initial_turns"], 3);
+        assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(obj["explain"], true);
         assert_eq!(obj["skill_search"]["dynamic_surface"], false);
         assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
@@ -532,7 +536,10 @@ mod tests {
             ]),
             context: None,
             forward_headers: std::collections::HashMap::new(),
-            max_candidates: 3,
+            execution_budget: Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(3),
+                hard_turn_limit: Some(7),
+            }),
             explain: true,
             interactive_client: false,
         });

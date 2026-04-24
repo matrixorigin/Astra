@@ -4149,7 +4149,10 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         &app,
         json!({
             "message": "inspect the project files",
-            "max_candidates": 10,
+            "execution_budget": {
+                "initial_turns": 10,
+                "hard_turn_limit": 10
+            },
             "context": {
                 "test_llm_rounds": [
                     {
@@ -4265,7 +4268,10 @@ async fn analysis_turn_injects_divergence_correction_after_five_exploration_roun
             // plus 6 normal decrements.
             // Progressive warning penalty (2×N) needs more budget than flat:
             // 6 rounds + penalties (2+4+6) = 18 steps minimum.
-            "max_candidates": 20,
+            "execution_budget": {
+                "initial_turns": 20,
+                "hard_turn_limit": 20
+            },
             "context": {
                 // P2.5 progress-aware semantics: divergence fires only when
                 // the *same* (tool, args) signature repeats across the full
@@ -4360,6 +4366,240 @@ async fn analysis_turn_injects_divergence_correction_after_five_exploration_roun
     assert!(
         injected_correction,
         "analysis turn should carry divergence correction into the final observer payload"
+    );
+}
+
+#[tokio::test]
+async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "explore the codebase and investigate the root cause",
+            "execution_budget": {
+                "initial_turns": 2,
+                "hard_turn_limit": 4
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc-budget-r1", "read_file", json!({"path": "src/lib.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-budget-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
+                    },
+                    { "full_text": "Completed after exploratory extension." }
+                ],
+                "edge_tools": [
+                    tool_schema("read_file"),
+                    tool_schema("glob")
+                ]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    let first = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
+    assert_eq!(
+        post_tool_result(&app, "tc-budget-r1", "module contents", "success").await,
+        StatusCode::OK
+    );
+
+    let second = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
+    assert_eq!(
+        post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "success").await,
+        StatusCode::OK
+    );
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+    let text: String = find_events(&events, "text_delta")
+        .into_iter()
+        .filter_map(|event| event["content"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        text.contains("Completed after exploratory extension."),
+        "expected post-extension final text, got: {text}"
+    );
+    assert!(
+        !text.contains("Turn budget exhausted"),
+        "extension path should not terminate with exhaustion text: {text}"
+    );
+}
+
+#[tokio::test]
+async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "explore the codebase and investigate the root cause",
+            "execution_budget": {
+                "initial_turns": 2,
+                "hard_turn_limit": 2
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
+                    },
+                    { "full_text": "Should never run." }
+                ],
+                "edge_tools": [
+                    tool_schema("read_file"),
+                    tool_schema("glob")
+                ]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    let first = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
+    assert_eq!(
+        post_tool_result(&app, "tc-hard-limit-r1", "module contents", "success").await,
+        StatusCode::OK
+    );
+
+    let second = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(second["request_id"].as_str(), Some("tc-hard-limit-r2"));
+    assert_eq!(
+        post_tool_result(
+            &app,
+            "tc-hard-limit-r2",
+            "src/lib.rs\nsrc/main.rs",
+            "success"
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+    let text: String = find_events(&events, "text_delta")
+        .into_iter()
+        .filter_map(|event| event["content"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        text.contains("Turn budget exhausted after 2 agentic turn(s)"),
+        "hard limit should terminate with exhaustion text, got: {text}"
+    );
+    assert!(
+        !text.contains("Should never run."),
+        "hard limit should prevent post-budget final text, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn web_agent_stream_emits_plain_final_text_once() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "answer directly",
+            "context": {
+                "test_llm_rounds": [{ "full_text": "Single final answer." }]
+            }
+        }),
+    )
+    .await;
+
+    let text_events = find_events(&events, "text_delta");
+    let exact_matches = text_events
+        .iter()
+        .filter(|event| event["content"].as_str() == Some("Single final answer."))
+        .count();
+    assert_eq!(
+        exact_matches, 1,
+        "plain final answer should stream exactly once, got events: {text_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
+    let (app, _hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
+
+    let resp = chat_stream_start(
+        &app,
+        json!({
+            "message": "explore the codebase and investigate the root cause",
+            "execution_budget": {
+                "initial_turns": 2,
+                "hard_turn_limit": 2
+            },
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [tool_call("tc-budget-fail-r1", "read_file", json!({"path": "src/lib.rs"}))]
+                    },
+                    {
+                        "tool_calls": [tool_call("tc-budget-fail-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
+                    },
+                    { "full_text": "Should never run." }
+                ],
+                "edge_tools": [
+                    tool_schema("read_file"),
+                    tool_schema("glob")
+                ]
+            }
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+
+    let first = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(first["request_id"].as_str(), Some("tc-budget-fail-r1"));
+    assert_eq!(
+        post_tool_result(
+            &app,
+            "tc-budget-fail-r1",
+            "transient read failure",
+            "partial_failure"
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let second = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(second["request_id"].as_str(), Some("tc-budget-fail-r2"));
+    assert_eq!(
+        post_tool_result(&app, "tc-budget-fail-r2", "permission denied", "denied").await,
+        StatusCode::OK
+    );
+
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("stream timed out")
+        .expect("reader task failed");
+    let tool_end_results: Vec<String> = find_events(&events, "tool_call_end")
+        .into_iter()
+        .filter_map(|event| event["result"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        tool_end_results
+            .iter()
+            .any(|result| result.contains("status=partial_failure")),
+        "expected partial_failure tool result in SSE stream, got: {tool_end_results:?}"
+    );
+    assert!(
+        tool_end_results
+            .iter()
+            .any(|result| result.contains("status=denied")),
+        "expected denied tool result in SSE stream, got: {tool_end_results:?}"
     );
 }
 

@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "max_candidates": 25, "explain": false, "plan_subtask_id": "...", "is_plan_subtask": true}
+//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -71,11 +71,6 @@ const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
 const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 300;
 
-/// Preserve the historical websocket candidate budget unless callers opt in explicitly.
-fn default_ws_max_candidates() -> u32 {
-    25
-}
-
 // ─── Client Message Types ────────────────────────────────────────────────────
 
 /// Messages sent from browser client to server.
@@ -104,8 +99,8 @@ pub(super) enum WsClientMessage {
         allow_tools: Option<Vec<String>>,
         #[serde(default)]
         context: Option<serde_json::Map<String, serde_json::Value>>,
-        #[serde(default = "default_ws_max_candidates")]
-        max_candidates: u32,
+        #[serde(default)]
+        execution_budget: Option<astra_services::runs::ExecutionBudget>,
         #[serde(default)]
         explain: bool,
         #[serde(default)]
@@ -515,7 +510,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 allow_skills,
                                 allow_tools,
                                 context,
-                                max_candidates,
+                                execution_budget,
                                 explain,
                                 plan_subtask_id,
                                 is_plan_subtask,
@@ -532,7 +527,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     allow_skills,
                                     allow_tools,
                                     context,
-                                    max_candidates,
+                                    execution_budget,
                                     explain,
                                     plan_subtask_id,
                                     is_plan_subtask,
@@ -643,7 +638,7 @@ async fn handle_chat_message(
     allow_skills: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
-    max_candidates: u32,
+    execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
     plan_subtask_id: Option<String>,
     is_plan_subtask: Option<bool>,
@@ -665,7 +660,7 @@ async fn handle_chat_message(
         allow_skills,
         allow_tools,
         context,
-        max_candidates,
+        execution_budget,
         explain,
         plan_subtask_id,
         is_plan_subtask,
@@ -911,7 +906,7 @@ fn build_bridge_chat_payload(
     allow_skills: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
-    max_candidates: u32,
+    execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
 ) -> Value {
     let allow_skills = normalize_bridge_allowlist(allow_skills.as_deref());
@@ -924,7 +919,7 @@ fn build_bridge_chat_payload(
         "allow_skills": allow_skills,
         "allow_tools": allow_tools,
         "context": context,
-        "max_candidates": max_candidates,
+        "execution_budget": execution_budget,
         "explain": explain,
         "messages": [{
             "role": "user",
@@ -953,7 +948,7 @@ fn build_ws_chat_request(
     allow_skills: Option<Vec<String>>,
     allow_tools: Option<Vec<String>>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
-    max_candidates: u32,
+    execution_budget: Option<astra_services::runs::ExecutionBudget>,
     explain: bool,
     plan_subtask_id: Option<String>,
     is_plan_subtask: Option<bool>,
@@ -969,7 +964,7 @@ fn build_ws_chat_request(
         allow_tools,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         forward_headers: std::collections::HashMap::new(),
-        max_candidates,
+        execution_budget,
         explain,
         interactive_client: true,
     }
@@ -2070,7 +2065,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_tools": ["bash"], "max_candidates": 3, "explain": true, "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage {
@@ -2082,7 +2077,7 @@ mod tests {
                 allow_skills,
                 allow_tools,
                 context,
-                max_candidates,
+                execution_budget,
                 explain,
                 plan_subtask_id,
                 is_plan_subtask,
@@ -2102,7 +2097,13 @@ mod tests {
                 assert_eq!(allow_skills, Some(vec!["plan".into()]));
                 assert_eq!(allow_tools, Some(vec!["bash".into()]));
                 assert!(context.is_none());
-                assert_eq!(max_candidates, 3);
+                assert_eq!(
+                    execution_budget,
+                    Some(astra_services::runs::ExecutionBudget {
+                        initial_turns: Some(3),
+                        hard_turn_limit: Some(7),
+                    })
+                );
                 assert!(explain);
                 assert_eq!(plan_subtask_id.as_deref(), Some("sub-42"));
                 assert_eq!(is_plan_subtask, Some(true));
@@ -2122,7 +2123,7 @@ mod tests {
                 skill_search,
                 allow_skills,
                 allow_tools,
-                max_candidates,
+                execution_budget,
                 explain,
                 plan_subtask_id,
                 is_plan_subtask,
@@ -2133,7 +2134,7 @@ mod tests {
                 assert!(skill_search.is_none());
                 assert!(allow_skills.is_none());
                 assert!(allow_tools.is_none());
-                assert_eq!(max_candidates, default_ws_max_candidates());
+                assert!(execution_budget.is_none());
                 assert!(!explain);
                 assert!(plan_subtask_id.is_none());
                 assert!(is_plan_subtask.is_none());
@@ -2161,7 +2162,10 @@ mod tests {
             Some(vec!["plan".into()]),
             Some(vec!["bash".into()]),
             Some(context.clone()),
-            3,
+            Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(3),
+                hard_turn_limit: Some(7),
+            }),
             true,
         );
 
@@ -2174,7 +2178,8 @@ mod tests {
         assert_eq!(payload["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(payload["allow_tools"], serde_json::json!(["bash"]));
         assert_eq!(payload["context"], serde_json::Value::Object(context));
-        assert_eq!(payload["max_candidates"], 3);
+        assert_eq!(payload["execution_budget"]["initial_turns"], 3);
+        assert_eq!(payload["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(payload["explain"], true);
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hello");
@@ -2191,7 +2196,10 @@ mod tests {
             Some(vec![" plan ".into(), "PLAN".into(), "analyze".into()]),
             Some(vec![" bash ".into(), "BASH".into(), "read_file".into()]),
             None,
-            3,
+            Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(3),
+                hard_turn_limit: Some(6),
+            }),
             true,
         );
 
@@ -2223,7 +2231,10 @@ mod tests {
                 "cwd".to_string(),
                 serde_json::Value::String("/tmp".into()),
             )])),
-            7,
+            Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(7),
+                hard_turn_limit: Some(11),
+            }),
             true,
             Some("sub-42".into()),
             Some(true),
@@ -2241,6 +2252,13 @@ mod tests {
                 surface_cap: 20,
             })
         );
+        assert_eq!(
+            request.execution_budget,
+            Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(7),
+                hard_turn_limit: Some(11),
+            })
+        );
         assert_eq!(request.allow_skills, Some(vec!["plan".into()]));
         assert_eq!(
             request.allow_tools,
@@ -2252,7 +2270,13 @@ mod tests {
             "sub-42"
         );
         assert_eq!(request.context.as_ref().unwrap()["is_plan_subtask"], true);
-        assert_eq!(request.max_candidates, 7);
+        assert_eq!(
+            request.execution_budget,
+            Some(astra_services::runs::ExecutionBudget {
+                initial_turns: Some(7),
+                hard_turn_limit: Some(12),
+            })
+        );
         assert!(request.explain);
         assert!(request.interactive_client);
     }

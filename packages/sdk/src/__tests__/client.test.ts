@@ -737,15 +737,18 @@ describe('chatRequestToWire', () => {
     expect(body.allow_tools).toBeUndefined();
   });
 
-  test('default max_candidates is 8', () => {
+  test('default request omits execution_budget', () => {
     const body = chatRequestToWire({ message: 'm' });
-    expect(body.max_candidates).toBe(8);
+    expect(body.execution_budget).toBeUndefined();
   });
 
-  test('full snake_case mapping: session, agent, model, context, plan, edge, capabilities', () => {
+  test('full snake_case mapping: session, agent, model, context, plan, edge, capabilities, budget', () => {
     const body = chatRequestToWire({
       message: 'q',
-      maxCandidates: 3,
+      executionBudget: {
+        initialTurns: 3,
+        hardTurnLimit: 7,
+      },
       sessionId: 'sess-1',
       agentId: 'ag-1',
       model: 'kimi',
@@ -758,7 +761,10 @@ describe('chatRequestToWire', () => {
     });
     expect(body).toMatchObject({
       message: 'q',
-      max_candidates: 3,
+      execution_budget: {
+        initial_turns: 3,
+        hard_turn_limit: 7,
+      },
       session_id: 'sess-1',
       agent_id: 'ag-1',
       model: 'kimi',
@@ -774,7 +780,7 @@ describe('chatRequestToWire', () => {
   test('omits undefined optional fields', () => {
     const body = chatRequestToWire({ message: 'x' });
     expect(Object.keys(body).sort()).toEqual(
-      ['max_candidates', 'message'].sort(),
+      ['message'].sort(),
     );
   });
 });

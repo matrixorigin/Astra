@@ -237,7 +237,10 @@ pub async fn run_chat_stream_session_info_smoke() {
     let body = json!({
         "message": "matrix e2e stream smoke",
         "session_id": session_id,
-        "max_candidates": 1,
+        "execution_budget": {
+            "initial_turns": 1,
+            "hard_turn_limit": 1
+        },
         "test_llm_rounds": [{
             "role": "assistant",
             "content": "stream smoke reply",

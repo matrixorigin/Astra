@@ -380,7 +380,10 @@ export type ChatRequest = {
   sessionId?: string;
   agentId?: string;
   model?: string;
-  maxCandidates?: number;
+  executionBudget?: {
+    initialTurns?: number;
+    hardTurnLimit?: number;
+  };
   context?: Record<string, unknown>;
   explain?: boolean;
   planSubtaskId?: string;

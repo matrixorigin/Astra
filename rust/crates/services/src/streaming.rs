@@ -30,7 +30,7 @@ pub struct StreamChatRequestData {
     pub session_id: String,
     pub message: String,
     pub context: Option<serde_json::Value>,
-    pub max_candidates: Option<i64>,
+    pub execution_budget: Option<super::runs::ExecutionBudget>,
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -55,5 +55,5 @@ pub struct StreamChatRequest {
     pub session_id: String,
     pub message: String,
     pub context: Option<serde_json::Value>,
-    pub max_candidates: Option<i64>,
+    pub execution_budget: Option<super::runs::ExecutionBudget>,
 }

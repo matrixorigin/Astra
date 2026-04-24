@@ -1769,8 +1769,25 @@ impl AgenticRunLifecycleService {
             "content": request.message,
         });
 
-        let max_turns = request.max_candidates.max(1) as usize;
         let task_profile = infer_task_execution_profile(&request.message);
+        let runtime_turn_ceiling = if is_plan_subtask_from_chat_context(&request.context) {
+            astra_core::RuntimeLimits::global().effective_plan_subtask_turns()
+        } else {
+            astra_core::RuntimeLimits::global().max_turns
+        };
+        let requested_budget = request.execution_budget.as_ref().map(|budget| {
+            astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
+                initial_turns: budget.initial_turns.map(|value| value as usize),
+                hard_turn_limit: budget.hard_turn_limit.map(|value| value as usize),
+            }
+        });
+        let agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                task_profile,
+                runtime_turn_ceiling,
+                requested_budget,
+            );
+        let max_turns = agentic_turn_budget.initial_turns;
         let edge_ctx = Self::extract_edge_context(request);
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
@@ -1820,6 +1837,7 @@ impl AgenticRunLifecycleService {
             current_run_id: Some(run_id.to_string()),
             recursion_depth: 0,
             final_text: String::new(),
+            final_text_streamed: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -1829,6 +1847,7 @@ impl AgenticRunLifecycleService {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
@@ -3243,6 +3262,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             current_run_id: Some(config.run_id.clone()),
             recursion_depth: 0,
             final_text: String::new(),
+            final_text_streamed: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -3252,6 +3272,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            agentic_turn_budget:
+                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default()
+                    .agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
@@ -3630,7 +3653,7 @@ mod tests {
             allow_tools: None,
             context: None,
             forward_headers: HashMap::new(),
-            max_candidates: 5,
+            execution_budget: None,
             explain: false,
             interactive_client: false,
         }
@@ -4297,7 +4320,7 @@ mod tests {
             allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
-            max_candidates: 5,
+            execution_budget: None,
             explain: false,
             interactive_client: false,
         };
@@ -4423,7 +4446,7 @@ mod tests {
             allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
-            max_candidates: 5,
+            execution_budget: None,
             explain: false,
             interactive_client: false,
         };
@@ -4436,25 +4459,49 @@ mod tests {
     fn build_initial_state_sets_user_message() {
         let svc = test_service();
         let req = test_request("write a test");
+        let expected_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("write a test"),
+            astra_core::RuntimeLimits::global().max_turns,
+            None,
+        );
         let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0]["role"], "user");
         assert_eq!(state.messages[0]["content"], "write a test");
         assert_eq!(state.current_session_id, Some("sess-1".to_string()));
         assert_eq!(state.current_run_id, Some("run-1".to_string()));
-        assert_eq!(state.max_turns, 5);
-        assert_eq!(state.remaining_turns, 5);
+        assert_eq!(state.max_turns, expected_budget.initial_turns);
+        assert_eq!(state.remaining_turns, expected_budget.initial_turns);
+        assert_eq!(state.agentic_turn_budget, expected_budget);
         assert_eq!(state.message, "write a test");
         assert!(state.cancellation.token.is_none());
     }
 
     #[test]
-    fn build_initial_state_clamps_max_turns() {
+    fn build_initial_state_applies_execution_budget_override() {
         let svc = test_service();
         let mut req = test_request("go");
-        req.max_candidates = 0;
+        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
+            initial_turns: Some(4),
+            hard_turn_limit: Some(9),
+        });
+        let state = svc.build_initial_state(&req, "s", "r", None, None);
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.remaining_turns, 4);
+        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 9);
+    }
+
+    #[test]
+    fn build_initial_state_clamps_execution_budget_override() {
+        let svc = test_service();
+        let mut req = test_request("go");
+        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
+            initial_turns: Some(0),
+            hard_turn_limit: Some(0),
+        });
         let state = svc.build_initial_state(&req, "s", "r", None, None);
         assert_eq!(state.max_turns, 1);
+        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 1);
     }
 
     #[test]

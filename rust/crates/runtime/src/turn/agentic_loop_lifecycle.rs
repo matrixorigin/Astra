@@ -76,6 +76,148 @@ fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
     }
 }
 
+fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
+    let budget = state.agentic_turn_budget;
+    if budget.extension_turns == 0 || state.max_turns <= budget.initial_turns {
+        return 0;
+    }
+    state
+        .max_turns
+        .saturating_sub(budget.initial_turns)
+        .div_ceil(budget.extension_turns)
+        .min(u32::MAX as usize) as u32
+}
+
+fn is_mutating_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file"
+            | "edit_file"
+            | "apply_patch"
+            | "create_file"
+            | "delete_file"
+            | "rename_file"
+            | "move_file"
+            | "replace_text"
+            | "insert_text"
+            | "append_file"
+            | "bash"
+    )
+}
+
+fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {
+    let Some(last) = state.stall.turn_sigs.last() else {
+        return false;
+    };
+    if last.is_empty() {
+        return false;
+    }
+    state
+        .stall
+        .turn_sigs
+        .iter()
+        .rev()
+        .nth(1)
+        .is_some_and(|previous| previous == last)
+}
+
+fn recent_progress_is_real(state: &AgenticLoopState) -> bool {
+    let recent_records: Vec<_> = state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .take(8)
+        .collect();
+    if recent_records.is_empty() {
+        return false;
+    }
+
+    let successful_recent = recent_records.iter().any(|record| record.ok);
+    if !successful_recent {
+        return false;
+    }
+
+    let mutating_progress = recent_records
+        .iter()
+        .any(|record| record.ok && is_mutating_tool_name(record.name.as_str()));
+    let distinct_recent_turns = state
+        .stall
+        .turn_sigs
+        .iter()
+        .rev()
+        .take(3)
+        .filter(|sig| !sig.is_empty())
+        .fold(
+            Vec::<&std::collections::BTreeSet<String>>::new(),
+            |mut acc, sig| {
+                if !acc.contains(&sig) {
+                    acc.push(sig);
+                }
+                acc
+            },
+        )
+        .len();
+
+    if recent_turns_are_repetitive(state) {
+        return false;
+    }
+
+    if state.task_profile.mutates_workspace {
+        return mutating_progress;
+    }
+
+    if state.task_profile.exploratory_task
+        || state.task_profile.complexity
+            == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex
+    {
+        return mutating_progress || distinct_recent_turns >= 2;
+    }
+
+    false
+}
+
+fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
+    let budget = state.agentic_turn_budget;
+    if budget.extension_turns == 0
+        || budget.max_extensions == 0
+        || state.max_turns >= budget.hard_turn_limit
+        || used_budget_extensions(state) >= budget.max_extensions
+        || crate::server::run_lifecycle::has_turn_verdict_warning(&state.stall.verdict_events)
+        || !recent_progress_is_real(state)
+    {
+        return None;
+    }
+
+    let additional_turns = budget
+        .extension_turns
+        .min(budget.hard_turn_limit.saturating_sub(state.max_turns));
+    if additional_turns == 0 {
+        return None;
+    }
+
+    state.max_turns += additional_turns;
+    state.remaining_turns += additional_turns;
+    let review_message = format!(
+        "[Budget review] Recent progress looks real for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
+        if state.task_profile.exploratory_task {
+            "exploratory "
+        } else if state.task_profile.mutates_workspace {
+            "implementation "
+        } else {
+            ""
+        },
+        additional_turns,
+        budget.hard_turn_limit,
+    );
+    state.messages.push(serde_json::json!({
+        "role": "system",
+        "content": review_message,
+    }));
+    Some(review_message)
+}
+
 /// Build an interruption state summary from the current loop state.
 pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
@@ -250,7 +392,19 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if state.remaining_turns == 0 {
-        if should_complete_budget_exhaustion_gracefully(state) {
+        if maybe_extend_turn_budget(state).is_some() {
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "↻ Budget review — extended to {}/{} turns.",
+                        state.max_turns, state.agentic_turn_budget.hard_turn_limit
+                    ),
+                );
+            }
+            state.final_text.clear();
+            state.interruption = None;
+        } else if should_complete_budget_exhaustion_gracefully(state) {
             try_write_heavy_checkpoint(state);
             state.interruption = Some(InterruptionRecord::new(
                 InterruptionKind::BudgetExhausted,
@@ -259,6 +413,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             ));
             if state.final_text.trim().is_empty() {
                 state.final_text = budget_exhaustion_completion_text(state);
+                state.final_text_streamed = false;
             }
             if !quiet {
                 host.emit_headless_line(
@@ -269,11 +424,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             return Ok(PreparedTurnIteration::Finished(
                 AgenticLoopOutcome::Completed,
             ));
+        } else {
+            return Err(format!(
+                "{} (budget: {} turns)",
+                CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, state.max_turns
+            ));
         }
-        return Err(format!(
-            "{} (budget: {} turns)",
-            CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, state.max_turns
-        ));
     }
 
     match state.rate_limit_cooldown.check_request(false) {
@@ -322,6 +478,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     reason.as_str(),
                     state.total_tool_calls,
                 );
+                state.final_text_streamed = false;
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::CooldownRejected,
                     ResumeAction::WaitAndRetry {

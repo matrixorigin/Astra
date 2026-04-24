@@ -176,6 +176,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                      Error: {}",
                     state.total_tool_calls, e.message,
                 );
+                state.final_text_streamed = false;
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::RateLimited,
                     ResumeAction::WaitAndRetry { delay_seconds: 30 },
