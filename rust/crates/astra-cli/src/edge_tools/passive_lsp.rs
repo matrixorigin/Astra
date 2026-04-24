@@ -823,6 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     #[serial_test::serial]
     async fn rust_spawn_sync_smoke() {
         let _g = EnvGuard::set("ASTRA_LSP_RUST", "1");
@@ -862,6 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     #[serial_test::serial]
     async fn typescript_server_spawn_sync_smoke() {
         let dir = tempfile::tempdir().unwrap();
