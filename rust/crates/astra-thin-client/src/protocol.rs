@@ -18,8 +18,8 @@ pub struct ChatStreamRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Map<String, Value>>,
-    #[serde(default = "default_max_candidates")]
-    pub max_candidates: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_budget: Option<ExecutionBudget>,
     #[serde(default)]
     pub explain: bool,
     /// Forwarded into server `context` for stop-hooks (`when: task_completed`) on cloud runs.
@@ -35,8 +35,12 @@ pub struct ChatStreamRequest {
     pub capabilities: Vec<String>,
 }
 
-fn default_max_candidates() -> u32 {
-    8
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_turn_limit: Option<u32>,
 }
 
 impl ChatStreamRequest {
@@ -47,7 +51,7 @@ impl ChatStreamRequest {
             agent_id: None,
             model: None,
             context: None,
-            max_candidates: default_max_candidates(),
+            execution_budget: None,
             explain: false,
             plan_subtask_id: None,
             is_plan_subtask: None,
@@ -531,7 +535,10 @@ mod tests {
             agent_id: None,
             model: Some("m".into()),
             context: None,
-            max_candidates: 3,
+            execution_budget: Some(ExecutionBudget {
+                initial_turns: Some(3),
+                hard_turn_limit: Some(6),
+            }),
             explain: true,
             plan_subtask_id: Some("t1".into()),
             is_plan_subtask: Some(true),
@@ -544,10 +551,26 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_request_default_max_candidates() {
+    fn chat_stream_request_defaults_leave_execution_budget_unset() {
         let j = serde_json::json!({"message":"x"});
         let r: ChatStreamRequest = serde_json::from_value(j).unwrap();
-        assert_eq!(r.max_candidates, 8);
+        assert!(r.execution_budget.is_none());
+    }
+
+    #[test]
+    fn chat_stream_request_roundtrip_preserves_execution_budget() {
+        let j = serde_json::json!({
+            "message": "x",
+            "execution_budget": {"initial_turns": 4, "hard_turn_limit": 9}
+        });
+        let r: ChatStreamRequest = serde_json::from_value(j).unwrap();
+        assert_eq!(
+            r.execution_budget,
+            Some(ExecutionBudget {
+                initial_turns: Some(4),
+                hard_turn_limit: Some(9),
+            })
+        );
     }
 
     #[test]

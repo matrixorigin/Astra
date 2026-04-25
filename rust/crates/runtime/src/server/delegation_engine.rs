@@ -32,8 +32,8 @@ use astra_services::coordination::{
 
 pub use astra_core::SubRunState;
 use astra_core::{
-    InvalidTransition, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
-    STATUS_VERIFICATION_FAILED,
+    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_VERIFICATION_FAILED,
 };
 
 use super::run_engine::RunEngine;
@@ -411,6 +411,8 @@ pub struct DelegationTracker {
     parents: RwLock<HashMap<String, String>>,
     /// run_id → cooperative pause flag (shared with the sub-run's loop)
     pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
+    /// run_id → cancellation token (shared with the sub-run's loop)
+    cancel_tokens: RwLock<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     /// Optional session ID for journal persistence.
     session_id: Option<String>,
     /// Real-time progress per delegation.
@@ -425,6 +427,7 @@ impl DelegationTracker {
             delegations: RwLock::new(HashMap::new()),
             parents: RwLock::new(HashMap::new()),
             pause_flags: RwLock::new(HashMap::new()),
+            cancel_tokens: RwLock::new(HashMap::new()),
             session_id: None,
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -437,6 +440,7 @@ impl DelegationTracker {
             delegations: RwLock::new(HashMap::new()),
             parents: RwLock::new(HashMap::new()),
             pause_flags: RwLock::new(HashMap::new()),
+            cancel_tokens: RwLock::new(HashMap::new()),
             session_id: Some(session_id),
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -763,6 +767,38 @@ impl DelegationTracker {
         count
     }
 
+    /// Register a cancellation token for a sub-run so `cancel_children_of` can cancel it.
+    pub async fn register_cancel_token(
+        &self,
+        run_id: &str,
+        token: Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        self.cancel_tokens
+            .write()
+            .await
+            .insert(run_id.to_string(), token);
+    }
+
+    /// Cancel ALL sub-runs that have a given parent run ID.
+    /// Returns the number of sub-runs cancelled.
+    pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
+        let children = self.get_children(parent_run_id).await;
+        let tokens = self.cancel_tokens.read().await;
+        let flags = self.pause_flags.read().await;
+        let mut count = 0;
+        for child_id in &children {
+            if let Some(token) = tokens.get(child_id) {
+                token.cancel();
+                count += 1;
+            }
+            // Also set pause flag to stop cooperative loops
+            if let Some(flag) = flags.get(child_id) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        count
+    }
+
     /// Check if a sub-run is currently paused.
     pub async fn is_paused(&self, run_id: &str) -> bool {
         self.pause_flags
@@ -935,17 +971,19 @@ impl DelegationTracker {
         }
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
 
-        // Acquire locks in consistent order: delegations → parents → pause_flags → progress
+        // Acquire locks in consistent order: delegations → parents → pause_flags → cancel_tokens → progress
         // (same order as load_from_run_records to prevent deadlock)
         let mut delegations = self.delegations.write().await;
         let mut parents = self.parents.write().await;
         let mut pause_flags = self.pause_flags.write().await;
+        let mut cancel_tokens = self.cancel_tokens.write().await;
         let mut progress_map = self.progress.write().await;
 
         delegations.remove(delegation_id);
         for rid in &run_ids {
             parents.remove(rid);
             pause_flags.remove(rid);
+            cancel_tokens.remove(rid);
         }
         progress_map.remove(delegation_id);
         Ok(())
@@ -1332,6 +1370,15 @@ impl DelegationEngine {
 
                     let retry_pause_flag = self.tracker.register_pause_flag(&retry_run_id).await;
                     retry_config.pause_flag = Some(retry_pause_flag);
+                    let retry_cancel_token = retry_config
+                        .cancel_token
+                        .as_ref()
+                        .map(|t| Arc::new(t.child_token()))
+                        .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
+                    self.tracker
+                        .register_cancel_token(&retry_run_id, retry_cancel_token.clone())
+                        .await;
+                    retry_config.cancel_token = Some(retry_cancel_token);
 
                     if retry_config.mailbox.is_none() {
                         if let Some(router) = &self.mailbox_router {
@@ -1818,6 +1865,14 @@ impl DelegationEngine {
                 .await?;
 
             let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
+            // Create a per-child cancel token derived from the parent's token.
+            // Cancelling the parent automatically cancels all children.
+            let child_cancel = cancel_token
+                .map(|t| Arc::new(t.child_token()))
+                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
+            self.tracker
+                .register_cancel_token(&sub_run_id, child_cancel.clone())
+                .await;
 
             let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
                 AgentProfile::new(
@@ -1883,7 +1938,7 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
-                cancel_token: cancel_token.cloned(),
+                cancel_token: Some(child_cancel),
             });
         }
         drop(reg);
@@ -2259,6 +2314,12 @@ impl DelegationEngine {
                 .await?;
 
             let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
+            let child_cancel = cancel_token
+                .map(|t| Arc::new(t.child_token()))
+                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
+            self.tracker
+                .register_cancel_token(&sub_run_id, child_cancel.clone())
+                .await;
 
             let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
                 AgentProfile::new(
@@ -2327,7 +2388,7 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
-                cancel_token: cancel_token.cloned(),
+                cancel_token: Some(child_cancel),
             };
 
             let exec_result = match per_stage_timeout {
@@ -3349,6 +3410,34 @@ impl DelegationEngine {
             );
         }
         count
+    }
+
+    /// Cancel all non-terminal sub-runs spawned by a parent run.
+    /// Returns the number of sub-runs whose status was persisted as cancelled.
+    pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
+        self.tracker.cancel_children_of(parent_run_id).await;
+        let mut persisted = 0;
+        for child_id in self.tracker.get_children(parent_run_id).await {
+            // Only persist cancelled status for non-terminal sub-runs to avoid
+            // overwriting completed/failed status in the durable store.
+            let is_terminal = self
+                .tracker
+                .get_sub_run_state(&child_id)
+                .await
+                .map_or(false, |s| s.is_terminal());
+            if !is_terminal {
+                astra_core::log_persist!(
+                    self.run_engine
+                        .persist_status(&child_id, STATUS_CANCELLED, Some("parent_cancel"), None)
+                        .await,
+                    "delegation",
+                    &child_id,
+                    "cancel"
+                );
+                persisted += 1;
+            }
+        }
+        persisted
     }
 
     /// Extract budget awareness prompt from delegation context.
@@ -6171,6 +6260,128 @@ mod tests {
             source.matches(needle.as_str()).count(),
             0,
             "spawned delegation tasks must not panic on a closed semaphore"
+        );
+    }
+
+    /// P1-B: cancel_children_of must cancel all child tokens.
+    #[tokio::test]
+    async fn cancel_children_of_cancels_tokens() {
+        let tracker = DelegationTracker::new();
+        let parent = "parent-run";
+        let child1 = "child-1";
+        let child2 = "child-2";
+
+        // Register children under parent
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: child1.into(),
+                parent_run_id: parent.into(),
+                delegation_id: "deleg-1".into(),
+                agent_id: "agent-a".into(),
+                depth: 0,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: child2.into(),
+                parent_run_id: parent.into(),
+                delegation_id: "deleg-1".into(),
+                agent_id: "agent-b".into(),
+                depth: 0,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        let token1 = Arc::new(tokio_util::sync::CancellationToken::new());
+        let token2 = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker.register_cancel_token(child1, token1.clone()).await;
+        tracker.register_cancel_token(child2, token2.clone()).await;
+
+        assert!(!token1.is_cancelled());
+        assert!(!token2.is_cancelled());
+
+        let count = tracker.cancel_children_of(parent).await;
+        assert_eq!(count, 2, "both children must be cancelled");
+        assert!(token1.is_cancelled(), "child1 token must be cancelled");
+        assert!(token2.is_cancelled(), "child2 token must be cancelled");
+    }
+
+    /// P1-B source guard: cancel_run must call cancel_children_of on delegation engine.
+    #[test]
+    fn cancel_run_cascades_to_delegation_children() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn cancel_run(")
+            .expect("cancel_run must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_children_of"),
+            "cancel_run must cascade cancellation to delegation sub-runs"
+        );
+    }
+
+    /// cancel_tokens must be cleaned up in cleanup_delegation to prevent memory leaks.
+    #[tokio::test]
+    async fn cleanup_delegation_removes_cancel_tokens() {
+        let tracker = DelegationTracker::new();
+        let deleg_id = "deleg-cleanup";
+        let child = "child-cleanup";
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: child.into(),
+                parent_run_id: "parent".into(),
+                delegation_id: deleg_id.into(),
+                agent_id: "agent".into(),
+                depth: 0,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker.register_cancel_token(child, token.clone()).await;
+        assert!(tracker.cancel_tokens.read().await.contains_key(child));
+
+        // Complete the sub-run so cleanup_delegation can proceed
+        tracker
+            .complete_sub_run(child, SubRunState::Completed)
+            .await;
+
+        tracker.cleanup_delegation(deleg_id).await.unwrap();
+        assert!(
+            !tracker.cancel_tokens.read().await.contains_key(child),
+            "cancel_tokens must be cleaned up after delegation cleanup"
+        );
+    }
+
+    /// Source guard: cleanup_delegation must clean cancel_tokens alongside pause_flags.
+    #[test]
+    fn cleanup_delegation_cleans_cancel_tokens_source_guard() {
+        let source = include_str!("delegation_engine.rs");
+        let impl_start = source
+            .find("impl DelegationTracker {")
+            .expect("impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find("async fn cleanup_delegation(")
+            .expect("cleanup_delegation must exist");
+        let fn_end = impl_source[fn_start..]
+            .find("\n    pub async fn ")
+            .or_else(|| impl_source[fn_start..].find("\n    async fn "))
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        let fn_body = &impl_source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_tokens"),
+            "cleanup_delegation must clean up cancel_tokens map"
         );
     }
 }

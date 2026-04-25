@@ -882,10 +882,10 @@ fn resolve_existing_search_path(
 }
 
 fn relative_search_target(workspace_root: &Path, resolved: &Path) -> String {
-    match resolved.strip_prefix(workspace_root) {
-        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
-        Ok(relative) => relative.to_string_lossy().into_owned(),
-        Err(_) => resolved.to_string_lossy().into_owned(),
+    match crate::fs_ops::relative_to_workspace_root(workspace_root, resolved) {
+        Some(relative) if relative.as_os_str().is_empty() => ".".into(),
+        Some(relative) => relative.to_string_lossy().into_owned(),
+        None => resolved.to_string_lossy().into_owned(),
     }
 }
 

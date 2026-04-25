@@ -38,6 +38,41 @@ fn build_client_for_url(url: &str) -> reqwest::Client {
 /// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
 const MAX_VERIFICATION_HISTORY_ROWS: i64 = 10_000;
 
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.components()
+        .fold(std::path::PathBuf::new(), |mut acc, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => acc.push(other),
+            }
+            acc
+        })
+}
+
+fn unique_path_variants(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut variants = vec![normalize_path(path)];
+    if let Ok(canonical) = path.canonicalize()
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+fn is_within_work_dir(path: &std::path::Path, work_dir: &std::path::Path) -> bool {
+    let path_variants = unique_path_variants(path);
+    let work_dir_variants = unique_path_variants(work_dir);
+
+    path_variants.iter().any(|candidate| {
+        work_dir_variants
+            .iter()
+            .any(|root| candidate == root || candidate.starts_with(root))
+    })
+}
+
 // ─── LLM Judge Trait ────────────────────────────────────────────────────────
 
 /// Trait for LLM-based semantic verification.
@@ -728,7 +763,10 @@ impl SubtaskStage {
 
     /// Can transition to executing?
     pub fn can_start(&self) -> bool {
-        matches!(self, Self::Pending | Self::VerificationFailed { .. })
+        matches!(
+            self,
+            Self::Pending | Self::VerificationFailed { .. } | Self::ExecutionFailed { .. }
+        )
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -984,16 +1022,15 @@ impl VerificationRunner {
                     std::path::PathBuf::from(path)
                 } else {
                     let full = self.work_dir.join(path);
+                    let normalized = normalize_path(&full);
+                    if !is_within_work_dir(&normalized, &self.work_dir) {
+                        return Err(format!("path '{path}' escapes work directory boundary"));
+                    }
                     if full.exists() {
-                        // Security: prevent relative path traversal (e.g. "../../../etc/passwd")
                         let canonical = full
                             .canonicalize()
                             .map_err(|e| format!("invalid path {path}: {e}"))?;
-                        let work_canonical = self
-                            .work_dir
-                            .canonicalize()
-                            .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
-                        if !canonical.starts_with(&work_canonical) {
+                        if !is_within_work_dir(&canonical, &self.work_dir) {
                             return Err(format!("path '{path}' escapes work directory boundary"));
                         }
                         canonical
@@ -1006,11 +1043,7 @@ impl VerificationRunner {
                         let canonical = found
                             .canonicalize()
                             .map_err(|e| format!("invalid path {path}: {e}"))?;
-                        let work_canonical = self
-                            .work_dir
-                            .canonicalize()
-                            .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
-                        if !canonical.starts_with(&work_canonical) {
+                        if !is_within_work_dir(&canonical, &self.work_dir) {
                             return Err(format!("path '{path}' escapes work directory boundary"));
                         }
                         canonical
@@ -2546,45 +2579,15 @@ impl MatrixOneDurableTaskLifecycle {
         })
     }
 
-    async fn persist_contract(&self, contract: &TaskContract) -> Result<(), String> {
-        let scope_json =
-            serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
-        let subtasks_json =
-            serde_json::to_string(&contract.subtasks).map_err(|e| format!("subtasks json: {e}"))?;
-        let criteria_json = serde_json::to_string(&contract.global_verification)
-            .map_err(|e| format!("criteria json: {e}"))?;
-
-        sqlx::query(
-            "INSERT INTO task_contracts \
-             (contract_id, task_id, session_id, user_id, goal, scope_json, \
-              subtasks_json, criteria_json, version, status, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE \
-             subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
-             scope_json = VALUES(scope_json), version = VALUES(version), \
-             status = VALUES(status), updated_at = NOW()",
-        )
-        .bind(&contract.contract_id)
-        .bind(&contract.task_id)
-        .bind("") // session_id filled by caller context
-        .bind("") // user_id filled by caller context
-        .bind(&contract.goal)
-        .bind(&scope_json)
-        .bind(&subtasks_json)
-        .bind(&criteria_json)
-        .bind(contract.version as i32)
-        .bind(contract.status.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("persist_contract: {e}"))?;
-        Ok(())
-    }
-
-    async fn persist_contract_with_user(
+    /// Persist a task contract with optimistic locking.
+    /// If `user_id` and `session_id` are provided, they are included in the UPDATE SET clause
+    /// and bound in the INSERT. Otherwise, empty strings are used for new inserts and
+    /// user/session columns are not updated on existing rows.
+    async fn persist_contract(
         &self,
         contract: &TaskContract,
-        user_id: &str,
-        session_id: &str,
+        user_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<(), String> {
         let scope_json =
             serde_json::to_string(&contract.scope).map_err(|e| format!("scope json: {e}"))?;
@@ -2593,29 +2596,79 @@ impl MatrixOneDurableTaskLifecycle {
         let criteria_json = serde_json::to_string(&contract.global_verification)
             .map_err(|e| format!("criteria json: {e}"))?;
 
-        sqlx::query(
-            "INSERT INTO task_contracts \
-             (contract_id, task_id, session_id, user_id, goal, scope_json, \
-              subtasks_json, criteria_json, version, status, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
-             ON DUPLICATE KEY UPDATE \
-             subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
-             scope_json = VALUES(scope_json), version = VALUES(version), \
-             status = VALUES(status), updated_at = NOW()",
-        )
-        .bind(&contract.contract_id)
-        .bind(&contract.task_id)
-        .bind(session_id)
-        .bind(user_id)
-        .bind(&contract.goal)
-        .bind(&scope_json)
-        .bind(&subtasks_json)
-        .bind(&criteria_json)
-        .bind(contract.version as i32)
-        .bind(contract.status.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("persist_contract: {e}"))?;
+        let prev_version = contract.version.saturating_sub(1) as i32;
+
+        // Optimistic locking: try UPDATE with version guard first.
+        let updated = if user_id.is_some() {
+            sqlx::query(
+                "UPDATE task_contracts SET \
+                 subtasks_json = ?, criteria_json = ?, scope_json = ?, \
+                 version = ?, status = ?, session_id = ?, user_id = ?, updated_at = NOW() \
+                 WHERE contract_id = ? AND version = ?",
+            )
+            .bind(&subtasks_json)
+            .bind(&criteria_json)
+            .bind(&scope_json)
+            .bind(contract.version as i32)
+            .bind(contract.status.as_str())
+            .bind(session_id.unwrap_or(""))
+            .bind(user_id.unwrap_or(""))
+            .bind(&contract.contract_id)
+            .bind(prev_version)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("persist_contract update: {e}"))?
+        } else {
+            sqlx::query(
+                "UPDATE task_contracts SET \
+                 subtasks_json = ?, criteria_json = ?, scope_json = ?, \
+                 version = ?, status = ?, updated_at = NOW() \
+                 WHERE contract_id = ? AND version = ?",
+            )
+            .bind(&subtasks_json)
+            .bind(&criteria_json)
+            .bind(&scope_json)
+            .bind(contract.version as i32)
+            .bind(contract.status.as_str())
+            .bind(&contract.contract_id)
+            .bind(prev_version)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("persist_contract update: {e}"))?
+        };
+
+        if updated.rows_affected() == 0 {
+            // Either new contract or version conflict. Try INSERT; if duplicate, it's a conflict.
+            let insert_result = sqlx::query(
+                "INSERT INTO task_contracts \
+                 (contract_id, task_id, session_id, user_id, goal, scope_json, \
+                  subtasks_json, criteria_json, version, status, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+            )
+            .bind(&contract.contract_id)
+            .bind(&contract.task_id)
+            .bind(session_id.unwrap_or(""))
+            .bind(user_id.unwrap_or(""))
+            .bind(&contract.goal)
+            .bind(&scope_json)
+            .bind(&subtasks_json)
+            .bind(&criteria_json)
+            .bind(contract.version as i32)
+            .bind(contract.status.as_str())
+            .execute(&self.pool)
+            .await;
+
+            match insert_result {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("Duplicate") => {
+                    return Err(format!(
+                        "persist_contract: version conflict for {} (expected version {})",
+                        contract.contract_id, prev_version
+                    ));
+                }
+                Err(e) => return Err(format!("persist_contract insert: {e}")),
+            }
+        }
         Ok(())
     }
 
@@ -2753,7 +2806,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             last_global_results: Vec::new(),
         };
 
-        self.persist_contract_with_user(&contract, user_id, session_id)
+        self.persist_contract(&contract, Some(user_id), Some(session_id))
             .await?;
         Ok(contract)
     }
@@ -2781,7 +2834,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         contract.status = ContractStatus::Amended;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
 
-        self.persist_contract(&contract).await?;
+        self.persist_contract(&contract, None, None).await?;
         Ok(contract)
     }
 
@@ -2840,7 +2893,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         };
 
         subtask.stage = SubtaskStage::Executing;
-        self.persist_contract(&contract).await?;
+        self.persist_contract(&contract, None, None).await?;
 
         self.emit_event(
             "subtask_started",
@@ -2893,7 +2946,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             SubtaskStage::AwaitingVerification
         };
 
-        self.persist_contract(&contract).await?;
+        self.persist_contract(&contract, None, None).await?;
         Ok(())
     }
 
@@ -2913,7 +2966,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             error: error.to_string(),
         };
 
-        self.persist_contract(&contract).await?;
+        self.persist_contract(&contract, None, None).await?;
         Ok(())
     }
 
@@ -3032,29 +3085,29 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             let criteria_json = serde_json::to_string(&contract.global_verification)
                 .map_err(|e| format!("criteria json: {e}"))?;
 
-            sqlx::query(
-                "INSERT INTO task_contracts \
-                 (contract_id, task_id, session_id, user_id, goal, scope_json, \
-                  subtasks_json, criteria_json, version, status, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW()) \
-                 ON DUPLICATE KEY UPDATE \
-                 subtasks_json = VALUES(subtasks_json), criteria_json = VALUES(criteria_json), \
-                 scope_json = VALUES(scope_json), version = VALUES(version), \
-                 status = VALUES(status), updated_at = NOW()",
+            let updated = sqlx::query(
+                "UPDATE task_contracts SET \
+                 subtasks_json = ?, criteria_json = ?, scope_json = ?, \
+                 version = ?, status = ?, updated_at = NOW() \
+                 WHERE contract_id = ? AND version = ?",
             )
-            .bind(&contract.contract_id)
-            .bind(&contract.task_id)
-            .bind("")
-            .bind("")
-            .bind(&contract.goal)
-            .bind(&scope_json)
             .bind(&subtasks_json)
             .bind(&criteria_json)
+            .bind(&scope_json)
             .bind(contract.version as i32)
             .bind(contract.status.as_str())
+            .bind(&contract.contract_id)
+            .bind((contract.version.saturating_sub(1)) as i32)
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("persist_contract in tx: {e}"))?;
+            if updated.rows_affected() == 0 {
+                return Err(format!(
+                    "persist_contract in tx: version conflict for {} (expected version {})",
+                    contract.contract_id,
+                    contract.version.saturating_sub(1)
+                ));
+            }
         }
 
         tx.commit()
@@ -3176,7 +3229,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
             .await?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
-        self.persist_contract(&contract).await?;
+        self.persist_contract(&contract, None, None).await?;
         Ok(())
     }
 
@@ -3185,10 +3238,29 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         task_id: &str,
         _session_id: &str,
     ) -> Result<TaskResumeContext, String> {
-        let contract = self
+        let mut contract = self
             .load_contract_by_task(task_id)
             .await?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+
+        // Reset stuck Executing subtasks to Pending. If we're resuming, any
+        // previously Executing subtask was interrupted and should be restartable.
+        let mut reset_count = 0usize;
+        for subtask in &mut contract.subtasks {
+            if matches!(subtask.stage, SubtaskStage::Executing) {
+                subtask.stage = SubtaskStage::Pending;
+                reset_count += 1;
+            }
+        }
+        if reset_count > 0 {
+            tracing::warn!(
+                task_id,
+                reset_count,
+                "reset stuck Executing subtask(s) to Pending on resume"
+            );
+            contract.version += 1;
+            self.persist_contract(&contract, None, None).await?;
+        }
 
         let active_subtask = contract
             .subtasks
@@ -3279,7 +3351,7 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
 
         contract.status = ContractStatus::Completed;
         contract.updated_at = chrono::Utc::now().to_rfc3339();
-        self.persist_contract(&contract).await?;
+        self.persist_contract(&contract, None, None).await?;
 
         self.emit_event("task_delivered", serde_json::json!({
             "task_id": task_id,
@@ -3933,9 +4005,28 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         task_id: &str,
         _session_id: &str,
     ) -> Result<TaskResumeContext, String> {
-        let contract = self
+        let mut contract = self
             .find_by_task(task_id)?
             .ok_or_else(|| format!("no contract for task '{task_id}'"))?;
+
+        // Reset stuck Executing subtasks to Pending (same as MatrixOne impl).
+        let mut reset_count = 0usize;
+        for subtask in &mut contract.subtasks {
+            if matches!(subtask.stage, SubtaskStage::Executing) {
+                subtask.stage = SubtaskStage::Pending;
+                reset_count += 1;
+            }
+        }
+        if reset_count > 0 {
+            tracing::warn!(
+                task_id,
+                reset_count,
+                "reset stuck Executing subtask(s) to Pending on resume"
+            );
+            contract.version += 1;
+            self.save_local(&contract)?;
+        }
+
         let active_subtask = contract
             .subtasks
             .iter()
@@ -5096,8 +5187,15 @@ mod tests {
             .resume_task(&contract.task_id, "new-session")
             .await
             .unwrap();
-        assert_eq!(ctx.active_subtask, Some("sub-1".into()));
+        // After resume, the previously-Executing subtask is reset to Pending
+        // (no longer stuck), so active_subtask is None.
+        assert_eq!(ctx.active_subtask, None);
         assert_eq!(ctx.contract.subtasks.len(), 2);
+        // The subtask should now be Pending (restartable)
+        assert!(
+            ctx.contract.subtasks[0].stage.can_start(),
+            "reset subtask must be restartable"
+        );
     }
 
     #[tokio::test]
@@ -7620,6 +7718,119 @@ Time:        3.456 s
         assert!(
             body.contains("tokio::time::timeout") || body.contains("time::timeout"),
             "run_shell_cmd_buffered must wrap spawn_blocking in tokio::time::timeout"
+        );
+    }
+
+    /// P1-E: persist_contract must use optimistic locking (WHERE version = ?).
+    /// No ON DUPLICATE KEY UPDATE without version guard.
+    #[test]
+    fn persist_contract_uses_optimistic_locking() {
+        let source = include_str!("durable_task.rs");
+        let impl_start = source
+            .find("impl MatrixOneDurableTaskLifecycle {")
+            .expect("impl must exist");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let impl_source = &source[impl_start..test_start];
+
+        // No persist_contract should use ON DUPLICATE KEY UPDATE (no version guard)
+        let persist_fns: Vec<&str> = impl_source
+            .match_indices("fn persist_contract")
+            .map(|(i, _)| {
+                let end = impl_source[i..]
+                    .find("\n    async fn ")
+                    .map(|p| i + p)
+                    .unwrap_or(impl_source.len());
+                &impl_source[i..end]
+            })
+            .collect();
+        for body in &persist_fns {
+            assert!(
+                !body.contains("ON DUPLICATE KEY UPDATE"),
+                "persist_contract must not use ON DUPLICATE KEY UPDATE — use UPDATE WHERE version = ? instead"
+            );
+        }
+
+        // All persist_contract variants must include version guard
+        for body in &persist_fns {
+            assert!(
+                body.contains("AND version = ?"),
+                "persist_contract must use optimistic locking (WHERE ... AND version = ?)"
+            );
+        }
+
+        // Also check the verify_subtask transaction path
+        let verify_start = impl_source
+            .find("async fn verify_subtask")
+            .expect("verify_subtask must exist");
+        let verify_end = impl_source[verify_start..]
+            .find("\n    async fn ")
+            .map(|p| verify_start + p)
+            .unwrap_or(impl_source.len());
+        let verify_body = &impl_source[verify_start..verify_end];
+        assert!(
+            !verify_body.contains("ON DUPLICATE KEY UPDATE"),
+            "verify_subtask must not use ON DUPLICATE KEY UPDATE"
+        );
+        assert!(
+            verify_body.contains("rows_affected()"),
+            "verify_subtask tx path must check rows_affected() for version conflict detection"
+        );
+    }
+
+    /// persist_contract must be a single shared helper, not duplicated.
+    /// persist_contract_with_user should NOT exist as a separate method.
+    #[test]
+    fn persist_contract_is_not_duplicated() {
+        let source = include_str!("durable_task.rs");
+        let impl_start = source
+            .find("impl MatrixOneDurableTaskLifecycle {")
+            .expect("impl must exist");
+        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let impl_source = &source[impl_start..test_start];
+
+        // There should be exactly ONE persist_contract method (the shared helper).
+        let persist_count = impl_source
+            .match_indices("async fn persist_contract")
+            .count();
+        assert_eq!(
+            persist_count, 1,
+            "there must be exactly 1 persist_contract method (shared helper), found {persist_count}"
+        );
+    }
+
+    /// P2-A: ExecutionFailed subtasks must be retryable via can_start().
+    #[test]
+    fn execution_failed_subtask_can_be_retried() {
+        let stage = SubtaskStage::ExecutionFailed {
+            error: "timeout".into(),
+        };
+        assert!(
+            stage.can_start(),
+            "ExecutionFailed subtasks must be retryable (can_start() == true)"
+        );
+    }
+
+    /// P2-A: resume_task must reset stuck Executing subtasks to Pending.
+    /// If a task is being resumed, any Executing subtask was interrupted and should be restartable.
+    #[test]
+    fn resume_task_resets_stuck_executing_subtask() {
+        let source = include_str!("durable_task.rs");
+        let impl_start = source
+            .find("impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle")
+            .expect("impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find("async fn resume_task(")
+            .expect("resume_task must exist");
+        let fn_end = impl_source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        let fn_body = &impl_source[fn_start..fn_end];
+        // resume_task must handle stuck Executing subtasks
+        assert!(
+            fn_body.contains("Executing") && fn_body.contains("Pending"),
+            "resume_task must reset stuck Executing subtasks to Pending"
         );
     }
 }

@@ -34,6 +34,43 @@ use crate::turn::file_edit_journal::{EditType, FileEditJournal};
 
 const MO_CONNECT_TIMEOUT_SECS: u32 = 5;
 
+fn normalize_path(path: &Path) -> PathBuf {
+    path.components()
+        .fold(PathBuf::new(), |mut acc, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => acc.push(other),
+            }
+            acc
+        })
+}
+
+fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut variants = vec![normalize_path(path)];
+    if let Ok(canonical) = path.canonicalize()
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+fn undo_file_with_candidates(
+    journal: &FileEditJournal,
+    candidates: &[PathBuf],
+) -> std::io::Result<Option<(PathBuf, EditType)>> {
+    for candidate in candidates {
+        match journal.undo_file(candidate)? {
+            Some(edit_type) => return Ok(Some((candidate.clone(), edit_type))),
+            None => continue,
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DatabaseSnapshotRollbackEntry {
     sequence: u64,
@@ -2812,10 +2849,52 @@ impl ServerToolExecutor {
     }
 
     fn rollback_display_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace_root)
-            .unwrap_or(path)
+        self.relative_to_workspace_root(path)
+            .unwrap_or_else(|| path.to_path_buf())
             .display()
             .to_string()
+    }
+
+    fn relative_to_workspace_root(&self, path: &Path) -> Option<PathBuf> {
+        let path_variants = unique_path_variants(path);
+        let root_variants = unique_path_variants(&self.workspace_root);
+
+        path_variants.iter().find_map(|candidate| {
+            root_variants.iter().find_map(|root| {
+                candidate
+                    .strip_prefix(root)
+                    .ok()
+                    .map(std::path::Path::to_path_buf)
+            })
+        })
+    }
+
+    fn rollback_path_candidates(&self, raw_path: &str, resolved: &Path) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        let mut push_unique = |candidate: PathBuf| {
+            if !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        };
+
+        for variant in unique_path_variants(resolved) {
+            push_unique(variant);
+        }
+
+        let relative = if Path::new(raw_path).is_absolute() {
+            self.relative_to_workspace_root(Path::new(raw_path))
+        } else {
+            Some(normalize_path(Path::new(raw_path)))
+        };
+
+        if let Some(relative) = relative {
+            push_unique(self.workspace_root.join(&relative));
+            if let Ok(canonical_root) = self.workspace_root.canonicalize() {
+                push_unique(canonical_root.join(relative));
+            }
+        }
+
+        candidates
     }
 
     pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
@@ -2870,19 +2949,22 @@ impl ServerToolExecutor {
                     Ok(path) => path,
                     Err(error) => return error,
                 };
+                let rollback_candidates = self.rollback_path_candidates(raw_path, &path);
                 let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => journal.undo_file(&path),
-                    Err(poisoned) => poisoned.into_inner().undo_file(&path),
+                    Ok(journal) => undo_file_with_candidates(&journal, &rollback_candidates),
+                    Err(poisoned) => {
+                        undo_file_with_candidates(&poisoned.into_inner(), &rollback_candidates)
+                    }
                 };
                 match undo_result {
-                    Ok(Some(edit_type)) => json!({
+                    Ok(Some((rolled_back_path, edit_type))) => json!({
                         "success": true,
                         "scope": "file",
-                        "path": self.rollback_display_path(&path),
+                        "path": self.rollback_display_path(&rolled_back_path),
                         "edit_type": edit_type_label(edit_type),
                         "summary": format!(
                             "Rolled back the latest recorded edit for {}",
-                            self.rollback_display_path(&path)
+                            self.rollback_display_path(&rolled_back_path)
                         ),
                     })
                     .to_string(),

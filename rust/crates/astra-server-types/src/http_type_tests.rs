@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::runs::ExecutionBudget;
 use serde_json::{Map, Value, json};
 
 // ── default functions ───────────────────────────────────────────
@@ -11,11 +12,6 @@ fn default_days_returns_seven() {
 #[test]
 fn default_admin_scope_returns_global() {
     assert_eq!(default_admin_scope(), "global");
-}
-
-#[test]
-fn default_max_candidates_returns_five() {
-    assert_eq!(default_max_candidates(), 5);
 }
 
 #[test]
@@ -49,7 +45,7 @@ fn default_signal_types_returns_wrong_skill() {
 fn chat_request_defaults_applied() {
     let req: ChatRequest = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
     assert_eq!(req.message, "hi");
-    assert_eq!(req.max_candidates, 5);
+    assert!(req.execution_budget.is_none());
     assert!(!req.explain);
     assert!(req.session_id.is_none());
     assert!(req.agent_id.is_none());
@@ -133,7 +129,7 @@ fn chat_request_all_fields() {
             "timeout_ms": 2500
         },
         "context": {"key": "value"},
-        "max_candidates": 10,
+        "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "explain": true
     });
     let req: ChatRequest = serde_json::from_value(input).unwrap();
@@ -149,10 +145,31 @@ fn chat_request_all_fields() {
         req.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
         Some(2500)
     );
-    assert_eq!(req.max_candidates, 10);
+    assert_eq!(
+        req.execution_budget,
+        Some(ExecutionBudget {
+            initial_turns: Some(10),
+            hard_turn_limit: Some(18),
+        })
+    );
     assert!(req.explain);
     let ctx = req.context.unwrap();
     assert_eq!(ctx.get("key").unwrap(), "value");
+}
+
+#[test]
+fn chat_request_execution_budget_roundtrip() {
+    let req: ChatRequest = serde_json::from_str(
+        r#"{"message":"budget","execution_budget":{"initial_turns":4,"hard_turn_limit":9}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        req.execution_budget,
+        Some(ExecutionBudget {
+            initial_turns: Some(4),
+            hard_turn_limit: Some(9),
+        })
+    );
 }
 
 #[test]
@@ -246,7 +263,9 @@ fn admin_token_create_request_all_fields() {
 
 #[test]
 fn chat_request_missing_message_errors() {
-    let result = serde_json::from_str::<ChatRequest>(r#"{"max_candidates":3}"#);
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"execution_budget":{"initial_turns":3,"hard_turn_limit":7}}"#,
+    );
     assert!(result.is_err());
 }
 
@@ -899,7 +918,10 @@ fn chat_request_into_data_maps_all_fields() {
         allow_skills: None,
         allow_tools: None,
         context: Some(ctx.clone()),
-        max_candidates: 3,
+        execution_budget: Some(ExecutionBudget {
+            initial_turns: Some(3),
+            hard_turn_limit: Some(7),
+        }),
         explain: true,
         plan_subtask_id: None,
         is_plan_subtask: None,
@@ -922,7 +944,13 @@ fn chat_request_into_data_maps_all_fields() {
         Some(astra_core::SkillSearchSettings::default())
     );
     assert_eq!(data.context, Some(ctx));
-    assert_eq!(data.max_candidates, 3);
+    assert_eq!(
+        data.execution_budget,
+        Some(ExecutionBudget {
+            initial_turns: Some(3),
+            hard_turn_limit: Some(7),
+        })
+    );
     assert!(data.explain);
 }
 
@@ -936,7 +964,7 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.model.is_none());
     assert!(data.llm_token_service.is_none());
     assert!(data.context.is_none());
-    assert_eq!(data.max_candidates, 5);
+    assert!(data.execution_budget.is_none());
     assert!(!data.explain);
 }
 
@@ -952,7 +980,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         allow_skills: None,
         allow_tools: None,
         context: None,
-        max_candidates: 5,
+        execution_budget: None,
         explain: false,
         plan_subtask_id: Some("sub-42".into()),
         is_plan_subtask: Some(true),

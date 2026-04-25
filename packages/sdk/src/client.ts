@@ -223,8 +223,13 @@ function normalizeEventList(raw: EventListResponse): EventListResponse {
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
-    max_candidates: req.maxCandidates ?? 8,
   };
+  if (req.executionBudget) {
+    body.execution_budget = {
+      initial_turns: req.executionBudget.initialTurns,
+      hard_turn_limit: req.executionBudget.hardTurnLimit,
+    };
+  }
   if (req.sessionId) body.session_id = req.sessionId;
   if (req.agentId) body.agent_id = req.agentId;
   if (req.model) body.model = req.model;

@@ -646,15 +646,18 @@ pub trait IncrementalSyncProtocol: Send + Sync {
 pub struct DeltaEngine;
 
 impl DeltaEngine {
-    /// Apply a delta batch to a state value.
+    /// Apply a delta batch to a state value atomically.
+    /// On error, `state` is unchanged (clone-and-swap).
     pub fn apply(state: &mut serde_json::Value, batch: &DeltaBatch) -> Result<u32, DeltaError> {
+        let mut draft = state.clone();
         let mut applied = 0u32;
 
         for op in &batch.operations {
-            Self::apply_op(state, op)?;
+            Self::apply_op(&mut draft, op)?;
             applied += 1;
         }
 
+        *state = draft;
         Ok(applied)
     }
 
@@ -1422,6 +1425,26 @@ mod tests {
             err.status_code(),
             413,
             "DeltaTooLarge must be 413 Payload Too Large"
+        );
+    }
+
+    /// P1-D: DeltaEngine::apply must be atomic — if any op fails, state is unchanged.
+    #[test]
+    fn apply_is_atomic_on_failure() {
+        let mut state = serde_json::json!({"x": 1});
+        let original = state.clone();
+
+        let mut batch = DeltaBatch::new(0, "cp");
+        // Op 1: valid add
+        batch.push(DeltaOp::add("/y", serde_json::json!(2)));
+        // Op 2: invalid — replace on non-existent path
+        batch.push(DeltaOp::replace("/z/deep/missing", serde_json::json!(3)));
+
+        let result = DeltaEngine::apply(&mut state, &batch);
+        assert!(result.is_err(), "batch with invalid op must fail");
+        assert_eq!(
+            state, original,
+            "state must be unchanged after failed atomic apply"
         );
     }
 }

@@ -454,9 +454,18 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) {
     finalize_turn_trace(state).await;
+    // Drop any execution-retry corrective messages now that the loop has
+    // finished. Keeping them in `state.messages` would pollute every
+    // subsequent user turn (the model would see a stale "you didn't apply the
+    // change" nudge that no longer applies). The marker is a stable header
+    // embedded by `agentic_loop_execution_phase::execution_retry_message`.
+    state
+        .messages
+        .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m));
     try_write_heavy_checkpoint(state);
-    if !state.final_text.is_empty() {
+    if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
+        state.final_text_streamed = true;
     }
 }
 
@@ -524,6 +533,111 @@ mod tests {
     };
 
     use super::*;
+
+    // E2E: full execution-retry guard lifecycle through the production loop.
+    // Round 1: model defers ("需要我直接执行这些修改吗？") on a mutating-profile
+    // task → guard fires, corrective user message is injected into
+    // `state.messages`, loop continues. Round 2: model finalizes with "Done.".
+    // After the loop ends, `finalize_and_render` must strip the marker so the
+    // corrective message does not leak into subsequent user turns.
+    #[tokio::test]
+    async fn execution_retry_injects_then_strips_corrective_message() {
+        let mut host = MockHost::new(vec![
+            text_result("需要我直接执行这些修改吗？", 10, 5, Some(20)),
+            text_result("Done.", 10, 5, Some(20)),
+        ]);
+        let mut state = make_state();
+        state.message = "修复这个 bug".to_string();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
+        assert!(
+            state.task_profile.mutates_workspace,
+            "test precondition: profile must be mutating"
+        );
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "loop should complete: {:?}", outcome);
+
+        assert!(
+            state.stall.forced_execution_retry,
+            "guard must have fired on the deferring round"
+        );
+        assert_eq!(
+            state.final_text, "Done.",
+            "second LLM response should win after the forced retry"
+        );
+
+        let leftover = state
+            .messages
+            .iter()
+            .filter(|m| crate::turn::agentic_loop_execution_phase::is_execution_retry_correction(m))
+            .count();
+        assert_eq!(
+            leftover, 0,
+            "finalize_and_render must strip the corrective message; \
+             {leftover} copies still in state.messages: {:#?}",
+            state.messages
+        );
+    }
+
+    // E2E negative: when the model finishes with a legitimate "no change
+    // needed" reply (zero tool calls, no defer signal), the guard must NOT
+    // fire — even on a mutating-profile task — and no corrective message
+    // should ever be injected.
+    #[tokio::test]
+    async fn execution_retry_does_not_fire_on_legitimate_no_op_completion() {
+        let mut host = MockHost::new(vec![text_result(
+            "I reviewed the code and the bug does not exist.",
+            10,
+            5,
+            Some(20),
+        )]);
+        let mut state = make_state();
+        state.message = "fix the bug".to_string();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        assert!(state.task_profile.mutates_workspace);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        assert!(
+            !state.stall.forced_execution_retry,
+            "guard must not fire when the model genuinely concludes no fix is needed"
+        );
+        let injected = state
+            .messages
+            .iter()
+            .filter(|m| crate::turn::agentic_loop_execution_phase::is_execution_retry_correction(m))
+            .count();
+        assert_eq!(injected, 0, "no corrective message should be injected");
+    }
+
+    // E2E: model defers twice in a row. The one-shot `forced_execution_retry`
+    // flag must prevent a second corrective injection, so the loop terminates
+    // after two LLM rounds instead of spinning forever.
+    #[tokio::test]
+    async fn double_defer_does_not_cause_infinite_retry() {
+        let mut host = MockHost::new(vec![
+            text_result("需要我直接执行这些修改吗？", 10, 5, Some(20)),
+            text_result("确认后我再执行。", 10, 5, Some(20)),
+        ]);
+        let mut state = make_state();
+        state.message = "修复这个 bug".to_string();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "loop must terminate: {:?}", outcome);
+        assert!(state.stall.forced_execution_retry);
+        // Second defer becomes the final text — guard did not fire again.
+        assert_eq!(state.final_text, "确认后我再执行。");
+        assert_eq!(
+            host.turn_count(),
+            2,
+            "exactly 2 LLM rounds, no infinite loop"
+        );
+    }
 
     #[tokio::test]
     async fn single_text_turn_completes() {

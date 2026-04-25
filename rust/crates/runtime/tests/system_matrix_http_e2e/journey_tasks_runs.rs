@@ -223,7 +223,10 @@ pub async fn run_chat_run_pause_resume_http() {
             "message": "matrix e2e background run",
             "session_id": session_id,
             "model": mock_model,
-            "max_candidates": 1
+            "execution_budget": {
+                "initial_turns": 1,
+                "hard_turn_limit": 1
+            }
         }),
     )
     .await;

@@ -165,5 +165,5 @@ pub(crate) fn init_with_otel(config: &LogInitConfig<'_>) -> Result<(), InitError
 
 /// Flush and shutdown the global OpenTelemetry tracer provider.
 pub(crate) fn shutdown_tracer_provider() {
-    let _ = global::shutdown_tracer_provider();
+    global::shutdown_tracer_provider();
 }

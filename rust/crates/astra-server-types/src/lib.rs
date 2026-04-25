@@ -71,8 +71,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub allow_tools: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default = "default_max_candidates")]
-    pub max_candidates: u32,
+    #[serde(default)]
+    pub execution_budget: Option<astra_services::runs::ExecutionBudget>,
     #[serde(default)]
     pub explain: bool,
     /// Durable plan subtask id — merged into `context` for cloud stop-hooks (`when: task_completed`).
@@ -419,11 +419,6 @@ pub struct AdminUserRoleResponse {
     pub message: String,
 }
 
-#[doc(hidden)]
-pub fn default_ws_max_candidates() -> u32 {
-    25
-}
-
 /// Messages sent from browser client to server.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -446,8 +441,8 @@ pub enum WsClientMessage {
         skill_search: Option<astra_core::SkillSearchSettings>,
         #[serde(default)]
         context: Option<serde_json::Map<String, serde_json::Value>>,
-        #[serde(default = "default_ws_max_candidates")]
-        max_candidates: u32,
+        #[serde(default)]
+        execution_budget: Option<astra_services::runs::ExecutionBudget>,
         #[serde(default)]
         explain: bool,
         #[serde(default)]
@@ -609,11 +604,6 @@ pub fn default_days() -> i32 {
 #[doc(hidden)]
 pub fn default_admin_scope() -> String {
     "global".to_string()
-}
-
-#[doc(hidden)]
-pub fn default_max_candidates() -> u32 {
-    5
 }
 
 #[doc(hidden)]
@@ -879,7 +869,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         allow_tools: request.allow_tools,
         context,
         forward_headers: std::collections::HashMap::new(),
-        max_candidates: request.max_candidates,
+        execution_budget: request.execution_budget,
         explain: request.explain,
         interactive_client: false,
     }

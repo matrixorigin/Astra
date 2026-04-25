@@ -1373,7 +1373,21 @@ async fn durable_task_resume_loads_verification_history_from_db() {
         .expect("resume_task");
 
     assert_eq!(ctx.task_id, task_id);
-    assert_eq!(ctx.active_subtask.as_deref(), Some("sub-it"));
+    // resume_task resets stuck Executing subtasks to Pending so they can be restarted.
+    assert_eq!(ctx.active_subtask, None, "no active subtask after reset");
+    assert_eq!(
+        ctx.contract.subtasks[0].stage.as_str(),
+        "pending",
+        "Executing subtask must be reset to Pending on resume"
+    );
+    assert!(
+        ctx.contract.subtasks[0].stage.can_start(),
+        "reset subtask must be restartable"
+    );
+    assert_eq!(
+        ctx.contract.version, 2,
+        "version must be bumped after reset (was 1 in DB)"
+    );
     assert_eq!(ctx.verification_history.len(), 1);
     let rep = &ctx.verification_history[0];
     assert_eq!(rep.subtask_id, "sub-it");

@@ -3199,6 +3199,28 @@ impl ToolExecutor {
         self.run_shell_output_with_program(program, "-Command", command, timeout_secs, false)
     }
 
+    /// Register file paths that were read by a successful bash command so
+    /// the read-before-edit gate accepts subsequent writes. Safe to call
+    /// speculatively — unknown or non-existent paths are silently ignored
+    /// by the underlying `register_external_read`.
+    fn register_bash_read_targets(&self, command: &str) {
+        let intent = astra_runtime::bash_intent::analyze_bash_command(command);
+        // `intent.read_targets` is already filtered: `analyze_bash_command`
+        // only harvests paths from non-mutating segments, so a mixed command
+        // like `cat a.rs && echo >> b.rs` yields `["a.rs"]` — safe to register.
+        for rel in intent.read_targets {
+            let path = std::path::Path::new(&rel);
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.project_root.join(path)
+            };
+            if abs.exists() {
+                self.register_external_read(&abs);
+            }
+        }
+    }
+
     pub(crate) fn bash(&self, args: &Value) -> String {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) => c,
@@ -3295,6 +3317,15 @@ impl ToolExecutor {
         match self.run_shell_output(command, timeout_secs) {
             Err(error) => error,
             Ok(out) => {
+                // Register any files read by this bash invocation so the
+                // read-before-edit gate accepts subsequent writes. Without
+                // this, `bash cat path` inspection creates a deadlock:
+                // model reads via bash, tries to edit, gate rejects with
+                // "has not been read yet", model reads again via bash, …
+                if out.status.success() {
+                    self.register_bash_read_targets(command);
+                }
+
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let mut result = String::new();
@@ -4164,6 +4195,110 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "echo hello"}));
         assert!(result.trim().contains("hello"), "got: {result}");
+    }
+
+    /// Regression for the c49bc4a3 inspection-loop deadlock: a model that
+    /// reads a file via `bash cat <path>` must be able to subsequently edit
+    /// that file without the read-before-edit gate rejecting the write.
+    #[test]
+    fn bash_cat_registers_file_as_read_so_staleness_gate_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("target.rs");
+        std::fs::write(&file_path, "original\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+
+        // Gate rejects edits for a file that was never read.
+        assert!(executor.check_staleness(&file_path).is_err());
+
+        // Simulate the model running `cat target.rs` via bash.
+        let out = executor.bash(&serde_json::json!({
+            "command": format!("cat {}", file_path.display()),
+        }));
+        assert!(out.contains("original"), "bash output: {out}");
+
+        // After bash-cat, the file must now be considered "read" — staleness
+        // check passes, and a follow-up write is not blocked.
+        assert!(
+            executor.check_staleness(&file_path).is_ok(),
+            "bash cat should have registered {:?} as read",
+            file_path
+        );
+    }
+
+    #[test]
+    fn bash_mutating_command_does_not_register_paths_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("out.txt");
+        let executor = test_executor_in(dir.path());
+
+        // A redirect creates the file but must NOT register it as read —
+        // "read" semantics shouldn't be inferred from a write operation.
+        let _ = executor.bash(&serde_json::json!({
+            "command": format!("echo hi > {}", file_path.display()),
+        }));
+        // File was created by the redirect.
+        assert!(file_path.exists());
+        // …but the read-tracker should still treat it as unread.
+        assert!(
+            executor.check_staleness(&file_path).is_err(),
+            "redirect should not register its target as read"
+        );
+    }
+
+    #[test]
+    fn bash_mixed_command_registers_only_read_segments() {
+        // For a compound command like `cat a.rs && echo >> b.rs`, the cat segment
+        // genuinely reads a.rs (so the staleness gate must let edits through),
+        // while the echo-append segment must NOT register b.rs as read (writes
+        // are not reads). Pre-fix code took the whole-command early-return on
+        // any mutating segment and dropped a.rs; post-fix relies on
+        // `analyze_bash_command` already excluding paths from mutating
+        // segments at extraction time.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, "content-a\n").unwrap();
+        std::fs::write(&b, "content-b\n").unwrap();
+        let executor = test_executor_in(dir.path());
+
+        assert!(executor.check_staleness(&a).is_err());
+        assert!(executor.check_staleness(&b).is_err());
+
+        let _ = executor.bash(&serde_json::json!({
+            "command": format!("cat {} && echo modify >> {}", a.display(), b.display()),
+        }));
+
+        assert!(
+            executor.check_staleness(&a).is_ok(),
+            "cat segment must register {:?} as read",
+            a
+        );
+        // Direct invariant: b.rs was in a mutating segment (echo-append), so
+        // register_bash_read_targets must NOT have marked it as read —
+        // staleness gate should still block edits on b.rs.
+        assert!(
+            executor.check_staleness(&b).is_err(),
+            "echo-append segment must NOT register {:?} as read",
+            b
+        );
+    }
+
+    #[test]
+    fn bash_sed_n_range_read_registers_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("mod.rs");
+        std::fs::write(
+            &file_path,
+            (1..=50).map(|n| format!("line {n}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let executor = test_executor_in(dir.path());
+
+        let _ = executor.bash(&serde_json::json!({
+            "command": format!("sed -n '1,20p' {}", file_path.display()),
+        }));
+        assert!(executor.check_staleness(&file_path).is_ok());
     }
 
     #[test]

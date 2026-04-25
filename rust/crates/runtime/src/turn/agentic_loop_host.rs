@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! run_agentic_loop_with_host(host, state)
-//!   for turn in 0..max_turns:
+//!   while turn_index < current_turn_budget:
 //!     ── cancel check ──────────────── cooperative, via cancel_flag
 //!     host.execute_turn(&mut state) → HostTurnResult    ← host-specific
 //!     ingest_agentic_turn_stream(...)                    ← runtime
@@ -403,6 +403,13 @@ pub struct StallTrackingState {
     pub tool_call_records: Vec<ToolCallRecord>,
     /// Whether a factual-retry was forced this loop.
     pub forced_factual_retry: bool,
+    /// Whether an execution-retry was forced after a mutating/confirmed task
+    /// attempted to finish without applying any concrete workspace mutation.
+    pub forced_execution_retry: bool,
+    /// Whether a mid-loop execution escalation was injected after a mutating
+    /// task accumulated enough read-only tool calls without producing any
+    /// workspace mutation. One-shot per turn.
+    pub forced_execution_escalation: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -499,6 +506,9 @@ pub struct AgenticLoopState {
 
     // ── Accumulated output ──
     pub final_text: String,
+    /// True once the current `final_text` has already been sent to the user.
+    /// Deferred completion paths leave this false so finalization emits exactly once.
+    pub final_text_streamed: bool,
     pub total_prompt: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,
@@ -510,6 +520,7 @@ pub struct AgenticLoopState {
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
+    pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
     /// Current agentic loop turn index (0-based, updated each iteration).
     /// Used by the CLI to inject `round_index` into the bridge payload so the
     /// system prompt can include round budget directives.
@@ -787,7 +798,8 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     run_loop_preamble(host, state).await;
 
-    for turn_index in 0..state.max_turns {
+    let mut turn_index = 0usize;
+    while turn_index < state.max_turns || state.remaining_turns == 0 {
         state.current_round_index = turn_index as u32;
         let TurnIterationPrep {
             quiet,
@@ -818,7 +830,10 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         .await?
         {
             TurnExecutionControl::Proceed(phase) => *phase,
-            TurnExecutionControl::ContinueLoop => continue,
+            TurnExecutionControl::ContinueLoop => {
+                turn_index += 1;
+                continue;
+            }
             TurnExecutionControl::Return(outcome) => return Ok(outcome),
         };
 
@@ -844,9 +859,11 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         maybe_trigger_auto_reflection(host, state).await;
 
         match tool_phase_control {
-            TurnToolPhaseControl::ContinueLoop => continue,
+            TurnToolPhaseControl::ContinueLoop => {}
             TurnToolPhaseControl::Return(outcome) => return Ok(outcome),
         }
+
+        turn_index += 1;
     }
     // Loop exhausted max_turns without explicit break — write final state.
     finalize_and_render(host, state).await;
@@ -968,6 +985,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
         current_run_id: None,
         recursion_depth: 0,
         final_text: String::new(),
+        final_text_streamed: false,
         total_prompt: 0,
         total_completion: 0,
         total_cache_read: 0,
@@ -977,6 +995,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
         has_any_usage: false,
         max_turns: 10,
         remaining_turns: 10,
+        agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
         turn_guard: TurnGuard::new(),
@@ -1085,6 +1104,10 @@ pub(crate) mod tests {
         pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
             self
+        }
+
+        pub(crate) fn turn_count(&self) -> usize {
+            self.current_turn
         }
 
         pub(crate) fn with_reflection_text(mut self, text: &str) -> Self {
@@ -1280,6 +1303,7 @@ pub(crate) mod tests {
             current_run_id: None,
             recursion_depth: 0,
             final_text: String::new(),
+            final_text_streamed: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -1289,6 +1313,7 @@ pub(crate) mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
@@ -1589,6 +1614,267 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 1);
         assert_eq!(state.final_text, "single turn");
         assert_eq!(state.remaining_turns, 0);
+    }
+
+    #[tokio::test]
+    async fn adaptive_budget_extends_complex_task_when_progress_is_real() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "read_file",
+                    json!({"path": "src/lib.rs"}),
+                    "module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "write_file",
+                    json!({"path": "src/lib.rs"}),
+                    "updated module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            text_result("completed after extension", 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["read_file", "write_file"]);
+        let mut state = make_state();
+        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+            "systematically refactor and implement a complex subsystem",
+        );
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: 4,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 3);
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.final_text, "completed after extension");
+        assert!(
+            state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_budget_refuses_extension_for_stalled_repetition() {
+        let repeated =
+            make_edge_tool_with_args("read_file", json!({"path": "src/lib.rs"}), "same contents");
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![repeated.clone()], 10, 5, Some(20)),
+            edge_tool_result(vec![repeated.clone()], 10, 5, Some(20)),
+            edge_tool_result(vec![repeated], 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+            "explore the codebase and investigate the root cause",
+        );
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: 4,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 2);
+        assert!(state.final_text.contains("Turn budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn adaptive_budget_refuses_extension_when_warning_verdict_present() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "read_file",
+                    json!({"path": "src/lib.rs"}),
+                    "module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "write_file",
+                    json!({"path": "src/lib.rs"}),
+                    "updated module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            text_result("should not run", 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["read_file", "write_file"]);
+        let mut state = make_state();
+        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+            "systematically refactor and implement a complex subsystem",
+        );
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: 4,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+        state.stall.verdict_events.push(
+            crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent {
+                turn: 1,
+                severity: "warning".into(),
+                injections: vec!["stall detected".into()],
+                avoid_tools: vec!["write_file".into()],
+                deprioritized_tools: vec![],
+                force_stop: false,
+                nudge_count: 1,
+                total_errors: 0,
+                deprioritized_count: 0,
+                total_timeouts: 0,
+                timeout_dominant_tools: vec![],
+                total_cache_hits: 0,
+                flaky_count: 0,
+            },
+        );
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 2);
+        assert!(state.final_text.contains("Turn budget exhausted"));
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_budget_extends_exploratory_task_on_distinct_real_progress() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "read_file",
+                    json!({"path": "src/lib.rs"}),
+                    "module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "glob",
+                    json!({"pattern": "src/**/*.rs"}),
+                    "src/lib.rs\nsrc/main.rs",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            text_result("completed after exploratory extension", 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["read_file", "glob"]);
+        let mut state = make_state();
+        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+            "explore the codebase and investigate the root cause",
+        );
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: 4,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 3);
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.final_text, "completed after exploratory extension");
+        assert!(
+            state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_budget_respects_hard_limit_even_with_real_progress() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "read_file",
+                    json!({"path": "src/lib.rs"}),
+                    "module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "write_file",
+                    json!({"path": "src/lib.rs"}),
+                    "updated module contents",
+                )],
+                10,
+                5,
+                Some(20),
+            ),
+            text_result("should never run", 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["read_file", "write_file"]);
+        let mut state = make_state();
+        state.task_profile = crate::turn::chat_turn_heuristics::infer_task_execution_profile(
+            "systematically refactor and implement a complex subsystem",
+        );
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
+            initial_turns: 2,
+            hard_turn_limit: 2,
+            extension_turns: 2,
+            max_extensions: 1,
+        };
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 2);
+        assert_eq!(state.max_turns, 2);
+        assert!(
+            state
+                .final_text
+                .contains("Turn budget exhausted after 2 agentic turn(s)")
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| content.contains("Budget review"))
+        );
     }
 
     // ── Error propagation tests ─────────────────────────────────────────────

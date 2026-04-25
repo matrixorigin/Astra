@@ -30,6 +30,7 @@ use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
     TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
+use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
@@ -888,6 +889,7 @@ impl ServerAgenticLoopHost {
             ..Default::default()
         };
 
+        state.final_text_streamed = !full_text.is_empty();
         state.final_text = full_text;
         state.total_prompt += prompt;
         state.total_completion += completion;
@@ -919,7 +921,9 @@ impl ServerAgenticLoopHost {
             sse_maps_through_tool_request, wait_approval_ledger_for_tool,
             wait_tool_result_ledger_for_tool,
         };
-        use astra_turn_core::headless_tool_assembly::ensure_tool_call_ids;
+        use astra_turn_core::headless_tool_assembly::{
+            ensure_tool_call_ids, parse_flat_tool_call_event,
+        };
         use astra_turn_core::sse_stream_host::EdgeToolExecResult;
         use astra_turn_core::stream_events::{
             ApprovalBatchRequestEvent, build_approval_batch_required_event,
@@ -976,25 +980,10 @@ impl ServerAgenticLoopHost {
             let mut executable_calls = Vec::new();
             if approval_required {
                 for tc in block {
-                    let Some(tc_map) = tc.as_object() else {
+                    if !tc.is_object() {
                         continue;
-                    };
-                    let request_id = tc_map
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let tool_name = tc_map
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let args = tc_map
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    }
+                    let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
                     if let Err(denied) = wait_approval_ledger_for_tool(
                         &self.edge_callback_ledger,
                         &self.user_id,
@@ -1034,41 +1023,20 @@ impl ServerAgenticLoopHost {
             }
 
             for tc in executable_calls {
-                let tc_map = match tc.as_object() {
-                    Some(m) => m,
-                    None => continue,
-                };
-                let id = tc_map
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let tool_name = tc_map
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let args = tc_map
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                if !tc.is_object() {
+                    continue;
+                }
+                let (id, tool_name, args) = parse_flat_tool_call_event(tc);
 
                 // ── Dedup read-only tool invocations within a short window ──
                 // Only applies when concurrency_safety classifies the tool as
                 // read-only / parallelizable; mutating tools skip the cache.
-                let args_for_sig: Value = match &args {
-                    Value::String(s) => serde_json::from_str(s).unwrap_or(args.clone()),
-                    _ => args.clone(),
-                };
                 let is_cacheable =
                     astra_turn_core::parallel_tool_exec::is_read_only_tool(&tool_name);
                 let sig = if is_cacheable {
                     Some(
                         astra_turn_core::tool_result_dedup::CallSignature::from_args(
-                            &tool_name,
-                            &args_for_sig,
+                            &tool_name, &args,
                         ),
                     )
                 } else {
@@ -1083,12 +1051,14 @@ impl ServerAgenticLoopHost {
                         .and_then(|mut g| g.lookup(s))
                 });
 
-                let (delivery_output, delivery_sse_maps, duration_ms): (
+                let (delivery_output, delivery_sse_maps, duration_ms, status, tool_result_fields): (
                     String,
                     Vec<Map<String, Value>>,
                     u64,
+                    String,
+                    Option<Map<String, Value>>,
                 ) = if let Some(cached_output) = cached {
-                    (cached_output, Vec::new(), 0)
+                    (cached_output, Vec::new(), 0, "ok".to_string(), None)
                 } else {
                     let delivery = wait_tool_result_ledger_for_tool(
                         &self.edge_callback_ledger,
@@ -1106,16 +1076,30 @@ impl ServerAgenticLoopHost {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    let tool_result = delivery.tool_results.first().cloned();
+                    let status = tool_result
+                        .as_ref()
+                        .map(|result| result.status.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
                     // Record successful read-only results only.
                     if let Some(sig_ref) = sig.as_ref() {
-                        let is_err = output.contains("status=error");
+                        let is_err = tool_result
+                            .as_ref()
+                            .and_then(|result| edge_tool_status_exit_code(&result.status))
+                            .is_some_and(|exit_code| exit_code != 0);
                         if !is_err {
                             if let Ok(mut guard) = self.tool_result_cache.lock() {
                                 guard.record(sig_ref.clone(), output.clone());
                             }
                         }
                     }
-                    (output, sse_maps, duration_ms)
+                    (
+                        output,
+                        sse_maps,
+                        duration_ms,
+                        status,
+                        tool_result.and_then(|result| result.tool_result_fields),
+                    )
                 };
 
                 for m in delivery_sse_maps {
@@ -1123,11 +1107,6 @@ impl ServerAgenticLoopHost {
                 }
 
                 let output = delivery_output;
-                let status = if output.contains("status=error") {
-                    "error"
-                } else {
-                    "ok"
-                };
 
                 results_by_id.insert(
                     id.clone(),
@@ -1136,8 +1115,8 @@ impl ServerAgenticLoopHost {
                         tool: tool_name,
                         args,
                         output,
-                        tool_result_fields: None,
-                        status: status.to_string(),
+                        tool_result_fields,
+                        status,
                         duration_ms,
                     },
                 );
@@ -1775,6 +1754,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true // Server injects guidance into the system prompt in execute_turn.
     }
 
+    fn render_final_text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.emit_event(json!({ "type": "text_delta", "content": text }));
+        }
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -1794,6 +1779,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     json!({ "type": "text_delta", "content": "[mock rounds exhausted]" }),
                 );
                 state.final_text = "[mock rounds exhausted]".to_string();
+                state.final_text_streamed = true;
                 return Ok(HostTurnResult {
                     accum: ChatTurnSseAccum {
                         full_text: "[mock rounds exhausted]".to_string(),
@@ -3085,6 +3071,7 @@ mod tests {
             current_run_id: None,
             recursion_depth: 0,
             final_text: String::new(),
+            final_text_streamed: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -3094,6 +3081,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),

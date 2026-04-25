@@ -150,7 +150,10 @@ fn build_bridge_tool_call_records(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("ok");
-        let ok = status.eq_ignore_ascii_case("ok");
+        let ok = matches!(
+            super::agentic_loop_tool_support::edge_tool_status_exit_code(status),
+            Some(0)
+        );
         let output = tool_result.get("output").map(|output| match output {
             Value::String(output) => output.clone(),
             other => other.to_string(),

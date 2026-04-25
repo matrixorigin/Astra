@@ -620,8 +620,7 @@ impl ToolExecutor {
         }
 
         // Dangerous file guard
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
-        let rel_str = rel.to_string_lossy();
+        let rel_str = self.project_relative_display(&path);
         if let Some(warning) = is_dangerous_write_target(&rel_str) {
             return json!({
                 "success": false,
@@ -636,13 +635,12 @@ impl ToolExecutor {
             }
             // Require full read (not outline/partial) before overwriting
             if !self.was_fully_read(&path) {
-                let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
                 return json!({
                     "success": false,
                     "error": format!(
                         "File was only partially read (outline or line range). Read the full file before overwriting.\n\
                          → Action required: call read_file(\"{}\") (without start_line/end_line) first, then retry.",
-                        rel.to_string_lossy()
+                        self.project_relative_display(&path)
                     )
                 }).to_string();
             }
@@ -676,7 +674,7 @@ impl ToolExecutor {
         // symlink swaps (TOCTOU) between the initial resolve_checked and now.
         if path.exists() {
             if let Ok(canonical) = path.canonicalize() {
-                if !canonical.starts_with(&self.project_root) {
+                if !self.is_within_project_root(&canonical) {
                     return json!({
                         "success": false,
                         "error": format!(
@@ -752,8 +750,7 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         // Dangerous file guard
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
-        let rel_str = rel.to_string_lossy();
+        let rel_str = self.project_relative_display(&path);
         if let Some(warning) = is_dangerous_write_target(&rel_str) {
             return format!(
                 "⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash 'echo ... > file' to bypass this guard.",
@@ -997,8 +994,7 @@ impl ToolExecutor {
         };
 
         // Safety: refuse .git/ contents
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(&path);
-        let rel_str = rel.to_string_lossy();
+        let rel_str = self.project_relative_display(&path);
         if rel_str.starts_with(".git/") || rel_str.starts_with(".git\\") || rel_str == ".git" {
             return "Error: refusing to delete .git contents".to_string();
         }
@@ -1042,10 +1038,7 @@ impl ToolExecutor {
     }
 
     fn rollback_display_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.project_root)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        self.project_relative_display(path)
     }
 
     fn parse_rollback_tool_output(tool_name: &str, output: String) -> Value {
@@ -1542,9 +1535,33 @@ impl ToolExecutor {
                     Ok(path) => path,
                     Err(error) => return error,
                 };
+                let mut candidates = vec![path.clone(), self.file_state_key(&path)];
+                let aliased = self.prefer_project_root_alias(&path);
+                if !candidates.iter().any(|candidate| candidate == &aliased) {
+                    candidates.push(aliased);
+                }
                 let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => journal.undo_file(&path),
-                    Err(poisoned) => poisoned.into_inner().undo_file(&path),
+                    Ok(journal) => {
+                        let mut outcome = Ok(None);
+                        for candidate in &candidates {
+                            outcome = journal.undo_file(candidate);
+                            if !matches!(outcome, Ok(None)) {
+                                break;
+                            }
+                        }
+                        outcome
+                    }
+                    Err(poisoned) => {
+                        let journal = poisoned.into_inner();
+                        let mut outcome = Ok(None);
+                        for candidate in &candidates {
+                            outcome = journal.undo_file(candidate);
+                            if !matches!(outcome, Ok(None)) {
+                                break;
+                            }
+                        }
+                        outcome
+                    }
                 };
                 match undo_result {
                     Ok(Some(edit_type)) => {

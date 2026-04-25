@@ -384,6 +384,7 @@ fn build_server_skill_executor(
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     session_id: &str,
     edge_connection_pool: Option<&super::edge_connection_pool::EdgeConnectionPool>,
+    cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 ) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
     use super::server_skill_subrun::ServerSkillSubRunExecutor;
     use crate::skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
@@ -400,7 +401,8 @@ fn build_server_skill_executor(
     .with_edge_profile(edge_profile.clone())
     .with_forward_headers(forward_headers.clone())
     .with_request_constraints(request_constraints)
-    .with_skill_resolver(skill_resolver);
+    .with_skill_resolver(skill_resolver)
+    .with_cancel_token(cancel_token);
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
     }
@@ -1167,6 +1169,7 @@ fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String>
 pub enum RunStatus {
     Running,
     Paused,
+    Waiting,
     Completed,
     Failed,
     Cancelled,
@@ -1177,6 +1180,7 @@ impl RunStatus {
         match self {
             Self::Running => STATUS_RUNNING,
             Self::Paused => STATUS_PAUSED,
+            Self::Waiting => STATUS_WAITING,
             Self::Completed => STATUS_COMPLETED,
             Self::Failed => STATUS_FAILED,
             Self::Cancelled => STATUS_CANCELLED,
@@ -1187,15 +1191,17 @@ impl RunStatus {
     ///
     /// Rules:
     /// - Terminal states (Completed, Failed, Cancelled) cannot transition to anything.
-    /// - Running → Paused, Completed, Failed, Cancelled
+    /// - Running → Paused, Waiting, Completed, Failed, Cancelled
     /// - Paused → Running, Cancelled, Failed
+    /// - Waiting → Running, Cancelled, Failed (external input resumes to Running)
     pub fn try_transition(&self, next: &RunStatus) -> Result<(), String> {
         let allowed = match self {
             Self::Running => matches!(
                 next,
-                Self::Paused | Self::Completed | Self::Failed | Self::Cancelled
+                Self::Paused | Self::Waiting | Self::Completed | Self::Failed | Self::Cancelled
             ),
             Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Waiting => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
             Self::Completed | Self::Failed | Self::Cancelled => false,
         };
         if allowed {
@@ -1579,14 +1585,10 @@ impl AgenticRunLifecycleService {
                 Ok(AgenticLoopOutcome::Waiting(w)) => {
                     let msg = format!("waiting: {w}");
                     events.push(json!({
-                        "event_type": "run_error",
-                        "data": {"error": msg.clone()}
+                        "event_type": "run_waiting",
+                        "data": {"reason": msg.clone()}
                     }));
-                    events.push(json!({
-                        "event_type": "run_finished",
-                        "data": usage.clone(),
-                    }));
-                    (RunStatus::Failed, Some(msg))
+                    (RunStatus::Waiting, Some(msg))
                 }
                 Err(err) => {
                     let msg = err.to_string();
@@ -1763,6 +1765,7 @@ impl AgenticRunLifecycleService {
         session_id: &str,
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
+        cancel_token: Option<Arc<CancellationToken>>,
     ) -> AgenticLoopState {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
@@ -1793,8 +1796,25 @@ impl AgenticRunLifecycleService {
             "content": request.message,
         });
 
-        let max_turns = request.max_candidates.max(1) as usize;
         let task_profile = infer_task_execution_profile(&request.message);
+        let runtime_turn_ceiling = if is_plan_subtask_from_chat_context(&request.context) {
+            astra_core::RuntimeLimits::global().effective_plan_subtask_turns()
+        } else {
+            astra_core::RuntimeLimits::global().max_turns
+        };
+        let requested_budget = request.execution_budget.as_ref().map(|budget| {
+            astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
+                initial_turns: budget.initial_turns.map(|value| value as usize),
+                hard_turn_limit: budget.hard_turn_limit.map(|value| value as usize),
+            }
+        });
+        let agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                task_profile,
+                runtime_turn_ceiling,
+                requested_budget,
+            );
+        let max_turns = agentic_turn_budget.initial_turns;
         let edge_ctx = Self::extract_edge_context(request);
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
@@ -1834,6 +1854,7 @@ impl AgenticRunLifecycleService {
             skill_resolver.clone(),
             session_id,
             self.edge_connection_pool.as_ref(),
+            cancel_token,
         );
 
         AgenticLoopState {
@@ -1843,6 +1864,7 @@ impl AgenticRunLifecycleService {
             current_run_id: Some(run_id.to_string()),
             recursion_depth: 0,
             final_text: String::new(),
+            final_text_streamed: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -1852,6 +1874,7 @@ impl AgenticRunLifecycleService {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
@@ -2146,8 +2169,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             None
         };
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
-        let mut loop_state =
-            self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
+        let mut loop_state = self.build_initial_state(
+            &request,
+            &session_id,
+            &run_id,
+            server_workspace.as_deref(),
+            Some(llm_cancel_token.clone()),
+        );
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
@@ -2322,7 +2350,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let terminal_events = terminal_events_for_persistence(&events);
 
             // Schedule eviction of the terminal run from the in-memory cache.
-            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            // Waiting runs are NOT evicted — they need to remain in memory for resume.
+            if final_status != RunStatus::Waiting {
+                Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            }
 
             // Publish terminal run state before best-effort post-run side effects
             // so background observers do not stay stuck in "running" because a
@@ -2501,11 +2532,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         const SSE_CHANNEL_CAPACITY: usize = 512;
         let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
 
-        let mut state =
-            self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
-        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+
+        let mut state = self.build_initial_state(
+            &request,
+            &session_id,
+            &run_id,
+            server_workspace.as_deref(),
+            Some(llm_cancel_token.clone()),
+        );
+        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         host.set_event_tx(event_tx.clone());
@@ -2636,7 +2673,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Schedule eviction of the terminal run from the in-memory cache.
-            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            // Waiting runs are NOT evicted — they need to remain in memory for resume.
+            if final_status != RunStatus::Waiting {
+                Self::schedule_run_eviction(&runs, bg_run_id.clone());
+            }
 
             // Record tokens consumed regardless of cancel — cancelled runs still
             // consumed tokens and must count toward the daily budget.
@@ -2662,20 +2702,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &bg_run_id,
                         "status"
                     );
-                    astra_core::log_persist!(
-                        engine
-                            .persist_usage(
-                                &bg_run_id,
-                                state.total_prompt,
-                                state.total_completion,
-                                state.total_tool_calls,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "usage"
-                    );
                 }
+            }
+
+            // Persist usage unconditionally — cancelled runs still consumed tokens
+            // and must have accurate usage in durable store for billing/audit.
+            if let Some(engine) = &run_engine {
+                astra_core::log_persist!(
+                    engine
+                        .persist_usage(
+                            &bg_run_id,
+                            state.total_prompt,
+                            state.total_completion,
+                            state.total_tool_calls,
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "usage"
+                );
             }
 
             // Persist terminal events to durable store.
@@ -2853,6 +2898,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         );
                     }
                 }
+                // Cascade cancellation to delegation sub-runs.
+                if mutated {
+                    if let Some(de) = &self.delegation_engine {
+                        de.cancel_children_of(&run_id).await;
+                    }
+                }
                 return Ok(CancelRunRecord {
                     run_id,
                     status: final_status,
@@ -2861,7 +2912,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return if matches!(run.status.as_str(), STATUS_RUNNING | STATUS_PAUSED) {
+            return if matches!(
+                run.status.as_str(),
+                STATUS_RUNNING | STATUS_PAUSED | STATUS_WAITING
+            ) {
                 Err(Self::run_control_state_unavailable("cancellation"))
             } else {
                 Ok(CancelRunRecord {
@@ -3235,6 +3289,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             current_run_id: Some(config.run_id.clone()),
             recursion_depth: 0,
             final_text: String::new(),
+            final_text_streamed: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -3244,6 +3299,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            agentic_turn_budget:
+                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default()
+                    .agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
             turn_guard: TurnGuard::new(),
@@ -3701,7 +3759,7 @@ mod tests {
             allow_tools: None,
             context: None,
             forward_headers: HashMap::new(),
-            max_candidates: 5,
+            execution_budget: None,
             explain: false,
             interactive_client: false,
         }
@@ -3951,7 +4009,8 @@ mod tests {
         }
 
         let svc = test_service().with_skill_service(Arc::new(MockSkillService));
-        let state = svc.build_initial_state(&test_request("hello"), "session-1", "run-1", None);
+        let state =
+            svc.build_initial_state(&test_request("hello"), "session-1", "run-1", None, None);
         let resolver = state
             .skills
             .resolver
@@ -3985,7 +4044,8 @@ mod tests {
 
         let mut filtered_request = test_request("hello");
         filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
-        let filtered_state = svc.build_initial_state(&filtered_request, "session-1", "run-1", None);
+        let filtered_state =
+            svc.build_initial_state(&filtered_request, "session-1", "run-1", None, None);
         assert!(
             filtered_state.skills.registry_for_activation.is_none(),
             "request-scoped allow_skills should disable automatic conditional activation"
@@ -4024,7 +4084,7 @@ mod tests {
     fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
         let svc = test_service();
         let request = test_request("git status");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         state.recent_tools = vec!["git_status".into()];
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
@@ -4078,7 +4138,7 @@ mod tests {
     fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
         let svc = test_service();
         let request = test_request("inspect blocked tools");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
 
         // One success so the pattern exists, then Block adds 5 failures.
@@ -4105,7 +4165,7 @@ mod tests {
     fn finalize_run_events_appends_run_finished_for_failures() {
         let svc = test_service();
         let request = test_request("boom");
-        let state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
 
         let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
             Ok(AgenticLoopOutcome::Error("boom".into())),
@@ -4124,7 +4184,7 @@ mod tests {
     fn finalize_run_events_cancellation_beats_completed_outcome() {
         let svc = test_service();
         let request = test_request("done");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let cancel_token = Arc::new(CancellationToken::new());
         cancel_token.cancel();
@@ -4492,7 +4552,7 @@ mod tests {
             allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
-            max_candidates: 5,
+            execution_budget: None,
             explain: false,
             interactive_client: false,
         };
@@ -4618,7 +4678,7 @@ mod tests {
             allow_tools: None,
             context: Some(ctx),
             forward_headers: HashMap::new(),
-            max_candidates: 5,
+            execution_budget: None,
             explain: false,
             interactive_client: false,
         };
@@ -4631,25 +4691,49 @@ mod tests {
     fn build_initial_state_sets_user_message() {
         let svc = test_service();
         let req = test_request("write a test");
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None);
+        let expected_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("write a test"),
+            astra_core::RuntimeLimits::global().max_turns,
+            None,
+        );
+        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0]["role"], "user");
         assert_eq!(state.messages[0]["content"], "write a test");
         assert_eq!(state.current_session_id, Some("sess-1".to_string()));
         assert_eq!(state.current_run_id, Some("run-1".to_string()));
-        assert_eq!(state.max_turns, 5);
-        assert_eq!(state.remaining_turns, 5);
+        assert_eq!(state.max_turns, expected_budget.initial_turns);
+        assert_eq!(state.remaining_turns, expected_budget.initial_turns);
+        assert_eq!(state.agentic_turn_budget, expected_budget);
         assert_eq!(state.message, "write a test");
         assert!(state.cancellation.token.is_none());
     }
 
     #[test]
-    fn build_initial_state_clamps_max_turns() {
+    fn build_initial_state_applies_execution_budget_override() {
         let svc = test_service();
         let mut req = test_request("go");
-        req.max_candidates = 0;
-        let state = svc.build_initial_state(&req, "s", "r", None);
+        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
+            initial_turns: Some(4),
+            hard_turn_limit: Some(9),
+        });
+        let state = svc.build_initial_state(&req, "s", "r", None, None);
+        assert_eq!(state.max_turns, 4);
+        assert_eq!(state.remaining_turns, 4);
+        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 9);
+    }
+
+    #[test]
+    fn build_initial_state_clamps_execution_budget_override() {
+        let svc = test_service();
+        let mut req = test_request("go");
+        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
+            initial_turns: Some(0),
+            hard_turn_limit: Some(0),
+        });
+        let state = svc.build_initial_state(&req, "s", "r", None, None);
         assert_eq!(state.max_turns, 1);
+        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 1);
     }
 
     #[test]
@@ -4674,7 +4758,7 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r", None);
+        let state = svc.build_initial_state(&req, "s", "r", None, None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
         assert_eq!(
@@ -4697,7 +4781,7 @@ mod tests {
         let svc = test_service();
         // Request with NO edge_profile.cwd — simulates web-agent mode.
         let req = test_request("fix a bug");
-        let state = svc.build_initial_state(&req, "s", "r", Some(dir.path()));
+        let state = svc.build_initial_state(&req, "s", "r", Some(dir.path()), None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
         assert_eq!(
@@ -4738,7 +4822,7 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r", Some(override_dir.path()));
+        let state = svc.build_initial_state(&req, "s", "r", Some(override_dir.path()), None);
         // Edge profile's cwd wins over the workspace override.
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "edge_hook");
@@ -5599,6 +5683,206 @@ mod tests {
             unique.len(),
             5,
             "no duplicate run_ids across pages — pagination must be deterministic"
+        );
+    }
+
+    /// P1-A: RunStatus must have a Waiting variant that is non-terminal.
+    /// Runs needing external input must not be killed as Failed.
+    #[test]
+    fn waiting_is_non_terminal_status() {
+        // Running → Waiting is valid
+        assert!(
+            RunStatus::Running
+                .try_transition(&RunStatus::Waiting)
+                .is_ok(),
+            "Running → Waiting must be allowed"
+        );
+        // Waiting → Running is valid (resume after input)
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::Running)
+                .is_ok(),
+            "Waiting → Running must be allowed (resume)"
+        );
+        // Waiting → Cancelled is valid
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::Cancelled)
+                .is_ok(),
+            "Waiting → Cancelled must be allowed"
+        );
+        // Waiting → Failed is valid (timeout)
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::Failed)
+                .is_ok(),
+            "Waiting → Failed must be allowed"
+        );
+        // Waiting serializes as "waiting"
+        assert_eq!(RunStatus::Waiting.as_str(), "waiting");
+    }
+
+    /// P1-A: finalize_run_events must NOT map Waiting to Failed.
+    #[test]
+    fn finalize_run_events_does_not_kill_waiting_runs() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("fn finalize_run_events(")
+            .expect("finalize_run_events must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+
+        // The Waiting arm must NOT produce RunStatus::Failed
+        let waiting_arm = fn_body
+            .find("Waiting(w)")
+            .expect("Waiting arm must exist in finalize_run_events");
+        let arm_body = &fn_body[waiting_arm..waiting_arm + 300.min(fn_body.len() - waiting_arm)];
+        assert!(
+            !arm_body.contains("RunStatus::Failed"),
+            "Waiting outcome must NOT be mapped to Failed — use RunStatus::Waiting"
+        );
+        assert!(
+            arm_body.contains("RunStatus::Waiting"),
+            "Waiting outcome must map to RunStatus::Waiting"
+        );
+        // Must NOT emit run_error for Waiting (it's not an error)
+        assert!(
+            !arm_body.contains("run_error"),
+            "Waiting outcome must not emit run_error event"
+        );
+    }
+
+    /// P1-F: stream_chat must persist usage unconditionally (not gated by persist_terminal_state).
+    /// Cancelled runs still consumed tokens and must have accurate durable records.
+    #[test]
+    fn stream_chat_persists_usage_unconditionally() {
+        let source = include_str!("run_lifecycle.rs");
+        // Find the stream_chat method
+        let fn_start = source
+            .find("async fn stream_chat(")
+            .expect("stream_chat must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+
+        // persist_usage must NOT be inside the persist_terminal_state block.
+        // Find the persist_terminal_state block and verify persist_usage is outside it.
+        let guard_pos = fn_body
+            .find("if persist_terminal_state {")
+            .expect("persist_terminal_state guard must exist");
+        // Find the closing brace of the guard block
+        let guard_block = &fn_body[guard_pos..];
+        let mut depth = 0;
+        let mut guard_end = 0;
+        for (i, c) in guard_block.char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    guard_end = guard_pos + i + 1;
+                    break;
+                }
+            }
+        }
+        let guard_body = &fn_body[guard_pos..guard_end];
+        assert!(
+            !guard_body.contains("persist_usage"),
+            "persist_usage must NOT be inside persist_terminal_state guard — \
+             cancelled stream_chat runs must still persist usage for billing/audit"
+        );
+
+        // persist_usage must exist somewhere in stream_chat
+        assert!(
+            fn_body.contains("persist_usage"),
+            "stream_chat must call persist_usage"
+        );
+    }
+
+    /// P1-C: build_server_skill_executor must accept and wire a cancel_token.
+    /// Without this, skill sub-runs ignore parent cancellation.
+    #[test]
+    fn build_server_skill_executor_accepts_cancel_token() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("fn build_server_skill_executor(")
+            .expect("build_server_skill_executor must exist");
+        let fn_end = source[fn_start..]
+            .find("\npub(crate) fn ")
+            .or_else(|| source[fn_start..].find("\nfn "))
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_token"),
+            "build_server_skill_executor must accept a cancel_token parameter"
+        );
+        assert!(
+            fn_body.contains("with_cancel_token"),
+            "build_server_skill_executor must wire cancel_token via with_cancel_token"
+        );
+    }
+
+    /// P1-C: build_initial_state must pass cancel_token to skill executor builder.
+    #[test]
+    fn build_initial_state_passes_cancel_token_to_skill_executor() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("fn build_initial_state(")
+            .expect("build_initial_state must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    fn ")
+            .or_else(|| source[fn_start..].find("\n    pub"))
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        assert!(
+            fn_body.contains("cancel_token"),
+            "build_initial_state must accept and pass cancel_token to skill executor"
+        );
+    }
+
+    /// Waiting runs must NOT be evicted from the in-memory cache.
+    /// If evicted, they cannot be resumed (no in-memory state to transition).
+    #[test]
+    fn waiting_runs_skip_eviction_in_both_spawn_paths() {
+        let source = include_str!("run_lifecycle.rs");
+        let prod_code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        // Find the two guarded eviction sites (create_run normal exit + stream_chat normal exit).
+        // The cancelled-run path doesn't need a Waiting guard (cancelled != Waiting).
+        // Each guarded site has `if final_status != RunStatus::Waiting` before the call.
+        let waiting_guards = prod_code
+            .matches("final_status != RunStatus::Waiting")
+            .count();
+        assert!(
+            waiting_guards >= 2,
+            "at least 2 schedule_run_eviction sites must be guarded by Waiting check, found {waiting_guards}"
+        );
+    }
+
+    /// cancel_run durable fallback must include STATUS_WAITING in cancellable states.
+    /// A Waiting run persisted in durable store must be cancellable.
+    #[test]
+    fn cancel_run_durable_fallback_includes_waiting() {
+        let source = include_str!("run_lifecycle.rs");
+        let fn_start = source
+            .find("async fn cancel_run(")
+            .expect("cancel_run must exist");
+        let fn_end = source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(source.len());
+        let fn_body = &source[fn_start..fn_end];
+        // The durable fallback match must include STATUS_WAITING
+        assert!(
+            fn_body.contains("STATUS_WAITING"),
+            "cancel_run durable fallback must include STATUS_WAITING"
         );
     }
 }

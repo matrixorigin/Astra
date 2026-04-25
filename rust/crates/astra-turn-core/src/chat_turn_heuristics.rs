@@ -6,12 +6,26 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::chat_history_openai::openai_user_content_message;
 use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_BUDGET: usize = 5;
+const EXPLORATORY_STALL_WINDOW: usize = 4;
+const EXPLORATORY_ROUND_BUDGET: usize = 8;
+
+const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(8, 12, 2, 2);
+const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(10, 18, 4, 2);
+const STANDARD_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(12, 20, 4, 2);
+const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(16, 32, 4, 4);
+const STANDARD_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(12, 24, 4, 3);
+const COMPLEX_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(16, 36, 5, 4);
+const STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
+    AgenticTurnBudget::new(14, 28, 4, 3);
+const COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
+    AgenticTurnBudget::new(18, 40, 6, 4);
 
 const MUTATING_TERMS: &[&str] = &[
     "fix",
@@ -76,6 +90,83 @@ const ANALYSIS_TERMS: &[&str] = &[
     "列出",
 ];
 
+const EXPLORATION_TERMS: &[&str] = &[
+    "explore",
+    "exploration",
+    "investigate",
+    "deep dive",
+    "understand the codebase",
+    "understand this system",
+    "trace",
+    "root cause",
+    "walk through",
+    "map out",
+    "survey",
+    "dig into",
+    "探索",
+    "排查",
+    "调研",
+    "梳理",
+    "追踪",
+    "根因",
+    "深挖",
+    "看源码",
+];
+
+const COMPLEXITY_TERMS: &[&str] = &[
+    "complex",
+    "systematic",
+    "end-to-end",
+    "multi-step",
+    "architecture",
+    "subsystem",
+    "large refactor",
+    "cross-cutting",
+    "全链路",
+    "系统性",
+    "复杂",
+    "大型",
+    "架构",
+    "重构",
+    "整体",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskComplexity {
+    Standard,
+    Complex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgenticTurnBudget {
+    pub initial_turns: usize,
+    pub hard_turn_limit: usize,
+    pub extension_turns: usize,
+    pub max_extensions: u32,
+}
+
+impl AgenticTurnBudget {
+    pub const fn new(
+        initial_turns: usize,
+        hard_turn_limit: usize,
+        extension_turns: usize,
+        max_extensions: u32,
+    ) -> Self {
+        Self {
+            initial_turns,
+            hard_turn_limit,
+            extension_turns,
+            max_extensions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgenticTurnBudgetOverride {
+    pub initial_turns: Option<usize>,
+    pub hard_turn_limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskExecutionProfile {
     pub mutates_workspace: bool,
@@ -83,6 +174,9 @@ pub struct TaskExecutionProfile {
     pub allow_factual_retry: bool,
     pub exploration_round_budget: usize,
     pub stall_window: usize,
+    pub complexity: TaskComplexity,
+    pub exploratory_task: bool,
+    pub agentic_turn_budget: AgenticTurnBudget,
 }
 
 impl Default for TaskExecutionProfile {
@@ -93,6 +187,9 @@ impl Default for TaskExecutionProfile {
             allow_factual_retry: true,
             exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
             stall_window: DEFAULT_STALL_WINDOW,
+            complexity: TaskComplexity::Standard,
+            exploratory_task: false,
+            agentic_turn_budget: STANDARD_ANALYSIS_TURN_BUDGET,
         }
     }
 }
@@ -106,6 +203,22 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_analysis = contains_any_keyword(&q, ANALYSIS_TERMS);
+    let exploratory = contains_any_keyword(&q, EXPLORATION_TERMS);
+    let complexity = if contains_any_keyword(&q, COMPLEXITY_TERMS) {
+        TaskComplexity::Complex
+    } else {
+        TaskComplexity::Standard
+    };
+    let exploration_round_budget = if exploratory {
+        EXPLORATORY_ROUND_BUDGET
+    } else {
+        DEFAULT_EXPLORATION_ROUND_BUDGET
+    };
+    let stall_window = if exploratory || complexity == TaskComplexity::Complex {
+        EXPLORATORY_STALL_WINDOW
+    } else {
+        DEFAULT_STALL_WINDOW
+    };
     // When both mutating and analysis terms are present, analysis wins —
     // the user is asking to *review/inspect* something that involves changes,
     // not asking to *make* changes. E.g. "评审当前修改" = review changes.
@@ -114,16 +227,22 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
             allow_factual_retry: true,
-            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
-            stall_window: DEFAULT_STALL_WINDOW,
+            exploration_round_budget,
+            stall_window,
+            complexity,
+            exploratory_task: exploratory,
+            agentic_turn_budget: default_agentic_turn_budget(true, exploratory, complexity),
         }
     } else if has_analysis {
         TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
             allow_factual_retry: true,
-            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
-            stall_window: DEFAULT_STALL_WINDOW,
+            exploration_round_budget,
+            stall_window,
+            complexity,
+            exploratory_task: exploratory,
+            agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
         }
     } else if has_mutating {
         // Mutating without analysis context
@@ -131,12 +250,90 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
             allow_factual_retry: true,
-            exploration_round_budget: DEFAULT_EXPLORATION_ROUND_BUDGET,
-            stall_window: DEFAULT_STALL_WINDOW,
+            exploration_round_budget,
+            stall_window,
+            complexity,
+            exploratory_task: exploratory,
+            agentic_turn_budget: default_agentic_turn_budget(true, exploratory, complexity),
         }
     } else {
-        TaskExecutionProfile::default()
+        TaskExecutionProfile {
+            exploration_round_budget,
+            stall_window,
+            complexity,
+            exploratory_task: exploratory,
+            agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
+            ..TaskExecutionProfile::default()
+        }
     }
+}
+
+fn default_agentic_turn_budget(
+    mutates_workspace: bool,
+    exploratory: bool,
+    complexity: TaskComplexity,
+) -> AgenticTurnBudget {
+    match (mutates_workspace, exploratory, complexity) {
+        (false, false, TaskComplexity::Standard) => STANDARD_ANALYSIS_TURN_BUDGET,
+        (false, false, TaskComplexity::Complex) => COMPLEX_ANALYSIS_TURN_BUDGET,
+        (true, false, TaskComplexity::Standard) => STANDARD_IMPLEMENTATION_TURN_BUDGET,
+        (true, false, TaskComplexity::Complex) => COMPLEX_IMPLEMENTATION_TURN_BUDGET,
+        (false, true, TaskComplexity::Standard) => STANDARD_EXPLORATORY_TURN_BUDGET,
+        (false, true, TaskComplexity::Complex) => COMPLEX_EXPLORATORY_TURN_BUDGET,
+        (true, true, TaskComplexity::Standard) => STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET,
+        (true, true, TaskComplexity::Complex) => COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET,
+    }
+}
+
+#[must_use]
+pub fn resolve_agentic_turn_budget(
+    profile: TaskExecutionProfile,
+    runtime_ceiling: usize,
+    override_budget: Option<AgenticTurnBudgetOverride>,
+) -> AgenticTurnBudget {
+    let ceiling = runtime_ceiling.max(1);
+    let mut budget = profile.agentic_turn_budget;
+    let requested_hard = override_budget
+        .and_then(|value| value.hard_turn_limit)
+        .unwrap_or(budget.hard_turn_limit);
+    let hard_turn_limit = requested_hard.max(1).min(ceiling);
+    if requested_hard > hard_turn_limit {
+        warn!(
+            requested_hard,
+            ceiling,
+            hard_turn_limit,
+            "agentic turn budget override clamped: hard_turn_limit reduced to runtime ceiling"
+        );
+    }
+    let requested_initial = override_budget
+        .and_then(|value| value.initial_turns)
+        .unwrap_or(budget.initial_turns);
+    let initial_turns = requested_initial.max(1).min(hard_turn_limit);
+    if requested_initial > initial_turns {
+        warn!(
+            requested_initial,
+            hard_turn_limit,
+            initial_turns,
+            "agentic turn budget override clamped: initial_turns reduced to hard_turn_limit"
+        );
+    }
+    let headroom = hard_turn_limit.saturating_sub(initial_turns);
+    let extension_turns = if headroom == 0 {
+        0
+    } else {
+        budget.extension_turns.max(1).min(headroom)
+    };
+    let max_extensions = if extension_turns == 0 {
+        0
+    } else {
+        let max_possible = headroom.div_ceil(extension_turns) as u32;
+        budget.max_extensions.min(max_possible).max(1)
+    };
+    budget.initial_turns = initial_turns;
+    budget.hard_turn_limit = hard_turn_limit;
+    budget.extension_turns = extension_turns;
+    budget.max_extensions = max_extensions;
+    budget
 }
 
 /// Cloud API returned no such session (case-insensitive substring match).
@@ -486,26 +683,49 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_profile_keeps_analysis_read_only_without_extra_loop_budget() {
-        let profile = infer_task_execution_profile("review 最新的commit");
-        assert!(!profile.mutates_workspace);
-        assert!(!profile.verification_required);
-        assert!(profile.allow_factual_retry);
-        assert_eq!(profile.stall_window, DEFAULT_STALL_WINDOW);
-        assert_eq!(
-            profile.exploration_round_budget,
-            DEFAULT_EXPLORATION_ROUND_BUDGET
+    fn task_execution_profile_scales_budget_for_implementation_and_exploration() {
+        let review = infer_task_execution_profile("review 最新的commit");
+        assert!(!review.mutates_workspace);
+        assert!(!review.verification_required);
+        assert!(review.allow_factual_retry);
+        assert_eq!(review.stall_window, DEFAULT_STALL_WINDOW);
+
+        let implementation = infer_task_execution_profile("implement the feature");
+        assert!(implementation.mutates_workspace);
+        assert!(implementation.verification_required);
+        assert!(implementation.allow_factual_retry);
+        assert!(
+            implementation.agentic_turn_budget.initial_turns
+                > review.agentic_turn_budget.initial_turns
+        );
+        assert!(
+            implementation.agentic_turn_budget.hard_turn_limit
+                > review.agentic_turn_budget.hard_turn_limit
         );
 
-        let profile = infer_task_execution_profile("implement the feature");
-        assert!(profile.mutates_workspace);
-        assert!(profile.verification_required);
-        assert!(profile.allow_factual_retry);
-        assert_eq!(profile.stall_window, DEFAULT_STALL_WINDOW);
-        assert_eq!(
-            profile.exploration_round_budget,
-            DEFAULT_EXPLORATION_ROUND_BUDGET
+        let exploratory =
+            infer_task_execution_profile("explore the codebase and investigate the root cause");
+        assert!(exploratory.exploration_round_budget > review.exploration_round_budget);
+        assert!(
+            exploratory.agentic_turn_budget.hard_turn_limit
+                >= implementation.agentic_turn_budget.hard_turn_limit
         );
+        assert!(exploratory.exploratory_task);
+    }
+
+    #[test]
+    fn resolve_agentic_turn_budget_clamps_override_to_runtime_ceiling() {
+        let budget = resolve_agentic_turn_budget(
+            infer_task_execution_profile("implement the feature"),
+            12,
+            Some(AgenticTurnBudgetOverride {
+                initial_turns: Some(20),
+                hard_turn_limit: Some(30),
+            }),
+        );
+        assert_eq!(budget.initial_turns, 12);
+        assert_eq!(budget.hard_turn_limit, 12);
+        assert_eq!(budget.max_extensions, 0);
     }
 
     #[test]

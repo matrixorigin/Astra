@@ -603,6 +603,8 @@ impl ToolExecutor {
             .get("cwd")
             .and_then(Value::as_str)
             .ok_or_else(|| "rust-analyzer runnable is missing args.cwd".to_string())?;
+        let display_cwd = self.prefer_project_root_alias(std::path::Path::new(cwd));
+        let display_cwd_str = display_cwd.to_string_lossy().to_string();
         let cargo_program = runnable_args
             .get("overrideCargo")
             .and_then(Value::as_str)
@@ -624,7 +626,7 @@ impl ToolExecutor {
             .unwrap_or_default();
 
         let mut parts = vec![
-            format!("cd {}", shell_escape(cwd)),
+            format!("cd {}", shell_escape(&display_cwd_str)),
             "&&".to_string(),
             "env".to_string(),
         ];
@@ -678,7 +680,7 @@ impl ToolExecutor {
             "command": cargo_program,
             "cargo_args": cargo_args,
             "executable_args": exec_args,
-            "cwd": cwd,
+            "cwd": display_cwd_str,
             "command_line": command_line,
             "exit_code": output.status.code(),
             "stdout": stdout,
