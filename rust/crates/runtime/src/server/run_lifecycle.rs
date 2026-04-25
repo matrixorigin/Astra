@@ -3781,7 +3781,7 @@ mod tests {
             Arc::new(TokioMutex::new(HashMap::new())),
         );
         let request = test_request("deploy the service");
-        let mut state = service.build_initial_state(&request, &session_id, "run-1", None);
+        let mut state = service.build_initial_state(&request, &session_id, "run-1", None, None);
         state.final_text = "deployment finished".to_string();
         state.session_turn = 7;
         state.telemetry.all_tools_used.insert("skill".to_string());
