@@ -403,6 +403,10 @@ pub struct StallTrackingState {
     /// Whether an execution-retry was forced after a mutating/confirmed task
     /// attempted to finish without applying any concrete workspace mutation.
     pub forced_execution_retry: bool,
+    /// Whether a mid-loop execution escalation was injected after a mutating
+    /// task accumulated enough read-only tool calls without producing any
+    /// workspace mutation. One-shot per turn.
+    pub forced_execution_escalation: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,

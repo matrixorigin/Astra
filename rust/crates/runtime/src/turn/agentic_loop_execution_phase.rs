@@ -95,6 +95,34 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
+    // Mid-loop execution escalation: if the model has been burning tool calls
+    // on read-only inspection of a mutating task without committing a single
+    // edit, force a high-signal correction BEFORE the next LLM call. This
+    // catches the failure mode where the loop runs out of budget in an
+    // inspection spiral (see session 4178c6a7). One-shot per turn; stripped
+    // by `finalize_and_render`.
+    if should_escalate_execution(state) {
+        let read_only_calls = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder() && r.ok)
+            .count();
+        state.stall.forced_execution_escalation = true;
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": execution_escalation_message(&state.message, read_only_calls),
+        }));
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ Mutating task accumulated {read_only_calls} read-only tool calls with zero edits; forcing escalation…"
+                ),
+            );
+        }
+    }
+
     let llm_wall_start = Instant::now();
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
@@ -395,6 +423,14 @@ fn should_force_execution_retry(state: &AgenticLoopState) -> bool {
     if state.stall.forced_execution_retry {
         return false;
     }
+    // If mid-loop escalation already fired this turn, the model has already
+    // received a stronger corrective message telling it to apply an edit.
+    // Adding a second retry injection would duplicate correction, waste
+    // tokens, and risk contradicting guidance. One corrective injection per
+    // turn is the invariant.
+    if state.stall.forced_execution_escalation {
+        return false;
+    }
     if has_concrete_workspace_mutation(state) {
         return false;
     }
@@ -548,6 +584,77 @@ fn execution_retry_message(original_query: &str) -> String {
          but your previous response ended without applying any concrete workspace mutation. \
          Do not ask for permission again and do not only restate a plan. \
          Use the available file-editing tools to make the change, then run the appropriate existing verification.\n\n\
+         Original user query: {original_query}"
+    )
+}
+
+/// Mid-loop escalation: kicks in while the model is still calling tools but
+/// has spent the first several rounds only on read-only inspection (`cat`,
+/// `grep`, `ls`, `git diff`, etc.) on a task whose profile says it should be
+/// mutating the workspace. Without this guard the loop runs out of budget
+/// before a single edit is applied.
+pub(crate) const EXECUTION_ESCALATION_MARKER: &str = "## ⤴ Execution Escalation";
+
+/// Minimum successful non-synthetic tool calls accumulated on a mutating task
+/// before we start forcing an execution escalation. Chosen to allow a normal
+/// "read a couple of files, then edit" workflow to proceed uninterrupted
+/// (typical fix workflows commit an edit within 3-5 tool calls), while still
+/// catching runaway read loops well before budget exhaustion.
+pub(crate) const EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD: usize = 8;
+
+pub(crate) fn is_execution_escalation(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(EXECUTION_ESCALATION_MARKER))
+}
+
+pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
+    is_execution_retry_correction(m) || is_execution_escalation(m)
+}
+
+pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
+    if state.stall.forced_execution_escalation {
+        return false;
+    }
+    if !state.task_profile.mutates_workspace {
+        return false;
+    }
+    if has_concrete_workspace_mutation(state) {
+        return false;
+    }
+
+    let successful_real_records: Vec<_> = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record.ok)
+        .collect();
+
+    if successful_real_records.len() < EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
+        return false;
+    }
+
+    // Every successful call was read-only (none mutating) and none committed
+    // a workspace change — the model is spinning on inspection.
+    successful_real_records
+        .iter()
+        .all(|record| !tool_record_is_workspace_mutation(record))
+}
+
+pub(crate) fn execution_escalation_message(original_query: &str, read_only_calls: usize) -> String {
+    format!(
+        "{EXECUTION_ESCALATION_MARKER}\n\
+         Runtime correction: you have made {read_only_calls} read-only tool calls on a task that \
+         clearly requires changing the workspace, and have not applied a single edit yet. \
+         Stop reading more files. Your NEXT response must invoke an editing tool \
+         (`apply_patch`, `edit_file`, `str_replace`, `write_file`, or a `bash` command that \
+         actually modifies files such as `sed -i`, a redirect `>`/`>>`, or `apply_patch`). \
+         Do not produce another round of `cat`/`grep`/`ls`/`git diff`/`find`. Do not ask the \
+         user for permission. Apply the change, then run the appropriate existing verification.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -1079,5 +1186,168 @@ mod tests {
 
         assert!(!tool_record_is_workspace_mutation(&read_only));
         assert!(tool_record_is_workspace_mutation(&mutating));
+    }
+
+    // ─── Mid-loop execution escalation tests ──────────────────────────────
+
+    fn make_mutating_state_with_reads(n: usize) -> AgenticLoopState {
+        let mut state = make_state();
+        state.message = "fix the bug in foo".into();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug in foo");
+        assert!(
+            state.task_profile.mutates_workspace,
+            "test precondition: profile must be mutating"
+        );
+        for i in 0..n {
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                args_full: Some(format!(r#"{{"command":"cat src/file{i}.rs"}}"#, i = i)),
+                ..Default::default()
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn escalation_fires_after_threshold_of_read_only_calls_on_mutating_task() {
+        let state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
+        assert!(should_escalate_execution(&state));
+    }
+
+    #[test]
+    fn escalation_does_not_fire_just_below_threshold() {
+        let state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD - 1);
+        assert!(!should_escalate_execution(&state));
+    }
+
+    #[test]
+    fn escalation_does_not_fire_on_non_mutating_task() {
+        let mut state =
+            make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2);
+        // Flip profile to read-only exploration — escalation must not engage.
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("review the diff");
+        assert!(!state.task_profile.mutates_workspace);
+        assert!(!should_escalate_execution(&state));
+    }
+
+    #[test]
+    fn escalation_does_not_fire_when_any_mutation_present() {
+        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
+        // One actual edit in the middle of many reads must suppress the guard.
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "edit_file".into(),
+            ok: true,
+            ..Default::default()
+        });
+        assert!(!should_escalate_execution(&state));
+    }
+
+    #[test]
+    fn escalation_does_not_fire_when_bash_mutation_mixed_in() {
+        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"sed -i 's/a/b/' foo.rs"}"#.into()),
+            ..Default::default()
+        });
+        assert!(!should_escalate_execution(&state));
+    }
+
+    #[test]
+    fn escalation_is_one_shot_per_turn() {
+        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
+        state.stall.forced_execution_escalation = true;
+        assert!(
+            !should_escalate_execution(&state),
+            "flag must prevent a second injection"
+        );
+    }
+
+    #[test]
+    fn escalation_ignores_failed_tool_calls_for_threshold() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        // 20 failed reads — don't count toward threshold (they weren't real
+        // progress; retrying reads is already flagged elsewhere).
+        for _ in 0..20 {
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                args_full: Some(r#"{"command":"cat missing.rs"}"#.into()),
+                ..Default::default()
+            });
+        }
+        assert!(!should_escalate_execution(&state));
+    }
+
+    #[test]
+    fn escalation_ignores_synthetic_placeholders() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        for _ in 0..(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2) {
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                args_preview: Some("<synthetic placeholder>".into()),
+                ..Default::default()
+            });
+        }
+        // If all records are synthetic placeholders they should be filtered
+        // out and the threshold should not be met.
+        let all_synthetic = state
+            .stall
+            .tool_call_records
+            .iter()
+            .all(|r| r.is_synthetic_placeholder());
+        if all_synthetic {
+            assert!(!should_escalate_execution(&state));
+        }
+    }
+
+    #[test]
+    fn retry_guard_yields_to_prior_escalation_in_same_turn() {
+        // If escalation already fired mid-loop, retry must NOT also fire at
+        // BreakLoop — one corrective injection per turn.
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.final_text = "I will proceed with the edits now.".into();
+        state.total_tool_calls = 10;
+
+        // Sanity: without the escalation flag this state would trigger retry.
+        state.stall.forced_execution_escalation = false;
+        assert!(should_force_execution_retry(&state));
+
+        // With the escalation flag set, retry must yield.
+        state.stall.forced_execution_escalation = true;
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn escalation_marker_detected_and_stripped_by_corrective_filter() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": execution_escalation_message("fix the bug", 9),
+        });
+        assert!(is_execution_escalation(&msg));
+        assert!(is_execution_corrective_message(&msg));
+
+        let retry = serde_json::json!({
+            "role": "user",
+            "content": execution_retry_message("fix the bug"),
+        });
+        assert!(is_execution_corrective_message(&retry));
+
+        let unrelated = serde_json::json!({"role":"user","content":"fix the bug"});
+        assert!(!is_execution_corrective_message(&unrelated));
     }
 }

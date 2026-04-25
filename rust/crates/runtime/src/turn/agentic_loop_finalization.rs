@@ -461,7 +461,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // embedded by `agentic_loop_execution_phase::execution_retry_message`.
     state
         .messages
-        .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_retry_correction(m));
+        .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m));
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
