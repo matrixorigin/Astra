@@ -69,6 +69,7 @@ pub(crate) use storage::{
 
 mod app_state;
 pub mod auto_tuning;
+pub mod bash_intent;
 pub mod bridge;
 pub mod evaluation;
 pub mod evolution;

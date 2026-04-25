@@ -89,72 +89,7 @@ fn used_budget_extensions(state: &AgenticLoopState) -> u32 {
 }
 
 fn bash_command_looks_mutating(command: &str) -> bool {
-    let lower = command.trim().to_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    // Compound commands like `cd /tmp && mv x y` or `sudo rm -rf foo` slip past
-    // a naive starts_with check. Split on common shell separators and inspect
-    // each segment after stripping leading sudo/env wrappers.
-    let segments = lower
-        .split(['|', ';', '\n'])
-        .flat_map(|chunk| chunk.split("&&"))
-        .flat_map(|chunk| chunk.split("||"));
-
-    for raw in segments {
-        let segment = raw.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        // Detect redirects: both `cmd > file` and `cmd >file` (no space).
-        // Exclude `>>` first so `>>` is not double-counted by the `>` check.
-        let has_redirect = segment.contains(">>")
-            || segment
-                .find('>')
-                .is_some_and(|i| i > 0 && segment.as_bytes().get(i - 1) != Some(&b'-'));
-        if segment.contains("apply_patch")
-            || has_redirect
-            || segment.contains("sed -i")
-            || segment.contains("perl -pi")
-            || segment.contains("tee ")
-        {
-            return true;
-        }
-        let mut head = segment;
-        loop {
-            let trimmed = head
-                .trim_start_matches("sudo ")
-                .trim_start_matches("nohup ")
-                .trim_start_matches("time ")
-                .trim_start();
-            if trimmed == head {
-                break;
-            }
-            head = trimmed;
-        }
-        if [
-            "mv ",
-            "cp ",
-            "rm ",
-            "mkdir ",
-            "touch ",
-            "chmod ",
-            "chown ",
-            "ln ",
-            "npm install",
-            "pnpm install",
-            "yarn install",
-            "cargo fix",
-            "go mod tidy",
-        ]
-        .iter()
-        .any(|prefix| head.starts_with(prefix))
-        {
-            return true;
-        }
-    }
-    false
+    crate::bash_intent::bash_command_looks_mutating(command)
 }
 
 fn extract_bash_command(args: Option<&str>) -> Option<String> {
