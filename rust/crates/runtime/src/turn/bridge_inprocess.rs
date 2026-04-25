@@ -2843,6 +2843,7 @@ mod tests {
                     round_budget_warning: true,
                     synthesize_or_batch: true,
                     parallel_feedback: false,
+                    parallel_batching_nudge: false,
                 },
                 ..Default::default()
             },
