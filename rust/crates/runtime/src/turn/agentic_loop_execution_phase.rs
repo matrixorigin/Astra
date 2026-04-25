@@ -676,6 +676,15 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 /// intervene with a higher-priority `user` message.
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
 
+/// Tightened streak threshold once the turn has entered the round-budget
+/// warning zone (`round_index >= ROUND_BUDGET_THRESHOLD`). At that point any
+/// additional sequential single-tool round is materially closer to running
+/// out of budget without a final answer, so we intervene more aggressively.
+/// Empirical real-session data: turns near the round-budget warning that
+/// added a 3rd consecutive single-tool round virtually never converged
+/// without external correction.
+pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE: usize = 3;
+
 pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
         return false;
@@ -690,7 +699,14 @@ pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState) -> bool {
         return false;
     }
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    streak >= PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+    let threshold = if state.llm_rounds_completed
+        >= crate::prompts::ROUND_BUDGET_THRESHOLD
+    {
+        PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE
+    } else {
+        PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+    };
+    streak >= threshold
 }
 
 pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
@@ -1543,5 +1559,37 @@ mod tests {
             "content": execution_retry_message("do something"),
         });
         assert!(!is_parallel_batching_force(&retry));
+    }
+
+    #[test]
+    fn parallel_batching_force_uses_tighter_threshold_in_round_budget_warning_zone() {
+        // Streak of 3 — below the early-zone threshold of 5...
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE {
+            push_single_tool_round(&mut state);
+        }
+        // ...so before the warning zone, this must NOT fire.
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
+        assert!(!should_force_parallel_batching(&state));
+
+        // Once round_index crosses ROUND_BUDGET_THRESHOLD, the same streak of
+        // 3 must fire — this is the coupling we want.
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
+        assert!(should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_late_threshold_silent_at_streak_two() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE - 1) {
+            push_single_tool_round(&mut state);
+        }
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 2;
+        // Even deep into the warning zone, a streak below the late threshold
+        // (=3) must not fire — we don't punish a single isolated single-tool
+        // round just because the turn is long.
+        assert!(!should_force_parallel_batching(&state));
     }
 }
