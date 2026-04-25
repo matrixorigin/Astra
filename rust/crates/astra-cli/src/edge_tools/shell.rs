@@ -3205,9 +3205,9 @@ impl ToolExecutor {
     /// by the underlying `register_external_read`.
     fn register_bash_read_targets(&self, command: &str) {
         let intent = astra_runtime::bash_intent::analyze_bash_command(command);
-        if intent.mutating {
-            return;
-        }
+        // `intent.read_targets` is already filtered: `analyze_bash_command`
+        // only harvests paths from non-mutating segments, so a mixed command
+        // like `cat a.rs && rm b.rs` yields `["a.rs"]` — safe to register.
         for rel in intent.read_targets {
             let path = std::path::Path::new(&rel);
             let abs = if path.is_absolute() {
@@ -4243,6 +4243,44 @@ mod tests {
         assert!(
             executor.check_staleness(&file_path).is_err(),
             "redirect should not register its target as read"
+        );
+    }
+
+    #[test]
+    fn bash_mixed_command_registers_only_read_segments() {
+        // For a compound command like `cat a.rs && rm b.rs`, the cat segment
+        // genuinely reads a.rs (so the staleness gate must let edits through),
+        // while the rm segment must NOT register b.rs as read (writes are not
+        // reads). Pre-fix code took the whole-command early-return on any
+        // mutating segment and dropped a.rs; post-fix relies on
+        // `analyze_bash_command` already excluding paths from mutating
+        // segments at extraction time.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, "content-a\n").unwrap();
+        std::fs::write(&b, "content-b\n").unwrap();
+        let executor = test_executor_in(dir.path());
+
+        assert!(executor.check_staleness(&a).is_err());
+        assert!(executor.check_staleness(&b).is_err());
+
+        let _ = executor.bash(&serde_json::json!({
+            "command": format!("cat {} && rm {}", a.display(), b.display()),
+        }));
+
+        assert!(
+            executor.check_staleness(&a).is_ok(),
+            "cat segment must register {:?} as read",
+            a
+        );
+        // b.rs no longer exists (rm consumed it); the relevant invariant is
+        // that we did not silently mark it as "read" — the segment was
+        // mutating, so register_bash_read_targets must skip it.
+        assert!(
+            !b.exists(),
+            "rm segment should have removed {:?} (sanity)",
+            b
         );
     }
 

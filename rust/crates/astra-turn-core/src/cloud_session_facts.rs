@@ -356,8 +356,7 @@ mod tests {
         // the fallback parser used to return a wrong/partial path. Records
         // that carry the untruncated `args_full` must use that instead.
         let mut facts = SessionFacts::default();
-        let truncated_preview =
-            r#"{"path":"rust/crates/astra-cli/src/edge_tools/file_state_legac"#;
+        let truncated_preview = r#"{"path":"rust/crates/astra-cli/src/edge_tools/file_state_legac"#;
         let full = r#"{"path":"rust/crates/astra-cli/src/edge_tools/file_state_legacy_helpers.rs","old_str":"foo","new_str":"bar"}"#;
         let mut tc = make_tc("str_replace", true, None, Some(truncated_preview));
         tc.args_full = Some(full.to_string());

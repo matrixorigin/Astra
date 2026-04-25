@@ -207,6 +207,9 @@ pub fn evaluate_tool_call_records(
                 .map(str::trim)
                 .filter(|full| !full.is_empty())
                 .map(|full| {
+                    // Hash is used only for in-process dedup within a single
+                    // `evaluate_tool_call_records` call — never persisted or
+                    // compared across Rust versions. DefaultHasher is fine here.
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     full.hash(&mut hasher);
@@ -809,14 +812,8 @@ mod tests {
             };
             3
         ];
-        let eval = evaluate_tool_call_records(
-            "look",
-            &["bash".to_string()],
-            &repeated,
-            0,
-            false,
-            0.1,
-        );
+        let eval =
+            evaluate_tool_call_records("look", &["bash".to_string()], &repeated, 0, false, 0.1);
         assert!(
             eval.signals.iter().any(|s| matches!(
                 s,
