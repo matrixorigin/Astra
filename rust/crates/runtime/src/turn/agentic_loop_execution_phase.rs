@@ -7,6 +7,7 @@ use super::agentic_loop_host::{
 };
 use super::agentic_loop_lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_state_summary, session_turn_number,
+    tool_record_is_workspace_mutation,
 };
 use super::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, agentic_turn_stream_snapshot_with_kind,
@@ -312,6 +313,29 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(e);
         }
         AgenticIngestIterationControl::BreakLoop => {
+            if should_force_execution_retry(state) {
+                state.stall.forced_execution_retry = true;
+                state.final_text.clear();
+                // The corrective user message is pushed onto `state.messages`
+                // for this loop iteration. The one-shot
+                // `forced_execution_retry` flag prevents a second injection,
+                // and `finalize_and_render` strips the marker before the next
+                // user turn so it does not pollute future conversations.
+                state.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": execution_retry_message(&state.message),
+                }));
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        "↻ Execution requested but no edits were applied; forcing corrective retry…"
+                            .to_string(),
+                    );
+                }
+                try_write_heavy_checkpoint(state);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
             if state.hooks.stop_hook_runs == 0
                 && let Some(prompt) =
                     crate::turn::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
@@ -365,6 +389,167 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             turn_result,
         },
     )))
+}
+
+fn should_force_execution_retry(state: &AgenticLoopState) -> bool {
+    if state.stall.forced_execution_retry {
+        return false;
+    }
+    if has_concrete_workspace_mutation(state) {
+        return false;
+    }
+    if state.final_text.trim().is_empty() {
+        return false;
+    }
+    let attempted_work_without_mutation = state.total_tool_calls > 0;
+    let defers = final_text_defers_execution(&state.final_text);
+    if state.task_profile.mutates_workspace {
+        // Only retry when the model engaged with the task (made tool calls but
+        // committed nothing) or explicitly deferred. A bare "Done." or "no fix
+        // needed" reply with zero tool calls is treated as a legitimate no-op
+        // — retrying would burn a turn for nothing.
+        return attempted_work_without_mutation || defers;
+    }
+    user_confirmed_execution_from_recent_context(state)
+        && (attempted_work_without_mutation || defers)
+}
+
+fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool {
+    state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| record.ok && !record.is_synthetic_placeholder())
+        .any(tool_record_is_workspace_mutation)
+}
+
+fn user_confirmed_execution_from_recent_context(state: &AgenticLoopState) -> bool {
+    if !looks_like_execution_confirmation(&state.message) {
+        return false;
+    }
+
+    state
+        .messages
+        .iter()
+        .rev()
+        .take(8)
+        .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("assistant"))
+        .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
+        .any(assistant_text_offered_execution)
+}
+
+fn looks_like_execution_confirmation(message: &str) -> bool {
+    let normalized = message
+        .trim()
+        .trim_matches(|c: char| {
+            c.is_ascii_punctuation()
+                || c.is_whitespace()
+                || matches!(c, '。' | '，' | '！' | '？' | '；' | '：')
+        })
+        .to_lowercase();
+    if normalized.is_empty() || normalized.chars().count() > 24 {
+        return false;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "yes"
+            | "y"
+            | "ok"
+            | "okay"
+            | "go ahead"
+            | "do it"
+            | "proceed"
+            | "continue"
+            | "sure"
+            | "当然"
+            | "当然了"
+            | "好"
+            | "好的"
+            | "可以"
+            | "没问题"
+            | "继续"
+            | "继续吧"
+            | "执行"
+            | "直接执行"
+            | "开始"
+            | "做吧"
+    ) || normalized.contains("继续")
+        || normalized.contains("执行")
+}
+
+fn assistant_text_offered_execution(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let offered = [
+        "需要我",
+        "我可以",
+        "要继续吗",
+        "即可执行",
+        "shall i",
+        "should i",
+        "want me to",
+        "i can",
+        "go ahead",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let action = [
+        "执行",
+        "修改",
+        "修复",
+        "apply",
+        "patch",
+        "edit",
+        "change",
+        "implement",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    offered && action
+}
+
+fn final_text_defers_execution(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "需要我直接执行",
+        "要继续吗",
+        "即可执行",
+        "等待确认",
+        "shall i",
+        "should i",
+        "want me to",
+        "ready to apply",
+        "can apply",
+        "can execute",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Stable marker prefix embedded in the corrective user message so that
+/// `finalize_and_render` can strip it after the turn completes. Keeps the
+/// conversation history clean across user turns without depending on the
+/// downstream compactor's heuristics.
+pub(crate) const EXECUTION_RETRY_MARKER: &str = "## ⤴ Execution Retry Correction";
+
+pub(crate) fn is_execution_retry_correction(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(EXECUTION_RETRY_MARKER))
+}
+
+fn execution_retry_message(original_query: &str) -> String {
+    format!(
+        "{EXECUTION_RETRY_MARKER}\n\
+         Runtime correction: the user requested or confirmed code execution, \
+         but your previous response ended without applying any concrete workspace mutation. \
+         Do not ask for permission again and do not only restate a plan. \
+         Use the available file-editing tools to make the change, then run the appropriate existing verification.\n\n\
+         Original user query: {original_query}"
+    )
 }
 
 fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostTurnResult) {
@@ -657,6 +842,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use astra_services::session_journal::ToolCallRecord;
+
     use super::*;
     use crate::observability_integration::ObservabilityHub;
     use crate::turn::agentic_loop_host::tests::make_state;
@@ -678,5 +865,219 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
+    }
+
+    #[test]
+    fn execution_retry_correction_is_detectable_and_stripped() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": execution_retry_message("fix the bug"),
+        });
+        assert!(is_execution_retry_correction(&msg));
+
+        let unrelated = serde_json::json!({
+            "role": "user",
+            "content": "fix the bug",
+        });
+        assert!(!is_execution_retry_correction(&unrelated));
+
+        let assistant_with_marker = serde_json::json!({
+            "role": "assistant",
+            "content": EXECUTION_RETRY_MARKER,
+        });
+        assert!(!is_execution_retry_correction(&assistant_with_marker));
+    }
+
+    #[test]
+    fn execution_retry_blocks_plan_only_finish_for_mutating_task() {
+        let mut state = make_state();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("修复这个问题");
+        state.message = "修复这个问题".into();
+        state.final_text = "需要我直接执行这些修改吗？".into();
+        state.total_tool_calls = 2;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"grep -rn \"foo\" rust/"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_skips_done_without_tools_for_mutating_task() {
+        // A mutating-profile task where the model produces a bare conclusion
+        // with zero tool calls is treated as a legitimate no-op completion
+        // (e.g. "I reviewed the code and the bug doesn't exist"). Forcing a
+        // retry here would just waste a turn.
+        let mut state = make_state();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.message = "fix the bug".into();
+        state.final_text = "I reviewed the code and the bug does not exist.".into();
+
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_fires_when_mutating_task_only_planned() {
+        // Mutating profile + tool calls were made (exploration) but nothing
+        // committed → still retry to push for execution.
+        let mut state = make_state();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.message = "fix the bug".into();
+        state.final_text = "Here is the plan: change foo to bar.".into();
+        state.total_tool_calls = 1;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"cat src/foo.rs"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn confirmation_detector_ignores_keyi_in_descriptive_sentence() {
+        // "可以看到这里有问题" is description, not a confirmation.
+        assert!(!looks_like_execution_confirmation("可以看到这里有问题"));
+    }
+
+    #[test]
+    fn bash_mutation_detects_compound_and_sudo_commands() {
+        use crate::turn::agentic_loop_lifecycle::tool_record_is_workspace_mutation;
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"cd /tmp && mv a b"}"#.into()),
+            ..Default::default()
+        };
+        assert!(tool_record_is_workspace_mutation(&record));
+
+        let sudo = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"sudo rm -rf /tmp/cache"}"#.into()),
+            ..Default::default()
+        };
+        assert!(tool_record_is_workspace_mutation(&sudo));
+    }
+
+    #[test]
+    fn bash_mutation_returns_false_for_malformed_args() {
+        use crate::turn::agentic_loop_lifecycle::tool_record_is_workspace_mutation;
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some("rm -rf /".into()),
+            ..Default::default()
+        };
+        // Non-JSON args are treated as missing rather than the raw string,
+        // avoiding false positives from corrupted journal entries.
+        assert!(!tool_record_is_workspace_mutation(&record));
+    }
+
+    #[test]
+    fn execution_retry_recognizes_affirmative_followup_context() {
+        let mut state = make_state();
+        state.message = "当然了".into();
+        state.final_text = "我可以继续执行，确认后开始。".into();
+        state.total_tool_calls = 1;
+        state.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "需要我直接执行这些修改吗？"
+        }));
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"cat rust/crates/runtime/src/lib.rs"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_recognizes_english_affirmative_followup_context() {
+        let mut state = make_state();
+        state.message = "go ahead".into();
+        state.final_text = "I can apply the patch now.".into();
+        state.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "Should I apply this patch?"
+        }));
+
+        assert!(should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_does_not_treat_bare_affirmative_as_execution() {
+        let mut state = make_state();
+        state.message = "当然了".into();
+        state.final_text = "好的。".into();
+        state.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "这个解释有帮助吗？"
+        }));
+
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_does_not_fire_for_read_only_review() {
+        let mut state = make_state();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("review local changes");
+        state.message = "review local changes".into();
+        state.final_text = "I found one issue.".into();
+        state.total_tool_calls = 1;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_does_not_fire_after_concrete_edit() {
+        let mut state = make_state();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.message = "fix the bug".into();
+        state.final_text = "Done.".into();
+        state.total_tool_calls = 2;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            ..Default::default()
+        });
+
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn bash_read_only_is_not_workspace_mutation_but_sed_i_is() {
+        let read_only = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"sed -n '1,20p' src/lib.rs"}"#.into()),
+            ..Default::default()
+        };
+        let mutating = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"sed -i 's/old/new/' src/lib.rs"}"#.into()),
+            ..Default::default()
+        };
+
+        assert!(!tool_record_is_workspace_mutation(&read_only));
+        assert!(tool_record_is_workspace_mutation(&mutating));
     }
 }

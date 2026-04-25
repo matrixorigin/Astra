@@ -400,6 +400,9 @@ pub struct StallTrackingState {
     pub tool_call_records: Vec<ToolCallRecord>,
     /// Whether a factual-retry was forced this loop.
     pub forced_factual_retry: bool,
+    /// Whether an execution-retry was forced after a mutating/confirmed task
+    /// attempted to finish without applying any concrete workspace mutation.
+    pub forced_execution_retry: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -1094,6 +1097,10 @@ pub(crate) mod tests {
         pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
             self
+        }
+
+        pub(crate) fn turn_count(&self) -> usize {
+            self.current_turn
         }
 
         pub(crate) fn with_reflection_text(mut self, text: &str) -> Self {

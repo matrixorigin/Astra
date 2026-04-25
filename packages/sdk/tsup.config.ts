@@ -13,6 +13,7 @@ export default defineConfig([
     entry: { react: 'src/react.ts' },
     format: ['esm', 'cjs'],
     dts: true,
+    clean: true,
     sourcemap: true,
     splitting: false,
     external: ['react'],
