@@ -133,15 +133,16 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     if let Some(resolver) = &state.skills.resolver {
         let full = resolver.available_skills();
         if !full.is_empty() {
-            let (visible, open_skill_name, _telemetry) = crate::turn::skill_tool::visible_skills_for_host_turn(
-                &full,
-                state.message.as_str(),
-                &state.skills.quality_tracker,
-                &state.skills.pinned,
-                &state.skills.discovered,
-                &state.skills.invoked,
-                &state.skills.search,
-            );
+            let (visible, open_skill_name, _telemetry) =
+                crate::turn::skill_tool::visible_skills_for_host_turn(
+                    &full,
+                    state.message.as_str(),
+                    &state.skills.quality_tracker,
+                    &state.skills.pinned,
+                    &state.skills.discovered,
+                    &state.skills.invoked,
+                    &state.skills.search,
+                );
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
                 &visible,
                 Some(&state.skills.quality_tracker),
@@ -536,15 +537,16 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.skills.listing_message = if full.is_empty() {
             None
         } else {
-            let (visible, open_skill_name, telemetry) = crate::turn::skill_tool::visible_skills_for_host_turn(
-                &full,
-                state.message.as_str(),
-                &state.skills.quality_tracker,
-                &state.skills.pinned,
-                &state.skills.discovered,
-                &state.skills.invoked,
-                &state.skills.search,
-            );
+            let (visible, open_skill_name, telemetry) =
+                crate::turn::skill_tool::visible_skills_for_host_turn(
+                    &full,
+                    state.message.as_str(),
+                    &state.skills.quality_tracker,
+                    &state.skills.pinned,
+                    &state.skills.discovered,
+                    &state.skills.invoked,
+                    &state.skills.search,
+                );
             let shortlist = crate::turn::skill_tool::build_skill_selector_shortlist_trace(
                 &visible,
                 open_skill_name,

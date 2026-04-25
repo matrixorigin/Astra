@@ -314,7 +314,10 @@ pub fn select_skills_for_turn(
     Option<astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry>,
 ) {
     if cfg.use_full_catalog(all_skills.len()) {
-        return (all_skills.to_vec(), None);
+        return (
+            all_skills.to_vec(),
+            Some(full_catalog_selector_telemetry(all_skills.len(), cfg)),
+        );
     }
 
     let mut picked: Vec<SkillToolInfo> = Vec::new();
@@ -391,7 +394,7 @@ fn filter_already_invoked_skills(
 }
 
 /// Visible skills + whether dynamic surfacing is active (open `skill_name` + `discover_skills`)
-/// + selector telemetry (`None` when full catalog bypasses the selector).
+/// + selector telemetry.
 pub fn visible_skills_for_host_turn(
     full: &[SkillToolInfo],
     user_message: &str,
@@ -407,13 +410,34 @@ pub fn visible_skills_for_host_turn(
 ) {
     if cfg.use_full_catalog(full.len()) {
         let filtered = filter_already_invoked_skills(full.to_vec(), invoked);
-        return (filtered, false, None);
+        return (
+            filtered,
+            false,
+            Some(full_catalog_selector_telemetry(full.len(), cfg)),
+        );
     }
     let (base, telemetry) =
         select_skills_for_turn(full, user_message, Some(quality_tracker), Some(pinned), cfg);
     let visible = merge_discovered_skills_into_visible(base, full, discovered);
     let filtered = filter_already_invoked_skills(visible, invoked);
     (filtered, true, telemetry)
+}
+
+fn full_catalog_selector_telemetry(
+    skill_count: usize,
+    cfg: &SkillSearchSettings,
+) -> astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
+    astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry {
+        selector_tier: Some("full_catalog".to_string()),
+        elapsed_ms: Some(0),
+        total_catalog_size: Some(skill_count as i64),
+        extra: Some(serde_json::json!({
+            "reason": "full_catalog_bypass",
+            "dynamic_surface": cfg.dynamic_surface,
+            "min_catalog_size": cfg.min_catalog_size,
+            "surface_cap": cfg.surface_cap,
+        })),
+    }
 }
 
 pub fn build_skill_selector_shortlist_trace(
@@ -5678,6 +5702,52 @@ Normal.
         assert_eq!(metric.shortlisted_chosen_count, 1);
         assert_eq!(metric.missed_chosen_count, 1);
         assert_eq!(metric.best_chosen_rank, Some(2));
+    }
+
+    #[test]
+    fn full_catalog_bypass_records_selector_telemetry() {
+        let cfg = SkillSearchSettings {
+            dynamic_surface: false,
+            min_catalog_size: 8,
+            surface_cap: 20,
+        };
+        let skills = vec![
+            SkillToolInfo {
+                name: "alpha".into(),
+                description: "first".into(),
+                ..Default::default()
+            },
+            SkillToolInfo {
+                name: "beta".into(),
+                description: "second".into(),
+                ..Default::default()
+            },
+        ];
+
+        let (visible, open_catalog, telemetry) = visible_skills_for_host_turn(
+            &skills,
+            "use beta",
+            &crate::skills::quality::SkillQualityTracker::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &cfg,
+        );
+
+        assert_eq!(visible.len(), 2);
+        assert!(!open_catalog);
+        let telemetry = telemetry.expect("full-catalog bypass telemetry should be present");
+        assert_eq!(telemetry.selector_tier.as_deref(), Some("full_catalog"));
+        assert_eq!(telemetry.total_catalog_size, Some(2));
+        assert_eq!(telemetry.elapsed_ms, Some(0));
+        assert_eq!(
+            telemetry
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("full_catalog_bypass")
+        );
     }
 
     #[test]

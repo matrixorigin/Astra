@@ -920,7 +920,10 @@ pub fn select_skill_indices(
     user_message: &str,
     quality_tracker: Option<&SkillQualityTracker>,
     cfg: &SkillSearchSettings,
-) -> (Vec<usize>, astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry) {
+) -> (
+    Vec<usize>,
+    astra_turn_core::skill_selector_metrics::SkillSelectorTelemetry,
+) {
     let started = Instant::now();
     let catalog_size = all_skills.len();
     let surface_cap = cfg.effective_surface_cap();

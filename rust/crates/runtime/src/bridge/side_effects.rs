@@ -352,8 +352,12 @@ fn build_hook_db_persist_from_payload(
                 execution_time_ms: None,
             })
     };
-    let derived_shortlist =
-        crate::turn::skill_tool::parse_skill_selector_shortlist_from_messages(&messages);
+    let derived_shortlist = hook_payload
+        .get("skill_selector_shortlist")
+        .and_then(parse_skill_selector_shortlist_trace_value)
+        .or_else(|| {
+            crate::turn::skill_tool::parse_skill_selector_shortlist_from_messages(&messages)
+        });
     let skill_selector_metric = hook_payload
         .get("skill_selector_metric")
         .and_then(parse_turn_skill_selector_metric_record)
@@ -578,6 +582,12 @@ fn truncate_text(text: &str, limit: usize) -> String {
 fn parse_turn_skill_selector_metric_record(
     value: &serde_json::Value,
 ) -> Option<TurnSkillSelectorMetricRecord> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn parse_skill_selector_shortlist_trace_value(
+    value: &serde_json::Value,
+) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
     serde_json::from_value(value.clone()).ok()
 }
 

@@ -244,6 +244,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
     pub first_budget_pressure: &'a mut f64,
     pub first_context_assembly_ms: &'a mut Option<u64>,
     pub all_selected_skills: &'a mut Vec<String>,
+    pub initial_skill_selector_shortlist: Option<Value>,
     /// Optional trace collector for observability (M1).
     pub trace_collector: Option<&'a astra_runtime::turn::turn_trace_collector::TurnTraceCollector>,
 }
@@ -669,6 +670,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.skill_effort.as_deref(),
         ctx.skill_agent_type.as_deref(),
     );
+    inject_skill_selector_shortlist_trace(
+        &mut payload,
+        ctx.telem.initial_skill_selector_shortlist.as_ref(),
+    );
 
     // Inject round_index so the bridge can add round budget directives.
     if let Some(root) = payload.as_object_mut() {
@@ -846,6 +851,16 @@ fn inject_runtime_turn_overrides(
     if let Some(agent_type) = skill_agent_type {
         root.insert("agent_type".into(), json!(agent_type));
     }
+}
+
+fn inject_skill_selector_shortlist_trace(payload: &mut Value, shortlist: Option<&Value>) {
+    let Some(shortlist) = shortlist else {
+        return;
+    };
+    let Some(root) = payload.as_object_mut() else {
+        return;
+    };
+    root.insert("skill_selector_shortlist".into(), shortlist.clone());
 }
 
 // `load_skill_instructions_text` removed — skill activation now goes through
