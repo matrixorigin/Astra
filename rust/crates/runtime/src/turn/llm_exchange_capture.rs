@@ -421,10 +421,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         unsafe { std::env::set_var(LLM_CAPTURE_ENV, "1") };
+        let session_id = "00000000-0000-0000-0000-000000000123";
 
         persist_configured_capture(
             None,
-            "sess-123",
+            session_id,
             "user-1",
             2,
             1,
@@ -442,14 +443,16 @@ mod tests {
         .expect("configured capture");
 
         let session_dir = astra_services::local_session_artifact_store()
-            .session_dir("sess-123")
+            .session_dir(session_id)
             .expect("session dir");
         let files: Vec<_> = std::fs::read_dir(session_dir)
             .expect("capture dir")
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert!(
-            files.iter().any(|name| name.contains("llm_capture_t2_r1_server_loop_host_success")),
+            files
+                .iter()
+                .any(|name| name.contains("llm_capture_t2_r1_server_loop_host_success")),
             "expected local capture file, got {files:?}"
         );
 
@@ -462,10 +465,11 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         unsafe { std::env::remove_var(LLM_CAPTURE_ENV) };
         let store = RecordingArtifactStore::default();
+        let session_id = "00000000-0000-0000-0000-000000000124";
 
         persist_configured_capture(
             Some(&store),
-            "sess-123",
+            session_id,
             "user-1",
             2,
             1,

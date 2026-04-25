@@ -1,8 +1,8 @@
 //! Session artifact HTTP E2E: authenticated list/get routes align with `session_artifacts`,
 //! including kind filtering, session scoping, and cross-user isolation.
 
-use axum::{body::Body, http::Request};
 use axum::http::StatusCode;
+use axum::{body, body::Body, http::Request};
 use futures_util::StreamExt;
 use serde_json::json;
 use sqlx::Row;
@@ -34,7 +34,11 @@ async fn collect_full_sse_stream(
     (status, String::from_utf8_lossy(&acc).to_string())
 }
 
-async fn stream_chat_full(app: &axum::Router, auth: &str, payload: serde_json::Value) -> (StatusCode, String) {
+async fn stream_chat_full(
+    app: &axum::Router,
+    auth: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, String) {
     let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
@@ -45,6 +49,29 @@ async fn stream_chat_full(app: &axum::Router, auth: &str, payload: serde_json::V
         .body(Body::from(payload.to_string()))
         .expect("stream request");
     collect_full_sse_stream(app, req, 30).await
+}
+
+async fn get_bytes(
+    app: &axum::Router,
+    path: &str,
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method("GET").uri(path);
+    if let Some(t) = auth {
+        req = req.header("authorization", t);
+    }
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let req = req.body(Body::empty()).expect("request");
+    let response = app.clone().oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("body");
+    (status, headers, bytes.to_vec())
 }
 
 async fn wait_for_artifact_count(
@@ -158,7 +185,11 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
     assert_eq!(list_j["session_id"].as_str(), Some(ctx.session_id.as_str()));
     assert_eq!(list_j["limit"].as_u64(), Some(1));
     let artifacts = list_j["artifacts"].as_array().expect("artifacts array");
-    assert_eq!(artifacts.len(), 1, "artifact kind filter should narrow results");
+    assert_eq!(
+        artifacts.len(),
+        1,
+        "artifact kind filter should narrow results"
+    );
     assert_eq!(
         artifacts[0]["artifact_id"].as_str(),
         Some(workspace_artifact_id.as_str())
@@ -170,7 +201,10 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
     assert_eq!(artifacts[0]["turn"].as_u64(), Some(7));
     assert_eq!(artifacts[0]["content"]["model"].as_str(), Some("gpt-5.4"));
 
-    let get_path = format!("/sessions/{}/artifacts/{}", ctx.session_id, workspace_artifact_id);
+    let get_path = format!(
+        "/sessions/{}/artifacts/{}",
+        ctx.session_id, workspace_artifact_id
+    );
     let (st_get, get_j) = get_json(&ctx.app, &get_path, Some(auth), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "artifact get: {get_j}");
     assert_eq!(
@@ -275,7 +309,8 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
         Some(WORKSPACE_METADATA_ARTIFACT_KIND)
     );
     assert_eq!(
-        db_row.try_get::<Option<String>, _>("source")
+        db_row
+            .try_get::<Option<String>, _>("source")
             .ok()
             .flatten()
             .as_deref(),
@@ -309,7 +344,10 @@ pub async fn run_published_session_artifact_round_trip() {
     .fetch_one(pool)
     .await
     .expect("llm capture count before stream");
-    assert_eq!(before_count, 0, "fresh session should not have llm_capture artifacts");
+    assert_eq!(
+        before_count, 0,
+        "fresh session should not have llm_capture artifacts"
+    );
 
     let payload = json!({
         "message": "publish llm capture and read it back",
@@ -360,7 +398,11 @@ pub async fn run_published_session_artifact_round_trip() {
 
     let list_path = format!("/sessions/{session_id}/artifacts?artifact_kind=llm_capture&limit=10");
     let (st_list, list_j) = get_json(app, &list_path, Some(auth), &[]).await;
-    assert_eq!(st_list, StatusCode::OK, "artifact list after publish: {list_j}");
+    assert_eq!(
+        st_list,
+        StatusCode::OK,
+        "artifact list after publish: {list_j}"
+    );
     let artifacts = list_j["artifacts"].as_array().expect("artifacts array");
     assert!(
         artifacts
@@ -371,7 +413,11 @@ pub async fn run_published_session_artifact_round_trip() {
 
     let get_path = format!("/sessions/{session_id}/artifacts/{artifact_id}");
     let (st_get, get_j) = get_json(app, &get_path, Some(auth), &[]).await;
-    assert_eq!(st_get, StatusCode::OK, "artifact get after publish: {get_j}");
+    assert_eq!(
+        st_get,
+        StatusCode::OK,
+        "artifact get after publish: {get_j}"
+    );
     assert_eq!(get_j["artifact_kind"].as_str(), Some("llm_capture"));
     assert_eq!(get_j["source"].as_str(), Some("server_loop_host"));
     assert_eq!(
@@ -402,5 +448,209 @@ pub async fn run_published_session_artifact_round_trip() {
         .execute(pool)
         .await;
     cleanup_session_data(pool, &session_id).await;
+    ctx.pool.close().await;
+}
+
+pub async fn run_session_artifact_latest_and_download_routes() {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let app = &ctx.app;
+    let auth = &b.auth_header;
+    let pool = &ctx.pool;
+
+    let (st_sess, sess) = post_json(
+        app,
+        "/sessions",
+        Some(auth.as_str()),
+        json!({ "title": "artifact latest download", "metadata": { "suite": "artifact_latest_download" } }),
+    )
+    .await;
+    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
+    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
+
+    let payload = json!({
+        "message": "publish llm capture for latest and download routes",
+        "session_id": &session_id,
+        "context": {
+            "test_llm_rounds": [{ "full_text": "Artifact download verified." }]
+        }
+    });
+    let (status, body) = stream_chat_full(app, auth, payload).await;
+    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
+    assert!(
+        body.contains("Artifact download verified."),
+        "SSE body should include the model text response: {body}"
+    );
+
+    wait_for_artifact_count(
+        pool,
+        &session_id,
+        "llm_capture",
+        1,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+
+    let row = sqlx::query(
+        "SELECT artifact_id \
+         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("latest llm_capture row");
+    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+
+    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
+    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
+    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
+    assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
+    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
+    assert_eq!(
+        latest_j["content"]["response"]["full_text"].as_str(),
+        Some("Artifact download verified.")
+    );
+
+    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
+    let (st_download, download_headers, download_body) =
+        get_bytes(app, &download_path, Some(auth), &[]).await;
+    assert_eq!(st_download, StatusCode::OK, "artifact download");
+    assert_eq!(
+        download_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let content_disposition = download_headers
+        .get("content-disposition")
+        .and_then(|value| value.to_str().ok())
+        .expect("content-disposition");
+    assert!(
+        content_disposition.contains("attachment;"),
+        "download should be an attachment: {content_disposition}"
+    );
+    assert!(
+        content_disposition.contains(artifact_id.as_str()),
+        "download filename should include the artifact id: {content_disposition}"
+    );
+    let download_j: serde_json::Value =
+        serde_json::from_slice(&download_body).expect("download json");
+    assert_eq!(
+        download_j["artifact_id"].as_str(),
+        Some(artifact_id.as_str())
+    );
+    assert_eq!(download_j["artifact_kind"].as_str(), Some("llm_capture"));
+    assert_eq!(
+        download_j["content"]["response"]["full_text"].as_str(),
+        Some("Artifact download verified.")
+    );
+
+    let (st_other_session, other_session_j) = post_json(
+        app,
+        "/sessions",
+        Some(auth.as_str()),
+        json!({ "title": "artifact latest wrong session" }),
+    )
+    .await;
+    assert_eq!(
+        st_other_session,
+        StatusCode::CREATED,
+        "create second session: {other_session_j}"
+    );
+    let other_session_id = other_session_j["session_id"]
+        .as_str()
+        .expect("other session_id")
+        .to_string();
+
+    let (st_wrong_latest, wrong_latest_j) = get_json(
+        app,
+        &format!("/sessions/{other_session_id}/artifacts/latest/llm_capture"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_wrong_latest,
+        StatusCode::NOT_FOUND,
+        "latest artifact should stay session-scoped: {wrong_latest_j}"
+    );
+
+    let (st_wrong_download, _headers, wrong_download_body) = get_bytes(
+        app,
+        &format!("/sessions/{other_session_id}/artifacts/{artifact_id}/download"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_wrong_download,
+        StatusCode::NOT_FOUND,
+        "artifact download should stay session-scoped: {}",
+        String::from_utf8_lossy(&wrong_download_body)
+    );
+
+    let (other_app, other_auth) = match b.auth_mode {
+        E2eAuthMode::LocalJwt => {
+            let b_suffix = Uuid::new_v4().simple().to_string();
+            let short = &b_suffix[..12];
+            let b_username = format!("art_dl_{short}");
+            let b_email = format!("art_dl_{short}@e2e.test");
+
+            let (st_reg, reg_b) = post_json(
+                &ctx.app,
+                "/auth/register",
+                None,
+                json!({
+                    "username": b_username,
+                    "email": b_email,
+                    "password": E2E_PASSWORD,
+                    "display_name": "Artifact download isolation B"
+                }),
+            )
+            .await;
+            assert_eq!(st_reg, StatusCode::CREATED, "register B: {reg_b}");
+
+            let (st_login, login_j) = post_json(
+                &ctx.app,
+                "/auth/login",
+                None,
+                json!({ "username": b_username, "password": E2E_PASSWORD }),
+            )
+            .await;
+            assert_eq!(st_login, StatusCode::OK, "login B: {login_j}");
+            let access_b = login_j["access_token"].as_str().expect("B access_token");
+            (ctx.app.clone(), format!("Bearer {access_b}"))
+        }
+        E2eAuthMode::TrustedMoi => {
+            let other = bootstrap_trusted_moi().await;
+            (other.ctx.app.clone(), other.auth_header)
+        }
+    };
+
+    let (st_foreign_latest, foreign_latest_j) =
+        get_json(&other_app, &latest_path, Some(&other_auth), &[]).await;
+    assert_eq!(
+        st_foreign_latest,
+        StatusCode::NOT_FOUND,
+        "foreign user must not read another user's latest artifact: {foreign_latest_j}"
+    );
+
+    let (st_foreign_download, _headers, foreign_download_body) =
+        get_bytes(&other_app, &download_path, Some(&other_auth), &[]).await;
+    assert_eq!(
+        st_foreign_download,
+        StatusCode::NOT_FOUND,
+        "foreign user must not download another user's artifact: {}",
+        String::from_utf8_lossy(&foreign_download_body)
+    );
+
+    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id IN (?, ?)")
+        .bind(&session_id)
+        .bind(&other_session_id)
+        .execute(pool)
+        .await;
+    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(pool, &other_session_id).await;
     ctx.pool.close().await;
 }

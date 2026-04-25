@@ -45,6 +45,16 @@ pub fn session_replay_compare(id: &str) -> String {
 }
 
 #[inline]
+pub fn session_artifact_latest(session_id: &str, artifact_kind: &str) -> String {
+    format!("/sessions/{session_id}/artifacts/latest/{artifact_kind}")
+}
+
+#[inline]
+pub fn session_artifact_download(session_id: &str, artifact_id: &str) -> String {
+    format!("/sessions/{session_id}/artifacts/{artifact_id}/download")
+}
+
+#[inline]
 pub fn chat_session_reflect(session_id: &str) -> String {
     format!("/chat/session/{session_id}/reflect")
 }
@@ -311,6 +321,22 @@ mod tests {
     #[test]
     fn session_replay_compare_path() {
         assert_eq!(session_replay_compare("s1"), "/sessions/s1/replay/compare");
+    }
+
+    #[test]
+    fn session_artifact_latest_path() {
+        assert_eq!(
+            session_artifact_latest("s1", "llm_capture"),
+            "/sessions/s1/artifacts/latest/llm_capture"
+        );
+    }
+
+    #[test]
+    fn session_artifact_download_path() {
+        assert_eq!(
+            session_artifact_download("s1", "a1"),
+            "/sessions/s1/artifacts/a1/download"
+        );
     }
 
     #[test]

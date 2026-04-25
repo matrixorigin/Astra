@@ -22,10 +22,10 @@ use astra_services::session_audit::{
     SessionAuditService,
 };
 use astra_services::session_restore::{
-    HybridRestoreService, SessionRestoreService, pull_step_checkpoint_from_cloud,
-    persist_remote_composite_snapshot_index, push_checkpoint_to_cloud,
-    push_context_trace_signal_to_cloud, push_session_state_to_cloud,
-    push_step_checkpoint_to_cloud, COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
+    COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
+    persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
+    push_checkpoint_to_cloud, push_context_trace_signal_to_cloud, push_session_state_to_cloud,
+    push_step_checkpoint_to_cloud,
 };
 use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSelection, WorkspaceMetadata, persist_remote_workspace,
@@ -2088,15 +2088,14 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         timestamp: Some("2026-09-08T10:00:00Z".into()),
         branch_name: Some("feature/remote-composite".into()),
     };
-    let mut composite_snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
-        &session_id, 7,
-    )
-    .label("remote-composite")
-    .session_state("000003-heavy.json")
-    .data_snapshot(data_snapshot.clone())
-    .git_commit("0123456789abcdef0123456789abcdef01234567")
-    .workspace_state(&session_id)
-    .build();
+    let mut composite_snapshot =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&session_id, 7)
+            .label("remote-composite")
+            .session_state("000003-heavy.json")
+            .data_snapshot(data_snapshot.clone())
+            .git_commit("0123456789abcdef0123456789abcdef01234567")
+            .workspace_state(&session_id)
+            .build();
     let mut index = astra_services::CompositeSnapshotIndex::default();
     index
         .append(&mut composite_snapshot)
@@ -2126,8 +2125,14 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         .expect("list composite snapshots");
     assert_eq!(listed.snapshots.len(), 1);
     assert_eq!(listed.current_version(), 1);
-    assert_eq!(listed.snapshots[0].snapshot_id, composite_snapshot.snapshot_id);
-    assert_eq!(listed.snapshots[0].label.as_deref(), Some("remote-composite"));
+    assert_eq!(
+        listed.snapshots[0].snapshot_id,
+        composite_snapshot.snapshot_id
+    );
+    assert_eq!(
+        listed.snapshots[0].label.as_deref(),
+        Some("remote-composite")
+    );
     assert_eq!(listed.snapshots[0].turn, 7);
 
     let restored = restore
@@ -2140,16 +2145,25 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         .expect("restore composite snapshot")
         .expect("composite snapshot restored");
 
-    assert_eq!(restored.snapshot.snapshot_id, composite_snapshot.snapshot_id);
+    assert_eq!(
+        restored.snapshot.snapshot_id,
+        composite_snapshot.snapshot_id
+    );
     assert!(
-        restored.restored_dimensions.iter().any(|dim| dim == "session"),
+        restored
+            .restored_dimensions
+            .iter()
+            .any(|dim| dim == "session"),
         "remote composite snapshot restore should recover the session-state dimension"
     );
     assert_eq!(
         restored.git_commit_to_checkout.as_deref(),
         Some("0123456789abcdef0123456789abcdef01234567")
     );
-    assert_eq!(restored.data_snapshot_to_restore.as_ref(), Some(&data_snapshot));
+    assert_eq!(
+        restored.data_snapshot_to_restore.as_ref(),
+        Some(&data_snapshot)
+    );
 
     let session = restored.session.expect("session restored from checkpoint");
     assert_eq!(session.turn_count, 7);

@@ -77,6 +77,9 @@
 //! - **`e2e_matrix_published_artifact_http_round_trip`** — a real runtime publish path (`/chat/stream`
 //!   success → `llm_capture` artifact) lands in `session_artifacts` and is readable back through the
 //!   authenticated session artifact HTTP routes.
+//! - **`e2e_matrix_session_artifact_latest_and_download`** — authenticated latest/download session
+//!   artifact routes expose a direct latest-by-kind read plus attachment download for published
+//!   `llm_capture` artifacts.
 //! - **`e2e_matrix_evaluation_reads`** — evaluation GETs (`x-user-id`), optional agent seed for trust/SLO/
 //!   observability, plus learning health/signals.
 //! - **`e2e_matrix_context_decision_chain`** — `POST /events` → `/context` → `/decisions` + `ctx_snapshots` /
@@ -359,6 +362,13 @@ async fn e2e_matrix_session_artifact_http_db() {
 async fn e2e_matrix_published_artifact_http_round_trip() {
     require_system_e2e_env();
     journey_session_artifacts_matrix::run_published_session_artifact_round_trip().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_session_artifact_latest_and_download() {
+    require_system_e2e_env();
+    journey_session_artifacts_matrix::run_session_artifact_latest_and_download_routes().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

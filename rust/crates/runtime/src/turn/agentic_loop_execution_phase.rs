@@ -255,9 +255,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 .join(", ");
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
-                format!(
-                    "↻ repeated cached tool calls on [{tool_list}]; forcing reuse corrective…"
-                ),
+                format!("↻ repeated cached tool calls on [{tool_list}]; forcing reuse corrective…"),
             );
         }
     }

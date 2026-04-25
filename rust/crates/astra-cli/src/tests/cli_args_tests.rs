@@ -732,6 +732,52 @@ fn cli_session_id_and_name_combined() {
     assert_eq!(cli.session_name.as_deref(), Some("debug-session"));
 }
 
+#[test]
+fn cli_session_capture_latest_parses() {
+    let cli = Cli::try_parse_from([
+        "astra",
+        "session",
+        "capture",
+        "latest",
+        "550e8400-e29b-41d4-a716-446655440000",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Session(SessionCmd::Capture(SessionCaptureCmd::Latest(args)))) => {
+            assert_eq!(
+                args.session_id.as_deref(),
+                Some("550e8400-e29b-41d4-a716-446655440000")
+            );
+            assert_eq!(args.artifact_kind, "llm_capture");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_session_capture_download_parses_output() {
+    let cli = Cli::try_parse_from([
+        "astra",
+        "session",
+        "capture",
+        "download",
+        "--output",
+        "capture.json",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Session(SessionCmd::Capture(SessionCaptureCmd::Download(args)))) => {
+            assert!(args.session_id.is_none());
+            assert_eq!(args.artifact_kind, "llm_capture");
+            assert_eq!(
+                args.output.as_deref(),
+                Some(std::path::Path::new("capture.json"))
+            );
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
 // ── --max-budget tests ──
 
 #[test]

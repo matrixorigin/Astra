@@ -2551,12 +2551,12 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::SessionArtifactStore;
     use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
     use crate::turn::cloud::summary::SummaryLlmClient;
     use crate::turn::edge_ledger::{approval_callback_key, tool_callback_key};
     use crate::turn::sse_stream_host::EdgeToolExecResult;
+    use astra_services::SessionArtifactStore;
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings {
@@ -3770,12 +3770,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         unsafe { std::env::set_var("MO_CAPTURE_LLM_EXCHANGES", "1") };
+        let session_id = "00000000-0000-0000-0000-000000000125";
 
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "user-capture".to_string(),
-            "sess-capture".to_string(),
+            session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
         .with_test_llm_rounds(vec![json!({
@@ -3791,14 +3792,16 @@ mod tests {
             .expect("mock turn");
 
         let session_dir = astra_services::local_session_artifact_store()
-            .session_dir("sess-capture")
+            .session_dir(session_id)
             .expect("session dir");
         let files: Vec<_> = std::fs::read_dir(session_dir)
             .expect("capture dir")
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert!(
-            files.iter().any(|name| name.contains("llm_capture_t0_r0_server_loop_host_success")),
+            files
+                .iter()
+                .any(|name| name.contains("llm_capture_t0_r0_server_loop_host_success")),
             "expected local llm capture file, got {files:?}"
         );
 

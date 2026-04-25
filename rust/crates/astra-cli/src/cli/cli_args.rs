@@ -656,7 +656,7 @@ pub(crate) enum BugSubcommand {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000"
+    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
 )]
 pub(crate) enum SessionCmd {
     /// List sessions
@@ -667,6 +667,38 @@ pub(crate) enum SessionCmd {
     Close(SessionShowArgs),
     /// Delete a session record
     Delete(SessionShowArgs),
+    /// Inspect or download session-scoped LLM captures
+    #[command(subcommand)]
+    Capture(SessionCaptureCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SessionCaptureCmd {
+    /// Show the latest capture for a session
+    Latest(SessionCaptureLatestArgs),
+    /// Download the latest capture for a session to a JSON file
+    Download(SessionCaptureDownloadArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SessionCaptureLatestArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    pub session_id: Option<String>,
+    /// Artifact kind to read (defaults to llm_capture)
+    #[arg(long, default_value = "llm_capture")]
+    pub artifact_kind: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SessionCaptureDownloadArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    pub session_id: Option<String>,
+    /// Artifact kind to download (defaults to llm_capture)
+    #[arg(long, default_value = "llm_capture")]
+    pub artifact_kind: String,
+    /// Output file path (defaults to the server-suggested filename in the current directory)
+    #[arg(long)]
+    pub output: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
