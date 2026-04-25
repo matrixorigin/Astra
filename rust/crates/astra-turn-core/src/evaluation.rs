@@ -33,7 +33,17 @@ pub enum EvalSignal {
     NoToolsNeeded,
     /// All tools succeeded with good output.
     AllToolsHealthy,
+    /// A long run of consecutive single-tool rounds was detected — the model
+    /// likely should have batched these into parallel rounds. Carries the
+    /// length of the longest consecutive single-tool-round streak.
+    SequentialReadChurn(usize),
 }
+
+/// Threshold for [`EvalSignal::SequentialReadChurn`]: how many consecutive
+/// single-tool rounds we tolerate before flagging the turn. Calibrated against
+/// real session data: healthy turns (mutate→verify chains, locate→read pairs)
+/// observed up to 6; wasted turns (pure exploratory churn) observed at 10+.
+pub const SEQUENTIAL_READ_CHURN_THRESHOLD: usize = 8;
 
 /// Result of evaluating a turn's success and quality.
 #[derive(Debug, Clone)]
@@ -231,13 +241,57 @@ pub fn evaluate_tool_call_records(
         })
         .collect::<Vec<_>>();
     let is_live_query = looks_like_live_query_with_context(input, recent_tools);
-    evaluate_turn(
+    let mut eval = evaluate_turn(
         &tool_calls,
         stall_count,
         verdict_warning,
         budget_pressure,
         is_live_query,
-    )
+    );
+
+    // ─── Sequential read-churn detection ────────────────────────────────
+    // Count the longest run of consecutive single-tool rounds across the
+    // real (non-synthetic, non-policy-blocked) records. Excludes records
+    // without a `round` index (e.g., orphaned tail records). When the run
+    // is ≥ SEQUENTIAL_READ_CHURN_THRESHOLD, the model almost certainly
+    // could have batched these calls into parallel rounds.
+    let max_streak = longest_single_tool_round_streak(tool_call_records);
+    if max_streak >= SEQUENTIAL_READ_CHURN_THRESHOLD {
+        eval.signals.push(EvalSignal::SequentialReadChurn(max_streak));
+        eval.quality = (eval.quality - 0.10).clamp(0.0, 1.0);
+    }
+
+    eval
+}
+
+/// Group real (non-synthetic, non-policy-blocked) tool-call records by their
+/// `round` index and return the longest run of consecutive rounds that each
+/// contained exactly one tool call. Records without a round index are
+/// ignored to avoid false positives from orphaned tail entries.
+fn longest_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
+    use std::collections::BTreeMap;
+    let mut per_round: BTreeMap<u32, usize> = BTreeMap::new();
+    for record in records {
+        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+            continue;
+        }
+        if let Some(round) = record.round {
+            *per_round.entry(round).or_insert(0) += 1;
+        }
+    }
+    let mut current = 0_usize;
+    let mut best = 0_usize;
+    for &count in per_round.values() {
+        if count == 1 {
+            current += 1;
+            if current > best {
+                best = current;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    best
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
@@ -274,6 +328,14 @@ pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
         EvalSignal::AllToolsHealthy => json!({
             "kind": "all_tools_healthy",
             "message": "All tool calls completed successfully with non-empty output",
+        }),
+        EvalSignal::SequentialReadChurn(streak) => json!({
+            "kind": "sequential_read_churn",
+            "streak": streak,
+            "threshold": SEQUENTIAL_READ_CHURN_THRESHOLD,
+            "message": format!(
+                "Detected {streak} consecutive single-tool rounds — these calls likely should have been batched into parallel rounds"
+            ),
         }),
     }
 }
@@ -1069,5 +1131,151 @@ mod tests {
             ..Default::default()
         };
         assert!(!normal.is_synthetic_placeholder());
+    }
+
+    // ─── Sequential read-churn (real-session-shaped fixtures) ───────────
+    //
+    // Real sessions inspected to calibrate the threshold:
+    //   - 6566d6a8 turn 1: 10 consecutive single-tool read rounds → wasted
+    //   - bbae8641 turn 3: 11 consecutive single-tool read rounds → wasted
+    //   - 6da9cf8f turn 6: 16 consecutive single-tool read rounds → wasted
+    //   - 03945541 turn 1: 6 single-tool rounds (locate→read chain) → healthy
+    //   - 03945541 turn 2: max 4 single-tool rounds (mutate→verify) → healthy
+    // Threshold of 8 cleanly separates these populations.
+
+    fn record_in_round(name: &str, round: u32, batch: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: Some(12),
+            output_bytes: Some(500),
+            args_preview: None,
+            result_preview: None,
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            batch_id: batch.map(str::to_string),
+            parallel: Some(batch.is_some()),
+            round: Some(round),
+            args_full: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sequential_read_churn_flags_long_single_tool_streak() {
+        // Mirrors session 6566d6a8 turn 1: 10 consecutive read_file rounds,
+        // each with exactly one tool call. The model should have batched.
+        let mut records = Vec::new();
+        for r in 0..10 {
+            records.push(record_in_round("read_file", r, None));
+        }
+        let eval = evaluate_tool_call_records("explain the auth flow", &[], &records, 0, false, 0.3);
+        let streak = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::SequentialReadChurn(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(
+            streak,
+            Some(10),
+            "expected SequentialReadChurn(10), got signals={:?}",
+            eval.signals
+        );
+        // Quality should be docked by the churn penalty.
+        let baseline = evaluate_tool_call_records(
+            "explain the auth flow",
+            &[],
+            &records[..1],
+            0,
+            false,
+            0.3,
+        );
+        assert!(
+            eval.quality < baseline.quality,
+            "churn turn quality={} should be below baseline={}",
+            eval.quality,
+            baseline.quality
+        );
+    }
+
+    #[test]
+    fn sequential_read_churn_does_not_flag_well_batched_turn() {
+        // Mirrors session 03945541 turn 2: 6 rounds, mostly batched in
+        // parallel pairs, with a few legitimately-sequential rounds for
+        // mutate→verify chains. max_consec_single_tool_rounds = 4.
+        let records = vec![
+            // round 0: 4-tool parallel batch
+            record_in_round("git_show", 0, Some("b-0-0")),
+            record_in_round("git_show", 0, Some("b-0-0")),
+            record_in_round("git_show", 0, Some("b-0-0")),
+            record_in_round("git_show", 0, Some("b-0-0")),
+            // round 1: 2-tool parallel
+            record_in_round("bash", 1, Some("b-1-0")),
+            record_in_round("bash", 1, Some("b-1-0")),
+            // rounds 2-5: 4 consecutive single-tool rounds (mutate→verify)
+            record_in_round("str_replace", 2, None),
+            record_in_round("read_file", 3, None),
+            record_in_round("str_replace", 4, None),
+            record_in_round("bash", 5, None),
+            // round 6: 2-tool parallel batch (cargo test pair)
+            record_in_round("bash", 6, Some("b-6-0")),
+            record_in_round("bash", 6, Some("b-6-0")),
+        ];
+        let eval = evaluate_tool_call_records("ship the fix", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
+            "well-batched turn should NOT emit SequentialReadChurn; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn sequential_read_churn_does_not_flag_parallel_only_turn() {
+        // 12 rounds, every one with 3 parallel tools. Zero single-tool rounds.
+        let mut records = Vec::new();
+        for r in 0..12 {
+            let batch = format!("b-{r}-0");
+            for _ in 0..3 {
+                records.push(record_in_round("read_file", r, Some(batch.as_str())));
+            }
+        }
+        let eval = evaluate_tool_call_records("survey the codebase", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
+            "all-parallel turn should NOT emit SequentialReadChurn; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn sequential_read_churn_below_threshold_is_silent() {
+        // Mirrors 03945541 turn 1: 6 single-tool rounds, just under the
+        // threshold of 8. Should NOT trigger.
+        let records: Vec<_> = (0..6)
+            .map(|r| record_in_round("git_show", r, None))
+            .collect();
+        let eval = evaluate_tool_call_records("review", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
+            "6 single-tool rounds is below threshold; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn sequential_read_churn_signal_serializes_to_json() {
+        let value = eval_signal_to_json(&EvalSignal::SequentialReadChurn(11));
+        assert_eq!(value["kind"], "sequential_read_churn");
+        assert_eq!(value["streak"], 11);
+        assert_eq!(value["threshold"], SEQUENTIAL_READ_CHURN_THRESHOLD as i64);
+        assert!(value["message"].as_str().unwrap().contains("11"));
     }
 }
