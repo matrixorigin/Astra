@@ -2091,13 +2091,14 @@ impl InProcessChatTurnBridge {
                 .unwrap_or("")
                 .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
-                crate::pipeline::evaluation::evaluate_tool_call_records(
+                crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
                     &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
                     0, // No stall events in single-call mode.
                     verdict_warning,
                     budget_pressure,
+                    crate::pipeline::evaluation::current_evaluation_thresholds(),
                 )
             });
             let tool_execution_ms: u64 = merged_tool_results

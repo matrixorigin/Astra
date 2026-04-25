@@ -62,13 +62,14 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
     };
     let verdict_warning =
         crate::server::run_lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
-    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records(
+    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        crate::pipeline::evaluation::current_evaluation_thresholds(),
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,

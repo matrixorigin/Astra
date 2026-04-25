@@ -1590,7 +1590,9 @@ pub(super) fn analyze_repl_turn_learning(
     recent_tools: &[String],
     result: &StreamResult,
 ) -> ReplTurnLearningSnapshot {
-    use astra_runtime::pipeline::evaluation::evaluate_tool_call_records;
+    use astra_runtime::pipeline::evaluation::{
+        current_evaluation_thresholds, evaluate_tool_call_records_with_thresholds,
+    };
     use astra_runtime::pipeline::routing::RoutingEngine;
     let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
 
@@ -1598,13 +1600,14 @@ pub(super) fn analyze_repl_turn_learning(
         v.severity.eq_ignore_ascii_case("warning") || v.severity.eq_ignore_ascii_case("critical")
     });
 
-    let eval = evaluate_tool_call_records(
+    let eval = evaluate_tool_call_records_with_thresholds(
         line,
         recent_tools,
         &result.tool_call_records,
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
+        current_evaluation_thresholds(),
     );
 
     ReplTurnLearningSnapshot { routing, eval }

@@ -46,19 +46,38 @@ pub enum EvalSignal {
     RedundantOverlappingReads(usize),
 }
 
-/// Threshold for [`EvalSignal::SequentialReadChurn`]: how many consecutive
-/// single-tool rounds we tolerate before flagging the turn. Calibrated against
-/// real session data: healthy turns (mutate→verify chains, locate→read pairs)
-/// observed up to 6; wasted turns (pure exploratory churn) observed at 10+.
+/// Default threshold for [`EvalSignal::SequentialReadChurn`]: how many
+/// consecutive single-tool rounds we tolerate before flagging the turn.
+/// Calibrated against real session data: healthy turns (mutate→verify chains,
+/// locate→read pairs) observed up to 6; wasted turns (pure exploratory churn)
+/// observed at 10+.
 pub const SEQUENTIAL_READ_CHURN_THRESHOLD: usize = 8;
 
-/// Threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum count of
-/// redundant read events needed before flagging the turn. Calibrated against
-/// 14k real sessions: at ≥3, the signal flags ~15% of `rounds≥8` turns and
-/// catches all confirmed-waste fixtures (c49bc4a3 t2 = 38, eafda07e t2 = 19,
-/// 8ba9d165 t2 = 19, 4178c6a7 t2 = 19, bbf46ab2 t3 = 11, bbf46ab2 t4 = 7)
-/// while leaving healthy short turns silent.
+/// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
+/// count of redundant read events needed before flagging the turn. Calibrated
+/// against 14k real sessions: at ≥3, the signal flags ~15% of `rounds≥8`
+/// turns and catches all confirmed-waste fixtures (c49bc4a3 t2 = 38,
+/// eafda07e t2 = 19, 8ba9d165 t2 = 19, 4178c6a7 t2 = 19, bbf46ab2 t3 = 11,
+/// bbf46ab2 t4 = 7) while leaving healthy short turns silent.
 pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
+
+/// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
+/// time constants above, but runtime callers may override them from config so
+/// passive eval signals can be tuned without a rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvaluationThresholds {
+    pub sequential_read_churn: usize,
+    pub redundant_overlapping_reads: usize,
+}
+
+impl Default for EvaluationThresholds {
+    fn default() -> Self {
+        Self {
+            sequential_read_churn: SEQUENTIAL_READ_CHURN_THRESHOLD,
+            redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+        }
+    }
+}
 
 /// Result of evaluating a turn's success and quality.
 #[derive(Debug, Clone)]
@@ -71,6 +90,8 @@ pub struct TurnEvaluation {
     pub confidence: f64,
     /// Signals that contributed to the evaluation.
     pub signals: Vec<EvalSignal>,
+    /// Thresholds used when deriving configurable passive eval signals.
+    pub thresholds: EvaluationThresholds,
 }
 
 /// Per-tool-call record for evaluation (matches ToolCallRecord shape).
@@ -115,6 +136,7 @@ pub fn evaluate_turn(
                 quality: 0.2,
                 confidence: 0.7,
                 signals,
+                thresholds: EvaluationThresholds::default(),
             };
         }
         // Conversational turn — no tools expected
@@ -123,6 +145,7 @@ pub fn evaluate_turn(
             quality: 0.5,
             confidence: 0.4, // low confidence for text-only turns
             signals,
+            thresholds: EvaluationThresholds::default(),
         };
     }
 
@@ -199,6 +222,7 @@ pub fn evaluate_turn(
         quality: quality.clamp(0.0, 1.0),
         confidence: confidence.clamp(0.0, 1.0),
         signals,
+        thresholds: EvaluationThresholds::default(),
     }
 }
 
@@ -209,6 +233,26 @@ pub fn evaluate_tool_call_records(
     stall_count: usize,
     verdict_warning: bool,
     budget_pressure: f64,
+) -> TurnEvaluation {
+    evaluate_tool_call_records_with_thresholds(
+        input,
+        recent_tools,
+        tool_call_records,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+        EvaluationThresholds::default(),
+    )
+}
+
+pub fn evaluate_tool_call_records_with_thresholds(
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+    thresholds: EvaluationThresholds,
 ) -> TurnEvaluation {
     // Synthetic placeholders (skill skipped/deferred, surgically removed
     // parallel tool calls) are audit-only records that do NOT represent real
@@ -263,19 +307,20 @@ pub fn evaluate_tool_call_records(
         budget_pressure,
         is_live_query,
     );
+    eval.thresholds = thresholds;
 
     // ─── Sequential read-churn detection ────────────────────────────────
     // Count the longest run of consecutive single-tool rounds across the
     // real (non-synthetic, non-policy-blocked) records. Excludes records
     // without a `round` index (e.g., orphaned tail records). When the run
-    // is ≥ SEQUENTIAL_READ_CHURN_THRESHOLD, the model almost certainly
+    // is ≥ the configured threshold, the model almost certainly
     // could have batched these calls into parallel rounds.
     let max_streak = longest_single_tool_round_streak(tool_call_records);
-    if max_streak >= SEQUENTIAL_READ_CHURN_THRESHOLD {
+    if max_streak >= thresholds.sequential_read_churn {
         eval.signals
             .push(EvalSignal::SequentialReadChurn(max_streak));
-        let penalty =
-            (0.05 + 0.01 * (max_streak - SEQUENTIAL_READ_CHURN_THRESHOLD) as f64).clamp(0.05, 0.20);
+        let penalty = (0.05 + 0.01 * (max_streak - thresholds.sequential_read_churn) as f64)
+            .clamp(0.05, 0.20);
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
@@ -288,11 +333,11 @@ pub fn evaluate_tool_call_records(
     // does NOT contribute to the count. Strictly observational at this
     // tier — no mid-loop intervention.
     let redundant_reads = count_redundant_overlapping_reads(tool_call_records);
-    if redundant_reads >= REDUNDANT_OVERLAPPING_READS_THRESHOLD {
+    if redundant_reads >= thresholds.redundant_overlapping_reads {
         eval.signals
             .push(EvalSignal::RedundantOverlappingReads(redundant_reads));
         let penalty = (0.03
-            + 0.01 * (redundant_reads - REDUNDANT_OVERLAPPING_READS_THRESHOLD) as f64)
+            + 0.01 * (redundant_reads - thresholds.redundant_overlapping_reads) as f64)
             .clamp(0.03, 0.15);
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
@@ -386,14 +431,20 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
         return None;
     }
     // `sed -n 'A,Bp' file`  (with or without quotes around the range)
-    let sed_re = SED_RANGE.get_or_init(|| {
-        Regex::new(r#"\bsed\s+-n\s+['"]?(\d+),(\d+)p['"]?\s+(\S+)"#).unwrap()
-    });
+    let sed_re = SED_RANGE
+        .get_or_init(|| Regex::new(r#"\bsed\s+-n\s+['"]?(\d+),(\d+)p['"]?\s+(\S+)"#).unwrap());
     if let Some(c) = sed_re.captures(args) {
         let s: u32 = c.get(1)?.as_str().parse().ok()?;
         let e: u32 = c.get(2)?.as_str().parse().ok()?;
-        let f = c.get(3)?.as_str().trim_matches(|x| x == '\'' || x == '"').to_string();
-        return Some(ReadRange { file: f, range: Some((s, e)) });
+        let f = c
+            .get(3)?
+            .as_str()
+            .trim_matches(|x| x == '\'' || x == '"')
+            .to_string();
+        return Some(ReadRange {
+            file: f,
+            range: Some((s, e)),
+        });
     }
     // Bare `cat <file>` — must NOT be part of a pipeline that accepts
     // input (heredoc, `<`, `<<`) and must NOT be a mutation (`>`/`>>`/`tee`).
@@ -404,10 +455,16 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
     if let Some(c) = cat_re.captures(args)
         && let Some(f) = c.get(1)
     {
-        let f = f.as_str().trim_matches(|x| x == '\'' || x == '"').to_string();
+        let f = f
+            .as_str()
+            .trim_matches(|x| x == '\'' || x == '"')
+            .to_string();
         // Skip if the "file" looks like an option (e.g. `-n`).
         if !f.starts_with('-') {
-            return Some(ReadRange { file: f, range: None });
+            return Some(ReadRange {
+                file: f,
+                range: None,
+            });
         }
     }
     None
@@ -418,8 +475,7 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
 /// clears the per-file read history so we don't over-flag legitimate
 /// "edit then verify" patterns.
 fn is_mutation_for_redundant_read(name: &str, args: &str) -> bool {
-    matches!(name, "edit" | "create" | "write")
-        || (name == "bash" && bash_args_look_mutating(args))
+    matches!(name, "edit" | "create" | "write") || (name == "bash" && bash_args_look_mutating(args))
 }
 
 fn bash_args_look_mutating(args: &str) -> bool {
@@ -430,9 +486,22 @@ fn bash_args_look_mutating(args: &str) -> bool {
     // Common mutating commands as substrings (tolerates prefixes like
     // `cd /tmp && mv …` or `sudo rm …`).
     const MUT_NEEDLES: &[&str] = &[
-        " mv ", " cp ", " rm ", "sed -i", "rmdir ", "mkdir ", "touch ",
-        "chmod ", "chown ", "git commit", "git add", "git checkout",
-        "git reset", "git rebase", "git merge", "git apply",
+        " mv ",
+        " cp ",
+        " rm ",
+        "sed -i",
+        "rmdir ",
+        "mkdir ",
+        "touch ",
+        "chmod ",
+        "chown ",
+        "git commit",
+        "git add",
+        "git checkout",
+        "git reset",
+        "git rebase",
+        "git merge",
+        "git apply",
     ];
     let padded = format!(" {args} ");
     MUT_NEEDLES.iter().any(|n| padded.contains(n))
@@ -489,6 +558,13 @@ pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
+    eval_signal_to_json_with_thresholds(signal, EvaluationThresholds::default())
+}
+
+pub fn eval_signal_to_json_with_thresholds(
+    signal: &EvalSignal,
+    thresholds: EvaluationThresholds,
+) -> serde_json::Value {
     match signal {
         EvalSignal::ToolErrorRate(rate) => json!({
             "kind": "tool_error_rate",
@@ -526,7 +602,7 @@ pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
         EvalSignal::SequentialReadChurn(streak) => json!({
             "kind": "sequential_read_churn",
             "streak": streak,
-            "threshold": SEQUENTIAL_READ_CHURN_THRESHOLD,
+            "threshold": thresholds.sequential_read_churn,
             "message": format!(
                 "Detected {streak} consecutive single-tool rounds — these calls likely should have been batched into parallel rounds"
             ),
@@ -534,7 +610,7 @@ pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
         EvalSignal::RedundantOverlappingReads(count) => json!({
             "kind": "redundant_overlapping_reads",
             "count": count,
-            "threshold": REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+            "threshold": thresholds.redundant_overlapping_reads,
             "message": format!(
                 "Detected {count} redundant read(s) with no intervening workspace mutation — the model likely re-read content already in context"
             ),
@@ -543,7 +619,17 @@ pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
 }
 
 pub fn eval_signals_to_json(signals: &[EvalSignal]) -> Vec<serde_json::Value> {
-    signals.iter().map(eval_signal_to_json).collect()
+    eval_signals_to_json_with_thresholds(signals, EvaluationThresholds::default())
+}
+
+pub fn eval_signals_to_json_with_thresholds(
+    signals: &[EvalSignal],
+    thresholds: EvaluationThresholds,
+) -> Vec<serde_json::Value> {
+    signals
+        .iter()
+        .map(|signal| eval_signal_to_json_with_thresholds(signal, thresholds))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -576,7 +662,7 @@ pub fn build_turn_evaluation_journal_event(
             .iter()
             .filter(|r| !r.is_synthetic_placeholder() && !r.was_blocked_by_policy())
             .count(),
-        eval_signals_to_json(&eval.signals),
+        eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds),
     )
 }
 
@@ -1266,6 +1352,7 @@ mod tests {
                 quality: 0.8,
                 confidence: 0.9,
                 signals: vec![],
+                thresholds: EvaluationThresholds::default(),
             },
         );
 
@@ -1480,6 +1567,31 @@ mod tests {
     }
 
     #[test]
+    fn sequential_read_churn_custom_threshold_is_respected() {
+        let records: Vec<_> = (0..6)
+            .map(|r| record_in_round("git_show", r, None))
+            .collect();
+        let eval = evaluate_tool_call_records_with_thresholds(
+            "review",
+            &[],
+            &records,
+            0,
+            false,
+            0.3,
+            EvaluationThresholds {
+                sequential_read_churn: 6,
+                ..Default::default()
+            },
+        );
+        let streak = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::SequentialReadChurn(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(streak, Some(6));
+        assert_eq!(eval.thresholds.sequential_read_churn, 6);
+    }
+
+    #[test]
     fn sequential_read_churn_streak_broken_by_round_gap() {
         // Rounds 0,1,2 (single-tool) then gap (round 3 missing) then
         // rounds 4,5,6,7,8,9,10,11,12 (single-tool). Without gap-awareness
@@ -1655,7 +1767,10 @@ mod tests {
             _ => None,
         });
         // calls 2 and 3 each overlap a prior, and threshold=3 fires only at 3.
-        assert_eq!(count, None, "only 2 redundant — below threshold 3, must be silent");
+        assert_eq!(
+            count, None,
+            "only 2 redundant — below threshold 3, must be silent"
+        );
     }
 
     #[test]
@@ -1699,7 +1814,8 @@ mod tests {
         ];
         let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
         assert!(
-            !eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
             "distinct files should not trigger redundancy; got {:?}",
@@ -1730,11 +1846,51 @@ mod tests {
         let v = eval_signal_to_json(&EvalSignal::RedundantOverlappingReads(5));
         assert_eq!(v["kind"], "redundant_overlapping_reads");
         assert_eq!(v["count"], 5);
-        assert_eq!(
-            v["threshold"],
-            REDUNDANT_OVERLAPPING_READS_THRESHOLD as i64
-        );
+        assert_eq!(v["threshold"], REDUNDANT_OVERLAPPING_READS_THRESHOLD as i64);
         assert!(v["message"].as_str().unwrap().contains("redundant"));
+    }
+
+    #[test]
+    fn redundant_reads_custom_threshold_flows_into_journal_json() {
+        let records = vec![
+            record_with_args("bash", 0, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 2, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 3, "sed -n '10,50p' src/foo.rs"),
+        ];
+        let eval = evaluate_tool_call_records_with_thresholds(
+            "fix bug",
+            &[],
+            &records,
+            0,
+            false,
+            0.3,
+            EvaluationThresholds {
+                redundant_overlapping_reads: 3,
+                ..Default::default()
+            },
+        );
+        let event = build_turn_evaluation_journal_event(
+            Some("sess-1"),
+            Some(1),
+            "cli_repl",
+            "fix bug",
+            &[],
+            &records,
+            0,
+            false,
+            0.3,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        let redundant = metadata["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["kind"] == "redundant_overlapping_reads")
+            .expect("redundant signal");
+        assert_eq!(redundant["count"], 3);
+        assert_eq!(redundant["threshold"], 3);
     }
 
     #[test]
@@ -1747,7 +1903,8 @@ mod tests {
         ];
         let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
         assert!(
-            !eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
             "2 redundant reads must be silent (threshold=3); got {:?}",
@@ -1767,7 +1924,8 @@ mod tests {
         ];
         let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
         assert!(
-            !eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
             "grep calls must not be classified as reads; got {:?}",

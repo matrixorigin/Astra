@@ -137,7 +137,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
     let parallel_batching_force_threshold = crate::runtime_config::RuntimeConfig::load()
         .tool_selection
-        .effective_parallel_batching_force_streak() as usize;
+        .effective_parallel_batching_force_streak()
+        as usize;
     if should_force_parallel_batching(state, parallel_batching_force_threshold) {
         let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
         state.stall.forced_parallel_batching = true;
@@ -528,7 +529,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // Using a named variable rather than a literal makes the contract self-
     // documenting and prevents accidental copy-paste to a broader scope.
     let model_ignored_phase1_corrective = true;
-    if should_abort_for_round_budget_phase2(state, model_ignored_phase1_corrective, round_budget_hard_limit) {
+    if should_abort_for_round_budget_phase2(
+        state,
+        model_ignored_phase1_corrective,
+        round_budget_hard_limit,
+    ) {
         state.stall.forced_round_budget_phase2 = true;
         let abort_msg = format!(
             "[Round budget hard-limit reached at round {}. The runtime injected a \
@@ -894,10 +899,7 @@ pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
 /// Whether to inject phase-1 corrective on the upcoming round. Caller passes
 /// the effective hard limit so test/runtime/ToolSelectionConfig overrides
 /// flow through.
-pub(crate) fn should_inject_round_budget_phase1(
-    state: &AgenticLoopState,
-    hard_limit: u32,
-) -> bool {
+pub(crate) fn should_inject_round_budget_phase1(state: &AgenticLoopState, hard_limit: u32) -> bool {
     if state.stall.forced_round_budget_phase1 {
         return false;
     }
@@ -1779,7 +1781,10 @@ mod tests {
             push_single_tool_round(&mut state);
         }
         // Precondition: without escalation flag, parallel-batching would fire.
-        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
         // Once escalation has fired, parallel-batching must yield.
         state.stall.forced_execution_escalation = true;
         assert!(
@@ -1795,7 +1800,10 @@ mod tests {
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
-        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
         state.stall.forced_execution_retry = true;
         assert!(
             !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
@@ -1840,7 +1848,10 @@ mod tests {
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
-        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
     }
 
     #[test]
@@ -1850,7 +1861,10 @@ mod tests {
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1) {
             push_single_tool_round(&mut state);
         }
-        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(!should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
     }
 
     #[test]
@@ -1871,7 +1885,10 @@ mod tests {
                 .messages
                 .push(serde_json::json!({"role": "tool", "content": "..."}));
         }
-        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(!should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
     }
 
     #[test]
@@ -1882,12 +1899,18 @@ mod tests {
             push_single_tool_round(&mut state);
         }
         // First time would fire...
-        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
         // ...but once the flag is set, a second attempt is suppressed even
         // if the model produces yet another single-tool round.
         state.stall.forced_parallel_batching = true;
         push_single_tool_round(&mut state);
-        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(!should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
     }
 
     #[test]
@@ -1916,12 +1939,18 @@ mod tests {
         }
         // ...so before the warning zone, this must NOT fire.
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
-        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(!should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
 
         // Once round_index crosses ROUND_BUDGET_THRESHOLD, the same streak of
         // 3 must fire — this is the coupling we want.
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
     }
 
     #[test]
@@ -1935,7 +1964,10 @@ mod tests {
         // Even deep into the warning zone, a streak below the late threshold
         // (=3) must not fire — we don't punish a single isolated single-tool
         // round just because the turn is long.
-        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
+        assert!(!should_force_parallel_batching(
+            &state,
+            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        ));
     }
 
     // ─── Round-budget convergence guard (two-phase) ──────────────────────
@@ -2019,22 +2051,30 @@ mod tests {
         // Without phase-1 set, phase-2 must not abort even if last round had
         // tool calls — the model never received the corrective.
         state.stall.forced_round_budget_phase1 = false;
-        assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
+        assert!(!should_abort_for_round_budget_phase2(
+            &state, true, hard_limit
+        ));
 
         // With phase-1 set but the model produced text-only on the next
         // round (ignored: false), phase-2 must NOT abort: the model
         // complied. The loop should drain naturally.
         state.stall.forced_round_budget_phase1 = true;
-        assert!(!should_abort_for_round_budget_phase2(&state, false, hard_limit));
+        assert!(!should_abort_for_round_budget_phase2(
+            &state, false, hard_limit
+        ));
 
         // Phase-1 fired AND model still attempted tools next round: abort.
-        assert!(should_abort_for_round_budget_phase2(&state, true, hard_limit));
+        assert!(should_abort_for_round_budget_phase2(
+            &state, true, hard_limit
+        ));
 
         // Sanity guard: even with phase-1 set and tool calls present, if
         // llm_rounds_completed is below the hard limit, phase-2 must NOT
         // fire — prevents mis-set flags from aborting prematurely.
         state.llm_rounds_completed = hard_limit - 1;
-        assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
+        assert!(!should_abort_for_round_budget_phase2(
+            &state, true, hard_limit
+        ));
     }
 
     #[test]
@@ -2046,7 +2086,9 @@ mod tests {
         state.stall.forced_round_budget_phase2 = true;
         // Even with phase-1 set and tool calls present, once phase-2 has
         // already fired we must not re-trigger.
-        assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
+        assert!(!should_abort_for_round_budget_phase2(
+            &state, true, hard_limit
+        ));
     }
 
     fn push_redundant_sed_read(state: &mut AgenticLoopState, round: u32) {

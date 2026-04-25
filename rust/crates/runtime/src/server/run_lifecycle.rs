@@ -427,13 +427,15 @@ fn build_runtime_turn_evaluation_event(
     state: &AgenticLoopState,
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
-    let eval = crate::pipeline::evaluation::evaluate_tool_call_records(
+    let eval_thresholds = crate::pipeline::evaluation::current_evaluation_thresholds();
+    let eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        eval_thresholds,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),

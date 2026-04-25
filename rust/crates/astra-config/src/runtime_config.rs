@@ -349,6 +349,20 @@ pub struct ToolSelectionConfig {
     /// more rope.
     #[serde(default)]
     pub redundant_reads_midloop_threshold: u32,
+
+    /// Post-mortem eval signal threshold: longest run of consecutive
+    /// single-tool rounds required before emitting `SequentialReadChurn`.
+    /// 0 = use default (8). Lower values make passive scoring stricter;
+    /// higher values make the signal rarer.
+    #[serde(default)]
+    pub sequential_read_churn_eval_threshold: u32,
+
+    /// Post-mortem eval signal threshold: redundant overlapping reads of the
+    /// same file (no intervening mutation) required before emitting
+    /// `RedundantOverlappingReads`. 0 = use default (3). Lower values make
+    /// passive scoring stricter; higher values make the signal rarer.
+    #[serde(default)]
+    pub redundant_reads_eval_threshold: u32,
 }
 
 impl ToolSelectionConfig {
@@ -410,6 +424,28 @@ impl ToolSelectionConfig {
             4
         }
     }
+
+    /// Resolved post-mortem sequential-read-churn eval threshold (0 →
+    /// default of 8). Floor of 2 avoids flagging every isolated single-tool
+    /// turn when misconfigured.
+    pub fn effective_sequential_read_churn_eval_threshold(&self) -> u32 {
+        if self.sequential_read_churn_eval_threshold > 0 {
+            self.sequential_read_churn_eval_threshold.max(2)
+        } else {
+            8
+        }
+    }
+
+    /// Resolved post-mortem redundant-reads eval threshold (0 → default of
+    /// 3). Floor of 2 avoids flagging the first redundant check when
+    /// misconfigured.
+    pub fn effective_redundant_reads_eval_threshold(&self) -> u32 {
+        if self.redundant_reads_eval_threshold > 0 {
+            self.redundant_reads_eval_threshold.max(2)
+        } else {
+            3
+        }
+    }
 }
 
 fn default_max_tools() -> u32 {
@@ -442,6 +478,8 @@ impl Default for ToolSelectionConfig {
             round_budget_limit: 0,
             parallel_batching_force_streak: 0,
             redundant_reads_midloop_threshold: 0,
+            sequential_read_churn_eval_threshold: 0,
+            redundant_reads_eval_threshold: 0,
         }
     }
 }
@@ -962,6 +1000,8 @@ impl RuntimeConfig {
             round_budget_limit,
             parallel_batching_force_streak,
             redundant_reads_midloop_threshold,
+            sequential_read_churn_eval_threshold,
+            redundant_reads_eval_threshold,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -1029,6 +1069,16 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.redundant_reads_midloop_threshold,
             redundant_reads_midloop_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.sequential_read_churn_eval_threshold,
+            sequential_read_churn_eval_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.redundant_reads_eval_threshold,
+            redundant_reads_eval_threshold,
             0,
         );
 
@@ -1443,6 +1493,8 @@ mod tests {
                 round_budget_limit: 0,
                 parallel_batching_force_streak: 0,
                 redundant_reads_midloop_threshold: 0,
+                sequential_read_churn_eval_threshold: 0,
+                redundant_reads_eval_threshold: 0,
             },
             learning: LearningConfig {
                 enabled: false,
@@ -1682,5 +1734,41 @@ selector_model = "qwen-flash"
             ..Default::default()
         };
         assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 2);
+    }
+
+    #[test]
+    fn sequential_read_churn_eval_threshold_default_and_floor() {
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 8);
+
+        let cfg = ToolSelectionConfig {
+            sequential_read_churn_eval_threshold: 10,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 10);
+
+        let cfg = ToolSelectionConfig {
+            sequential_read_churn_eval_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_sequential_read_churn_eval_threshold(), 2);
+    }
+
+    #[test]
+    fn redundant_reads_eval_threshold_default_and_floor() {
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 3);
+
+        let cfg = ToolSelectionConfig {
+            redundant_reads_eval_threshold: 6,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 6);
+
+        let cfg = ToolSelectionConfig {
+            redundant_reads_eval_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 2);
     }
 }
