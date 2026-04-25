@@ -113,6 +113,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             "role": "user",
             "content": execution_escalation_message(&state.message, read_only_calls),
         }));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "execution_escalation",
+            read_only_calls,
+            round = state.llm_rounds_completed,
+            "loop guard fired"
+        );
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
@@ -135,6 +142,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             "role": "user",
             "content": parallel_batching_force_message(streak, &state.message),
         }));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "parallel_batching_force",
+            streak,
+            round = state.llm_rounds_completed,
+            "loop guard fired"
+        );
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
@@ -375,6 +389,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     "role": "user",
                     "content": execution_retry_message(&state.message),
                 }));
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "execution_retry",
+                    round = state.llm_rounds_completed,
+                    "loop guard fired"
+                );
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
@@ -451,6 +471,9 @@ fn should_force_execution_retry(state: &AgenticLoopState) -> bool {
     // tokens, and risk contradicting guidance. One corrective injection per
     // turn is the invariant.
     if state.stall.forced_execution_escalation {
+        return false;
+    }
+    if state.stall.forced_parallel_batching {
         return false;
     }
     if has_concrete_workspace_mutation(state) {
@@ -1400,6 +1423,22 @@ mod tests {
 
         // With the escalation flag set, retry must yield.
         state.stall.forced_execution_escalation = true;
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_blocks_subsequent_retry_in_same_turn() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.final_text = "I'll continue investigating.".into();
+        state.total_tool_calls = 10;
+        // Without the parallel-batching flag, this state would trigger retry.
+        assert!(should_force_execution_retry(&state));
+        // Once the parallel-batching force fired, retry must yield to honor
+        // the one-corrective-per-turn invariant.
+        state.stall.forced_parallel_batching = true;
         assert!(!should_force_execution_retry(&state));
     }
 
