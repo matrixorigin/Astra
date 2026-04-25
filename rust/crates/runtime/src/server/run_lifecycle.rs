@@ -3676,11 +3676,6 @@ mod tests {
     }
 
     fn runtime_db_it_settings(database: &str) -> MatrixOneSettings {
-        assert_eq!(
-            std::env::var("ASTRA_RUNTIME_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_RUNTIME_DB_IT=1 for ignored runtime DB e2e tests"
-        );
         dotenvy::dotenv().ok();
         MatrixOneSettings {
             host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
