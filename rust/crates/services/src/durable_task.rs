@@ -38,6 +38,41 @@ fn build_client_for_url(url: &str) -> reqwest::Client {
 /// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
 const MAX_VERIFICATION_HISTORY_ROWS: i64 = 10_000;
 
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.components()
+        .fold(std::path::PathBuf::new(), |mut acc, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => acc.push(other),
+            }
+            acc
+        })
+}
+
+fn unique_path_variants(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut variants = vec![normalize_path(path)];
+    if let Ok(canonical) = path.canonicalize()
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+fn is_within_work_dir(path: &std::path::Path, work_dir: &std::path::Path) -> bool {
+    let path_variants = unique_path_variants(path);
+    let work_dir_variants = unique_path_variants(work_dir);
+
+    path_variants.iter().any(|candidate| {
+        work_dir_variants
+            .iter()
+            .any(|root| candidate == root || candidate.starts_with(root))
+    })
+}
+
 // ─── LLM Judge Trait ────────────────────────────────────────────────────────
 
 /// Trait for LLM-based semantic verification.
@@ -987,16 +1022,15 @@ impl VerificationRunner {
                     std::path::PathBuf::from(path)
                 } else {
                     let full = self.work_dir.join(path);
+                    let normalized = normalize_path(&full);
+                    if !is_within_work_dir(&normalized, &self.work_dir) {
+                        return Err(format!("path '{path}' escapes work directory boundary"));
+                    }
                     if full.exists() {
-                        // Security: prevent relative path traversal (e.g. "../../../etc/passwd")
                         let canonical = full
                             .canonicalize()
                             .map_err(|e| format!("invalid path {path}: {e}"))?;
-                        let work_canonical = self
-                            .work_dir
-                            .canonicalize()
-                            .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
-                        if !canonical.starts_with(&work_canonical) {
+                        if !is_within_work_dir(&canonical, &self.work_dir) {
                             return Err(format!("path '{path}' escapes work directory boundary"));
                         }
                         canonical
@@ -1009,11 +1043,7 @@ impl VerificationRunner {
                         let canonical = found
                             .canonicalize()
                             .map_err(|e| format!("invalid path {path}: {e}"))?;
-                        let work_canonical = self
-                            .work_dir
-                            .canonicalize()
-                            .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
-                        if !canonical.starts_with(&work_canonical) {
+                        if !is_within_work_dir(&canonical, &self.work_dir) {
                             return Err(format!("path '{path}' escapes work directory boundary"));
                         }
                         canonical

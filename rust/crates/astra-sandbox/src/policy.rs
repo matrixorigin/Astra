@@ -1,6 +1,17 @@
 //! Sandbox policy configuration.
 
-use std::path::PathBuf;
+use crate::path::normalize_path;
+use std::path::{Path, PathBuf};
+
+fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut variants = vec![normalize_path(path)];
+    if let Ok(canonical) = path.canonicalize()
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
 
 /// Security enforcement level (ordered from least to most restrictive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -165,10 +176,16 @@ impl SandboxPolicy {
         if self.mode == SandboxMode::Permissive {
             return true;
         }
-        if path.starts_with(&self.project_root) {
-            return true;
-        }
-        self.allowed_paths.iter().any(|ap| path.starts_with(ap))
+        let path_variants = unique_path_variants(path);
+        let prefix_matches = |prefix: &Path| {
+            let prefix_variants = unique_path_variants(prefix);
+            path_variants.iter().any(|candidate| {
+                prefix_variants
+                    .iter()
+                    .any(|allowed| candidate.starts_with(allowed))
+            })
+        };
+        prefix_matches(&self.project_root) || self.allowed_paths.iter().any(|ap| prefix_matches(ap))
     }
 
     /// Check if an environment variable should be passed to child process.
@@ -248,6 +265,21 @@ mod tests {
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/proj")));
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/proj/deep/dir")));
         assert!(!p.is_path_allowed(std::path::Path::new("/home/user")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_project_root_alias_is_allowed_for_existing_paths() {
+        let real_root = tempfile::tempdir().unwrap();
+        let alias_parent = tempfile::tempdir().unwrap();
+        let alias_root = alias_parent.path().join("project-alias");
+        std::os::unix::fs::symlink(real_root.path(), &alias_root).unwrap();
+
+        let file = real_root.path().join("nested.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let p = SandboxPolicy::for_project(&alias_root);
+        assert!(p.is_path_allowed(&file.canonicalize().unwrap()));
     }
 
     #[test]

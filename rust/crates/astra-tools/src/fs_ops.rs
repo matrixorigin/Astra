@@ -23,6 +23,55 @@ const BINARY_EXTS: &[&str] = &[
     "ttf", "otf", "woff", "woff2", "eot", "sqlite", "db", "mdb", "ico",
 ];
 
+fn normalize_path(path: &Path) -> PathBuf {
+    path.components()
+        .fold(PathBuf::new(), |mut acc, component| {
+            match component {
+                std::path::Component::ParentDir => {
+                    acc.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => acc.push(other),
+            }
+            acc
+        })
+}
+
+fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut variants = vec![normalize_path(path)];
+    if let Ok(canonical) = path.canonicalize()
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+fn is_within_workspace_root(path: &Path, workspace_root: &Path) -> bool {
+    let path_variants = unique_path_variants(path);
+    let root_variants = unique_path_variants(workspace_root);
+
+    path_variants.iter().any(|candidate| {
+        root_variants
+            .iter()
+            .any(|root| candidate == root || candidate.starts_with(root))
+    })
+}
+
+pub(crate) fn relative_to_workspace_root(workspace_root: &Path, path: &Path) -> Option<PathBuf> {
+    let path_variants = unique_path_variants(path);
+    let root_variants = unique_path_variants(workspace_root);
+
+    path_variants.iter().find_map(|candidate| {
+        root_variants.iter().find_map(|root| {
+            candidate
+                .strip_prefix(root)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        })
+    })
+}
+
 /// Resolve a relative path against workspace_root with normalization.
 ///
 /// Returns an error if the resolved path escapes the workspace boundary.
@@ -33,16 +82,7 @@ pub fn resolve_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, St
         workspace_root.join(relative)
     };
 
-    let normalized = path.components().fold(PathBuf::new(), |mut acc, c| {
-        match c {
-            std::path::Component::ParentDir => {
-                acc.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => acc.push(other),
-        }
-        acc
-    });
+    let normalized = normalize_path(&path);
 
     let final_path = if normalized.exists() {
         normalized
@@ -52,7 +92,7 @@ pub fn resolve_path(workspace_root: &Path, relative: &str) -> Result<PathBuf, St
         normalized
     };
 
-    if !final_path.starts_with(workspace_root) {
+    if !is_within_workspace_root(&final_path, workspace_root) {
         return Err(format!(
             "SANDBOX_DENIED: Path '{}' is outside workspace root '{}'",
             relative,
@@ -1201,6 +1241,21 @@ mod tests {
         let result = list_dir(tmp.path(), &args);
         assert!(result.output.contains("a.txt"));
         assert!(result.output.contains("sub/"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_allows_existing_path_under_workspace_alias() {
+        let real_root = TempDir::new().unwrap();
+        let alias_parent = TempDir::new().unwrap();
+        let alias_root = alias_parent.path().join("workspace-alias");
+        std::os::unix::fs::symlink(real_root.path(), &alias_root).unwrap();
+
+        let file = real_root.path().join("nested.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let resolved = resolve_path(&alias_root, "nested.txt").unwrap();
+        assert_eq!(resolved, file.canonicalize().unwrap());
     }
 
     #[test]

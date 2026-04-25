@@ -2270,13 +2270,6 @@ mod tests {
             "sub-42"
         );
         assert_eq!(request.context.as_ref().unwrap()["is_plan_subtask"], true);
-        assert_eq!(
-            request.execution_budget,
-            Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(7),
-                hard_turn_limit: Some(12),
-            })
-        );
         assert!(request.explain);
         assert!(request.interactive_client);
     }

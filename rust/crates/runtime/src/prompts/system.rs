@@ -1150,6 +1150,19 @@ pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -
 ///
 /// This is generic and history-based: it looks only at the current round index
 /// plus whether the visible conversation ends with tool results.
+fn is_trailing_runtime_system_message(message: &serde_json::Value) -> bool {
+    message.get("role").and_then(|r| r.as_str()) == Some("system")
+}
+
+fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .skip_while(|message| is_trailing_runtime_system_message(message))
+        .take_while(|message| message.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count()
+}
+
 pub fn synthesize_or_batch_directive(
     messages: &[serde_json::Value],
     round_index: u32,
@@ -1159,11 +1172,7 @@ pub fn synthesize_or_batch_directive(
         return String::new();
     }
 
-    let trailing_tool_count = messages
-        .iter()
-        .rev()
-        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .count();
+    let trailing_tool_count = trailing_tool_result_count(messages);
     if trailing_tool_count == 0 {
         return String::new();
     }
@@ -1205,11 +1214,7 @@ pub fn tool_round_guidance_trace_with(
     limit: u32,
 ) -> (String, PromptGuidanceSignals) {
     let round_budget_warning = round_index >= warning;
-    let trailing_tool_count = messages
-        .iter()
-        .rev()
-        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .count();
+    let trailing_tool_count = trailing_tool_result_count(messages);
     let synthesize_or_batch = round_index >= warning && trailing_tool_count > 0;
     let parallel_feedback = trailing_tool_count > 1;
 
@@ -1238,12 +1243,7 @@ pub fn parallel_execution_feedback(messages: &[serde_json::Value]) -> String {
     if messages.is_empty() {
         return String::new();
     }
-    // Count trailing consecutive tool-role messages (results from last round).
-    let tool_count = messages
-        .iter()
-        .rev()
-        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .count();
+    let tool_count = trailing_tool_result_count(messages);
     if tool_count > 1 {
         format!(
             "\n\n✓ Previous round: {tool_count} tools executed in parallel — excellent. \
@@ -2713,6 +2713,34 @@ mod tests {
         assert!(guidance.contains("Synthesize Or Batch Now"));
         assert!(guidance.contains("2 tools executed in parallel"));
         assert!(signals.round_budget_warning);
+        assert!(signals.synthesize_or_batch);
+        assert!(signals.parallel_feedback);
+    }
+
+    #[test]
+    fn tool_round_guidance_ignores_trailing_runtime_system_messages() {
+        let messages = vec![
+            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+            serde_json::json!({"role": "tool", "content": "README.md"}),
+            serde_json::json!({
+                "role": "system",
+                "content": "✓ 2 tools executed in parallel — excellent. Keep batching independent operations."
+            }),
+            serde_json::json!({
+                "role": "system",
+                "content": "## Already Fetched (do NOT re-read/re-grep these)\nFiles: README.md"
+            }),
+        ];
+
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &messages,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+
+        assert!(guidance.contains("Synthesize Or Batch Now"));
+        assert!(guidance.contains("2 tools executed in parallel"));
         assert!(signals.synthesize_or_batch);
         assert!(signals.parallel_feedback);
     }
