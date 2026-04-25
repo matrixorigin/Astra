@@ -334,6 +334,21 @@ pub struct ToolSelectionConfig {
     /// 0 = use default (6). Set higher for complex multi-file tasks.
     #[serde(default)]
     pub round_budget_limit: u32,
+
+    /// Mid-loop guard: number of consecutive single-tool rounds tolerated
+    /// before the runtime injects a parallel-batching corrective. 0 = use
+    /// default (5). Lower values intervene more aggressively; higher values
+    /// give the model more rope before correction.
+    #[serde(default)]
+    pub parallel_batching_force_streak: u32,
+
+    /// Mid-loop guard: count of redundant overlapping reads of the same file
+    /// (no intervening edit) tolerated before the runtime injects a
+    /// "use existing context" corrective. 0 = use default (4). Tune lower
+    /// to intervene sooner on read-loop turns; tune higher to leave models
+    /// more rope.
+    #[serde(default)]
+    pub redundant_reads_midloop_threshold: u32,
 }
 
 impl ToolSelectionConfig {
@@ -374,6 +389,27 @@ impl ToolSelectionConfig {
             15
         }
     }
+
+    /// Resolved parallel-batching force streak threshold (0 → default of 5).
+    /// Floor of 2 prevents a misconfiguration from triggering on every round.
+    pub fn effective_parallel_batching_force_streak(&self) -> u32 {
+        if self.parallel_batching_force_streak > 0 {
+            self.parallel_batching_force_streak.max(2)
+        } else {
+            5
+        }
+    }
+
+    /// Resolved redundant-reads mid-loop corrective threshold (0 → default
+    /// of 4). Floor of 2 prevents pathological aggressive intervention; one
+    /// re-read is normal noise and we never want to fire on count = 1.
+    pub fn effective_redundant_reads_midloop_threshold(&self) -> u32 {
+        if self.redundant_reads_midloop_threshold > 0 {
+            self.redundant_reads_midloop_threshold.max(2)
+        } else {
+            4
+        }
+    }
 }
 
 fn default_max_tools() -> u32 {
@@ -404,6 +440,8 @@ impl Default for ToolSelectionConfig {
             max_tools_per_turn: 0,
             round_budget_warning: 0,
             round_budget_limit: 0,
+            parallel_batching_force_streak: 0,
+            redundant_reads_midloop_threshold: 0,
         }
     }
 }
@@ -922,6 +960,8 @@ impl RuntimeConfig {
             max_tools_per_turn,
             round_budget_warning,
             round_budget_limit,
+            parallel_batching_force_streak,
+            redundant_reads_midloop_threshold,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -979,6 +1019,16 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.round_budget_limit,
             round_budget_limit,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.parallel_batching_force_streak,
+            parallel_batching_force_streak,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.redundant_reads_midloop_threshold,
+            redundant_reads_midloop_threshold,
             0,
         );
 
@@ -1391,6 +1441,8 @@ mod tests {
                 max_tools_per_turn: 0,
                 round_budget_warning: 0,
                 round_budget_limit: 0,
+                parallel_batching_force_streak: 0,
+                redundant_reads_midloop_threshold: 0,
             },
             learning: LearningConfig {
                 enabled: false,
@@ -1592,5 +1644,43 @@ selector_model = "qwen-flash"
             ..Default::default()
         };
         assert_eq!(cfg.effective_round_budget_limit(), 15);
+    }
+
+    #[test]
+    fn parallel_batching_force_streak_default_and_floor() {
+        // 0 → default 5
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_parallel_batching_force_streak(), 5);
+        // explicit override respected
+        let cfg = ToolSelectionConfig {
+            parallel_batching_force_streak: 8,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_parallel_batching_force_streak(), 8);
+        // pathological override 1 floors to 2
+        let cfg = ToolSelectionConfig {
+            parallel_batching_force_streak: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_parallel_batching_force_streak(), 2);
+    }
+
+    #[test]
+    fn redundant_reads_midloop_threshold_default_and_floor() {
+        // 0 → default 4
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 4);
+        // explicit override respected
+        let cfg = ToolSelectionConfig {
+            redundant_reads_midloop_threshold: 6,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 6);
+        // pathological override 1 floors to 2
+        let cfg = ToolSelectionConfig {
+            redundant_reads_midloop_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_redundant_reads_midloop_threshold(), 2);
     }
 }

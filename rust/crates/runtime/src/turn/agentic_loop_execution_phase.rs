@@ -135,7 +135,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // streak of trailing single-tool rounds despite the prompt-layer nudge,
     // regardless of task type. Catches the "exploratory churn" failure mode
     // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
-    if should_force_parallel_batching(state) {
+    let parallel_batching_force_threshold = crate::runtime_config::RuntimeConfig::load()
+        .tool_selection
+        .effective_parallel_batching_force_streak() as usize;
+    if should_force_parallel_batching(state, parallel_batching_force_threshold) {
         let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
         state.stall.forced_parallel_batching = true;
         state.messages.push(serde_json::json!({
@@ -197,8 +200,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // rather than re-reading. Lives below round-budget phase-1 because
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
+    let redundant_reads_threshold = crate::runtime_config::RuntimeConfig::load()
+        .tool_selection
+        .effective_redundant_reads_midloop_threshold() as usize;
     if !state.stall.forced_round_budget_phase1
-        && should_inject_redundant_reads_corrective(state, REDUNDANT_READS_MIDLOOP_THRESHOLD)
+        && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
     {
         let count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
             &state.stall.tool_call_records,
@@ -213,7 +219,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             tier = "redundant_reads_corrective",
             round = state.llm_rounds_completed,
             count = count,
-            threshold = REDUNDANT_READS_MIDLOOP_THRESHOLD,
+            threshold = redundant_reads_threshold,
             "loop guard fired"
         );
         if !prep.quiet {
@@ -791,6 +797,10 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 /// (=4) escalates into a forced corrective injection. One above the nudge
 /// threshold so the model gets exactly ONE chance to self-correct before we
 /// intervene with a higher-priority `user` message.
+/// Default for the early-streak threshold; the actual value used at runtime
+/// flows through `ToolSelectionConfig::effective_parallel_batching_force_streak`.
+/// Must match `effective_parallel_batching_force_streak`'s zero-default.
+#[allow(dead_code)]
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
 
 /// Tightened streak threshold once the turn has entered the round-budget
@@ -800,6 +810,7 @@ pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
 /// Empirical real-session data: turns near the round-budget warning that
 /// added a 3rd consecutive single-tool round virtually never converged
 /// without external correction.
+#[allow(dead_code)]
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE: usize = 3;
 
 pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
@@ -811,7 +822,10 @@ pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(PARALLEL_BATCHING_FORCE_MARKER))
 }
 
-pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState) -> bool {
+pub(crate) fn should_force_parallel_batching(
+    state: &AgenticLoopState,
+    early_threshold: usize,
+) -> bool {
     if state.stall.forced_parallel_batching {
         return false;
     }
@@ -821,10 +835,15 @@ pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState) -> bool {
         return false;
     }
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    // Late-budget threshold stays derived (compile-time floor of 2): once the
+    // model is close to the round-budget warning, even a short streak should
+    // trigger correction. Derived as `max(2, early - 2)` to preserve the
+    // original (5, 3) gap without requiring a separate config knob.
+    let late_threshold = early_threshold.saturating_sub(2).max(2);
     let threshold = if state.llm_rounds_completed >= crate::prompts::ROUND_BUDGET_THRESHOLD {
-        PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE
+        late_threshold
     } else {
-        PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+        early_threshold
     };
     streak >= threshold
 }
@@ -944,8 +963,14 @@ pub(crate) const REDUNDANT_READS_MARKER: &str = "## ⤴ Redundant Reads Detected
 /// healthy double-checking; three matches the post-mortem signal but at
 /// mid-loop we wait one more event to avoid premature intervention on
 /// borderline turns.
+/// Default for the redundant-reads mid-loop threshold; the actual value used
+/// at runtime flows through
+/// `ToolSelectionConfig::effective_redundant_reads_midloop_threshold`. Must
+/// match that accessor's zero-default.
+#[allow(dead_code)]
 pub(crate) const REDUNDANT_READS_MIDLOOP_THRESHOLD: usize = 4;
 
+#[allow(dead_code)]
 pub(crate) fn is_redundant_reads_corrective(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
         return false;
@@ -1754,11 +1779,11 @@ mod tests {
             push_single_tool_round(&mut state);
         }
         // Precondition: without escalation flag, parallel-batching would fire.
-        assert!(should_force_parallel_batching(&state));
+        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
         // Once escalation has fired, parallel-batching must yield.
         state.stall.forced_execution_escalation = true;
         assert!(
-            !should_force_parallel_batching(&state),
+            !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
             "parallel-batching must not fire when escalation already active"
         );
     }
@@ -1770,10 +1795,10 @@ mod tests {
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
-        assert!(should_force_parallel_batching(&state));
+        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
         state.stall.forced_execution_retry = true;
         assert!(
-            !should_force_parallel_batching(&state),
+            !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
             "parallel-batching must not fire when retry already active"
         );
     }
@@ -1815,7 +1840,7 @@ mod tests {
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
-        assert!(should_force_parallel_batching(&state));
+        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
     }
 
     #[test]
@@ -1825,7 +1850,7 @@ mod tests {
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1) {
             push_single_tool_round(&mut state);
         }
-        assert!(!should_force_parallel_batching(&state));
+        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
     }
 
     #[test]
@@ -1846,7 +1871,7 @@ mod tests {
                 .messages
                 .push(serde_json::json!({"role": "tool", "content": "..."}));
         }
-        assert!(!should_force_parallel_batching(&state));
+        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
     }
 
     #[test]
@@ -1857,12 +1882,12 @@ mod tests {
             push_single_tool_round(&mut state);
         }
         // First time would fire...
-        assert!(should_force_parallel_batching(&state));
+        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
         // ...but once the flag is set, a second attempt is suppressed even
         // if the model produces yet another single-tool round.
         state.stall.forced_parallel_batching = true;
         push_single_tool_round(&mut state);
-        assert!(!should_force_parallel_batching(&state));
+        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
     }
 
     #[test]
@@ -1891,12 +1916,12 @@ mod tests {
         }
         // ...so before the warning zone, this must NOT fire.
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
-        assert!(!should_force_parallel_batching(&state));
+        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
 
         // Once round_index crosses ROUND_BUDGET_THRESHOLD, the same streak of
         // 3 must fire — this is the coupling we want.
         state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
-        assert!(should_force_parallel_batching(&state));
+        assert!(should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
     }
 
     #[test]
@@ -1910,7 +1935,7 @@ mod tests {
         // Even deep into the warning zone, a streak below the late threshold
         // (=3) must not fire — we don't punish a single isolated single-tool
         // round just because the turn is long.
-        assert!(!should_force_parallel_batching(&state));
+        assert!(!should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD));
     }
 
     // ─── Round-budget convergence guard (two-phase) ──────────────────────
