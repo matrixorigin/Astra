@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use astra_services::SessionArtifactStore;
+
 use crate::step_protocol::{
     CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
 };
@@ -24,9 +26,9 @@ const MAX_LIGHT_CHECKPOINTS: usize = 50;
 
 /// Get the step checkpoint directory for a session.
 fn checkpoint_dir_for(session_id: &str) -> PathBuf {
-    astra_services::session_journal::local_sessions_dir()
-        .join(session_id)
-        .join(STEP_CHECKPOINT_DIR)
+    astra_services::local_session_artifact_store()
+        .session_path(session_id, STEP_CHECKPOINT_DIR)
+        .expect("validated session_id must resolve step checkpoint dir")
 }
 
 /// Write a step checkpoint to local filesystem.
@@ -334,7 +336,9 @@ fn events_path_for(session_id: &str) -> PathBuf {
 }
 
 fn session_dir_for(session_id: &str) -> PathBuf {
-    astra_services::session_journal::local_sessions_dir().join(session_id)
+    astra_services::local_session_artifact_store()
+        .session_dir(session_id)
+        .expect("validated session_id must resolve step session dir")
 }
 
 /// File-backed event store: in-memory DAG + append-only JSONL on disk.

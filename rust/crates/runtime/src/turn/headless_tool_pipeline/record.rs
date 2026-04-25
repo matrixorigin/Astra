@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use astra_services::SessionArtifactStore;
+
 use super::super::agentic_headless_round::HeadlessStderrStyle;
 use super::super::headless_tool_assembly::{
     READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
@@ -74,7 +76,9 @@ fn maybe_persist_model_tool_result(
     model_result_str: String,
 ) -> String {
     if let Some(sid) = current_session_id {
-        let session_dir = astra_services::session_journal::local_sessions_dir().join(sid);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(sid)
+            .expect("validated session_id must resolve tool-result session dir");
         match super::super::tool_result_storage::maybe_persist_tool_result(
             &session_dir,
             id,

@@ -72,6 +72,11 @@
 //!   team (404); team name absent from foreigner's list.
 //! - **`e2e_matrix_meta_health`** — `GET /` + `GET /health` (service metadata, DB connected, persist counters).
 //! - **`e2e_matrix_session_http_db`** — `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`).
+//! - **`e2e_matrix_session_artifact_http_db`** — authenticated session artifact list/get routes align with
+//!   `session_artifacts`, including session scoping and cross-user isolation.
+//! - **`e2e_matrix_published_artifact_http_round_trip`** — a real runtime publish path (`/chat/stream`
+//!   success → `llm_capture` artifact) lands in `session_artifacts` and is readable back through the
+//!   authenticated session artifact HTTP routes.
 //! - **`e2e_matrix_evaluation_reads`** — evaluation GETs (`x-user-id`), optional agent seed for trust/SLO/
 //!   observability, plus learning health/signals.
 //! - **`e2e_matrix_context_decision_chain`** — `POST /events` → `/context` → `/decisions` + `ctx_snapshots` /
@@ -117,6 +122,7 @@ mod journey_extended;
 mod journey_full;
 mod journey_meta_matrix;
 mod journey_remote_skills;
+mod journey_session_artifacts_matrix;
 mod journey_session_http_db_matrix;
 mod journey_stream_persistence;
 mod journey_tasks_runs;
@@ -338,6 +344,21 @@ async fn e2e_matrix_meta_health() {
 async fn e2e_matrix_session_http_db() {
     require_system_e2e_env();
     journey_session_http_db_matrix::run_session_http_matches_agent_sessions_row().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_session_artifact_http_db() {
+    require_system_e2e_env();
+    journey_session_artifacts_matrix::run_session_artifact_http_matches_session_artifacts_rows()
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_published_artifact_http_round_trip() {
+    require_system_e2e_env();
+    journey_session_artifacts_matrix::run_published_session_artifact_round_trip().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

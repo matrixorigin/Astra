@@ -93,9 +93,11 @@ pub(super) async fn completions_handler(
     })?;
 
     // 3. Build upstream request
+    let mut messages = request.messages;
+    crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
     let mut body = serde_json::json!({
         "model": resolved.model_name,
-        "messages": request.messages,
+        "messages": messages,
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
         "stream": false,
@@ -228,6 +230,16 @@ mod tests {
             json["choices"][0]["message"]["content"],
             r#"{"score": 0.85}"#
         );
+    }
+
+    #[test]
+    fn completions_handler_strips_empty_assistant_tool_calls_before_forwarding() {
+        let mut messages = vec![
+            serde_json::json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+        crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
+        assert!(messages[0].get("tool_calls").is_none(), "{messages:?}");
     }
 
     /// audit-C2: completions handler must not use .expect("json object") —

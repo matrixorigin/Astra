@@ -1,6 +1,7 @@
 use crate::pipeline::step_checkpoint;
 use crate::pipeline::step_protocol::StepCheckpoint;
 use crate::{EventCreateRequestData, EventService};
+use astra_services::SessionArtifactStore;
 
 use super::agentic_adaptive_tuning::{
     record_loop_completion_feedback, record_new_evolution_promotion_events,
@@ -82,7 +83,13 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
         return;
     };
 
-    persist_context_trace_to_workspace_if_present(session_id.clone(), signal.clone()).await;
+    persist_context_trace_to_workspace_if_present(
+        session_id.clone(),
+        persistence.user_id.clone(),
+        persistence.artifact_store.clone(),
+        signal.clone(),
+    )
+    .await;
 
     let mut metadata = match serde_json::to_value(&signal) {
         Ok(value) => value,
@@ -155,26 +162,47 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
 
 async fn persist_context_trace_to_workspace_if_present(
     session_id: String,
+    user_id: String,
+    artifact_store: astra_services::DatabaseSessionArtifactStore,
     signal: astra_services::session_workspace::ContextTraceSignal,
 ) {
     let workspace_session_id = session_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let workspace_path =
-            astra_services::session_workspace::workspace_dir_for(&workspace_session_id)
-                .join("workspace.yaml");
-        if !workspace_path.is_file() {
-            return Ok(());
-        }
-        let mut workspace =
-            astra_services::session_workspace::read_workspace(&workspace_session_id)?;
-        workspace.last_context_trace = Some(signal);
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
-    })
+    let result = tokio::task::spawn_blocking(
+        move || -> std::io::Result<Option<astra_services::session_workspace::WorkspaceMetadata>> {
+            let workspace_path =
+                astra_services::session_workspace::workspace_dir_for(&workspace_session_id)
+                    .join("workspace.yaml");
+            if !workspace_path.is_file() {
+                return Ok(None);
+            }
+            let mut workspace =
+                astra_services::session_workspace::read_workspace(&workspace_session_id)?;
+            workspace.last_context_trace = Some(signal);
+            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            astra_services::session_workspace::write_workspace(&workspace)?;
+            Ok(Some(workspace))
+        },
+    )
     .await;
 
     match result {
-        Ok(Ok(())) => {}
+        Ok(Ok(Some(workspace))) => {
+            if let Err(err) = astra_services::session_workspace::persist_remote_workspace(
+                &workspace,
+                &user_id,
+                &artifact_store,
+            )
+            .await
+            {
+                astra_core::agent_warn!(
+                    "context-trace",
+                    "Failed to persist remote workspace trace for {}: {}",
+                    session_id,
+                    err
+                );
+            }
+        }
+        Ok(Ok(None)) => {}
         Ok(Err(err)) => {
             astra_core::agent_warn!(
                 "context-trace",
@@ -191,6 +219,67 @@ async fn persist_context_trace_to_workspace_if_present(
                 err
             );
         }
+    }
+}
+
+fn persist_remote_composite_snapshot_index_blocking(
+    state: &AgenticLoopState,
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+    source: &str,
+) {
+    let Some(persistence) = state.telemetry.context_trace_persistence.clone() else {
+        return;
+    };
+    let session_id = session_id.to_string();
+    let session_id_for_log = session_id.clone();
+    let index = index.clone();
+    let future = async move {
+        astra_services::session_restore::persist_remote_composite_snapshot_index(
+            &session_id,
+            &persistence.user_id,
+            &index,
+            &persistence.artifact_store,
+        )
+        .await
+        .map(|_| ())
+    };
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .and_then(|runtime| Ok(runtime.block_on(future)))
+            .map_err(|error| error.to_string())
+            .and_then(|result| result),
+    };
+    if let Err(error) = result {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Failed to {source} for {session_id_for_log}: {error}"
+        );
+    }
+}
+
+async fn persist_remote_composite_snapshot_index_if_present(
+    state: &AgenticLoopState,
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+    source: &str,
+) {
+    let Some(persistence) = state.telemetry.context_trace_persistence.clone() else {
+        return;
+    };
+    if let Err(error) = astra_services::session_restore::persist_remote_composite_snapshot_index(
+        session_id,
+        &persistence.user_id,
+        index,
+        &persistence.artifact_store,
+    )
+    .await
+    .map(|_| ())
+    {
+        astra_core::agent_warn!("checkpoint", "Failed to {source} for {session_id}: {error}");
     }
 }
 
@@ -270,6 +359,12 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         // checkpoint can re-attempt without referencing a half-written index.
         return;
     }
+    persist_remote_composite_snapshot_index_blocking(
+        state,
+        sid,
+        &index,
+        "persist remote composite snapshot index",
+    );
 
     state.last_composite_snapshot = Some(snapshot);
     state.stall.last_heavy_checkpoint = Some(cp);
@@ -351,6 +446,14 @@ pub(crate) async fn build_full_composite_snapshot(
             "checkpoint",
             "Failed to write composite snapshot index: {e}"
         );
+    } else {
+        persist_remote_composite_snapshot_index_if_present(
+            state,
+            sid,
+            &index,
+            "persist remote composite snapshot index",
+        )
+        .await;
     }
 
     state.last_composite_snapshot = Some(snapshot.clone());
@@ -513,14 +616,17 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
                 state.max_turns.saturating_sub(state.remaining_turns),
                 state.total_prompt as usize,
             );
-            // Use home dir for absolute path, consistent with other session file writes.
-            let base = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            let path = base.join(format!(".astra/sessions/{sid}/session-memory.md"));
-            if let Err(e) = crate::turn::cloud::session_memory_extract::write_session_memory_file(
-                &path,
-                &l1_content,
-            ) {
-                tracing::debug!(session_id = %sid, error = %e, "error-triggered L1 write failed (non-fatal)");
+            if let Ok(path) = astra_services::local_session_artifact_store()
+                .session_path(sid, "session-memory.md")
+            {
+                if let Err(e) =
+                    crate::turn::cloud::session_memory_extract::write_session_memory_file(
+                        &path,
+                        &l1_content,
+                    )
+                {
+                    tracing::debug!(session_id = %sid, error = %e, "error-triggered L1 write failed (non-fatal)");
+                }
             }
         }
     }
@@ -666,6 +772,35 @@ mod tests {
         assert_eq!(state.final_text, "Final answer");
         assert_eq!(host.rendered_final_text.len(), 1);
         assert_eq!(host.rendered_final_text[0], "Final answer");
+    }
+
+    #[test]
+    fn context_trace_workspace_persistence_pushes_remote_workspace_artifact() {
+        let source = include_str!("agentic_loop_finalization.rs");
+        let start = source
+            .find("async fn persist_context_trace_to_workspace_if_present")
+            .expect("workspace trace persistence helper");
+        let end = source
+            .find("/// Best-effort heavy checkpoint write.")
+            .expect("workspace trace helper end marker");
+        let snippet = &source[start..end];
+        assert!(
+            snippet.contains("persist_remote_workspace"),
+            "context trace workspace persistence should publish remote workspace artifacts"
+        );
+        assert!(
+            snippet.contains("artifact_store"),
+            "context trace workspace persistence should receive an artifact store"
+        );
+    }
+
+    #[test]
+    fn composite_snapshot_index_persistence_pushes_remote_artifact() {
+        let source = include_str!("agentic_loop_finalization.rs");
+        assert!(
+            source.contains("persist_remote_composite_snapshot_index"),
+            "composite snapshot writes should publish a remote index artifact"
+        );
     }
 
     // ─── E2E: auto-reflection is wired into run_agentic_loop_impl ──────────

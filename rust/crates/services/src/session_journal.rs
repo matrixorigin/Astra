@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
+use crate::SessionArtifactStore;
+
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
@@ -1909,7 +1911,7 @@ pub fn resolve_session_id(query: &str) -> std::io::Result<String> {
 
 /// Helper: get the journal directory path (same as [`local_sessions_dir()`]).
 fn journal_dir() -> PathBuf {
-    local_sessions_dir()
+    crate::local_session_artifact_store().sessions_root()
 }
 
 fn resolve_session_id_from_list(query: &str, sessions: &[String]) -> std::io::Result<String> {

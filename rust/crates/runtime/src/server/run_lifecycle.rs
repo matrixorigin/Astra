@@ -580,6 +580,8 @@ async fn configure_runtime_controllers(
     let context_trace_persistence = shared_pool.map(|pool| ContextTracePersistenceContext {
         user_id: user_id.to_string(),
         event_service: build_runtime_event_service(matrixone, Some(pool)),
+        artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())
+            .with_pool(pool.clone()),
         agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.to_string(),
     });
     initialize_runtime_controllers(
@@ -3382,6 +3384,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 None,
             )
             .with_cancel_token(config.cancel_token.clone());
+            if let Some(pool) = self.shared_pool.as_ref() {
+                executor = executor.with_workspace_artifact_store(
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                        .with_pool(pool.clone()),
+                );
+            }
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -5653,6 +5661,30 @@ mod tests {
         assert!(
             fn_body.contains("STATUS_WAITING"),
             "cancel_run durable fallback must include STATUS_WAITING"
+        );
+    }
+
+    #[test]
+    fn configure_runtime_controllers_wires_context_trace_artifact_store() {
+        let source = include_str!("run_lifecycle.rs");
+        assert!(
+            source.contains(
+                "artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())"
+            ),
+            "context trace persistence should construct a remote workspace artifact store"
+        );
+        assert!(
+            source.contains(".with_pool(pool.clone())"),
+            "context trace artifact persistence should reuse the shared MatrixOne pool"
+        );
+    }
+
+    #[test]
+    fn server_tool_executor_is_wired_with_workspace_artifact_store() {
+        let source = include_str!("run_lifecycle.rs");
+        assert!(
+            source.contains(".with_workspace_artifact_store("),
+            "server run lifecycle should inject a workspace artifact store into ServerToolExecutor"
         );
     }
 }

@@ -361,6 +361,24 @@ pub(crate) fn llm_completions_url_for_provider(base_url: &str, provider: &str) -
 /// appear after the first position. This function collects every system
 /// message, concatenates their content with `\n\n`, and places the result
 /// as the first message. All non-system messages keep their original order.
+pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        if obj
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|tcs| tcs.is_empty())
+        {
+            obj.remove("tool_calls");
+        }
+    }
+}
+
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut rest: Vec<Value> = Vec::new();
@@ -401,6 +419,8 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
         })
         .collect();
 
+    strip_empty_assistant_tool_calls(&mut out);
+
     for msg in &mut out {
         if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
@@ -408,14 +428,6 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
         let Some(obj) = msg.as_object_mut() else {
             continue;
         };
-        let remove_empty_tool_calls = obj
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .is_some_and(|tcs| tcs.is_empty());
-        if remove_empty_tool_calls {
-            obj.remove("tool_calls");
-            continue;
-        }
         let Some(tcs) = obj.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -3027,6 +3039,17 @@ mod tests {
         let out = consolidate_system_messages(&msgs);
         assert_eq!(out.len(), 2);
         assert!(out[1].get("tool_calls").is_none(), "{out:?}");
+    }
+
+    #[test]
+    fn strip_empty_assistant_tool_calls_only_removes_empty_arrays() {
+        let mut msgs = vec![
+            json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+        ];
+        strip_empty_assistant_tool_calls(&mut msgs);
+        assert!(msgs[0].get("tool_calls").is_none(), "{msgs:?}");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "bash");
     }
 
     #[test]

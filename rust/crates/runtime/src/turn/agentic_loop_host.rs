@@ -378,6 +378,7 @@ pub struct EvaluationPersistenceContext {
 pub struct ContextTracePersistenceContext {
     pub user_id: String,
     pub event_service: DatabaseEventService,
+    pub artifact_store: astra_services::DatabaseSessionArtifactStore,
     pub agent_id: String,
 }
 
@@ -428,6 +429,11 @@ pub struct StallTrackingState {
     /// workspace mutation. One-shot per turn — escalation is via the
     /// existing post-mortem `EvalSignal::RedundantOverlappingReads`.
     pub forced_redundant_reads_corrective: bool,
+    /// Whether the repeated-cache-waste mid-loop corrective injected a
+    /// guidance message this loop. Fires when the model keeps reissuing
+    /// identical tool calls that are served from cache instead of reusing
+    /// the earlier result. One-shot per turn.
+    pub forced_cache_waste_corrective: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,

@@ -8,7 +8,8 @@ pub use astra_server_types::{
     LearningSignalDescriptions, LearningSignalsResponse, LearningStatsResponse,
     LearningTriggerRequest, LearningTriggerResponse, PromptOptimizeRequest, PromptOptimizeResponse,
     RootResponse, RunListQuery, RunListResponse, RunMutationResponse, RunStatusResponse,
-    RunStreamQuery, SessionActivityQuery, SessionActivityResponse, SessionCreateRequest,
-    SessionListQuery, SessionListResponse, SessionResponse, SessionUpdateRequest,
-    chat_request_into_data, merge_plan_subtask_context,
+    RunStreamQuery, SessionActivityQuery, SessionActivityResponse, SessionArtifactListQuery,
+    SessionArtifactListResponse, SessionArtifactResponse, SessionCreateRequest, SessionListQuery,
+    SessionListResponse, SessionResponse, SessionUpdateRequest, chat_request_into_data,
+    merge_plan_subtask_context,
 };

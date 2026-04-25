@@ -7,6 +7,8 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+use crate::SessionArtifactStore;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -451,10 +453,9 @@ pub fn build_session_diagnostic(session_id: &str) -> Result<SessionDiagnosticRep
     }
 
     // Composite snapshot info
-    let snapshot_dir = crate::session_journal::local_sessions_dir()
-        .join(session_id)
-        .join("step_checkpoints")
-        .join("composite_snapshots.json");
+    let snapshot_dir = crate::local_session_artifact_store()
+        .session_path(session_id, "step_checkpoints/composite_snapshots.json")
+        .expect("validated session_id must resolve reflect snapshot path");
     let (composite_snapshot_count, latest_snapshot_dimensions) = if snapshot_dir.exists() {
         match std::fs::read_to_string(&snapshot_dir) {
             Ok(content) => match serde_json::from_str::<CompositeSnapshotIndex>(&content) {

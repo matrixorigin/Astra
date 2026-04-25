@@ -229,6 +229,38 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             );
         }
     }
+    if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_redundant_reads_corrective
+        && should_inject_cache_waste_corrective(state, CACHE_WASTE_MIDLOOP_THRESHOLD)
+    {
+        let wasteful = cache_wasteful_tools(state, CACHE_WASTE_MIDLOOP_THRESHOLD);
+        state.stall.forced_cache_waste_corrective = true;
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": cache_waste_corrective_message(&wasteful, &state.message),
+        }));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "cache_waste_corrective",
+            round = state.llm_rounds_completed,
+            tools = ?wasteful,
+            threshold = CACHE_WASTE_MIDLOOP_THRESHOLD,
+            "loop guard fired"
+        );
+        if !prep.quiet {
+            let tool_list = wasteful
+                .iter()
+                .map(|(tool, count)| format!("{tool} ({count}x)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ repeated cached tool calls on [{tool_list}]; forcing reuse corrective…"
+                ),
+            );
+        }
+    }
 
     let llm_wall_start = Instant::now();
     // Increment the LLM-round counter regardless of outcome so retry/error
@@ -907,6 +939,7 @@ pub(crate) fn should_inject_round_budget_phase1(state: &AgenticLoopState, hard_l
     if state.stall.forced_execution_escalation
         || state.stall.forced_parallel_batching
         || state.stall.forced_redundant_reads_corrective
+        || state.stall.forced_cache_waste_corrective
     {
         return false;
     }
@@ -966,6 +999,8 @@ pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str
 // every problem turn well before the count balloons.
 
 pub(crate) const REDUNDANT_READS_MARKER: &str = "## ⤴ Redundant Reads Detected";
+pub(crate) const CACHE_WASTE_MARKER: &str = "## ⤴ Repeated Cached Tool Calls Detected";
+pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 
 /// Mid-loop corrective threshold (intentionally one above the post-mortem
 /// signal threshold). One redundant overlap is normal noise; two can be
@@ -989,6 +1024,28 @@ pub(crate) fn is_redundant_reads_corrective(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(REDUNDANT_READS_MARKER))
 }
 
+fn cache_wasteful_tools(state: &AgenticLoopState, threshold: usize) -> Vec<(String, usize)> {
+    let mut tools: Vec<(String, usize)> = state
+        .turn_guard
+        .health
+        .cache_wasteful_tools(threshold)
+        .into_iter()
+        .map(|(tool, count)| (tool.to_string(), count))
+        .collect();
+    tools.sort_by(|left, right| left.0.cmp(&right.0));
+    tools
+}
+
+#[cfg(test)]
+pub(crate) fn is_cache_waste_corrective(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(CACHE_WASTE_MARKER))
+}
+
 /// Whether to inject the redundant-reads mid-loop corrective on the upcoming
 /// round. One-shot per turn (the flag is set when corrective fires).
 pub(crate) fn should_inject_redundant_reads_corrective(
@@ -1002,6 +1059,39 @@ pub(crate) fn should_inject_redundant_reads_corrective(
         &state.stall.tool_call_records,
     );
     count >= threshold
+}
+
+pub(crate) fn should_inject_cache_waste_corrective(
+    state: &AgenticLoopState,
+    threshold: usize,
+) -> bool {
+    if state.stall.forced_cache_waste_corrective {
+        return false;
+    }
+    !cache_wasteful_tools(state, threshold).is_empty()
+}
+
+pub(crate) fn cache_waste_corrective_message(
+    tools: &[(impl AsRef<str>, usize)],
+    original_query: &str,
+) -> String {
+    let tool_list = tools
+        .iter()
+        .map(|(tool, count)| format!("{} ({count}x)", tool.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{CACHE_WASTE_MARKER}\n\
+         Runtime correction: you have repeated cached tool calls this turn [{tool_list}]. \
+         Those results are already in context — calling the same tool again wastes tokens and does not add evidence.\n\n\
+         REQUIRED next-step behavior:\n\
+         - Reuse the cached result you already have; do NOT repeat the same tool call again.\n\
+         - Only call another tool if it fetches genuinely new evidence (different file, different diff target, different query, or changed worktree).\n\
+         - If you already have enough evidence, write the final answer now.\n\
+         - If you still need more evidence, explain the ONE specific missing fact and use a different tool or different arguments to get it.\n\n\
+         Anti-hallucination: do NOT pretend a repeated cached call produced new information.\n\n\
+         Original user query: {original_query}"
+    )
 }
 
 pub(crate) fn redundant_reads_corrective_message(count: usize, original_query: &str) -> String {
@@ -2212,5 +2302,61 @@ mod tests {
         assert!(is_redundant_reads_corrective(&msg));
         let unrelated = serde_json::json!({"role": "user", "content": "hello"});
         assert!(!is_redundant_reads_corrective(&unrelated));
+    }
+
+    #[test]
+    fn cache_waste_corrective_fires_at_threshold() {
+        let mut state = make_state();
+        state.message = "review local changes".into();
+        for _ in 0..CACHE_WASTE_MIDLOOP_THRESHOLD {
+            state.turn_guard.record_cache_hit("git_diff");
+        }
+        assert!(should_inject_cache_waste_corrective(
+            &state,
+            CACHE_WASTE_MIDLOOP_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn cache_waste_corrective_silent_below_threshold() {
+        let mut state = make_state();
+        state.message = "review local changes".into();
+        for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD - 1) {
+            state.turn_guard.record_cache_hit("git_diff");
+        }
+        assert!(!should_inject_cache_waste_corrective(
+            &state,
+            CACHE_WASTE_MIDLOOP_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn cache_waste_corrective_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "review local changes".into();
+        for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD + 2) {
+            state.turn_guard.record_cache_hit("git_diff");
+        }
+        assert!(should_inject_cache_waste_corrective(
+            &state,
+            CACHE_WASTE_MIDLOOP_THRESHOLD
+        ));
+        state.stall.forced_cache_waste_corrective = true;
+        state.turn_guard.record_cache_hit("git_diff");
+        assert!(!should_inject_cache_waste_corrective(
+            &state,
+            CACHE_WASTE_MIDLOOP_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn cache_waste_corrective_marker_recognized() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": cache_waste_corrective_message(&[("git_diff", 3)], "review local changes"),
+        });
+        assert!(is_cache_waste_corrective(&msg));
+        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
+        assert!(!is_cache_waste_corrective(&unrelated));
     }
 }

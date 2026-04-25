@@ -576,9 +576,16 @@ impl InProcessChatTurnBridge {
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
+        let mut remote_artifact_store =
+            astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+        if let Some(pool) = self.shared_pool.clone() {
+            remote_artifact_store = remote_artifact_store.with_pool(pool);
+        }
+        let remote_artifact_store = Arc::new(remote_artifact_store);
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
+            let remote_artifact_store = remote_artifact_store.clone();
             let _client_disconnect_guard = cc
                 .as_ref()
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
@@ -1523,16 +1530,14 @@ impl InProcessChatTurnBridge {
                                 Ok(s) => s,
                                 Err(e2) => {
                                     let kind = classify_llm_error(&e2);
-                                    // Dump full LLM request for post-mortem debugging
                                     let dump = crate::turn::llm_request_dump::build_llm_request_dump(
                                         &session_id, agent_id.as_deref(), &model_name, &provider,
                                         &e2, &llm_messages, &pruned_tools,
                                         round_ix, Some(max_output_tokens / 2),
                                     );
-                                    if let Some(path) = dump.write_local() {
-                                        eprintln!("[llm_error_dump] {path}");
-                                    }
-                                    dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
+                                    let _ = dump
+                                        .persist_remote(&user_id, remote_artifact_store.as_ref())
+                                        .await;
                                     yield render_sse_map(&build_stream_error_event(
                                         &format!("Context window exceeded even after aggressive compaction: {e2}"),
                                         kind.as_str(),
@@ -1544,16 +1549,14 @@ impl InProcessChatTurnBridge {
                         }
                         Err(e) => {
                             let kind = classify_llm_error(&e);
-                            // Dump full LLM request for post-mortem debugging
                             let dump = crate::turn::llm_request_dump::build_llm_request_dump(
                                 &session_id, agent_id.as_deref(), &model_name, &provider,
                                 &e, &llm_messages, &pruned_tools,
                                 round_ix, Some(max_output_tokens),
                             );
-                            if let Some(path) = dump.write_local() {
-                                eprintln!("[llm_error_dump] {path}");
-                            }
-                            dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
+                            let _ = dump
+                                .persist_remote(&user_id, remote_artifact_store.as_ref())
+                                .await;
                             yield render_sse_map(&build_stream_error_event(&e, kind.as_str(), kind.is_retryable()));
                             return;
                         }
@@ -1699,6 +1702,34 @@ impl InProcessChatTurnBridge {
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
                 }
+                let capture_model = if resolved_model.is_empty() {
+                    model_name.as_str()
+                } else {
+                    resolved_model.as_str()
+                };
+                let _ = crate::turn::llm_exchange_capture::persist_configured_capture(
+                    Some(remote_artifact_store.as_ref()),
+                    &session_id,
+                    &user_id,
+                    trace_turn,
+                    u32::try_from(round_ix).unwrap_or(u32::MAX),
+                    agent_id.as_deref(),
+                    "bridge_inprocess",
+                    capture_model,
+                    &provider,
+                    &llm_messages,
+                    &pruned_tools,
+                    None,
+                    "success",
+                    json!({
+                        "full_text": loop_text.clone(),
+                        "reasoning": loop_reasoning.clone(),
+                        "tool_calls": loop_tool_calls.clone(),
+                        "usage": usage.clone(),
+                        "finish_reason": if loop_tool_calls.is_empty() { "stop" } else { "tool_calls" },
+                    }),
+                )
+                .await;
                 if let Some(buf) = turn_event_buffer.as_mut() {
                     buf.record_llm_round(LlmRoundRecord {
                         ttft_ms: None,

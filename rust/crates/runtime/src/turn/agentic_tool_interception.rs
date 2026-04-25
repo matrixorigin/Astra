@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 use serde_json::Value;
 
@@ -485,14 +486,11 @@ async fn intercept_skill_calls(
 }
 
 fn build_skill_context(state: &AgenticLoopState) -> crate::turn::skill_tool::SkillContext {
-    let session_dir = state.current_session_id.as_ref().map(|id| {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".astra")
-            .join("sessions")
-            .join(id)
-            .to_string_lossy()
-            .into_owned()
+    let session_dir = state.current_session_id.as_ref().and_then(|id| {
+        astra_services::local_session_artifact_store()
+            .session_dir(id)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
     });
 
     crate::turn::skill_tool::SkillContext {

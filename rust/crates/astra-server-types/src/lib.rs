@@ -135,6 +135,34 @@ pub struct SessionActivityResponse {
     pub total: i64,
 }
 
+#[derive(Deserialize, Default)]
+pub struct SessionArtifactListQuery {
+    pub artifact_kind: Option<String>,
+    #[serde(default = "default_session_artifact_limit")]
+    pub limit: u32,
+}
+
+#[derive(Serialize, PartialEq)]
+pub struct SessionArtifactResponse {
+    pub artifact_id: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub artifact_kind: String,
+    pub source: Option<String>,
+    pub turn: Option<u32>,
+    pub round: Option<u32>,
+    pub content: serde_json::Value,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Serialize, PartialEq)]
+pub struct SessionArtifactListResponse {
+    pub session_id: String,
+    pub artifacts: Vec<SessionArtifactResponse>,
+    pub limit: u32,
+}
+
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthUserResponse {
     pub user_id: String,
@@ -619,6 +647,11 @@ pub fn default_run_list_limit() -> u32 {
 #[doc(hidden)]
 pub fn default_session_activity_limit() -> u32 {
     100
+}
+
+#[doc(hidden)]
+pub fn default_session_artifact_limit() -> u32 {
+    20
 }
 
 #[doc(hidden)]
