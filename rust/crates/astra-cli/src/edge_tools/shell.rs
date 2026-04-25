@@ -3207,7 +3207,7 @@ impl ToolExecutor {
         let intent = astra_runtime::bash_intent::analyze_bash_command(command);
         // `intent.read_targets` is already filtered: `analyze_bash_command`
         // only harvests paths from non-mutating segments, so a mixed command
-        // like `cat a.rs && rm b.rs` yields `["a.rs"]` — safe to register.
+        // like `cat a.rs && echo >> b.rs` yields `["a.rs"]` — safe to register.
         for rel in intent.read_targets {
             let path = std::path::Path::new(&rel);
             let abs = if path.is_absolute() {
@@ -4248,11 +4248,11 @@ mod tests {
 
     #[test]
     fn bash_mixed_command_registers_only_read_segments() {
-        // For a compound command like `cat a.rs && rm b.rs`, the cat segment
+        // For a compound command like `cat a.rs && echo >> b.rs`, the cat segment
         // genuinely reads a.rs (so the staleness gate must let edits through),
-        // while the rm segment must NOT register b.rs as read (writes are not
-        // reads). Pre-fix code took the whole-command early-return on any
-        // mutating segment and dropped a.rs; post-fix relies on
+        // while the echo-append segment must NOT register b.rs as read (writes
+        // are not reads). Pre-fix code took the whole-command early-return on
+        // any mutating segment and dropped a.rs; post-fix relies on
         // `analyze_bash_command` already excluding paths from mutating
         // segments at extraction time.
         let dir = tempfile::tempdir().unwrap();
@@ -4266,7 +4266,7 @@ mod tests {
         assert!(executor.check_staleness(&b).is_err());
 
         let _ = executor.bash(&serde_json::json!({
-            "command": format!("cat {} && rm {}", a.display(), b.display()),
+            "command": format!("cat {} && echo modify >> {}", a.display(), b.display()),
         }));
 
         assert!(
@@ -4274,12 +4274,12 @@ mod tests {
             "cat segment must register {:?} as read",
             a
         );
-        // b.rs no longer exists (rm consumed it); the relevant invariant is
-        // that we did not silently mark it as "read" — the segment was
-        // mutating, so register_bash_read_targets must skip it.
+        // Direct invariant: b.rs was in a mutating segment (echo-append), so
+        // register_bash_read_targets must NOT have marked it as read —
+        // staleness gate should still block edits on b.rs.
         assert!(
-            !b.exists(),
-            "rm segment should have removed {:?} (sanity)",
+            executor.check_staleness(&b).is_err(),
+            "echo-append segment must NOT register {:?} as read",
             b
         );
     }
