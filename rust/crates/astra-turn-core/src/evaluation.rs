@@ -37,6 +37,13 @@ pub enum EvalSignal {
     /// likely should have batched these into parallel rounds. Carries the
     /// length of the longest consecutive single-tool-round streak.
     SequentialReadChurn(usize),
+    /// Multiple read tool calls hit overlapping line ranges of the same file
+    /// without any intervening workspace mutation, suggesting the model
+    /// re-read content it had already loaded into context. Carries the
+    /// number of redundant read events (each read after the first overlap
+    /// in a file's no-mutation window counts once). Calibrated against
+    /// real session data; see `REDUNDANT_OVERLAPPING_READS_THRESHOLD`.
+    RedundantOverlappingReads(usize),
 }
 
 /// Threshold for [`EvalSignal::SequentialReadChurn`]: how many consecutive
@@ -44,6 +51,14 @@ pub enum EvalSignal {
 /// real session data: healthy turns (mutate→verify chains, locate→read pairs)
 /// observed up to 6; wasted turns (pure exploratory churn) observed at 10+.
 pub const SEQUENTIAL_READ_CHURN_THRESHOLD: usize = 8;
+
+/// Threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum count of
+/// redundant read events needed before flagging the turn. Calibrated against
+/// 14k real sessions: at ≥3, the signal flags ~15% of `rounds≥8` turns and
+/// catches all confirmed-waste fixtures (c49bc4a3 t2 = 38, eafda07e t2 = 19,
+/// 8ba9d165 t2 = 19, 4178c6a7 t2 = 19, bbf46ab2 t3 = 11, bbf46ab2 t4 = 7)
+/// while leaving healthy short turns silent.
+pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
 
 /// Result of evaluating a turn's success and quality.
 #[derive(Debug, Clone)]
@@ -264,6 +279,24 @@ pub fn evaluate_tool_call_records(
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
+    // ─── Redundant overlapping read detection ───────────────────────────
+    // Detects the failure mode where the model re-reads the SAME file/line
+    // range multiple times across a turn instead of referring back to its
+    // own prior tool outputs. The detector excludes the legitimate
+    // "mutate then re-read to verify" pattern: any workspace-mutating tool
+    // call clears the per-file read history, so a re-read AFTER an edit
+    // does NOT contribute to the count. Strictly observational at this
+    // tier — no mid-loop intervention.
+    let redundant_reads = count_redundant_overlapping_reads(tool_call_records);
+    if redundant_reads >= REDUNDANT_OVERLAPPING_READS_THRESHOLD {
+        eval.signals
+            .push(EvalSignal::RedundantOverlappingReads(redundant_reads));
+        let penalty = (0.03
+            + 0.01 * (redundant_reads - REDUNDANT_OVERLAPPING_READS_THRESHOLD) as f64)
+            .clamp(0.03, 0.15);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    }
+
     eval
 }
 
@@ -301,6 +334,153 @@ fn longest_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
         prev_round = Some(round);
     }
     best
+}
+
+/// Parsed read target for redundancy detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadRange {
+    file: String,
+    /// Line range, or `None` for whole-file reads.
+    range: Option<(u32, u32)>,
+}
+
+fn ranges_overlap(a: &ReadRange, b: &ReadRange) -> bool {
+    if a.file != b.file {
+        return false;
+    }
+    match (a.range, b.range) {
+        (None, _) | (_, None) => true,
+        (Some((a0, a1)), Some((b0, b1))) => !(a1 < b0 || b1 < a0),
+    }
+}
+
+/// Best-effort extraction of a read target from a tool-call's full args.
+/// Returns `None` for tools that don't read file content (grep/ls/glob),
+/// for ambiguous bash commands, and for parse failures. Recognized:
+///   - `bash` with `sed -n '<a>,<b>p' <file>`
+///   - `bash` with bare `cat <file>` (no shell redirection / pipe input)
+///   - `view` tool with JSON args like `{"path":"<f>","view_range":[a,b]}`
+fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static SED_RANGE: OnceLock<Regex> = OnceLock::new();
+    static CAT_FILE: OnceLock<Regex> = OnceLock::new();
+
+    if name == "view" {
+        // Prefer JSON parsing — `view` args_full is always JSON in practice.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
+            let path = v.get("path").and_then(|p| p.as_str())?.to_string();
+            let range = v
+                .get("view_range")
+                .and_then(|r| r.as_array())
+                .and_then(|arr| {
+                    let s = arr.first()?.as_u64()? as u32;
+                    let e = arr.get(1)?.as_u64()? as u32;
+                    Some((s, e))
+                });
+            return Some(ReadRange { file: path, range });
+        }
+        return None;
+    }
+    if name != "bash" {
+        return None;
+    }
+    // `sed -n 'A,Bp' file`  (with or without quotes around the range)
+    let sed_re = SED_RANGE.get_or_init(|| {
+        Regex::new(r#"\bsed\s+-n\s+['"]?(\d+),(\d+)p['"]?\s+(\S+)"#).unwrap()
+    });
+    if let Some(c) = sed_re.captures(args) {
+        let s: u32 = c.get(1)?.as_str().parse().ok()?;
+        let e: u32 = c.get(2)?.as_str().parse().ok()?;
+        let f = c.get(3)?.as_str().trim_matches(|x| x == '\'' || x == '"').to_string();
+        return Some(ReadRange { file: f, range: Some((s, e)) });
+    }
+    // Bare `cat <file>` — must NOT be part of a pipeline that accepts
+    // input (heredoc, `<`, `<<`) and must NOT be a mutation (`>`/`>>`/`tee`).
+    if args.contains('>') || args.contains("<<") {
+        return None;
+    }
+    let cat_re = CAT_FILE.get_or_init(|| Regex::new(r#"\bcat\s+(\S+)"#).unwrap());
+    if let Some(c) = cat_re.captures(args)
+        && let Some(f) = c.get(1)
+    {
+        let f = f.as_str().trim_matches(|x| x == '\'' || x == '"').to_string();
+        // Skip if the "file" looks like an option (e.g. `-n`).
+        if !f.starts_with('-') {
+            return Some(ReadRange { file: f, range: None });
+        }
+    }
+    None
+}
+
+/// Whether a tool call mutates workspace state in a way that justifies
+/// a re-read of the same content. Conservative — any plausible mutation
+/// clears the per-file read history so we don't over-flag legitimate
+/// "edit then verify" patterns.
+fn is_mutation_for_redundant_read(name: &str, args: &str) -> bool {
+    matches!(name, "edit" | "create" | "write")
+        || (name == "bash" && bash_args_look_mutating(args))
+}
+
+fn bash_args_look_mutating(args: &str) -> bool {
+    // Output redirection or in-place mutation.
+    if args.contains(">") || args.contains("|& tee") || args.contains("| tee") {
+        return true;
+    }
+    // Common mutating commands as substrings (tolerates prefixes like
+    // `cd /tmp && mv …` or `sudo rm …`).
+    const MUT_NEEDLES: &[&str] = &[
+        " mv ", " cp ", " rm ", "sed -i", "rmdir ", "mkdir ", "touch ",
+        "chmod ", "chown ", "git commit", "git add", "git checkout",
+        "git reset", "git rebase", "git merge", "git apply",
+    ];
+    let padded = format!(" {args} ");
+    MUT_NEEDLES.iter().any(|n| padded.contains(n))
+}
+
+/// Best-effort extraction of the file targeted by a mutation, used to scope
+/// per-file history clears. Returns `None` if the target file is unclear,
+/// in which case the caller clears ALL per-file histories (conservative).
+fn mutation_target_file(name: &str, args: &str) -> Option<String> {
+    if matches!(name, "edit" | "create" | "write") {
+        // Astra's edit/create tools take JSON args with a `path` field.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
+            return v.get("path").and_then(|p| p.as_str()).map(String::from);
+        }
+    }
+    None
+}
+
+/// Count redundant overlapping reads — see `EvalSignal::RedundantOverlappingReads`.
+fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
+    use std::collections::HashMap;
+    let mut per_file: HashMap<String, Vec<ReadRange>> = HashMap::new();
+    let mut redundant = 0usize;
+    for rec in records {
+        if rec.is_synthetic_placeholder() || rec.was_blocked_by_policy() {
+            continue;
+        }
+        let args = rec.args_full.as_deref().unwrap_or("");
+        if is_mutation_for_redundant_read(&rec.name, args) {
+            // Mutation: invalidate the relevant file's read history (or all
+            // file histories if we can't pinpoint the target).
+            match mutation_target_file(&rec.name, args) {
+                Some(f) => {
+                    per_file.remove(&f);
+                }
+                None => per_file.clear(),
+            }
+            continue;
+        }
+        if let Some(target) = extract_read_target(&rec.name, args) {
+            let entry = per_file.entry(target.file.clone()).or_default();
+            if entry.iter().any(|prev| ranges_overlap(prev, &target)) {
+                redundant += 1;
+            }
+            entry.push(target);
+        }
+    }
+    redundant
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
@@ -344,6 +524,14 @@ pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
             "threshold": SEQUENTIAL_READ_CHURN_THRESHOLD,
             "message": format!(
                 "Detected {streak} consecutive single-tool rounds — these calls likely should have been batched into parallel rounds"
+            ),
+        }),
+        EvalSignal::RedundantOverlappingReads(count) => json!({
+            "kind": "redundant_overlapping_reads",
+            "count": count,
+            "threshold": REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+            "message": format!(
+                "Detected {count} redundant read(s) with no intervening workspace mutation — the model likely re-read content already in context"
             ),
         }),
     }
@@ -1376,6 +1564,209 @@ mod tests {
         assert!(
             (penalty - 0.20).abs() < 1e-9,
             "streak=30 should cap at 0.20, got {penalty}"
+        );
+    }
+
+    // ─── Redundant overlapping reads detection ──────────────────────────
+    //
+    // Calibration fixtures (real session shapes; see commit message):
+    //   - 8ba9d165 turn 2: 4×`sed -n '159,200p' execution_phase.rs`,
+    //     4×`sed -n '840,870p' …`, etc. — count >= 17.
+    //   - eafda07e turn 2: 19 redundant reads, 18 rounds, 259k tokens.
+    // Threshold 3 catches all known waste fixtures while leaving healthy
+    // turns silent.
+
+    fn record_with_args(name: &str, round: u32, args_full: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: Some(12),
+            output_bytes: Some(500),
+            args_preview: Some(args_full.chars().take(80).collect()),
+            result_preview: None,
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            batch_id: None,
+            parallel: Some(false),
+            round: Some(round),
+            args_full: Some(args_full.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn redundant_reads_detects_repeated_sed_ranges_in_same_file() {
+        // Mirrors 8ba9d165 turn 2: same line range read 4 times across rounds,
+        // no edits in between — pure waste.
+        let records = vec![
+            record_with_args(
+                "bash",
+                0,
+                "sed -n '159,200p' rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs",
+            ),
+            record_with_args(
+                "bash",
+                3,
+                "sed -n '159,200p' rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs",
+            ),
+            record_with_args(
+                "bash",
+                6,
+                "sed -n '159,200p' rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs",
+            ),
+            record_with_args(
+                "bash",
+                9,
+                "sed -n '159,200p' rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs",
+            ),
+        ];
+        let eval = evaluate_tool_call_records("修复优化", &[], &records, 0, false, 0.3);
+        let count = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(
+            count,
+            Some(3), // 3 reads after the first overlap = 3 redundant events
+            "expected RedundantOverlappingReads(3), got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn redundant_reads_detects_overlapping_but_not_identical_ranges() {
+        // Reading 100-150 then 120-180 = same content overlap; should count.
+        let records = vec![
+            record_with_args("bash", 0, "sed -n '100,150p' src/foo.rs"),
+            record_with_args("bash", 1, "sed -n '120,180p' src/foo.rs"),
+            record_with_args("bash", 2, "sed -n '140,200p' src/foo.rs"),
+        ];
+        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
+        let count = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
+            _ => None,
+        });
+        // calls 2 and 3 each overlap a prior, and threshold=3 fires only at 3.
+        assert_eq!(count, None, "only 2 redundant — below threshold 3, must be silent");
+    }
+
+    #[test]
+    fn redundant_reads_excludes_mutate_then_verify_pattern() {
+        // Read → edit → read of same range is healthy verification, not waste.
+        // We need 4 reads to potentially cross threshold; with an edit
+        // between the first 2 and last 2, the count must reset and stay <3.
+        let records = vec![
+            record_with_args("bash", 0, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
+            // Edit invalidates per-file history.
+            record_with_args(
+                "edit",
+                2,
+                r#"{"path":"src/foo.rs","old_str":"x","new_str":"y"}"#,
+            ),
+            record_with_args("bash", 3, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 4, "sed -n '10,50p' src/foo.rs"),
+        ];
+        let eval = evaluate_tool_call_records("fix bug", &[], &records, 0, false, 0.3);
+        let count = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
+            _ => None,
+        });
+        // Pre-edit: 1 redundant. Post-edit: 1 redundant. Total = 2 < threshold(3).
+        assert_eq!(
+            count, None,
+            "mutate→verify pattern must not flag — got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn redundant_reads_does_not_flag_distinct_files() {
+        // Three reads of different files = no overlap, no signal.
+        let records = vec![
+            record_with_args("bash", 0, "sed -n '1,50p' src/a.rs"),
+            record_with_args("bash", 1, "sed -n '1,50p' src/b.rs"),
+            record_with_args("bash", 2, "sed -n '1,50p' src/c.rs"),
+            record_with_args("bash", 3, "sed -n '1,50p' src/d.rs"),
+        ];
+        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
+            "distinct files should not trigger redundancy; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn redundant_reads_recognizes_view_tool_with_overlapping_ranges() {
+        // The native `view` tool with overlapping `view_range` should also
+        // count — the failure mode is identical regardless of bash vs view.
+        let records = vec![
+            record_with_args("view", 0, r#"{"path":"src/foo.rs","view_range":[10,50]}"#),
+            record_with_args("view", 1, r#"{"path":"src/foo.rs","view_range":[20,60]}"#),
+            record_with_args("view", 2, r#"{"path":"src/foo.rs","view_range":[30,70]}"#),
+            record_with_args("view", 3, r#"{"path":"src/foo.rs","view_range":[40,80]}"#),
+        ];
+        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
+        let count = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::RedundantOverlappingReads(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(count, Some(3), "got {:?}", eval.signals);
+    }
+
+    #[test]
+    fn redundant_reads_signal_serializes_to_json() {
+        let v = eval_signal_to_json(&EvalSignal::RedundantOverlappingReads(5));
+        assert_eq!(v["kind"], "redundant_overlapping_reads");
+        assert_eq!(v["count"], 5);
+        assert_eq!(
+            v["threshold"],
+            REDUNDANT_OVERLAPPING_READS_THRESHOLD as i64
+        );
+        assert!(v["message"].as_str().unwrap().contains("redundant"));
+    }
+
+    #[test]
+    fn redundant_reads_below_threshold_is_silent() {
+        // 2 redundant reads (threshold=3) must not emit signal.
+        let records = vec![
+            record_with_args("bash", 0, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
+            record_with_args("bash", 2, "sed -n '10,50p' src/foo.rs"),
+        ];
+        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
+            "2 redundant reads must be silent (threshold=3); got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn redundant_reads_grep_and_other_search_tools_not_counted() {
+        // grep/ls/glob are search tools, not "read region of file" — they
+        // must not contribute to redundancy even if same path repeats.
+        let records = vec![
+            record_with_args("bash", 0, "grep -n 'foo' src/x.rs"),
+            record_with_args("bash", 1, "grep -n 'bar' src/x.rs"),
+            record_with_args("bash", 2, "grep -n 'baz' src/x.rs"),
+            record_with_args("bash", 3, "grep -n 'qux' src/x.rs"),
+        ];
+        let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RedundantOverlappingReads(_))),
+            "grep calls must not be classified as reads; got {:?}",
+            eval.signals
         );
     }
 }
