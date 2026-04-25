@@ -195,12 +195,31 @@ pub fn evaluate_tool_call_records(
         .filter(|record| !record.is_synthetic_placeholder() && !record.was_blocked_by_policy())
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
+            // Prefer the *untruncated* args for the repeat-key. `args_preview`
+            // is capped at ~80 chars, so two distinct calls that share a long
+            // common prefix (e.g. `grep -n '<long-pattern>' /home/xupeng/githu…`)
+            // collide and surface as a false repeat-loop. Hash `args_full`
+            // when present to keep the key bounded; fall back to the preview
+            // for legacy records, then to the bare tool name.
             repeat_key: record
-                .args_preview
+                .args_full
                 .as_deref()
                 .map(str::trim)
-                .filter(|preview| !preview.is_empty())
-                .map(|preview| format!("{}::{preview}", record.name))
+                .filter(|full| !full.is_empty())
+                .map(|full| {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    full.hash(&mut hasher);
+                    format!("{}::full::{:016x}", record.name, hasher.finish())
+                })
+                .or_else(|| {
+                    record
+                        .args_preview
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|preview| !preview.is_empty())
+                        .map(|preview| format!("{}::preview::{preview}", record.name))
+                })
                 .unwrap_or_else(|| record.name.clone()),
             ok: record.ok,
             ms: record.ms,
@@ -713,6 +732,97 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
             "identical git_show targets should still surface as repeat loops: {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn repeat_tool_call_uses_args_full_to_avoid_truncation_collisions() {
+        // Reproduces a real false-positive observed in session
+        // 24234a1f-1c01-4577-a06a-168e7b583c6d: three legitimate `grep` calls
+        // against three distinct files all share the same ~80-char truncated
+        // `args_preview` because the long pattern + common path prefix fills
+        // the preview before the file name diverges. The repeat-loop signal
+        // must look at the *untruncated* `args_full` so distinct calls never
+        // collide just because their previews happen to share a prefix.
+        use astra_services::session_journal::ToolCallRecord;
+
+        let identical_truncated_preview =
+            "grep -n 'canonicalize|unique_path_variants|normalize_path' /home/xupeng/githu…";
+
+        let record = |full_path: &str| ToolCallRecord {
+            name: "bash".to_string(),
+            ok: true,
+            ms: 51,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(500),
+            args_preview: Some(identical_truncated_preview.to_string()),
+            args_full: Some(format!(
+                r#"{{"command":"grep -n 'canonicalize|unique_path_variants|normalize_path' {}"}}"#,
+                full_path
+            )),
+            result_preview: Some("ok".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            ..Default::default()
+        };
+
+        let distinct_full_args = vec![
+            record("/home/xupeng/github/astra/rust/crates/services/src/durable_task.rs"),
+            record("/home/xupeng/github/astra/rust/crates/astra-tools/src/fs_ops.rs"),
+            record("/home/xupeng/github/astra/rust/crates/astra-sandbox/src/policy.rs"),
+        ];
+
+        let eval = evaluate_tool_call_records(
+            "review canonicalize hot path",
+            &["bash".to_string()],
+            &distinct_full_args,
+            0,
+            false,
+            0.15,
+        );
+
+        assert!(
+            !eval.signals.iter().any(|s| matches!(
+                s,
+                EvalSignal::RepeatToolCall(name) if name == "bash"
+            )),
+            "three distinct bash invocations differing only past the args_preview \
+             truncation must NOT surface as a retry loop: {:?}",
+            eval.signals
+        );
+
+        // Sanity check: when args_full is genuinely identical, the signal
+        // still fires (we did not break legitimate repeat-loop detection).
+        let repeated = vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                ms: 51,
+                args_preview: Some(identical_truncated_preview.into()),
+                args_full: Some(r#"{"command":"grep -n 'foo' bar.rs"}"#.into()),
+                result_preview: Some("ok".into()),
+                output_bytes: Some(120),
+                ..Default::default()
+            };
+            3
+        ];
+        let eval = evaluate_tool_call_records(
+            "look",
+            &["bash".to_string()],
+            &repeated,
+            0,
+            false,
+            0.1,
+        );
+        assert!(
+            eval.signals.iter().any(|s| matches!(
+                s,
+                EvalSignal::RepeatToolCall(name) if name == "bash"
+            )),
+            "identical args_full repeats must still surface as a retry loop: {:?}",
             eval.signals
         );
     }
