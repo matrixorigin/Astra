@@ -44,6 +44,11 @@ pub enum EvalSignal {
     /// in a file's no-mutation window counts once). Calibrated against
     /// real session data; see `REDUNDANT_OVERLAPPING_READS_THRESHOLD`.
     RedundantOverlappingReads(usize),
+    /// Many search-like tool calls (grep/rg/find) were issued in one turn,
+    /// suggesting the model fanned out exploratory search instead of
+    /// narrowing the search space or batching more effectively. Carries the
+    /// total number of search-like calls in the turn.
+    SearchFanout(usize),
 }
 
 /// Default threshold for [`EvalSignal::SequentialReadChurn`]: how many
@@ -61,6 +66,16 @@ pub const SEQUENTIAL_READ_CHURN_THRESHOLD: usize = 8;
 /// bbf46ab2 t4 = 7) while leaving healthy short turns silent.
 pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
 
+/// Default threshold for [`EvalSignal::SearchFanout`]: minimum count of
+/// grep/rg/find-like tool calls in a turn before flagging passive search
+/// fan-out. Calibrated against 15k real sessions: among 68 long turns
+/// (`llm_rounds >= 8`), threshold 8 flags 10 (14.7%), including known waste
+/// fixtures c49bc4a3 t1/t2, bbf46ab2 t3/t4, 8ba9d165 t2, 03945541 t2.
+/// False-positive risk is higher than redundant-reads because some healthy
+/// investigative turns also fan out search, so this remains post-mortem only
+/// and carries a milder quality penalty.
+pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
+
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
@@ -68,6 +83,7 @@ pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
 pub struct EvaluationThresholds {
     pub sequential_read_churn: usize,
     pub redundant_overlapping_reads: usize,
+    pub search_fanout: usize,
 }
 
 impl Default for EvaluationThresholds {
@@ -75,6 +91,7 @@ impl Default for EvaluationThresholds {
         Self {
             sequential_read_churn: SEQUENTIAL_READ_CHURN_THRESHOLD,
             redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+            search_fanout: SEARCH_FANOUT_THRESHOLD,
         }
     }
 }
@@ -342,6 +359,20 @@ pub fn evaluate_tool_call_records_with_thresholds(
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
+    // ─── Search fan-out detection ────────────────────────────────────────
+    // Detects turns that spray many grep/rg/find-like searches instead of
+    // narrowing the search space or switching to more direct reads. This
+    // signal is intentionally mild and observational only: some healthy
+    // investigations legitimately use many searches, so we do NOT intervene
+    // at runtime based on it without more calibration.
+    let search_fanout = count_search_fanout(tool_call_records);
+    if search_fanout >= thresholds.search_fanout {
+        eval.signals.push(EvalSignal::SearchFanout(search_fanout));
+        let penalty =
+            (0.02 + 0.005 * (search_fanout - thresholds.search_fanout) as f64).clamp(0.02, 0.12);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    }
+
     eval
 }
 
@@ -379,6 +410,43 @@ fn longest_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
         prev_round = Some(round);
     }
     best
+}
+
+fn bash_command_text(args: &str) -> String {
+    let trimmed = args.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(command) = v.get("command").and_then(|c| c.as_str())
+    {
+        return command.trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn is_search_like_tool_call(name: &str, args: &str) -> bool {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    if matches!(name, "grep" | "rg") {
+        return true;
+    }
+    if name != "bash" {
+        return false;
+    }
+    static SEARCH_CMD: OnceLock<Regex> = OnceLock::new();
+    let search_re = SEARCH_CMD
+        .get_or_init(|| Regex::new(r#"(^|[;&|]\s*|\s+)(git\s+grep|grep|rg|find)\b"#).unwrap());
+    search_re.is_match(&bash_command_text(args))
+}
+
+/// Count grep/rg/find-like search calls in a turn. Intended for passive
+/// post-mortem evaluation only — this signal is intentionally broad, so the
+/// threshold is set conservatively and the penalty is mild.
+pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
+    records
+        .iter()
+        .filter(|rec| !rec.is_synthetic_placeholder() && !rec.was_blocked_by_policy())
+        .filter(|rec| is_search_like_tool_call(&rec.name, rec.args_full.as_deref().unwrap_or("")))
+        .count()
 }
 
 /// Parsed read target for redundancy detection.
@@ -613,6 +681,14 @@ pub fn eval_signal_to_json_with_thresholds(
             "threshold": thresholds.redundant_overlapping_reads,
             "message": format!(
                 "Detected {count} redundant read(s) with no intervening workspace mutation — the model likely re-read content already in context"
+            ),
+        }),
+        EvalSignal::SearchFanout(count) => json!({
+            "kind": "search_fanout",
+            "count": count,
+            "threshold": thresholds.search_fanout,
+            "message": format!(
+                "Detected {count} grep/rg/find-like search calls in one turn — the model likely fanned out exploratory search instead of narrowing or switching to direct reads"
             ),
         }),
     }
@@ -1682,6 +1758,109 @@ mod tests {
             (penalty - 0.20).abs() < 1e-9,
             "streak=30 should cap at 0.20, got {penalty}"
         );
+    }
+
+    // ─── Search fan-out detection ────────────────────────────────────────
+
+    #[test]
+    fn search_fanout_detects_many_search_calls() {
+        let records = vec![
+            record_with_args(
+                "bash",
+                0,
+                r#"{"command":"grep -n 'canonicalize' src/a.rs | head -20"}"#,
+            ),
+            record_with_args(
+                "bash",
+                1,
+                r#"{"command":"grep -n 'normalize_path' src/b.rs | head -20"}"#,
+            ),
+            record_with_args(
+                "bash",
+                2,
+                r#"{"command":"find src -type f -name '*.rs' | xargs grep -l 'unique_path_variants' | head -20"}"#,
+            ),
+            record_with_args("grep", 3, r#"{"pattern":"canonicalize","path":"src/c.rs"}"#),
+            record_with_args(
+                "bash",
+                4,
+                r#"{"command":"cd /repo && rg 'file_state_key' src/ | head -20"}"#,
+            ),
+            record_with_args("rg", 5, r#"{"pattern":"project_root","path":"src/d.rs"}"#),
+            record_with_args(
+                "bash",
+                6,
+                r#"{"command":"git grep -n 'ToolExecutor' -- rust/crates/astra-cli/src"}"#,
+            ),
+            record_with_args(
+                "bash",
+                7,
+                r#"{"command":"grep -n 'shared_file_state' src/e.rs | head -20"}"#,
+            ),
+        ];
+        let eval = evaluate_tool_call_records("investigate", &[], &records, 0, false, 0.3);
+        let count = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::SearchFanout(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(count, Some(8), "got {:?}", eval.signals);
+    }
+
+    #[test]
+    fn search_fanout_below_threshold_is_silent() {
+        let records = vec![
+            record_with_args("bash", 0, r#"{"command":"grep -n 'a' src/a.rs"}"#),
+            record_with_args("bash", 1, r#"{"command":"grep -n 'b' src/b.rs"}"#),
+            record_with_args("bash", 2, r#"{"command":"grep -n 'c' src/c.rs"}"#),
+            record_with_args("bash", 3, r#"{"command":"grep -n 'd' src/d.rs"}"#),
+            record_with_args("bash", 4, r#"{"command":"grep -n 'e' src/e.rs"}"#),
+            record_with_args("grep", 5, r#"{"pattern":"f","path":"src/f.rs"}"#),
+            record_with_args("rg", 6, r#"{"pattern":"g","path":"src/g.rs"}"#),
+        ];
+        let eval = evaluate_tool_call_records("investigate", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::SearchFanout(_))),
+            "7 search calls is below threshold 8; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn search_fanout_ignores_non_search_calls() {
+        let records = vec![
+            record_with_args("bash", 0, r#"{"command":"cat src/a.rs"}"#),
+            record_with_args("bash", 1, r#"{"command":"sed -n '1,20p' src/b.rs"}"#),
+            record_with_args("view", 2, r#"{"path":"src/c.rs","view_range":[1,20]}"#),
+            record_with_args("read_file", 3, r#"{"path":"src/d.rs"}"#),
+            record_with_args("git_show", 4, r#"{"commit":"HEAD"}"#),
+        ];
+        let eval = evaluate_tool_call_records("investigate", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::SearchFanout(_))),
+            "non-search calls must not trigger SearchFanout; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn search_fanout_custom_threshold_flows_into_json() {
+        let value = eval_signal_to_json_with_thresholds(
+            &EvalSignal::SearchFanout(5),
+            EvaluationThresholds {
+                search_fanout: 4,
+                ..Default::default()
+            },
+        );
+        assert_eq!(value["kind"], "search_fanout");
+        assert_eq!(value["count"], 5);
+        assert_eq!(value["threshold"], 4);
+        assert!(value["message"].as_str().unwrap().contains("grep/rg/find"));
     }
 
     // ─── Redundant overlapping reads detection ──────────────────────────

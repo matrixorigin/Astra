@@ -363,6 +363,12 @@ pub struct ToolSelectionConfig {
     /// passive scoring stricter; higher values make the signal rarer.
     #[serde(default)]
     pub redundant_reads_eval_threshold: u32,
+
+    /// Post-mortem eval signal threshold: grep/rg/find-like calls required
+    /// before emitting `SearchFanout`. 0 = use default (8). Lower values make
+    /// passive scoring stricter; higher values make the signal rarer.
+    #[serde(default)]
+    pub search_fanout_eval_threshold: u32,
 }
 
 impl ToolSelectionConfig {
@@ -446,6 +452,16 @@ impl ToolSelectionConfig {
             3
         }
     }
+
+    /// Resolved post-mortem search-fanout eval threshold (0 → default of 8).
+    /// Floor of 2 avoids pathological misconfiguration.
+    pub fn effective_search_fanout_eval_threshold(&self) -> u32 {
+        if self.search_fanout_eval_threshold > 0 {
+            self.search_fanout_eval_threshold.max(2)
+        } else {
+            8
+        }
+    }
 }
 
 fn default_max_tools() -> u32 {
@@ -480,6 +496,7 @@ impl Default for ToolSelectionConfig {
             redundant_reads_midloop_threshold: 0,
             sequential_read_churn_eval_threshold: 0,
             redundant_reads_eval_threshold: 0,
+            search_fanout_eval_threshold: 0,
         }
     }
 }
@@ -1002,6 +1019,7 @@ impl RuntimeConfig {
             redundant_reads_midloop_threshold,
             sequential_read_churn_eval_threshold,
             redundant_reads_eval_threshold,
+            search_fanout_eval_threshold,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -1079,6 +1097,11 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.redundant_reads_eval_threshold,
             redundant_reads_eval_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.search_fanout_eval_threshold,
+            search_fanout_eval_threshold,
             0,
         );
 
@@ -1495,6 +1518,7 @@ mod tests {
                 redundant_reads_midloop_threshold: 0,
                 sequential_read_churn_eval_threshold: 0,
                 redundant_reads_eval_threshold: 0,
+                search_fanout_eval_threshold: 0,
             },
             learning: LearningConfig {
                 enabled: false,
@@ -1770,5 +1794,23 @@ selector_model = "qwen-flash"
             ..Default::default()
         };
         assert_eq!(cfg.effective_redundant_reads_eval_threshold(), 2);
+    }
+
+    #[test]
+    fn search_fanout_eval_threshold_default_and_floor() {
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_search_fanout_eval_threshold(), 8);
+
+        let cfg = ToolSelectionConfig {
+            search_fanout_eval_threshold: 10,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_search_fanout_eval_threshold(), 10);
+
+        let cfg = ToolSelectionConfig {
+            search_fanout_eval_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_search_fanout_eval_threshold(), 2);
     }
 }
