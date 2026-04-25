@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::chat_history_openai::openai_user_content_message;
 use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
@@ -296,10 +297,26 @@ pub fn resolve_agentic_turn_budget(
         .and_then(|value| value.hard_turn_limit)
         .unwrap_or(budget.hard_turn_limit);
     let hard_turn_limit = requested_hard.max(1).min(ceiling);
+    if requested_hard > hard_turn_limit {
+        warn!(
+            requested_hard,
+            ceiling,
+            hard_turn_limit,
+            "agentic turn budget override clamped: hard_turn_limit reduced to runtime ceiling"
+        );
+    }
     let requested_initial = override_budget
         .and_then(|value| value.initial_turns)
         .unwrap_or(budget.initial_turns);
     let initial_turns = requested_initial.max(1).min(hard_turn_limit);
+    if requested_initial > initial_turns {
+        warn!(
+            requested_initial,
+            hard_turn_limit,
+            initial_turns,
+            "agentic turn budget override clamped: initial_turns reduced to hard_turn_limit"
+        );
+    }
     let headroom = hard_turn_limit.saturating_sub(initial_turns);
     let extension_turns = if headroom == 0 {
         0
