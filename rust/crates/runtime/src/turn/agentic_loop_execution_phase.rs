@@ -191,6 +191,41 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
+    // Redundant-reads mid-loop corrective. Detects the model re-reading
+    // overlapping line ranges of the same file with no intervening edit;
+    // injects a one-shot corrective telling it to use existing context
+    // rather than re-reading. Lives below round-budget phase-1 because
+    // phase-1 is the harder finalization push — if both would fire on the
+    // same round we prefer phase-1's narrower "stop calling tools" message.
+    if !state.stall.forced_round_budget_phase1
+        && should_inject_redundant_reads_corrective(state, REDUNDANT_READS_MIDLOOP_THRESHOLD)
+    {
+        let count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+            &state.stall.tool_call_records,
+        );
+        state.stall.forced_redundant_reads_corrective = true;
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": redundant_reads_corrective_message(count, &state.message),
+        }));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "redundant_reads_corrective",
+            round = state.llm_rounds_completed,
+            count = count,
+            threshold = REDUNDANT_READS_MIDLOOP_THRESHOLD,
+            "loop guard fired"
+        );
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ {count} redundant overlapping reads; nudging model to use existing context…"
+                ),
+            );
+        }
+    }
+
     let llm_wall_start = Instant::now();
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
@@ -884,6 +919,74 @@ pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str
          - Explicitly list anything you could NOT verify or finish.\n\
          - Do NOT fabricate, infer, or invent results you did not actually observe.\n\
          - A partial-but-honest answer is strictly better than a confident-but-fabricated one.\n\n\
+         Original user query: {original_query}"
+    )
+}
+
+// Redundant-reads mid-loop corrective.
+//
+// Detects the pattern where the model re-reads overlapping line ranges of the
+// same file with no intervening workspace mutation. The detection algorithm
+// lives in `astra-turn-core::evaluation::count_redundant_overlapping_reads`
+// (post-mortem use) and is reused here for a one-shot mid-loop corrective.
+//
+// Threshold note: post-mortem flags at count ≥ 3; mid-loop fires at ≥
+// `REDUNDANT_READS_MIDLOOP_THRESHOLD` to err slightly on the side of
+// underkill, since this is a behavioral intervention rather than a passive
+// signal. Calibrated against the same 14k-session survey: confirmed-waste
+// fixtures all reach 7+ within their turn, so a threshold of 4 still catches
+// every problem turn well before the count balloons.
+
+pub(crate) const REDUNDANT_READS_MARKER: &str = "## ⤴ Redundant Reads Detected";
+
+/// Mid-loop corrective threshold (intentionally one above the post-mortem
+/// signal threshold). One redundant overlap is normal noise; two can be
+/// healthy double-checking; three matches the post-mortem signal but at
+/// mid-loop we wait one more event to avoid premature intervention on
+/// borderline turns.
+pub(crate) const REDUNDANT_READS_MIDLOOP_THRESHOLD: usize = 4;
+
+pub(crate) fn is_redundant_reads_corrective(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(REDUNDANT_READS_MARKER))
+}
+
+/// Whether to inject the redundant-reads mid-loop corrective on the upcoming
+/// round. One-shot per turn (the flag is set when corrective fires).
+pub(crate) fn should_inject_redundant_reads_corrective(
+    state: &AgenticLoopState,
+    threshold: usize,
+) -> bool {
+    if state.stall.forced_redundant_reads_corrective {
+        return false;
+    }
+    let count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
+        &state.stall.tool_call_records,
+    );
+    count >= threshold
+}
+
+pub(crate) fn redundant_reads_corrective_message(count: usize, original_query: &str) -> String {
+    format!(
+        "{REDUNDANT_READS_MARKER}\n\
+         Runtime correction: you have re-read overlapping line ranges of the \
+         same file {count} times this turn without any intervening edit. The \
+         content has not changed — re-reading wastes tokens and stalls progress.\n\n\
+         REQUIRED next-step behavior:\n\
+         - Use the file content already in your context; do NOT issue another \
+           read for any range you have already loaded.\n\
+         - If you genuinely need a new section, use the `view` tool with \
+           explicit `view_range` (NOT `bash sed`/`bash cat`) and only for ranges \
+           you have not already seen.\n\
+         - If you have enough information to answer, produce the final answer now.\n\
+         - If you do not, state precisely what is still unknown and which ONE \
+           specific new piece of evidence you need — do not loop on the same files.\n\n\
+         Anti-hallucination: do NOT fabricate file contents you have not actually \
+         observed. A partial-but-honest answer beats a confident-but-fabricated one.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -1919,5 +2022,89 @@ mod tests {
         // Even with phase-1 set and tool calls present, once phase-2 has
         // already fired we must not re-trigger.
         assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
+    }
+
+    fn push_redundant_sed_read(state: &mut AgenticLoopState, round: u32) {
+        // Same file, same range, no intervening mutation — counts as one
+        // overlap each call after the first.
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            ms: 50,
+            error: None,
+            input_bytes: Some(12),
+            output_bytes: Some(500),
+            args_preview: Some("sed -n '159,200p' f.rs".into()),
+            result_preview: None,
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            batch_id: None,
+            parallel: Some(false),
+            round: Some(round),
+            args_full: Some("sed -n '159,200p' f.rs".into()),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn redundant_reads_corrective_fires_at_threshold() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        // First read seeds the file's history; subsequent overlapping reads
+        // each contribute one redundant event.
+        for r in 0..(REDUNDANT_READS_MIDLOOP_THRESHOLD + 1) {
+            push_redundant_sed_read(&mut state, r as u32);
+        }
+        assert!(should_inject_redundant_reads_corrective(
+            &state,
+            REDUNDANT_READS_MIDLOOP_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn redundant_reads_corrective_silent_below_threshold() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        // Threshold-many reads = (threshold-1) overlap events: stays silent.
+        for r in 0..REDUNDANT_READS_MIDLOOP_THRESHOLD {
+            push_redundant_sed_read(&mut state, r as u32);
+        }
+        assert!(!should_inject_redundant_reads_corrective(
+            &state,
+            REDUNDANT_READS_MIDLOOP_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn redundant_reads_corrective_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        for r in 0..(REDUNDANT_READS_MIDLOOP_THRESHOLD + 5) {
+            push_redundant_sed_read(&mut state, r as u32);
+        }
+        // First check fires...
+        assert!(should_inject_redundant_reads_corrective(
+            &state,
+            REDUNDANT_READS_MIDLOOP_THRESHOLD
+        ));
+        // ...then the one-shot flag gates the next attempt.
+        state.stall.forced_redundant_reads_corrective = true;
+        push_redundant_sed_read(&mut state, 99);
+        assert!(!should_inject_redundant_reads_corrective(
+            &state,
+            REDUNDANT_READS_MIDLOOP_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn redundant_reads_corrective_marker_recognized() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": redundant_reads_corrective_message(5, "fix the bug"),
+        });
+        assert!(is_redundant_reads_corrective(&msg));
+        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
+        assert!(!is_redundant_reads_corrective(&unrelated));
     }
 }

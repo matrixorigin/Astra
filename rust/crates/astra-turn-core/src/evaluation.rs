@@ -452,7 +452,12 @@ fn mutation_target_file(name: &str, args: &str) -> Option<String> {
 }
 
 /// Count redundant overlapping reads — see `EvalSignal::RedundantOverlappingReads`.
-fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
+///
+/// Public so the runtime can call it mid-loop for a corrective intervention,
+/// not just post-mortem. The runtime uses a slightly higher threshold than
+/// the eval-signal threshold to err on the side of underkill for the
+/// behavioral intervention.
+pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
     use std::collections::HashMap;
     let mut per_file: HashMap<String, Vec<ReadRange>> = HashMap::new();
     let mut redundant = 0usize;

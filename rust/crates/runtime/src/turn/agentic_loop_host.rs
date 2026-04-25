@@ -421,6 +421,13 @@ pub struct StallTrackingState {
     /// Set when phase-1 fired and the model still attempted tool calls on
     /// the very next round. One-shot per turn.
     pub forced_round_budget_phase2: bool,
+    /// Whether the redundant-reads mid-loop corrective injected a guidance
+    /// message this loop. Fires when the model has re-read overlapping line
+    /// ranges of the same file enough times to cross
+    /// `REDUNDANT_READS_MIDLOOP_THRESHOLD` without any intervening
+    /// workspace mutation. One-shot per turn — escalation is via the
+    /// existing post-mortem `EvalSignal::RedundantOverlappingReads`.
+    pub forced_redundant_reads_corrective: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,

@@ -495,6 +495,7 @@ pub(crate) async fn stream_chat_sse(
             forced_parallel_batching: false,
             forced_round_budget_phase1: false,
             forced_round_budget_phase2: false,
+            forced_redundant_reads_corrective: false,
             nudge_count: 0,
             guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
