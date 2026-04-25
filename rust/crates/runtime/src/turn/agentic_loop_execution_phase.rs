@@ -482,7 +482,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // the new tool calls and end the loop with a partial-progress notice.
     // This mirrors Claude Code's `error_max_turns` exit but reaches it only
     // after a corrective grace round, avoiding overkill on weaker models.
-    if should_abort_for_round_budget_phase2(state, true) {
+    // Phase-2 only fires inside `ProceedWithToolCalls`: the model emitted tool
+    // calls after the phase-1 corrective, so this flag is inherently true here.
+    // Using a named variable rather than a literal makes the contract self-
+    // documenting and prevents accidental copy-paste to a broader scope.
+    let model_ignored_phase1_corrective = true;
+    if should_abort_for_round_budget_phase2(state, model_ignored_phase1_corrective, round_budget_hard_limit) {
         state.stall.forced_round_budget_phase2 = true;
         let abort_msg = format!(
             "[Round budget hard-limit reached at round {}. The runtime injected a \
@@ -847,16 +852,24 @@ pub(crate) fn should_inject_round_budget_phase1(
 
 /// Whether to abort the loop with phase-2 hard stop. Triggers when phase-1
 /// already fired AND the most-recent assistant turn still attempted at least
-/// one tool call (caller decides how that's signaled — typically by
-/// inspecting the just-finished BreakLoop/Continue branch).
+/// one tool call AND `llm_rounds_completed >= hard_limit` (sanity guard
+/// prevents mis-set flags from aborting at a low round count). The caller
+/// passes `last_round_had_tool_calls` to distinguish model compliance
+/// (text-only) from model ignoring the corrective (tool calls).
 pub(crate) fn should_abort_for_round_budget_phase2(
     state: &AgenticLoopState,
     last_round_had_tool_calls: bool,
+    hard_limit: u32,
 ) -> bool {
     if state.stall.forced_round_budget_phase2 {
         return false;
     }
-    state.stall.forced_round_budget_phase1 && last_round_had_tool_calls
+    // Sanity guard: phase-2 should never fire at a low round count even if
+    // the one-shot flag is manually mis-set (e.g. in a bug or test fixture
+    // error). The hard_limit must have been genuinely exceeded.
+    state.stall.forced_round_budget_phase1
+        && last_round_had_tool_calls
+        && state.llm_rounds_completed >= hard_limit
 }
 
 pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
@@ -1869,28 +1882,42 @@ mod tests {
     #[test]
     fn round_budget_phase2_fires_only_after_phase1_with_subsequent_tool_calls() {
         let mut state = make_state();
+        let hard_limit = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
+        // Set rounds completed to meet the hard_limit so the sanity guard
+        // passes — phase-2 only makes sense when the budget is genuinely
+        // exhausted.
+        state.llm_rounds_completed = hard_limit;
+
         // Without phase-1 set, phase-2 must not abort even if last round had
         // tool calls — the model never received the corrective.
         state.stall.forced_round_budget_phase1 = false;
-        assert!(!should_abort_for_round_budget_phase2(&state, true));
+        assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
 
         // With phase-1 set but the model produced text-only on the next
         // round (ignored: false), phase-2 must NOT abort: the model
         // complied. The loop should drain naturally.
         state.stall.forced_round_budget_phase1 = true;
-        assert!(!should_abort_for_round_budget_phase2(&state, false));
+        assert!(!should_abort_for_round_budget_phase2(&state, false, hard_limit));
 
         // Phase-1 fired AND model still attempted tools next round: abort.
-        assert!(should_abort_for_round_budget_phase2(&state, true));
+        assert!(should_abort_for_round_budget_phase2(&state, true, hard_limit));
+
+        // Sanity guard: even with phase-1 set and tool calls present, if
+        // llm_rounds_completed is below the hard limit, phase-2 must NOT
+        // fire — prevents mis-set flags from aborting prematurely.
+        state.llm_rounds_completed = hard_limit - 1;
+        assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
     }
 
     #[test]
     fn round_budget_phase2_is_one_shot_per_turn() {
         let mut state = make_state();
+        let hard_limit = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
+        state.llm_rounds_completed = hard_limit;
         state.stall.forced_round_budget_phase1 = true;
         state.stall.forced_round_budget_phase2 = true;
         // Even with phase-1 set and tool calls present, once phase-2 has
         // already fired we must not re-trigger.
-        assert!(!should_abort_for_round_budget_phase2(&state, true));
+        assert!(!should_abort_for_round_budget_phase2(&state, true, hard_limit));
     }
 }
