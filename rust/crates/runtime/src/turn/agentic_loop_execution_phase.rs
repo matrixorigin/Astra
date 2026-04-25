@@ -698,10 +698,13 @@ pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState) -> bool {
     if state.stall.forced_parallel_batching {
         return false;
     }
+    // One corrective injection per turn: if mid-loop retry or escalation
+    // already fired, a parallel-batching force would duplicate correction.
+    if state.stall.forced_execution_retry || state.stall.forced_execution_escalation {
+        return false;
+    }
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    let threshold = if state.llm_rounds_completed
-        >= crate::prompts::ROUND_BUDGET_THRESHOLD
-    {
+    let threshold = if state.llm_rounds_completed >= crate::prompts::ROUND_BUDGET_THRESHOLD {
         PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE
     } else {
         PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
@@ -717,7 +720,7 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
          a round of latency, tokens, and budget for each call. \
          Your NEXT response MUST do exactly one of the following:\n\
          - Produce your final answer now if you already have enough information, OR\n\
-         - Call ≥3 independent tools in a single parallel batch (different files, \
+         - Call ≥2 independent tools in a single parallel batch (different files, \
            different greps, different reads — anything that does not strictly \
            depend on the previous tool's output).\n\
          Do not produce another single-tool round.\n\n\
@@ -727,6 +730,14 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
 
 pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
     if state.stall.forced_execution_escalation {
+        return false;
+    }
+    // One corrective injection per turn: if parallel-batching force already
+    // fired, skip escalation to avoid double-injecting corrective messages.
+    // NOTE: execution order in execute_turn_and_ingest_phase is
+    //   escalation → parallel-batching, so in practice escalation runs first.
+    //   This guard is defensive against future reordering.
+    if state.stall.forced_parallel_batching {
         return false;
     }
     if !state.task_profile.mutates_workspace {
@@ -1378,6 +1389,20 @@ mod tests {
     }
 
     #[test]
+    fn escalation_suppressed_when_parallel_batching_already_fired() {
+        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
+        // Precondition: without the flag, escalation would fire.
+        assert!(should_escalate_execution(&state));
+        // Once parallel-batching force has fired, escalation must yield to
+        // honor the one-corrective-per-turn invariant.
+        state.stall.forced_parallel_batching = true;
+        assert!(
+            !should_escalate_execution(&state),
+            "escalation must not fire when parallel-batching force already active"
+        );
+    }
+
+    #[test]
     fn escalation_ignores_failed_tool_calls_for_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
@@ -1456,6 +1481,38 @@ mod tests {
         // the one-corrective-per-turn invariant.
         state.stall.forced_parallel_batching = true;
         assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn parallel_batching_suppressed_when_escalation_already_fired() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+        // Precondition: without escalation flag, parallel-batching would fire.
+        assert!(should_force_parallel_batching(&state));
+        // Once escalation has fired, parallel-batching must yield.
+        state.stall.forced_execution_escalation = true;
+        assert!(
+            !should_force_parallel_batching(&state),
+            "parallel-batching must not fire when escalation already active"
+        );
+    }
+
+    #[test]
+    fn parallel_batching_suppressed_when_retry_already_fired() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+        assert!(should_force_parallel_batching(&state));
+        state.stall.forced_execution_retry = true;
+        assert!(
+            !should_force_parallel_batching(&state),
+            "parallel-batching must not fire when retry already active"
+        );
     }
 
     #[test]

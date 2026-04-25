@@ -257,8 +257,11 @@ pub fn evaluate_tool_call_records(
     // could have batched these calls into parallel rounds.
     let max_streak = longest_single_tool_round_streak(tool_call_records);
     if max_streak >= SEQUENTIAL_READ_CHURN_THRESHOLD {
-        eval.signals.push(EvalSignal::SequentialReadChurn(max_streak));
-        eval.quality = (eval.quality - 0.10).clamp(0.0, 1.0);
+        eval.signals
+            .push(EvalSignal::SequentialReadChurn(max_streak));
+        let penalty =
+            (0.05 + 0.01 * (max_streak - SEQUENTIAL_READ_CHURN_THRESHOLD) as f64).clamp(0.05, 0.20);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
     eval
@@ -281,15 +284,21 @@ fn longest_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
     }
     let mut current = 0_usize;
     let mut best = 0_usize;
-    for &count in per_round.values() {
-        if count == 1 {
+    let mut prev_round: Option<u32> = None;
+    for (&round, &count) in &per_round {
+        // A gap in round indices breaks the streak — the missing round(s)
+        // may have been filtered out (synthetic/blocked) and we cannot
+        // assume they were single-tool.
+        let adjacent = prev_round.is_none_or(|p| round == p + 1);
+        if count == 1 && adjacent {
             current += 1;
             if current > best {
                 best = current;
             }
         } else {
-            current = 0;
+            current = if count == 1 { 1 } else { 0 };
         }
+        prev_round = Some(round);
     }
     best
 }
@@ -1172,7 +1181,8 @@ mod tests {
         for r in 0..10 {
             records.push(record_in_round("read_file", r, None));
         }
-        let eval = evaluate_tool_call_records("explain the auth flow", &[], &records, 0, false, 0.3);
+        let eval =
+            evaluate_tool_call_records("explain the auth flow", &[], &records, 0, false, 0.3);
         let streak = eval.signals.iter().find_map(|s| match s {
             EvalSignal::SequentialReadChurn(n) => Some(*n),
             _ => None,
@@ -1184,14 +1194,8 @@ mod tests {
             eval.signals
         );
         // Quality should be docked by the churn penalty.
-        let baseline = evaluate_tool_call_records(
-            "explain the auth flow",
-            &[],
-            &records[..1],
-            0,
-            false,
-            0.3,
-        );
+        let baseline =
+            evaluate_tool_call_records("explain the auth flow", &[], &records[..1], 0, false, 0.3);
         assert!(
             eval.quality < baseline.quality,
             "churn turn quality={} should be below baseline={}",
@@ -1225,7 +1229,8 @@ mod tests {
         ];
         let eval = evaluate_tool_call_records("ship the fix", &[], &records, 0, false, 0.3);
         assert!(
-            !eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
             "well-batched turn should NOT emit SequentialReadChurn; got {:?}",
@@ -1245,7 +1250,8 @@ mod tests {
         }
         let eval = evaluate_tool_call_records("survey the codebase", &[], &records, 0, false, 0.3);
         assert!(
-            !eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
             "all-parallel turn should NOT emit SequentialReadChurn; got {:?}",
@@ -1262,7 +1268,8 @@ mod tests {
             .collect();
         let eval = evaluate_tool_call_records("review", &[], &records, 0, false, 0.3);
         assert!(
-            !eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
             "6 single-tool rounds is below threshold; got {:?}",
@@ -1277,5 +1284,98 @@ mod tests {
         assert_eq!(value["streak"], 11);
         assert_eq!(value["threshold"], SEQUENTIAL_READ_CHURN_THRESHOLD as i64);
         assert!(value["message"].as_str().unwrap().contains("11"));
+    }
+
+    #[test]
+    fn sequential_read_churn_streak_broken_by_round_gap() {
+        // Rounds 0,1,2 (single-tool) then gap (round 3 missing) then
+        // rounds 4,5,6,7,8,9,10,11,12 (single-tool). Without gap-awareness
+        // the streak would be 12; with it, the two segments are 3 and 9.
+        let mut records = Vec::new();
+        for r in [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+            records.push(record_in_round("read_file", r, None));
+        }
+        let eval = evaluate_tool_call_records("explore", &[], &records, 0, false, 0.3);
+        let streak = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::SequentialReadChurn(n) => Some(*n),
+            _ => None,
+        });
+        // Longest contiguous segment is 9 (rounds 4-12), which exceeds
+        // the threshold of 8.
+        assert_eq!(
+            streak,
+            Some(9),
+            "gap must break streak; expected 9, got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn sequential_read_churn_gap_splits_below_threshold() {
+        // Two segments of 4 separated by a gap — neither reaches threshold.
+        let mut records = Vec::new();
+        for r in [0, 1, 2, 3, 8, 9, 10, 11] {
+            records.push(record_in_round("read_file", r, None));
+        }
+        let eval = evaluate_tool_call_records("explore", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::SequentialReadChurn(_))),
+            "two segments of 4 with gap should not trigger; got {:?}",
+            eval.signals
+        );
+    }
+
+    // ─── Graduated penalty calibration ─────────────────────────────────
+    //
+    // Formula: penalty = (0.05 + 0.01 * (streak - THRESHOLD)).clamp(0.05, 0.20)
+    // We verify three points: at threshold, mid-range, and cap.
+    // To isolate the churn penalty from other quality factors, we compare
+    // two evaluations with the SAME number of records — one with all
+    // single-tool rounds (triggers churn), one with all records in a
+    // single round (no churn). The quality delta is purely the penalty.
+
+    fn churn_penalty_for_streak(streak: usize) -> f64 {
+        // All-single-tool-rounds: triggers SequentialReadChurn.
+        let churn_records: Vec<_> = (0..streak as u32)
+            .map(|r| record_in_round("read_file", r, None))
+            .collect();
+        // Same records but all in round 0: one round with `streak` tools,
+        // so longest single-tool streak = 0 → no churn penalty.
+        let batched_records: Vec<_> = (0..streak)
+            .map(|_| record_in_round("read_file", 0, None))
+            .collect();
+        let eval_churn = evaluate_tool_call_records("q", &[], &churn_records, 0, false, 0.3);
+        let eval_batched = evaluate_tool_call_records("q", &[], &batched_records, 0, false, 0.3);
+        eval_batched.quality - eval_churn.quality
+    }
+
+    #[test]
+    fn graduated_penalty_at_threshold_is_minimum() {
+        let penalty = churn_penalty_for_streak(SEQUENTIAL_READ_CHURN_THRESHOLD); // 8
+        assert!(
+            (penalty - 0.05).abs() < 1e-9,
+            "streak=8 should penalize 0.05, got {penalty}"
+        );
+    }
+
+    #[test]
+    fn graduated_penalty_scales_with_streak() {
+        let penalty = churn_penalty_for_streak(18);
+        assert!(
+            (penalty - 0.15).abs() < 1e-9,
+            "streak=18 should penalize 0.15, got {penalty}"
+        );
+    }
+
+    #[test]
+    fn graduated_penalty_caps_at_maximum() {
+        let penalty = churn_penalty_for_streak(30);
+        assert!(
+            (penalty - 0.20).abs() < 1e-9,
+            "streak=30 should cap at 0.20, got {penalty}"
+        );
     }
 }

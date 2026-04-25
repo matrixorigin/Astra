@@ -885,8 +885,10 @@ pub fn build_system_prompt_trace(
             section.trace_signals.guidance_signals.synthesize_or_batch;
         guidance_signals.parallel_feedback |=
             section.trace_signals.guidance_signals.parallel_feedback;
-        guidance_signals.parallel_batching_nudge |=
-            section.trace_signals.guidance_signals.parallel_batching_nudge;
+        guidance_signals.parallel_batching_nudge |= section
+            .trace_signals
+            .guidance_signals
+            .parallel_batching_nudge;
 
         match section.token_bucket {
             PromptTokenBucket::BasePersona => base_persona_tokens += tokens,
@@ -1172,12 +1174,7 @@ pub fn trailing_single_tool_round_streak(messages: &[serde_json::Value]) -> usiz
         }
         // Count contiguous trailing tool messages = this round's tool result count.
         let mut tool_count = 0_usize;
-        while idx > 0
-            && messages[idx - 1]
-                .get("role")
-                .and_then(|r| r.as_str())
-                == Some("tool")
-        {
+        while idx > 0 && messages[idx - 1].get("role").and_then(|r| r.as_str()) == Some("tool") {
             tool_count += 1;
             idx -= 1;
         }
@@ -1186,10 +1183,7 @@ pub fn trailing_single_tool_round_streak(messages: &[serde_json::Value]) -> usiz
             // Step over the assistant message that produced this single call,
             // if present, then continue scanning further-back rounds.
             if idx > 0
-                && messages[idx - 1]
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    == Some("assistant")
+                && messages[idx - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
             {
                 idx -= 1;
             } else {
@@ -1218,7 +1212,6 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
          - Reserve sequential single-tool rounds for cases where each call genuinely depends on the previous result.\n"
     )
 }
-
 
 ///
 /// This is generic and history-based: it looks only at the current round index
