@@ -411,6 +411,16 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub forced_parallel_batching: bool,
+    /// Whether the round-budget convergence guard injected its phase-1
+    /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
+    /// crosses the effective round-budget hard limit; it tells the model
+    /// to produce a final answer next round and (in the runtime) restricts
+    /// all tools so the next round must be text-only. One-shot per turn.
+    pub forced_round_budget_phase1: bool,
+    /// Whether the round-budget guard escalated to phase-2 (hard abort).
+    /// Set when phase-1 fired and the model still attempted tool calls on
+    /// the very next round. One-shot per turn.
+    pub forced_round_budget_phase2: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
