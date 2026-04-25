@@ -123,6 +123,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
+    // Third-tier guard: parallel-batching force. Independent of the mutating-
+    // task escalation above — fires whenever the model has produced a long
+    // streak of trailing single-tool rounds despite the prompt-layer nudge,
+    // regardless of task type. Catches the "exploratory churn" failure mode
+    // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
+    if should_force_parallel_batching(state) {
+        let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+        state.stall.forced_parallel_batching = true;
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": parallel_batching_force_message(streak, &state.message),
+        }));
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ {streak} consecutive single-tool rounds; forcing parallel-batching corrective…"
+                ),
+            );
+        }
+    }
+
     let llm_wall_start = Instant::now();
     // Increment the LLM-round counter regardless of outcome so retry/error
     // paths don't see a stale count (the counter tracks *attempted* LLM
@@ -612,7 +634,56 @@ pub(crate) fn is_execution_escalation(m: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
-    is_execution_retry_correction(m) || is_execution_escalation(m)
+    is_execution_retry_correction(m) || is_execution_escalation(m) || is_parallel_batching_force(m)
+}
+
+/// Third-tier guard for the parallel-batching layer. The prompt-side soft
+/// nudge fires when the trailing single-tool round streak hits
+/// `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4). If the model ignores the nudge
+/// and produces yet another single-tool round, the streak crosses
+/// `PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD` (=5) and we inject a hard
+/// corrective `user` message — the same pattern as `EXECUTION_ESCALATION`,
+/// scoped to a different failure mode (sequential read churn rather than
+/// read-only spin on a mutating task).
+pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batching Force";
+
+/// Trailing single-tool-round streak length at which the soft prompt nudge
+/// (=4) escalates into a forced corrective injection. One above the nudge
+/// threshold so the model gets exactly ONE chance to self-correct before we
+/// intervene with a higher-priority `user` message.
+pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
+
+pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(PARALLEL_BATCHING_FORCE_MARKER))
+}
+
+pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState) -> bool {
+    if state.stall.forced_parallel_batching {
+        return false;
+    }
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    streak >= PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+}
+
+pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
+    format!(
+        "{PARALLEL_BATCHING_FORCE_MARKER}\n\
+         Runtime correction: your last {streak} rounds each ran exactly ONE tool, \
+         despite the prompt-layer nudge to batch independent calls. This wastes \
+         a round of latency, tokens, and budget for each call. \
+         Your NEXT response MUST do exactly one of the following:\n\
+         - Produce your final answer now if you already have enough information, OR\n\
+         - Call ≥3 independent tools in a single parallel batch (different files, \
+           different greps, different reads — anything that does not strictly \
+           depend on the previous tool's output).\n\
+         Do not produce another single-tool round.\n\n\
+         Original user query: {original_query}"
+    )
 }
 
 pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
@@ -1349,5 +1420,89 @@ mod tests {
 
         let unrelated = serde_json::json!({"role":"user","content":"fix the bug"});
         assert!(!is_execution_corrective_message(&unrelated));
+    }
+
+    // ─── Parallel-batching force (third-tier guard) ─────────────────────
+
+    fn push_single_tool_round(state: &mut AgenticLoopState) {
+        state
+            .messages
+            .push(serde_json::json!({"role": "assistant", "tool_calls": []}));
+        state
+            .messages
+            .push(serde_json::json!({"role": "tool", "content": "..."}));
+    }
+
+    #[test]
+    fn parallel_batching_force_fires_at_streak_threshold() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+        assert!(should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_silent_below_threshold() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1) {
+            push_single_tool_round(&mut state);
+        }
+        assert!(!should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_silent_when_last_round_batched() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        // Long single-tool history that crossed threshold...
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
+            push_single_tool_round(&mut state);
+        }
+        // ...but the most-recent round used 3 parallel tools — the model
+        // already self-corrected, no force needed.
+        state
+            .messages
+            .push(serde_json::json!({"role": "assistant", "tool_calls": []}));
+        for _ in 0..3 {
+            state
+                .messages
+                .push(serde_json::json!({"role": "tool", "content": "..."}));
+        }
+        assert!(!should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 3) {
+            push_single_tool_round(&mut state);
+        }
+        // First time would fire...
+        assert!(should_force_parallel_batching(&state));
+        // ...but once the flag is set, a second attempt is suppressed even
+        // if the model produces yet another single-tool round.
+        state.stall.forced_parallel_batching = true;
+        push_single_tool_round(&mut state);
+        assert!(!should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_marker_recognized_by_corrective_filter() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": parallel_batching_force_message(7, "do something"),
+        });
+        assert!(is_parallel_batching_force(&msg));
+        assert!(is_execution_corrective_message(&msg));
+        // Other corrective markers must not be misclassified as this one.
+        let retry = serde_json::json!({
+            "role": "user",
+            "content": execution_retry_message("do something"),
+        });
+        assert!(!is_parallel_batching_force(&retry));
     }
 }

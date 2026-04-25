@@ -407,6 +407,10 @@ pub struct StallTrackingState {
     /// task accumulated enough read-only tool calls without producing any
     /// workspace mutation. One-shot per turn.
     pub forced_execution_escalation: bool,
+    /// Whether a parallel-batching force injection has fired this loop. Set
+    /// when the model has produced a long streak of consecutive single-tool
+    /// rounds despite the soft prompt-layer nudge. One-shot per turn.
+    pub forced_parallel_batching: bool,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
