@@ -369,6 +369,14 @@ pub struct ToolSelectionConfig {
     /// passive scoring stricter; higher values make the signal rarer.
     #[serde(default)]
     pub search_fanout_eval_threshold: u32,
+
+    /// Post-mortem eval signal threshold: redundant retries of the same heavy
+    /// validation command prefix (cargo check/test/build, tsc, npm test, etc.)
+    /// required before emitting `RedundantValidationRetries`. 0 = use default
+    /// (2). Lower values make passive scoring stricter; higher values make the
+    /// signal rarer.
+    #[serde(default)]
+    pub redundant_validation_retries_eval_threshold: u32,
 }
 
 impl ToolSelectionConfig {
@@ -462,6 +470,17 @@ impl ToolSelectionConfig {
             8
         }
     }
+
+    /// Resolved post-mortem redundant-validation-retries eval threshold
+    /// (0 → default of 2). Minimum 1 is meaningful here: it means flag on the
+    /// first retry after an initial validation run.
+    pub fn effective_redundant_validation_retries_eval_threshold(&self) -> u32 {
+        if self.redundant_validation_retries_eval_threshold > 0 {
+            self.redundant_validation_retries_eval_threshold
+        } else {
+            2
+        }
+    }
 }
 
 fn default_max_tools() -> u32 {
@@ -497,6 +516,7 @@ impl Default for ToolSelectionConfig {
             sequential_read_churn_eval_threshold: 0,
             redundant_reads_eval_threshold: 0,
             search_fanout_eval_threshold: 0,
+            redundant_validation_retries_eval_threshold: 0,
         }
     }
 }
@@ -1020,6 +1040,7 @@ impl RuntimeConfig {
             sequential_read_churn_eval_threshold,
             redundant_reads_eval_threshold,
             search_fanout_eval_threshold,
+            redundant_validation_retries_eval_threshold,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -1102,6 +1123,13 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.search_fanout_eval_threshold,
             search_fanout_eval_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self
+                .tool_selection
+                .redundant_validation_retries_eval_threshold,
+            redundant_validation_retries_eval_threshold,
             0,
         );
 
@@ -1519,6 +1547,7 @@ mod tests {
                 sequential_read_churn_eval_threshold: 0,
                 redundant_reads_eval_threshold: 0,
                 search_fanout_eval_threshold: 0,
+                redundant_validation_retries_eval_threshold: 0,
             },
             learning: LearningConfig {
                 enabled: false,
@@ -1812,5 +1841,32 @@ selector_model = "qwen-flash"
             ..Default::default()
         };
         assert_eq!(cfg.effective_search_fanout_eval_threshold(), 2);
+    }
+
+    #[test]
+    fn redundant_validation_retries_eval_threshold_default_and_override() {
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(
+            cfg.effective_redundant_validation_retries_eval_threshold(),
+            2
+        );
+
+        let cfg = ToolSelectionConfig {
+            redundant_validation_retries_eval_threshold: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_redundant_validation_retries_eval_threshold(),
+            4
+        );
+
+        let cfg = ToolSelectionConfig {
+            redundant_validation_retries_eval_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_redundant_validation_retries_eval_threshold(),
+            1
+        );
     }
 }

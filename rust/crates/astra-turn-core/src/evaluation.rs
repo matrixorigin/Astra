@@ -49,6 +49,11 @@ pub enum EvalSignal {
     /// narrowing the search space or batching more effectively. Carries the
     /// total number of search-like calls in the turn.
     SearchFanout(usize),
+    /// The same heavy validation command prefix (e.g. `cargo check`,
+    /// `cargo test`, `npx tsc --noEmit`, `npm test`) was retried multiple
+    /// times with no intervening workspace mutation. Carries the number of
+    /// redundant retries after the first run.
+    RedundantValidationRetries(usize),
 }
 
 /// Default threshold for [`EvalSignal::SequentialReadChurn`]: how many
@@ -76,6 +81,17 @@ pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
 /// and carries a milder quality penalty.
 pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
 
+/// Default threshold for [`EvalSignal::RedundantValidationRetries`]:
+/// redundant retries of the SAME heavy validation prefix within a no-mutation
+/// window before flagging the turn. Carries retry count (runs after the first).
+/// Calibrated against 15k real sessions: among 68 long turns (`llm_rounds >= 8`)
+/// threshold 2 flags 2 turns (2.9%) with high precision:
+/// - 80ca74de turn 8: `npm test --prefix tmp/reimbursement-system` retried 3x
+///   with no intervening edit
+/// - 1d21375d turn 3: `cargo check -p astra-tools` retried 2x with no
+///   intervening edit
+pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
+
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
@@ -84,6 +100,7 @@ pub struct EvaluationThresholds {
     pub sequential_read_churn: usize,
     pub redundant_overlapping_reads: usize,
     pub search_fanout: usize,
+    pub redundant_validation_retries: usize,
 }
 
 impl Default for EvaluationThresholds {
@@ -92,6 +109,7 @@ impl Default for EvaluationThresholds {
             sequential_read_churn: SEQUENTIAL_READ_CHURN_THRESHOLD,
             redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
             search_fanout: SEARCH_FANOUT_THRESHOLD,
+            redundant_validation_retries: REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
         }
     }
 }
@@ -373,6 +391,23 @@ pub fn evaluate_tool_call_records_with_thresholds(
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
+    // Detect redundant retries of the same heavy validation prefix in a
+    // no-mutation window (e.g. `cargo check`, `cargo test`, `npx tsc --noEmit`).
+    // This is narrower and higher-precision than generic RepeatToolCall because
+    // it collapses harmless output-shaping suffixes like `| head -40`,
+    // `| tail -20`, and `&& grep ...`.
+    let redundant_validation_retries = max_redundant_validation_retries(tool_call_records);
+    if redundant_validation_retries >= thresholds.redundant_validation_retries {
+        eval.signals.push(EvalSignal::RedundantValidationRetries(
+            redundant_validation_retries,
+        ));
+        let penalty = (0.03
+            + 0.01
+                * (redundant_validation_retries - thresholds.redundant_validation_retries) as f64)
+            .clamp(0.03, 0.10);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    }
+
     eval
 }
 
@@ -447,6 +482,81 @@ pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
         .filter(|rec| !rec.is_synthetic_placeholder() && !rec.was_blocked_by_policy())
         .filter(|rec| is_search_like_tool_call(&rec.name, rec.args_full.as_deref().unwrap_or("")))
         .count()
+}
+
+fn split_shell_control_segments(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split(';'))
+}
+
+fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
+    if name != "bash" {
+        return None;
+    }
+    let command = bash_command_text(args);
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    for seg in split_shell_control_segments(command) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let seg = seg.split('|').next().unwrap_or(seg).trim();
+        let seg = seg.strip_suffix("2>&1").unwrap_or(seg).trim();
+        let seg = seg.strip_suffix("1>&2").unwrap_or(seg).trim();
+        let normalized = seg.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lower = normalized.to_ascii_lowercase();
+        if lower.starts_with("cargo check ")
+            || lower == "cargo check"
+            || lower.starts_with("cargo test ")
+            || lower == "cargo test"
+            || lower.starts_with("cargo build ")
+            || lower == "cargo build"
+            || lower.starts_with("npx tsc --noemit")
+            || lower == "tsc --noemit"
+            || lower.starts_with("tsc --noemit ")
+            || lower == "pytest"
+            || lower.starts_with("pytest ")
+            || lower == "npm test"
+            || lower.starts_with("npm test ")
+            || lower == "npm run build"
+            || lower.starts_with("npm run build ")
+            || lower == "go test"
+            || lower.starts_with("go test ")
+        {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+/// Return the maximum number of redundant retries of the same heavy validation
+/// prefix within any no-mutation window in the turn. A retry count of 2 means
+/// the same prefix ran 3 times total in one window.
+fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut best = 0usize;
+    for rec in records {
+        if rec.is_synthetic_placeholder() || rec.was_blocked_by_policy() {
+            continue;
+        }
+        let args = rec.args_full.as_deref().unwrap_or("");
+        if is_mutation_for_redundant_read(&rec.name, args) {
+            seen.clear();
+            continue;
+        }
+        if let Some(prefix) = normalize_validation_prefix(&rec.name, args) {
+            let entry = seen.entry(prefix).or_insert(0);
+            *entry += 1;
+            best = best.max(entry.saturating_sub(1));
+        }
+    }
+    best
 }
 
 /// Parsed read target for redundancy detection.
@@ -547,8 +657,20 @@ fn is_mutation_for_redundant_read(name: &str, args: &str) -> bool {
 }
 
 fn bash_args_look_mutating(args: &str) -> bool {
-    // Output redirection or in-place mutation.
-    if args.contains(">") || args.contains("|& tee") || args.contains("| tee") {
+    // Output redirection or in-place mutation. Ignore fd redirects like
+    // `2>&1` / `1>&2` — they shape output but do not mutate workspace.
+    let bytes = args.as_bytes();
+    let has_write_redirect = bytes.iter().enumerate().any(|(i, b)| {
+        *b == b'>'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|next| *next != b'&' && *next != b'>')
+    });
+    if args.contains(">>")
+        || args.contains("|& tee")
+        || args.contains("| tee")
+        || has_write_redirect
+    {
         return true;
     }
     // Common mutating commands as substrings (tolerates prefixes like
@@ -689,6 +811,14 @@ pub fn eval_signal_to_json_with_thresholds(
             "threshold": thresholds.search_fanout,
             "message": format!(
                 "Detected {count} grep/rg/find-like search calls in one turn — the model likely fanned out exploratory search instead of narrowing or switching to direct reads"
+            ),
+        }),
+        EvalSignal::RedundantValidationRetries(count) => json!({
+            "kind": "redundant_validation_retries",
+            "count": count,
+            "threshold": thresholds.redundant_validation_retries,
+            "message": format!(
+                "Detected {count} redundant retries of the same heavy validation command with no intervening workspace mutation"
             ),
         }),
     }
@@ -1861,6 +1991,100 @@ mod tests {
         assert_eq!(value["count"], 5);
         assert_eq!(value["threshold"], 4);
         assert!(value["message"].as_str().unwrap().contains("grep/rg/find"));
+    }
+
+    #[test]
+    fn redundant_validation_retries_detects_same_prefix_with_output_shaping_variants() {
+        let records = vec![
+            record_with_args("bash", 0, r#"{"command":"cd tmp && cargo check 2>&1"}"#),
+            record_with_args(
+                "bash",
+                1,
+                r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
+            ),
+            record_with_args(
+                "bash",
+                2,
+                r#"{"command":"cd tmp && cargo check 2>&1 | tail -20"}"#,
+            ),
+        ];
+        let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
+        let count = eval.signals.iter().find_map(|s| match s {
+            EvalSignal::RedundantValidationRetries(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(count, Some(2), "got {:?}", eval.signals);
+    }
+
+    #[test]
+    fn redundant_validation_retries_below_threshold_is_silent() {
+        let records = vec![
+            record_with_args("bash", 0, r#"{"command":"cd tmp && cargo check 2>&1"}"#),
+            record_with_args(
+                "bash",
+                1,
+                r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
+            ),
+        ];
+        let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RedundantValidationRetries(_))),
+            "single retry should stay below threshold; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn redundant_validation_retries_reset_after_mutation() {
+        let records = vec![
+            record_with_args("bash", 0, r#"{"command":"cd tmp && cargo check 2>&1"}"#),
+            record_with_args(
+                "bash",
+                1,
+                r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
+            ),
+            record_with_args(
+                "edit",
+                2,
+                r#"{"path":"tmp/src/main.rs","old_str":"a","new_str":"b"}"#,
+            ),
+            record_with_args(
+                "bash",
+                3,
+                r#"{"command":"cd tmp && cargo check 2>&1 | tail -20"}"#,
+            ),
+            record_with_args(
+                "bash",
+                4,
+                r#"{"command":"cd tmp && cargo check 2>&1 | grep -A3 '^error:'"}"#,
+            ),
+        ];
+        let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RedundantValidationRetries(_))),
+            "mutation should reset retry history; got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn redundant_validation_retries_custom_threshold_flows_into_json() {
+        let value = eval_signal_to_json_with_thresholds(
+            &EvalSignal::RedundantValidationRetries(3),
+            EvaluationThresholds {
+                redundant_validation_retries: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(value["kind"], "redundant_validation_retries");
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["threshold"], 2);
     }
 
     // ─── Redundant overlapping reads detection ──────────────────────────

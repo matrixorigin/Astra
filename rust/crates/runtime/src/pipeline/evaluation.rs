@@ -17,5 +17,9 @@ pub fn current_evaluation_thresholds() -> EvaluationThresholds {
             .effective_redundant_reads_eval_threshold()
             as usize,
         search_fanout: cfg.tool_selection.effective_search_fanout_eval_threshold() as usize,
+        redundant_validation_retries: cfg
+            .tool_selection
+            .effective_redundant_validation_retries_eval_threshold()
+            as usize,
     }
 }
