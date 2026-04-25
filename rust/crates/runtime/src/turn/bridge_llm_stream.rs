@@ -579,6 +579,14 @@ pub(crate) async fn call_llm_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::response::Response;
+    use axum::routing::post;
+    use futures_util::StreamExt;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn is_valid_tool_name_rejects_xml_artifacts() {
@@ -669,5 +677,72 @@ mod tests {
             body.contains("total_budget") || body.contains("budget"),
             "call_llm_stream must check total budget to prevent unbounded blocking"
         );
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_omits_empty_assistant_tool_calls_in_request_body() {
+        #[derive(Clone, Default, Debug)]
+        struct Capture {
+            messages: Vec<Value>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<Mutex<Capture>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            capture.lock().expect("capture lock").messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {payload}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("response")
+        }
+
+        async fn spawn_test_server(app: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("server");
+            });
+            format!("http://{addr}")
+        }
+
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let app = Router::new()
+            .route("/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let base = spawn_test_server(app).await;
+        let messages = vec![
+            json!({"role":"assistant","content":"Done.","tool_calls":[]}),
+            json!({"role":"user","content":"hi"}),
+        ];
+
+        let stream = call_llm_stream(
+            &messages,
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("stream");
+        let _: Vec<_> = stream.collect().await;
+
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(seen.messages.len(), 2);
+        assert!(seen.messages[0].get("tool_calls").is_none(), "{seen:?}");
     }
 }

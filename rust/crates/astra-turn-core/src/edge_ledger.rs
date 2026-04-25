@@ -226,8 +226,10 @@ pub fn assistant_message_with_tool_calls_and_reasoning(
     let mut msg = json!({
         "role": "assistant",
         "content": Value::Null,
-        "tool_calls": tool_calls,
     });
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = Value::Array(tool_calls.to_vec());
+    }
     if !reasoning_content.is_empty() {
         msg["reasoning_content"] = Value::String(reasoning_content.to_string());
     } else if force_reasoning_field {
@@ -500,6 +502,12 @@ mod tests {
         let msg = assistant_message_with_tool_calls(&tc);
         assert!(msg.get("reasoning_content").is_none());
         assert_eq!(msg["role"], "assistant");
+    }
+
+    #[test]
+    fn assistant_message_omits_empty_tool_calls() {
+        let msg = assistant_message_with_tool_calls_and_reasoning(&[], "", false);
+        assert!(msg.get("tool_calls").is_none(), "{msg:?}");
     }
 
     #[test]

@@ -104,4 +104,16 @@ mod tests {
         let result = apply_turn_to_session_entry(&entry, "", &[], "", &[], None, None);
         assert_eq!(result["turn_count"].as_i64().unwrap(), 1);
     }
+
+    #[test]
+    fn compacted_cloud_history_omits_empty_tool_calls_when_cached() {
+        let entry = Map::new();
+        let cloud_loop_history =
+            vec![json!({"role": "assistant", "content": "done", "tool_calls": []})];
+        let result =
+            apply_turn_to_session_entry(&entry, "final", &[], "", &cloud_loop_history, None, None);
+        let history = result["history"].as_array().unwrap();
+        assert!(history[0].get("tool_calls").is_none(), "{history:?}");
+        assert!(history[1].get("tool_calls").is_none(), "{history:?}");
+    }
 }

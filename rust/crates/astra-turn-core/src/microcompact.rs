@@ -167,6 +167,7 @@ fn compact_tool_results_with_pin_list(
     facts: &crate::cloud_session_facts::SessionFacts,
     pin_turns: u32,
 ) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let keep = config.keep_recent;
 
     // Build tool_call_id → tool_name mapping
@@ -300,6 +301,7 @@ fn compact_tool_results_with_config(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
 ) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let keep = config.keep_recent;
 
     // Build tool_call_id → tool_name mapping from assistant messages.
@@ -1579,5 +1581,17 @@ mod tests {
             stats_normal.results_compacted,
             stats_aware.results_compacted
         );
+    }
+
+    #[test]
+    fn compact_tool_results_omits_empty_assistant_tool_calls() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "done", "tool_calls": []}),
+            json!({"role": "tool", "content": "src/main.rs\n".to_string() + &"x".repeat(500), "tool_call_id": "c1", "name": "read_file"}),
+        ];
+
+        let _ = compact_tool_results(&mut messages, Some(0));
+
+        assert!(messages[0].get("tool_calls").is_none(), "{messages:?}");
     }
 }

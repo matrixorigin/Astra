@@ -383,7 +383,8 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     }
     out.extend(rest);
 
-    // Sanitize assistant messages: fix tool_calls with empty function names.
+    // Sanitize assistant messages: remove empty tool_calls arrays and fix
+    // tool_calls with empty function names.
     // Some providers (e.g. MiniMax) reject messages containing tool_calls
     // where the function name is empty (can happen when skill interception
     // captures a call before the streaming name chunk arrives).
@@ -404,7 +405,18 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
         if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
         }
-        let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let remove_empty_tool_calls = obj
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|tcs| tcs.is_empty());
+        if remove_empty_tool_calls {
+            obj.remove("tool_calls");
+            continue;
+        }
+        let Some(tcs) = obj.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
         };
         for tc in tcs.iter_mut() {
@@ -1740,6 +1752,67 @@ mod tests {
         assert_eq!(seen.model.as_deref(), Some("gpt-5-mini"));
     }
 
+    #[tokio::test]
+    async fn call_llm_and_collect_omits_empty_assistant_tool_calls_in_request_body() {
+        #[derive(Clone, Default, Debug)]
+        struct Capture {
+            messages: Vec<Value>,
+        }
+
+        async fn gateway_handler(
+            State(capture): State<Arc<Mutex<Capture>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            capture.lock().expect("capture lock").messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("gateway response")
+        }
+
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let app = Router::new()
+            .route("/chat/completions", post(gateway_handler))
+            .with_state(capture.clone());
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![
+            json!({"role":"assistant","content":"Done.","tool_calls":[]}),
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"c1","name":"bash","content":"ok"}),
+            json!({"role":"user","content":"hi"}),
+        ];
+
+        let result = call_llm_and_collect(
+            &messages,
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+
+        assert_eq!(result.full_text, "ok");
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(seen.messages.len(), 4);
+        assert!(seen.messages[0].get("tool_calls").is_none(), "{seen:?}");
+        assert_eq!(
+            seen.messages[1]["tool_calls"][0]["function"]["name"].as_str(),
+            Some("bash")
+        );
+    }
+
     #[test]
     fn classify_llm_error_categories() {
         use astra_core::ErrorKind;
@@ -2943,6 +3016,17 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(tc_name, "_unknown");
+    }
+
+    #[test]
+    fn consolidate_omits_empty_tool_calls_arrays() {
+        let msgs = vec![
+            json!({"role": "system", "content": "be helpful"}),
+            json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert!(out[1].get("tool_calls").is_none(), "{out:?}");
     }
 
     #[test]

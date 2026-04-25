@@ -130,15 +130,18 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
+    // Load runtime config once per round for all mid-loop guards below.
+    let tool_cfg = &crate::runtime_config::RuntimeConfig::load().tool_selection;
+    let parallel_batching_force_threshold =
+        tool_cfg.effective_parallel_batching_force_streak() as usize;
+    let round_budget_hard_limit = tool_cfg.effective_round_budget_limit();
+    let redundant_reads_threshold = tool_cfg.effective_redundant_reads_midloop_threshold() as usize;
+
     // Third-tier guard: parallel-batching force. Independent of the mutating-
     // task escalation above — fires whenever the model has produced a long
     // streak of trailing single-tool rounds despite the prompt-layer nudge,
     // regardless of task type. Catches the "exploratory churn" failure mode
     // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
-    let parallel_batching_force_threshold = crate::runtime_config::RuntimeConfig::load()
-        .tool_selection
-        .effective_parallel_batching_force_streak()
-        as usize;
     if should_force_parallel_batching(state, parallel_batching_force_threshold) {
         let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
         state.stall.forced_parallel_batching = true;
@@ -168,9 +171,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // tools, inject a final-finalize corrective with explicit anti-
     // hallucination wording. Phase 2 (after this round) escalates to a hard
     // abort if the model ignores phase 1.
-    let round_budget_hard_limit = crate::runtime_config::RuntimeConfig::load()
-        .tool_selection
-        .effective_round_budget_limit();
     if should_inject_round_budget_phase1(state, round_budget_hard_limit) {
         state.stall.forced_round_budget_phase1 = true;
         state.messages.push(serde_json::json!({
@@ -201,9 +201,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // rather than re-reading. Lives below round-budget phase-1 because
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
-    let redundant_reads_threshold = crate::runtime_config::RuntimeConfig::load()
-        .tool_selection
-        .effective_redundant_reads_midloop_threshold() as usize;
     if !state.stall.forced_round_budget_phase1
         && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
     {
@@ -805,7 +802,7 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 /// Default for the early-streak threshold; the actual value used at runtime
 /// flows through `ToolSelectionConfig::effective_parallel_batching_force_streak`.
 /// Must match `effective_parallel_batching_force_streak`'s zero-default.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
 
 /// Tightened streak threshold once the turn has entered the round-budget
@@ -815,7 +812,7 @@ pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
 /// Empirical real-session data: turns near the round-budget warning that
 /// added a 3rd consecutive single-tool round virtually never converged
 /// without external correction.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE: usize = 3;
 
 pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
@@ -903,6 +900,16 @@ pub(crate) fn should_inject_round_budget_phase1(state: &AgenticLoopState, hard_l
     if state.stall.forced_round_budget_phase1 {
         return false;
     }
+    // One corrective injection per turn: if another guard already fired
+    // this round, skip phase-1 to avoid double-injecting. In practice
+    // phase-1 fires at round >= hard_limit (typically 15) while other
+    // guards fire earlier, so overlap is rare — this is defensive.
+    if state.stall.forced_execution_escalation
+        || state.stall.forced_parallel_batching
+        || state.stall.forced_redundant_reads_corrective
+    {
+        return false;
+    }
     state.llm_rounds_completed >= hard_limit
 }
 
@@ -969,10 +976,10 @@ pub(crate) const REDUNDANT_READS_MARKER: &str = "## ⤴ Redundant Reads Detected
 /// at runtime flows through
 /// `ToolSelectionConfig::effective_redundant_reads_midloop_threshold`. Must
 /// match that accessor's zero-default.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) const REDUNDANT_READS_MIDLOOP_THRESHOLD: usize = 4;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn is_redundant_reads_corrective(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
         return false;
@@ -2016,6 +2023,38 @@ mod tests {
             &state,
             crate::prompts::ROUND_BUDGET_HARD_LIMIT
         ));
+    }
+
+    #[test]
+    fn round_budget_phase1_suppressed_when_other_corrective_already_fired() {
+        let hard_limit = crate::prompts::ROUND_BUDGET_HARD_LIMIT;
+
+        // Escalation suppresses phase-1.
+        let mut state = make_state();
+        state.llm_rounds_completed = hard_limit;
+        state.stall.forced_execution_escalation = true;
+        assert!(
+            !should_inject_round_budget_phase1(&state, hard_limit),
+            "phase-1 must not fire when escalation already active"
+        );
+
+        // Parallel-batching suppresses phase-1.
+        let mut state = make_state();
+        state.llm_rounds_completed = hard_limit;
+        state.stall.forced_parallel_batching = true;
+        assert!(
+            !should_inject_round_budget_phase1(&state, hard_limit),
+            "phase-1 must not fire when parallel-batching already active"
+        );
+
+        // Redundant-reads suppresses phase-1.
+        let mut state = make_state();
+        state.llm_rounds_completed = hard_limit;
+        state.stall.forced_redundant_reads_corrective = true;
+        assert!(
+            !should_inject_round_budget_phase1(&state, hard_limit),
+            "phase-1 must not fire when redundant-reads already active"
+        );
     }
 
     #[test]

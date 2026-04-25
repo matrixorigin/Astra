@@ -36,6 +36,21 @@ pub(crate) fn build_learning_bridge(
     Some(std::sync::Arc::new(bridge))
 }
 
+fn build_fallback_delegation_engine()
+-> std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine> {
+    let mut registry = astra_services::AgentProfileRegistry::new();
+    super::delegate_subrun::register_default_agents(&mut registry);
+    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+    let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+        registry,
+        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
+        std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
+    );
+    std::sync::Arc::new(engine)
+}
+
 /// Extract a [`BackgroundPlanContext`] from the current REPL state.
 ///
 /// Clones the active plan for the background executor, moves durable task state
@@ -258,20 +273,7 @@ async fn ensure_durable_task_state(
         });
 
         if state.delegation_engine.is_none() {
-            let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
-                astra_services::AgentProfileRegistry::new(),
-            ));
-            let run_store =
-                std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-            let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
-                registry,
-                std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-                std::sync::Arc::new(
-                    astra_runtime::server::delegation_engine::DelegationTracker::new(),
-                ),
-                std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
-            );
-            state.delegation_engine = Some(std::sync::Arc::new(engine));
+            state.delegation_engine = Some(build_fallback_delegation_engine());
         }
     }
 }
@@ -279,6 +281,9 @@ async fn ensure_durable_task_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::coordination::{
+        AggregationStrategy, CoordinationPattern, DelegationRequest,
+    };
     use astra_services::task_orchestrator::TaskPlan;
 
     #[test]
@@ -343,5 +348,25 @@ mod tests {
             ctx.evolution_service.as_ref().unwrap(),
             &evolution
         ));
+    }
+
+    #[tokio::test]
+    async fn fallback_delegation_engine_registers_default_root_agent() {
+        let engine = build_fallback_delegation_engine();
+        let request = DelegationRequest {
+            delegation_id: "del-1".to_string(),
+            parent_run_id: "run-1".to_string(),
+            task: "delegate".to_string(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["coder".to_string()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 10,
+            },
+            user_id: "user-1".to_string(),
+            depth: 0,
+            context: std::collections::HashMap::new(),
+        };
+
+        assert!(engine.validate(&request, "main").await.is_ok());
     }
 }

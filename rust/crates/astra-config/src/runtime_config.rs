@@ -421,66 +421,47 @@ impl ToolSelectionConfig {
     /// Resolved parallel-batching force streak threshold (0 → default of 5).
     /// Floor of 2 prevents a misconfiguration from triggering on every round.
     pub fn effective_parallel_batching_force_streak(&self) -> u32 {
-        if self.parallel_batching_force_streak > 0 {
-            self.parallel_batching_force_streak.max(2)
-        } else {
-            5
-        }
+        resolve_threshold(self.parallel_batching_force_streak, 5, 2)
     }
 
     /// Resolved redundant-reads mid-loop corrective threshold (0 → default
     /// of 4). Floor of 2 prevents pathological aggressive intervention; one
     /// re-read is normal noise and we never want to fire on count = 1.
     pub fn effective_redundant_reads_midloop_threshold(&self) -> u32 {
-        if self.redundant_reads_midloop_threshold > 0 {
-            self.redundant_reads_midloop_threshold.max(2)
-        } else {
-            4
-        }
+        resolve_threshold(self.redundant_reads_midloop_threshold, 4, 2)
     }
 
     /// Resolved post-mortem sequential-read-churn eval threshold (0 →
     /// default of 8). Floor of 2 avoids flagging every isolated single-tool
     /// turn when misconfigured.
     pub fn effective_sequential_read_churn_eval_threshold(&self) -> u32 {
-        if self.sequential_read_churn_eval_threshold > 0 {
-            self.sequential_read_churn_eval_threshold.max(2)
-        } else {
-            8
-        }
+        resolve_threshold(self.sequential_read_churn_eval_threshold, 8, 2)
     }
 
     /// Resolved post-mortem redundant-reads eval threshold (0 → default of
     /// 3). Floor of 2 avoids flagging the first redundant check when
     /// misconfigured.
     pub fn effective_redundant_reads_eval_threshold(&self) -> u32 {
-        if self.redundant_reads_eval_threshold > 0 {
-            self.redundant_reads_eval_threshold.max(2)
-        } else {
-            3
-        }
+        resolve_threshold(self.redundant_reads_eval_threshold, 3, 2)
     }
 
     /// Resolved post-mortem search-fanout eval threshold (0 → default of 8).
     /// Floor of 2 avoids pathological misconfiguration.
     pub fn effective_search_fanout_eval_threshold(&self) -> u32 {
-        if self.search_fanout_eval_threshold > 0 {
-            self.search_fanout_eval_threshold.max(2)
-        } else {
-            8
-        }
+        resolve_threshold(self.search_fanout_eval_threshold, 8, 2)
     }
 
     /// Resolved post-mortem redundant-validation-retries eval threshold
-    /// (0 → default of 2). Minimum 1 is meaningful here: it means flag on the
-    /// first retry after an initial validation run.
+    /// (0 → default of 2). No floor — 1 is meaningful (flag on first retry).
     pub fn effective_redundant_validation_retries_eval_threshold(&self) -> u32 {
-        if self.redundant_validation_retries_eval_threshold > 0 {
-            self.redundant_validation_retries_eval_threshold
-        } else {
-            2
-        }
+        resolve_threshold(self.redundant_validation_retries_eval_threshold, 2, 1)
     }
+}
+
+/// Resolve a `0-means-default` config field: returns `default` when `value`
+/// is 0, otherwise `value` clamped to at least `floor`.
+fn resolve_threshold(value: u32, default: u32, floor: u32) -> u32 {
+    if value > 0 { value.max(floor) } else { default }
 }
 
 fn default_max_tools() -> u32 {
@@ -1868,5 +1849,19 @@ selector_model = "qwen-flash"
             cfg.effective_redundant_validation_retries_eval_threshold(),
             1
         );
+    }
+
+    #[test]
+    fn resolve_threshold_helper() {
+        // 0 → default
+        assert_eq!(super::resolve_threshold(0, 5, 2), 5);
+        // explicit value above floor → as-is
+        assert_eq!(super::resolve_threshold(8, 5, 2), 8);
+        // explicit value below floor → clamped to floor
+        assert_eq!(super::resolve_threshold(1, 5, 2), 2);
+        // explicit value == floor → as-is
+        assert_eq!(super::resolve_threshold(2, 5, 2), 2);
+        // floor of 1 (validation retries case)
+        assert_eq!(super::resolve_threshold(1, 2, 1), 1);
     }
 }
