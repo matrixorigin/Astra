@@ -193,7 +193,8 @@ impl SessionFacts {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Extract file path from a ToolCallRecord.
-/// Uses `file_path` field if available, falls back to parsing `args_preview`.
+/// Uses `file_path` field if available, falls back to parsing `args_full` (untruncated)
+/// and finally `args_preview` (which may be truncated mid-path).
 fn extract_file_path(tc: &ToolCallRecord) -> Option<String> {
     // Prefer the dedicated field (populated at tool execution time)
     if let Some(fp) = &tc.file_path {
@@ -201,8 +202,14 @@ fn extract_file_path(tc: &ToolCallRecord) -> Option<String> {
             return Some(fp.clone());
         }
     }
-    // Fallback: parse args_preview for simple cases (read_file, write_to_file)
-    // This is unreliable for str_replace (path may be truncated), but better than nothing.
+    // Next-best: parse the untruncated args_full. Reliable for str_replace and
+    // any record where `args_preview` would have been cut off mid-path.
+    if let Some(full) = tc.args_full.as_deref() {
+        if let Some(path) = parse_path_from_json_preview(full) {
+            return Some(path);
+        }
+    }
+    // Last-resort: parse args_preview. Best-effort for legacy records.
     let preview = tc.args_preview.as_deref()?;
     parse_path_from_json_preview(preview)
 }
@@ -340,6 +347,29 @@ mod tests {
 
         assert_eq!(facts.active_files.len(), 1);
         assert_eq!(facts.active_files[0].path, "src/foo.rs");
+    }
+
+    #[test]
+    fn update_prefers_args_full_over_truncated_args_preview() {
+        // Repro of a real journal hazard: when `file_path` is missing
+        // (legacy/older record) and `args_preview` was truncated mid-path,
+        // the fallback parser used to return a wrong/partial path. Records
+        // that carry the untruncated `args_full` must use that instead.
+        let mut facts = SessionFacts::default();
+        let truncated_preview =
+            r#"{"path":"rust/crates/astra-cli/src/edge_tools/file_state_legac"#;
+        let full = r#"{"path":"rust/crates/astra-cli/src/edge_tools/file_state_legacy_helpers.rs","old_str":"foo","new_str":"bar"}"#;
+        let mut tc = make_tc("str_replace", true, None, Some(truncated_preview));
+        tc.args_full = Some(full.to_string());
+        let event = make_event(1, vec![tc]);
+        facts.update_from_journal_event(&event);
+
+        assert_eq!(facts.active_files.len(), 1);
+        assert_eq!(
+            facts.active_files[0].path,
+            "rust/crates/astra-cli/src/edge_tools/file_state_legacy_helpers.rs",
+            "extractor must read the untruncated args_full, not the truncated preview"
+        );
     }
 
     #[test]
