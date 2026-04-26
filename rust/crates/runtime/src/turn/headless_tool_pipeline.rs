@@ -684,6 +684,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_cross_turn_short_circuit_records_explicit_trace_payload() {
+        let mut harness = PipelineHarness::new();
+        begin_recorded_turn(&mut harness, 1);
+
+        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-1", "a.txt").await;
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "cached cross-turn short-circuit should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        let started_payload = tool_events[0].1.as_ref().expect("started payload");
+        assert_eq!(
+            started_payload.get("tool_name").and_then(Value::as_str),
+            Some("read_file")
+        );
+        assert_eq!(
+            started_payload.get("call_id").and_then(Value::as_str),
+            Some("call-read-a-1")
+        );
+        assert!(
+            started_payload
+                .get("args_preview")
+                .and_then(Value::as_str)
+                .is_some_and(|preview| preview.contains("a.txt")),
+            "started trace should include args preview, got: {started_payload:?}"
+        );
+
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        let skipped_payload = tool_events[1].1.as_ref().expect("skipped payload");
+        assert_eq!(
+            skipped_payload.get("reason").and_then(Value::as_str),
+            Some("cached_cross_turn")
+        );
+        assert_eq!(
+            skipped_payload.get("cached").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            skipped_payload
+                .get("args_preview")
+                .and_then(Value::as_str)
+                .is_some_and(|preview| preview.contains("a.txt")),
+            "skipped trace should include args preview, got: {skipped_payload:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_and_record_pipeline_appends_one_tool_result() {
         let mut harness = PipelineHarness::new();
         let mut pipeline = harness.pipeline();
@@ -1617,6 +1673,77 @@ mod tests {
     }
 
     #[test]
+    fn validate_slot_blocks_repeated_str_replace_with_recovery_policy() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("str_replace".to_string());
+        let args = json!({
+            "path": "src/lib.rs",
+            "old_str": "fn missing() {}",
+            "new_str": "fn present() {}"
+        });
+        harness.tool_calls.push(json!({
+            "id": "call-edit-0",
+            "function": { "name": "str_replace", "arguments": serde_json::to_string(&args).unwrap() }
+        }));
+        let sig = crate::turn::tool_result_semantics::tool_dedup_signature("str_replace", &args);
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for result_hash in [11, 12] {
+            harness.turn_guard.health.record_outcome(
+                &sig,
+                crate::turn::tool_health::ToolOutcome {
+                    success: false,
+                    latency_ms: 10,
+                    result_hash,
+                    at_epoch: now_epoch,
+                    failure_category: None,
+                },
+            );
+        }
+
+        begin_recorded_turn(&mut harness, 1);
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("str_replace recovery required"),
+            "expected str_replace-specific recovery advisory"
+        );
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        let skipped = tool_events
+            .iter()
+            .find(|(kind, _)| {
+                matches!(
+                    kind,
+                    crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+                )
+            })
+            .expect("expected skipped trace event");
+        assert_eq!(
+            skipped
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("str_replace_recovery_required")
+        );
+        assert!(
+            skipped
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("output"))
+                .and_then(Value::as_str)
+                .is_some_and(|output| output.contains("read_file the target range"))
+        );
+    }
+
+    #[test]
     fn validate_slot_allows_retry_when_recent_success_exists() {
         let mut harness = PipelineHarness::new();
         harness.tool_calls.push(json!({
@@ -1657,6 +1784,41 @@ mod tests {
         assert!(
             matches!(result, HeadlessPipelineStage::Continue(_)),
             "recent success should keep the tool callable"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_cached_reads_are_suppressed_after_threshold() {
+        let mut harness = PipelineHarness::new();
+
+        short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
+        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-2", "a.txt").await;
+        short_circuit_cached_read_file(&mut harness, 2, "call-read-a-3", "a.txt").await;
+
+        assert!(
+            harness.tool_results[2]
+                .to_string()
+                .contains("Repeated cached read suppressed"),
+            "third identical cached read should be a suppression advisory instead of replaying output, got: {:?}",
+            harness.tool_results
+        );
+        let tool_events = tool_trace_events(&harness);
+        let suppressed = tool_events
+            .iter()
+            .find(|(_, payload)| {
+                payload.as_ref().is_some_and(|payload| {
+                    payload.get("reason").and_then(Value::as_str)
+                        == Some("repeated_cache_hit_suppressed")
+                })
+            })
+            .expect("expected repeated cache-hit suppression trace");
+        assert_eq!(
+            suppressed
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 

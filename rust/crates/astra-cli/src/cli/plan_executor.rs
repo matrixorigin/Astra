@@ -1641,6 +1641,7 @@ async fn plan_executor_task(
                     message: &prompt,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
+                    provider: None,
                     explain: crate::ExplainMode::Off,
                     render_md: false,
                     history: &ctx.history,

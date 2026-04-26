@@ -323,6 +323,15 @@ impl ToolHealthTracker {
         self.dirty_tools.insert(tool_name.to_string());
     }
 
+    /// Number of session-local cache hits recorded for the canonical signature.
+    #[must_use]
+    pub fn cache_hits_for_signature(&self, signature: &str) -> usize {
+        self.cache_hits_by_signature
+            .get(signature)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Check if a tool has been deprioritized due to repeated failures.
     pub fn is_deprioritized(&self, tool_name: &str) -> bool {
         self.tools.get(tool_name).is_some_and(|h| h.deprioritized)
@@ -385,8 +394,9 @@ impl ToolHealthTracker {
                 }
                 "str_replace" => {
                     msg.push_str(
-                        " If str_replace keeps failing, verify the exact match string \
-                         by reading the file first with read_file.",
+                        " If str_replace keeps failing, read the file first to verify \
+                         the exact content, then retry. If it still fails after 2 retries, \
+                         use write_file to rewrite the entire file instead.",
                     );
                 }
                 _ => {}
@@ -1717,5 +1727,22 @@ mod tests {
         let c = ToolOutcome::new(true, 0, "aaa");
         assert_ne!(a.result_hash, b.result_hash);
         assert_eq!(a.result_hash, c.result_hash);
+    }
+
+    #[test]
+    fn str_replace_injection_suggests_write_file_fallback() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..4 {
+            tracker.record_failure("str_replace");
+        }
+        let msg = tracker.deprioritize_warning().unwrap();
+        assert!(
+            msg.contains("write_file"),
+            "injection should suggest write_file fallback, got: {msg}"
+        );
+        assert!(
+            msg.contains("str_replace"),
+            "injection should mention str_replace, got: {msg}"
+        );
     }
 }

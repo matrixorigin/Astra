@@ -686,6 +686,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.turn_chain_id,
         ctx.user_query_event_id,
     );
+    if let Some(root) = payload.as_object_mut() {
+        root.insert("root_turn_journal_owned".into(), json!(true));
+    }
 
     // ─── SelfModel: inject self-awareness text into edge_profile ───
     // Publish fresh denial-pressure + per-tool outcome bias + recent

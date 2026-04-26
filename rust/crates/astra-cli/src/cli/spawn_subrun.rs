@@ -105,6 +105,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
+        let compact_strategy =
+            astra_runtime::turn::microcompact::CompactStrategy::from_provider_hint(&config.model);
 
         let executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &self.token);
@@ -289,6 +291,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,

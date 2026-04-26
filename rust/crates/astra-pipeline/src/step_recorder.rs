@@ -40,6 +40,9 @@ pub struct StepRecorder {
     events: Vec<StepEvent>,
     current_step: Option<Step>,
     turn_number: u32,
+    round_index: u32,
+    step_sequence: u32,
+    current_step_sequence: Option<u32>,
     slot_counter: u32,
     /// Per-tool timing for lightweight profiling
     tool_timings: HashMap<String, Vec<u64>>,
@@ -59,6 +62,9 @@ impl StepRecorder {
             events: Vec::new(),
             current_step: None,
             turn_number: 0,
+            round_index: 0,
+            step_sequence: 0,
+            current_step_sequence: None,
             slot_counter: 0,
             tool_timings: HashMap::new(),
             phase_log: Vec::new(),
@@ -73,6 +79,8 @@ impl StepRecorder {
     /// highest existing file number, preventing cross-turn overwrites.
     pub fn with_persistence(session_id: &str, task_id: &str) -> Self {
         let file_store = FileBackedEventStore::new(session_id);
+        let events = file_store.all_events().to_vec();
+        let step_sequence = next_step_sequence(&events);
         let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
             .unwrap_or_default()
             .iter()
@@ -81,6 +89,8 @@ impl StepRecorder {
             .unwrap_or(0);
         Self {
             file_store: Some(file_store),
+            events,
+            step_sequence,
             checkpoint_count: existing_max.saturating_add(1),
             ..Self::new(session_id, task_id)
         }
@@ -114,13 +124,25 @@ impl StepRecorder {
 
     /// Begin a new turn. Creates a PERCEIVE step.
     pub fn begin_turn(&mut self, turn: u32) {
-        self.turn_number = turn;
+        self.begin_turn_with_context(turn, turn);
+    }
+
+    /// Begin a new agentic round for a visible user turn.
+    pub fn begin_turn_with_context(&mut self, visible_turn: u32, round_index: u32) {
+        self.turn_number = visible_turn;
+        self.round_index = round_index;
         self.slot_counter = 0;
+        let step_sequence = self.step_sequence;
+        self.step_sequence = self.step_sequence.saturating_add(1);
+        self.current_step_sequence = Some(step_sequence);
 
         let step = Step::new(
-            format!("{}-turn-{}", self.session_id, turn),
+            format!(
+                "{}-turn-{}-step-{}",
+                self.session_id, visible_turn, step_sequence
+            ),
             self.task_id.clone(),
-            format!("turn-{}", turn),
+            format!("turn-{}", visible_turn),
             StepAction::Perceive,
             StepPayload::Perceive {
                 user_query: String::new(), // filled later
@@ -130,7 +152,7 @@ impl StepRecorder {
 
         self.emit(step.step_id(), StepEventType::StepCreated);
         self.phase_log
-            .push((turn, StepAction::Perceive, epoch_ms()));
+            .push((visible_turn, StepAction::Perceive, epoch_ms()));
         self.current_step = Some(step);
     }
 
@@ -225,6 +247,17 @@ impl StepRecorder {
         call_id: &str,
         idempotency_key: Option<&str>,
     ) {
+        self.begin_tool_with_key_and_args_preview(tool_name, call_id, idempotency_key, None);
+    }
+
+    /// Record start of a tool execution with idempotency key and argument preview.
+    pub fn begin_tool_with_key_and_args_preview(
+        &mut self,
+        tool_name: &str,
+        call_id: &str,
+        idempotency_key: Option<&str>,
+        args_preview: Option<&str>,
+    ) {
         let slot_idx = self.slot_counter;
         self.slot_counter += 1;
 
@@ -235,21 +268,37 @@ impl StepRecorder {
             slot.call_id = call_id.to_string();
             slot.state = SlotState::Running;
             slot.idempotency_key = idempotency_key.map(|k| k.to_string());
+            slot.args_preview = args_preview.map(|a| a.to_string());
         }
 
-        self.emit_with_payload(
-            StepEventType::ToolCallStarted,
-            serde_json::json!({
-                "tool_name": tool_name,
-                "slot_index": slot_idx,
-                "idempotency_key": idempotency_key,
-            }),
-        );
+        let mut payload = serde_json::json!({
+            "tool_name": tool_name,
+            "slot_index": slot_idx,
+            "call_id": call_id,
+            "idempotency_key": idempotency_key,
+        });
+        if let Some(args_preview) = args_preview {
+            payload["args_preview"] = serde_json::json!(args_preview);
+        }
+        self.emit_with_payload(StepEventType::ToolCallStarted, payload);
     }
 
     /// Record a cache hit on the current slot (sets cached_result + Skipped state).
     /// Call this instead of complete_tool() when the idempotency cache provides the result.
     pub fn record_cache_hit(&mut self, tool_name: &str, cached: CachedToolResult) {
+        self.record_cache_hit_with_reason(tool_name, cached, "idempotency_cache_hit");
+    }
+
+    /// Record a cache hit with an explicit trace reason.
+    ///
+    /// Use a scoped reason (for example `cached_cross_turn`) when the cache
+    /// source matters for loop diagnostics and trace replay.
+    pub fn record_cache_hit_with_reason(
+        &mut self,
+        tool_name: &str,
+        cached: CachedToolResult,
+        reason: &str,
+    ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
 
         if let Some(ref mut step) = self.current_step
@@ -258,7 +307,7 @@ impl StepRecorder {
             slot.cached_result = Some(cached);
         }
 
-        self.skip_tool_with_reason(tool_name, "idempotency_cache_hit", true, None);
+        self.skip_tool_with_reason(tool_name, reason, true, None);
     }
 
     /// Record a short-circuit skip for the current tool slot.
@@ -274,12 +323,14 @@ impl StepRecorder {
         output: Option<&str>,
     ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
-        let idem_key = self.current_step.as_ref().and_then(|step| {
-            step.execution
-                .cursor
-                .slots
-                .get(slot_idx as usize)
-                .and_then(|s| s.idempotency_key.clone())
+        let slot_meta = self.current_step.as_ref().and_then(|step| {
+            step.execution.cursor.slots.get(slot_idx as usize).map(|s| {
+                (
+                    s.call_id.clone(),
+                    s.idempotency_key.clone(),
+                    s.args_preview.clone(),
+                )
+            })
         });
 
         if let Some(ref mut step) = self.current_step {
@@ -300,8 +351,14 @@ impl StepRecorder {
             "reason": reason,
             "cached": was_cached,
         });
-        if let Some(key) = idem_key {
-            payload["idempotency_key"] = serde_json::json!(key);
+        if let Some((call_id, idem_key, args_preview)) = slot_meta {
+            payload["call_id"] = serde_json::json!(call_id);
+            if let Some(key) = idem_key {
+                payload["idempotency_key"] = serde_json::json!(key);
+            }
+            if let Some(args_preview) = args_preview {
+                payload["args_preview"] = serde_json::json!(args_preview);
+            }
         }
         if let Some(output) = output {
             payload["output"] = serde_json::json!(output);
@@ -356,13 +413,15 @@ impl StepRecorder {
     ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
 
-        // Extract idempotency key from slot before mutation
-        let idem_key = self.current_step.as_ref().and_then(|step| {
-            step.execution
-                .cursor
-                .slots
-                .get(slot_idx as usize)
-                .and_then(|s| s.idempotency_key.clone())
+        // Extract trace metadata from slot before mutation.
+        let slot_meta = self.current_step.as_ref().and_then(|step| {
+            step.execution.cursor.slots.get(slot_idx as usize).map(|s| {
+                (
+                    s.call_id.clone(),
+                    s.idempotency_key.clone(),
+                    s.args_preview.clone(),
+                )
+            })
         });
 
         if let Some(ref mut step) = self.current_step {
@@ -397,13 +456,24 @@ impl StepRecorder {
             "tool_name": tool_name,
             "elapsed_ms": elapsed_ms,
             "cached": was_cached,
+            "is_error": is_error,
         });
-        if let Some(key) = &idem_key {
-            payload["idempotency_key"] = serde_json::json!(key);
+        if let Some((call_id, idem_key, args_preview)) = slot_meta {
+            payload["call_id"] = serde_json::json!(call_id);
+            if let Some(key) = idem_key {
+                payload["idempotency_key"] = serde_json::json!(key);
+            }
+            if let Some(args_preview) = args_preview {
+                payload["args_preview"] = serde_json::json!(args_preview);
+            }
         }
         if let Some(out) = output {
             payload["output"] = serde_json::json!(out);
-            payload["is_error"] = serde_json::json!(is_error);
+            if is_error {
+                payload["error"] = serde_json::json!(out);
+            }
+        } else if is_error {
+            payload["error"] = serde_json::json!("tool failed without captured error");
         }
 
         self.emit_with_payload(event_type, payload);
@@ -525,7 +595,7 @@ impl StepRecorder {
         let event_type = if completed {
             StepEventType::StepCompleted
         } else {
-            StepEventType::StepRetried
+            StepEventType::StepIncomplete
         };
         let step_id = self
             .current_step
@@ -692,7 +762,7 @@ impl StepRecorder {
                         .clone(),
                 ]
             },
-            payload: None,
+            payload: Some(self.trace_context_payload()),
             created_at: epoch_ms(),
         };
         if let Some(ref mut fs) = self.file_store {
@@ -723,13 +793,36 @@ impl StepRecorder {
             event_type,
             agent_id: None,
             caused_by,
-            payload: Some(payload),
+            payload: Some(self.with_trace_context(payload)),
             created_at: epoch_ms(),
         };
         if let Some(ref mut fs) = self.file_store {
             fs.append(event.clone());
         }
         self.events.push(event);
+    }
+
+    fn trace_context_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "trace_context": {
+                "visible_turn": self.turn_number,
+                "round_index": self.round_index,
+                "step_sequence": self.current_step_sequence,
+            }
+        })
+    }
+
+    fn with_trace_context(&self, mut payload: serde_json::Value) -> serde_json::Value {
+        let trace_context = self.trace_context_payload()["trace_context"].clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("trace_context".to_string(), trace_context);
+            payload
+        } else {
+            serde_json::json!({
+                "value": payload,
+                "trace_context": trace_context,
+            })
+        }
     }
 
     fn rebind_session_id(&mut self, session_id: &str) {
@@ -775,6 +868,29 @@ fn rebind_step_id(step_id: &mut String, previous_session_id: &str, session_id: &
     if let Some(suffix) = step_id.strip_prefix(&previous_prefix) {
         *step_id = format!("{session_id}-turn-{suffix}");
     }
+}
+
+fn next_step_sequence(events: &[StepEvent]) -> u32 {
+    events
+        .iter()
+        .filter_map(|event| {
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("trace_context"))
+                .and_then(|ctx| ctx.get("step_sequence"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|seq| u32::try_from(seq).ok())
+                .or_else(|| {
+                    event
+                        .step_id
+                        .rsplit("-step-")
+                        .next()
+                        .and_then(|seq| seq.parse::<u32>().ok())
+                })
+        })
+        .max()
+        .map_or(0, |seq| seq.saturating_add(1))
 }
 
 /// Summary of a recorded session for debugging/audit.
@@ -986,6 +1102,85 @@ mod tests {
     }
 
     #[test]
+    fn regression_incomplete_turn_is_not_recorded_as_retry() {
+        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool("read_file", "call-1");
+        rec.complete_tool("read_file", false, 12, false);
+
+        rec.end_turn(false);
+
+        let last = rec.events().last().unwrap();
+        assert_eq!(
+            last.event_type,
+            StepEventType::StepIncomplete,
+            "normal incomplete turn progression must not be mislabeled as retry"
+        );
+        assert!(
+            !rec.events()
+                .iter()
+                .any(|event| event.event_type == StepEventType::StepRetried),
+            "StepRetried should be reserved for actual retry scheduling"
+        );
+    }
+
+    #[test]
+    fn regression_failed_tool_event_carries_actionable_payload() {
+        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool_with_key_and_args_preview(
+            "str_replace",
+            "call-1",
+            Some("sem:str_replace:file.rs"),
+            Some("path=file.rs old_str=fn_old"),
+        );
+
+        rec.complete_tool_with_result(
+            "str_replace",
+            true,
+            7,
+            false,
+            "Error: old_str not found in file",
+        );
+
+        let failed = rec
+            .events()
+            .iter()
+            .find(|event| event.event_type == StepEventType::ToolCallFailed)
+            .expect("expected failed tool event");
+        let payload = failed.payload.as_ref().expect("failed event payload");
+        assert_eq!(
+            payload.get("tool_name").and_then(serde_json::Value::as_str),
+            Some("str_replace")
+        );
+        assert_eq!(
+            payload.get("call_id").and_then(serde_json::Value::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            payload
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            Some("sem:str_replace:file.rs")
+        );
+        assert_eq!(
+            payload
+                .get("args_preview")
+                .and_then(serde_json::Value::as_str),
+            Some("path=file.rs old_str=fn_old")
+        );
+        assert!(
+            payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("old_str not found")),
+            "failed event should carry actionable error, got: {payload:?}"
+        );
+    }
+
+    #[test]
     fn recorder_summary() {
         let mut rec = StepRecorder::new("sess-1", "task-1");
 
@@ -1089,21 +1284,204 @@ mod tests {
         rec.end_turn(true);
 
         assert_eq!(rec.summary().session_id, "sess-adopted");
-        assert_eq!(rec.current_step().unwrap().step_id(), "sess-adopted-turn-0");
+        assert_eq!(
+            rec.current_step().unwrap().step_id(),
+            "sess-adopted-turn-0-step-0"
+        );
         assert!(
             rec.events()
                 .iter()
-                .all(|event| event.step_id == "sess-adopted-turn-0")
+                .all(|event| event.step_id == "sess-adopted-turn-0-step-0")
         );
 
         let adopted_path = tmp.path().join("sess-adopted").join("step_events.jsonl");
         let persisted = std::fs::read_to_string(adopted_path).unwrap();
-        assert!(persisted.contains("\"step_id\":\"sess-adopted-turn-0\""));
+        assert!(persisted.contains("\"step_id\":\"sess-adopted-turn-0-step-0\""));
         assert!(
             !tmp.path()
                 .join("ephemeral")
                 .join("step_events.jsonl")
                 .exists()
         );
+    }
+
+    #[test]
+    fn with_persistence_continues_step_sequence_and_causal_chain_across_recorders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let sid = "sess-continued";
+
+        let mut first = StepRecorder::with_persistence(sid, "task-1");
+        first.begin_turn_with_context(0, 0);
+        first.end_turn(false);
+        let previous_tail = first.events().last().unwrap().event_id.clone();
+        drop(first);
+
+        let mut second = StepRecorder::with_persistence(sid, "task-2");
+        second.begin_turn_with_context(1, 0);
+
+        assert_eq!(
+            second.current_step().unwrap().step_id(),
+            "sess-continued-turn-1-step-1"
+        );
+        let created = second.events().last().unwrap();
+        assert_eq!(created.event_type, StepEventType::StepCreated);
+        assert_eq!(created.caused_by, vec![previous_tail]);
+        let trace_context = created
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("trace_context"))
+            .unwrap();
+        assert_eq!(
+            trace_context
+                .get("visible_turn")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            trace_context
+                .get("round_index")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            trace_context
+                .get("step_sequence")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn regression_recreated_visible_turns_have_unique_step_ids_and_context() {
+        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        rec.begin_turn(6);
+        rec.end_turn(false);
+        rec.begin_turn(6);
+        rec.end_turn(false);
+
+        let created: Vec<&StepEvent> = rec
+            .events()
+            .iter()
+            .filter(|event| event.event_type == StepEventType::StepCreated)
+            .collect();
+        assert_eq!(created.len(), 2);
+        assert_ne!(
+            created[0].step_id, created[1].step_id,
+            "re-created visible turns need unique step ids for trace correlation"
+        );
+        for (idx, event) in created.iter().enumerate() {
+            let trace_context = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("trace_context"))
+                .expect("step events should carry trace context");
+            assert_eq!(
+                trace_context
+                    .get("visible_turn")
+                    .and_then(serde_json::Value::as_u64),
+                Some(6)
+            );
+            assert_eq!(
+                trace_context
+                    .get("step_sequence")
+                    .and_then(serde_json::Value::as_u64),
+                Some(idx as u64)
+            );
+        }
+    }
+
+    #[test]
+    fn regression_step_events_jsonl_satisfies_trace_invariants() {
+        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        rec.begin_turn(3);
+        rec.record_plan(&["read_file".into()], 0.8, 0.2, 4000);
+        rec.begin_act(1);
+        rec.begin_tool_with_key_and_args_preview(
+            "read_file",
+            "call-read-1",
+            Some("sem:read:file.rs"),
+            Some("path=file.rs start=1 end=20"),
+        );
+        rec.record_cache_hit_with_reason(
+            "read_file",
+            CachedToolResult {
+                tool_name: "read_file".to_string(),
+                output: "cached output".to_string(),
+                is_error: false,
+                cached_at: 42,
+            },
+            "cached_cross_turn",
+        );
+        rec.end_turn(false);
+
+        let jsonl = rec
+            .events()
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let parsed = jsonl
+            .lines()
+            .map(serde_json::from_str::<StepEvent>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("events should parse as JSONL");
+
+        let mut event_ids = std::collections::HashSet::new();
+        let mut created_step_ids = std::collections::HashSet::new();
+        for (idx, event) in parsed.iter().enumerate() {
+            assert!(
+                event_ids.insert(event.event_id.clone()),
+                "event_id must be unique: {}",
+                event.event_id
+            );
+            if idx == 0 {
+                assert!(event.caused_by.is_empty());
+            } else {
+                assert!(
+                    event
+                        .caused_by
+                        .iter()
+                        .all(|parent| event_ids.contains(parent)),
+                    "all causal parents must refer to earlier events: {:?}",
+                    event.caused_by
+                );
+            }
+            let trace_context = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("trace_context"))
+                .expect("every trace event should carry trace_context");
+            assert_eq!(
+                trace_context
+                    .get("visible_turn")
+                    .and_then(serde_json::Value::as_u64),
+                Some(3)
+            );
+            if event.event_type == StepEventType::StepCreated {
+                assert!(
+                    created_step_ids.insert(event.step_id.clone()),
+                    "StepCreated step_id must be unique: {}",
+                    event.step_id
+                );
+            }
+            if event.event_type == StepEventType::ToolCallSkipped {
+                let payload = event.payload.as_ref().unwrap();
+                assert_eq!(
+                    payload.get("reason").and_then(serde_json::Value::as_str),
+                    Some("cached_cross_turn")
+                );
+                assert_eq!(
+                    payload.get("cached").and_then(serde_json::Value::as_bool),
+                    Some(true)
+                );
+            }
+            assert_ne!(
+                event.event_type,
+                StepEventType::StepRetried,
+                "StepRetried must not represent normal cross-round progression"
+            );
+        }
     }
 }

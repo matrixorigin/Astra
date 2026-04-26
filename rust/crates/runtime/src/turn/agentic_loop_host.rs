@@ -739,6 +739,9 @@ pub struct AgenticLoopState {
     /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
     pub session_facts: crate::turn::cloud::session_facts::SessionFacts,
 
+    /// Provider-aware compaction strategy for microcompact placeholders.
+    pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
+
     // ── Approval checkpoint persistence ──
     /// Approval overrides synchronized from CLI's PermissionManager before each turn.
     /// Written to HeavyCheckpoint so approval decisions survive session restarts.
@@ -1098,6 +1101,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
@@ -1418,6 +1422,7 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -7696,8 +7701,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .iter()
             .filter(|m| {
                 m.get("role").and_then(Value::as_str) == Some("tool")
-                    && m.get("content").and_then(Value::as_str)
-                        == Some("[Previous tool output cleared]")
+                    && m.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(astra_turn_core::microcompact::is_cleared_content)
             })
             .count();
 

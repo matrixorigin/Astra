@@ -604,6 +604,9 @@ pub struct ExecutionSlot {
     pub state: SlotState,
     /// Points to idempotency cache entry
     pub idempotency_key: Option<String>,
+    /// Stable, short preview of the tool arguments for trace/debugging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_preview: Option<String>,
     /// Inline cached result (for checkpoint completeness)
     pub cached_result: Option<CachedToolResult>,
     /// Tool-level retry count (separate from step retry)
@@ -672,6 +675,7 @@ impl ExecutionCursor {
                     call_id: String::new(),
                     state: SlotState::Pending,
                     idempotency_key: None,
+                    args_preview: None,
                     cached_result: None,
                     retry_count: 0,
                 })
@@ -1529,6 +1533,9 @@ pub enum StepEventType {
     StepAssigned,
     StepStarted,
     StepCompleted,
+    /// Step ended without terminal success/failure, e.g. a visible turn paused,
+    /// hit a round budget, or yielded to the next iteration.
+    StepIncomplete,
     StepFailed,
     StepRetried,
 
@@ -2028,6 +2035,7 @@ mod tests {
             call_id: "c1".into(),
             state: SlotState::Completed,
             idempotency_key: Some("key1".into()),
+            args_preview: Some("pattern=foo".into()),
             cached_result: Some(CachedToolResult {
                 tool_name: "grep".into(),
                 output: "3 matches".into(),
@@ -2042,6 +2050,7 @@ mod tests {
             call_id: "c2".into(),
             state: SlotState::Running,
             idempotency_key: None,
+            args_preview: None,
             cached_result: None,
             retry_count: 1,
         };
@@ -2333,6 +2342,7 @@ mod tests {
             call_id: "c1".into(),
             state: SlotState::Completed,
             idempotency_key: Some("key1".into()),
+            args_preview: Some("pattern=foo".into()),
             cached_result: Some(CachedToolResult {
                 tool_name: "grep".into(),
                 output: "3 matches".into(),
@@ -2929,6 +2939,7 @@ mod tests {
                     call_id: "c1".into(),
                     state: SlotState::Running, // crash artifact!
                     idempotency_key: None,
+                    args_preview: None,
                     cached_result: None,
                     retry_count: 0,
                 }],
@@ -3026,6 +3037,7 @@ mod tests {
                         call_id: "c1".into(),
                         state: SlotState::Completed,
                         idempotency_key: None,
+                        args_preview: None,
                         cached_result: None,
                         retry_count: 0,
                     },
@@ -3035,6 +3047,7 @@ mod tests {
                         call_id: "c2".into(),
                         state: SlotState::Completed,
                         idempotency_key: None,
+                        args_preview: None,
                         cached_result: None,
                         retry_count: 0,
                     },

@@ -495,7 +495,8 @@ fn e2e_microcompact_pins_active_files_under_pressure() {
     }
 
     // High pressure compaction
-    let stats = compact_tool_results_state_aware(&mut messages, 0.85, &facts, 5);
+    let stats =
+        compact_tool_results_state_aware(&mut messages, 0.85, &facts, 5, Default::default());
     assert!(stats.results_compacted > 0, "should compact some results");
 
     // src/auth.rs (turn 19, within 5-turn window) should be PINNED
@@ -509,9 +510,8 @@ fn e2e_microcompact_pins_active_files_under_pressure() {
         })
         .and_then(|m| m.get("content").and_then(Value::as_str));
     assert!(auth_content.is_some(), "auth.rs should still exist");
-    assert_ne!(
-        auth_content.unwrap(),
-        CLEARED_PLACEHOLDER,
+    assert!(
+        !is_cleared_content(auth_content.unwrap()),
         "auth.rs should NOT be cleared"
     );
 

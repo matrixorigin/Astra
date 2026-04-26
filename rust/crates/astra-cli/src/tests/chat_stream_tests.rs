@@ -41,6 +41,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -94,7 +95,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         .expect("step events should persist under adopted session");
 
     assert!(!adopted_events.trim().is_empty());
-    assert!(adopted_events.contains("\"step_id\":\"sess-step-adopt-turn-0\""));
+    assert!(adopted_events.contains("\"step_id\":\"sess-step-adopt-turn-0-step-0\""));
     assert!(
         !ephemeral_path.exists(),
         "new-session first turn must not persist step events under ephemeral/"
@@ -125,6 +126,7 @@ async fn stream_chat_sse_simple_text_response() {
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -212,6 +214,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         message: "hi",
         session_id: Some("sess-traced"),
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -305,6 +308,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             message: "hi",
             session_id,
             model: None,
+            provider: None,
             explain: ExplainMode::Off,
             render_md: false,
             history: &[],
@@ -390,6 +394,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -503,6 +508,7 @@ async fn stream_chat_sse_api_error_propagated() {
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -590,6 +596,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         message: "run echo hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -700,6 +707,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         message: "write inside a transaction",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -853,6 +861,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         message: "review local changes",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],

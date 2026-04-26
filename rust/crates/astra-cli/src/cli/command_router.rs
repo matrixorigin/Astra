@@ -417,6 +417,7 @@ pub(super) async fn execute_cli_command(
                 api,
                 message: &message,
                 model: global_model.as_deref(),
+                provider: None,
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
@@ -826,6 +827,7 @@ pub(super) async fn execute_cli_command(
                 api,
                 message: &message,
                 model: args.model.as_deref().or(global_model.as_deref()),
+                provider: None,
                 explain: explain_mode,
                 render_md,
                 verbose_mode: !quiet,
@@ -1375,6 +1377,7 @@ pub(super) async fn run_print_mode(
         api,
         message: &message,
         model,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         verbose_mode: std::env::var("ASTRA_VERBOSE")

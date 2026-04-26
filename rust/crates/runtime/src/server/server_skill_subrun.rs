@@ -201,6 +201,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let effective_model = model
             .map(String::from)
             .or_else(|| self.default_model.clone());
+        let compact_strategy = crate::turn::microcompact::CompactStrategy::from_provider_hint(
+            effective_model.as_deref().unwrap_or(""),
+        );
 
         // Build a sub-run session ID for isolation.
         let safe_name = crate::skills::loader::sanitize_for_path(skill_name);
@@ -376,6 +379,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,

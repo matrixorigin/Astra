@@ -634,6 +634,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             state.final_text.push_str(&abort_msg);
         }
         state.final_text_streamed = false;
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(state, Some(abort_msg.clone())),
+        ));
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "round_budget_phase2",

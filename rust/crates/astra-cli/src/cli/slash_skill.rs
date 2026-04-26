@@ -1742,6 +1742,7 @@ Follow these steps:
                 message: &reflection_message,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
+                provider: None,
                 explain: ExplainMode::Off,
                 render_md: false,
                 history: &reflection_history,

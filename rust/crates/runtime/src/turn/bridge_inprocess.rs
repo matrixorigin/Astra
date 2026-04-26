@@ -493,9 +493,20 @@ async fn infer_bridge_session_turn(shared_pool: Option<&SharedPool>, session_id:
     (count.max(0) as u32).saturating_add(1)
 }
 
-fn bridge_root_turn_journal_owned(headers: &HeaderMap, bridge_e2e_authorized: bool) -> bool {
+fn bridge_root_turn_journal_owned(
+    headers: &HeaderMap,
+    payload: &Value,
+    bridge_e2e_authorized: bool,
+) -> bool {
     if bridge_e2e_authorized {
         return false;
+    }
+    if payload
+        .get("root_turn_journal_owned")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
     }
     header_str(headers, ROOT_TURN_JOURNAL_HEADER)
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
@@ -573,9 +584,11 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 // ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
 pub use super::prompt_cache::PromptCacheConfig;
 #[cfg(test)]
+pub(crate) use super::prompt_cache::add_message_cache_breakpoint;
+#[cfg(test)]
 pub(crate) use super::prompt_cache::build_system_message;
 pub(crate) use super::prompt_cache::{
-    add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
     build_system_message_with_dynamic_sections,
 };
 
@@ -754,7 +767,7 @@ impl InProcessChatTurnBridge {
             user_query_event_id: user_query_event_id.clone(),
         };
         let root_runtime_owns_turn_journal =
-            bridge_root_turn_journal_owned(headers, bridge_e2e_authorized);
+            bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
         let turn_learning_writer = self.turn_learning_writer.clone();
         let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
@@ -1663,8 +1676,8 @@ impl InProcessChatTurnBridge {
                         let _ = round_val;
                     }
                 } else {
-                    // Add cache breakpoint on last conversation message for Anthropic
-                    add_message_cache_breakpoint(&mut llm_messages, &cache_cfg);
+                    // Add Anthropic protocol-level prompt-cache metadata on the request clone.
+                    apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
                     let skill_injections: Vec<crate::turn::context_assembly_trace::SkillInjection> =
@@ -6419,17 +6432,28 @@ mod tests {
     #[test]
     fn bridge_root_turn_journal_requires_explicit_header() {
         let mut headers = HeaderMap::new();
+        let empty_payload = json!({});
         headers.insert("x-mo-session-turn", "2".parse().unwrap());
         assert!(
-            !bridge_root_turn_journal_owned(&headers, false),
+            !bridge_root_turn_journal_owned(&headers, &empty_payload, false),
             "session turn alone must not suppress bridge full-journal capture"
         );
         headers.insert(ROOT_TURN_JOURNAL_HEADER, "1".parse().unwrap());
-        assert!(bridge_root_turn_journal_owned(&headers, false));
+        assert!(bridge_root_turn_journal_owned(
+            &headers,
+            &empty_payload,
+            false
+        ));
         assert!(
-            !bridge_root_turn_journal_owned(&headers, true),
+            !bridge_root_turn_journal_owned(&headers, &empty_payload, true),
             "bridge e2e should never impersonate a root journal owner"
         );
+        let payload_owned = json!({"root_turn_journal_owned": true});
+        assert!(bridge_root_turn_journal_owned(
+            &HeaderMap::new(),
+            &payload_owned,
+            false
+        ));
     }
 
     #[test]

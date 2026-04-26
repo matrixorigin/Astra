@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
-use astra_sandbox::{CommandRisk, analyze_command_risks};
+use astra_sandbox::{CommandRisk, analyze_command_risks, is_rm_catastrophic_rm_path};
 
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
@@ -140,7 +140,8 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
         }
     }
     // Path-aware rm -rf: block only catastrophic targets, let permission layer handle the rest.
-    if (lower.contains("rm -rf") || lower.contains("rm -fr")) && is_rm_catastrophic_path(&lower) {
+    if (lower.contains("rm -rf") || lower.contains("rm -fr")) && is_rm_catastrophic_rm_path(&lower)
+    {
         return Err(
             "Error: rm -rf targeting root/home/system path is blocked in execute_bash".into(),
         );
@@ -183,38 +184,6 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
 }
 
 /// Returns `true` if an `rm -rf` / `rm -fr` command targets a catastrophic path
-/// (root, home, or top-level system directories). Project-relative paths like
-/// `rm -rf ./build` or `rm -rf node_modules` return `false` — those are handled
-/// by the permission layer (`Ask`).
-fn is_rm_catastrophic_path(lower: &str) -> bool {
-    let rest = lower
-        .find("rm -rf")
-        .map(|i| &lower[i + 6..])
-        .or_else(|| lower.find("rm -fr").map(|i| &lower[i + 6..]))
-        .unwrap_or("")
-        .trim_start();
-    let target = rest.split_whitespace().next().unwrap_or("");
-    if target.is_empty() {
-        return true;
-    }
-    if matches!(target, "/" | "/*" | "~" | "~/") {
-        return true;
-    }
-    if target.starts_with("$home") {
-        return true;
-    }
-    const SYSTEM_DIRS: &[&str] = &[
-        "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/boot", "/dev", "/proc", "/sys", "/opt",
-        "/root", "/tmp", "/home",
-    ];
-    for d in SYSTEM_DIRS {
-        if target == *d || target.starts_with(&format!("{d}/")) {
-            return true;
-        }
-    }
-    false
-}
-
 struct GrepRequest<'a> {
     workspace_root: &'a Path,
     target: &'a str,

@@ -39,7 +39,7 @@ use crate::turn::llm_client::{
     sleep_ms_or_llm_cancel,
 };
 use crate::turn::prompt_cache::{
-    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
     build_system_message_with_dynamic_sections,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
@@ -964,7 +964,7 @@ impl ServerAgenticLoopHost {
         let mut annotated_tools = edge_tools_snapshot.clone();
         annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
         let mut annotated_messages = state.messages.clone();
-        add_message_cache_breakpoint(&mut annotated_messages, &cache_cfg);
+        apply_anthropic_cache_metadata(&mut annotated_messages, &cache_cfg, &self.session_id);
         let (provider, model) = self
             .mock_provider
             .clone()
@@ -1962,8 +1962,8 @@ impl ServerAgenticLoopHost {
             llm_messages.push(listing.clone());
         }
 
-        // Add cache breakpoint on the last conversation message for Anthropic.
-        add_message_cache_breakpoint(&mut llm_messages, cache_cfg);
+        // Add Anthropic protocol-level prompt-cache metadata on the request clone.
+        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, &self.session_id);
 
         llm_messages
     }
@@ -3804,6 +3804,7 @@ mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,

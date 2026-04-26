@@ -1469,6 +1469,7 @@ mod tests {
                             s.contains("[earlier response compacted]")
                                 || s.contains("[compacted")
                                 || s.contains("tool result cleared")
+                                || s.starts_with("[Cleared: ")
                         })
                         .unwrap_or(false)
                 })

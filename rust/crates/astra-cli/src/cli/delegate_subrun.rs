@@ -200,6 +200,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .model_override
             .clone()
             .or_else(|| self.default_model.clone());
+        let compact_strategy =
+            astra_runtime::turn::microcompact::CompactStrategy::from_provider_hint(
+                effective_model.as_deref().unwrap_or(""),
+            );
 
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
@@ -393,6 +397,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,

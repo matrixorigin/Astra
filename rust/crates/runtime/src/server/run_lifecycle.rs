@@ -1139,12 +1139,30 @@ fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String>
     None
 }
 
-fn build_run_turn_complete_event(total_tool_calls: u32, final_text: &str) -> Value {
+fn build_run_turn_complete_event_with_interruption(
+    total_tool_calls: u32,
+    final_text: &str,
+    interruption: Option<&crate::turn::interruption::InterruptionRecord>,
+) -> Value {
+    let execution_state = interruption.map(|record| {
+        serde_json::json!({
+            "status": "interrupted",
+            "interrupted": true,
+            "interruption_kind": record.kind.label(),
+            "resume_action": &record.resume_action,
+            "resumable": record.kind.is_resumable(),
+            "has_checkpoint": record.has_checkpoint,
+            "tool_calls_completed": record.tool_calls_completed,
+            "turns_completed": record.turns_completed,
+            "remaining_turns": record.remaining_turns,
+            "error_detail": record.error_detail,
+        })
+    });
     Value::Object(astra_turn_core::complete::build_turn_complete_event(
         total_tool_calls > 0,
-        false,
+        interruption.is_some(),
         &crate::turn::stall::DivergenceStatus::Healthy,
-        None,
+        execution_state,
         (!final_text.is_empty()).then_some(final_text),
     ))
 }
@@ -1262,7 +1280,7 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
         .filter(|event| {
             matches!(
                 event.get("event_type").and_then(Value::as_str),
-                Some("text_done" | "run_error" | "run_finished")
+                Some("text_done" | "run_error" | "run_interrupted" | "run_finished")
             )
         })
         .cloned()
@@ -1545,17 +1563,45 @@ impl AgenticRunLifecycleService {
         } else {
             match loop_outcome {
                 Ok(AgenticLoopOutcome::Completed) => {
-                    if !loop_state.final_text.is_empty() {
+                    if let Some(interruption) = loop_state.interruption.as_ref() {
+                        let interruption_json = interruption.to_json();
+                        if !loop_state.final_text.is_empty() {
+                            events.push(json!({
+                                "event_type": "text_done",
+                                "data": {
+                                    "full_text": loop_state.final_text.clone(),
+                                    "partial": true,
+                                    "interruption": interruption_json.clone(),
+                                }
+                            }));
+                        }
                         events.push(json!({
-                        "event_type": "text_done",
-                        "data": { "full_text": loop_state.final_text.clone() }
+                            "event_type": "run_interrupted",
+                            "data": interruption_json.clone(),
                         }));
+                        let mut finished = usage;
+                        finished["interrupted"] = Value::Bool(true);
+                        finished["interruption_kind"] =
+                            Value::String(interruption.kind.label().to_string());
+                        finished["resumable"] = Value::Bool(interruption.kind.is_resumable());
+                        events.push(json!({
+                            "event_type": "run_finished",
+                            "data": finished,
+                        }));
+                        (RunStatus::Paused, Some(interruption.user_message.clone()))
+                    } else {
+                        if !loop_state.final_text.is_empty() {
+                            events.push(json!({
+                            "event_type": "text_done",
+                            "data": { "full_text": loop_state.final_text.clone() }
+                            }));
+                        }
+                        events.push(json!({
+                            "event_type": "run_finished",
+                            "data": usage,
+                        }));
+                        (RunStatus::Completed, None)
                     }
-                    events.push(json!({
-                        "event_type": "run_finished",
-                        "data": usage,
-                    }));
-                    (RunStatus::Completed, None)
                 }
                 Ok(AgenticLoopOutcome::Cancelled) => unreachable!("handled by cancellation gate"),
                 Ok(AgenticLoopOutcome::Error(e)) => {
@@ -1941,6 +1987,9 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy: crate::turn::microcompact::CompactStrategy::from_provider_hint(
+                request.model.as_deref().unwrap_or(""),
+            ),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -2737,9 +2786,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
             let _ = event_tx
-                .send(build_run_turn_complete_event(
+                .send(build_run_turn_complete_event_with_interruption(
                     state.total_tool_calls,
                     &state.final_text,
+                    state.interruption.as_ref(),
                 ))
                 .await;
 
@@ -3212,6 +3262,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         use crate::turn::turn_guard::TurnGuard;
 
         // Build edge profile from agent's system prompt and metadata.
+        let compact_strategy = crate::turn::microcompact::CompactStrategy::from_provider_hint(
+            config.agent_profile.model_override.as_deref().unwrap_or(""),
+        );
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
             edge_profile.insert(
@@ -3385,6 +3438,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
@@ -3473,20 +3527,27 @@ impl SubRunExecutor for ServerSubRunExecutor {
         learning_stack.save_with_active_canary(active_canary);
 
         match outcome {
-            Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: STATUS_COMPLETED.to_string(),
-                output: if loop_state.final_text.is_empty() {
-                    None
+            Ok(AgenticLoopOutcome::Completed) => {
+                let status = if loop_state.interruption.is_some() {
+                    STATUS_PAUSED
                 } else {
-                    Some(loop_state.final_text)
-                },
-                error: None,
-                prompt_tokens: loop_state.total_prompt,
-                completion_tokens: loop_state.total_completion,
-                tool_calls: loop_state.total_tool_calls,
-            }),
+                    STATUS_COMPLETED
+                };
+                Ok(astra_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: status.to_string(),
+                    output: if loop_state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(loop_state.final_text)
+                    },
+                    error: None,
+                    prompt_tokens: loop_state.total_prompt,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
             Ok(AgenticLoopOutcome::Cancelled) => {
                 // Cancelled via pause_flag — report as "paused" so the
                 // delegation engine can distinguish from hard errors.
@@ -3603,7 +3664,8 @@ mod tests {
 
     #[test]
     fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
-        let event = build_run_turn_complete_event(0, "recovered final answer");
+        let event =
+            build_run_turn_complete_event_with_interruption(0, "recovered final answer", None);
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["assistant_text"], "recovered final answer");
         assert_eq!(event["has_tool_calls"], false);
@@ -3611,10 +3673,44 @@ mod tests {
 
     #[test]
     fn build_run_turn_complete_event_omits_empty_assistant_text() {
-        let event = build_run_turn_complete_event(1, "");
+        let event = build_run_turn_complete_event_with_interruption(1, "", None);
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], true);
         assert!(event.get("assistant_text").is_none());
+    }
+
+    #[test]
+    fn build_run_turn_complete_event_marks_interrupted_turns() {
+        let interruption = crate::turn::interruption::InterruptionRecord::new(
+            crate::turn::interruption::InterruptionKind::BudgetExhausted,
+            crate::turn::interruption::ResumeAction::ContinueImmediately,
+            crate::turn::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 7,
+                turns_completed: 15,
+                remaining_turns: 0,
+                error_detail: Some("Round budget hard-limit reached".to_string()),
+            },
+        );
+
+        let event = build_run_turn_complete_event_with_interruption(
+            7,
+            "[Round budget hard-limit reached]",
+            Some(&interruption),
+        );
+
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["has_tool_calls"], false);
+        assert_eq!(event["stall_detected"], true);
+        assert_eq!(event["execution_state"]["status"], "interrupted");
+        assert_eq!(event["execution_state"]["interrupted"], true);
+        assert_eq!(
+            event["execution_state"]["interruption_kind"],
+            "budget_exhausted"
+        );
+        assert_eq!(event["execution_state"]["tool_calls_completed"], 7);
+        assert_eq!(event["execution_state"]["remaining_turns"], 0);
+        assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
     }
 
     #[test]
@@ -4021,6 +4117,48 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event_type"], "run_finished");
         assert_eq!(events[0]["data"]["cancelled"], true);
+    }
+
+    #[test]
+    fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() {
+        let svc = test_service();
+        let request = test_request("partial");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        state.final_text = "[Round budget hard-limit reached]".to_string();
+        state.interruption = Some(crate::turn::interruption::InterruptionRecord::new(
+            crate::turn::interruption::InterruptionKind::BudgetExhausted,
+            crate::turn::interruption::ResumeAction::ContinueImmediately,
+            crate::turn::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 5,
+                turns_completed: 15,
+                remaining_turns: 0,
+                error_detail: Some("Round budget hard-limit reached".to_string()),
+            },
+        ));
+
+        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Completed),
+            vec![],
+            &state,
+        );
+
+        assert_eq!(status, RunStatus::Paused);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget"))
+        );
+        assert_eq!(events[0]["event_type"], "text_done");
+        assert_eq!(events[0]["data"]["partial"], true);
+        assert_eq!(
+            events[0]["data"]["interruption"]["kind"],
+            "budget_exhausted"
+        );
+        assert_eq!(events[1]["event_type"], "run_interrupted");
+        assert_eq!(events[2]["event_type"], "run_finished");
+        assert_eq!(events[2]["data"]["interrupted"], true);
+        assert_eq!(events[2]["data"]["interruption_kind"], "budget_exhausted");
     }
 
     #[test]

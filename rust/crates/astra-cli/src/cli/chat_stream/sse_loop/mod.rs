@@ -614,6 +614,10 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        compact_strategy:
+            astra_runtime::turn::microcompact::CompactStrategy::from_provider_and_model(
+                p.provider, p.model,
+            ),
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,

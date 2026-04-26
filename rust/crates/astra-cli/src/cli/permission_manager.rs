@@ -1798,14 +1798,21 @@ fn is_word_boundary(c: u8) -> bool {
 
 /// Returns true if `rm -rf`/`rm -fr` targets a catastrophic path (root, home, system dirs).
 fn is_rm_catastrophic_target(lower: &str) -> bool {
+    // Find the rm target path using find() so compound commands
+    // (sudo rm -rf /, cd / && rm -rf *) are caught.
     let rest = lower
         .find("rm -rf")
         .map(|i| &lower[i + 6..])
         .or_else(|| lower.find("rm -fr").map(|i| &lower[i + 6..]))
         .unwrap_or("")
         .trim_start();
-    let target = rest.split_whitespace().next().unwrap_or("");
+    let target = rest
+        .split_whitespace()
+        .find(|t| !t.starts_with('-'))
+        .unwrap_or("");
+
     if target.is_empty() {
+        // bare `rm -rf` with no arguments — treat as dangerous
         return true;
     }
     if matches!(target, "/" | "/*" | "~" | "~/") {
