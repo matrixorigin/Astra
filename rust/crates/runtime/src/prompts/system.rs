@@ -885,6 +885,10 @@ pub fn build_system_prompt_trace(
             section.trace_signals.guidance_signals.synthesize_or_batch;
         guidance_signals.parallel_feedback |=
             section.trace_signals.guidance_signals.parallel_feedback;
+        guidance_signals.parallel_batching_nudge |= section
+            .trace_signals
+            .guidance_signals
+            .parallel_batching_nudge;
 
         match section.token_bucket {
             PromptTokenBucket::BasePersona => base_persona_tokens += tokens,
@@ -1145,8 +1149,70 @@ pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -
     }
 }
 
-/// Inject an additional synthesis nudge once the loop has already spent several
-/// rounds without producing any assistant text after the latest tool batch.
+/// Threshold for the parallel-batching nudge: how many consecutive trailing
+/// single-tool rounds we tolerate before injecting a corrective directive.
+/// Set lower than [`crate::evaluation::SEQUENTIAL_READ_CHURN_THRESHOLD`] (=8,
+/// post-mortem) so we intervene EARLY — by round 4 of the same pattern, the
+/// turn is already wasting tokens and we want to break the streak.
+pub const PARALLEL_BATCHING_NUDGE_THRESHOLD: usize = 4;
+
+/// Walk the conversation tail backwards and count how many consecutive
+/// most-recent rounds each ran exactly one tool. A "round" here is a contiguous
+/// run of `tool` messages produced after one assistant turn; trailing runtime
+/// system messages (which we inject as nudges/feedback) are skipped.
+///
+/// Returns the streak length. The streak terminates as soon as we hit a round
+/// with a different tool count (zero or ≥2) or run out of history.
+pub fn trailing_single_tool_round_streak(messages: &[serde_json::Value]) -> usize {
+    let mut idx = messages.len();
+    let mut streak = 0_usize;
+
+    loop {
+        // Skip any runtime-injected system messages between rounds.
+        while idx > 0 && is_trailing_runtime_system_message(&messages[idx - 1]) {
+            idx -= 1;
+        }
+        // Count contiguous trailing tool messages = this round's tool result count.
+        let mut tool_count = 0_usize;
+        while idx > 0 && messages[idx - 1].get("role").and_then(|r| r.as_str()) == Some("tool") {
+            tool_count += 1;
+            idx -= 1;
+        }
+        if tool_count == 1 {
+            streak += 1;
+            // Step over the assistant message that produced this single call,
+            // if present, then continue scanning further-back rounds.
+            if idx > 0
+                && messages[idx - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
+            {
+                idx -= 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    streak
+}
+
+/// Inject a corrective batching nudge once the model has produced a streak of
+/// single-tool rounds. Symmetric counterpart to [`parallel_execution_feedback`]
+/// (positive reinforcement on multi-tool rounds).
+pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> String {
+    let streak = trailing_single_tool_round_streak(messages);
+    if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
+        return String::new();
+    }
+    format!(
+        "\n\n## ⚠ Sequential Tool Calls Detected\n\
+         Your last {streak} rounds each ran exactly ONE tool. This is the most expensive way to gather information.\n\
+         - Look at the next set of files / commands you intend to inspect.\n\
+         - If they are independent (different files, different greps, different reads), batch them ALL into the next single round in parallel.\n\
+         - Reserve sequential single-tool rounds for cases where each call genuinely depends on the previous result.\n"
+    )
+}
+
 ///
 /// This is generic and history-based: it looks only at the current round index
 /// plus whether the visible conversation ends with tool results.
@@ -1217,18 +1283,22 @@ pub fn tool_round_guidance_trace_with(
     let trailing_tool_count = trailing_tool_result_count(messages);
     let synthesize_or_batch = round_index >= warning && trailing_tool_count > 0;
     let parallel_feedback = trailing_tool_count > 1;
+    let single_tool_streak = trailing_single_tool_round_streak(messages);
+    let parallel_batching_nudge = single_tool_streak >= PARALLEL_BATCHING_NUDGE_THRESHOLD;
 
     (
         format!(
-            "{}{}{}",
+            "{}{}{}{}",
             round_budget_directive_with(round_index, warning, limit),
             synthesize_or_batch_directive(messages, round_index, warning),
+            parallel_batching_nudge_directive(messages),
             parallel_execution_feedback(messages)
         ),
         PromptGuidanceSignals {
             round_budget_warning,
             synthesize_or_batch,
             parallel_feedback,
+            parallel_batching_nudge,
         },
     )
 }
@@ -2876,5 +2946,116 @@ mod tests {
             !before_limit.contains("Round Budget Exceeded"),
             "round 14 should not trigger hard stop"
         );
+    }
+
+    // ─── Parallel batching nudge (real-session-shaped fixtures) ─────────
+    //
+    // Scenarios pulled from real sessions:
+    //   - 6566d6a8 turn 1: 10 trailing single-tool read rounds → strong nudge
+    //   - 03945541 turn 1: 6 single-tool rounds (locate→read) → soft case,
+    //     but the nudge still fires at round 4+ since it cannot distinguish
+    //     "legitimate dependency chain" from "should-have-batched" — the
+    //     model's own next-round planning is the right place to disambiguate.
+    //   - well-batched runs (≥2 tools per round) → never trigger.
+
+    fn assistant_with_tool_calls(n: usize) -> Vec<serde_json::Value> {
+        let mut msgs = vec![serde_json::json!({"role": "assistant", "tool_calls": []})];
+        for _ in 0..n {
+            msgs.push(serde_json::json!({"role": "tool", "content": "..."}));
+        }
+        msgs
+    }
+
+    fn rounds_pattern(per_round: &[usize]) -> Vec<serde_json::Value> {
+        let mut out = vec![serde_json::json!({"role": "user", "content": "go"})];
+        for &n in per_round {
+            out.extend(assistant_with_tool_calls(n));
+        }
+        out
+    }
+
+    #[test]
+    fn trailing_single_tool_streak_counts_consecutive_singletons_only() {
+        // [3, 1, 1, 1, 1] → trailing streak = 4
+        let msgs = rounds_pattern(&[3, 1, 1, 1, 1]);
+        assert_eq!(trailing_single_tool_round_streak(&msgs), 4);
+
+        // [1, 1, 2, 1, 1] → trailing streak = 2 (broken by the 2-tool round)
+        let msgs = rounds_pattern(&[1, 1, 2, 1, 1]);
+        assert_eq!(trailing_single_tool_round_streak(&msgs), 2);
+
+        // [3, 3, 3] → 0 (last round was multi-tool)
+        let msgs = rounds_pattern(&[3, 3, 3]);
+        assert_eq!(trailing_single_tool_round_streak(&msgs), 0);
+
+        // Empty / no tool messages → 0
+        assert_eq!(trailing_single_tool_round_streak(&[]), 0);
+        let only_user = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        assert_eq!(trailing_single_tool_round_streak(&only_user), 0);
+    }
+
+    #[test]
+    fn parallel_batching_nudge_fires_after_threshold_streak() {
+        // 4 single-tool rounds in a row — at threshold.
+        let msgs = rounds_pattern(&[1, 1, 1, 1]);
+        let directive = parallel_batching_nudge_directive(&msgs);
+        assert!(
+            directive.contains("Sequential Tool Calls Detected"),
+            "expected nudge at threshold; got {:?}",
+            directive
+        );
+        assert!(directive.contains("4 rounds"));
+    }
+
+    #[test]
+    fn parallel_batching_nudge_silent_below_threshold() {
+        let msgs = rounds_pattern(&[1, 1, 1]);
+        assert!(parallel_batching_nudge_directive(&msgs).is_empty());
+    }
+
+    #[test]
+    fn parallel_batching_nudge_silent_when_last_round_was_parallel() {
+        // Long single-tool history followed by a 3-tool batch → no nudge,
+        // because the model already corrected the pattern.
+        let msgs = rounds_pattern(&[1, 1, 1, 1, 1, 1, 3]);
+        assert!(
+            parallel_batching_nudge_directive(&msgs).is_empty(),
+            "should not nudge after the model already batched"
+        );
+    }
+
+    #[test]
+    fn parallel_batching_nudge_skips_runtime_system_messages() {
+        // Trailing nudges/feedback injected by the runtime should not break
+        // the streak detection.
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1]);
+        msgs.push(serde_json::json!({
+            "role": "system",
+            "content": "## Already Fetched (do NOT re-read these)\nFiles: foo.rs"
+        }));
+        assert_eq!(trailing_single_tool_round_streak(&msgs), 4);
+        assert!(
+            parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected")
+        );
+    }
+
+    #[test]
+    fn tool_round_guidance_includes_batching_nudge_and_signals_it() {
+        let msgs = rounds_pattern(&[1, 1, 1, 1]);
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &msgs,
+            0, // early in the loop — round-budget warning should NOT fire
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+        assert!(
+            guidance.contains("Sequential Tool Calls Detected"),
+            "guidance must surface the batching nudge"
+        );
+        assert!(!guidance.contains("Round Budget Warning"));
+        assert!(signals.parallel_batching_nudge);
+        assert!(!signals.round_budget_warning);
+        // Single-tool last round → no positive parallel_feedback either.
+        assert!(!signals.parallel_feedback);
     }
 }

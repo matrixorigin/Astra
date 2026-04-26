@@ -113,6 +113,10 @@ pub struct PromptGuidanceSignals {
     pub round_budget_warning: bool,
     pub synthesize_or_batch: bool,
     pub parallel_feedback: bool,
+    /// Set when the trailing N rounds in conversation history each ran
+    /// exactly one tool — strong signal the model is making sequential
+    /// single-tool calls that should have been batched.
+    pub parallel_batching_nudge: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -113,11 +113,47 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             "role": "user",
             "content": execution_escalation_message(&state.message, read_only_calls),
         }));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "execution_escalation",
+            read_only_calls,
+            round = state.llm_rounds_completed,
+            "loop guard fired"
+        );
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
                     "↻ Mutating task accumulated {read_only_calls} read-only tool calls with zero edits; forcing escalation…"
+                ),
+            );
+        }
+    }
+
+    // Third-tier guard: parallel-batching force. Independent of the mutating-
+    // task escalation above — fires whenever the model has produced a long
+    // streak of trailing single-tool rounds despite the prompt-layer nudge,
+    // regardless of task type. Catches the "exploratory churn" failure mode
+    // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
+    if should_force_parallel_batching(state) {
+        let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+        state.stall.forced_parallel_batching = true;
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": parallel_batching_force_message(streak, &state.message),
+        }));
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "parallel_batching_force",
+            streak,
+            round = state.llm_rounds_completed,
+            "loop guard fired"
+        );
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ {streak} consecutive single-tool rounds; forcing parallel-batching corrective…"
                 ),
             );
         }
@@ -353,6 +389,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     "role": "user",
                     "content": execution_retry_message(&state.message),
                 }));
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "execution_retry",
+                    round = state.llm_rounds_completed,
+                    "loop guard fired"
+                );
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
@@ -429,6 +471,9 @@ fn should_force_execution_retry(state: &AgenticLoopState) -> bool {
     // tokens, and risk contradicting guidance. One corrective injection per
     // turn is the invariant.
     if state.stall.forced_execution_escalation {
+        return false;
+    }
+    if state.stall.forced_parallel_batching {
         return false;
     }
     if has_concrete_workspace_mutation(state) {
@@ -612,11 +657,87 @@ pub(crate) fn is_execution_escalation(m: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
-    is_execution_retry_correction(m) || is_execution_escalation(m)
+    is_execution_retry_correction(m) || is_execution_escalation(m) || is_parallel_batching_force(m)
+}
+
+/// Third-tier guard for the parallel-batching layer. The prompt-side soft
+/// nudge fires when the trailing single-tool round streak hits
+/// `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=4). If the model ignores the nudge
+/// and produces yet another single-tool round, the streak crosses
+/// `PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD` (=5) and we inject a hard
+/// corrective `user` message — the same pattern as `EXECUTION_ESCALATION`,
+/// scoped to a different failure mode (sequential read churn rather than
+/// read-only spin on a mutating task).
+pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batching Force";
+
+/// Trailing single-tool-round streak length at which the soft prompt nudge
+/// (=4) escalates into a forced corrective injection. One above the nudge
+/// threshold so the model gets exactly ONE chance to self-correct before we
+/// intervene with a higher-priority `user` message.
+pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize = 5;
+
+/// Tightened streak threshold once the turn has entered the round-budget
+/// warning zone (`round_index >= ROUND_BUDGET_THRESHOLD`). At that point any
+/// additional sequential single-tool round is materially closer to running
+/// out of budget without a final answer, so we intervene more aggressively.
+/// Empirical real-session data: turns near the round-budget warning that
+/// added a 3rd consecutive single-tool round virtually never converged
+/// without external correction.
+pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE: usize = 3;
+
+pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(PARALLEL_BATCHING_FORCE_MARKER))
+}
+
+pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState) -> bool {
+    if state.stall.forced_parallel_batching {
+        return false;
+    }
+    // One corrective injection per turn: if mid-loop retry or escalation
+    // already fired, a parallel-batching force would duplicate correction.
+    if state.stall.forced_execution_retry || state.stall.forced_execution_escalation {
+        return false;
+    }
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    let threshold = if state.llm_rounds_completed >= crate::prompts::ROUND_BUDGET_THRESHOLD {
+        PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE
+    } else {
+        PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+    };
+    streak >= threshold
+}
+
+pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
+    format!(
+        "{PARALLEL_BATCHING_FORCE_MARKER}\n\
+         Runtime correction: your last {streak} rounds each ran exactly ONE tool, \
+         despite the prompt-layer nudge to batch independent calls. This wastes \
+         a round of latency, tokens, and budget for each call. \
+         Your NEXT response MUST do exactly one of the following:\n\
+         - Produce your final answer now if you already have enough information, OR\n\
+         - Call ≥2 independent tools in a single parallel batch (different files, \
+           different greps, different reads — anything that does not strictly \
+           depend on the previous tool's output).\n\
+         Do not produce another single-tool round.\n\n\
+         Original user query: {original_query}"
+    )
 }
 
 pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
     if state.stall.forced_execution_escalation {
+        return false;
+    }
+    // One corrective injection per turn: if parallel-batching force already
+    // fired, skip escalation to avoid double-injecting corrective messages.
+    // NOTE: execution order in execute_turn_and_ingest_phase is
+    //   escalation → parallel-batching, so in practice escalation runs first.
+    //   This guard is defensive against future reordering.
+    if state.stall.forced_parallel_batching {
         return false;
     }
     if !state.task_profile.mutates_workspace {
@@ -1268,6 +1389,20 @@ mod tests {
     }
 
     #[test]
+    fn escalation_suppressed_when_parallel_batching_already_fired() {
+        let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
+        // Precondition: without the flag, escalation would fire.
+        assert!(should_escalate_execution(&state));
+        // Once parallel-batching force has fired, escalation must yield to
+        // honor the one-corrective-per-turn invariant.
+        state.stall.forced_parallel_batching = true;
+        assert!(
+            !should_escalate_execution(&state),
+            "escalation must not fire when parallel-batching force already active"
+        );
+    }
+
+    #[test]
     fn escalation_ignores_failed_tool_calls_for_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
@@ -1333,6 +1468,54 @@ mod tests {
     }
 
     #[test]
+    fn parallel_batching_force_blocks_subsequent_retry_in_same_turn() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile =
+            crate::turn::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.final_text = "I'll continue investigating.".into();
+        state.total_tool_calls = 10;
+        // Without the parallel-batching flag, this state would trigger retry.
+        assert!(should_force_execution_retry(&state));
+        // Once the parallel-batching force fired, retry must yield to honor
+        // the one-corrective-per-turn invariant.
+        state.stall.forced_parallel_batching = true;
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn parallel_batching_suppressed_when_escalation_already_fired() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+        // Precondition: without escalation flag, parallel-batching would fire.
+        assert!(should_force_parallel_batching(&state));
+        // Once escalation has fired, parallel-batching must yield.
+        state.stall.forced_execution_escalation = true;
+        assert!(
+            !should_force_parallel_batching(&state),
+            "parallel-batching must not fire when escalation already active"
+        );
+    }
+
+    #[test]
+    fn parallel_batching_suppressed_when_retry_already_fired() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+        assert!(should_force_parallel_batching(&state));
+        state.stall.forced_execution_retry = true;
+        assert!(
+            !should_force_parallel_batching(&state),
+            "parallel-batching must not fire when retry already active"
+        );
+    }
+
+    #[test]
     fn escalation_marker_detected_and_stripped_by_corrective_filter() {
         let msg = serde_json::json!({
             "role": "user",
@@ -1349,5 +1532,121 @@ mod tests {
 
         let unrelated = serde_json::json!({"role":"user","content":"fix the bug"});
         assert!(!is_execution_corrective_message(&unrelated));
+    }
+
+    // ─── Parallel-batching force (third-tier guard) ─────────────────────
+
+    fn push_single_tool_round(state: &mut AgenticLoopState) {
+        state
+            .messages
+            .push(serde_json::json!({"role": "assistant", "tool_calls": []}));
+        state
+            .messages
+            .push(serde_json::json!({"role": "tool", "content": "..."}));
+    }
+
+    #[test]
+    fn parallel_batching_force_fires_at_streak_threshold() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+        assert!(should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_silent_below_threshold() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1) {
+            push_single_tool_round(&mut state);
+        }
+        assert!(!should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_silent_when_last_round_batched() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        // Long single-tool history that crossed threshold...
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
+            push_single_tool_round(&mut state);
+        }
+        // ...but the most-recent round used 3 parallel tools — the model
+        // already self-corrected, no force needed.
+        state
+            .messages
+            .push(serde_json::json!({"role": "assistant", "tool_calls": []}));
+        for _ in 0..3 {
+            state
+                .messages
+                .push(serde_json::json!({"role": "tool", "content": "..."}));
+        }
+        assert!(!should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 3) {
+            push_single_tool_round(&mut state);
+        }
+        // First time would fire...
+        assert!(should_force_parallel_batching(&state));
+        // ...but once the flag is set, a second attempt is suppressed even
+        // if the model produces yet another single-tool round.
+        state.stall.forced_parallel_batching = true;
+        push_single_tool_round(&mut state);
+        assert!(!should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_marker_recognized_by_corrective_filter() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": parallel_batching_force_message(7, "do something"),
+        });
+        assert!(is_parallel_batching_force(&msg));
+        assert!(is_execution_corrective_message(&msg));
+        // Other corrective markers must not be misclassified as this one.
+        let retry = serde_json::json!({
+            "role": "user",
+            "content": execution_retry_message("do something"),
+        });
+        assert!(!is_parallel_batching_force(&retry));
+    }
+
+    #[test]
+    fn parallel_batching_force_uses_tighter_threshold_in_round_budget_warning_zone() {
+        // Streak of 3 — below the early-zone threshold of 5...
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE {
+            push_single_tool_round(&mut state);
+        }
+        // ...so before the warning zone, this must NOT fire.
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD - 1;
+        assert!(!should_force_parallel_batching(&state));
+
+        // Once round_index crosses ROUND_BUDGET_THRESHOLD, the same streak of
+        // 3 must fire — this is the coupling we want.
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD;
+        assert!(should_force_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_force_late_threshold_silent_at_streak_two() {
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD_LATE - 1) {
+            push_single_tool_round(&mut state);
+        }
+        state.llm_rounds_completed = crate::prompts::ROUND_BUDGET_THRESHOLD + 2;
+        // Even deep into the warning zone, a streak below the late threshold
+        // (=3) must not fire — we don't punish a single isolated single-tool
+        // round just because the turn is long.
+        assert!(!should_force_parallel_batching(&state));
     }
 }
