@@ -733,11 +733,13 @@ fn compact_subtask_history_entry(
 }
 
 fn final_text_claims_acceptance_checks_pass(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("acceptance checks pass")
-        || lower.contains("acceptance checks passed")
-        || lower.contains("acceptance check pass")
-        || lower.contains("acceptance check passed")
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)acceptance\s+(checks?|criteria|tests?)\s+.{0,20}(pass|satisfied|met|succeed|verified|complete)").unwrap()
+    });
+    re.is_match(text)
 }
 
 fn tool_record_has_verificationish_evidence(
@@ -2772,6 +2774,28 @@ All acceptance checks pass:
             }],
         );
         assert_eq!(sanitized, assistant_text);
+    }
+
+    #[test]
+    fn sanitize_unverified_acceptance_claims_catches_synonym_evasion() {
+        let write_only = &[astra_services::session_journal::ToolCallRecord {
+            name: "write_file".into(),
+            ok: true,
+            ..Default::default()
+        }];
+        for phrase in [
+            "All acceptance criteria satisfied.",
+            "Acceptance tests all passed.",
+            "The acceptance check has been verified.",
+            "Acceptance criteria met.",
+            "Acceptance checks succeeded.",
+        ] {
+            let sanitized = sanitize_unverified_acceptance_claims(phrase, write_only);
+            assert!(
+                sanitized.contains("Automated verification"),
+                "should catch evasion phrase: {phrase}"
+            );
+        }
     }
 
     fn bash_tool_record(command: &str) -> astra_services::session_journal::ToolCallRecord {

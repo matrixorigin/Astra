@@ -132,6 +132,7 @@ fn estimate_tokens(s: &str) -> usize {
 ///
 /// Returns the number of tool results compacted and estimated tokens saved.
 pub fn compact_tool_results(messages: &mut [Value], keep_recent: Option<usize>) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = keep_recent
         .map(|k| AdaptiveCompactConfig {
             keep_recent: k,
@@ -144,6 +145,7 @@ pub fn compact_tool_results(messages: &mut [Value], keep_recent: Option<usize>) 
 /// Pressure-adaptive variant: compact with parameters derived from context
 /// pressure so that high-pressure turns free more headroom.
 pub fn compact_tool_results_adaptive(messages: &mut [Value], pressure: f64) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
     compact_tool_results_with_config(messages, &config)
 }
@@ -157,6 +159,7 @@ pub fn compact_tool_results_state_aware(
     facts: &crate::cloud_session_facts::SessionFacts,
     pin_turns: u32,
 ) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
     compact_tool_results_with_pin_list(messages, &config, facts, pin_turns)
 }
@@ -167,7 +170,6 @@ fn compact_tool_results_with_pin_list(
     facts: &crate::cloud_session_facts::SessionFacts,
     pin_turns: u32,
 ) -> CompactStats {
-    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let keep = config.keep_recent;
 
     // Build tool_call_id → tool_name mapping
@@ -301,7 +303,6 @@ fn compact_tool_results_with_config(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
 ) -> CompactStats {
-    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let keep = config.keep_recent;
 
     // Build tool_call_id → tool_name mapping from assistant messages.

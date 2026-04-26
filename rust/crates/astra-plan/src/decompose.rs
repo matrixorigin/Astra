@@ -3174,7 +3174,8 @@ pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
         text.push_str(&desc.to_lowercase());
     }
 
-    let mentions_browser = [
+    // Strong signals: tool/framework names that unambiguously mean browser.
+    let strong_browser = [
         "browser",
         "in browser",
         "浏览器",
@@ -3182,19 +3183,23 @@ pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
         "selenium",
         "puppeteer",
         "cypress",
-        "chromium",
-        "chrome",
-        "firefox",
-        "webkit",
-        "dom",
-        "ui",
-        "canvas",
-        "page",
-        "页面",
     ]
     .iter()
     .any(|needle| text.contains(needle));
+
+    // Weak signals: only count if paired with explicit browser context.
+    // "page" alone matches "pagination", "ui" matches "build"/"suite".
+    let weak_browser = !strong_browser
+        && [" web page", "web ui", "in the dom", "html canvas", "页面"]
+            .iter()
+            .any(|needle| text.contains(needle));
+
+    let mentions_browser = strong_browser || weak_browser;
+
+    // Verification keywords — removed "run" (too generic: "run tests", "run migration").
     let mentions_verification = [
+        "test in browser",
+        "verify in browser",
         "test",
         "verify",
         "validation",
@@ -3202,8 +3207,7 @@ pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
         "check",
         "qa",
         "smoke",
-        "open",
-        "run",
+        "open in",
         "测试",
         "验证",
         "检查",
@@ -5865,6 +5869,51 @@ Done!"#;
             prompt.contains("Playwright") || prompt.contains("browser headless screenshot"),
             "prompt should name acceptable browser-capable evidence: {prompt}"
         );
+    }
+
+    #[test]
+    fn browser_verification_no_false_positive_on_non_browser_tasks() {
+        // "page" in "pagination", "ui" in "build", "run" alone — should NOT trigger.
+        for title in [
+            "Run database migration for user page",
+            "Build UI component library",
+            "Run unit tests for the pagination module",
+            "Check DOM manipulation in JSDOM tests",
+            "Run canvas rendering benchmark",
+        ] {
+            let st = SubtaskPlan {
+                id: "t1".into(),
+                title: title.into(),
+                description: None,
+                ..Default::default()
+            };
+            assert!(
+                !subtask_requires_browser_verification(&st),
+                "should NOT trigger browser verification for: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_verification_true_positive_on_real_browser_tasks() {
+        for title in [
+            "Test game in browser",
+            "Verify the web page renders correctly",
+            "Open in browser and check layout",
+            "用浏览器测试页面",
+            "Run Playwright tests for login flow",
+        ] {
+            let st = SubtaskPlan {
+                id: "t1".into(),
+                title: title.into(),
+                description: None,
+                ..Default::default()
+            };
+            assert!(
+                subtask_requires_browser_verification(&st),
+                "should trigger browser verification for: {title}"
+            );
+        }
     }
 
     #[test]

@@ -137,6 +137,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         tool_cfg.effective_parallel_batching_force_streak() as usize;
     let round_budget_hard_limit = tool_cfg.effective_round_budget_limit();
     let redundant_reads_threshold = tool_cfg.effective_redundant_reads_midloop_threshold() as usize;
+    let cache_waste_threshold = tool_cfg.effective_cache_waste_midloop_threshold() as usize;
+    let exploration_family_threshold =
+        tool_cfg.effective_exploration_family_churn_midloop_threshold() as usize;
 
     // Third-tier guard: parallel-batching force. Independent of the mutating-
     // task escalation above — fires whenever the model has produced a long
@@ -260,9 +263,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if !state.stall.forced_round_budget_phase1
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
-        && should_inject_cache_waste_corrective(state, CACHE_WASTE_MIDLOOP_THRESHOLD)
+        && should_inject_cache_waste_corrective(state, cache_waste_threshold)
     {
-        let wasteful = cache_wasteful_tools(state, CACHE_WASTE_MIDLOOP_THRESHOLD);
+        let wasteful = cache_wasteful_tools(state, cache_waste_threshold);
         state.stall.forced_cache_waste_corrective = true;
         state.messages.push(serde_json::json!({
             "role": "user",
@@ -273,7 +276,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             tier = "cache_waste_corrective",
             round = state.llm_rounds_completed,
             tools = ?wasteful,
-            threshold = CACHE_WASTE_MIDLOOP_THRESHOLD,
+            threshold = cache_waste_threshold,
             "loop guard fired"
         );
         if !prep.quiet {
@@ -292,10 +295,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
         && !state.stall.forced_cache_waste_corrective
-        && let Some((family, streak)) = exploration_family_corrective_candidate(
-            state,
-            astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
-        )
+        && let Some((family, streak)) =
+            exploration_family_corrective_candidate(state, exploration_family_threshold)
     {
         let restricted = apply_exploration_family_restrictions(state, &family);
         state.stall.forced_exploration_family_corrective = true;
@@ -617,12 +618,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // calls after the phase-1 corrective, so this flag is inherently true here.
     // Using a named variable rather than a literal makes the contract self-
     // documenting and prevents accidental copy-paste to a broader scope.
-    let model_ignored_phase1_corrective = true;
-    if should_abort_for_round_budget_phase2(
-        state,
-        model_ignored_phase1_corrective,
-        round_budget_hard_limit,
-    ) {
+    if should_abort_for_round_budget_phase2(state, round_budget_hard_limit) {
         state.stall.forced_round_budget_phase2 = true;
         let abort_msg = format!(
             "[Round budget hard-limit reached at round {}. The runtime injected a \
@@ -1186,6 +1182,15 @@ pub(crate) fn should_force_parallel_batching(
     if state.stall.forced_execution_retry || state.stall.forced_execution_escalation {
         return false;
     }
+    // Same invariant for the new cascade guards.
+    if state.stall.forced_round_budget_phase1
+        || state.stall.forced_redundant_reads_corrective
+        || state.stall.forced_cache_waste_corrective
+        || state.stall.forced_exploration_family_corrective
+        || state.stall.forced_exploration_family_phase2
+    {
+        return false;
+    }
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
     // Late-budget threshold stays derived (compile-time floor of 2): once the
     // model is close to the round-budget warning, even a short streak should
@@ -1273,18 +1278,14 @@ pub(crate) fn should_inject_round_budget_phase1(state: &AgenticLoopState, hard_l
 /// (text-only) from model ignoring the corrective (tool calls).
 pub(crate) fn should_abort_for_round_budget_phase2(
     state: &AgenticLoopState,
-    last_round_had_tool_calls: bool,
     hard_limit: u32,
 ) -> bool {
     if state.stall.forced_round_budget_phase2 {
         return false;
     }
-    // Sanity guard: phase-2 should never fire at a low round count even if
-    // the one-shot flag is manually mis-set (e.g. in a bug or test fixture
-    // error). The hard_limit must have been genuinely exceeded.
-    state.stall.forced_round_budget_phase1
-        && last_round_had_tool_calls
-        && state.llm_rounds_completed >= hard_limit
+    // Phase-2 fires when phase-1 corrective was injected but the model
+    // continued to call tools (ignored the corrective).
+    state.stall.forced_round_budget_phase1 && state.llm_rounds_completed >= hard_limit
 }
 
 pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
@@ -1322,6 +1323,9 @@ pub(crate) const CACHE_WASTE_MARKER: &str = "## ⤴ Repeated Cached Tool Calls D
 pub(crate) const EXPLORATION_FAMILY_MARKER: &str = "## ⤴ Exploration Family Churn Detected";
 pub(crate) const EXPLORATION_FAMILY_PHASE2_MARKER: &str =
     "## ⤴ Exploration Family Convergence Required";
+/// Default cache-waste midloop threshold. Used in tests; production code
+/// reads from `ToolSelectionConfig::effective_cache_waste_midloop_threshold()`.
+#[cfg(test)]
 pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 
 /// Mid-loop corrective threshold (intentionally one above the post-mortem
@@ -2552,6 +2556,34 @@ mod tests {
     }
 
     #[test]
+    fn parallel_batching_suppressed_when_cascade_guard_already_fired() {
+        let flags: Vec<Box<dyn Fn(&mut AgenticLoopState)>> = vec![
+            Box::new(|s| s.stall.forced_round_budget_phase1 = true),
+            Box::new(|s| s.stall.forced_redundant_reads_corrective = true),
+            Box::new(|s| s.stall.forced_cache_waste_corrective = true),
+            Box::new(|s| s.stall.forced_exploration_family_corrective = true),
+            Box::new(|s| s.stall.forced_exploration_family_phase2 = true),
+        ];
+        for set_flag in &flags {
+            let mut state = make_state();
+            state.message = "explore the codebase".into();
+            for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
+                push_single_tool_round(&mut state);
+            }
+            // Precondition: would fire without the flag.
+            assert!(should_force_parallel_batching(
+                &state,
+                PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+            ));
+            set_flag(&mut state);
+            assert!(
+                !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
+                "parallel-batching must not fire when a cascade guard already active"
+            );
+        }
+    }
+
+    #[test]
     fn escalation_marker_detected_and_stripped_by_corrective_filter() {
         let msg = serde_json::json!({
             "role": "user",
@@ -2823,30 +2855,17 @@ mod tests {
         // Without phase-1 set, phase-2 must not abort even if last round had
         // tool calls — the model never received the corrective.
         state.stall.forced_round_budget_phase1 = false;
-        assert!(!should_abort_for_round_budget_phase2(
-            &state, true, hard_limit
-        ));
+        assert!(!should_abort_for_round_budget_phase2(&state, hard_limit));
 
-        // With phase-1 set but the model produced text-only on the next
-        // round (ignored: false), phase-2 must NOT abort: the model
-        // complied. The loop should drain naturally.
+        // With phase-1 set: phase-2 fires because the model continued past
+        // the hard limit after receiving the corrective.
         state.stall.forced_round_budget_phase1 = true;
-        assert!(!should_abort_for_round_budget_phase2(
-            &state, false, hard_limit
-        ));
+        assert!(should_abort_for_round_budget_phase2(&state, hard_limit));
 
-        // Phase-1 fired AND model still attempted tools next round: abort.
-        assert!(should_abort_for_round_budget_phase2(
-            &state, true, hard_limit
-        ));
-
-        // Sanity guard: even with phase-1 set and tool calls present, if
-        // llm_rounds_completed is below the hard limit, phase-2 must NOT
-        // fire — prevents mis-set flags from aborting prematurely.
+        // Sanity guard: even with phase-1 set, if llm_rounds_completed is
+        // below the hard limit, phase-2 must NOT fire.
         state.llm_rounds_completed = hard_limit - 1;
-        assert!(!should_abort_for_round_budget_phase2(
-            &state, true, hard_limit
-        ));
+        assert!(!should_abort_for_round_budget_phase2(&state, hard_limit));
     }
 
     #[test]
@@ -2856,11 +2875,9 @@ mod tests {
         state.llm_rounds_completed = hard_limit;
         state.stall.forced_round_budget_phase1 = true;
         state.stall.forced_round_budget_phase2 = true;
-        // Even with phase-1 set and tool calls present, once phase-2 has
-        // already fired we must not re-trigger.
-        assert!(!should_abort_for_round_budget_phase2(
-            &state, true, hard_limit
-        ));
+        // Even with phase-1 set, once phase-2 has already fired we must not
+        // re-trigger.
+        assert!(!should_abort_for_round_budget_phase2(&state, hard_limit));
     }
 
     fn push_redundant_sed_read(state: &mut AgenticLoopState, round: u32) {

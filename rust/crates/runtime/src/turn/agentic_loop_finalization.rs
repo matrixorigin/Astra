@@ -585,6 +585,9 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_exploration_family_corrective = false;
     state.stall.forced_exploration_family_phase2 = false;
     state.stall.exploration_family_corrective_family = None;
+    // Clear tool restrictions injected by exploration-family correctives so
+    // they don't leak into the next user turn.
+    state.restricted_tools.clear();
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records
@@ -823,6 +826,8 @@ mod tests {
         state.stall.forced_exploration_family_corrective = true;
         state.stall.forced_exploration_family_phase2 = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
+        state.restricted_tools.insert("git_diff".into());
+        state.restricted_tools.insert("git_log".into());
 
         finalize_and_render(&mut host, &mut state).await;
 
@@ -844,6 +849,10 @@ mod tests {
         assert!(!state.stall.forced_exploration_family_corrective);
         assert!(!state.stall.forced_exploration_family_phase2);
         assert!(state.stall.exploration_family_corrective_family.is_none());
+        assert!(
+            state.restricted_tools.is_empty(),
+            "restricted_tools must be cleared across turns"
+        );
     }
 
     #[tokio::test]

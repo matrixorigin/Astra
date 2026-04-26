@@ -377,6 +377,18 @@ pub struct ToolSelectionConfig {
     /// signal rarer.
     #[serde(default)]
     pub redundant_validation_retries_eval_threshold: u32,
+
+    /// Mid-loop guard: count of cache-waste tool calls (same tool+args, cached
+    /// result) tolerated before the runtime injects a corrective. 0 = use
+    /// default (3).
+    #[serde(default)]
+    pub cache_waste_midloop_threshold: u32,
+
+    /// Mid-loop guard: count of exploration-family churn rounds (same family
+    /// dominates consecutive rounds) tolerated before the runtime injects a
+    /// corrective. 0 = use default (3).
+    #[serde(default)]
+    pub exploration_family_churn_midloop_threshold: u32,
 }
 
 impl ToolSelectionConfig {
@@ -456,6 +468,16 @@ impl ToolSelectionConfig {
     pub fn effective_redundant_validation_retries_eval_threshold(&self) -> u32 {
         resolve_threshold(self.redundant_validation_retries_eval_threshold, 2, 1)
     }
+
+    /// Resolved mid-loop cache-waste threshold (0 → default of 3). Floor of 2.
+    pub fn effective_cache_waste_midloop_threshold(&self) -> u32 {
+        resolve_threshold(self.cache_waste_midloop_threshold, 3, 2)
+    }
+
+    /// Resolved mid-loop exploration-family churn threshold (0 → default of 3). Floor of 2.
+    pub fn effective_exploration_family_churn_midloop_threshold(&self) -> u32 {
+        resolve_threshold(self.exploration_family_churn_midloop_threshold, 3, 2)
+    }
 }
 
 /// Resolve a `0-means-default` config field: returns `default` when `value`
@@ -498,6 +520,8 @@ impl Default for ToolSelectionConfig {
             redundant_reads_eval_threshold: 0,
             search_fanout_eval_threshold: 0,
             redundant_validation_retries_eval_threshold: 0,
+            cache_waste_midloop_threshold: 0,
+            exploration_family_churn_midloop_threshold: 0,
         }
     }
 }
@@ -1022,6 +1046,8 @@ impl RuntimeConfig {
             redundant_reads_eval_threshold,
             search_fanout_eval_threshold,
             redundant_validation_retries_eval_threshold,
+            cache_waste_midloop_threshold,
+            exploration_family_churn_midloop_threshold,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -1111,6 +1137,18 @@ impl RuntimeConfig {
                 .tool_selection
                 .redundant_validation_retries_eval_threshold,
             redundant_validation_retries_eval_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.cache_waste_midloop_threshold,
+            cache_waste_midloop_threshold,
+            0,
+        );
+        merge_if_non_default(
+            &mut self
+                .tool_selection
+                .exploration_family_churn_midloop_threshold,
+            exploration_family_churn_midloop_threshold,
             0,
         );
 
@@ -1529,6 +1567,8 @@ mod tests {
                 redundant_reads_eval_threshold: 0,
                 search_fanout_eval_threshold: 0,
                 redundant_validation_retries_eval_threshold: 0,
+                cache_waste_midloop_threshold: 0,
+                exploration_family_churn_midloop_threshold: 0,
             },
             learning: LearningConfig {
                 enabled: false,

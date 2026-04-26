@@ -424,7 +424,10 @@ impl ThinClient {
         session_id: &str,
         artifact_kind: &str,
     ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::session_artifact_latest(session_id, artifact_kind))?;
+        let path = paths::session_artifact_latest(session_id, artifact_kind).ok_or_else(|| {
+            ThinClientError::InvalidInput(format!("invalid artifact_kind: {artifact_kind}"))
+        })?;
+        let url = self.url(&path)?;
         let resp = self
             .http
             .get(url)
@@ -440,7 +443,10 @@ impl ThinClient {
         session_id: &str,
         artifact_id: &str,
     ) -> Result<(Vec<u8>, Option<String>), ThinClientError> {
-        let url = self.url(&paths::session_artifact_download(session_id, artifact_id))?;
+        let path = paths::session_artifact_download(session_id, artifact_id).ok_or_else(|| {
+            ThinClientError::InvalidInput(format!("invalid artifact_id: {artifact_id}"))
+        })?;
+        let url = self.url(&path)?;
         let resp = self
             .http
             .get(url)
@@ -1494,9 +1500,18 @@ fn attachment_filename(headers: &HeaderMap) -> Option<String> {
         .trim_matches('"')
         .trim();
     if filename.is_empty() {
+        return None;
+    }
+    // Strip control characters and cap length for safety.
+    let sanitized: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(255)
+        .collect();
+    if sanitized.is_empty() {
         None
     } else {
-        Some(filename.to_string())
+        Some(sanitized)
     }
 }
 
@@ -2341,5 +2356,44 @@ mod tests {
             body.contains(".timeout("),
             "get_authed_path_text must apply a per-request .timeout()"
         );
+    }
+
+    #[test]
+    fn attachment_filename_parses_normal_filename() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"capture_2024.json\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            attachment_filename(&headers),
+            Some("capture_2024.json".to_string())
+        );
+    }
+
+    #[test]
+    fn attachment_filename_caps_length() {
+        let long_name = "a".repeat(300);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{long_name}\"")
+                .parse()
+                .unwrap(),
+        );
+        let result = attachment_filename(&headers).unwrap();
+        assert_eq!(result.len(), 255);
+    }
+
+    #[test]
+    fn attachment_filename_returns_none_for_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"\"".parse().unwrap(),
+        );
+        assert_eq!(attachment_filename(&headers), None);
     }
 }

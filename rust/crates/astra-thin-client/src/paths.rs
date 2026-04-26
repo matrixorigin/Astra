@@ -44,14 +44,36 @@ pub fn session_replay_compare(id: &str) -> String {
     format!("/sessions/{id}/replay/compare")
 }
 
+/// Returns `None` if `artifact_kind` contains path-unsafe characters.
 #[inline]
-pub fn session_artifact_latest(session_id: &str, artifact_kind: &str) -> String {
-    format!("/sessions/{session_id}/artifacts/latest/{artifact_kind}")
+pub fn session_artifact_latest(session_id: &str, artifact_kind: &str) -> Option<String> {
+    if !is_safe_path_segment(artifact_kind) {
+        return None;
+    }
+    Some(format!(
+        "/sessions/{session_id}/artifacts/latest/{artifact_kind}"
+    ))
 }
 
+/// Returns `None` if `artifact_id` contains path-unsafe characters.
 #[inline]
-pub fn session_artifact_download(session_id: &str, artifact_id: &str) -> String {
-    format!("/sessions/{session_id}/artifacts/{artifact_id}/download")
+pub fn session_artifact_download(session_id: &str, artifact_id: &str) -> Option<String> {
+    if !is_safe_path_segment(artifact_id) {
+        return None;
+    }
+    Some(format!(
+        "/sessions/{session_id}/artifacts/{artifact_id}/download"
+    ))
+}
+
+/// A safe path segment contains only alphanumeric, `-`, `_`, or `.` characters
+/// and is non-empty. Rejects `/`, `..`, `?`, `#`, `%`, etc.
+fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
 #[inline]
@@ -327,7 +349,7 @@ mod tests {
     fn session_artifact_latest_path() {
         assert_eq!(
             session_artifact_latest("s1", "llm_capture"),
-            "/sessions/s1/artifacts/latest/llm_capture"
+            Some("/sessions/s1/artifacts/latest/llm_capture".to_string())
         );
     }
 
@@ -335,8 +357,24 @@ mod tests {
     fn session_artifact_download_path() {
         assert_eq!(
             session_artifact_download("s1", "a1"),
-            "/sessions/s1/artifacts/a1/download"
+            Some("/sessions/s1/artifacts/a1/download".to_string())
         );
+    }
+
+    #[test]
+    fn session_artifact_latest_rejects_path_traversal() {
+        assert_eq!(session_artifact_latest("s1", "../../admin"), None);
+        assert_eq!(session_artifact_latest("s1", "a/b"), None);
+        assert_eq!(session_artifact_latest("s1", ".."), None);
+        assert_eq!(session_artifact_latest("s1", ""), None);
+        assert_eq!(session_artifact_latest("s1", "a?b"), None);
+        assert_eq!(session_artifact_latest("s1", "a#b"), None);
+    }
+
+    #[test]
+    fn session_artifact_download_rejects_path_traversal() {
+        assert_eq!(session_artifact_download("s1", "../secret"), None);
+        assert_eq!(session_artifact_download("s1", "a%2Fb"), None);
     }
 
     #[test]

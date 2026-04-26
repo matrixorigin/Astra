@@ -2462,7 +2462,7 @@ fn shell_segment_base_command(segment: &str) -> Option<String> {
         let lower = base.to_ascii_lowercase();
         match lower.as_str() {
             "sudo" | "command" | "nohup" | "setsid" | "nice" | "time" | "strace" | "ltrace"
-            | "taskset" => continue,
+            | "taskset" | "exec" | "builtin" => continue,
             "env" => {
                 while tokens.peek().is_some_and(|next| next.contains('=')) {
                     tokens.next();
@@ -7192,6 +7192,10 @@ mod tests {
         assert!(
             forbidden_name_based_process_kill("strace pkill -9 node").is_some(),
             "strace prefix should not bypass pkill block"
+        );
+        assert!(
+            forbidden_name_based_process_kill("exec pkill -f node").is_some(),
+            "exec prefix should not bypass pkill block"
         );
     }
 
