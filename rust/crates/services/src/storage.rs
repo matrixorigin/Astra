@@ -526,13 +526,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
-    // Brand-new table on this branch — drop+recreate so dev DBs always pick up the
-    // current schema. No production migration concerns yet.
-    query("DROP TABLE IF EXISTS skill_selector_turn_metrics")
-        .execute(&pool)
-        .await?;
     query(
-        "CREATE TABLE skill_selector_turn_metrics (
+        "CREATE TABLE IF NOT EXISTS skill_selector_turn_metrics (
             event_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(64) NULL,

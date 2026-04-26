@@ -281,8 +281,7 @@ fn build_hook_db_persist_from_payload(
             .and_then(|outcome| serde_json::to_value(outcome.mutation_objective_score()).ok());
     let turn_number = hook_payload
         .get("turn_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or_default();
+        .and_then(serde_json::Value::as_i64);
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
         session_id: session_id.clone(),
@@ -362,13 +361,15 @@ fn build_hook_db_persist_from_payload(
         .get("skill_selector_metric")
         .and_then(parse_turn_skill_selector_metric_record)
         .or_else(|| {
-            crate::turn::skill_tool::build_turn_skill_selector_metric_record(
-                &session_id,
-                &user_id,
-                turn_number,
-                derived_shortlist.as_ref(),
-                &selected_skills,
-            )
+            turn_number.and_then(|turn_number| {
+                crate::turn::skill_tool::build_turn_skill_selector_metric_record(
+                    &session_id,
+                    &user_id,
+                    turn_number,
+                    derived_shortlist.as_ref(),
+                    &selected_skills,
+                )
+            })
         });
     let implicit_feedback = if !run_implicit_feedback {
         first_user_content(&messages).and_then(|user_content| {
@@ -1465,6 +1466,31 @@ mod inprocess_hook_contract_tests {
         assert_eq!(metric.turn_number, 6);
         assert_eq!(metric.visible_skill_count, 2);
         assert_eq!(metric.best_chosen_rank, Some(2));
+    }
+
+    #[tokio::test]
+    async fn hook_does_not_derive_skill_selector_metric_without_turn_count() {
+        let mut payload = build_hook_payload_with_derived_skill_metric();
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .remove("turn_count");
+        let hook_writer = RecordingHookDbWriter::default();
+
+        run_bridge_hook_side_effects(
+            Some(payload),
+            Arc::new(hook_writer.clone()),
+            Arc::new(RecordingReflectionStateStore::default()),
+            Arc::new(RecordingReflectionLessonWriter::default()),
+            Arc::new(RecordingObserverWorker::default()),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].skill_selector_metric.is_none());
     }
 
     #[tokio::test]

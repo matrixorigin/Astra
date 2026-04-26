@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -12,7 +14,12 @@ from typing import Any
 import yaml
 
 
-BASE_DIR = Path("/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_BASE_DIR = Path(
+    os.environ.get("ASTRA_SKILL_SELECTOR_BENCH_BASE", REPO_ROOT / "tmp" / "selector-skill-libraries")
+)
+
+BASE_DIR = DEFAULT_BASE_DIR
 CURATED_DIR = BASE_DIR / "astra-curated-skills"
 QUARANTINE_DIR = BASE_DIR / "astra-quarantine"
 SAMPLE_DIR = BASE_DIR / "astra-benchmark-1000"
@@ -283,7 +290,24 @@ def write_skill(entry: SkillEntry, target_dir: Path) -> None:
     skill_md.write_text(f"---\n{yaml_dump(frontmatter)}\n---\n\n{entry.body}", encoding="utf-8")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Curate the skill-selector benchmark corpus.")
+    parser.add_argument("--base-dir", default=str(DEFAULT_BASE_DIR))
+    return parser.parse_args()
+
+
+def configure_paths(base_dir: Path) -> None:
+    global BASE_DIR, CURATED_DIR, QUARANTINE_DIR, SAMPLE_DIR, REPORT_PATH
+    BASE_DIR = base_dir
+    CURATED_DIR = BASE_DIR / "astra-curated-skills"
+    QUARANTINE_DIR = BASE_DIR / "astra-quarantine"
+    SAMPLE_DIR = BASE_DIR / "astra-benchmark-1000"
+    REPORT_PATH = BASE_DIR / "astra-curation-report.json"
+
+
 def main() -> None:
+    args = parse_args()
+    configure_paths(Path(args.base_dir))
     raw_entries = [entry for entry in (load_entry(path) for path in BASE_DIR.rglob("SKILL.md")) if entry]
 
     # Drop our own generated outputs on reruns.

@@ -263,6 +263,7 @@ static CANONICAL_MAP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::
 
 static SELECTOR_CACHE: OnceLock<RwLock<HashMap<String, Arc<SelectorCatalogIndex>>>> =
     OnceLock::new();
+const SELECTOR_CATALOG_CACHE_MAX_ENTRIES: usize = 8;
 
 #[derive(Clone, Debug)]
 struct SelectorEntry {
@@ -468,6 +469,9 @@ fn catalog_index(skills: &[SkillToolInfo]) -> Arc<SelectorCatalogIndex> {
         embeddings: RwLock::new(None),
     });
     if let Ok(mut cache) = selector_cache().write() {
+        if cache.len() >= SELECTOR_CATALOG_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
         cache.insert(key, built.clone());
     }
     built

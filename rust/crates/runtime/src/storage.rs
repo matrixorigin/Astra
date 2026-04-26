@@ -161,8 +161,8 @@ pub(crate) async fn insert_turn_skill_selector_metric(
         "INSERT INTO skill_selector_turn_metrics \
          (event_id, session_id, user_id, turn_number, visible_skill_count, chosen_skill_count, \
           shortlisted_chosen_count, missed_chosen_count, best_chosen_rank, \
-          selector_tier, elapsed_ms, total_catalog_size, extra, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+           selector_tier, elapsed_ms, total_catalog_size, extra, created_at) \
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
     )
     .bind(&record.event_id)
     .bind(&record.session_id)

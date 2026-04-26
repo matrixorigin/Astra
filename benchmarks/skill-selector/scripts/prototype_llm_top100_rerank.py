@@ -19,11 +19,17 @@ import numpy as np
 import yaml
 
 
-BASE_DIR = Path("/Users/ghs-mo/MOWorkSpace/mo-agent-engine-selector-metrics/tmp/selector-skill-libraries")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_BASE_DIR = Path(
+    os.environ.get("ASTRA_SKILL_SELECTOR_BENCH_BASE", REPO_ROOT / "tmp" / "selector-skill-libraries")
+)
+DEFAULT_MODELS_YAML_PATH = Path(os.environ.get("ASTRA_MODELS_YAML", REPO_ROOT / ".models.yaml"))
+
+BASE_DIR = DEFAULT_BASE_DIR
 SAMPLE_DIR = BASE_DIR / "astra-benchmark-1000"
 PRIMARY_PATH = BASE_DIR / "selector-benchmark-dataset" / "primary.jsonl"
 RESULTS_DIR = BASE_DIR / "selector-benchmark-dataset" / "benchmark-results"
-MODELS_YAML_PATH = Path("/Users/ghs-mo/MOWorkSpace/mo-agent-engine/.models.yaml")
+MODELS_YAML_PATH = DEFAULT_MODELS_YAML_PATH
 
 DEFAULT_RERANK_MODEL = "qwen2.5-3b-instruct"
 DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
@@ -56,6 +62,8 @@ class Record:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rerank embedding top100 candidates with a cheap LLM.")
+    parser.add_argument("--base-dir", default=str(DEFAULT_BASE_DIR))
+    parser.add_argument("--models-yaml", default=str(DEFAULT_MODELS_YAML_PATH))
     parser.add_argument("--rerank-model", default=DEFAULT_RERANK_MODEL)
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     parser.add_argument("--limit", type=int, default=None)
@@ -64,13 +72,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-return", type=int, default=30)
     parser.add_argument(
         "--rows-out",
-        default=str(RESULTS_DIR / "llm-top100-rerank-rows.jsonl"),
+        default=None,
     )
     parser.add_argument(
         "--summary-out",
-        default=str(RESULTS_DIR / "llm-top100-rerank-summary.json"),
+        default=None,
     )
     return parser.parse_args()
+
+
+def configure_paths(args: argparse.Namespace) -> None:
+    global BASE_DIR, SAMPLE_DIR, PRIMARY_PATH, RESULTS_DIR, MODELS_YAML_PATH
+    BASE_DIR = Path(args.base_dir)
+    SAMPLE_DIR = BASE_DIR / "astra-benchmark-1000"
+    PRIMARY_PATH = BASE_DIR / "selector-benchmark-dataset" / "primary.jsonl"
+    RESULTS_DIR = BASE_DIR / "selector-benchmark-dataset" / "benchmark-results"
+    MODELS_YAML_PATH = Path(args.models_yaml)
+    if args.rows_out is None:
+        args.rows_out = str(RESULTS_DIR / "llm-top100-rerank-rows.jsonl")
+    if args.summary_out is None:
+        args.summary_out = str(RESULTS_DIR / "llm-top100-rerank-summary.json")
 
 
 def load_model_config(model_name: str) -> ModelConfig:
@@ -290,6 +311,7 @@ def summarize(rows: list[dict[str, Any]], field: str) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    configure_paths(args)
     model = load_model_config(args.rerank_model)
     skills = load_skills()
     skill_index = {skill.name: idx for idx, skill in enumerate(skills)}
