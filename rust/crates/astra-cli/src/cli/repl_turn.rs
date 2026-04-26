@@ -1255,6 +1255,61 @@ async fn run_chat_turn(
     }
 }
 
+/// Build a compact tool-call summary for cross-turn context continuity.
+///
+/// Appended to the assistant text in history so the next turn's prompt
+/// contains file paths and tool outcomes from the previous turn — without
+/// storing the full tool_call / tool_result messages.
+fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord]) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+
+    // Collect unique file paths (preserving first-seen order).
+    let mut files: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for r in records {
+        if let Some(fp) = r.file_path.as_deref() {
+            if !files.contains(&fp) {
+                files.push(fp);
+            }
+        }
+        if !r.ok && !failed.contains(&r.name.as_str()) {
+            failed.push(&r.name);
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !files.is_empty() {
+        if files.len() <= 15 {
+            parts.push(format!("files: {}", files.join(", ")));
+        } else {
+            let shown: Vec<&str> = files[..15].to_vec();
+            parts.push(format!(
+                "files: {} (+{} more)",
+                shown.join(", "),
+                files.len() - 15
+            ));
+        }
+    }
+    if !failed.is_empty() {
+        parts.push(format!("failed: {}", failed.join(", ")));
+    }
+    let tool_count = records.len();
+    parts.push(format!("tool_calls: {tool_count}"));
+
+    format!("\n\n[Turn context: {}]", parts.join(" | "))
+}
+
+/// Build the text stored in history: assistant response + optional tool summary.
+fn build_history_text(full_text: &str, records: &[session_journal::ToolCallRecord]) -> String {
+    let summary = build_turn_tool_summary(records);
+    if summary.is_empty() {
+        return full_text.to_string();
+    }
+    format!("{full_text}{summary}")
+}
+
 /// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
 /// stall/verdict/step sidecars. Shared by normal chat and plan-only LLM turns.
 fn commit_turn_journal_workspace_and_sidecars(
@@ -1805,9 +1860,10 @@ fn apply_turn_success_sync(
     maybe_update_session_goal(state, line);
     // New user input invalidates redo stack (history diverged)
     state.redo_stack.clear();
-    state
-        .history
-        .push((line.to_string(), result.full_text.clone()));
+    state.history.push((
+        line.to_string(),
+        build_history_text(&result.full_text, &result.tool_call_records),
+    ));
     state.recent_tools = result.tools_used.clone();
 
     // Persist tool health for cross-session error budgets
@@ -5460,5 +5516,335 @@ mod tests {
         assert_eq!(super::stall_type_confidence("skill_lockou"), 0.0);
         // Underscore suffix must not match — only exact or colon suffix.
         assert_eq!(super::stall_type_confidence("skill_lockout_v2"), 0.0);
+    }
+
+    // ── tool summary for cross-turn context ───────────────────────────────────
+
+    fn make_record(
+        name: &str,
+        ok: bool,
+        file_path: Option<&str>,
+    ) -> session_journal::ToolCallRecord {
+        session_journal::ToolCallRecord {
+            name: name.into(),
+            ok,
+            file_path: file_path.map(|s| s.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tool_summary_empty_when_no_tools() {
+        let summary = super::build_turn_tool_summary(&[]);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn tool_summary_lists_files_touched() {
+        let records = vec![
+            make_record("read_file", true, Some("src/main.rs")),
+            make_record("str_replace", true, Some("src/main.rs")),
+            make_record("read_file", true, Some("src/lib.rs")),
+        ];
+        let summary = super::build_turn_tool_summary(&records);
+        assert!(
+            summary.contains("src/main.rs"),
+            "should list files: {summary}"
+        );
+        assert!(
+            summary.contains("src/lib.rs"),
+            "should list files: {summary}"
+        );
+        // Deduped
+        assert_eq!(
+            summary.matches("src/main.rs").count(),
+            1,
+            "should dedup: {summary}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_shows_failed_tools() {
+        let records = vec![
+            make_record("read_file", false, Some("src/missing.rs")),
+            make_record("bash", true, None),
+        ];
+        let summary = super::build_turn_tool_summary(&records);
+        assert!(
+            summary.contains("read_file") && summary.contains("fail"),
+            "should show failures: {summary}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_appended_to_history() {
+        let records = vec![
+            make_record("read_file", true, Some("src/main.rs")),
+            make_record("str_replace", true, Some("src/main.rs")),
+        ];
+        let full_text = "## Done\nFixed the bug.".to_string();
+        let history_text = super::build_history_text(&full_text, &records);
+        assert!(
+            history_text.starts_with("## Done"),
+            "original text preserved"
+        );
+        assert!(
+            history_text.contains("src/main.rs"),
+            "summary appended: {history_text}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_not_appended_when_no_tools() {
+        let full_text = "Just a text response.".to_string();
+        let history_text = super::build_history_text(&full_text, &[]);
+        assert_eq!(history_text, full_text, "no summary when no tools");
+    }
+
+    // ── multi-turn simulation: real session scenarios ─────────────────────────
+
+    /// Simulate the exact scenario from session 15a5eb62 (glm-5.1):
+    /// Turn 1: simple chat (no tools)
+    /// Turn 2: code review with skill + git_diff + read_file (3 tool calls)
+    /// Turn 3: "修复和优化" — model needs paths from Turn 2
+    ///
+    /// BEFORE fix: Turn 3 prompt had zero file paths from Turn 2.
+    /// AFTER fix: Turn 3 prompt should contain file paths from Turn 2's tool summary.
+    #[test]
+    fn multi_turn_path_continuity_review_then_fix() {
+        let mut history: Vec<(String, String)> = Vec::new();
+
+        // ── Turn 1: simple chat ──
+        let t1_text = "I can help you with that project.";
+        let t1_records: Vec<session_journal::ToolCallRecord> = vec![];
+        history.push((
+            "hello".into(),
+            super::build_history_text(t1_text, &t1_records),
+        ));
+
+        // ── Turn 2: code review (skill + git_diff + read_file) ──
+        let t2_text = "## Code Review\n\n**permission_manager.rs:978** — boundary check incomplete\n**safety_middleware.rs:8** — missing UPDATE keyword\n**journal_digest.rs:241** — use enum instead of String";
+        let t2_records = vec![
+            make_record("skill", true, None),
+            make_record("git_diff", true, None),
+            make_record("git_diff", true, None),
+            make_record(
+                "read_file",
+                true,
+                Some("rust/crates/astra-cli/src/cli/permission_manager.rs"),
+            ),
+            make_record(
+                "read_file",
+                true,
+                Some("rust/crates/astra-turn-core/src/safety_middleware.rs"),
+            ),
+            make_record(
+                "read_file",
+                true,
+                Some("rust/crates/astra-cli/src/cli/journal_digest.rs"),
+            ),
+            make_record("grep", true, None),
+        ];
+        history.push((
+            "review latest commit".into(),
+            super::build_history_text(t2_text, &t2_records),
+        ));
+
+        // ── Turn 3: model sees the prompt ──
+        let messages = super::history_as_messages(&history);
+        // Add current user message
+        let current = "修复和优化";
+        let mut full_messages = messages;
+        full_messages.push(serde_json::json!({"role": "user", "content": current}));
+
+        // The assistant message from Turn 2 should contain the tool summary
+        let t2_assistant = full_messages[3]["content"].as_str().unwrap();
+
+        // CRITICAL: model can now see the full file paths from Turn 2
+        assert!(
+            t2_assistant.contains("rust/crates/astra-cli/src/cli/permission_manager.rs"),
+            "Turn 3 prompt must contain permission_manager.rs full path.\nActual Turn 2 assistant:\n{t2_assistant}"
+        );
+        assert!(
+            t2_assistant.contains("rust/crates/astra-turn-core/src/safety_middleware.rs"),
+            "Turn 3 prompt must contain safety_middleware.rs full path.\nActual Turn 2 assistant:\n{t2_assistant}"
+        );
+        assert!(
+            t2_assistant.contains("rust/crates/astra-cli/src/cli/journal_digest.rs"),
+            "Turn 3 prompt must contain journal_digest.rs full path.\nActual Turn 2 assistant:\n{t2_assistant}"
+        );
+
+        // The review text only had short names — the summary provides full paths
+        assert!(
+            !t2_text.contains("rust/crates/"),
+            "review text itself should NOT have full paths (that's the whole problem)"
+        );
+    }
+
+    /// Simulate 4 turns with increasing complexity:
+    /// Turn 1: review (7 tools, 3 files)
+    /// Turn 2: fix (18 tools, 3 files, 2 failures)
+    /// Turn 3: review changes (3 tools)
+    /// Turn 4: optimize (7 tools, 1 file)
+    /// Verify Turn 4 can see all prior file paths.
+    #[test]
+    fn four_turn_session_context_accumulation() {
+        let mut history: Vec<(String, String)> = Vec::new();
+
+        // Turn 1
+        let t1_records = vec![
+            make_record("skill", true, None),
+            make_record("git_diff", true, None),
+            make_record("read_file", true, Some("src/cli/permission_manager.rs")),
+            make_record("read_file", false, Some("src/safety_middleware.rs")),
+            make_record("grep", true, None),
+        ];
+        history.push((
+            "review latest commit".into(),
+            super::build_history_text(
+                "## Review\nIssues found in permission_manager.rs",
+                &t1_records,
+            ),
+        ));
+
+        // Turn 2
+        let t2_records = vec![
+            make_record("read_file", true, Some("src/cli/permission_manager.rs")),
+            make_record("read_file", true, Some("src/safety_middleware.rs")),
+            make_record("str_replace", true, Some("src/cli/permission_manager.rs")),
+            make_record("str_replace", true, Some("src/safety_middleware.rs")),
+            make_record("str_replace", true, Some("src/cli/journal_digest.rs")),
+            make_record("bash", true, None),
+            make_record("bash", false, None),
+        ];
+        history.push((
+            "修复和优化".into(),
+            super::build_history_text("## Done\nFixed 3 files.", &t2_records),
+        ));
+
+        // Turn 3
+        let t3_records = vec![
+            make_record("skill", true, None),
+            make_record("git_diff", true, None),
+        ];
+        history.push((
+            "review changes".into(),
+            super::build_history_text(
+                "## Review\nLGTM. Suggest adding Default to ErrorCategory.",
+                &t3_records,
+            ),
+        ));
+
+        // Turn 4 prompt
+        let messages = super::history_as_messages(&history);
+        let mut full_messages = messages;
+        full_messages.push(serde_json::json!({"role": "user", "content": "按照建议优化"}));
+
+        // Turn 4 should see file paths from ALL prior turns
+        let all_text: String = full_messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // From Turn 1
+        assert!(
+            all_text.contains("src/cli/permission_manager.rs"),
+            "Turn 1 path visible"
+        );
+        // From Turn 2
+        assert!(
+            all_text.contains("src/cli/journal_digest.rs"),
+            "Turn 2 path visible"
+        );
+        assert!(
+            all_text.contains("src/safety_middleware.rs"),
+            "Turn 2 path visible"
+        );
+        // Turn 1 failure visible
+        assert!(
+            all_text.contains("failed: read_file"),
+            "Turn 1 failure visible"
+        );
+        // Turn 2 failure visible
+        assert!(all_text.contains("failed: bash"), "Turn 2 failure visible");
+    }
+
+    /// Verify the summary doesn't bloat context excessively.
+    /// With 20 unique files across 50 tool calls, summary should be < 2KB.
+    /// Files beyond 15 are truncated with "(+N more)".
+    #[test]
+    fn tool_summary_stays_compact_under_heavy_load() {
+        let mut records = Vec::new();
+        for i in 0..50 {
+            let file = format!("src/module_{}/file_{}.rs", i / 5, i % 5);
+            records.push(make_record(
+                if i % 3 == 0 {
+                    "read_file"
+                } else {
+                    "str_replace"
+                },
+                i % 7 != 0,
+                Some(&file),
+            ));
+        }
+        let summary = super::build_turn_tool_summary(&records);
+        assert!(
+            summary.len() < 2048,
+            "summary should be compact, got {} bytes: {summary}",
+            summary.len()
+        );
+        // First 15 files shown
+        assert!(summary.contains("src/module_0/file_0.rs"));
+        // Truncation indicator
+        assert!(
+            summary.contains("more)"),
+            "should truncate beyond 15 files: {summary}"
+        );
+    }
+
+    /// Verify that compaction + tool summary works together.
+    /// After compaction, the summary from the compacted turn should still be
+    /// in the compacted summary text (since it's part of the assistant text).
+    #[test]
+    fn tool_summary_survives_in_compacted_history() {
+        let mut history: Vec<(String, String)> = Vec::new();
+
+        // Simulate a compacted entry (empty user = compacted)
+        history.push((
+            String::new(),
+            "[Prior context — 3 turns compacted]\nUser worked on fixing permission_manager.rs and safety_middleware.rs.\n\n[Turn context: files: src/permission_manager.rs, src/safety_middleware.rs | tool_calls: 12]".into(),
+        ));
+
+        // Recent turn
+        let records = vec![
+            make_record("read_file", true, Some("src/journal_digest.rs")),
+            make_record("str_replace", true, Some("src/journal_digest.rs")),
+        ];
+        history.push((
+            "add Default derive".into(),
+            super::build_history_text("Added #[derive(Default)] to ErrorCategory.", &records),
+        ));
+
+        let messages = super::history_as_messages(&history);
+        let mut full = messages;
+        full.push(serde_json::json!({"role": "user", "content": "run tests"}));
+
+        let all_text: String = full
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Compacted summary preserves old file paths
+        assert!(
+            all_text.contains("src/permission_manager.rs"),
+            "compacted paths visible"
+        );
+        // Recent turn has new paths
+        assert!(
+            all_text.contains("src/journal_digest.rs"),
+            "recent paths visible"
+        );
     }
 }

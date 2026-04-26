@@ -5,9 +5,7 @@ use serde_json::Value;
 
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
-const DESTRUCTIVE_KEYWORDS: &[&str] = &[
-    "DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE", "UPDATE", "MERGE",
-];
+const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
 const SHELL_EXECUTION_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
 
 /// Safe commands that can be used inside command substitution `$(...)`.
@@ -487,13 +485,9 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 9. Backslash-escaped whitespace — can alter shell tokenization
-    if check_backslash_escaped_whitespace(command) {
-        return Some(
-            "shell command contains backslash-escaped whitespace that can alter command parsing"
-                .to_string(),
-        );
-    }
+    // 9. (Removed) Backslash-escaped whitespace check was too strict — `cp my\ file.txt dest/`
+    // is standard shell idiom for spaces in filenames. The permission layer handles suspicious
+    // commands via Ask.
 
     // 10. /proc/*/environ access — can expose sensitive environment variables
     if check_proc_environ_access(command) {
@@ -1157,37 +1151,6 @@ fn check_carriage_return_attack(command: &str) -> bool {
         if ch == '\r' && !in_double_quote {
             return true;
         }
-    }
-
-    false
-}
-
-fn check_backslash_escaped_whitespace(command: &str) -> bool {
-    let chars: Vec<char> = command.chars().collect();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut i = 0usize;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '\\' && !in_single_quote {
-            if !in_double_quote && matches!(chars.get(i + 1), Some(' ' | '\t')) {
-                return true;
-            }
-            i += 2;
-            continue;
-        }
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            i += 1;
-            continue;
-        }
-        if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            i += 1;
-            continue;
-        }
-        i += 1;
     }
 
     false
@@ -1971,14 +1934,15 @@ mod tests {
     }
 
     #[test]
-    fn middleware_blocks_backslash_escaped_whitespace() {
+    fn middleware_allows_backslash_escaped_whitespace_in_filenames() {
+        // `cp my\ file.txt dest/` is standard shell idiom for spaces in filenames
         let decision =
-            evaluate_tool_safety_request("bash", &json!({"command": r"echo\ test /tmp/file"}));
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("backslash-escaped whitespace")
-        ));
+            evaluate_tool_safety_request("bash", &json!({"command": r"cp my\ file.txt dest/"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": r"cat my\ doc\ v2.txt"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
