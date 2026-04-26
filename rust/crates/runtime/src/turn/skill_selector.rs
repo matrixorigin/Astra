@@ -825,7 +825,7 @@ fn request_embedding_batches(
         .map(|(idx, chunk)| (idx, chunk.to_vec()))
         .collect::<Vec<_>>();
     run_selector_future(async move {
-        let mut batches = futures_util::stream::iter(batches_input.into_iter())
+        let mut batches = futures_util::stream::iter(batches_input)
             .map(|(idx, batch)| {
                 let config = config.clone();
                 async move {
