@@ -5,7 +5,9 @@ use serde_json::Value;
 
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
-const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
+const DESTRUCTIVE_KEYWORDS: &[&str] = &[
+    "DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE", "UPDATE", "MERGE",
+];
 const SHELL_EXECUTION_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
 
 /// Safe commands that can be used inside command substitution `$(...)`.

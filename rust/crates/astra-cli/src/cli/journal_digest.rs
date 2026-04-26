@@ -2,7 +2,7 @@
 
 use crate::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub const SCHEMA_VERSION: &str = "astra-journal-digest-v1";
@@ -245,9 +245,8 @@ pub struct FailedToolCall {
     pub turn_id: Option<u32>,
     /// Tool name (e.g. "bash", "write_file").
     pub tool: String,
-    /// Coarse error category derived from the error message.
-    /// One of: "safety_guard", "permission_denied", "tool_error", "unknown".
-    pub error_category: String,
+    /// Coarse error category for failed tool calls.
+    pub error_category: ErrorCategory,
     /// First ~200 chars of the error message.
     pub error_preview: String,
     /// First ~80 chars of the tool arguments.
@@ -313,22 +312,48 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+/// Error categories for failed tool calls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    /// Blocked by safety guard (shell obfuscation, dangerous patterns).
+    SafetyGuard,
+    /// Permission denied by security policy.
+    PermissionDenied,
+    /// General tool execution error.
+    ToolError,
+    /// Unknown or unrecognized error.
+    #[default]
+    Unknown,
+}
+
+impl std::fmt::Display for ErrorCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorCategory::SafetyGuard => write!(f, "safety_guard"),
+            ErrorCategory::PermissionDenied => write!(f, "permission_denied"),
+            ErrorCategory::ToolError => write!(f, "tool_error"),
+            ErrorCategory::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 /// Classify a tool failure error message into a coarse category.
-fn classify_tool_error(error: &str) -> &'static str {
+fn classify_tool_error(error: &str) -> ErrorCategory {
     let lower = error.to_ascii_lowercase();
     if lower.contains("safety guard") || lower.contains("shell_obfuscation") {
-        "safety_guard"
+        ErrorCategory::SafetyGuard
     } else if lower.contains("dangerous command")
         || lower.contains("dangerous pattern")
         || lower.contains("permission denied")
         || lower.contains("denied by rule")
         || lower.contains("blocked by default")
     {
-        "permission_denied"
+        ErrorCategory::PermissionDenied
     } else if lower.contains("error:") || lower.contains("failed:") {
-        "tool_error"
+        ErrorCategory::ToolError
     } else {
-        "unknown"
+        ErrorCategory::Unknown
     }
 }
 
@@ -431,7 +456,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 if let Some(calls) = ev.tool_calls.as_ref() {
                     for call in calls.iter().filter(|c| !c.ok) {
                         if classify_tool_error(call.error.as_deref().unwrap_or(""))
-                            == "safety_guard"
+                            == ErrorCategory::SafetyGuard
                         {
                             safety_guard_blocks += 1;
                         }
@@ -446,7 +471,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                                 seq,
                                 turn_id: ev.turn,
                                 tool: call.name.clone(),
-                                error_category: classify_tool_error(err).to_string(),
+                                error_category: classify_tool_error(err),
                                 error_preview: preview(Some(&err.to_string()), 200),
                                 args_preview: call.args_preview.clone(),
                             });
@@ -1397,7 +1422,7 @@ mod tests {
         let safety = d
             .failed_tool_calls
             .iter()
-            .find(|f| f.error_category == "safety_guard")
+            .find(|f| f.error_category == ErrorCategory::SafetyGuard)
             .expect("safety_guard entry");
         assert_eq!(safety.tool, "bash");
         assert_eq!(safety.seq, 1);
@@ -1410,7 +1435,7 @@ mod tests {
         let perm = d
             .failed_tool_calls
             .iter()
-            .find(|f| f.error_category == "permission_denied")
+            .find(|f| f.error_category == ErrorCategory::PermissionDenied)
             .expect("permission_denied entry");
         assert_eq!(perm.tool, "bash");
         assert!(perm.error_preview.contains("Dangerous command"));

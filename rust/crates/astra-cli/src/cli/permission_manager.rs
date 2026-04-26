@@ -1771,13 +1771,9 @@ fn contains_pipe_to(cmd: &str, target: &str) -> bool {
                 let rest = &cmd[i + 1..];
                 let rest = rest.strip_prefix(' ').unwrap_or(rest);
                 if rest.starts_with(target) {
-                    // Ensure target is a complete word (followed by space, end, or non-alnum)
+                    // Ensure target is a complete word using proper word boundary check
                     let after = &rest[target.len()..];
-                    if after.is_empty()
-                        || after.starts_with(|c: char| {
-                            !c.is_alphanumeric() && c != '_' && c != '-' && c != '/'
-                        })
-                    {
+                    if after.is_empty() || is_word_boundary(after.as_bytes()[0]) {
                         return true;
                     }
                 }
@@ -1786,6 +1782,18 @@ fn contains_pipe_to(cmd: &str, target: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Check if a byte represents a word boundary character.
+/// This ensures the matched target is a complete word, not a substring.
+fn is_word_boundary(c: u8) -> bool {
+    // Word boundaries: whitespace, shell operators, comments, or any non-alphanumeric except _-/.
+    c.is_ascii_whitespace()
+        || matches!(
+            c,
+            b';' | b'|' | b'&' | b'`' | b'$' | b'#' | b'(' | b')' | b'<' | b'>'
+        )
+        || !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'/')
 }
 
 fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
