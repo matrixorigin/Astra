@@ -1,7 +1,7 @@
 //! Deterministic end-to-end checks for skill selector metrics with live MatrixOne persistence.
 //!
 //! ```text
-//! ASTRA_RUNTIME_DB_IT=1 cargo test -p astra-runtime --test selector_metrics_db_e2e -- --ignored
+//! cargo test -p astra-runtime --test selector_metrics_db_e2e -- --ignored
 //! ```
 
 use std::time::Duration;
@@ -23,11 +23,6 @@ use sqlx::{MySql, Row};
 use uuid::Uuid;
 
 fn require_db_it_env() -> MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_RUNTIME_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_RUNTIME_DB_IT=1 for ignored selector metric DB e2e tests"
-    );
     dotenvy::dotenv().ok();
     MatrixOneSettings {
         host: std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
@@ -321,7 +316,7 @@ impl TurnObserverWorker for NoopObserverWorker {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_RUNTIME_DB_IT=1 and live MatrixOne"]
+#[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
     let database = test_database_name();
     let (settings, shared_pool) = setup_pool(&database).await;
@@ -425,7 +420,7 @@ async fn selector_metric_e2e_persists_and_summarizes_recent_turns() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_RUNTIME_DB_IT=1 and live MatrixOne"]
+#[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
     let database = test_database_name();
     let (settings, shared_pool) = setup_pool(&database).await;
@@ -475,7 +470,7 @@ async fn selector_metric_e2e_excludes_text_only_turns_from_metrics() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_RUNTIME_DB_IT=1 and live MatrixOne"]
+#[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
     let database = test_database_name();
     let (settings, shared_pool) = setup_pool(&database).await;
@@ -541,7 +536,7 @@ async fn selector_metric_e2e_handles_multiskill_alias_partial_recall() {
 }
 
 #[tokio::test]
-#[ignore = "ASTRA_RUNTIME_DB_IT=1 and live MatrixOne"]
+#[ignore = "requires live MatrixOne"]
 async fn selector_metric_e2e_trims_global_window_to_recent_rows() {
     let database = test_database_name();
     let (settings, shared_pool) = setup_pool(&database).await;
