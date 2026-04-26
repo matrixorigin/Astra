@@ -169,6 +169,7 @@ fn flush_interrupted_then_regular_flush_preserves_both() {
         agentic_step: Some(0),
         source: None,
         run_id: None,
+        tool_calls: None,
     });
     buf.flush_interrupted(&writer).unwrap();
     assert!(buf.is_empty());
@@ -187,6 +188,7 @@ fn flush_interrupted_then_regular_flush_preserves_both() {
         agentic_step: Some(0),
         source: None,
         run_id: None,
+        tool_calls: None,
     });
     buf2.flush(&writer).unwrap();
 
@@ -278,6 +280,7 @@ fn append_after_flush_interrupted_still_produces_readable_journal() {
         agentic_step: Some(0),
         source: None,
         run_id: None,
+        tool_calls: None,
     });
     buf.flush_interrupted(&writer).unwrap();
 

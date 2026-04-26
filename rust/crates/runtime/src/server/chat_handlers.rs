@@ -14,6 +14,7 @@ fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
     })
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_or_create_chat_session_id(
     state: &AppState,
     user: &AuthUserRecord,
@@ -21,6 +22,29 @@ pub(super) async fn resolve_or_create_chat_session_id(
     agent_id: Option<String>,
     session_id_is_trusted: bool,
 ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    resolve_or_create_chat_session(
+        state,
+        user,
+        requested_session_id,
+        agent_id,
+        session_id_is_trusted,
+    )
+    .await
+    .map(|resolved| resolved.session_id)
+}
+
+pub(super) struct ResolvedChatSession {
+    pub(super) session_id: Option<String>,
+    pub(super) full_llm_capture: bool,
+}
+
+pub(super) async fn resolve_or_create_chat_session(
+    state: &AppState,
+    user: &AuthUserRecord,
+    requested_session_id: Option<String>,
+    agent_id: Option<String>,
+    session_id_is_trusted: bool,
+) -> Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)> {
     match requested_session_id {
         Some(session_id) => {
             if session_id.trim().is_empty() {
@@ -35,9 +59,18 @@ pub(super) async fn resolve_or_create_chat_session_id(
                 .get_session(session_id.clone(), user.user_id.clone())
                 .await
             {
-                Ok(_) => Ok(Some(session_id)),
+                Ok(session) => Ok(ResolvedChatSession {
+                    session_id: Some(session_id),
+                    full_llm_capture:
+                        crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                            &session.metadata,
+                        )),
+                }),
                 Err(error) if is_session_service_unconfigured_error(&error) => {
-                    Ok(session_id_is_trusted.then_some(session_id))
+                    Ok(ResolvedChatSession {
+                        session_id: session_id_is_trusted.then_some(session_id),
+                        full_llm_capture: false,
+                    })
                 }
                 Err(error) => Err(normalize_chat_turn_session_error(error)),
             }
@@ -62,8 +95,19 @@ pub(super) async fn resolve_or_create_chat_session_id(
                 )
                 .await
             {
-                Ok(session) => Ok(Some(session.session_id)),
-                Err(error) if is_session_service_unconfigured_error(&error) => Ok(None),
+                Ok(session) => Ok(ResolvedChatSession {
+                    session_id: Some(session.session_id),
+                    full_llm_capture:
+                        crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                            &session.metadata,
+                        )),
+                }),
+                Err(error) if is_session_service_unconfigured_error(&error) => {
+                    Ok(ResolvedChatSession {
+                        session_id: None,
+                        full_llm_capture: false,
+                    })
+                }
                 Err(error) => Err(error),
             }
         }
@@ -124,7 +168,7 @@ pub(super) async fn chat_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
-    chat_data.session_id = resolve_or_create_chat_session_id(
+    let resolved = resolve_or_create_chat_session(
         &state,
         &user,
         chat_data.session_id.take(),
@@ -132,6 +176,8 @@ pub(super) async fn chat_handler(
         false,
     )
     .await?;
+    chat_data.session_id = resolved.session_id;
+    chat_data.full_llm_capture = resolved.full_llm_capture;
     let run = state
         .run_lifecycle_service
         .create_run(user.user_id, chat_data)
@@ -151,7 +197,7 @@ pub(super) async fn chat_stream_handler(
 
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
-    chat_data.session_id = match resolve_or_create_chat_session_id(
+    let resolved = match resolve_or_create_chat_session(
         &state,
         &user,
         chat_data.session_id.take(),
@@ -160,9 +206,11 @@ pub(super) async fn chat_stream_handler(
     )
     .await
     {
-        Ok(session_id) => session_id,
+        Ok(resolved) => resolved,
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
+    chat_data.session_id = resolved.session_id;
+    chat_data.full_llm_capture = resolved.full_llm_capture;
 
     // Bridge E2E hooks: when test secret is present and NO test_llm_rounds in
     // context, route through bridge. When test_llm_rounds IS present, fall
@@ -274,6 +322,12 @@ pub(super) async fn dispatch_chat_turn_bridge(
                 Ok(v) => v,
                 Err(r) => return r,
             },
+        );
+    }
+    if prepared.full_llm_capture == Some(true) {
+        bridge_headers.insert(
+            HeaderName::from_static("x-mo-full-llm-capture"),
+            HeaderValue::from_static("1"),
         );
     }
     if let Some(session_turn) = prepared.session_turn.as_deref() {
@@ -418,6 +472,7 @@ mod tests {
             "x-mo-username-b64",
             "x-mo-bridge-capabilities",
             "x-mo-session-id",
+            "x-mo-full-llm-capture",
             "x-mo-turn-chain-id",
             "x-mo-user-query-event-id",
             "x-mo-tools-changed",
@@ -472,6 +527,7 @@ mod tests {
         let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
             message: "hello".to_string(),
             session_id: Some("s1".to_string()),
+            full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
             llm_token_service: Some(astra_services::LlmTokenServiceConfig {
@@ -520,6 +576,7 @@ mod tests {
         let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
             message: "hello".to_string(),
             session_id: Some("s1".to_string()),
+            full_llm_capture: false,
             agent_id: Some("a1".to_string()),
             model: Some("gpt-4".to_string()),
             llm_token_service: None,
@@ -562,11 +619,11 @@ mod tests {
     fn dispatch_header_count() {
         // Base headers: 4 (secret, user-id, username-b64, capabilities)
         // + authorization passthrough: 1
-        // + optional from prepared: 10 (session-id, session-turn, turn-chain-id,
+        // + optional from prepared: 11 (session-id, full-llm-capture, session-turn, turn-chain-id,
         //   user-query-event-id, tools-changed, task-hint, user-query-b64,
         //   routing-meta-b64, force-intent, execution-state-b64)
-        // Total possible: 15
-        assert_eq!(4 + 1 + 10, 15);
+        // Total possible: 16
+        assert_eq!(4 + 1 + 11, 16);
     }
 }
 
@@ -833,6 +890,7 @@ mod chat_stream_bridge_fallback_tests {
         body::{self, Body},
         http::{HeaderMap, Request, StatusCode},
     };
+    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
 
     use crate::{
@@ -911,6 +969,31 @@ mod chat_stream_bridge_fallback_tests {
 
     #[derive(Clone)]
     struct StubSessionService;
+
+    #[derive(Clone)]
+    struct CaptureEnabledSessionService;
+
+    #[derive(Clone, Default)]
+    struct RecordingCreateRunLifecycle {
+        requests: Arc<Mutex<Vec<ChatRequestData>>>,
+    }
+
+    impl RecordingCreateRunLifecycle {
+        async fn recorded_requests(&self) -> Vec<ChatRequestData> {
+            self.requests.lock().await.clone()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingStreamChatLifecycle {
+        requests: Arc<Mutex<Vec<ChatRequestData>>>,
+    }
+
+    impl RecordingStreamChatLifecycle {
+        async fn recorded_requests(&self) -> Vec<ChatRequestData> {
+            self.requests.lock().await.clone()
+        }
+    }
 
     #[async_trait]
     impl SessionService for StubSessionService {
@@ -996,11 +1079,104 @@ mod chat_stream_bridge_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl SessionService for CaptureEnabledSessionService {
+        async fn create_session(
+            &self,
+            user_id: String,
+            request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionRecord {
+                session_id: "s-created-capture".to_string(),
+                user_id,
+                agent_id: request.agent_id,
+                title: Some("Created".to_string()),
+                metadata: serde_json::Map::from_iter([(
+                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    serde_json::json!(true),
+                )]),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionListRecord {
+                sessions: Vec::new(),
+                total: 0,
+                limit: 20,
+                offset: 0,
+            })
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionRecord {
+                session_id,
+                user_id,
+                agent_id: None,
+                title: Some("Existing".to_string()),
+                metadata: serde_json::Map::from_iter([(
+                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    serde_json::json!(true),
+                )]),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn update_session(
+            &self,
+            session_id: String,
+            user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id).await
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            Ok(())
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionActivityRecord {
+                session_id: String::new(),
+                activities: vec![],
+                total: 0,
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct StubOtherNotImplementedLifecycle;
 
     #[derive(Clone)]
     struct StubConfiguredLifecycle;
+
+    #[derive(Clone)]
+    struct StubAssistantTextLifecycle;
 
     #[async_trait]
     impl RunLifecycleService for StubOtherNotImplementedLifecycle {
@@ -1130,6 +1306,269 @@ mod chat_stream_bridge_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl RunLifecycleService for RecordingCreateRunLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.requests.lock().await.push(request);
+            Ok(ChatRunRecord {
+                session_id: "s-recorded".to_string(),
+                run_id: "run-recorded".to_string(),
+                status: "queued".to_string(),
+                explain: None,
+            })
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl RunLifecycleService for RecordingStreamChatLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.requests.lock().await.push(request);
+            Ok(ChatStreamRecord {
+                session_id: "s-stream-recorded".to_string(),
+                run_id: "run-stream-recorded".to_string(),
+                events: vec![serde_json::json!({
+                    "event_type": "run_finished",
+                    "data": {"status": "completed"}
+                })],
+                event_rx: None,
+            })
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubConfiguredStreamingLifecycle;
+
+    #[async_trait]
+    impl RunLifecycleService for StubConfiguredStreamingLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+            event_tx
+                .try_send(serde_json::json!({
+                    "event_type": "run_error",
+                    "data": {"error": "live boom"}
+                }))
+                .expect("queue run_error");
+            event_tx
+                .try_send(serde_json::json!({
+                    "event_type": "run_finished",
+                    "data": {"prompt_tokens": 11, "completion_tokens": 4, "tool_call_count": 0}
+                }))
+                .expect("queue run_finished");
+            drop(event_tx);
+            Ok(ChatStreamRecord {
+                session_id: "s-live-stream".to_string(),
+                run_id: "run-live-stream".to_string(),
+                events: Vec::new(),
+                event_rx: Some(event_rx),
+            })
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl RunLifecycleService for StubAssistantTextLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(ChatStreamRecord {
+                session_id: "s-turn".to_string(),
+                run_id: "run-turn".to_string(),
+                events: vec![
+                    serde_json::json!({
+                        "event_type": "text_delta",
+                        "data": {"chunk": "stale partial"}
+                    }),
+                    serde_json::json!({
+                        "event_type": "turn_complete",
+                        "data": {"assistant_text": "recovered final text", "has_tool_calls": false}
+                    }),
+                ],
+                event_rx: None,
+            })
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
     #[tokio::test]
     async fn chat_stream_uses_client_run_event_shape_for_live_lifecycle_streams() {
         let app = build_app(
@@ -1168,6 +1607,108 @@ mod chat_stream_bridge_fallback_tests {
     }
 
     #[tokio::test]
+    async fn chat_handler_propagates_full_capture_from_session_metadata_into_run_request() {
+        let lifecycle = RecordingCreateRunLifecycle::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(CaptureEnabledSessionService))
+                .with_run_lifecycle_service(Arc::new(lifecycle.clone())),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"session_id":"capture-session","message":"hi"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let requests = lifecycle.recorded_requests().await;
+        assert_eq!(requests.len(), 1, "one run request expected");
+        assert!(requests[0].full_llm_capture);
+        assert_eq!(requests[0].session_id.as_deref(), Some("capture-session"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_handler_propagates_full_capture_from_session_metadata_into_stream_request()
+    {
+        let lifecycle = RecordingStreamChatLifecycle::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(CaptureEnabledSessionService))
+                .with_run_lifecycle_service(Arc::new(lifecycle.clone())),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"session_id":"capture-session","message":"hi"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let requests = lifecycle.recorded_requests().await;
+        assert_eq!(requests.len(), 1, "one stream request expected");
+        assert!(requests[0].full_llm_capture);
+        assert_eq!(requests[0].session_id.as_deref(), Some("capture-session"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_streaming_path_uses_client_run_event_shape_for_terminal_events() {
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService))
+                .with_run_lifecycle_service(Arc::new(StubConfiguredStreamingLifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"run_id\":\"run-live-stream\""));
+        assert!(text.contains("\"type\":\"usage\""));
+        assert!(text.contains("\"prompt_tokens\":11"));
+        assert!(text.contains("\"completion_tokens\":4"));
+        assert!(text.contains("\"type\":\"run_finished\""));
+        assert!(text.contains("\"status\":\"failed\""));
+        assert!(text.contains("\"error\":\"live boom\""));
+    }
+
+    #[tokio::test]
     async fn chat_stream_does_not_fall_back_for_other_not_implemented_errors() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -1198,5 +1739,44 @@ mod chat_stream_bridge_fallback_tests {
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"error\""));
         assert!(!text.contains("\"type\":\"text_delta\""));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_emits_turn_complete_assistant_text_for_client_reconciliation() {
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService))
+                .with_run_lifecycle_service(Arc::new(StubAssistantTextLifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"text_delta\""));
+        assert!(text.contains("\"content\":\"stale partial\""));
+        assert!(
+            text.contains("\"type\":\"turn_complete\""),
+            "turn completion event should reach the client: {text}"
+        );
+        assert!(
+            text.contains("\"assistant_text\":\"recovered final text\""),
+            "authoritative assistant text should survive the HTTP SSE route: {text}"
+        );
     }
 }

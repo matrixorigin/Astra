@@ -750,6 +750,7 @@ mod tests {
             agentic_step: None,
             source: None,
             run_id: None,
+            tool_calls: None,
         });
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
             prompt_tokens: 200,
@@ -763,6 +764,7 @@ mod tests {
             agentic_step: None,
             source: None,
             run_id: None,
+            tool_calls: None,
         });
         assert_eq!(buf.current_round(), 2);
         state.turn_event_buffer = Some(buf);

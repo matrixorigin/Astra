@@ -92,7 +92,7 @@ fn bash_command_looks_mutating(command: &str) -> bool {
     crate::bash_intent::bash_command_looks_mutating(command)
 }
 
-fn extract_bash_command(args: Option<&str>) -> Option<String> {
+pub(crate) fn extract_bash_command(args: Option<&str>) -> Option<String> {
     let args = args?;
     let value = serde_json::from_str::<Value>(args).ok()?;
     let command = value.get("command").and_then(Value::as_str)?;

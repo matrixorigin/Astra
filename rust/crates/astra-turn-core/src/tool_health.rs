@@ -200,6 +200,10 @@ pub struct ToolHealthTracker {
     /// so cross-session persistence and cloud sync can preserve recent identical-call
     /// evidence.
     outcome_cache: HashMap<String, VecDeque<ToolOutcome>>,
+    /// Session-local cache-hit counts keyed by canonical tool signature.
+    /// Used to detect wasteful repeated cache hits without overblocking
+    /// unrelated calls to the same tool.
+    cache_hits_by_signature: HashMap<String, usize>,
 }
 
 impl ToolHealthTracker {
@@ -300,8 +304,19 @@ impl ToolHealthTracker {
     /// Neutral for health scoring — the tool didn't actually execute.
     /// Does NOT break the consecutive failure streak (tool wasn't tested).
     pub fn record_cache_hit(&mut self, tool_name: &str) {
+        self.record_cache_hit_for_signature(tool_name, tool_name);
+    }
+
+    /// Record a cache hit for a canonical tool signature.
+    /// This keeps overall per-tool diagnostics while letting waste detection
+    /// key off the exact repeated request shape.
+    pub fn record_cache_hit_for_signature(&mut self, tool_name: &str, signature: &str) {
         let health = self.tools.entry(tool_name.to_string()).or_default();
         health.cache_hit_count += 1;
+        *self
+            .cache_hits_by_signature
+            .entry(signature.to_string())
+            .or_default() += 1;
         // Not counted as total_calls — the tool didn't run
         // Not counted as success or failure — no signal about tool health
         // Mark dirty for delta sync (cache stats changed)
@@ -638,11 +653,20 @@ impl ToolHealthTracker {
     /// Tools with repeated identical calls served from cache (>= threshold).
     /// This indicates the LLM is making wasteful duplicate calls.
     pub fn cache_wasteful_tools(&self, threshold: usize) -> Vec<(&str, usize)> {
-        self.tools
-            .iter()
-            .filter(|(_, h)| h.cache_hit_count >= threshold)
-            .map(|(name, h)| (name.as_str(), h.cache_hit_count))
-            .collect()
+        let mut aggregated: HashMap<&str, usize> = HashMap::new();
+        for (signature, count) in &self.cache_hits_by_signature {
+            if *count < threshold {
+                continue;
+            }
+            let tool_name = signature
+                .split_once(':')
+                .map(|(tool_name, _)| tool_name)
+                .unwrap_or(signature.as_str());
+            *aggregated.entry(tool_name).or_default() += *count;
+        }
+        let mut wasteful: Vec<_> = aggregated.into_iter().collect();
+        wasteful.sort_by(|left, right| left.0.cmp(right.0));
+        wasteful
     }
 
     /// Total timeout count across all tools.
@@ -988,6 +1012,25 @@ mod tests {
     fn empty_tool_success_rate_is_one() {
         let health = ToolHealth::default();
         assert!((health.success_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_wasteful_requires_repeated_same_signature() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        tracker.record_cache_hit_for_signature("read_file", "read_file:path=b.txt");
+        tracker.record_cache_hit_for_signature("read_file", "read_file:path=c.txt");
+
+        assert!(
+            tracker.cache_wasteful_tools(3).is_empty(),
+            "three different cached read_file signatures should not look wasteful"
+        );
+
+        tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+
+        let wasteful = tracker.cache_wasteful_tools(3);
+        assert_eq!(wasteful, vec![("read_file", 3)]);
     }
 
     // ── Persistence ──

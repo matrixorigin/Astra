@@ -950,6 +950,47 @@ mod chat_stream_turnguard_e2e {
         );
     }
 
+    #[test]
+    fn distinct_cache_signatures_do_not_propagate_to_restricted() {
+        let mut guard = TurnGuard::new();
+        let mut restricted = HashSet::new();
+
+        guard.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        guard.record_cache_hit_for_signature("read_file", "read_file:path=b.txt");
+        guard.record_cache_hit_for_signature("read_file", "read_file:path=c.txt");
+
+        let v = guard.evaluate();
+        assert!(
+            !v.avoid_tools.contains(&"read_file".to_string()),
+            "distinct cached signatures should not avoid the whole tool"
+        );
+
+        apply_verdict(&v, 25, &mut restricted);
+        assert!(
+            !restricted.contains("read_file"),
+            "distinct cached signatures should not land in restricted_tools"
+        );
+    }
+
+    #[test]
+    fn repeated_identical_cache_signature_propagates_to_restricted() {
+        let mut guard = TurnGuard::new();
+        let mut restricted = HashSet::new();
+
+        for _ in 0..3 {
+            guard.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        }
+
+        let v = guard.evaluate();
+        assert!(v.avoid_tools.contains(&"read_file".to_string()));
+
+        apply_verdict(&v, 25, &mut restricted);
+        assert!(
+            restricted.contains("read_file"),
+            "repeated identical cached signature must land in restricted_tools"
+        );
+    }
+
     /// Rehabilitation removes tool from avoid list (next evaluation).
     #[test]
     fn rehabilitation_clears_tool_from_avoid() {

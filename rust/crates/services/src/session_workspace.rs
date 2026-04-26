@@ -29,6 +29,8 @@ pub struct ContextTraceToolSelection {
     pub tools_available: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selection_scope: String,
     #[serde(default)]
     pub rejected_tools: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -128,7 +130,12 @@ impl ContextTraceSignal {
         }
         if let Some(selection) = self.tool_selection.as_ref() {
             if !selection.selected_tools.is_empty() {
-                parts.push(format!("tools: {}", selection.selected_tools.join(", ")));
+                let label = if selection.selection_scope.is_empty() {
+                    "tools".to_string()
+                } else {
+                    format!("tools[{}]", selection.selection_scope)
+                };
+                parts.push(format!("{label}: {}", selection.selected_tools.join(", ")));
             }
             if !selection.strategy.is_empty() {
                 parts.push(format!(
@@ -957,6 +964,7 @@ mod tests {
             tool_selection: Some(ContextTraceToolSelection {
                 tools_available: 12,
                 selected_tools: vec!["lsp".into(), "view".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 4,
                 strategy: "code-intel".into(),
                 confidence: 0.91,
@@ -999,6 +1007,30 @@ mod tests {
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.last_context_trace, ws.last_context_trace);
+    }
+
+    #[test]
+    fn context_trace_preview_labels_tool_selection_scope() {
+        let trace = ContextTraceSignal {
+            turn_id: "turn-7".into(),
+            captured_at: None,
+            tool_selection: Some(ContextTraceToolSelection {
+                tools_available: 4,
+                selected_tools: vec!["lsp".into()],
+                selection_scope: "latest_round".into(),
+                rejected_tools: 1,
+                strategy: "code-intel".into(),
+                confidence: 0.88,
+                latency_ms: 9,
+            }),
+            memory: None,
+            history: None,
+            budget: None,
+            timing: None,
+            explanations: Vec::new(),
+        };
+
+        assert!(trace.preview().contains("tools[latest_round]: lsp"));
     }
 
     #[test]

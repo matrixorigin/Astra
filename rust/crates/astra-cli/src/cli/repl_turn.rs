@@ -694,6 +694,56 @@ fn is_low_information_followup(line: &str) -> bool {
     has_deictic_reference || has_question_shape || short_ascii_action
 }
 
+fn is_greeting_like_message(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "hey!"
+            | "hello!"
+            | "hi!"
+            | "good morning"
+            | "good afternoon"
+            | "good evening"
+    ) || matches!(trimmed, "你好" | "您好" | "嗨" | "哈喽")
+}
+
+fn session_goal_candidate(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || is_greeting_like_message(trimmed)
+        || is_low_information_followup(trimmed)
+    {
+        return None;
+    }
+
+    Some(truncate_chars(trimmed, 220))
+}
+
+fn session_goal_is_placeholder(goal: &str) -> bool {
+    let trimmed = goal.trim();
+    trimmed.is_empty() || is_greeting_like_message(trimmed)
+}
+
+fn maybe_update_session_goal(state: &mut ReplState, line: &str) {
+    let Some(candidate) = session_goal_candidate(line) else {
+        return;
+    };
+
+    match state.session_goal.as_deref() {
+        None => state.session_goal = Some(candidate),
+        Some(existing) if session_goal_is_placeholder(existing) => {
+            state.session_goal = Some(candidate);
+        }
+        Some(_) => {}
+    }
+}
+
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
     let mut lines = Vec::new();
     let mut total_chars = 0usize;
@@ -1591,7 +1641,8 @@ pub(super) fn analyze_repl_turn_learning(
     result: &StreamResult,
 ) -> ReplTurnLearningSnapshot {
     use astra_runtime::pipeline::evaluation::{
-        current_evaluation_thresholds, evaluate_tool_call_records_with_thresholds,
+        TurnEvaluationTelemetry, current_evaluation_thresholds,
+        evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
     use astra_runtime::pipeline::routing::RoutingEngine;
     let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
@@ -1600,7 +1651,32 @@ pub(super) fn analyze_repl_turn_learning(
         v.severity.eq_ignore_ascii_case("warning") || v.severity.eq_ignore_ascii_case("critical")
     });
 
-    let eval = evaluate_tool_call_records_with_thresholds(
+    let mut first_round_prompt_tokens: Option<u64> = None;
+    let mut max_round_prompt_tokens: Option<u64> = None;
+    for event in &result.turn_observability_events {
+        if event.event_type != session_journal::JournalEventType::LlmRound {
+            continue;
+        }
+        let source = event
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("source"))
+            .and_then(serde_json::Value::as_str);
+        if source != Some("agentic_loop") {
+            continue;
+        }
+        let Some(tokens_in) = event.tokens_in else {
+            continue;
+        };
+        first_round_prompt_tokens.get_or_insert(tokens_in);
+        max_round_prompt_tokens = Some(
+            max_round_prompt_tokens
+                .map(|current| current.max(tokens_in))
+                .unwrap_or(tokens_in),
+        );
+    }
+
+    let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
         line,
         recent_tools,
         &result.tool_call_records,
@@ -1608,6 +1684,12 @@ pub(super) fn analyze_repl_turn_learning(
         has_verdict_warning,
         result.budget_pressure,
         current_evaluation_thresholds(),
+        TurnEvaluationTelemetry {
+            llm_rounds: result.llm_rounds,
+            prompt_tokens: Some(result.prompt_tokens),
+            first_round_prompt_tokens,
+            max_round_prompt_tokens,
+        },
     );
 
     ReplTurnLearningSnapshot { routing, eval }
@@ -1720,11 +1802,7 @@ fn apply_turn_success_sync(
         super::repl_ui::clear_followup_prompt_hint();
     }
 
-    // Capture session goal from the first substantive user message.
-    if state.session_goal.is_none() && !line.trim().is_empty() {
-        let goal: String = line.trim().chars().take(220).collect();
-        state.session_goal = Some(goal);
-    }
+    maybe_update_session_goal(state, line);
     // New user input invalidates redo stack (history diverged)
     state.redo_stack.clear();
     state
@@ -3473,6 +3551,13 @@ mod tests {
         );
         assert_eq!(
             trace
+                .tool_selection
+                .as_ref()
+                .map(|selection| selection.selection_scope.as_str()),
+            Some("latest_round")
+        );
+        assert_eq!(
+            trace
                 .memory
                 .as_ref()
                 .map(|memory| memory.selected_memory_ids.len()),
@@ -3496,6 +3581,7 @@ mod tests {
             tool_selection: Some(ContextTraceToolSelection {
                 tools_available: 8,
                 selected_tools: vec!["lsp".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 2,
                 strategy: "code-intel".into(),
                 confidence: 0.9,
@@ -3787,6 +3873,31 @@ mod tests {
         let effective_no_goal = build_effective_line("sure", &state_no_goal);
         assert!(effective_no_goal.contains("[Active task attachment]"));
         assert!(!effective_no_goal.contains("Session goal:"));
+    }
+
+    #[test]
+    fn maybe_update_session_goal_promotes_substantive_goal_after_greeting() {
+        let mut state = ReplState::default();
+
+        maybe_update_session_goal(&mut state, "hi");
+        assert!(state.session_goal.is_none());
+
+        maybe_update_session_goal(&mut state, "review local changes");
+        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
+    }
+
+    #[test]
+    fn maybe_update_session_goal_replaces_placeholder_but_preserves_real_goal() {
+        let mut state = ReplState {
+            session_goal: Some("hi".to_string()),
+            ..ReplState::default()
+        };
+
+        maybe_update_session_goal(&mut state, "review local changes");
+        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
+
+        maybe_update_session_goal(&mut state, "investigate auth refresh drift");
+        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
     }
 
     #[test]
@@ -4238,6 +4349,77 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn analyze_repl_turn_learning_flags_llm_round_churn() {
+        let llm_round_event = |round: u32, tokens_in: u64| {
+            let mut event = session_journal::JournalEvent::base_public(
+                session_journal::JournalEventType::LlmRound,
+                Some("sess-1"),
+            );
+            event.turn = Some(2);
+            event.round = Some(round);
+            event.tokens_in = Some(tokens_in);
+            event.metadata = Some(serde_json::json!({
+                "source": "agentic_loop",
+            }));
+            event
+        };
+        let mut result = stub_stream_result("");
+        result.tools_used = vec!["git_diff".into()];
+        result.tool_calls_count = 1;
+        result.prompt_tokens = 136_947;
+        result.llm_rounds = Some(9);
+        result.turn_observability_events =
+            vec![llm_round_event(0, 9_401), llm_round_event(7, 20_954)];
+        result.tool_call_records = vec![session_journal::ToolCallRecord {
+            name: "git_diff".into(),
+            ok: true,
+            ms: 12,
+            error: None,
+            input_bytes: Some(16),
+            output_bytes: Some(240),
+            args_preview: None,
+            result_preview: Some("diff".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            ..Default::default()
+        }];
+
+        let learning = analyze_repl_turn_learning("review local changes", 2, &[], &result);
+        assert!(
+            learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::LlmRoundChurn {
+                    rounds: 9,
+                    prompt_tokens: 136_947,
+                }
+            )),
+            "expected llm_round_churn signal, got {:?}",
+            learning.eval.signals
+        );
+        assert!(
+            learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::PromptGrowthChurn {
+                    first_prompt_tokens: 9_401,
+                    max_prompt_tokens: 20_954,
+                    delta_tokens: 11_553,
+                }
+            )),
+            "expected prompt_growth_churn signal, got {:?}",
+            learning.eval.signals
+        );
+        assert!(
+            !learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::AllToolsHealthy
+            )),
+            "llm-round churn must revoke all_tools_healthy: {:?}",
+            learning.eval.signals
+        );
     }
 
     #[test]

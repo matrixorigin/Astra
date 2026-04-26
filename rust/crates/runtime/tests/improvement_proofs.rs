@@ -6416,6 +6416,20 @@ mod turnguard_step_integration_proofs {
     }
 
     #[test]
+    fn cache_duplication_promotes_tool_into_avoid_tools() {
+        let mut guard = TurnGuard::new();
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+        guard.record_cache_hit("read_file");
+
+        let verdict = guard.evaluate();
+        assert!(
+            verdict.avoid_tools.contains(&"read_file".to_string()),
+            "cache-wasteful tool should become a hard avoid signal"
+        );
+    }
+
+    #[test]
     fn cache_below_threshold_no_warning() {
         let mut guard = TurnGuard::new();
         guard.record_cache_hit("read_file");

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::permission_manager::PermissionMode;
 use crate::repl_turn::is_auth_error;
 use astra_thin_client::paths;
@@ -1035,6 +1036,56 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Status(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let trace_state = fetch_session_trace_state(api, Some(&token), &session_id).await?;
+            print_json_or_raw(
+                &serde_json::json!({
+                    "session_id": trace_state.session_id,
+                    "full_llm_capture": trace_state.enabled,
+                })
+                .to_string(),
+            );
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::On(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let trace_state =
+                update_session_trace_state(api, Some(&token), &session_id, true).await?;
+            print_json_or_raw(
+                &serde_json::json!({
+                    "session_id": trace_state.session_id,
+                    "full_llm_capture": trace_state.enabled,
+                })
+                .to_string(),
+            );
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Off(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let trace_state =
+                update_session_trace_state(api, Some(&token), &session_id, false).await?;
+            print_json_or_raw(
+                &serde_json::json!({
+                    "session_id": trace_state.session_id,
+                    "full_llm_capture": trace_state.enabled,
+                })
+                .to_string(),
+            );
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::SelfInspect(cmd)) => {
             let body = crate::self_command::execute_self_command(&cmd, profile.as_deref()).await?;
             print_json_or_raw(&body);
@@ -2023,10 +2074,16 @@ fn resolve_download_output_path(
     output: Option<&std::path::Path>,
     suggested_name: &str,
 ) -> std::path::PathBuf {
+    // Sanitize server-supplied filename: strip directory components and reject traversal.
+    let safe_name = std::path::Path::new(suggested_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("download.json");
     match output {
-        Some(path) if path.is_dir() => path.join(suggested_name),
+        Some(path) if path.is_dir() => path.join(safe_name),
         Some(path) => path.to_path_buf(),
-        None => std::path::PathBuf::from(suggested_name),
+        None => std::path::PathBuf::from(safe_name),
     }
 }
 
@@ -2911,6 +2968,27 @@ mod api_url_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let resolved = resolve_download_output_path(Some(dir.path()), "capture.json");
         assert_eq!(resolved, dir.path().join("capture.json"));
+    }
+
+    #[test]
+    fn resolve_download_output_path_strips_path_traversal() {
+        let resolved = resolve_download_output_path(None, "../../.bashrc");
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from(".bashrc"),
+            "path traversal components must be stripped from server-suggested filename"
+        );
+    }
+
+    #[test]
+    fn resolve_download_output_path_strips_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_download_output_path(Some(dir.path()), "/etc/cron.d/backdoor");
+        assert_eq!(
+            resolved,
+            dir.path().join("backdoor"),
+            "absolute path components must be stripped"
+        );
     }
 
     #[test]

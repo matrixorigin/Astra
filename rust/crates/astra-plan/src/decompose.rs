@@ -519,7 +519,7 @@ Return ONLY this JSON when information is missing:
 Question categories: "scope" (features to include), "approach" (implementation strategy), "behavior" (edge cases), "technical" (specific tech choices), "confirmation" (yes/no).
 
 ### If You Have Enough Information
-Decompose this goal into 3-8 concrete subtasks. For EACH subtask, provide:
+Decompose this goal into 1-6 concrete subtasks. For EACH subtask, provide:
 
 1. **id**: short kebab-case ID (e.g., "add-auth", "fix-parser", "write-tests")
 2. **title**: one-line summary
@@ -539,9 +539,10 @@ Decompose this goal into 3-8 concrete subtasks. For EACH subtask, provide:
 Guidelines:
 - Order subtasks so dependencies come first
 - Each subtask should be completable in ONE focused session
+- For simple greenfield deliverables or one-shot artifacts (for example a small game, demo, page, script, or prototype), prefer 1-3 subtasks. Do NOT split implementation, polish, and lightweight verification into separate subtasks unless the user explicitly asked for staged execution or the work truly needs independent checkpoints.
 - **All file paths must be relative to the project root** (the current working directory). Never use `/tmp/`, `tmp/`, or any absolute path. If the goal creates new files, place them in the project root or a sensible subdirectory (e.g. `src/`, `index.html`, `app.js`).
 - **Paths in `acceptance_checks` must match `files` exactly** — mismatched paths cause false verification failures.
-- Always include a testing subtask
+- Fold lightweight testing / verification into the implementation subtask that performs the work. Only create a standalone testing / verification subtask when verification is substantial, cross-cutting, or explicitly requested by the user.
 - If the goal involves refactoring, add a "verify no regression" final subtask
 
 Return ONLY this JSON:
@@ -794,6 +795,137 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
         subtasks,
         notes: parsed.notes,
     })
+}
+
+fn goal_is_simple_greenfield(goal: &str) -> bool {
+    let lower = goal.to_lowercase();
+    let mentions_creation = [
+        "build",
+        "create",
+        "generate",
+        "make",
+        "生成",
+        "创建",
+        "做一个",
+        "做个",
+        "写一个",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let artifact_like = [
+        "game",
+        "demo",
+        "prototype",
+        "page",
+        "site",
+        "app",
+        "script",
+        "小游戏",
+        "游戏",
+        "页面",
+        "网站",
+        "脚本",
+        "原型",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let explicitly_complex = [
+        "refactor",
+        "migrate",
+        "multi-step",
+        "multiple",
+        "comprehensive",
+        "test",
+        "测试",
+        "重构",
+        "迁移",
+        "多个",
+        "分步骤",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    mentions_creation && artifact_like && !explicitly_complex
+}
+
+fn subtask_is_lightweight_tail_phase(subtask: &SubtaskPlan) -> bool {
+    let title = subtask.title.to_lowercase();
+    let desc = subtask.description.as_deref().unwrap_or("").to_lowercase();
+    let text = format!("{title}\n{desc}");
+    [
+        "test",
+        "verify",
+        "browser",
+        "polish",
+        "effects",
+        "试玩",
+        "测试",
+        "验证",
+        "浏览器",
+        "润色",
+        "特效",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn merge_subtask_into_previous(plan: &mut TaskPlan, idx: usize) -> bool {
+    if idx == 0 || idx >= plan.subtasks.len() {
+        return false;
+    }
+    let current = plan.subtasks.remove(idx);
+    let current_id = current.id;
+    let current_description = current.description;
+    let current_files = current.files;
+    let current_acceptance_checks = current.acceptance_checks;
+    let previous_id = {
+        let previous = &mut plan.subtasks[idx - 1];
+        if let Some(desc) = current_description.filter(|d| !d.trim().is_empty()) {
+            match previous.description.as_mut() {
+                Some(prev) if !prev.contains(&desc) => {
+                    prev.push_str(
+                        "\n\nAlso cover the lightweight follow-up work that was merged here:\n",
+                    );
+                    prev.push_str(&desc);
+                }
+                None => previous.description = Some(desc),
+                _ => {}
+            }
+        }
+        for file in current_files {
+            if !previous.files.contains(&file) {
+                previous.files.push(file);
+            }
+        }
+        previous.acceptance_checks.extend(current_acceptance_checks);
+        previous.id.clone()
+    };
+    for subtask in &mut plan.subtasks {
+        for dep in &mut subtask.depends_on {
+            if *dep == current_id {
+                *dep = previous_id.clone();
+            }
+        }
+        subtask.depends_on.dedup();
+    }
+    true
+}
+
+pub fn normalize_simple_greenfield_plan(goal: &str, plan: &mut TaskPlan) {
+    if !goal_is_simple_greenfield(goal) || plan.subtasks.len() <= 4 {
+        return;
+    }
+
+    let mut idx = plan.subtasks.len();
+    while idx > 1 {
+        idx -= 1;
+        if !subtask_is_lightweight_tail_phase(&plan.subtasks[idx]) {
+            continue;
+        }
+        if merge_subtask_into_previous(plan, idx) && plan.subtasks.len() <= 4 {
+            break;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3035,6 +3167,55 @@ pub fn rewind_plan_from_subtask(plan: &mut TaskPlan, start_idx: usize) -> usize 
 ///
 /// Includes the task title, description, files to modify, and acceptance criteria.
 /// Used by the plan auto-execution loop to convert subtasks into actionable LLM prompts.
+pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
+    let mut text = subtask.title.to_lowercase();
+    if let Some(desc) = &subtask.description {
+        text.push('\n');
+        text.push_str(&desc.to_lowercase());
+    }
+
+    let mentions_browser = [
+        "browser",
+        "in browser",
+        "浏览器",
+        "playwright",
+        "selenium",
+        "puppeteer",
+        "cypress",
+        "chromium",
+        "chrome",
+        "firefox",
+        "webkit",
+        "dom",
+        "ui",
+        "canvas",
+        "page",
+        "页面",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let mentions_verification = [
+        "test",
+        "verify",
+        "validation",
+        "validate",
+        "check",
+        "qa",
+        "smoke",
+        "open",
+        "run",
+        "测试",
+        "验证",
+        "检查",
+        "打开",
+        "试玩",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+
+    mentions_browser && mentions_verification
+}
+
 pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
     let mut prompt = format!("Execute this subtask: {}\n", subtask.title);
 
@@ -3111,8 +3292,21 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
            satisfy the subtask. The subtask is only complete when concrete files \
            have been written and any acceptance check passes.\n\
          - Do not invoke `github_create_pr` (or any PR-creation skill) before you \
-           have actually written and committed the changes this subtask requires.",
+         have actually written and committed the changes this subtask requires.",
     );
+
+    if subtask_requires_browser_verification(subtask) {
+        prompt.push_str(
+            "\n\
+             IMPORTANT — this subtask explicitly requires browser/UI verification:\n\
+             - `curl`, `grep`, `head`, `ps`, or starting a local HTTP server do NOT count as browser verification.\n\
+             - Only mark the subtask done after collecting evidence from a real browser-capable tool or workflow \
+               (for example: Playwright, Selenium, Puppeteer, Cypress, a browser headless screenshot, \
+               or a browser DOM dump after real page execution).\n\
+             - If no browser-capable tool is available in this environment, say that plainly instead of claiming \
+               the browser behavior was verified.\n",
+        );
+    }
 
     prompt
 }
@@ -5193,6 +5387,28 @@ Done!"#;
     }
 
     #[test]
+    fn decomposition_prompt_discourages_over_decomposition_for_simple_greenfield_tasks() {
+        let prompt =
+            decomposition_prompt("在 tmp 下生成一个枪战类游戏", &ProjectContext::default());
+        assert!(
+            prompt.contains("Decompose this goal into 1-6 concrete subtasks"),
+            "prompt should no longer force a 3-8 subtask floor: {prompt}"
+        );
+        assert!(
+            prompt.contains("prefer 1-3 subtasks"),
+            "prompt should explicitly prefer fewer subtasks for simple greenfield deliverables: {prompt}"
+        );
+        assert!(
+            prompt.contains("Only create a standalone testing / verification subtask"),
+            "prompt should stop forcing a separate testing subtask for lightweight verification: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Always include a testing subtask"),
+            "prompt should not require a dedicated testing subtask anymore: {prompt}"
+        );
+    }
+
+    #[test]
     fn decomposition_prompt_includes_prior_templates() {
         let ctx = ProjectContext {
             root: "/test".into(),
@@ -5432,6 +5648,144 @@ Done!"#;
         assert!(plan.subtasks[0].acceptance_checks.is_empty());
     }
 
+    #[test]
+    fn normalize_simple_greenfield_plan_merges_lightweight_tail_subtasks() {
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "setup".into(),
+                    title: "Setup game skeleton".into(),
+                    description: Some("Create index.html and game loop.".into()),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "player".into(),
+                    title: "Implement player".into(),
+                    description: Some("Add movement and shooting.".into()),
+                    depends_on: vec!["setup".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "enemies".into(),
+                    title: "Implement enemies".into(),
+                    description: Some("Add enemy AI and waves.".into()),
+                    depends_on: vec!["player".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "collision".into(),
+                    title: "Implement collision".into(),
+                    description: Some("Wire bullet and player collisions.".into()),
+                    depends_on: vec!["enemies".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "ui".into(),
+                    title: "Implement game state and UI".into(),
+                    description: Some("Add score, health, and game over UI.".into()),
+                    depends_on: vec!["collision".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "polish".into(),
+                    title: "Add visual effects and polish".into(),
+                    description: Some("Add muzzle flash and hit particles.".into()),
+                    depends_on: vec!["ui".into()],
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "browser-test".into(),
+                    title: "Test game in browser".into(),
+                    description: Some("Open the page in a browser and verify controls.".into()),
+                    depends_on: vec!["polish".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        normalize_simple_greenfield_plan("在tmp下生成一个枪战类游戏", &mut plan);
+
+        assert!(
+            plan.subtasks.len() <= 4,
+            "simple greenfield plan should collapse obvious lightweight tail phases: {:?}",
+            plan.subtasks
+                .iter()
+                .map(|s| s.title.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !plan
+                .subtasks
+                .iter()
+                .any(|s| s.title == "Add visual effects and polish"),
+            "polish tail subtask should be merged for simple greenfield plans"
+        );
+        assert!(
+            !plan
+                .subtasks
+                .iter()
+                .any(|s| s.title == "Test game in browser"),
+            "standalone browser-test tail subtask should be merged for simple greenfield plans"
+        );
+        let tail = plan.subtasks.last().expect("tail subtask");
+        let tail_desc = tail.description.as_deref().unwrap_or("");
+        assert!(tail_desc.contains("muzzle flash"));
+        assert!(tail_desc.contains("verify controls"));
+    }
+
+    #[test]
+    fn normalize_simple_greenfield_plan_leaves_non_greenfield_plans_unchanged() {
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "refactor".into(),
+                    title: "Refactor auth module".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "test".into(),
+                    title: "Run migration tests".into(),
+                    depends_on: vec!["refactor".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        normalize_simple_greenfield_plan("重构认证模块并迁移数据库，然后运行完整测试", &mut plan);
+
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[1].title, "Run migration tests");
+    }
+
+    #[test]
+    fn goal_is_simple_greenfield_allows_chinese_goals_with_common_connectors() {
+        // "先" / "然后" / "并且" are extremely common Chinese connectors.
+        // Simple greenfield goals using them should still match.
+        assert!(
+            goal_is_simple_greenfield("创建一个游戏，然后部署"),
+            "'然后' should not exclude a simple greenfield goal"
+        );
+        assert!(
+            goal_is_simple_greenfield("先生成一个小游戏"),
+            "'先' should not exclude a simple greenfield goal"
+        );
+        assert!(
+            goal_is_simple_greenfield("做一个页面并且加上动画"),
+            "'并且' should not exclude a simple greenfield goal"
+        );
+        // Genuinely complex goals should still be excluded
+        assert!(
+            !goal_is_simple_greenfield("重构认证模块并迁移数据库"),
+            "refactor+migrate should still be excluded"
+        );
+        assert!(
+            !goal_is_simple_greenfield("创建一个游戏，分步骤实现"),
+            "'分步骤' should still exclude"
+        );
+    }
+
     // ═══════════════════════════ Auto-Execution Tests ═══════════════════════
 
     #[test]
@@ -5486,6 +5840,31 @@ Done!"#;
         let prompt = format_subtask_prompt(&st);
         assert!(prompt.contains("Extract connection pooling"));
         assert!(prompt.contains("retry logic"));
+    }
+
+    #[test]
+    fn browser_verification_subtask_prompt_requires_real_browser_evidence() {
+        let st = SubtaskPlan {
+            id: "t4".into(),
+            title: "Test game in browser".into(),
+            description: Some(
+                "Open the page, play a round, and verify keyboard input works.".into(),
+            ),
+            ..Default::default()
+        };
+        let prompt = format_subtask_prompt(&st);
+        assert!(
+            prompt.contains("requires browser/UI verification"),
+            "prompt should surface explicit browser-verification guidance: {prompt}"
+        );
+        assert!(
+            prompt.contains("curl") && prompt.contains("do NOT count as browser verification"),
+            "prompt should explicitly reject curl-style checks as sufficient evidence: {prompt}"
+        );
+        assert!(
+            prompt.contains("Playwright") || prompt.contains("browser headless screenshot"),
+            "prompt should name acceptable browser-capable evidence: {prompt}"
+        );
     }
 
     #[test]

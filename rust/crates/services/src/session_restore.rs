@@ -2955,6 +2955,7 @@ mod tests {
             tool_selection: Some(session_workspace::ContextTraceToolSelection {
                 tools_available: 8,
                 selected_tools: vec!["bash".into(), "grep".into(), "bash".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 0,
                 strategy: "recent_tools".into(),
                 confidence: 0.91,

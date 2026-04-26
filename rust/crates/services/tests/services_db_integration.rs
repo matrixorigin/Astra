@@ -37,8 +37,8 @@ use astra_services::{
     DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
     MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
     MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService,
-    SessionArtifactStore, SessionListFilter, SessionService, SkillSearchQuery, SkillService,
-    StagedMutationState, StateSyncService, ensure_core_schema,
+    SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter, SessionService,
+    SkillSearchQuery, SkillService, StagedMutationState, StateSyncService, ensure_core_schema,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -510,6 +510,88 @@ async fn cleanup_restore_fixture(
     .bind(user_id)
     .execute(pool)
     .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_SERVICES_DB_IT=1 and live MatrixOne"]
+async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timestamps() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let older_id = Uuid::now_v7().to_string();
+    let newer_id = loop {
+        let candidate = Uuid::now_v7().to_string();
+        if candidate > older_id {
+            break candidate;
+        }
+    };
+    let tied_ts = "2026-10-01 12:34:56.123456";
+
+    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'artifact-ordering', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    for (artifact_id, turn, marker) in [(&older_id, 1_i32, "older"), (&newer_id, 2_i32, "newer")] {
+        sqlx::query(
+            "INSERT INTO session_artifacts \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, created_at) \
+             VALUES (?, ?, ?, 'llm_capture', 'ordering_probe', ?, 0, ?, CAST(? AS JSON), ?)",
+        )
+        .bind(artifact_id)
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(turn)
+        .bind(
+            serde_json::json!({
+                "response": { "full_text": marker }
+            })
+            .to_string(),
+        )
+        .bind(serde_json::json!({ "marker": marker }).to_string())
+        .bind(tied_ts)
+        .execute(&pool)
+        .await
+        .expect("insert session artifact");
+    }
+
+    let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
+    let latest = store
+        .load_latest_json_artifact(&session_id, "llm_capture")
+        .await
+        .expect("load latest artifact")
+        .expect("latest artifact row");
+    assert_eq!(
+        latest.artifact_id, newer_id,
+        "latest artifact selection must stay deterministic when created_at ties"
+    );
+    assert_eq!(
+        latest.content["response"]["full_text"].as_str(),
+        Some("newer"),
+        "latest artifact should surface the newest payload under a tied timestamp"
+    );
+
+    let listed = store
+        .list_json_artifacts(&session_id, Some("llm_capture"), 10)
+        .await
+        .expect("list session artifacts");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].artifact_id, newer_id,
+        "artifact lists should use the same stable latest-first ordering"
+    );
+    assert_eq!(listed[1].artifact_id, older_id);
+
+    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -1634,6 +1716,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 8,
             selected_tools: vec!["view".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 1,
             strategy: "selector".into(),
             confidence: 0.92,
@@ -1651,6 +1734,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 6,
             selected_tools: vec!["grep".into(), "view".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 0,
             strategy: "fallback".into(),
             confidence: 0.88,
@@ -1870,6 +1954,7 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
             tool_selection: Some(ContextTraceToolSelection {
                 tools_available: 8,
                 selected_tools: vec!["view".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 0,
                 strategy: "prune-test".into(),
                 confidence: 0.9,
@@ -1967,6 +2052,7 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 12,
             selected_tools: vec!["bash".into(), "rg".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 0,
             strategy: "artifact-restore".into(),
             confidence: 0.98,
@@ -2283,6 +2369,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 8,
             selected_tools: vec!["rg".into(), "view".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 1,
             strategy: "lazy-create".into(),
             confidence: 0.95,

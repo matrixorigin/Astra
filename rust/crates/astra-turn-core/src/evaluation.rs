@@ -54,6 +54,30 @@ pub enum EvalSignal {
     /// times with no intervening workspace mutation. Carries the number of
     /// redundant retries after the first run.
     RedundantValidationRetries(usize),
+    /// Too many LLM rounds were consumed in a single user turn, which usually
+    /// indicates tool churn or repeated replanning. Carries the round count and
+    /// total prompt tokens consumed by the turn.
+    LlmRoundChurn { rounds: u32, prompt_tokens: u64 },
+    /// Prompt tokens ballooned substantially across LLM rounds in one turn.
+    /// Carries the first observed prompt size, the peak prompt size, and the
+    /// delta between them.
+    PromptGrowthChurn {
+        first_prompt_tokens: u64,
+        max_prompt_tokens: u64,
+        delta_tokens: u64,
+    },
+    /// Multiple consecutive *multi-call* rounds stayed inside the same
+    /// exploratory tool family (diff/search/read) instead of progressing toward
+    /// synthesis, mutation, or validation. Carries the dominant family and streak
+    /// length.
+    ExplorationFamilyChurn { family: String, streak: usize },
+    /// The turn consumed materially high cost (rounds/prompt growth/budget/tool
+    /// volume) while still showing low-yield exploration signals. Carries the
+    /// total tool-call count and observed LLM rounds when available.
+    HighCostLowYield {
+        tool_calls: usize,
+        llm_rounds: Option<u32>,
+    },
 }
 
 /// Default threshold for [`EvalSignal::SequentialReadChurn`]: how many
@@ -92,6 +116,19 @@ pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
 ///   intervening edit
 pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
 
+/// Default threshold for [`EvalSignal::LlmRoundChurn`]: user turns that need
+/// 8+ LLM rounds are usually in trouble unless they are doing something very
+/// deliberate. Calibrated from recent forensic sessions where healthy turns
+/// typically finish within <=4 rounds while wasteful review/investigation turns
+/// balloon to 8+.
+pub const LLM_ROUND_CHURN_THRESHOLD: usize = 8;
+pub const EXPLORATION_FAMILY_CHURN_THRESHOLD: usize = 3;
+pub const PROMPT_GROWTH_CHURN_MIN_ROUNDS: u32 = 4;
+pub const PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS: u64 = 8_000;
+pub const PROMPT_GROWTH_CHURN_MIN_RATIO_NUMERATOR: u64 = 2;
+pub const PROMPT_GROWTH_CHURN_MIN_RATIO_DENOMINATOR: u64 = 1;
+const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
+
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
@@ -101,6 +138,8 @@ pub struct EvaluationThresholds {
     pub redundant_overlapping_reads: usize,
     pub search_fanout: usize,
     pub redundant_validation_retries: usize,
+    pub llm_round_churn: usize,
+    pub exploration_family_churn: usize,
 }
 
 impl Default for EvaluationThresholds {
@@ -110,8 +149,18 @@ impl Default for EvaluationThresholds {
             redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
             search_fanout: SEARCH_FANOUT_THRESHOLD,
             redundant_validation_retries: REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
+            llm_round_churn: LLM_ROUND_CHURN_THRESHOLD,
+            exploration_family_churn: EXPLORATION_FAMILY_CHURN_THRESHOLD,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnEvaluationTelemetry {
+    pub llm_rounds: Option<u32>,
+    pub prompt_tokens: Option<u64>,
+    pub first_round_prompt_tokens: Option<u64>,
+    pub max_round_prompt_tokens: Option<u64>,
 }
 
 /// Result of evaluating a turn's success and quality.
@@ -269,7 +318,7 @@ pub fn evaluate_tool_call_records(
     verdict_warning: bool,
     budget_pressure: f64,
 ) -> TurnEvaluation {
-    evaluate_tool_call_records_with_thresholds(
+    evaluate_tool_call_records_with_thresholds_and_telemetry(
         input,
         recent_tools,
         tool_call_records,
@@ -277,6 +326,7 @@ pub fn evaluate_tool_call_records(
         verdict_warning,
         budget_pressure,
         EvaluationThresholds::default(),
+        TurnEvaluationTelemetry::default(),
     )
 }
 
@@ -288,6 +338,29 @@ pub fn evaluate_tool_call_records_with_thresholds(
     verdict_warning: bool,
     budget_pressure: f64,
     thresholds: EvaluationThresholds,
+) -> TurnEvaluation {
+    evaluate_tool_call_records_with_thresholds_and_telemetry(
+        input,
+        recent_tools,
+        tool_call_records,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+        thresholds,
+        TurnEvaluationTelemetry::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+    thresholds: EvaluationThresholds,
+    telemetry: TurnEvaluationTelemetry,
 ) -> TurnEvaluation {
     // Synthetic placeholders (skill skipped/deferred, surgically removed
     // parallel tool calls) are audit-only records that do NOT represent real
@@ -408,7 +481,173 @@ pub fn evaluate_tool_call_records_with_thresholds(
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
+    if let Some(rounds) = telemetry
+        .llm_rounds
+        .filter(|rounds| *rounds as usize >= thresholds.llm_round_churn)
+    {
+        let prompt_tokens = telemetry.prompt_tokens.unwrap_or(0);
+        eval.signals.push(EvalSignal::LlmRoundChurn {
+            rounds,
+            prompt_tokens,
+        });
+        let penalty =
+            (0.10 + 0.02 * (rounds as usize - thresholds.llm_round_churn) as f64).clamp(0.10, 0.25);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+        eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
+    }
+
+    if let (Some(rounds), Some(first_prompt_tokens), Some(max_round_prompt_tokens)) = (
+        telemetry.llm_rounds,
+        telemetry.first_round_prompt_tokens,
+        telemetry.max_round_prompt_tokens,
+    ) {
+        let delta_tokens = max_round_prompt_tokens.saturating_sub(first_prompt_tokens);
+        let prompt_doubled = first_prompt_tokens > 0
+            && max_round_prompt_tokens.saturating_mul(PROMPT_GROWTH_CHURN_MIN_RATIO_DENOMINATOR)
+                >= first_prompt_tokens.saturating_mul(PROMPT_GROWTH_CHURN_MIN_RATIO_NUMERATOR);
+        if rounds >= PROMPT_GROWTH_CHURN_MIN_ROUNDS
+            && delta_tokens >= PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS
+            && prompt_doubled
+        {
+            eval.signals.push(EvalSignal::PromptGrowthChurn {
+                first_prompt_tokens,
+                max_prompt_tokens: max_round_prompt_tokens,
+                delta_tokens,
+            });
+            eval.quality = (eval.quality - 0.08).clamp(0.0, 1.0);
+            eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
+        }
+    }
+
+    if let Some((family, streak)) = longest_exploration_family_round_streak(tool_call_records)
+        .filter(|(_, streak)| *streak >= thresholds.exploration_family_churn)
+    {
+        eval.signals.push(EvalSignal::ExplorationFamilyChurn {
+            family: family.as_str().to_string(),
+            streak,
+        });
+        let penalty =
+            (0.04 + 0.01 * (streak - thresholds.exploration_family_churn) as f64).clamp(0.04, 0.16);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    }
+
+    revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
+    align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
+
     eval
+}
+
+fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
+    matches!(
+        signal,
+        EvalSignal::EmptyToolOutput
+            | EvalSignal::StallDetected
+            | EvalSignal::HighBudgetPressure
+            | EvalSignal::RepeatToolCall(_)
+            | EvalSignal::VerdictWarning
+            | EvalSignal::SequentialReadChurn(_)
+            | EvalSignal::RedundantOverlappingReads(_)
+            | EvalSignal::SearchFanout(_)
+            | EvalSignal::RedundantValidationRetries(_)
+            | EvalSignal::LlmRoundChurn { .. }
+            | EvalSignal::PromptGrowthChurn { .. }
+            | EvalSignal::ExplorationFamilyChurn { .. }
+            | EvalSignal::HighCostLowYield { .. }
+    )
+}
+
+fn is_high_cost_signal(signal: &EvalSignal) -> bool {
+    matches!(
+        signal,
+        EvalSignal::HighBudgetPressure
+            | EvalSignal::LlmRoundChurn { .. }
+            | EvalSignal::PromptGrowthChurn { .. }
+    )
+}
+
+fn is_strong_low_yield_signal(signal: &EvalSignal) -> bool {
+    matches!(
+        signal,
+        EvalSignal::RepeatToolCall(_)
+            | EvalSignal::SequentialReadChurn(_)
+            | EvalSignal::RedundantOverlappingReads(_)
+            | EvalSignal::RedundantValidationRetries(_)
+            | EvalSignal::ExplorationFamilyChurn { .. }
+    )
+}
+
+fn is_low_yield_signal(signal: &EvalSignal) -> bool {
+    matches!(
+        signal,
+        EvalSignal::EmptyToolOutput
+            | EvalSignal::RepeatToolCall(_)
+            | EvalSignal::SequentialReadChurn(_)
+            | EvalSignal::RedundantOverlappingReads(_)
+            | EvalSignal::SearchFanout(_)
+            | EvalSignal::RedundantValidationRetries(_)
+            | EvalSignal::ExplorationFamilyChurn { .. }
+    )
+}
+
+fn revoke_all_tools_healthy_when_quality_signals_disagree(
+    eval: &mut TurnEvaluation,
+    tool_calls: &[ToolCallInfo],
+) {
+    if !eval
+        .signals
+        .iter()
+        .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy))
+        || !eval.signals.iter().any(is_negative_quality_signal)
+    {
+        return;
+    }
+
+    eval.signals
+        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
+    eval.quality = (eval.quality - 0.15).clamp(0.0, 1.0);
+    eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
+
+    let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
+    let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
+    eval.success = error_rate < 0.5 && eval.quality > 0.3;
+}
+
+fn align_high_cost_low_yield_verdict(
+    eval: &mut TurnEvaluation,
+    tool_calls: &[ToolCallInfo],
+    telemetry: TurnEvaluationTelemetry,
+) {
+    if eval
+        .signals
+        .iter()
+        .any(|signal| matches!(signal, EvalSignal::HighCostLowYield { .. }))
+    {
+        return;
+    }
+
+    let has_high_cost = tool_calls.len() >= HIGH_COST_TOOL_CALL_THRESHOLD
+        || eval.signals.iter().any(is_high_cost_signal);
+    let low_yield_count = eval
+        .signals
+        .iter()
+        .filter(|signal| is_low_yield_signal(signal))
+        .count();
+    let has_strong_low_yield = eval.signals.iter().any(is_strong_low_yield_signal);
+
+    if !has_high_cost || !(has_strong_low_yield || low_yield_count >= 2) {
+        return;
+    }
+
+    eval.signals.push(EvalSignal::HighCostLowYield {
+        tool_calls: tool_calls.len(),
+        llm_rounds: telemetry.llm_rounds,
+    });
+    eval.quality = (eval.quality - 0.12).clamp(0.0, 1.0);
+    eval.confidence = (eval.confidence - 0.10).clamp(0.0, 1.0);
+
+    let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
+    let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
+    eval.success = error_rate < 0.5 && eval.quality > 0.35;
 }
 
 /// Group real (non-synthetic, non-policy-blocked) tool-call records by their
@@ -445,6 +684,119 @@ fn longest_single_tool_round_streak(records: &[ToolCallRecord]) -> usize {
         prev_round = Some(round);
     }
     best
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplorationFamily {
+    Diff,
+    Search,
+    Read,
+}
+
+impl ExplorationFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Diff => "diff",
+            Self::Search => "search",
+            Self::Read => "read",
+        }
+    }
+}
+
+fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFamily> {
+    let args = record.args_full.as_deref().unwrap_or("");
+    match record.name.as_str() {
+        "git_diff" => Some(ExplorationFamily::Diff),
+        "read_file" | "view" => Some(ExplorationFamily::Read),
+        "grep" | "rg" | "glob" => Some(ExplorationFamily::Search),
+        "bash" if is_search_like_tool_call(&record.name, args) => Some(ExplorationFamily::Search),
+        "bash" if extract_read_target(&record.name, args).is_some() => {
+            Some(ExplorationFamily::Read)
+        }
+        _ => None,
+    }
+}
+
+fn longest_exploration_family_round_streak(
+    records: &[ToolCallRecord],
+) -> Option<(ExplorationFamily, usize)> {
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy, Default)]
+    struct RoundState {
+        family: Option<ExplorationFamily>,
+        homogeneous: bool,
+        count: usize,
+    }
+
+    let mut per_round: BTreeMap<u32, RoundState> = BTreeMap::new();
+    for record in records {
+        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+            continue;
+        }
+        let Some(round) = record.round else { continue };
+        let state = per_round.entry(round).or_insert(RoundState {
+            family: None,
+            homogeneous: true,
+            count: 0,
+        });
+        state.count += 1;
+        let Some(family) = classify_exploration_family(record) else {
+            state.homogeneous = false;
+            continue;
+        };
+        match state.family {
+            None => state.family = Some(family),
+            Some(existing) if existing == family && state.homogeneous => {}
+            Some(_) => state.homogeneous = false,
+        }
+    }
+
+    let mut best: Option<(ExplorationFamily, usize)> = None;
+    let mut current_family: Option<ExplorationFamily> = None;
+    let mut current_streak = 0usize;
+    let mut prev_round: Option<u32> = None;
+
+    for (&round, state) in &per_round {
+        let round_family = if state.homogeneous && state.count >= 2 {
+            state.family
+        } else {
+            None
+        };
+        let adjacent = prev_round.is_none_or(|prev| round == prev + 1);
+        match round_family {
+            Some(family) if adjacent && current_family == Some(family) => {
+                current_streak += 1;
+            }
+            Some(family) => {
+                current_family = Some(family);
+                current_streak = 1;
+            }
+            None => {
+                current_family = None;
+                current_streak = 0;
+            }
+        }
+        if let Some(family) = current_family {
+            match best {
+                Some((_, best_streak)) if best_streak >= current_streak => {}
+                _ => best = Some((family, current_streak)),
+            }
+        }
+        prev_round = Some(round);
+    }
+
+    best
+}
+
+/// Return the dominant exploratory-family streak across consecutive
+/// multi-call rounds. Exposed so runtime mid-loop guards can reuse the same
+/// family/streak definition as passive turn evaluation.
+pub fn exploration_family_round_streak(
+    records: &[ToolCallRecord],
+) -> Option<(&'static str, usize)> {
+    longest_exploration_family_round_streak(records)
+        .map(|(family, streak)| (family.as_str(), streak))
 }
 
 fn bash_command_text(args: &str) -> String {
@@ -589,18 +941,27 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
     static SED_RANGE: OnceLock<Regex> = OnceLock::new();
     static CAT_FILE: OnceLock<Regex> = OnceLock::new();
 
-    if name == "view" {
-        // Prefer JSON parsing — `view` args_full is always JSON in practice.
+    if name == "view" || name == "read_file" {
+        // Prefer JSON parsing — `view`/`read_file` args_full is always JSON.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             let path = v.get("path").and_then(|p| p.as_str())?.to_string();
-            let range = v
-                .get("view_range")
-                .and_then(|r| r.as_array())
-                .and_then(|arr| {
-                    let s = arr.first()?.as_u64()? as u32;
-                    let e = arr.get(1)?.as_u64()? as u32;
-                    Some((s, e))
-                });
+            let range = if name == "view" {
+                v.get("view_range")
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| {
+                        let s = arr.first()?.as_u64()? as u32;
+                        let e = arr.get(1)?.as_u64()? as u32;
+                        Some((s, e))
+                    })
+            } else {
+                // read_file uses start_line / end_line
+                let s = v
+                    .get("start_line")
+                    .and_then(|n| n.as_u64())
+                    .map(|n| n as u32);
+                let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
+                s.zip(e)
+            };
             return Some(ReadRange { file: path, range });
         }
         return None;
@@ -820,6 +1181,58 @@ pub fn eval_signal_to_json_with_thresholds(
             "message": format!(
                 "Detected {count} redundant retries of the same heavy validation command with no intervening workspace mutation"
             ),
+        }),
+        EvalSignal::LlmRoundChurn {
+            rounds,
+            prompt_tokens,
+        } => json!({
+            "kind": "llm_round_churn",
+            "rounds": rounds,
+            "prompt_tokens": prompt_tokens,
+            "threshold": thresholds.llm_round_churn,
+            "message": format!(
+                "Detected {rounds} LLM rounds in one user turn with {prompt_tokens} prompt tokens — this turn likely churned through repeated replanning/tool loops"
+            ),
+        }),
+        EvalSignal::PromptGrowthChurn {
+            first_prompt_tokens,
+            max_prompt_tokens,
+            delta_tokens,
+        } => json!({
+            "kind": "prompt_growth_churn",
+            "first_prompt_tokens": first_prompt_tokens,
+            "max_prompt_tokens": max_prompt_tokens,
+            "delta_tokens": delta_tokens,
+            "min_rounds": PROMPT_GROWTH_CHURN_MIN_ROUNDS,
+            "min_delta_tokens": PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS,
+            "message": format!(
+                "Prompt tokens grew from {first_prompt_tokens} to {max_prompt_tokens} in one turn (Δ {delta_tokens}) — this looks like context ballooning across repeated rounds"
+            ),
+        }),
+        EvalSignal::ExplorationFamilyChurn { family, streak } => json!({
+            "kind": "exploration_family_churn",
+            "family": family,
+            "streak": streak,
+            "threshold": thresholds.exploration_family_churn,
+            "message": format!(
+                "Detected {streak} consecutive {family}-dominant exploratory rounds — marginal evidence yield likely collapsed before the loop shifted toward synthesis or action"
+            ),
+        }),
+        EvalSignal::HighCostLowYield {
+            tool_calls,
+            llm_rounds,
+        } => json!({
+            "kind": "high_cost_low_yield",
+            "tool_calls": tool_calls,
+            "llm_rounds": llm_rounds,
+            "message": match llm_rounds {
+                Some(rounds) => format!(
+                    "The turn used {tool_calls} tool calls across {rounds} LLM rounds while still showing low-yield exploration signals — success/confidence were downgraded to avoid optimistic scoring"
+                ),
+                None => format!(
+                    "The turn used {tool_calls} tool calls while still showing low-yield exploration signals — success/confidence were downgraded to avoid optimistic scoring"
+                ),
+            },
         }),
     }
 }
@@ -1459,8 +1872,16 @@ mod tests {
             eval.success,
             "real-session loop still completed successfully"
         );
-        assert_eq!(eval.quality, 0.5);
-        assert_eq!(eval.confidence, 0.7);
+        assert_eq!(eval.quality, 0.35);
+        assert_eq!(eval.confidence, 0.75);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::AllToolsHealthy)),
+            "repeat-heavy churn must not still look healthy: {:?}",
+            eval.signals
+        );
         assert!(
             eval.signals
                 .iter()
@@ -1502,9 +1923,228 @@ mod tests {
         );
         let metadata = event.metadata.expect("turn evaluation metadata");
         assert_eq!(metadata["tool_call_count"], 12);
-        assert_eq!(metadata["signal_count"], 4);
-        assert_eq!(metadata["quality"], 0.5);
-        assert_eq!(metadata["confidence"], 0.7);
+        assert_eq!(metadata["signal_count"], 3);
+        assert_eq!(metadata["quality"], 0.35);
+        assert_eq!(metadata["confidence"], 0.75);
+        assert!(
+            !metadata["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|signal| signal["kind"] == "all_tools_healthy"),
+            "turn_evaluation metadata must not keep all_tools_healthy for repeat-heavy churn: {metadata:?}"
+        );
+    }
+
+    #[test]
+    fn llm_round_churn_surfaces_even_when_tool_calls_succeed() {
+        let records = vec![journal_ok_call("git_diff")];
+        let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+            "review local changes",
+            &["git_diff".to_string()],
+            &records,
+            0,
+            false,
+            0.26,
+            EvaluationThresholds {
+                llm_round_churn: 8,
+                ..Default::default()
+            },
+            TurnEvaluationTelemetry {
+                llm_rounds: Some(9),
+                prompt_tokens: Some(136_947),
+                first_round_prompt_tokens: Some(9_401),
+                max_round_prompt_tokens: Some(20_954),
+            },
+        );
+
+        assert!(
+            eval.signals.iter().any(|signal| matches!(
+                signal,
+                EvalSignal::LlmRoundChurn {
+                    rounds: 9,
+                    prompt_tokens: 136_947,
+                }
+            )),
+            "expected llm_round_churn signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.signals.iter().any(|signal| matches!(
+                signal,
+                EvalSignal::PromptGrowthChurn {
+                    first_prompt_tokens: 9_401,
+                    max_prompt_tokens: 20_954,
+                    delta_tokens: 11_553,
+                }
+            )),
+            "expected prompt_growth_churn signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "llm-round churn must revoke all_tools_healthy: {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.quality < 0.5,
+            "quality should be downgraded, got {}",
+            eval.quality
+        );
+
+        let event = build_turn_evaluation_journal_event(
+            Some("sess-llm-round"),
+            Some(2),
+            "cli_repl",
+            "review local changes",
+            &["git_diff".to_string()],
+            &records,
+            0,
+            false,
+            0.26,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        let signal = metadata["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["kind"] == "llm_round_churn")
+            .expect("llm_round_churn signal");
+        assert_eq!(signal["rounds"], 9);
+        assert_eq!(signal["prompt_tokens"], 136_947);
+        assert_eq!(signal["threshold"], 8);
+        let growth = metadata["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["kind"] == "prompt_growth_churn")
+            .expect("prompt_growth_churn signal");
+        assert_eq!(growth["first_prompt_tokens"], 9_401);
+        assert_eq!(growth["max_prompt_tokens"], 20_954);
+        assert_eq!(growth["delta_tokens"], 11_553);
+    }
+
+    #[test]
+    fn high_cost_low_yield_downgrades_expensive_exploration_churn() {
+        let records = vec![
+            record_in_round("git_diff", 0, Some("b-0")),
+            record_in_round("git_diff", 0, Some("b-0")),
+            record_in_round("git_diff", 1, Some("b-1")),
+            record_in_round("git_diff", 1, Some("b-1")),
+            record_in_round("git_diff", 2, Some("b-2")),
+            record_in_round("git_diff", 2, Some("b-2")),
+        ];
+
+        let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+            "review local changes",
+            &["git_diff".to_string()],
+            &records,
+            0,
+            false,
+            0.26,
+            EvaluationThresholds::default(),
+            TurnEvaluationTelemetry {
+                llm_rounds: Some(9),
+                prompt_tokens: Some(136_947),
+                first_round_prompt_tokens: Some(9_401),
+                max_round_prompt_tokens: Some(20_954),
+            },
+        );
+
+        assert!(
+            eval.signals.iter().any(|signal| matches!(
+                signal,
+                EvalSignal::HighCostLowYield {
+                    tool_calls: 6,
+                    llm_rounds: Some(9),
+                }
+            )),
+            "expected high_cost_low_yield signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval.success,
+            "expensive low-yield exploration churn should not score as success: {:?}",
+            eval
+        );
+        assert!(
+            eval.confidence < 0.8,
+            "confidence should be downgraded for low-certainty high-cost churn, got {}",
+            eval.confidence
+        );
+    }
+
+    #[test]
+    fn prompt_growth_churn_does_not_fire_when_first_prompt_tokens_is_zero() {
+        let records = vec![record_in_round("bash", 0, Some("b-0"))];
+        let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+            "review local changes",
+            &["bash".to_string()],
+            &records,
+            0,
+            false,
+            0.26,
+            EvaluationThresholds::default(),
+            TurnEvaluationTelemetry {
+                llm_rounds: Some(6),
+                prompt_tokens: Some(50_000),
+                first_round_prompt_tokens: Some(0),
+                max_round_prompt_tokens: Some(20_000),
+            },
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::PromptGrowthChurn { .. })),
+            "PromptGrowthChurn must not fire when first_prompt_tokens=0: {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn high_cost_low_yield_stays_silent_on_high_cost_progressive_turn() {
+        let records = vec![
+            record_in_round("grep", 0, Some("b-0")),
+            record_in_round("grep", 0, Some("b-0")),
+            record_in_round("read_file", 1, Some("b-1")),
+            record_in_round("read_file", 1, Some("b-1")),
+            record_in_round("str_replace", 2, None),
+            record_in_round("bash", 3, None),
+        ];
+
+        let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+            "fix the bug",
+            &[],
+            &records,
+            0,
+            false,
+            0.26,
+            EvaluationThresholds::default(),
+            TurnEvaluationTelemetry {
+                llm_rounds: Some(9),
+                prompt_tokens: Some(136_947),
+                first_round_prompt_tokens: Some(9_401),
+                max_round_prompt_tokens: Some(20_954),
+            },
+        );
+
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::HighCostLowYield { .. })),
+            "progressive turn should not be over-penalized as high_cost_low_yield: {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.success,
+            "progressive high-cost turn should remain successful"
+        );
     }
 
     #[test]
@@ -1679,6 +2319,14 @@ mod tests {
             "expected SequentialReadChurn(10), got signals={:?}",
             eval.signals
         );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::AllToolsHealthy)),
+            "wasteful single-tool churn must not still look healthy: {:?}",
+            eval.signals
+        );
         // Quality should be docked by the churn penalty.
         let baseline =
             evaluate_tool_call_records("explain the auth flow", &[], &records[..1], 0, false, 0.3);
@@ -1795,6 +2443,123 @@ mod tests {
         });
         assert_eq!(streak, Some(6));
         assert_eq!(eval.thresholds.sequential_read_churn, 6);
+    }
+
+    #[test]
+    fn exploration_family_churn_flags_repeated_git_diff_rounds() {
+        let mut records = vec![record_in_round("git_diff", 0, None)];
+        for round in 1..4 {
+            let batch = format!("b-{round}-0");
+            for _ in 0..5 {
+                records.push(record_in_round("git_diff", round, Some(batch.as_str())));
+            }
+        }
+
+        let eval = evaluate_tool_call_records("review local changes", &[], &records, 0, false, 0.3);
+        let streak = eval.signals.iter().find_map(|signal| match signal {
+            EvalSignal::ExplorationFamilyChurn { family, streak } => {
+                Some((family.as_str(), *streak))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            streak,
+            Some(("diff", 3)),
+            "expected exploration-family diff streak, got {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "low-yield diff churn must not still look fully healthy: {:?}",
+            eval.signals
+        );
+
+        let baseline =
+            evaluate_tool_call_records("review local changes", &[], &records[..1], 0, false, 0.3);
+        assert!(
+            eval.quality < baseline.quality,
+            "exploration-family churn quality={} should be below baseline={}",
+            eval.quality,
+            baseline.quality
+        );
+    }
+
+    #[test]
+    fn exploration_family_churn_flags_repeated_search_rounds() {
+        let records = vec![
+            record_in_round("rg", 0, Some("b-0")),
+            record_in_round("glob", 0, Some("b-0")),
+            record_in_round("rg", 1, Some("b-1")),
+            record_in_round("glob", 1, Some("b-1")),
+            record_in_round("rg", 2, Some("b-2")),
+            record_in_round("glob", 2, Some("b-2")),
+        ];
+
+        let eval =
+            evaluate_tool_call_records("investigate auth flow", &[], &records, 0, false, 0.3);
+        let streak = eval.signals.iter().find_map(|signal| match signal {
+            EvalSignal::ExplorationFamilyChurn { family, streak } => {
+                Some((family.as_str(), *streak))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            streak,
+            Some(("search", 3)),
+            "expected exploration-family search streak, got {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn exploration_family_churn_does_not_flag_progressive_turn() {
+        let records = vec![
+            record_in_round("grep", 0, Some("b-0-0")),
+            record_in_round("grep", 0, Some("b-0-0")),
+            record_in_round("read_file", 1, Some("b-1-0")),
+            record_in_round("read_file", 1, Some("b-1-0")),
+            record_in_round("str_replace", 2, None),
+            record_in_round("bash", 3, None),
+        ];
+
+        let eval = evaluate_tool_call_records("fix the bug", &[], &records, 0, false, 0.3);
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ExplorationFamilyChurn { .. })),
+            "progressive search→read→mutate→validate turn should stay silent: {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn exploration_family_churn_signal_serializes_to_json() {
+        let value = eval_signal_to_json(&EvalSignal::ExplorationFamilyChurn {
+            family: "diff".to_string(),
+            streak: 4,
+        });
+        assert_eq!(value["kind"], "exploration_family_churn");
+        assert_eq!(value["family"], "diff");
+        assert_eq!(value["streak"], 4);
+        assert_eq!(
+            value["threshold"],
+            EXPLORATION_FAMILY_CHURN_THRESHOLD as i64
+        );
+    }
+
+    #[test]
+    fn high_cost_low_yield_signal_serializes_to_json() {
+        let value = eval_signal_to_json(&EvalSignal::HighCostLowYield {
+            tool_calls: 12,
+            llm_rounds: Some(9),
+        });
+        assert_eq!(value["kind"], "high_cost_low_yield");
+        assert_eq!(value["tool_calls"], 12);
+        assert_eq!(value["llm_rounds"], 9);
     }
 
     #[test]
@@ -2242,6 +3007,47 @@ mod tests {
             _ => None,
         });
         assert_eq!(count, Some(3), "got {:?}", eval.signals);
+    }
+
+    #[test]
+    fn redundant_reads_recognizes_read_file_tool() {
+        let records = vec![
+            record_with_args("read_file", 0, r#"{"path":"src/main.rs"}"#),
+            record_with_args("read_file", 1, r#"{"path":"src/main.rs"}"#),
+            record_with_args("read_file", 2, r#"{"path":"src/main.rs"}"#),
+            record_with_args("read_file", 3, r#"{"path":"src/main.rs"}"#),
+        ];
+        let count = count_redundant_overlapping_reads(&records);
+        assert_eq!(
+            count, 3,
+            "read_file re-reads of the same file should count as redundant"
+        );
+    }
+
+    #[test]
+    fn redundant_reads_recognizes_read_file_with_overlapping_ranges() {
+        let records = vec![
+            record_with_args(
+                "read_file",
+                0,
+                r#"{"path":"src/lib.rs","start_line":1,"end_line":50}"#,
+            ),
+            record_with_args(
+                "read_file",
+                1,
+                r#"{"path":"src/lib.rs","start_line":20,"end_line":80}"#,
+            ),
+            record_with_args(
+                "read_file",
+                2,
+                r#"{"path":"src/lib.rs","start_line":40,"end_line":100}"#,
+            ),
+        ];
+        let count = count_redundant_overlapping_reads(&records);
+        assert_eq!(
+            count, 2,
+            "read_file overlapping ranges should count as redundant"
+        );
     }
 
     #[test]

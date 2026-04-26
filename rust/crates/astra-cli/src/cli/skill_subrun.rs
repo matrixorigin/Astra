@@ -579,6 +579,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         };
 

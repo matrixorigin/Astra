@@ -86,6 +86,32 @@ impl StepRecorder {
         }
     }
 
+    /// Attach file-backed persistence after the authoritative session id becomes known.
+    ///
+    /// Existing in-memory events are rebound to the adopted session id before being
+    /// flushed to disk so first-turn forensic artifacts land under the real session.
+    pub fn attach_persistence(&mut self, session_id: &str) {
+        if self.file_store.is_some() && self.session_id == session_id {
+            return;
+        }
+
+        self.rebind_session_id(session_id);
+
+        let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|(n, _)| *n)
+            .max()
+            .unwrap_or(0);
+        self.checkpoint_count = self.checkpoint_count.max(existing_max.saturating_add(1));
+
+        let mut file_store = FileBackedEventStore::new(session_id);
+        for event in &self.events {
+            file_store.append(event.clone());
+        }
+        self.file_store = Some(file_store);
+    }
+
     /// Begin a new turn. Creates a PERCEIVE step.
     pub fn begin_turn(&mut self, turn: u32) {
         self.turn_number = turn;
@@ -226,12 +252,40 @@ impl StepRecorder {
     pub fn record_cache_hit(&mut self, tool_name: &str, cached: CachedToolResult) {
         let slot_idx = self.slot_counter.saturating_sub(1);
 
+        if let Some(ref mut step) = self.current_step
+            && let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize)
+        {
+            slot.cached_result = Some(cached);
+        }
+
+        self.skip_tool_with_reason(tool_name, "idempotency_cache_hit", true, None);
+    }
+
+    /// Record a short-circuit skip for the current tool slot.
+    ///
+    /// Use this for duplicate blocks, permission/restriction blocks, semantic dedup,
+    /// and other paths where the model requested a tool but runtime intentionally
+    /// did not execute it.
+    pub fn skip_tool_with_reason(
+        &mut self,
+        tool_name: &str,
+        reason: &str,
+        was_cached: bool,
+        output: Option<&str>,
+    ) {
+        let slot_idx = self.slot_counter.saturating_sub(1);
+        let idem_key = self.current_step.as_ref().and_then(|step| {
+            step.execution
+                .cursor
+                .slots
+                .get(slot_idx as usize)
+                .and_then(|s| s.idempotency_key.clone())
+        });
+
         if let Some(ref mut step) = self.current_step {
             if let Some(slot) = step.execution.cursor.slots.get_mut(slot_idx as usize) {
-                slot.cached_result = Some(cached);
                 slot.state = SlotState::Skipped;
             }
-            // Track in Act result
             if let Some(StepResult::Act {
                 ref mut tool_results_count,
                 ..
@@ -241,14 +295,18 @@ impl StepRecorder {
             }
         }
 
-        self.emit_with_payload(
-            StepEventType::ToolCallSkipped,
-            serde_json::json!({
-                "tool_name": tool_name,
-                "reason": "idempotency_cache_hit",
-            }),
-        );
-
+        let mut payload = serde_json::json!({
+            "tool_name": tool_name,
+            "reason": reason,
+            "cached": was_cached,
+        });
+        if let Some(key) = idem_key {
+            payload["idempotency_key"] = serde_json::json!(key);
+        }
+        if let Some(output) = output {
+            payload["output"] = serde_json::json!(output);
+        }
+        self.emit_with_payload(StepEventType::ToolCallSkipped, payload);
         self.checkpoint_count += 1;
     }
 
@@ -673,6 +731,50 @@ impl StepRecorder {
         }
         self.events.push(event);
     }
+
+    fn rebind_session_id(&mut self, session_id: &str) {
+        let previous_session_id = self.session_id.clone();
+        if previous_session_id == session_id {
+            return;
+        }
+
+        self.session_id = session_id.to_string();
+
+        if let Some(step) = self.current_step.as_mut() {
+            rebind_step(step, &previous_session_id, session_id);
+        }
+        for event in &mut self.events {
+            rebind_step_id(&mut event.step_id, &previous_session_id, session_id);
+        }
+    }
+}
+
+fn rebind_step(step: &mut Step, previous_session_id: &str, session_id: &str) {
+    rebind_step_id(
+        &mut step.descriptor.step_id,
+        previous_session_id,
+        session_id,
+    );
+    if let Some(parent_step_id) = step.descriptor.parent_step_id.as_mut() {
+        rebind_step_id(parent_step_id, previous_session_id, session_id);
+    }
+    if let Some(checkpoint) = step.checkpoint.as_mut() {
+        match checkpoint {
+            StepCheckpoint::Light(light) => {
+                rebind_step_id(&mut light.step_id, previous_session_id, session_id);
+            }
+            StepCheckpoint::Heavy(heavy) => {
+                rebind_step_id(&mut heavy.light.step_id, previous_session_id, session_id);
+            }
+        }
+    }
+}
+
+fn rebind_step_id(step_id: &mut String, previous_session_id: &str, session_id: &str) {
+    let previous_prefix = format!("{previous_session_id}-turn-");
+    if let Some(suffix) = step_id.strip_prefix(&previous_prefix) {
+        *step_id = format!("{session_id}-turn-{suffix}");
+    }
 }
 
 /// Summary of a recorded session for debugging/audit.
@@ -819,6 +921,41 @@ mod tests {
     }
 
     #[test]
+    fn skip_tool_with_reason_marks_slot_and_records_payload() {
+        let mut rec = StepRecorder::new("sess-1", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool_with_key("grep", "call-1", Some("sem:grep"));
+
+        rec.skip_tool_with_reason(
+            "grep",
+            "duplicate_within_turn",
+            false,
+            Some("blocked duplicate output"),
+        );
+
+        let step = rec.current_step().unwrap();
+        assert_eq!(step.execution.cursor.slots[0].state, SlotState::Skipped);
+        let last = rec.events().last().unwrap();
+        assert_eq!(last.event_type, StepEventType::ToolCallSkipped);
+        let payload = last.payload.as_ref().unwrap();
+        assert_eq!(
+            payload.get("reason").and_then(serde_json::Value::as_str),
+            Some("duplicate_within_turn")
+        );
+        assert_eq!(
+            payload
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            Some("sem:grep")
+        );
+        assert_eq!(
+            payload.get("output").and_then(serde_json::Value::as_str),
+            Some("blocked duplicate output")
+        );
+    }
+
+    #[test]
     fn recorder_verdict_force_stop() {
         let mut rec = StepRecorder::new("sess-1", "task-1");
         rec.begin_turn(0);
@@ -938,5 +1075,35 @@ mod tests {
             "checkpoint_count must start after existing max"
         );
         // tmp is dropped here, cleaning up automatically
+    }
+
+    #[test]
+    fn attach_persistence_rebinds_existing_events_to_adopted_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut rec = StepRecorder::new("ephemeral", "task-1");
+        rec.begin_turn(0);
+        rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
+        rec.attach_persistence("sess-adopted");
+        rec.end_turn(true);
+
+        assert_eq!(rec.summary().session_id, "sess-adopted");
+        assert_eq!(rec.current_step().unwrap().step_id(), "sess-adopted-turn-0");
+        assert!(
+            rec.events()
+                .iter()
+                .all(|event| event.step_id == "sess-adopted-turn-0")
+        );
+
+        let adopted_path = tmp.path().join("sess-adopted").join("step_events.jsonl");
+        let persisted = std::fs::read_to_string(adopted_path).unwrap();
+        assert!(persisted.contains("\"step_id\":\"sess-adopted-turn-0\""));
+        assert!(
+            !tmp.path()
+                .join("ephemeral")
+                .join("step_events.jsonl")
+                .exists()
+        );
     }
 }

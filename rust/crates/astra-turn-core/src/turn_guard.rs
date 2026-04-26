@@ -282,6 +282,14 @@ impl TurnGuard {
         self.health.record_cache_hit(tool_name);
     }
 
+    /// Record an idempotency cache hit for a canonical tool signature.
+    /// Lets higher-level guards distinguish one repeated request from many
+    /// unrelated cached requests to the same tool.
+    pub fn record_cache_hit_for_signature(&mut self, tool_name: &str, signature: &str) {
+        self.health
+            .record_cache_hit_for_signature(tool_name, signature);
+    }
+
     /// Append a `ToolOutcome` to the per-`(tool, args)` outcome cache.
     ///
     /// This is a cross-turn session-local record of what happened when this
@@ -477,6 +485,9 @@ impl TurnGuard {
                     ),
                     _ => {}
                 }
+            }
+            for (tool_name, _) in &cache_wasteful {
+                avoid_tools.insert((*tool_name).to_string());
             }
             // Treat cache waste as a nudge signal so escalation can fire
             // even with zero tool errors. Add 1 nudge per evaluation where

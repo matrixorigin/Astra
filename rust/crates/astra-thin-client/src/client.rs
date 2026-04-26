@@ -1626,7 +1626,10 @@ mod tests {
             .and(header("authorization", "Bearer tok"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header("content-disposition", "attachment; filename=\"llm_capture_art-1.json\"")
+                    .insert_header(
+                        "content-disposition",
+                        "attachment; filename=\"llm_capture_art-1.json\"",
+                    )
                     .set_body_string("{\"artifact_id\":\"art-1\"}"),
             )
             .mount(&srv)
@@ -1638,7 +1641,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filename.as_deref(), Some("llm_capture_art-1.json"));
-        assert_eq!(String::from_utf8(bytes).unwrap(), "{\"artifact_id\":\"art-1\"}");
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "{\"artifact_id\":\"art-1\"}"
+        );
     }
 
     #[tokio::test]

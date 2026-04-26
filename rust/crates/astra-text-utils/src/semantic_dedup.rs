@@ -74,14 +74,24 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 num_str
             ))
         }
-        // Git: key on ref (staged flag changes output semantically)
+        // Git diff: output semantics depend on ref/base_ref, staged mode,
+        // stat_only, and optional path scoping.
         "git_diff" => {
             let git_ref = arg_str(args, "ref").unwrap_or("HEAD");
             let base_ref = arg_str(args, "base_ref").unwrap_or("");
             let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+            let stat_only = args
+                .get("stat_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = arg_str(args, "path").unwrap_or("");
             Some(format!(
-                "git_diff:{}..{}:staged={}",
-                base_ref, git_ref, staged
+                "git_diff:{}..{}:staged={}:stat_only={}:path={}",
+                base_ref,
+                git_ref,
+                staged,
+                stat_only,
+                normalize_path(path)
             ))
         }
         "git_log" => {
@@ -579,6 +589,36 @@ mod tests {
         let k1 = semantic_call_key("git_diff", &json!({}));
         let k2 = semantic_call_key("git_diff", &json!({"staged": true}));
         assert_ne!(k1, k2, "staged vs unstaged should differ");
+    }
+
+    #[test]
+    fn git_diff_stat_only_differs_from_full_patch() {
+        let k1 = semantic_call_key("git_diff", &json!({"stat_only": true}));
+        let k2 = semantic_call_key("git_diff", &json!({}));
+        assert_ne!(
+            k1, k2,
+            "stat-only diff must not share a semantic cache key with full patch output"
+        );
+    }
+
+    #[test]
+    fn git_diff_path_filter_differs_from_repo_wide_diff() {
+        let k1 = semantic_call_key("git_diff", &json!({"path": "src/a.rs"}));
+        let k2 = semantic_call_key("git_diff", &json!({}));
+        assert_ne!(
+            k1, k2,
+            "path-scoped diff must not share a semantic cache key with repo-wide diff"
+        );
+    }
+
+    #[test]
+    fn git_diff_different_paths_do_not_collide() {
+        let k1 = semantic_call_key("git_diff", &json!({"path": "src/a.rs"}));
+        let k2 = semantic_call_key("git_diff", &json!({"path": "src/b.rs"}));
+        assert_ne!(
+            k1, k2,
+            "different git_diff path filters must stay distinct for cache safety"
+        );
     }
 
     #[test]

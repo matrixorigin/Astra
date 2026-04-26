@@ -2455,6 +2455,40 @@ fn destructive_command_warning(command: &str) -> Option<&'static str> {
     None
 }
 
+fn shell_segment_base_command(segment: &str) -> Option<String> {
+    let mut tokens = segment.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        let base = token.rsplit('/').next().unwrap_or(token);
+        let lower = base.to_ascii_lowercase();
+        match lower.as_str() {
+            "sudo" | "command" | "nohup" | "setsid" | "nice" | "time" | "strace" | "ltrace"
+            | "taskset" => continue,
+            "env" => {
+                while tokens.peek().is_some_and(|next| next.contains('=')) {
+                    tokens.next();
+                }
+                continue;
+            }
+            _ => return Some(lower),
+        }
+    }
+    None
+}
+
+fn forbidden_name_based_process_kill(command: &str) -> Option<&'static str> {
+    for segment in bash_command_segments(command) {
+        let Some(base) = shell_segment_base_command(segment) else {
+            continue;
+        };
+        if matches!(base.as_str(), "pkill" | "killall") {
+            return Some(
+                "Error: name-based process killing commands (`pkill` / `killall`) are not allowed in this shared environment. Find the specific PID first and then use `kill <PID>`.",
+            );
+        }
+    }
+    None
+}
+
 fn destructive_powershell_warning(command: &str) -> Option<&'static str> {
     static PATTERNS: &[(&str, &str)] = &[
         (
@@ -3312,6 +3346,10 @@ impl ToolExecutor {
                     return msg;
                 }
             }
+        }
+
+        if let Some(msg) = forbidden_name_based_process_kill(command) {
+            return msg.to_string();
         }
 
         match self.run_shell_output(command, timeout_secs) {
@@ -7120,6 +7158,43 @@ mod tests {
         assert!(destructive_command_warning("git commit --no-verify -m 'x'").is_some());
     }
 
+    #[test]
+    fn forbidden_name_based_process_kill_detects_direct_and_prefixed_forms() {
+        assert!(forbidden_name_based_process_kill("pkill -f http.server").is_some());
+        assert!(forbidden_name_based_process_kill("sudo pkill -f http.server").is_some());
+        assert!(forbidden_name_based_process_kill("cd tmp && killall python3").is_some());
+        assert!(forbidden_name_based_process_kill("env FOO=bar pkill node").is_some());
+        assert!(forbidden_name_based_process_kill("kill 12345").is_none());
+    }
+
+    #[test]
+    fn forbidden_name_based_process_kill_detects_absolute_path_bypass() {
+        assert!(
+            forbidden_name_based_process_kill("/usr/bin/pkill -f http.server").is_some(),
+            "absolute path should not bypass pkill block"
+        );
+        assert!(
+            forbidden_name_based_process_kill("sudo /usr/bin/killall python3").is_some(),
+            "sudo + absolute path should not bypass killall block"
+        );
+    }
+
+    #[test]
+    fn forbidden_name_based_process_kill_detects_nice_time_strace_prefixes() {
+        assert!(
+            forbidden_name_based_process_kill("nice pkill -f node").is_some(),
+            "nice prefix should not bypass pkill block"
+        );
+        assert!(
+            forbidden_name_based_process_kill("time killall python3").is_some(),
+            "time prefix should not bypass killall block"
+        );
+        assert!(
+            forbidden_name_based_process_kill("strace pkill -9 node").is_some(),
+            "strace prefix should not bypass pkill block"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Bash integration: command semantics in output
     // -----------------------------------------------------------------------
@@ -7157,6 +7232,16 @@ mod tests {
         assert!(
             result.contains("⚠️"),
             "command containing destructive pattern should have warning: {result}"
+        );
+    }
+
+    #[test]
+    fn bash_blocks_name_based_process_kill_commands() {
+        let executor = test_executor();
+        let result = executor.bash(&serde_json::json!({"command": "pkill -f http.server"}));
+        assert!(
+            result.contains("not allowed in this shared environment"),
+            "pkill should be hard-blocked before execution: {result}"
         );
     }
 

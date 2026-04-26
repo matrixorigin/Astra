@@ -21,5 +21,7 @@ pub fn current_evaluation_thresholds() -> EvaluationThresholds {
             .tool_selection
             .effective_redundant_validation_retries_eval_threshold()
             as usize,
+        llm_round_churn: astra_turn_core::evaluation::LLM_ROUND_CHURN_THRESHOLD,
+        exploration_family_churn: astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
     }
 }

@@ -304,6 +304,9 @@ fn apply_one_event(
                 .get("has_tool_calls")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            if let Some(assistant_text) = event.get("assistant_text").and_then(|v| v.as_str()) {
+                accum.full_text = assistant_text.to_string();
+            }
         }
         "session_info" => {
             if let Some(sid) = event.get("session_id").and_then(|v| v.as_str()) {
@@ -619,6 +622,23 @@ mod tests {
             &mut vec![],
         );
         assert!(a.has_tool_calls);
+    }
+
+    #[test]
+    fn turn_complete_overrides_full_text_with_authoritative_assistant_text() {
+        let mut a = ChatTurnSseAccum {
+            full_text: "stale partial".to_string(),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "turn_complete",
+                ",\"has_tool_calls\":false,\"assistant_text\":\"recovered final text\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.full_text, "recovered final text");
     }
 
     #[test]

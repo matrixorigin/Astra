@@ -227,6 +227,7 @@ const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("fork", "Fork session"),
     ("history", "Session conversation history"),
     ("list", "List journals"),
+    ("trace", "Toggle per-session full LLM capture"),
     ("verify", "Verify session integrity"),
 ];
 
@@ -989,6 +990,7 @@ mod tests {
         let subs = subs.unwrap();
         assert!(subs.iter().any(|(tok, _)| *tok == "context"));
         assert!(subs.iter().any(|(tok, _)| *tok == "drift"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "trace"));
     }
 
     #[test]

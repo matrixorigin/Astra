@@ -34,6 +34,7 @@ struct HeadlessBlockedTool<'a> {
     id: &'a str,
     name: &'a str,
     args: &'a Value,
+    reason_code: &'a str,
     err_msg: String,
     journal_reason: String,
     early_exit_ms: u64,
@@ -298,6 +299,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::pipeline::step_protocol::CachedToolResult;
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
     use crate::turn::sse_stream_host::EdgeToolExecResult;
@@ -318,6 +320,62 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
+    }
+
+    async fn short_circuit_cached_read_file(
+        harness: &mut PipelineHarness,
+        turn_index: usize,
+        call_id: &str,
+        path: &str,
+    ) {
+        harness.valid_tool_names.insert("read_file".to_string());
+        harness.tool_calls.clear();
+        harness.tool_calls.push(json!({
+            "id": call_id,
+            "function": { "name": "read_file", "arguments": serde_json::to_string(&json!({ "path": path })).unwrap() }
+        }));
+        let args = json!({ "path": path });
+        let idem_key = IdempotencyKey::semantic("read_file", &args);
+        harness.idempotency_cache.record(
+            &idem_key,
+            CachedToolResult {
+                tool_name: "read_file".to_string(),
+                output: format!("cached {path}"),
+                is_error: false,
+                cached_at: 0,
+            },
+        );
+
+        let mut pipeline = harness.pipeline_with_server_executor(turn_index, None);
+        match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected cached read_file to short-circuit"),
+        }
+    }
+
+    fn begin_recorded_turn(harness: &mut PipelineHarness, tool_count: usize) {
+        harness.step_recorder.begin_turn(0);
+        harness.step_recorder.begin_act(tool_count);
+    }
+
+    fn tool_trace_events(
+        harness: &PipelineHarness,
+    ) -> Vec<(crate::pipeline::step_protocol::StepEventType, Option<Value>)> {
+        harness
+            .step_recorder
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+                        | crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+                        | crate::pipeline::step_protocol::StepEventType::ToolCallCompleted
+                        | crate::pipeline::step_protocol::StepEventType::ToolCallFailed
+                )
+            })
+            .map(|event| (event.event_type.clone(), event.payload.clone()))
+            .collect()
     }
 
     struct PipelineHarness {
@@ -462,6 +520,7 @@ mod tests {
     async fn permit_execution_short_circuits_restricted_tool() {
         let mut harness = PipelineHarness::new();
         harness.restricted_tools.insert("grep".to_string());
+        begin_recorded_turn(&mut harness, 1);
         let mut pipeline = harness.pipeline();
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,
@@ -474,6 +533,154 @@ mod tests {
             }
             _ => panic!("expected restricted tool short circuit"),
         }
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "restricted short-circuit should still be traced"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("restricted_tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_within_turn_short_circuit_records_step_skip_trace() {
+        let mut harness = PipelineHarness::new();
+        begin_recorded_turn(&mut harness, 3);
+        {
+            let mut pipeline = harness.pipeline();
+            assert!(matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)),
+                HeadlessPipelineStage::Continue(_)
+            ));
+            assert!(matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)),
+                HeadlessPipelineStage::Continue(_)
+            ));
+            assert!(matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)),
+                HeadlessPipelineStage::ShortCircuit
+            ));
+        }
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "duplicate-within-turn short-circuit should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("duplicate_within_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_dedup_short_circuit_records_step_skip_trace() {
+        let mut harness = PipelineHarness::new();
+        harness.semantic_dedup.check_and_record(
+            "grep",
+            &json!({ "pattern": "headless" }),
+            "previous grep output that should be reused for semantic dedup blocking",
+            0,
+        );
+        begin_recorded_turn(&mut harness, 1);
+
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(1, None);
+            assert!(matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)),
+                HeadlessPipelineStage::ShortCircuit
+            ));
+        }
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "semantic dedup short-circuit should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("semantic_dedup_pre_check")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_budget_short_circuit_records_step_skip_trace() {
+        let mut harness = PipelineHarness::new();
+        begin_recorded_turn(&mut harness, 1);
+        let mut pipeline = harness.pipeline();
+        pipeline.executed_this_turn = pipeline.ctx.max_tools_per_turn;
+
+        assert!(matches!(
+            pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)),
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "turn-budget short-circuit should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("turn_budget_exhausted")
+        );
     }
 
     #[tokio::test]
@@ -791,6 +998,7 @@ mod tests {
     async fn unknown_tool_records_health_failure() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "outline");
+        begin_recorded_turn(&mut harness, 1);
         let mut pipeline = harness.pipeline();
 
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
@@ -798,9 +1006,33 @@ mod tests {
             matches!(result, HeadlessPipelineStage::ShortCircuit),
             "unknown tool should short-circuit"
         );
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "unknown tool should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("unknown_tool")
+        );
 
         // The health tracker must have recorded a failure for "outline".
-        let health = pipeline.ctx.turn_guard.health.get("outline");
+        let health = harness.turn_guard.health.get("outline");
         assert!(health.is_some(), "outline should be tracked");
         let h = health.unwrap();
         assert_eq!(h.total_calls, 1);
@@ -894,13 +1126,38 @@ mod tests {
                 "arguments": "{}"
             }
         }));
+        begin_recorded_turn(&mut harness, 1);
         let mut pipeline = harness.pipeline();
 
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
         assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "empty-name short-circuit should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("unknown_tool")
+        );
 
         // Empty-name tool should also be tracked in health.
-        let health = pipeline.ctx.turn_guard.health.get("");
+        let health = harness.turn_guard.health.get("");
         assert!(health.is_some(), "empty-name tool should be tracked");
         assert_eq!(health.unwrap().total_failures, 1);
     }
@@ -1138,6 +1395,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_dedup_does_not_block_git_diff_path_after_stat_only() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("git_diff".to_string());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "before\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "before\nafter\n").unwrap();
+
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+
+        harness.tool_calls.push(json!({
+            "id": "call-git-diff-stat",
+            "function": { "name": "git_diff", "arguments": "{\"stat_only\":true}" }
+        }));
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::Continue(v) => v,
+                _ => panic!("expected stat_only git_diff to validate"),
+            };
+            let permitted = match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::Continue(p) => p,
+                _ => panic!("expected stat_only git_diff to execute"),
+            };
+            let executed = pipeline.execute_execution(permitted).await;
+            assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+            pipeline.record_execution(executed).await;
+        }
+
+        harness.tool_calls.clear();
+        harness.tool_calls.push(json!({
+            "id": "call-git-diff-path",
+            "function": { "name": "git_diff", "arguments": "{\"path\":\"tracked.txt\"}" }
+        }));
+        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(v) => v,
+            _ => panic!("expected path-scoped git_diff to validate"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(p) => p,
+            HeadlessPipelineStage::ShortCircuit => {
+                panic!("path-scoped git_diff must not be semantically blocked by earlier stat_only")
+            }
+            HeadlessPipelineStage::AbortRound => panic!("unexpected abort"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        assert!(
+            executed.execution.result_str.contains("@@"),
+            "path-scoped git_diff should execute and return patch hunks, got: {}",
+            executed.execution.result_str
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hits_on_different_read_file_signatures_do_not_trigger_guard() {
+        let mut harness = PipelineHarness::new();
+
+        short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
+        short_circuit_cached_read_file(&mut harness, 1, "call-read-b-1", "b.txt").await;
+        short_circuit_cached_read_file(&mut harness, 2, "call-read-c-1", "c.txt").await;
+
+        let verdict = harness.turn_guard.evaluate();
+        assert!(
+            !verdict.avoid_tools.contains(&"read_file".to_string()),
+            "distinct read_file signatures should not exhaust the whole tool"
+        );
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .all(|msg| !msg.contains("Duplicate calls detected")),
+            "distinct cached signatures should not look like duplicate waste"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_populates_outcome_cache_under_canonical_signature() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("outline".to_string());
@@ -1227,6 +1579,7 @@ mod tests {
             },
         );
 
+        begin_recorded_turn(&mut harness, 1);
         let mut pipeline = harness.pipeline();
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
         assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
@@ -1236,6 +1589,30 @@ mod tests {
                 .to_string()
                 .contains("Outcome memory blocked"),
             "expected blocked outcome-memory advisory in tool result"
+        );
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "outcome-memory short-circuit should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("outcome_memory_blocked")
         );
     }
 
@@ -1519,5 +1896,57 @@ mod tests {
         let grep_h = pipeline.ctx.turn_guard.health.get("grep").unwrap();
         assert_eq!(grep_h.consecutive_failures, 0);
         assert_eq!(grep_h.total_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_block_short_circuit_records_step_skip_trace() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "grep".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"decision":"block","reason":"policy denied"}'"#.into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        begin_recorded_turn(&mut harness, 1);
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        drop(pipeline);
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "pre-tool hook block should emit started+skipped trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            crate::pipeline::step_protocol::StepEventType::ToolCallSkipped
+        ));
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("pre_tool_hook_blocked")
+        );
     }
 }

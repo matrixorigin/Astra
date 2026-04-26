@@ -249,7 +249,7 @@ fn persist_remote_composite_snapshot_index_blocking(
         Err(_) => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .and_then(|runtime| Ok(runtime.block_on(future)))
+            .map(|runtime| runtime.block_on(future))
             .map_err(|error| error.to_string())
             .and_then(|result| result),
     };
@@ -565,11 +565,26 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     state
         .messages
         .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m));
+    reset_per_turn_corrective_state(state);
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
         state.final_text_streamed = true;
     }
+}
+
+fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
+    state.stall.forced_factual_retry = false;
+    state.stall.forced_execution_retry = false;
+    state.stall.forced_execution_escalation = false;
+    state.stall.forced_parallel_batching = false;
+    state.stall.forced_round_budget_phase1 = false;
+    state.stall.forced_round_budget_phase2 = false;
+    state.stall.forced_redundant_reads_corrective = false;
+    state.stall.forced_cache_waste_corrective = false;
+    state.stall.forced_exploration_family_corrective = false;
+    state.stall.forced_exploration_family_phase2 = false;
+    state.stall.exploration_family_corrective_family = None;
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records
@@ -665,12 +680,16 @@ mod tests {
         assert!(outcome.is_ok(), "loop should complete: {:?}", outcome);
 
         assert!(
-            state.stall.forced_execution_retry,
-            "guard must have fired on the deferring round"
+            host.turn_count() == 2,
+            "guard must have fired on the deferring round to force a second LLM pass"
         );
         assert_eq!(
             state.final_text, "Done.",
             "second LLM response should win after the forced retry"
+        );
+        assert!(
+            !state.stall.forced_execution_retry,
+            "completion should reset one-shot retry state so it does not leak into the next user turn"
         );
 
         let leftover = state
@@ -735,7 +754,6 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must terminate: {:?}", outcome);
-        assert!(state.stall.forced_execution_retry);
         // Second defer becomes the final text — guard did not fire again.
         assert_eq!(state.final_text, "确认后我再执行。");
         assert_eq!(
@@ -743,6 +761,89 @@ mod tests {
             2,
             "exactly 2 LLM rounds, no infinite loop"
         );
+        assert!(
+            !state.stall.forced_execution_retry,
+            "completion should clear the one-shot retry flag after the turn ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_strips_all_correctives_and_resets_one_shot_flags() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "Done.".into();
+        state.messages.extend([
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold retry", crate::turn::agentic_loop_execution_phase::EXECUTION_RETRY_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold escalation", crate::turn::agentic_loop_execution_phase::EXECUTION_ESCALATION_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold batching", crate::turn::agentic_loop_execution_phase::PARALLEL_BATCHING_FORCE_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold round budget", crate::turn::agentic_loop_execution_phase::ROUND_BUDGET_PHASE1_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold redundant reads", crate::turn::agentic_loop_execution_phase::REDUNDANT_READS_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold cache waste", crate::turn::agentic_loop_execution_phase::CACHE_WASTE_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "{}\nold exploration family churn",
+                    crate::turn::agentic_loop_execution_phase::EXPLORATION_FAMILY_MARKER
+                ),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "{}\nold exploration family phase2",
+                    crate::turn::agentic_loop_execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
+                ),
+            }),
+        ]);
+        state.stall.forced_factual_retry = true;
+        state.stall.forced_execution_retry = true;
+        state.stall.forced_execution_escalation = true;
+        state.stall.forced_parallel_batching = true;
+        state.stall.forced_round_budget_phase1 = true;
+        state.stall.forced_round_budget_phase2 = true;
+        state.stall.forced_redundant_reads_corrective = true;
+        state.stall.forced_cache_waste_corrective = true;
+        state.stall.forced_exploration_family_corrective = true;
+        state.stall.forced_exploration_family_phase2 = true;
+        state.stall.exploration_family_corrective_family = Some("diff".into());
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(
+            state.messages.iter().all(|m| {
+                !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m)
+            }),
+            "completed turns should not retain stale runtime corrective messages: {:#?}",
+            state.messages
+        );
+        assert!(!state.stall.forced_factual_retry);
+        assert!(!state.stall.forced_execution_retry);
+        assert!(!state.stall.forced_execution_escalation);
+        assert!(!state.stall.forced_parallel_batching);
+        assert!(!state.stall.forced_round_budget_phase1);
+        assert!(!state.stall.forced_round_budget_phase2);
+        assert!(!state.stall.forced_redundant_reads_corrective);
+        assert!(!state.stall.forced_cache_waste_corrective);
+        assert!(!state.stall.forced_exploration_family_corrective);
+        assert!(!state.stall.forced_exploration_family_phase2);
+        assert!(state.stall.exploration_family_corrective_family.is_none());
     }
 
     #[tokio::test]

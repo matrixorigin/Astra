@@ -434,6 +434,19 @@ pub struct StallTrackingState {
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
     pub forced_cache_waste_corrective: bool,
+    /// Whether a broad exploration-family corrective injected a guidance
+    /// message and restricted the dominant low-yield family this loop. Fires
+    /// when consecutive multi-call rounds stay inside the same exploratory
+    /// family (diff/search/read). One-shot per turn.
+    pub forced_exploration_family_corrective: bool,
+    /// Whether the exploration-family corrective escalated to a stronger
+    /// convergence directive after the model spent a later round attempting
+    /// ONLY tools from the already-restricted family. One-shot per turn.
+    pub forced_exploration_family_phase2: bool,
+    /// Dominant exploratory family currently under runtime correction. Used
+    /// to detect whether later blocked rounds are simply retrying the same
+    /// low-yield path instead of switching families or synthesizing.
+    pub exploration_family_corrective_family: Option<String>,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -742,6 +755,12 @@ pub struct AgenticLoopState {
     /// Session-level turn number (1-based). Set by the CLI from ReplState.turn
     /// so that llm_round journal events carry the correct turn number.
     pub session_turn: u32,
+    /// Optional authoritative bridge turn-chain id propagated by outer loops.
+    /// When present, all `/chat/turn` retries within the same visible turn
+    /// should reuse this id instead of generating a fresh bridge-local value.
+    pub bridge_turn_chain_id: Option<String>,
+    /// Optional authoritative root user-query event id propagated by outer loops.
+    pub bridge_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 }
@@ -1083,6 +1102,8 @@ pub fn make_test_loop_state() -> AgenticLoopState {
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
         session_turn: 0,
+        bridge_turn_chain_id: None,
+        bridge_user_query_event_id: None,
         turn_event_buffer: None,
     }
 }
@@ -1401,6 +1422,8 @@ pub(crate) mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         }
     }

@@ -1139,6 +1139,16 @@ fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String>
     None
 }
 
+fn build_run_turn_complete_event(total_tool_calls: u32, final_text: &str) -> Value {
+    Value::Object(astra_turn_core::complete::build_turn_complete_event(
+        total_tool_calls > 0,
+        false,
+        &crate::turn::stall::DivergenceStatus::Healthy,
+        None,
+        (!final_text.is_empty()).then_some(final_text),
+    ))
+}
+
 // ─── Run State ──────────────────────────────────────────────────────────────
 
 /// Status of a single agentic run.
@@ -1252,7 +1262,7 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
         .filter(|event| {
             matches!(
                 event.get("event_type").and_then(Value::as_str),
-                Some("run_error" | "run_finished")
+                Some("text_done" | "run_error" | "run_finished")
             )
         })
         .cloned()
@@ -1703,6 +1713,7 @@ impl AgenticRunLifecycleService {
         )
         .with_model(request.model.clone())
         .with_llm_token_service(request.llm_token_service.clone())
+        .with_full_llm_capture(request.full_llm_capture)
         .with_edge_tools(edge_tools)
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
@@ -1934,6 +1945,8 @@ impl AgenticRunLifecycleService {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         }
     }
@@ -2627,6 +2640,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+            let streamed_final_events = super::run_handlers::transform_stream_run_events_for_client(
+                &bg_run_id,
+                final_events.clone(),
+            );
             persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
             let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
             all_events.append(&mut final_events);
@@ -2682,6 +2699,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
+            for event in streamed_final_events {
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+
             // Persist usage unconditionally — cancelled runs still consumed tokens
             // and must have accurate usage in durable store for billing/audit.
             if let Some(engine) = &run_engine {
@@ -2713,13 +2736,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
-            let turn_complete = astra_turn_core::complete::build_turn_complete_event(
-                state.total_tool_calls > 0,
-                false,
-                &crate::turn::stall::DivergenceStatus::Healthy,
-                None,
-            );
-            let _ = event_tx.try_send(Value::Object(turn_complete));
+            let _ = event_tx
+                .send(build_run_turn_complete_event(
+                    state.total_tool_calls,
+                    &state.final_text,
+                ))
+                .await;
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
             drop(event_tx);
@@ -3367,6 +3389,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         };
 
@@ -3578,6 +3602,22 @@ mod tests {
     }
 
     #[test]
+    fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
+        let event = build_run_turn_complete_event(0, "recovered final answer");
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["assistant_text"], "recovered final answer");
+        assert_eq!(event["has_tool_calls"], false);
+    }
+
+    #[test]
+    fn build_run_turn_complete_event_omits_empty_assistant_text() {
+        let event = build_run_turn_complete_event(1, "");
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["has_tool_calls"], true);
+        assert!(event.get("assistant_text").is_none());
+    }
+
+    #[test]
     fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
         // Sanity-check that the detect_implicit_feedback_signal contract used in
         // record_server_loop_learning_outcome produces a "correction" signal
@@ -3655,6 +3695,7 @@ mod tests {
         ChatRequestData {
             message: message.to_string(),
             session_id: None,
+            full_llm_capture: false,
             agent_id: None,
             model: None,
             llm_token_service: None,
@@ -4021,14 +4062,16 @@ mod tests {
     fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
         let events = vec![
             json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+            json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
             json!({"event_type": "run_error", "data": {"error": "boom"}}),
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];
 
         let persisted = terminal_events_for_persistence(&events);
-        assert_eq!(persisted.len(), 2);
-        assert_eq!(persisted[0]["event_type"], "run_error");
-        assert_eq!(persisted[1]["event_type"], "run_finished");
+        assert_eq!(persisted.len(), 3);
+        assert_eq!(persisted[0]["event_type"], "text_done");
+        assert_eq!(persisted[1]["event_type"], "run_error");
+        assert_eq!(persisted[2]["event_type"], "run_finished");
     }
 
     #[tokio::test]
@@ -4322,6 +4365,7 @@ mod tests {
         let req = ChatRequestData {
             message: "hi".into(),
             session_id: None,
+            full_llm_capture: false,
             agent_id: None,
             model: None,
             llm_token_service: None,
@@ -4448,6 +4492,7 @@ mod tests {
         let req = ChatRequestData {
             message: "hi".into(),
             session_id: None,
+            full_llm_capture: false,
             agent_id: None,
             model: None,
             llm_token_service: None,
@@ -4952,6 +4997,39 @@ mod tests {
         assert_eq!(status.status, durable.status);
         assert_eq!(status.waiting_for, durable.waiting_for);
         assert_eq!(status.events_count, durable.events.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn stream_run_cache_miss_replays_durable_text_done() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine
+            .start_run("run-durable-text", "user-1", "session-1")
+            .await
+            .expect("start durable run");
+        engine
+            .append_event(
+                "run-durable-text",
+                json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
+            )
+            .await
+            .expect("persist text_done");
+        engine
+            .append_event(
+                "run-durable-text",
+                json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
+            )
+            .await
+            .expect("persist run_finished");
+
+        let events = ok(svc
+            .stream_run("run-durable-text".into(), "user-1".into(), 1)
+            .await);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event_type"], "text_done");
+        assert_eq!(events[0]["data"]["full_text"], "durable final answer");
+        assert_eq!(events[1]["event_type"], "run_finished");
     }
 
     #[tokio::test]

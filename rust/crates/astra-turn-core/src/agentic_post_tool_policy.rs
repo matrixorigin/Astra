@@ -331,6 +331,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_waste_warning_retries_and_restricts_tools() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = Vec::new();
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        let tool_calls = vec![json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}})];
+        turn_guard.record_cache_hit("read_file");
+        turn_guard.record_cache_hit("read_file");
+        turn_guard.record_cache_hit("read_file");
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "inspect the code",
+            tool_calls_for_guard: &tool_calls,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: None,
+            max_turns: 8,
+            loop_turn: 0,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+        });
+
+        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert!(restricted_tools.contains("read_file"));
+        assert_eq!(verdict_events.len(), 1);
+        assert!(
+            verdict_events[0]
+                .avoid_tools
+                .contains(&"read_file".to_string()),
+            "cache-waste warning should become a real restriction"
+        );
+    }
+
+    #[test]
     fn canonical_tool_call_shape_feeds_intent_tracking() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();

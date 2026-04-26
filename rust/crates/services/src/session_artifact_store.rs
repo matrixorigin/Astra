@@ -232,11 +232,11 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         crate::session_journal::validate_session_id(session_id)?;
         let pool = self.get_pool().await.map_err(|error| error.to_string())?;
         let row = query(
-            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-                    content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
-             FROM session_artifacts \
-             WHERE session_id = ? AND artifact_kind = ? \
-             ORDER BY created_at DESC LIMIT 1",
+             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+                     content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
+              FROM session_artifacts \
+              WHERE session_id = ? AND artifact_kind = ? \
+              ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
         )
         .bind(session_id)
         .bind(artifact_kind)
@@ -266,7 +266,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                         content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
                  FROM session_artifacts \
                  WHERE session_id = ? AND artifact_kind = ? \
-                 ORDER BY created_at DESC LIMIT ?",
+                 ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
             )
             .bind(session_id)
             .bind(kind)
@@ -280,7 +280,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                         content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
                  FROM session_artifacts \
                  WHERE session_id = ? \
-                 ORDER BY created_at DESC LIMIT ?",
+                 ORDER BY created_at DESC, artifact_id DESC LIMIT ?",
             )
             .bind(session_id)
             .bind(capped_limit)
@@ -419,8 +419,8 @@ mod tests {
             "artifact listing should support listing all artifacts for a session"
         );
         assert!(
-            source.contains("ORDER BY created_at DESC LIMIT ?"),
-            "artifact listing should return newest artifacts first with a bounded limit"
+            source.contains("ORDER BY created_at DESC, artifact_id DESC LIMIT ?"),
+            "artifact listing should return newest artifacts first with a stable bounded order"
         );
     }
 }

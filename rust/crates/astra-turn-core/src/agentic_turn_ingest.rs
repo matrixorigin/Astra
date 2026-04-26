@@ -173,6 +173,7 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(sid) = snap.session_id.as_ref() {
         *st.current_session_id = Some(sid.clone());
+        st.step_recorder.attach_persistence(sid);
     }
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();

@@ -27,12 +27,20 @@ const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
 
 fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
+    step_recorder: &mut crate::pipeline::step_recorder::StepRecorder,
     quiet: bool,
     term: &mut dyn HeadlessRoundTerminal,
     messages: &mut Vec<Value>,
     tool_results: &mut Vec<Value>,
     tool_call_records: &mut Vec<ToolCallRecord>,
 ) {
+    step_recorder.begin_tool_with_key(blocked.name, blocked.id, None);
+    step_recorder.skip_tool_with_reason(
+        blocked.name,
+        blocked.reason_code,
+        false,
+        Some(&blocked.err_msg),
+    );
     if !quiet && let Some(status_line) = blocked.status_line {
         term.emit_line(HeadlessStderrStyle::Yellow, status_line);
     }
@@ -48,6 +56,19 @@ fn emit_blocked_tool_result(
     ));
 }
 
+fn trace_short_circuit_tool_skip(
+    step_recorder: &mut crate::pipeline::step_recorder::StepRecorder,
+    tool_id: &str,
+    tool_name: &str,
+    reason: &str,
+    idempotency_key: Option<&str>,
+    output: Option<&str>,
+    was_cached: bool,
+) {
+    step_recorder.begin_tool_with_key(tool_name, tool_id, idempotency_key);
+    step_recorder.skip_tool_with_reason(tool_name, reason, was_cached, output);
+}
+
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) fn emit_turn_budget_stub(&mut self, slot: &HeadlessResolvedToolSlot) {
         let body = format!(
@@ -55,6 +76,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
              Skipping this call. Prioritize the most important remaining \
              tools in your next response — do not repeat all skipped calls.",
             max_tools_per_turn = self.ctx.max_tools_per_turn,
+        );
+        trace_short_circuit_tool_skip(
+            self.ctx.step_recorder,
+            &slot.id,
+            &slot.name,
+            "turn_budget_exhausted",
+            None,
+            Some(&body),
+            false,
         );
         let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
         self.ctx.messages.push(tool_msg);
@@ -94,6 +124,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &slot.id,
             &slot.name,
             self.ctx.valid_tool_names,
+        );
+        trace_short_circuit_tool_skip(
+            self.ctx.step_recorder,
+            &slot.id,
+            &slot.name,
+            "unknown_tool",
+            None,
+            Some(&err_msg),
+            false,
         );
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(err_tr);
@@ -161,13 +200,24 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.messages.push(tool_msg);
                 self.ctx.tool_results.push(tr);
             }
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &slot.id,
+                &slot.name,
+                "duplicate_within_turn",
+                Some(&idem_key.cache_key()),
+                None,
+                false,
+            );
             self.ctx
                 .tool_call_records
                 .push(journal_record_duplicate_within_turn(
                     slot.name.clone(),
                     make_args_preview(&slot.name, &slot.args),
                 ));
-            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&slot.name, &call_sig);
             agent_warn!(
                 "dedup",
                 "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
@@ -219,7 +269,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx
                 .step_recorder
                 .record_cache_hit(&slot.name, cached.clone());
-            self.ctx.turn_guard.record_cache_hit(&slot.name);
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&slot.name, &call_sig);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
@@ -257,7 +309,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
-            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &slot.id,
+                &slot.name,
+                "semantic_dedup_pre_check",
+                Some(&idem_key.cache_key()),
+                Some(&body),
+                false,
+            );
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&slot.name, &call_sig);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
@@ -289,11 +352,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     id: &slot.id,
                     name: &slot.name,
                     args: &slot.args,
+                    reason_code: "outcome_memory_blocked",
                     err_msg: err_msg.clone(),
                     journal_reason: err_msg.clone(),
                     early_exit_ms: 0,
                     status_line: Some(format!("  ⚠ Outcome-memory block: {}", slot.name)),
                 },
+                self.ctx.step_recorder,
                 self.ctx.quiet,
                 self.ctx.term,
                 self.ctx.messages,
@@ -327,6 +392,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &execution.id,
                 &execution.name,
                 self.ctx.valid_tool_names,
+            );
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &execution.id,
+                &execution.name,
+                "unknown_tool",
+                None,
+                Some(&err_msg),
+                false,
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
@@ -365,11 +439,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     id: &execution.id,
                     name: &execution.name,
                     args: &execution.args,
+                    reason_code: "restricted_tool",
                     journal_reason: err_msg.clone(),
                     err_msg,
                     early_exit_ms: execution.early_exit_ms,
                     status_line: Some(format!("  ⚠ Blocked restricted tool: {}", execution.name)),
                 },
+                self.ctx.step_recorder,
                 self.ctx.quiet,
                 self.ctx.term,
                 self.ctx.messages,
@@ -408,11 +484,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         id: &execution.id,
                         name: &execution.name,
                         args: &execution.args,
+                        reason_code: "permission_denied",
                         err_msg,
                         journal_reason: reason,
                         early_exit_ms: execution.early_exit_ms,
                         status_line: Some(format!("  🔒 Permission denied: {}", execution.name)),
                     },
+                    self.ctx.step_recorder,
                     self.ctx.quiet,
                     self.ctx.term,
                     self.ctx.messages,
@@ -441,6 +519,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             id: &execution.id,
                             name: &execution.name,
                             args: &execution.args,
+                            reason_code: "pre_tool_hook_blocked",
                             journal_reason: err_msg.clone(),
                             err_msg,
                             early_exit_ms: execution.early_exit_ms,
@@ -449,6 +528,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                                 execution.name, reason
                             )),
                         },
+                        self.ctx.step_recorder,
                         self.ctx.quiet,
                         self.ctx.term,
                         self.ctx.messages,

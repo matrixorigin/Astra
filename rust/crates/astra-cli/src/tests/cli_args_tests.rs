@@ -778,6 +778,38 @@ fn cli_session_capture_download_parses_output() {
     }
 }
 
+#[test]
+fn cli_session_trace_on_parses() {
+    let cli = Cli::try_parse_from(["astra", "session", "trace", "on"]).unwrap();
+    match cli.command {
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::On(args)))) => {
+            assert!(args.session_id.is_none());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn cli_session_trace_status_parses_session_id() {
+    let cli = Cli::try_parse_from([
+        "astra",
+        "session",
+        "trace",
+        "status",
+        "550e8400-e29b-41d4-a716-446655440000",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Status(args)))) => {
+            assert_eq!(
+                args.session_id.as_deref(),
+                Some("550e8400-e29b-41d4-a716-446655440000")
+            );
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
 // ── --max-budget tests ──
 
 #[test]
