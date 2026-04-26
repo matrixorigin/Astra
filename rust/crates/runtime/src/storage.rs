@@ -2,7 +2,7 @@ pub use astra_services::storage::*;
 
 use std::time::Duration;
 
-use sqlx::{MySql, Row, query};
+use sqlx::{MySql, query};
 
 use crate::turn::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnImplicitFeedbackRecord,
@@ -186,23 +186,23 @@ pub(crate) async fn trim_turn_skill_selector_metrics_window(
     tx: &mut sqlx::Transaction<'_, MySql>,
     window_size: i64,
 ) -> Result<u64, sqlx::Error> {
-    let row = query("SELECT COUNT(*) AS total_rows FROM skill_selector_turn_metrics")
-        .fetch_one(&mut **tx)
-        .await?;
-    let total_rows = row.try_get::<i64, _>("total_rows").unwrap_or(0);
-    let overflow = astra_turn_core::skill_selector_metrics::skill_selector_window_overflow(
-        total_rows,
-        window_size,
-    );
-    if overflow == 0 {
-        return Ok(0);
+    if window_size <= 0 {
+        let result = query("DELETE FROM skill_selector_turn_metrics")
+            .execute(&mut **tx)
+            .await?;
+        return Ok(result.rows_affected());
     }
     let result = query(
         "DELETE FROM skill_selector_turn_metrics \
-         ORDER BY created_at ASC, event_id ASC \
-         LIMIT ?",
+         WHERE event_id NOT IN ( \
+             SELECT event_id FROM ( \
+                 SELECT event_id FROM skill_selector_turn_metrics \
+                 ORDER BY created_at DESC, event_id DESC \
+                 LIMIT ? \
+             ) AS recent_skill_selector_metrics \
+         )",
     )
-    .bind(overflow)
+    .bind(window_size)
     .execute(&mut **tx)
     .await?;
     Ok(result.rows_affected())

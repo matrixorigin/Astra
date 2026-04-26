@@ -94,6 +94,22 @@ async fn cleanup_session_rows(pool: &sqlx::Pool<MySql>, session_id: &str) {
         .await;
 }
 
+fn test_description_and_aliases(description: &str) -> (String, Vec<String>) {
+    const ALIAS_PREFIX: &str = " [aliases: ";
+    if let Some(alias_start) = description.rfind(ALIAS_PREFIX)
+        && description.ends_with(']')
+    {
+        let aliases = description[alias_start + ALIAS_PREFIX.len()..description.len() - 1]
+            .split(',')
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        return (description[..alias_start].to_string(), aliases);
+    }
+    (description.to_string(), Vec::new())
+}
+
 fn build_hook_payload(
     session_id: &str,
     user_id: &str,
@@ -129,7 +145,7 @@ fn build_hook_payload(
         }
     })];
 
-    Value::Object(astra_turn_core::tail_persist::build_turn_hook_args(
+    let mut payload = astra_turn_core::tail_persist::build_turn_hook_args(
         user_id,
         session_id,
         &messages,
@@ -146,7 +162,31 @@ fn build_hook_payload(
         true,
         true,
         true,
-    ))
+    );
+    payload.insert(
+        "skill_selector_shortlist".to_string(),
+        json!({
+            "open_catalog": true,
+            "visible_skill_count": shortlist.len(),
+            "skills": shortlist
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| json!({
+                    "rank": idx + 1,
+                    "skill_name": name,
+                    "aliases": [],
+                    "description": format!("{name} workflow"),
+                    "source": "test"
+                }))
+                .collect::<Vec<_>>(),
+            "telemetry": {
+                "selector_tier": "lexical",
+                "elapsed_ms": 1,
+                "total_catalog_size": shortlist.len()
+            }
+        }),
+    );
+    Value::Object(payload)
 }
 
 fn build_custom_skill_hook_payload(
@@ -190,7 +230,7 @@ fn build_custom_skill_hook_payload(
         })
         .collect::<Vec<_>>();
 
-    Value::Object(astra_turn_core::tail_persist::build_turn_hook_args(
+    let mut payload = astra_turn_core::tail_persist::build_turn_hook_args(
         user_id,
         session_id,
         &messages,
@@ -207,7 +247,34 @@ fn build_custom_skill_hook_payload(
         true,
         true,
         true,
-    ))
+    );
+    payload.insert(
+        "skill_selector_shortlist".to_string(),
+        json!({
+            "open_catalog": true,
+            "visible_skill_count": shortlist.len(),
+            "skills": shortlist
+                .iter()
+                .enumerate()
+                .map(|(idx, (name, description))| {
+                    let (description, aliases) = test_description_and_aliases(description);
+                    json!({
+                        "rank": idx + 1,
+                        "skill_name": name,
+                        "aliases": aliases,
+                        "description": description,
+                        "source": "test"
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "telemetry": {
+                "selector_tier": "lexical",
+                "elapsed_ms": 1,
+                "total_catalog_size": shortlist.len()
+            }
+        }),
+    );
+    Value::Object(payload)
 }
 
 fn build_text_only_hook_payload(

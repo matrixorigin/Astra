@@ -322,7 +322,7 @@ fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
 
 fn attach_skill_selector_metric_to_hook_payload(
     hook_payload: &mut Map<String, Value>,
-    llm_messages: &[Value],
+    _llm_messages: &[Value],
     tool_calls: &[Value],
     skill_selector_shortlist: Option<&Value>,
 ) {
@@ -335,11 +335,8 @@ fn attach_skill_selector_metric_to_hook_payload(
     let Some(turn_number) = hook_payload.get("turn_count").and_then(Value::as_i64) else {
         return;
     };
-    let Some(shortlist) = skill_selector_shortlist
-        .and_then(parse_skill_selector_shortlist_trace_value)
-        .or_else(|| {
-            crate::turn::skill_tool::parse_skill_selector_shortlist_from_messages(llm_messages)
-        })
+    let Some(shortlist) =
+        skill_selector_shortlist.and_then(parse_skill_selector_shortlist_trace_value)
     else {
         return;
     };
@@ -2398,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_skill_selector_metric_uses_assembled_llm_messages() {
+    fn attach_skill_selector_metric_uses_structured_shortlist() {
         let request_messages = vec![json!({
             "role": "user",
             "content": "deploy the service"
@@ -2411,13 +2408,32 @@ mod tests {
                 "arguments": "{\"skill_name\":\"deploy\"}"
             }
         })];
-        let llm_messages = vec![
-            json!({
-                "role": "system",
-                "content": "<available_skills>\n<skill>\n  <name>build</name>\n  <description>Build artifacts</description>\n</skill>\n<skill>\n  <name>deploy</name>\n  <description>Deploy the service</description>\n</skill>\n</available_skills>\n\ndiscover_skills"
-            }),
-            request_messages[0].clone(),
-        ];
+        let llm_messages = vec![request_messages[0].clone()];
+        let shortlist = json!({
+            "open_catalog": true,
+            "visible_skill_count": 2,
+            "skills": [
+                {
+                    "rank": 1,
+                    "skill_name": "build",
+                    "aliases": [],
+                    "description": "Build artifacts",
+                    "source": "test"
+                },
+                {
+                    "rank": 2,
+                    "skill_name": "deploy",
+                    "aliases": [],
+                    "description": "Deploy the service",
+                    "source": "test"
+                }
+            ],
+            "telemetry": {
+                "selector_tier": "lexical",
+                "elapsed_ms": 1,
+                "total_catalog_size": 2
+            }
+        });
         let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
             "user-1",
             "session-1",
@@ -2441,7 +2457,7 @@ mod tests {
             &mut hook_payload,
             &llm_messages,
             &tool_calls,
-            None,
+            Some(&shortlist),
         );
 
         let metric = hook_payload

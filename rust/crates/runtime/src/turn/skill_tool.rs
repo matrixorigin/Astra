@@ -716,88 +716,6 @@ pub fn skill_listing_system_message(
     })
 }
 
-fn xml_tag_value<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let start = text.find(&start_tag)? + start_tag.len();
-    let end = text[start..].find(&end_tag)? + start;
-    Some(text[start..end].trim())
-}
-
-fn parse_aliases_from_description(description: &str) -> (String, Vec<String>) {
-    const ALIAS_PREFIX: &str = " [aliases: ";
-    if let Some(alias_start) = description.rfind(ALIAS_PREFIX)
-        && description.ends_with(']')
-    {
-        let aliases = description[alias_start + ALIAS_PREFIX.len()..description.len() - 1]
-            .split(',')
-            .map(str::trim)
-            .filter(|alias| !alias.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        return (description[..alias_start].to_string(), aliases);
-    }
-    (description.to_string(), Vec::new())
-}
-
-pub fn parse_skill_selector_shortlist_from_text(
-    content: &str,
-) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
-    let start = content.find("<available_skills>")?;
-    let end = content.find("</available_skills>")? + "</available_skills>".len();
-    let mut rest = &content[start..end];
-    let mut skills = Vec::new();
-
-    while let Some(skill_start) = rest.find("<skill>") {
-        let after_start = &rest[skill_start + "<skill>".len()..];
-        let Some(skill_end) = after_start.find("</skill>") else {
-            break;
-        };
-        let skill_block = &after_start[..skill_end];
-        let skill_name = xml_tag_value(skill_block, "name")?.to_string();
-        let description = xml_tag_value(skill_block, "description").unwrap_or_default();
-        let (description, aliases) = parse_aliases_from_description(description);
-        skills.push(
-            astra_turn_core::skill_selector_metrics::SkillSelectorShortlistEntry {
-                rank: i32::try_from(skills.len() + 1).unwrap_or(i32::MAX),
-                skill_name,
-                aliases,
-                description,
-                source: "listing_message".to_string(),
-                category: xml_tag_value(skill_block, "category").map(ToString::to_string),
-            },
-        );
-        rest = &after_start[skill_end + "</skill>".len()..];
-    }
-
-    if skills.is_empty() {
-        return None;
-    }
-
-    Some(
-        astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace {
-            open_catalog: content.contains("discover_skills"),
-            visible_skill_count: i32::try_from(skills.len()).unwrap_or(i32::MAX),
-            skills,
-            telemetry: Default::default(),
-        },
-    )
-}
-
-pub fn parse_skill_selector_shortlist_from_messages(
-    messages: &[Value],
-) -> Option<astra_turn_core::skill_selector_metrics::SkillSelectorShortlistTrace> {
-    messages.iter().find_map(|message| {
-        if message.get("role").and_then(Value::as_str) != Some("system") {
-            return None;
-        }
-        message
-            .get("content")
-            .and_then(Value::as_str)
-            .and_then(parse_skill_selector_shortlist_from_text)
-    })
-}
-
 /// Check if a tool call is a skill invocation.
 pub fn is_skill_call(tool_call: &Value) -> bool {
     tool_call
@@ -5750,37 +5668,6 @@ Normal.
         );
     }
 
-    #[test]
-    fn parse_skill_selector_shortlist_from_messages_recovers_listing_order_and_aliases() {
-        let listing = skill_listing_system_message(
-            &[
-                SkillToolInfo {
-                    name: "deploy".into(),
-                    description: "ship code".into(),
-                    aliases: vec!["ship-it".into()],
-                    category: Some("ops".into()),
-                    ..Default::default()
-                },
-                SkillToolInfo {
-                    name: "inspect".into(),
-                    description: "inspect system".into(),
-                    ..Default::default()
-                },
-            ],
-            None,
-            None,
-            true,
-        );
-        let shortlist = parse_skill_selector_shortlist_from_messages(&[listing])
-            .expect("shortlist should parse");
-
-        assert!(shortlist.open_catalog);
-        assert_eq!(shortlist.visible_skill_count, 2);
-        assert_eq!(shortlist.skills[0].skill_name, "deploy");
-        assert_eq!(shortlist.skills[0].aliases, vec!["ship-it"]);
-        assert_eq!(shortlist.skills[0].category.as_deref(), Some("ops"));
-        assert_eq!(shortlist.skills[1].rank, 2);
-    }
     /// audit-A4: remote_skill_http_client must have connect_timeout and timeout.
     /// Remote skill URLs are attacker-controllable via skill manifests — without
     /// a timeout, a malicious skill server hangs the agent loop forever.

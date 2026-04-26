@@ -178,7 +178,7 @@ fn build_hook_db_persist_from_payload(
     }
     let turn_verification_summary = hook_payload
         .get("turn_count")
-        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| valid_turn_number(Some(value)))
         .and_then(|turn| u32::try_from(turn).ok())
         .filter(|_| tool_calls.len() == 1)
         .and_then(|turn| turn_verification_summary_from_journal(&session_id, turn));
@@ -279,9 +279,7 @@ fn build_hook_db_persist_from_payload(
     let mutation_objective_score =
         crate::pipeline::learning::build_learning_outcome_from_payload(payload)
             .and_then(|outcome| serde_json::to_value(outcome.mutation_objective_score()).ok());
-    let turn_number = hook_payload
-        .get("turn_count")
-        .and_then(serde_json::Value::as_i64);
+    let turn_number = valid_turn_number(hook_payload.get("turn_count"));
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
         session_id: session_id.clone(),
@@ -353,10 +351,7 @@ fn build_hook_db_persist_from_payload(
     };
     let derived_shortlist = hook_payload
         .get("skill_selector_shortlist")
-        .and_then(parse_skill_selector_shortlist_trace_value)
-        .or_else(|| {
-            crate::turn::skill_tool::parse_skill_selector_shortlist_from_messages(&messages)
-        });
+        .and_then(parse_skill_selector_shortlist_trace_value);
     let skill_selector_metric = hook_payload
         .get("skill_selector_metric")
         .and_then(parse_turn_skill_selector_metric_record)
@@ -568,15 +563,20 @@ async fn resolve_reflection_transfer(
     }
 }
 
+fn valid_turn_number(value: Option<&serde_json::Value>) -> Option<i64> {
+    const MAX_TURN_NUMBER: i64 = 1_i64 << 31;
+    value
+        .and_then(serde_json::Value::as_i64)
+        .filter(|turn| (0..MAX_TURN_NUMBER).contains(turn))
+}
+
 fn truncate_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        text.to_string()
+    let mut chars = text.chars();
+    let truncated = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
     } else {
-        let mut end = limit;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text[..end].to_string()
+        text.to_string()
     }
 }
 
@@ -900,7 +900,7 @@ mod inprocess_hook_contract_tests {
         TurnReflectionStateStore, build_turn_hook_args,
     };
 
-    use super::run_bridge_hook_side_effects;
+    use super::{run_bridge_hook_side_effects, truncate_text};
 
     #[derive(Clone, Default)]
     struct RecordingHookDbWriter {
@@ -1083,7 +1083,7 @@ mod inprocess_hook_contract_tests {
             "id": "call-skill-2",
             "function": {"name": "skill", "arguments": "{\"skill_name\": \"ship-it\"}"}
         })];
-        Value::Object(build_turn_hook_args(
+        let mut payload = build_turn_hook_args(
             "user-1",
             "session-1",
             &messages,
@@ -1100,7 +1100,38 @@ mod inprocess_hook_contract_tests {
             true,
             true,
             true,
-        ))
+        );
+        payload.insert(
+            "skill_selector_shortlist".to_string(),
+            json!({
+                "open_catalog": true,
+                "visible_skill_count": 2,
+                "skills": [
+                    {
+                        "rank": 1,
+                        "skill_name": "inspect",
+                        "aliases": [],
+                        "description": "inspect cluster",
+                        "source": "test",
+                        "category": null
+                    },
+                    {
+                        "rank": 2,
+                        "skill_name": "deploy",
+                        "aliases": ["ship-it"],
+                        "description": "deploy service",
+                        "source": "test",
+                        "category": null
+                    }
+                ],
+                "telemetry": {
+                    "selector_tier": "lexical",
+                    "elapsed_ms": 1,
+                    "total_catalog_size": 2
+                }
+            }),
+        );
+        Value::Object(payload)
     }
 
     fn build_hook_payload_text_only() -> Value {
@@ -1445,7 +1476,7 @@ mod inprocess_hook_contract_tests {
     }
 
     #[tokio::test]
-    async fn hook_derives_skill_selector_metric_from_skill_listing_message() {
+    async fn hook_derives_skill_selector_metric_from_structured_shortlist() {
         let hook_writer = RecordingHookDbWriter::default();
         run_bridge_hook_side_effects(
             Some(build_hook_payload_with_derived_skill_metric()),
@@ -1491,6 +1522,39 @@ mod inprocess_hook_contract_tests {
         let plans = hook_writer.plans.lock().await;
         assert_eq!(plans.len(), 1);
         assert!(plans[0].skill_selector_metric.is_none());
+    }
+
+    #[tokio::test]
+    async fn hook_does_not_derive_skill_selector_metric_with_invalid_turn_count() {
+        let mut payload = build_hook_payload_with_derived_skill_metric();
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .insert("turn_count".to_string(), json!(-1));
+        let hook_writer = RecordingHookDbWriter::default();
+
+        run_bridge_hook_side_effects(
+            Some(payload),
+            Arc::new(hook_writer.clone()),
+            Arc::new(RecordingReflectionStateStore::default()),
+            Arc::new(RecordingReflectionLessonWriter::default()),
+            Arc::new(RecordingObserverWorker::default()),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].skill_selector_metric.is_none());
+    }
+
+    #[test]
+    fn truncate_text_preserves_utf8_and_marks_truncation() {
+        let input = "你好🚀".repeat(1000);
+        let truncated = truncate_text(&input, 5);
+        assert_eq!(truncated, "你好🚀你好…");
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 
     #[tokio::test]
