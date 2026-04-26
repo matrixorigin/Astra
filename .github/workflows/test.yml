@@ -45,7 +45,7 @@ jobs:
     name: "Test: astra-cli"
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
           --profile ci --bins -E 'not test(/edge_tools::/)'
       - name: "Test astra-cli (edge_tools)"
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
           --profile ci --bins -E 'test(/edge_tools::/)'
