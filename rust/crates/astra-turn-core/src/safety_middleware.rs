@@ -443,10 +443,17 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
 
     // 4. Command substitution / backticks — dynamic execution hidden in arguments
     if check_command_substitution(command) {
-        return Some(
-            "shell command contains command substitution (`$(...)` or backticks), which can execute hidden commands dynamically"
-                .to_string(),
-        );
+        let hint = if command_has_interpreter_inline_code(command) {
+            ". For `node -e` / `python3 -c` with template literals or `$(...)`, \
+             use single quotes around the code argument (e.g. `node -e '...'`) \
+             or write the script to a file first"
+        } else {
+            ""
+        };
+        return Some(format!(
+            "shell command contains command substitution (`$(...)` or backticks), \
+             which can execute hidden commands dynamically{hint}"
+        ));
     }
 
     // 5. Inline interpreter execution check removed.
@@ -624,6 +631,20 @@ fn check_command_substitution(command: &str) -> bool {
     }
 
     false
+}
+
+/// Detect `node -e "..."` / `python3 -c "..."` patterns where the inline
+/// code argument is double-quoted (making `$()` and backticks dangerous).
+fn command_has_interpreter_inline_code(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let interpreters = [
+        "node -e ",
+        "node -e\"",
+        "nodejs -e ",
+        "python3 -c ",
+        "python -c ",
+    ];
+    interpreters.iter().any(|pat| lower.contains(pat))
 }
 
 /// Check if command has backticks outside of single quotes
@@ -1767,6 +1788,35 @@ mod tests {
             &json!({"command": r#"node --eval "require('fs').readFileSync('/etc/passwd', 'utf8')""#}),
         );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn node_e_backtick_error_includes_single_quote_hint() {
+        // When node -e code uses backticks (JS template literals) inside double
+        // quotes, the error should guide the LLM to use single quotes or a file.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"node -e "const x = `hello`; console.log(x)""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("single quotes") || reason.contains("write the script to a file")
+        ));
+    }
+
+    #[test]
+    fn python_c_dollar_paren_error_includes_single_quote_hint() {
+        // When python3 -c code uses $() inside double quotes, guide the LLM.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"python3 -c "import os; os.system($(get_cmd))""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("single quotes") || reason.contains("write the script to a file")
+        ));
     }
 
     #[test]
