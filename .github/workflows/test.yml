@@ -36,16 +36,35 @@ jobs:
   # ── Stage 2: parallel offline test shards (all need: build) ────────
   #
   # Shard balance (test counts):
-  #   shard-a: astra-cli (2550)                    — heaviest, shell tests need process isolation
+  #   shard-a: astra-cli (split by edge_tools group) — shell tests need process isolation
   #   shard-b: astra-runtime (3151) + contracts (19) + trusted_moi (4)
   #   shard-c: astra-turn-core (2167) + astra-services (1186)
   #   shard-d: core crates ~2460 + bridge-e2e-hooks (3176, mostly overlaps runtime)
 
   shard-a:
-    name: "Test: astra-cli"
+    name: "Test: astra-cli (${{ matrix.segment }})"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - segment: non-edge
+            filter: "not test(/edge_tools::/)"
+            command_timeout: 15m
+          - segment: edge-shell
+            filter: "test(/edge_tools::shell::/)"
+            command_timeout: 20m
+          - segment: edge-fs-tools
+            filter: "test(/edge_tools::fs_tools::/)"
+            command_timeout: 15m
+          - segment: edge-git-gix
+            filter: "test(/edge_tools::git_gix::/)"
+            command_timeout: 15m
+          - segment: edge-rest
+            filter: "test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::fs_tools::/) and not test(/edge_tools::git_gix::/)"
+            command_timeout: 15m
 
     steps:
       - uses: actions/checkout@v4
@@ -56,15 +75,13 @@ jobs:
           workspaces: rust
           shared-key: ci-test
           save-if: false
-      - name: "Test astra-cli (non-edge_tools)"
+      - name: "Test astra-cli (${{ matrix.segment }})"
+        env:
+          NEXTEST_FILTER: ${{ matrix.filter }}
         run: >-
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
-          --profile ci --bins -E 'not test(/edge_tools::/)'
-      - name: "Test astra-cli (edge_tools)"
-        timeout-minutes: 25
-        run: >-
-          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
-          --profile ci --bins -E 'test(/edge_tools::/)'
+          timeout ${{ matrix.command_timeout }} cargo nextest run
+          --manifest-path rust/Cargo.toml -p astra-cli
+          --profile ci --bins -E "$NEXTEST_FILTER"
       - name: Dump processes on failure
         if: failure()
         run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
