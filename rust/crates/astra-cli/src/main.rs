@@ -972,6 +972,12 @@ async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     diagnostic_log::init_cli_observability(&cli);
+    // Apply safety.trust_mode from runtime config to the global guard.
+    // Defaults to Strict — users must explicitly opt in via
+    // `~/.astra/config/runtime.toml` [safety] trust_mode = "trusted".
+    astra_runtime::apply_safety_config_from_runtime_config(
+        &astra_runtime::runtime_config::RuntimeConfig::load(),
+    );
     // Resolve API URL: --api-url flag > ASTRA_API_URL env var > config file > default
     let base = command_router::resolve_api_url(cli.api_url.as_deref());
     let api = match astra_thin_client::ThinClient::new(&base, None) {

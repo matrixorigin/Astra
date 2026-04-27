@@ -63,6 +63,56 @@ pub struct RuntimeConfig {
     /// Adaptive tuning engine parameters (cooldowns, cycle intervals).
     #[serde(default)]
     pub adaptive_tuning: AdaptiveTuningConfig,
+
+    /// Safety-guard configuration.
+    ///
+    /// Controls shell-obfuscation guard relaxation for trusted local
+    /// environments. Defaults to Strict — never flip this silently.
+    #[serde(default)]
+    pub safety: SafetyConfig,
+}
+
+/// Safety-guard configuration.
+///
+/// Kept deliberately small — this struct is a contract between config files
+/// and the runtime. The `trust_mode` field maps 1:1 to
+/// `astra_turn_core::safety_middleware::TrustMode` (kept as a `String` here
+/// to avoid a cross-crate dep).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SafetyConfig {
+    /// Trust level for shell-obfuscation checks.
+    ///
+    /// - `"strict"` (default) — all rules fire. Safe for any environment.
+    /// - `"trusted"` — opt-in developer-local relaxation of high-false-positive
+    ///   rules (command substitution). Prompt-injection defenses still apply.
+    ///
+    /// Unknown values fail to parse (no silent fallback).
+    #[serde(default = "default_trust_mode")]
+    pub trust_mode: TrustModeSerde,
+}
+
+/// Serializable trust-mode string. Matches the snake-case variants of
+/// `astra_turn_core::safety_middleware::TrustMode`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustModeSerde {
+    #[default]
+    Strict,
+    Trusted,
+}
+
+fn default_trust_mode() -> TrustModeSerde {
+    TrustModeSerde::Strict
+}
+
+// String comparison helpers for tests (the canonical comparison is by enum).
+impl PartialEq<&str> for TrustModeSerde {
+    fn eq(&self, other: &&str) -> bool {
+        match self {
+            TrustModeSerde::Strict => *other == "strict",
+            TrustModeSerde::Trusted => *other == "trusted",
+        }
+    }
 }
 
 fn default_config_version() -> String {
@@ -83,6 +133,7 @@ impl Default for RuntimeConfig {
             memory_pressure: MemoryPressureConfig::default(),
             context_window: ContextWindowConfig::default(),
             adaptive_tuning: AdaptiveTuningConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 }
@@ -1146,6 +1197,7 @@ impl RuntimeConfig {
             memory_pressure,
             context_window,
             adaptive_tuning,
+            safety,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1587,6 +1639,14 @@ impl RuntimeConfig {
             default_tuning_cycle_interval(),
         );
 
+        // SafetyConfig: whole-struct replace when the other side has an
+        // explicit Trusted setting. Strict (default) doesn't override, so
+        // layering a "Trusted" project config over a "Strict" user config
+        // yields Trusted (explicit opt-in always wins).
+        if matches!(safety.trust_mode, TrustModeSerde::Trusted) {
+            self.safety = safety;
+        }
+
         self
     }
 
@@ -1836,6 +1896,7 @@ mod tests {
                 budget_cooldown_turns: 6,
                 tuning_cycle_interval: 8,
             },
+            safety: SafetyConfig::default(),
         });
 
         assert_eq!(merged.version, "2.0");
@@ -2230,6 +2291,37 @@ selector_model = "qwen-flash"
         let profile = &parsed.tool_selection.model_profiles[0];
         assert_eq!(profile.model_match, "gpt-5");
         assert_eq!(profile.max_identical_tool_calls, 6);
+    }
+
+    #[test]
+    fn safety_config_defaults_to_strict_trust_mode() {
+        // TrustMode::Strict is the safe default. Shipping with Trusted would
+        // turn a fail-closed guard into fail-open — never do that implicitly.
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.safety.trust_mode, "strict");
+    }
+
+    #[test]
+    fn safety_trust_mode_parses_from_toml() {
+        let toml = r#"
+            version = "1.0"
+            [safety]
+            trust_mode = "trusted"
+        "#;
+        let parsed: RuntimeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.safety.trust_mode, "trusted");
+    }
+
+    #[test]
+    fn safety_trust_mode_rejects_unknown_values_by_serde() {
+        // Guard against typos silently becoming Strict — fail loudly.
+        let toml = r#"
+            version = "1.0"
+            [safety]
+            trust_mode = "yolo"
+        "#;
+        let result: Result<RuntimeConfig, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown trust_mode should fail to parse");
     }
 
     #[test]

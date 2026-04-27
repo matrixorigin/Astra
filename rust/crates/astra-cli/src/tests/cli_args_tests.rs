@@ -225,6 +225,51 @@ fn cli_config_set_subcommand() {
 }
 
 #[test]
+fn cli_config_show_policy_with_model() {
+    // Parse the new `astra config show-policy --model <id>` subcommand.
+    let cli = Cli::try_parse_from(["astra", "config", "show-policy", "--model", "opus"]).unwrap();
+    match cli.command {
+        Some(Command::Config(ConfigCmd::ShowPolicy(ref args))) => {
+            assert_eq!(args.model.as_deref(), Some("opus"));
+            assert!(!args.json, "json flag defaults to false");
+        }
+        _ => panic!("expected Config ShowPolicy command"),
+    }
+}
+
+#[test]
+fn cli_config_show_policy_without_model_means_global_defaults() {
+    // Omitting --model should resolve the global (no-model) policy.
+    let cli = Cli::try_parse_from(["astra", "config", "show-policy"]).unwrap();
+    match cli.command {
+        Some(Command::Config(ConfigCmd::ShowPolicy(ref args))) => {
+            assert!(args.model.is_none());
+        }
+        _ => panic!("expected Config ShowPolicy command"),
+    }
+}
+
+#[test]
+fn cli_config_show_policy_json_flag() {
+    let cli = Cli::try_parse_from([
+        "astra",
+        "config",
+        "show-policy",
+        "--model",
+        "haiku",
+        "--json",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Config(ConfigCmd::ShowPolicy(ref args))) => {
+            assert_eq!(args.model.as_deref(), Some("haiku"));
+            assert!(args.json);
+        }
+        _ => panic!("expected Config ShowPolicy command"),
+    }
+}
+
+#[test]
 fn cli_chat_with_model() {
     let cli = Cli::try_parse_from(["astra", "chat", "-m", "hello", "--model", "gpt-4o"]).unwrap();
     match cli.command {

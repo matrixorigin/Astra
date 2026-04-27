@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use regex::Regex;
 use serde_json::Value;
@@ -110,6 +111,29 @@ const ROLE_IDENTITY_WORDS: &[&str] = &[
 pub enum SafetyMiddlewareDecision {
     Allow,
     Deny(String),
+}
+
+/// Opt-in relaxation level for shell-obfuscation checks.
+///
+/// - [`TrustMode::Strict`] (default) — all 13 shell guards fire; safe for
+///   multi-tenant / hostile-input environments.
+/// - [`TrustMode::Trusted`] — loosens the "high false-positive" rules that
+///   commonly trip on legitimate shell idioms (`gh --body "$(cat file)"`,
+///   `export VAR=$(git rev-parse HEAD)`). **Every rule that defends against
+///   prompt injection with no legitimate use case stays on** — `eval`,
+///   `${!...}`, `@P`, heredoc-to-interpreter, carriage returns, Unicode
+///   spoofing, `/proc/*/environ`, obfuscated flags, etc.
+///
+/// Intended for single-user developer-local sessions where the user is the
+/// trusted principal. Should not be enabled on shared servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustMode {
+    /// Fail-safe default. All shell-obfuscation rules active.
+    #[default]
+    Strict,
+    /// Developer opt-in — relax high-FP rules only.
+    Trusted,
 }
 
 /// Error returned when a safety guard cannot evaluate input (fail-closed: treated as deny).
@@ -412,11 +436,63 @@ fn shell_obfuscation_guard(
     let Some(command) = tool_args.get("command").and_then(Value::as_str) else {
         return Ok(None);
     };
-    Ok(check_shell_command_safety(command))
+    Ok(check_shell_command_safety_with_mode(
+        command,
+        current_trust_mode(),
+    ))
 }
 
+/// Global trust mode used by [`shell_obfuscation_guard`].
+///
+/// Defaults to [`TrustMode::Strict`]. Runtime startup (or a CLI flag) may
+/// call [`set_global_trust_mode`] once to flip the process into Trusted
+/// mode — intended only for single-user developer-local sessions.
+///
+/// Uses `AtomicU8` rather than a mutex so reads on the hot path have no
+/// lock overhead. Atomic writes are relaxed because the value is a simple
+/// enum and staleness-by-one-write is acceptable.
+static CURRENT_TRUST_MODE: AtomicU8 = AtomicU8::new(TRUST_MODE_STRICT);
+
+const TRUST_MODE_STRICT: u8 = 0;
+const TRUST_MODE_TRUSTED: u8 = 1;
+
+/// Read the global trust mode. Hot-path-safe; no locks.
+#[must_use]
+pub fn current_trust_mode() -> TrustMode {
+    match CURRENT_TRUST_MODE.load(Ordering::Relaxed) {
+        TRUST_MODE_TRUSTED => TrustMode::Trusted,
+        _ => TrustMode::Strict,
+    }
+}
+
+/// Override the global trust mode. Intended to be called once at startup
+/// from a trusted configuration source (e.g. `RuntimeConfig::load()` +
+/// explicit user opt-in). Calling from untrusted input is a bug.
+pub fn set_global_trust_mode(mode: TrustMode) {
+    let value = match mode {
+        TrustMode::Strict => TRUST_MODE_STRICT,
+        TrustMode::Trusted => TRUST_MODE_TRUSTED,
+    };
+    CURRENT_TRUST_MODE.store(value, Ordering::Relaxed);
+}
+
+/// Back-compatible entry point — equivalent to
+/// [`check_shell_command_safety_with_mode`] with [`TrustMode::Strict`].
+///
+/// Existing callers see no behavior change. New call sites that need the
+/// relaxed behavior should use the `_with_mode` variant.
 #[must_use]
 pub fn check_shell_command_safety(command: &str) -> Option<String> {
+    check_shell_command_safety_with_mode(command, TrustMode::Strict)
+}
+
+/// Shell-obfuscation guard with explicit [`TrustMode`].
+///
+/// See [`TrustMode`] for the exact contract. In [`TrustMode::Trusted`],
+/// rule 4 (unsafe command substitution) is skipped; every other rule still
+/// fires so prompt-injection defenses remain intact.
+#[must_use]
+pub fn check_shell_command_safety_with_mode(command: &str, mode: TrustMode) -> Option<String> {
     // 1. Indirect expansion ${!...} — dynamically constructs variable names
     if command.contains("${!") {
         return Some(
@@ -441,8 +517,13 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 4. Command substitution / backticks — dynamic execution hidden in arguments
-    if check_command_substitution(command) {
+    // 4. Command substitution / backticks — dynamic execution hidden in
+    //    arguments. Categorized high-false-positive: `gh --body "$(cat md)"`,
+    //    `export VAR=$(git rev-parse HEAD)` etc. are routine. Relaxed in
+    //    TrustMode::Trusted so developer-local sessions aren't harassed.
+    //    Prompt-injection defenses don't rely on this rule — rules 1/2/3
+    //    (indirect expansion, @P, eval) cover the true attack paths.
+    if matches!(mode, TrustMode::Strict) && check_command_substitution(command) {
         let hint = if command_has_interpreter_inline_code(command) {
             ". For `node -e` / `python3 -c` with template literals or `$(...)`, \
              use single quotes around the code argument (e.g. `node -e '...'`) \
@@ -2548,5 +2629,196 @@ assert!(!sanitized.content.contains("you are now a hacker"));"#;
         assert!(sanitized.content.contains("redacted 1 credential"));
         assert!(!sanitized.content.contains("ignore previous"));
         assert!(!sanitized.content.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    // ── TrustMode tests ─────────────────────────────────────────────
+    //
+    // TrustMode::Trusted is an opt-in relaxation for developer-local use.
+    // It only loosens the "high false-positive" rules (currently rule 4 —
+    // unsafe command substitution). Every "true-attack-only" rule (eval,
+    // ${!...}, @P, \r, /proc/*/environ, zsh dangerous, Unicode spoofing,
+    // obfuscated flags, interpreter stdin/heredoc) must still fire in
+    // Trusted mode — these have no legitimate use.
+
+    #[test]
+    fn strict_mode_is_the_default_and_blocks_unsafe_subst() {
+        // `curl` is intentionally not in the SAFE_SUBST_COMMANDS whitelist,
+        // so Strict blocks this command substitution.
+        let decision = check_shell_command_safety_with_mode(
+            r#"TOKEN=$(curl -s https://example.com/token)"#,
+            TrustMode::Strict,
+        );
+        assert!(
+            decision
+                .as_deref()
+                .is_some_and(|r| r.contains("command substitution")),
+            "Strict mode must still block unsafe `$(...)`, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_allows_unsafe_command_substitution() {
+        // Same command as above — in Trusted mode, rule 4 is skipped so the
+        // developer can use `$(curl ...)` for local work without fighting
+        // the guard. True-attack rules (eval, ${!...}, @P, \r) still apply.
+        let decision = check_shell_command_safety_with_mode(
+            r#"TOKEN=$(curl -s https://example.com/token)"#,
+            TrustMode::Trusted,
+        );
+        assert!(
+            decision.is_none(),
+            "Trusted mode should allow `$(curl ...)` idiom, got blocked with: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_allows_gh_pr_create_heredoc_style_idiom() {
+        // Another real user example that mixes an arg-flag with a
+        // command substitution of a non-whitelisted command.
+        let decision = check_shell_command_safety_with_mode(
+            r#"gh api repos/x/y/pulls --method POST --input - < <(jq -n '{"title":"x"}')"#,
+            TrustMode::Trusted,
+        );
+        // The only potential trigger here is rule 4 (`<(...)` is process
+        // substitution, close cousin to command substitution). If rule 4
+        // fires on it, relaxing rule 4 should free it.
+        // `jq` is not in SAFE_SUBST_COMMANDS.
+        assert!(
+            decision.is_none(),
+            "Trusted mode should allow process substitution idiom, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_still_blocks_eval_payload() {
+        // true-attack-only rules must stay on in Trusted mode.
+        let decision =
+            check_shell_command_safety_with_mode(r#"eval "$PAYLOAD""#, TrustMode::Trusted);
+        assert!(
+            decision.as_deref().is_some_and(|r| r.contains("eval")),
+            "Trusted mode must still block eval, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_still_blocks_indirect_expansion() {
+        let decision =
+            check_shell_command_safety_with_mode(r#"echo ${!payload}"#, TrustMode::Trusted);
+        assert!(
+            decision
+                .as_deref()
+                .is_some_and(|r| r.contains("indirect expansion")),
+            "Trusted mode must still block `${{!...}}`, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_still_blocks_param_transformation() {
+        let decision =
+            check_shell_command_safety_with_mode(r#"printf %s ${payload@P}"#, TrustMode::Trusted);
+        assert!(
+            decision.as_deref().is_some_and(|r| r.contains("@P")),
+            "Trusted mode must still block `${{...@P}}`, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_still_blocks_carriage_return_attack() {
+        let decision =
+            check_shell_command_safety_with_mode("echo safe\rrm -rf /", TrustMode::Trusted);
+        assert!(
+            decision
+                .as_deref()
+                .is_some_and(|r| r.contains("carriage return")),
+            "Trusted mode must still block \\r, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_mode_still_blocks_interpreter_heredoc() {
+        // Rule 6 (heredoc to interpreter) is categorized true-attack-only.
+        let decision = check_shell_command_safety_with_mode(
+            "python3 - <<EOF\nimport os; os.system('x')\nEOF",
+            TrustMode::Trusted,
+        );
+        assert!(
+            decision
+                .as_deref()
+                .is_some_and(|r| r.contains("stdin or heredoc")),
+            "Trusted mode must still block heredoc-to-interpreter, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn backcompat_check_shell_command_safety_equals_strict_mode() {
+        // The legacy 1-arg entry point must stay identical to Strict mode
+        // so existing callers see no behavior change until they opt in.
+        let cmd = r#"gh pr create --body "$(cat pr-body.md)""#;
+        assert_eq!(
+            check_shell_command_safety(cmd),
+            check_shell_command_safety_with_mode(cmd, TrustMode::Strict)
+        );
+    }
+
+    #[test]
+    fn trust_mode_default_is_strict() {
+        // Defensive — `Default::default()` must not accidentally relax.
+        assert_eq!(TrustMode::default(), TrustMode::Strict);
+    }
+
+    // Serializes the global-state integration tests so they don't race.
+    static GLOBAL_TRUST_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn global_trust_mode_defaults_to_strict_and_guard_respects_it() {
+        let _g = GLOBAL_TRUST_MODE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Save & restore global state
+        let prior = current_trust_mode();
+        set_global_trust_mode(TrustMode::Strict);
+        assert_eq!(current_trust_mode(), TrustMode::Strict);
+
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"TOKEN=$(curl -s https://x.com/t)"#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(ref reason)
+                if reason.contains("shell_obfuscation")
+                && reason.contains("command substitution")
+        ));
+
+        set_global_trust_mode(prior);
+    }
+
+    #[test]
+    fn flipping_global_trust_mode_to_trusted_relaxes_guard() {
+        let _g = GLOBAL_TRUST_MODE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = current_trust_mode();
+        set_global_trust_mode(TrustMode::Trusted);
+
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"TOKEN=$(curl -s https://x.com/t)"#}),
+        );
+        assert_eq!(
+            decision,
+            SafetyMiddlewareDecision::Allow,
+            "Trusted mode must allow curl substitution end-to-end"
+        );
+
+        // true-attack rules must STILL fire even after the flip.
+        let eval_decision =
+            evaluate_tool_safety_request("bash", &json!({"command": r#"eval "$PAYLOAD""#}));
+        assert!(matches!(
+            eval_decision,
+            SafetyMiddlewareDecision::Deny(ref reason) if reason.contains("eval")
+        ));
+
+        set_global_trust_mode(prior);
     }
 }

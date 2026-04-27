@@ -103,6 +103,23 @@ pub use astra_core::*;
 // from needing a direct astra-turn-core dependency.
 pub use astra_turn_core::recent_arg_hints;
 
+/// Apply the `safety.trust_mode` field from a [`astra_config::RuntimeConfig`]
+/// to the global safety guard state.
+///
+/// Call once at startup from any process that wants the runtime_config
+/// TOML to be authoritative. Calling from user input / request args is a
+/// bug — `TrustMode::Trusted` is an opt-in trust delegation from the
+/// operator, not the LLM.
+pub fn apply_safety_config_from_runtime_config(cfg: &astra_config::RuntimeConfig) {
+    use astra_config::TrustModeSerde;
+    use astra_turn_core::safety_middleware::{TrustMode, set_global_trust_mode};
+    let mode = match cfg.safety.trust_mode {
+        TrustModeSerde::Strict => TrustMode::Strict,
+        TrustModeSerde::Trusted => TrustMode::Trusted,
+    };
+    set_global_trust_mode(mode);
+}
+
 // ── Re-exports: service layer (via astra_services) ────────────────────────
 
 pub use astra_services::{

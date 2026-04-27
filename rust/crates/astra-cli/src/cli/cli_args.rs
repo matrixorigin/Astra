@@ -1074,6 +1074,8 @@ pub(crate) enum ConfigCmd {
     Get(ConfigGetArgs),
     /// Set a setting value
     Set(ConfigSetArgs),
+    /// Show the resolved workflow-guard policy for a model
+    ShowPolicy(ConfigShowPolicyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1088,4 +1090,15 @@ pub(crate) struct ConfigSetArgs {
     pub key: String,
     /// Setting value
     pub value: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigShowPolicyArgs {
+    /// Model id to resolve the policy for (substring-matched against
+    /// built-in and user profiles). Omit to show global defaults.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Emit the resolved policy as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
 }

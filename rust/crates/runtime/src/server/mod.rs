@@ -104,6 +104,12 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         );
     });
 
+    // Apply safety.trust_mode from runtime config before any request can
+    // reach the safety guards. Defaults to Strict; only flipped if the
+    // operator explicitly sets `[safety] trust_mode = "trusted"` in
+    // runtime.toml.
+    crate::apply_safety_config_from_runtime_config(&crate::runtime_config::RuntimeConfig::load());
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let settings = AppSettings::from_env()?;
     let state = state_builder::build_server_state(settings).await?;
