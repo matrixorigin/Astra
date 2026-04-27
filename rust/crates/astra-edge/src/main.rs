@@ -187,6 +187,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent("astra-edge/0.1")
+        .no_proxy()
         .build()
         .expect("Failed to create HTTP client");
     let ctx = astra_tools::ToolContext {

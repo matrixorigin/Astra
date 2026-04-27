@@ -820,6 +820,7 @@ pub async fn validate_connectivity(
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
         .build()
     {
         Ok(c) => c,
