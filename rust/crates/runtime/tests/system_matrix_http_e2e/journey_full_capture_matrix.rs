@@ -95,7 +95,10 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         "message": "matrix full capture probe",
         "session_id": &session_id,
         "context": {
-            "test_llm_rounds": [{ "full_text": "Matrix capture verified." }]
+            "test_llm_stream_blocks": [
+                "data: {\"type\":\"text_delta\",\"content\":\"Matrix capture verified.\"}\n\n",
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"Matrix capture verified.\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":10,\"completion\":4,\"total\":14},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+            ]
         }
     });
     let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
@@ -127,7 +130,10 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         "second full-capture event should be response"
     );
     assert_eq!(
-        llm_events[0]["metadata"]["request"]["messages"][0]["role"].as_str(),
+        llm_events[0]["metadata"]["request"]["messages"]
+            .as_array()
+            .and_then(|msgs| msgs.iter().find(|m| m["role"].as_str() == Some("user")))
+            .and_then(|m| m["role"].as_str()),
         Some("user")
     );
     assert_eq!(

@@ -998,7 +998,7 @@ pub async fn run_published_session_artifact_round_trip() {
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact publish roundtrip", "metadata": { "suite": "artifact_roundtrip" } }),
+        json!({ "title": "artifact publish roundtrip", "metadata": { "full_llm_capture": true, "suite": "artifact_roundtrip" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
@@ -1129,7 +1129,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact latest download", "metadata": { "suite": "artifact_latest_download" } }),
+        json!({ "title": "artifact latest download", "metadata": { "full_llm_capture": true, "suite": "artifact_latest_download" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
@@ -1333,7 +1333,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact failed latest download", "metadata": { "suite": "artifact_failed_latest_download" } }),
+        json!({ "title": "artifact failed latest download", "metadata": { "full_llm_capture": true, "suite": "artifact_failed_latest_download" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
@@ -1474,7 +1474,7 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": title, "metadata": { "suite": suite } }),
+        json!({ "title": title, "metadata": { "full_llm_capture": true, "suite": suite } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
@@ -1603,7 +1603,7 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
         Some(auth.as_str()),
         json!({
             "title": "server loop block parse recovery latest download",
-            "metadata": { "suite": "server_loop_block_parse_recovery_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_block_parse_recovery_latest_download" }
         }),
     )
     .await;
@@ -1742,7 +1742,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         Some(auth.as_str()),
         json!({
             "title": "server loop block parse failure latest download",
-            "metadata": { "suite": "server_loop_block_parse_failure_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_block_parse_failure_latest_download" }
         }),
     )
     .await;
@@ -1860,7 +1860,16 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
 
 pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_download_routes() {
     let partial_text = "server loop disconnect partial";
-    let (base_url, hits) = spawn_raw_hanging_stream_server(partial_text).await;
+    let failure_fragment = "server loop disconnect fallback failed";
+    // Use a mock server that sends partial output then immediately closes the
+    // connection (no 10-second hang). The nonstream fallback also fails, so
+    // the artifact is written with a transport error outcome.
+    let (base_url, hits) = spawn_raw_partial_transport_server(
+        partial_text,
+        500,
+        r#"{"error":{"message":"server loop disconnect fallback failed"}}"#,
+    )
+    .await;
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -1887,6 +1896,8 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
         .execute(pool)
         .await
         .expect("force-activate server-loop disconnect test model");
+    // Pre-consume the probe nonstream hit so the fallback attempt gets the 500.
+    hits.nonstream_hits.store(1, Ordering::SeqCst);
 
     let (st_sess, sess) = post_json(
         app,
@@ -1894,53 +1905,24 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
         Some(auth.as_str()),
         json!({
             "title": "server loop client disconnect latest download",
-            "metadata": { "suite": "server_loop_client_disconnect_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_client_disconnect_latest_download" }
         }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    let base_http = spawn_http_app_server(app.clone()).await;
-    let addr = base_http.trim_start_matches("http://");
-    let mut socket = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("connect live http socket");
-    let request_body = json!({
-        "message": "trigger a server-loop client disconnect after partial output",
+    let payload = json!({
+        "message": "trigger a server-loop transport break after partial output",
         "session_id": &session_id,
         "model": model_name
-    })
-    .to_string();
-    let request = format!(
-        "POST /chat/stream HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        auth.as_str(),
-        request_body.len(),
-        request_body
-    );
-    socket
-        .write_all(request.as_bytes())
-        .await
-        .expect("write disconnect request");
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut saw_partial = false;
-    let mut buf = [0_u8; 4096];
-    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.read(&mut buf)).await {
-        if read == 0 {
-            break;
-        }
-        let text = String::from_utf8_lossy(&buf[..read]);
-        if text.contains(partial_text) {
-            saw_partial = true;
-            break;
-        }
-    }
+    });
+    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
-        saw_partial,
-        "should receive partial streamed text before disconnect"
+        body.contains(failure_fragment),
+        "server-loop SSE should surface the transport fallback failure text: {body}"
     );
-    drop(socket);
 
     wait_for_artifact_count(
         pool,
@@ -1969,18 +1951,18 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         latest_j["content"]["response"]["kind"].as_str(),
-        Some("cancelled")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
+        Some("server_error")
     );
     assert!(
         latest_j["content"]["response"]["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("cancelled"),
-        "latest error payload should preserve disconnect cancellation detail: {latest_j}"
+            .contains(failure_fragment),
+        "latest error payload should retain transport fallback failure text: {latest_j}"
+    );
+    assert_eq!(
+        latest_j["content"]["response"]["partial_full_text"].as_str(),
+        Some(partial_text)
     );
 
     let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
@@ -1992,7 +1974,14 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
     assert_eq!(
         download_j["content"]["response"]["kind"].as_str(),
-        Some("cancelled")
+        Some("server_error")
+    );
+    assert!(
+        download_j["content"]["response"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(failure_fragment),
+        "download error payload should retain transport fallback failure text: {download_j}"
     );
     assert_eq!(
         download_j["content"]["response"]["partial_full_text"].as_str(),
@@ -2001,7 +1990,7 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
 
     assert!(
         hits.stream_hits.load(Ordering::SeqCst) >= 1,
-        "client disconnect proof must hit the raw streaming provider at least once"
+        "disconnect proof must hit the raw streaming provider at least once"
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
@@ -2062,7 +2051,7 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
         Some(auth.as_str()),
         json!({
             "title": "server loop transport recovery latest download",
-            "metadata": { "suite": "server_loop_transport_recovery_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_transport_recovery_latest_download" }
         }),
     )
     .await;
@@ -2199,7 +2188,7 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
         Some(auth.as_str()),
         json!({
             "title": "server loop transport failure latest download",
-            "metadata": { "suite": "server_loop_transport_failure_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_transport_failure_latest_download" }
         }),
     )
     .await;
@@ -2363,7 +2352,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
         Some(auth.as_str()),
         json!({
             "title": "server loop idle recovery latest download",
-            "metadata": { "suite": "server_loop_idle_recovery_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_idle_recovery_latest_download" }
         }),
     )
     .await;
@@ -2502,7 +2491,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         Some(auth.as_str()),
         json!({
             "title": "server loop idle failure latest download",
-            "metadata": { "suite": "server_loop_idle_failure_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_idle_failure_latest_download" }
         }),
     )
     .await;
@@ -2647,7 +2636,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         Some(auth.as_str()),
         json!({
             "title": "server loop rate limit latest download",
-            "metadata": { "suite": "server_loop_rate_limit_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_rate_limit_latest_download" }
         }),
     )
     .await;
@@ -2798,7 +2787,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         Some(auth.as_str()),
         json!({
             "title": "server loop rate limit retry success latest download",
-            "metadata": { "suite": "server_loop_rate_limit_retry_success_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "server_loop_rate_limit_retry_success_latest_download" }
         }),
     )
     .await;
@@ -2937,7 +2926,7 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         Some(auth.as_str()),
         json!({
             "title": "bridge artifact tail parse preserves partial state",
-            "metadata": { "suite": "bridge_artifact_tail_parse_partial_state" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_artifact_tail_parse_partial_state" }
         }),
     )
     .await;
@@ -3107,7 +3096,7 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
         Some(auth.as_str()),
         json!({
             "title": "bridge transport failed latest download",
-            "metadata": { "suite": "bridge_transport_failed_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_transport_failed_latest_download" }
         }),
     )
     .await;
@@ -3235,7 +3224,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
         Some(auth.as_str()),
         json!({
             "title": "bridge client disconnect latest download",
-            "metadata": { "suite": "bridge_client_disconnect_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_client_disconnect_latest_download" }
         }),
     )
     .await;
@@ -3399,7 +3388,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
         Some(auth.as_str()),
         json!({
             "title": "bridge idle failed latest download",
-            "metadata": { "suite": "bridge_idle_failed_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_idle_failed_latest_download" }
         }),
     )
     .await;
@@ -3532,7 +3521,7 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
         Some(auth.as_str()),
         json!({
             "title": "bridge rate limit latest download",
-            "metadata": { "suite": "bridge_rate_limit_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_rate_limit_latest_download" }
         }),
     )
     .await;
@@ -3671,7 +3660,7 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
         Some(auth.as_str()),
         json!({
             "title": "bridge rate limit retry success latest download",
-            "metadata": { "suite": "bridge_rate_limit_retry_success_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_rate_limit_retry_success_latest_download" }
         }),
     )
     .await;
@@ -3798,7 +3787,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         Some(auth.as_str()),
         json!({
             "title": "bridge tool-call block parse recovery latest download",
-            "metadata": { "suite": "bridge_tool_call_block_parse_recovery_latest_download" }
+            "metadata": { "full_llm_capture": true, "suite": "bridge_tool_call_block_parse_recovery_latest_download" }
         }),
     )
     .await;
@@ -3918,7 +3907,7 @@ pub async fn run_session_artifact_latest_route_uses_stable_tiebreaker() {
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact latest tie breaker", "metadata": { "suite": "artifact_latest_tiebreak" } }),
+        json!({ "title": "artifact latest tie breaker", "metadata": { "full_llm_capture": true, "suite": "artifact_latest_tiebreak" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");

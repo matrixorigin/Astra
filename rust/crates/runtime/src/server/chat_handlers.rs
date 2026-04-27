@@ -126,6 +126,12 @@ fn chat_stream_bridge_fallback_payload(
 ) -> serde_json::Value {
     let allow_skills = normalize_bridge_allowlist(chat_data.allow_skills.as_deref());
     let allow_tools = normalize_bridge_allowlist(chat_data.allow_tools.as_deref());
+    // Hoist test_llm_stream_blocks from context to top-level so bridge can find it.
+    let test_llm_stream_blocks = chat_data
+        .context
+        .as_ref()
+        .and_then(|c| c.get("test_llm_stream_blocks"))
+        .cloned();
     serde_json::json!({
         "session_id": chat_data.session_id.as_deref(),
         "agent_id": chat_data.agent_id.as_deref(),
@@ -140,6 +146,7 @@ fn chat_stream_bridge_fallback_payload(
         "context": chat_data.context.as_ref(),
         "execution_budget": chat_data.execution_budget.as_ref(),
         "explain": chat_data.explain,
+        "test_llm_stream_blocks": test_llm_stream_blocks,
         "messages": [
             {
                 "role": "user",

@@ -185,7 +185,7 @@ async fn e2e_matrix_chat_stream_session_info() {
     journey_extended::run_chat_stream_session_info_smoke().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
 async fn e2e_matrix_stream_session_metadata_enables_full_llm_exchange_journaling() {
     require_system_e2e_env();
