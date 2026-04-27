@@ -9,7 +9,7 @@ Rust-first agent platform for auditable chat runs, session history, replay, skil
 ```bash
 cp .env.example .env                       # fill in MEMORIA_MASTER_KEY + MEMORIA_EMBEDDING_API_KEY
 cp .models.yaml.example .models.yaml       # fill in your LLM API keys
-make dev-init                              # generate JWT_SECRET_KEY + TOKEN_ENCRYPTION_KEY
+make dev-init                              # generate JWT_SECRET_KEY + TOKEN_ENCRYPTION_KEY + CHAT_TURN_BRIDGE_SECRET
 ```
 
 ### 2. Build

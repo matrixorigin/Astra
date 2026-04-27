@@ -654,6 +654,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_str_replace_dry_run_does_not_write() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(tmp.path().join("f.txt"), "old text here").unwrap();
+        let result = exec
+            .execute(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "f.txt",
+                    "old_str": "old text",
+                    "new_str": "new text",
+                    "dry_run": true
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "got: {}", result.output);
+        assert!(
+            result.output.contains("[DRY RUN]"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "old text here");
+    }
+
+    #[tokio::test]
     async fn dispatch_env() {
         let (_tmp, exec) = test_executor();
         let result = exec

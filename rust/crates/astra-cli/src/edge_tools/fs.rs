@@ -770,10 +770,10 @@ impl ToolExecutor {
         let count = content.matches(old_str).count();
         if count == 0 {
             let norm_count = super::fuzzy_replacer::quote_normalized_match_count(&content, old_str);
-            if norm_count > 1 {
+            if norm_count > 1 && !replace_all {
                 self.record_fuzzy_match_event(
                     &path,
-                    "quote-normalized",
+                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
                     astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
                 );
                 return format!(
@@ -786,11 +786,20 @@ impl ToolExecutor {
             if let Some(fuzzy_match) =
                 super::fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
             {
+                let replacement = if fuzzy_match.is_quote_normalized() {
+                    super::fuzzy_replacer::preserve_quote_style(
+                        old_str,
+                        fuzzy_match.actual,
+                        new_str,
+                    )
+                } else {
+                    new_str.to_string()
+                };
                 let actual: &str = &fuzzy_match.actual;
                 let new_content = if replace_all {
-                    content.replace(actual, new_str)
+                    content.replace(actual, &replacement)
                 } else {
-                    content.replacen(actual, new_str, 1)
+                    content.replacen(actual, &replacement, 1)
                 };
                 if dry_run {
                     self.record_fuzzy_match_event(
@@ -807,7 +816,7 @@ impl ToolExecutor {
                 let turn_idx = self
                     .journal_turn_index
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let journal_call_id = if fuzzy_match.strategy == "quote-normalized" {
+                let journal_call_id = if fuzzy_match.is_quote_normalized() {
                     format!("str_replace_quote_norm:{}", path.display())
                 } else {
                     format!("str_replace_fuzzy:{}", path.display())
@@ -826,7 +835,7 @@ impl ToolExecutor {
                         if format_result.is_some() {
                             self.record_write(&path);
                         }
-                        let mut result = if fuzzy_match.strategy == "quote-normalized" {
+                        let mut result = if fuzzy_match.is_quote_normalized() {
                             String::from(
                                 "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
                             )
@@ -837,7 +846,7 @@ impl ToolExecutor {
                             )
                         };
                         let old_lines: Vec<&str> = fuzzy_match.actual.lines().collect();
-                        let new_lines: Vec<&str> = new_str.lines().collect();
+                        let new_lines: Vec<&str> = replacement.lines().collect();
                         if old_lines.len().max(new_lines.len()) <= 10 {
                             for l in &old_lines {
                                 result.push_str(&format!("- {l}\n"));
@@ -867,6 +876,18 @@ impl ToolExecutor {
                     }
                     Err(e) => return format!("Error writing file: {e}"),
                 }
+            }
+            if replace_all && norm_count > 1 {
+                self.record_fuzzy_match_event(
+                    &path,
+                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
+                    astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+                );
+                return format!(
+                    "Error: old_str matches {norm_count} occurrences after normalizing curly quotes, \
+                     but the file contains mixed curly quote forms. \
+                     Cannot safely replace_all with inconsistent quoting styles."
+                );
             }
             self.record_fuzzy_match_event(
                 &path,
@@ -2499,7 +2520,7 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                 if normalize_ws(line) == norm_first {
                     msg.push_str(&format!("  Possible match at line {}\n", i + 1));
                     // Show a few lines of actual content
-                    let end = (i + old_lines.len().min(5)).min(lines.len());
+                    let end = (i + old_lines.len()).min(lines.len());
                     for (j, line_content) in lines[i..end].iter().enumerate() {
                         msg.push_str(&format!("  {}: {}\n", i + j + 1, line_content));
                     }
@@ -2532,7 +2553,7 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                 // Show context around first match
                 let line_idx = matches[0] - 1;
                 let start = line_idx;
-                let end = (line_idx + old_lines.len() + 1).min(lines.len());
+                let end = (line_idx + old_lines.len()).min(lines.len());
                 msg.push_str("Actual file content:\n");
                 for (j, line_content) in lines[start..end].iter().enumerate() {
                     msg.push_str(&format!("  {}: {}\n", start + j + 1, line_content));
@@ -2543,11 +2564,13 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
 
     // Strategy 3: If multi-line, check how many lines match
     if old_lines.len() > 1 {
+        let file_line_set: std::collections::HashSet<&str> =
+            lines.iter().map(|l| l.trim()).collect();
         let matching_count = old_lines
             .iter()
             .filter(|ol| {
                 let trimmed = ol.trim();
-                !trimmed.is_empty() && lines.iter().any(|fl| fl.trim() == trimmed)
+                !trimmed.is_empty() && file_line_set.contains(trimmed)
             })
             .count();
         if matching_count > 0 {
@@ -3144,6 +3167,101 @@ type Handler interface {
         // Verify actual file content
         let actual = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(actual, "let x = \"world\";");
+    }
+
+    #[test]
+    fn str_replace_preserves_curly_quotes_from_file_on_quote_normalized_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("curly-preserve.rs");
+        std::fs::write(&file_path, "let x = \u{201C}hello\u{201D};").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "curly-preserve.rs"}));
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "curly-preserve.rs",
+            "old_str": "let x = \"hello\";",
+            "new_str": "let x = \"world\";"
+        }));
+        assert!(
+            result.contains("curly quotes"),
+            "should mention normalization: {result}"
+        );
+        let actual = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(actual, "let x = \u{201C}world\u{201D};");
+    }
+
+    // F1: edge_tools whitespace hint should show all old_lines context, not capped at 5
+    #[test]
+    fn str_replace_not_found_hint_whitespace_full_span_edge_tools() {
+        let content =
+            "  fn big() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    f();\n  }\n";
+        let old_str = "fn big() {\n  a();\n  b();\n  c();\n  d();\n  e();\n  f();\n}";
+        let msg = str_replace_not_found_hint(content, old_str);
+        assert!(
+            msg.contains("whitespace-normalized"),
+            "should trigger whitespace hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("f();"),
+            "should show all 8 lines of context (not capped at 5), got: {msg}"
+        );
+    }
+
+    // F2: first-line hint should show exactly old_lines.len() context, not +1
+    #[test]
+    fn str_replace_not_found_hint_first_line_no_extra_line_edge_tools() {
+        let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
+        let old_str = "fn foo() {\n    bar();\n    qux();\n}";
+        let msg = str_replace_not_found_hint(content, old_str);
+        assert!(
+            msg.contains("Actual file content"),
+            "should trigger first-line hint, got: {msg}"
+        );
+        assert!(
+            !msg.contains("footer"),
+            "should not show extra line beyond old_str span, got: {msg}"
+        );
+    }
+
+    // F3: individual-lines check should use HashSet for O(n+m) perf
+    // (This is a correctness test — same behavior, ensures the optimization doesn't break anything)
+    #[test]
+    fn str_replace_not_found_hint_individual_lines_edge_tools() {
+        let msg = str_replace_not_found_hint("aaa\nbbb\nccc\n", "aaa\nXXX\nccc");
+        assert!(
+            msg.contains("lines from old_str exist individually"),
+            "got: {msg}"
+        );
+    }
+
+    // Issue #1: replace_all + mixed curly-quote forms → specific error (not generic hint)
+    #[test]
+    fn str_replace_replace_all_mixed_curly_quotes_gives_specific_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("mixed-curly.txt");
+        // Two occurrences with different curly-quote forms
+        std::fs::write(
+            &file_path,
+            "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done",
+        )
+        .unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "mixed-curly.txt"}));
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "mixed-curly.txt",
+            "old_str": "\"a\"",
+            "new_str": "\"b\"",
+            "replace_all": true
+        }));
+        assert!(
+            result.contains("Error"),
+            "should error on mixed curly-quote forms: {result}"
+        );
+        assert!(
+            result.contains("curly quote"),
+            "error should mention curly quotes, got: {result}"
+        );
     }
 
     #[test]

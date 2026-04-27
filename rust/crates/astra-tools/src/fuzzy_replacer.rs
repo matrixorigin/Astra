@@ -20,12 +20,22 @@
 //! Inspired by opencode (anomalyco/opencode) and Cline's replacer strategies.
 
 #![allow(dead_code)]
+
+pub const STRATEGY_QUOTE_NORMALIZED: &str = "quote-normalized";
+
 /// Result of a fuzzy match: the actual content substring and which strategy matched.
+#[derive(Debug)]
 pub struct FuzzyMatch<'a> {
     /// The actual substring from the file content to replace.
     pub actual: &'a str,
     /// Human-readable name of the strategy that matched.
     pub strategy: &'static str,
+}
+
+impl FuzzyMatch<'_> {
+    pub fn is_quote_normalized(&self) -> bool {
+        self.strategy == STRATEGY_QUOTE_NORMALIZED
+    }
 }
 
 /// Try all fuzzy replacer strategies in cascade order.
@@ -42,7 +52,9 @@ pub fn fuzzy_find_replacement<'a>(
         ("line-number-stripped", |c, s| {
             line_number_stripped_find(c, s)
         }),
-        ("quote-normalized", |c, s| quote_normalized_find(c, s)),
+        (STRATEGY_QUOTE_NORMALIZED, |c, s| {
+            quote_normalized_find(c, s)
+        }),
         ("line-trimmed", |c, s| line_trimmed_find(c, s)),
         ("block-anchor", |c, s| block_anchor_find(c, s)),
         ("whitespace-normalized", |c, s| {
@@ -56,33 +68,27 @@ pub fn fuzzy_find_replacement<'a>(
     ];
 
     for (name, strategy_fn) in strategies {
-        let matches = strategy_fn(content, old_str);
-        if replace_all && !matches.is_empty() {
-            // For replace_all, verify the match exists in content
-            if content.contains(&matches[0]) {
-                // Find the actual slice in content
-                if let Some(pos) = content.find(&matches[0]) {
-                    return Some(FuzzyMatch {
-                        actual: &content[pos..pos + matches[0].len()],
-                        strategy: name,
-                    });
-                }
+        let mut matches = strategy_fn(content, old_str);
+        matches.dedup();
+        if matches.is_empty() {
+            continue;
+        }
+        if matches.len() > 1 {
+            if replace_all {
+                return None;
+            }
+            continue;
+        }
+        let actual = &matches[0];
+        if let Some(pos) = content.find(actual) {
+            let is_unique = !content[pos + actual.len()..].contains(actual);
+            if is_unique || replace_all {
+                return Some(FuzzyMatch {
+                    actual: &content[pos..pos + actual.len()],
+                    strategy: name,
+                });
             }
         }
-        if matches.len() == 1 {
-            // Verify uniqueness: the matched string should appear exactly once
-            if let Some(pos) = content.find(&matches[0]) {
-                let remaining = &content[pos + matches[0].len()..];
-                let is_unique = !remaining.contains(&matches[0]);
-                if is_unique || replace_all {
-                    return Some(FuzzyMatch {
-                        actual: &content[pos..pos + matches[0].len()],
-                        strategy: name,
-                    });
-                }
-            }
-        }
-        // 0 matches → try next; >1 matches → ambiguous, try next
     }
     None
 }
@@ -192,13 +198,47 @@ fn strip_line_number_prefix(line: &str) -> &str {
 /// Match after normalizing curly/smart quotes to ASCII quotes.
 /// Handles: LLMs and copy-paste from docs/web often producing U+2018/2019/201C/201D.
 fn quote_normalized_find(content: &str, old_str: &str) -> Vec<String> {
-    if quote_normalized_match_count(content, old_str) != 1 {
+    let norm_search = normalize_quotes(old_str);
+    let norm_content = normalize_quotes(content);
+    if !norm_content.contains(&norm_search) {
         return vec![];
     }
 
-    quote_normalized_actual(content, old_str)
-        .map(|actual| vec![actual.to_string()])
-        .unwrap_or_default()
+    let content_indices: Vec<usize> = content
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(content.len()))
+        .collect();
+    let norm_indices: Vec<usize> = norm_content
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(norm_content.len()))
+        .collect();
+
+    let mut results = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel_pos) = norm_content[search_from..].find(&norm_search) {
+        let pos = search_from + rel_pos;
+        let start_char = norm_indices
+            .partition_point(|&i| i <= pos)
+            .saturating_sub(1);
+        let end_pos = pos + norm_search.len();
+        let end_char = norm_indices.partition_point(|&i| i < end_pos);
+        if let (Some(&cs), Some(&ce)) = (
+            content_indices.get(start_char),
+            content_indices.get(end_char),
+        ) {
+            let actual = &content[cs..ce];
+            if !results.contains(&actual.to_string()) {
+                results.push(actual.to_string());
+            }
+        }
+        search_from = pos + norm_search.len();
+        if results.len() > 2 {
+            break;
+        }
+    }
+    results
 }
 
 // ─── Strategy 1: LineTrimmedReplacer ────────────────────────────────────────
@@ -545,34 +585,91 @@ fn normalize_quotes(s: &str) -> String {
         .replace(['\u{201C}', '\u{201D}'], "\"")
 }
 
-fn quote_normalized_actual<'a>(content: &'a str, search: &str) -> Option<&'a str> {
-    let norm_search = normalize_quotes(search);
-    let norm_content = normalize_quotes(content);
-    let pos = norm_content.find(&norm_search)?;
-
-    let mut content_indices: Vec<usize> = content.char_indices().map(|(i, _)| i).collect();
-    content_indices.push(content.len());
-    let mut norm_indices: Vec<usize> = norm_content.char_indices().map(|(i, _)| i).collect();
-    norm_indices.push(norm_content.len());
-    let start_char = norm_indices
-        .partition_point(|&i| i <= pos)
-        .saturating_sub(1);
-    let end_pos = pos + norm_search.len();
-    let end_char = norm_indices.partition_point(|&i| i < end_pos);
-    let content_start = *content_indices.get(start_char)?;
-    let content_end = *content_indices.get(end_char)?;
-    Some(&content[content_start..content_end])
-}
-
 pub fn quote_normalized_match_count(content: &str, search: &str) -> usize {
     let norm_search = normalize_quotes(search);
     let norm_content = normalize_quotes(content);
     norm_content.matches(&norm_search).count()
 }
 
+pub fn preserve_quote_style(old_str: &str, actual_old_str: &str, new_str: &str) -> String {
+    if old_str == actual_old_str {
+        return new_str.to_string();
+    }
+
+    let has_double_quotes =
+        actual_old_str.contains('\u{201C}') || actual_old_str.contains('\u{201D}');
+    let has_single_quotes =
+        actual_old_str.contains('\u{2018}') || actual_old_str.contains('\u{2019}');
+
+    if !has_double_quotes && !has_single_quotes {
+        return new_str.to_string();
+    }
+
+    let mut result = new_str.to_string();
+    if has_double_quotes {
+        result = apply_curly_double_quotes(&result);
+    }
+    if has_single_quotes {
+        result = apply_curly_single_quotes(&result);
+    }
+    result
+}
+
 /// Collapse all whitespace to single spaces and trim.
-fn normalize_ws(s: &str) -> String {
+pub fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_opening_quote_context(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+
+    matches!(
+        chars[index - 1],
+        ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '\u{2014}' | '\u{2013}'
+    )
+}
+
+fn apply_curly_double_quotes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::with_capacity(s.len());
+    for (idx, ch) in chars.iter().enumerate() {
+        if *ch == '"' {
+            result.push(if is_opening_quote_context(&chars, idx) {
+                '\u{201C}'
+            } else {
+                '\u{201D}'
+            });
+        } else {
+            result.push(*ch);
+        }
+    }
+    result
+}
+
+fn apply_curly_single_quotes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::with_capacity(s.len());
+    for (idx, ch) in chars.iter().enumerate() {
+        if *ch == '\'' {
+            let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+            let next = chars.get(idx + 1).copied();
+            let is_contraction =
+                prev.is_some_and(char::is_alphabetic) && next.is_some_and(char::is_alphabetic);
+            let curly = if is_contraction {
+                '\u{2019}'
+            } else if is_opening_quote_context(&chars, idx) {
+                '\u{2018}'
+            } else {
+                '\u{2019}'
+            };
+            result.push(curly);
+        } else {
+            result.push(*ch);
+        }
+    }
+    result
 }
 
 /// Remove common leading indentation from all non-empty lines.
@@ -758,18 +855,209 @@ mod tests {
     }
 
     #[test]
-    fn quote_normalized_actual_returns_original_slice() {
-        let content = "let x = \u{201C}hello\u{201D};";
-        let search = "\"hello\"";
-        let found = quote_normalized_actual(content, search);
-        assert_eq!(found, Some("\u{201C}hello\u{201D}"));
-    }
-
-    #[test]
     fn quote_normalized_match_count_handles_curly_quotes() {
         let content = "let x = \"hello\";\nlet y = \"hello\";";
         let search = "let x = \u{201C}hello\u{201D};";
         assert_eq!(quote_normalized_match_count(content, search), 1);
+    }
+
+    #[test]
+    fn preserve_quote_style_applies_curly_double_quotes() {
+        let result = preserve_quote_style(
+            "let x = \"hello\";",
+            "let x = \u{201C}hello\u{201D};",
+            "let x = \"world\";",
+        );
+        assert_eq!(result, "let x = \u{201C}world\u{201D};");
+    }
+
+    #[test]
+    fn preserve_quote_style_keeps_apostrophes_as_right_single_quotes() {
+        let result = preserve_quote_style("\"don't\"", "\u{201C}don\u{2019}t\u{201D}", "\"won't\"");
+        assert_eq!(result, "\u{201C}won\u{2019}t\u{201D}");
+    }
+
+    #[test]
+    fn fuzzy_replace_all_aborts_on_distinct_actual_matches() {
+        // Safety: when replace_all finds distinct actual substrings (different
+        // indentation), abort the entire cascade to avoid partial/wrong replacements.
+        let content = "  fn hi() {\n    a();\n  }\n\n\tfn hi() {\n\t  a();\n\t}\n";
+        let search = "fn hi() {\n  a();\n}";
+        let result = fuzzy_find_replacement(content, search, true);
+        assert!(result.is_none(), "got unexpected match");
+    }
+
+    #[test]
+    fn fuzzy_replace_all_quote_normalized_with_identical_matches() {
+        let content = "say \u{201C}hi\u{201D} and \u{201C}hi\u{201D} again";
+        let search = "\"hi\"";
+        let result = fuzzy_find_replacement(content, search, true);
+        assert!(
+            result.is_some(),
+            "should match identical curly-quoted strings"
+        );
+        let m = result.unwrap();
+        assert_eq!(m.strategy, STRATEGY_QUOTE_NORMALIZED);
+    }
+
+    #[test]
+    fn is_quote_normalized_returns_false_for_other_strategies() {
+        let content = "    fn foo() {\n        bar();\n    }";
+        let search = "fn foo() {\n    bar();\n}";
+        let result = fuzzy_find_replacement(content, search, false);
+        assert!(result.is_some());
+        assert!(!result.unwrap().is_quote_normalized());
+    }
+
+    #[test]
+    fn preserve_quote_style_both_double_and_single_quotes() {
+        let result = preserve_quote_style(
+            "She said \"don't\"",
+            "She said \u{201C}don\u{2019}t\u{201D}",
+            "She said \"won't\"",
+        );
+        assert_eq!(result, "She said \u{201C}won\u{2019}t\u{201D}");
+    }
+
+    #[test]
+    fn preserve_quote_style_no_curly_quotes_returns_unchanged() {
+        let result = preserve_quote_style("hello", "hello", "world");
+        assert_eq!(result, "world");
+    }
+
+    #[test]
+    fn apply_curly_double_quotes_no_quotes_returns_unchanged() {
+        assert_eq!(
+            apply_curly_double_quotes("no quotes here"),
+            "no quotes here"
+        );
+    }
+
+    #[test]
+    fn apply_curly_double_quotes_opening_and_closing() {
+        assert_eq!(
+            apply_curly_double_quotes("say \"hi\" ok"),
+            "say \u{201C}hi\u{201D} ok"
+        );
+    }
+
+    #[test]
+    fn apply_curly_double_quotes_after_open_paren() {
+        assert_eq!(
+            apply_curly_double_quotes("(\"test\")"),
+            "(\u{201C}test\u{201D})"
+        );
+    }
+
+    #[test]
+    fn apply_curly_single_quotes_contraction() {
+        assert_eq!(apply_curly_single_quotes("don't"), "don\u{2019}t");
+    }
+
+    #[test]
+    fn apply_curly_single_quotes_opening_closing() {
+        assert_eq!(
+            apply_curly_single_quotes("say 'hi' ok"),
+            "say \u{2018}hi\u{2019} ok"
+        );
+    }
+
+    #[test]
+    fn apply_curly_single_quotes_at_string_start() {
+        assert_eq!(
+            apply_curly_single_quotes("'hello'"),
+            "\u{2018}hello\u{2019}"
+        );
+    }
+
+    #[test]
+    fn apply_curly_single_quotes_trailing_apostrophe() {
+        assert_eq!(apply_curly_single_quotes("test'"), "test\u{2019}");
+    }
+
+    #[test]
+    fn is_opening_quote_context_after_em_dash() {
+        let chars: Vec<char> = "x\u{2014}\"y".chars().collect();
+        assert!(is_opening_quote_context(&chars, 2));
+    }
+
+    #[test]
+    fn is_opening_quote_context_after_en_dash() {
+        let chars: Vec<char> = "x\u{2013}\"y".chars().collect();
+        assert!(is_opening_quote_context(&chars, 2));
+    }
+
+    #[test]
+    fn is_opening_quote_context_at_index_zero() {
+        let chars: Vec<char> = "\"hi".chars().collect();
+        assert!(is_opening_quote_context(&chars, 0));
+    }
+
+    #[test]
+    fn is_opening_quote_context_after_letter_is_false() {
+        let chars: Vec<char> = "x\"y".chars().collect();
+        assert!(!is_opening_quote_context(&chars, 1));
+    }
+
+    // Issue #2: strategy functions should return distinct matches, not count copies
+    #[test]
+    fn quote_normalized_find_returns_distinct_match_not_count_copies() {
+        let content = "\u{201C}a\u{201D} and \u{201C}a\u{201D}";
+        let matches = quote_normalized_find(content, "\"a\"");
+        // Should return 1 distinct match, not 2 copies of the same string.
+        // The cascade can check content.matches(actual).count() for replace_all.
+        assert_eq!(
+            matches.len(),
+            1,
+            "should return distinct matches only, got: {matches:?}"
+        );
+    }
+
+    // ─── Issue #1: mixed curly-quote forms should all be found ──────────
+    #[test]
+    fn quote_normalized_find_returns_all_distinct_forms() {
+        // Content has \u{201C}a\u{201D} (open-close) AND \u{201C}a\u{201C} (open-open, malformed)
+        // Both normalize to "a", but they are different actual byte sequences.
+        let content = "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done";
+        let matches = quote_normalized_find(content, "\"a\"");
+        assert_eq!(
+            matches.len(),
+            2,
+            "should find both distinct curly-quote forms, got: {matches:?}"
+        );
+        let mut sorted = matches.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 2, "the two forms should be distinct strings");
+    }
+
+    #[test]
+    fn replace_all_mixed_curly_quotes_aborts_on_distinct_forms() {
+        // Safety: when replace_all finds distinct actual substrings (different
+        // curly-quote styles), abort to avoid partial replacement.
+        let content = "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done";
+        let result = fuzzy_find_replacement(content, "\"a\"", true);
+        assert!(
+            result.is_none(),
+            "should abort on distinct curly-quote forms, got: {result:?}"
+        );
+    }
+
+    // ─── Cascade: replace_all with identical duplicate matches ──────────
+    #[test]
+    fn replace_all_with_duplicate_strategy_results_should_succeed() {
+        // Two identical blocks at different positions. line_trimmed_find returns
+        // two results with the same actual string. replace_all should still work
+        // because content.replace(actual, new) handles all occurrences.
+        let content = "  foo()\n  bar()\n\n  foo()\n  bar()";
+        let search = "foo()\nbar()";
+        let result = fuzzy_find_replacement(content, search, true);
+        assert!(
+            result.is_some(),
+            "replace_all should succeed when strategy returns identical matches"
+        );
+        let m = result.unwrap();
+        assert_eq!(m.strategy, "line-trimmed");
     }
 
     // ─── LineTrimmedReplacer ────────────────────────────────────────────────

@@ -44,6 +44,14 @@ else
     echo "✅ JWT_SECRET_KEY already configured"
 fi
 
+if ! grep -q "^CHAT_TURN_BRIDGE_SECRET=" "$ENV_FILE" || grep -Eq "^CHAT_TURN_BRIDGE_SECRET=(|your-chat-turn-bridge-secret.*)$" "$ENV_FILE"; then
+    BRIDGE_KEY="$(openssl rand -hex 32)"
+    update_or_add "CHAT_TURN_BRIDGE_SECRET" "$BRIDGE_KEY"
+    echo "✅ Generated CHAT_TURN_BRIDGE_SECRET"
+else
+    echo "✅ CHAT_TURN_BRIDGE_SECRET already configured"
+fi
+
 # ── Optional: fast linker (mold) ──
 CARGO_CONFIG="$PROJECT_ROOT/rust/.cargo/config.toml"
 if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
