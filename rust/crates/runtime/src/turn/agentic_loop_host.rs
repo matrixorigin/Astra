@@ -1307,6 +1307,30 @@ pub(crate) mod tests {
         }
     }
 
+    fn tool_preamble_result(
+        preamble: &str,
+        tool_calls: Vec<Value>,
+        edge_tools: Vec<EdgeToolExecResult>,
+        prompt: u64,
+        completion: u64,
+        ttft: Option<u64>,
+    ) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                full_text: preamble.to_string(),
+                has_tool_calls: true,
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                tool_calls,
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: ttft,
+            edge_tool_round: edge_tools,
+            error_kind: None,
+        }
+    }
+
     pub(crate) fn make_edge_tool(name: &str, output: &str) -> EdgeToolExecResult {
         EdgeToolExecResult {
             request_id: format!("req-{name}"),
@@ -2045,6 +2069,108 @@ pub(crate) mod tests {
                 .iter()
                 .filter_map(|message| message.get("content").and_then(Value::as_str))
                 .any(|content| content.contains("Budget review"))
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_tool_churn_budget_exhaustion_is_partial_and_bounded() {
+        let large_bash_diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n{}",
+            "+ changed from bash git diff\n".repeat(4_000)
+        );
+        let large_structured_diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n{}",
+            "+ changed from structured git_diff\n".repeat(4_000)
+        );
+        let mut host = MockHost::new(vec![
+            tool_preamble_result(
+                "The changes look good; I will just inspect the diff.",
+                vec![json!({
+                    "id": "req-bash",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\":\"git diff -- src/\"}"
+                    }
+                })],
+                vec![make_edge_tool_with_args(
+                    "bash",
+                    json!({"command": "git diff -- src/"}),
+                    &large_bash_diff,
+                )],
+                90_000,
+                200,
+                Some(20),
+            ),
+            tool_preamble_result(
+                "Everything appears fixed after the diff.",
+                vec![json!({
+                    "id": "req-git_diff",
+                    "type": "function",
+                    "function": {
+                        "name": "git_diff",
+                        "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+                    }
+                })],
+                vec![make_edge_tool_with_args(
+                    "git_diff",
+                    json!({"path": "src", "ref": "HEAD"}),
+                    &large_structured_diff,
+                )],
+                95_000,
+                250,
+                Some(25),
+            ),
+            text_result("should never run", 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["bash", "git_diff"]);
+        let mut state = make_state();
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+        state.final_text = "stale success from a previous turn".to_string();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 2);
+        assert!(state.interruption.is_some(), "budget exhaustion is partial");
+        assert!(
+            state.final_text.contains("Turn budget exhausted"),
+            "budget exhaustion should surface resumable partial status"
+        );
+        assert!(
+            !state.final_text.contains("stale success")
+                && !state.final_text.contains("changes look good")
+                && !state.final_text.contains("Everything appears fixed"),
+            "tool-call preambles and stale success text must not become final output"
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+
+        let tool_contents: Vec<&str> = state
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect();
+        assert_eq!(tool_contents.len(), 2);
+        assert!(
+            tool_contents
+                .iter()
+                .all(|content| content.chars().count() <= 18_500),
+            "large diff/read outputs should be folded before replaying into the next prompt: {:?}",
+            tool_contents
+                .iter()
+                .map(|content| content.chars().count())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            tool_contents
+                .iter()
+                .any(|content| content.contains("truncated"))
+                || tool_contents
+                    .iter()
+                    .any(|content| content.contains("elided")),
+            "bounded tool messages should explain that output was folded"
         );
     }
 

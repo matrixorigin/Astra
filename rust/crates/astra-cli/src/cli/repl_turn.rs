@@ -4717,6 +4717,111 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_turn_replay_persists_observability_and_context_trace() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-turn-replay-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 4,
+            ..Default::default()
+        };
+        let partial_text =
+            "[budget_exhausted] 2 tool call(s) completed. You can continue in the next message.";
+        let mut result = stub_stream_result(partial_text);
+        result.prompt_tokens = 12_345;
+        result.completion_tokens = 234;
+        result.llm_rounds = Some(2);
+        result.tool_calls_count = 2;
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "tool_calls_completed": 2,
+            "user_message": partial_text,
+        }));
+        let mut llm_round = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::LlmRound,
+            Some(&sid),
+        );
+        llm_round.turn = Some(4);
+        llm_round.round = Some(1);
+        llm_round.tokens_in = Some(12_345);
+        llm_round.tokens_out = Some(234);
+        llm_round.metadata = Some(serde_json::json!({
+            "source": "agentic_loop",
+            "finish_reason": "tool_calls",
+        }));
+        result.turn_observability_events = vec![llm_round];
+        result.pending_context_assembly_trace = Some((
+            99,
+            serde_json::json!({
+                "turn_id": "turn-99",
+                "tools": {
+                    "tools_selected": [
+                        {"tool_name": "git_diff"},
+                        {"tool_name": "read_file"}
+                    ]
+                },
+                "token_budget": {"total_used": 12_345}
+            }),
+        ));
+
+        let learning = analyze_repl_turn_learning("continue", state.turn, &[], &result);
+        commit_turn_journal_workspace_and_sidecars(
+            &mut state,
+            "continue",
+            &result,
+            &learning,
+            Instant::now(),
+        );
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let llm_round = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::LlmRound)
+            .expect("persisted llm_round event");
+        assert_eq!(llm_round.turn, Some(4));
+        assert_eq!(llm_round.round, Some(1));
+        assert_eq!(
+            llm_round.metadata.as_ref().unwrap()["source"],
+            "agentic_loop"
+        );
+
+        let turn_event = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("persisted turn event");
+        assert_eq!(turn_event.turn, Some(4));
+        assert_eq!(turn_event.assistant_output.as_deref(), Some(partial_text));
+        let metadata = turn_event.metadata.as_ref().expect("turn metadata");
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["interruption_kind"], "budget_exhausted");
+        assert_eq!(metadata["interruption"]["tool_calls_completed"], 2);
+
+        let assembly_event = events
+            .iter()
+            .find(|event| {
+                event.event_type == session_journal::JournalEventType::ContextAssemblyRecorded
+            })
+            .expect("persisted context assembly event");
+        assert_eq!(assembly_event.turn, Some(4));
+        assert_eq!(
+            assembly_event.metadata.as_ref().unwrap()["trace_recorded"],
+            true
+        );
+        assert_eq!(
+            assembly_event.metadata.as_ref().unwrap()["turn_id"],
+            "turn-99"
+        );
+        assert_eq!(assembly_event.metadata.as_ref().unwrap()["tool_count"], 2);
+        assert_eq!(
+            assembly_event.metadata.as_ref().unwrap()["total_tokens"],
+            12_345
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
     fn apply_turn_success_clears_stale_prompt_hint_when_suppressed() {
         let (_tmp, _g) = isolated_sessions_dir();

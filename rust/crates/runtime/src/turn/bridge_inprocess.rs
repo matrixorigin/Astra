@@ -5908,6 +5908,83 @@ mod tests {
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
+    async fn forward_bridge_e2e_hooks_ignore_root_owned_journal_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        unsafe {
+            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        }
+        let session_id = "00000000-0000-0000-0000-000000000133";
+        let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
+        let mut headers = bridge_test_headers(session_id, true);
+        headers.insert(ROOT_TURN_JOURNAL_HEADER, "1".parse().unwrap());
+        let payload = json!({
+            "root_turn_journal_owned": true,
+            "messages": [{"role": "user", "content": "root-owned bridge capture"}],
+            "edge_tools": [],
+            "test_llm_stream_blocks": [
+                "data: {\"type\":\"text_delta\",\"content\":\"root-owned bridge reply\"}\n\n",
+                "data: {\"type\":\"usage\",\"prompt_tokens\":13,\"completion_tokens\":5}\n\n",
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"root-owned bridge reply\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":13,\"completion\":5,\"total\":18},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+            ]
+        });
+
+        let response = bridge
+            .forward(
+                &headers,
+                Bytes::from(payload.to_string()),
+                Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                Arc::new(crate::InMemoryTurnReflectionStateStore::default()),
+                Arc::new(crate::NoopTurnReflectionLessonWriter),
+                Arc::new(crate::NoopTurnObserverWorker),
+                Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                None,
+            )
+            .await
+            .expect("bridge forward");
+        let body = collect_response_body(response).await;
+        assert!(body.contains("root-owned bridge reply"));
+
+        let journal = wait_for_journal_events(session_id).await;
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert_eq!(
+            llm_events.len(),
+            2,
+            "expected request+response events: {journal:?}"
+        );
+        assert!(
+            journal
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("llm_round")),
+            "direct bridge e2e hooks intentionally ignore root-owned journal hints to avoid impersonating the root runtime: {journal:?}"
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["trace"]["session_turn_source"].as_str(),
+            Some("header")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
+            Some("root-owned bridge reply")
+        );
+
+        unsafe {
+            std::env::remove_var("ASTRA_BRIDGE_TEST_SECRET");
+        }
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
     async fn forward_persists_full_journal_rounds_from_round_index_across_same_session_turn() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
