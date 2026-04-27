@@ -99,7 +99,30 @@ impl ProviderCacheStrategy {
     /// proxies that serve Claude-named models.
     pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
         if let Some(provider) = provider.filter(|value| !value.trim().is_empty()) {
-            return Self::from_provider_hint(provider);
+            let from_provider = Self::from_provider_hint(provider);
+            // If the provider is explicitly Anthropic, trust it.
+            if from_provider.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
+                return from_provider;
+            }
+            // If the provider is a known non-Anthropic API (OpenAI, Gemini, etc.),
+            // respect that even when the model name contains "claude" — the caller
+            // is explicitly routing through a non-Anthropic endpoint.
+            // Unknown providers (e.g. openrouter, litellm) fall through to model
+            // detection so that Claude models served via proxy get the right protocol.
+            let lower = provider.to_ascii_lowercase();
+            let is_known_non_anthropic = lower.contains("openai")
+                || lower.contains("gemini")
+                || lower.contains("google")
+                || lower.contains("mistral")
+                || lower.contains("cohere")
+                || lower.contains("groq")
+                || lower.contains("together")
+                || lower.contains("deepseek")
+                || lower.contains("qwen")
+                || lower.contains("ollama");
+            if is_known_non_anthropic {
+                return from_provider;
+            }
         }
         model.map(Self::from_provider_hint).unwrap_or_default()
     }
@@ -2181,6 +2204,7 @@ mod tests {
 
     #[test]
     fn explicit_provider_takes_precedence_over_claude_named_model() {
+        // Known non-Anthropic providers override model name
         assert_eq!(
             CompactStrategy::from_provider_and_model(Some("openai"), Some("claude-sonnet-4")),
             CompactStrategy::Normalized
@@ -2188,6 +2212,15 @@ mod tests {
         assert_eq!(
             ProviderCacheStrategy::from_provider_and_model(Some("anthropic"), Some("gpt-4o"))
                 .prompt_cache_protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+        // Unknown proxy providers (openrouter, litellm) fall through to model detection
+        assert_eq!(
+            ProviderCacheStrategy::from_provider_and_model(
+                Some("openrouter"),
+                Some("claude-sonnet-4-20250514")
+            )
+            .prompt_cache_protocol,
             PromptCacheProtocol::AnthropicCacheControl
         );
     }

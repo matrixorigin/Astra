@@ -2689,9 +2689,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+            // In streaming mode, `text_delta` events were already sent to the client
+            // in real-time via `event_tx`. Exclude them from `streamed_final_events`
+            // to avoid double-emission. Terminal events (text_done, run_finished, etc.)
+            // are added by `finalize_run_events` and must still be sent.
             let streamed_final_events = super::run_handlers::transform_stream_run_events_for_client(
                 &bg_run_id,
-                final_events.clone(),
+                final_events
+                    .iter()
+                    .filter(|e| {
+                        e.get("type").and_then(serde_json::Value::as_str) != Some("text_delta")
+                    })
+                    .cloned()
+                    .collect(),
             );
             persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
             let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];

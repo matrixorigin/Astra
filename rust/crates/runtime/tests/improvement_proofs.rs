@@ -4224,7 +4224,7 @@ mod runtime_limits_proofs {
         // These were previously scattered across 6+ files as raw constants.
         // Now centralized with env-var override capability.
         let d = RuntimeLimits::default();
-        assert_eq!(d.max_turns, 50, "was MAX_TURNS in chat_stream.rs");
+        assert_eq!(d.max_turns, 150, "was MAX_TURNS in chat_stream.rs");
         assert_eq!(d.max_tool_rounds, 100, "was MAX_TOOL_ROUNDS in routing.rs");
         assert!(
             (d.turn_timeout_s - 300.0).abs() < f64::EPSILON,

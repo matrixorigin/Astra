@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn defaults_match_original_constants() {
         let d = RuntimeLimits::default();
-        assert_eq!(d.max_turns, 50);
+        assert_eq!(d.max_turns, 150);
         assert_eq!(d.plan_subtask_max_turns, 0);
         assert_eq!(d.max_tool_rounds, 100);
         assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);
