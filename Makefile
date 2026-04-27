@@ -503,7 +503,7 @@ test-online:
 		cp .env.example .env; \
 	fi
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	TEST_DB=astra_runtime_test; \
+	TEST_DB=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
 	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
 	DB_PORT=$${MATRIXONE_PORT:-6001}; \
 	DB_USER=$${MATRIXONE_USER:-root}; \
@@ -512,13 +512,11 @@ test-online:
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS \
 		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || \
 	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip-ssl \
-		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || \
-	mysql -h$$DB_HOST -P$$DB_PORT -u$$DB_USER -p$$DB_PASS --skip_ssl \
-		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;"; \
+		-e "DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;" 2>/dev/null || true; \
 	echo "Running astra-runtime ignored unit tests (live DB)..."; \
-	ASTRA_DATABASE=$$TEST_DB ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored; \
-	ASTRA_DATABASE=$$TEST_DB ASTRA_AUTO_CREATE_DATABASE=1 \
+	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 \
 		$(MAKE) test-ignored-integration
 	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \

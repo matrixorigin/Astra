@@ -67,6 +67,14 @@ async fn wait_for_full_capture_events(session_id: &str) -> Vec<Value> {
 }
 
 pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() {
+    let Some(test_secret) = std::env::var("ASTRA_BRIDGE_TEST_SECRET").ok() else {
+        // Bridge journal test requires ASTRA_BRIDGE_TEST_SECRET == CHAT_TURN_BRIDGE_SECRET.
+        // Without it the bridge auth fails and no journal is written.
+        // Mark as explicitly skipped rather than silently passing.
+        panic!(
+            "ASTRA_BRIDGE_TEST_SECRET not set — set it to the same value as CHAT_TURN_BRIDGE_SECRET to run this test"
+        );
+    };
     let temp = tempdir().expect("tempdir");
     let _guard = JournalDirGuard::new(temp.path());
 
@@ -101,7 +109,6 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
             ]
         }
     });
-    let test_secret = std::env::var("ASTRA_BRIDGE_TEST_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")
