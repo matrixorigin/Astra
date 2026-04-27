@@ -49,8 +49,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::ToolCallRecord;
@@ -88,8 +88,8 @@ pub struct HostTurnResult {
 }
 
 pub use astra_turn_core::interaction_types::{
-    ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
+    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence, TurnInteractionMode,
+    TurnInteractionPolicy, ASK_USER_TOOL_NAME,
 };
 
 /// Request for a hidden host-executed reflection subcall.
@@ -776,10 +776,10 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 
 #[allow(unused_imports)]
 pub(crate) use super::agentic_adaptive_tuning::{
-    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
-    apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
-    record_new_evolution_promotion_events, should_emit_adaptive_scenario_event,
-    snapshot_evolution_promotion_ids,
+    apply_adaptive_execution_profile, apply_per_turn_adaptation, apply_tactical_actions,
+    maybe_run_tuning_cycle, record_loop_completion_feedback, record_new_evolution_promotion_events,
+    should_emit_adaptive_scenario_event, snapshot_evolution_promotion_ids,
+    DEFAULT_TUNING_CYCLE_INTERVAL,
 };
 pub use super::agentic_loop_tool_support::delegate_tool_schema;
 #[allow(unused_imports)]
@@ -809,22 +809,22 @@ pub const DELEGATE_TOOL_NAME: &str = super::agentic_delegate_interception::DELEG
 
 #[allow(unused_imports)]
 pub(crate) use super::agentic_delegate_interception::{
-    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
-    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
-    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
-    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    coordination_pattern_name, delegation_adaptive_context, delegation_final_output_preview,
+    format_delegation_result, format_delegation_terminal_preview, is_delegation_call,
+    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
-    tool_call_arguments_value, tool_call_name,
+    tool_call_arguments_value, tool_call_name, DelegationAdaptiveContext,
+    DelegationExecutionResult, DelegationFinalOutputSource, DelegationOutcomeMetadata,
 };
 
 #[allow(unused_imports)]
 pub(crate) use super::agentic_auto_reflection::{
-    AUTO_REFLECTION_SIGNAL_THRESHOLD, maybe_trigger_auto_reflection,
+    maybe_trigger_auto_reflection, AUTO_REFLECTION_SIGNAL_THRESHOLD,
 };
 #[allow(unused_imports)]
 pub(crate) use super::agentic_loop_execution_phase::{
-    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
+    execute_turn_and_ingest_phase, TurnExecutionControl, TurnExecutionPhase,
 };
 #[allow(unused_imports)]
 pub(crate) use super::agentic_loop_finalization::{
@@ -833,10 +833,10 @@ pub(crate) use super::agentic_loop_finalization::{
 };
 #[allow(unused_imports)]
 pub(crate) use super::agentic_loop_lifecycle::{
-    PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
+    prepare_turn_iteration, run_loop_preamble, PreparedTurnIteration, TurnIterationPrep,
 };
 #[allow(unused_imports)]
-pub(crate) use super::agentic_loop_tool_phase::{TurnToolPhaseControl, execute_tool_phase};
+pub(crate) use super::agentic_loop_tool_phase::{execute_tool_phase, TurnToolPhaseControl};
 
 pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
@@ -1610,7 +1610,7 @@ pub(crate) mod tests {
         // Tokens accumulate across turns (+=)
         assert_eq!(state.total_prompt, 35); // 20 + 15
         assert_eq!(state.total_completion, 15); // 10 + 5
-        // Edge tool counted
+                                                // Edge tool counted
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
@@ -1850,13 +1850,11 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 3);
         assert_eq!(state.max_turns, 4);
         assert_eq!(state.final_text, "completed after extension");
-        assert!(
-            state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -1948,13 +1946,11 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert!(state.final_text.contains("Turn budget exhausted"));
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(!state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -2001,13 +1997,11 @@ pub(crate) mod tests {
         assert_eq!(host.current_turn, 3);
         assert_eq!(state.max_turns, 4);
         assert_eq!(state.final_text, "completed after exploratory extension");
-        assert!(
-            state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -2058,18 +2052,14 @@ pub(crate) mod tests {
             !state.final_text.contains("changes look good"),
             "budget exhaustion must overwrite stale success-shaped text"
         );
-        assert!(
-            state
-                .final_text
-                .contains("Turn budget exhausted after 2 agentic turn(s)")
-        );
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
+        assert!(state
+            .final_text
+            .contains("Turn budget exhausted after 2 agentic turn(s)"));
+        assert!(!state
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Budget review")));
     }
 
     #[tokio::test]
@@ -2153,10 +2143,16 @@ pub(crate) mod tests {
             .filter_map(|message| message.get("content").and_then(Value::as_str))
             .collect();
         assert_eq!(tool_contents.len(), 2);
+        // After folding, each tool result should be well below the original 50 000-char payloads.
+        // The observed folded sizes are ~922–1096 chars (FOLD_KEEP_CHARS=200 plus annotation
+        // and line-boundary overhead).  Using 1500 as a generous ceiling keeps the assertion
+        // coupled to realistic folding output rather than the old 18_500 that would silently
+        // pass even if folding regressed entirely.
+        const FOLD_BOUND_CHARS: usize = 1_500;
         assert!(
             tool_contents
                 .iter()
-                .all(|content| content.chars().count() <= 18_500),
+                .all(|content| content.chars().count() <= FOLD_BOUND_CHARS),
             "large diff/read outputs should be folded before replaying into the next prompt: {:?}",
             tool_contents
                 .iter()
@@ -2556,14 +2552,14 @@ pub(crate) mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    pub(crate) fn make_test_delegation_engine()
-    -> Arc<crate::server::delegation_engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine(
+    ) -> Arc<crate::server::delegation_engine::DelegationEngine> {
         use crate::server::delegation_engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
         use crate::server::run_engine::RunEngine;
-        use astra_services::AgentProfileRegistry;
         use astra_services::coordination::{AgentProfile, AgentTier};
+        use astra_services::AgentProfileRegistry;
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
@@ -2953,7 +2949,8 @@ pub(crate) mod tests {
         assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has`backtick`"));
         assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has\nnewline"));
         assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has\ttab"));
-        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string(&"a".repeat(129))); // too long
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string(&"a".repeat(129)));
+        // too long
     }
 
     #[test]
@@ -3379,7 +3376,7 @@ pub(crate) mod tests {
     #[test]
     fn skill_listing_system_message_format() {
         use crate::skills::manifest::SkillSourceKind;
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+        use crate::turn::skill_tool::{skill_listing_system_message, SkillToolInfo};
 
         let skills = vec![
             SkillToolInfo {
@@ -3467,7 +3464,7 @@ pub(crate) mod tests {
     #[test]
     fn skill_listing_refresh_updates_field() {
         use crate::skills::manifest::SkillSourceKind;
-        use crate::turn::skill_tool::{SkillToolInfo, skill_listing_system_message};
+        use crate::turn::skill_tool::{skill_listing_system_message, SkillToolInfo};
 
         let mut state = make_state();
 
@@ -3608,18 +3605,14 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
         assert_eq!(msg1.len(), 1);
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Follow these instructions carefully.")
-        );
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Follow these instructions carefully."));
 
         // Second call: stub (dedup)
         let msg2: Vec<&Value> = state
@@ -3675,24 +3668,20 @@ pub(crate) mod tests {
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_1"))
             .collect();
-        assert!(
-            msg1[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
+        assert!(msg1[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
 
         let msg2: Vec<&Value> = state
             .messages
             .iter()
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
             .collect();
-        assert!(
-            msg2[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: other-skill")
-        );
+        assert!(msg2[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: other-skill"));
 
         // Both tracked
         assert_eq!(state.skills.invoked.len(), 2);
@@ -3827,12 +3816,10 @@ pub(crate) mod tests {
             .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
             .collect();
         assert_eq!(skill_msgs.len(), 1);
-        assert!(
-            skill_msgs[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("# Skill: test-skill")
-        );
+        assert!(skill_msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Skill: test-skill"));
 
         // Skill exclusivity drop is now a debug log, not a user-facing headless line.
         // Verify the host did NOT receive any deferred notice (it goes to tracing now).
@@ -4774,8 +4761,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
     }
 
-    fn make_session()
-    -> std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>
+    fn make_session(
+    ) -> std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>
     {
         std::sync::Arc::new(std::sync::RwLock::new(
             crate::observability_integration::ObservabilitySession::new_simple("test-session"),
@@ -6197,7 +6184,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_all_8_default_rules_fire() {
-        use crate::auto_tuning::{FeedbackSignal, SignalType, default_rules};
+        use crate::auto_tuning::{default_rules, FeedbackSignal, SignalType};
 
         let hub = make_hub();
         // Load default evolution rules so the tuning engine has something to evaluate
@@ -7056,11 +7043,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
             state.pending_reflection_signals.len(),
             AUTO_REFLECTION_SIGNAL_THRESHOLD
         );
-        assert!(
-            host.emitted_lines
-                .iter()
-                .any(|line| line.contains("parse failed"))
-        );
+        assert!(host
+            .emitted_lines
+            .iter()
+            .any(|line| line.contains("parse failed")));
     }
 
     #[tokio::test]
@@ -7087,11 +7073,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
             state.pending_reflection_signals.len(),
             AUTO_REFLECTION_SIGNAL_THRESHOLD
         );
-        assert!(
-            host.emitted_lines
-                .iter()
-                .any(|line| line.contains("skipped:") && line.contains("network unavailable"))
-        );
+        assert!(host
+            .emitted_lines
+            .iter()
+            .any(|line| line.contains("skipped:") && line.contains("network unavailable")));
     }
 
     #[tokio::test]
@@ -8364,7 +8349,7 @@ mod parallel_execution_tests {
     /// Unit test for partition_tool_batches.
     #[test]
     fn partition_tool_batches_groups_correctly() {
-        use crate::turn::agentic_headless_round::{ToolBatch, partition_tool_batches};
+        use crate::turn::agentic_headless_round::{partition_tool_batches, ToolBatch};
         use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
 
         let tool_calls = vec![

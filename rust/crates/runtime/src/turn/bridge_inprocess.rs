@@ -5824,9 +5824,7 @@ mod tests {
     async fn forward_persists_full_journal_request_and_response_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
-        }
+        let _env_guard = temp_env::with_var("ASTRA_BRIDGE_TEST_SECRET", Some("bridge-journal-secret"));
         let session_id = "00000000-0000-0000-0000-000000000129";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
@@ -5901,19 +5899,16 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
 
-        unsafe {
-            std::env::remove_var("ASTRA_BRIDGE_TEST_SECRET");
-        }
+
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
-    async fn forward_bridge_e2e_hooks_ignore_root_owned_journal_hint() {
+    async fn forward_does_not_persist_full_journal_events_when_session_capture_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
-        }
+        let _env_guard =
+            temp_env::with_var("ASTRA_BRIDGE_TEST_SECRET", Some("bridge-journal-secret"));
         let session_id = "00000000-0000-0000-0000-000000000133";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let mut headers = bridge_test_headers(session_id, true);
@@ -5978,19 +5973,15 @@ mod tests {
             Some("root-owned bridge reply")
         );
 
-        unsafe {
-            std::env::remove_var("ASTRA_BRIDGE_TEST_SECRET");
-        }
-    }
 
+    }
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
     async fn forward_persists_full_journal_rounds_from_round_index_across_same_session_turn() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
-        }
+        let _env_guard =
+            temp_env::with_var("ASTRA_BRIDGE_TEST_SECRET", Some("bridge-journal-secret"));
         let session_id = "00000000-0000-0000-0000-000000000132";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
@@ -6072,20 +6063,17 @@ mod tests {
             .collect();
         assert_eq!(bridge_rounds, vec![Some(0), Some(1)]);
 
-        unsafe {
-            std::env::remove_var("ASTRA_BRIDGE_TEST_SECRET");
-        }
+
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
-    async fn forward_persists_full_journal_error_response_with_partial_state_when_session_capture_enabled()
+    async fn forward_persists_full_journal_error_response_with_partial_state_when_session_capture_enabled() {
      {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
-        }
+        let _env_guard =
+            temp_env::with_var("ASTRA_BRIDGE_TEST_SECRET", Some("bridge-journal-secret"));
         let session_id = "00000000-0000-0000-0000-000000000130";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, true);
@@ -6149,19 +6137,16 @@ mod tests {
             Some("header")
         );
 
-        unsafe {
-            std::env::remove_var("ASTRA_BRIDGE_TEST_SECRET");
-        }
+
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
-    async fn forward_does_not_persist_full_journal_events_when_session_capture_disabled() {
+    async fn forward_persists_full_journal_context_with_reasoning_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-        unsafe {
-            std::env::set_var("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
-        }
+        let _env_guard =
+            temp_env::with_var("ASTRA_BRIDGE_TEST_SECRET", Some("bridge-journal-secret"));
         let session_id = "00000000-0000-0000-0000-000000000131";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
         let headers = bridge_test_headers(session_id, false);
