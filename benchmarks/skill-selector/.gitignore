@@ -5,9 +5,7 @@ target/
 skills/
 
 # Run artifacts that should not be committed.
-results/*-rows.jsonl
-results/*-run.jsonl
-results/embedding-cache/
+results/
 
 # Python cruft.
 __pycache__/

@@ -12,7 +12,7 @@ benchmarks/skill-selector/
 ├── validator/     # Rust bin: sanity-checks SKILL.md / metadata of the corpus
 ├── scripts/       # Python: corpus curation, dataset generation, prototypes
 ├── dataset/       # primary.jsonl + catalog.jsonl + manifests (committed)
-├── results/       # *-summary.json snapshots from prior runs (committed)
+├── results/       # local benchmark outputs, NOT committed (see .gitignore)
 ├── skills.tar.gz  # 1000-skill corpus body (committed, 21 MB)
 └── skills/        # extracted corpus, NOT committed (see .gitignore)
 ```
@@ -49,9 +49,8 @@ Useful flags:
 - `--include-unpassed` count records that did not pass the LLM judge filter.
 
 The runner writes a per-prompt JSONL row plus an aggregate summary JSON
-(hit@1 / hit@3 / hit@5 / hit@14 etc.). Compare the new summary against the
-checked-in baselines in `results/` to see whether your selector change
-regressed accuracy.
+(hit@1 / hit@3 / hit@5 / hit@14 etc.). The `results/` directory is ignored so
+large benchmark outputs do not get committed accidentally.
 
 If `MEMORIA_EMBEDDING_BASE_URL` + `MEMORIA_EMBEDDING_API_KEY` are set, the
 selector's embedding-fusion path is exercised; otherwise it runs lexical-only.
@@ -76,9 +75,9 @@ this repo. Read the script headers before running.
 - `generate_selector_benchmark.py` — generate primary / hard / no-skill prompts.
 - `prototype_*.py`                 — algorithmic prototypes (hybrid / rerank).
 
-## Baselines on file (committed `results/`)
+## Reference baseline notes
 
-Quick reference of what is already measured against this corpus:
+Quick reference from the initial experiments against this corpus:
 
 | Variant                                | hit@1 | hit@3 | hit@5 | hit@14 |
 | -------------------------------------- | ----- | ----- | ----- | ------ |
@@ -86,4 +85,4 @@ Quick reference of what is already measured against this corpus:
 | pure embedding (BAAI/bge-m3, top-k)    | 38.1% | 53.7% | 60.5% | 71.8%  |
 | chunked-fulltext embedding (top1/10/30/50) | 36.9% / 69.4% / 81.9% / 85.9% |
 
-See `results/*-summary.json` for full details.
+Re-run the benchmark locally to produce fresh `results/*-summary.json` details.
