@@ -177,6 +177,18 @@ fn set_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) -> StreamIdleEnv
     guard
 }
 
+/// Asserts the number of non-stream fallback hits falls inside `min..=max`.
+///
+/// The non-stream mocks in this journey optionally answer the first non-stream
+/// request with an HTTP 200 body `"probe ok"` connectivity probe before
+/// serving any real fallback (see `spawn_raw_partial_transport_server` and
+/// siblings around line 228 / 302 / 370). The probe is not driven by a config
+/// flag — whether it fires depends on how fast the client notices the
+/// partial-transport failure and engages the non-stream fallback path, which
+/// varies with scheduler / CI load.
+///
+/// Callers that expect N genuine fallbacks must therefore accept `N..=N+1`
+/// (the "+1" = optional probe) to stay stable under CI timing jitter.
 fn assert_nonstream_hits_in_range(actual: u32, min: u32, max: u32, message: &str) {
     assert!(
         (min..=max).contains(&actual),
