@@ -1320,15 +1320,15 @@ const REMOTE_SKILL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 fn remote_skill_http_client() -> &'static reqwest::Client {
     static REMOTE_SKILL_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     REMOTE_SKILL_HTTP.get_or_init(|| {
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-        // In test mode, skip any system proxy so localhost requests work
-        // even when http_proxy/https_proxy is set without a no_proxy entry.
-        if cfg!(test) {
-            builder = builder.no_proxy();
-        }
-        // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
-        // Without a timeout, a malicious skill server can hang the agent loop forever.
-        builder
+        // Remote skill servers are typically local/intranet (or user-provided
+        // endpoints that should not be routed through the host's LLM proxy).
+        // Only turn/llm_client.rs honours env proxy vars; every other reqwest
+        // client in the runtime must call .no_proxy().
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            // audit-A4: remote skill URLs are attacker-controllable (via skill manifest).
+            // Without a timeout, a malicious skill server can hang the agent loop forever.
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()

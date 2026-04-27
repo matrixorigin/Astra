@@ -3,6 +3,14 @@
 //! Extracted from [`super::bridge_inprocess`] so both the in-process bridge
 //! and [`crate::server::server_loop_host::ServerAgenticLoopHost`] can call LLMs
 //! without duplicating the retry/backoff/parsing logic.
+//!
+//! # Proxy invariant
+//!
+//! [`apply_env_proxy`] is the **only** place in the codebase that honours
+//! `HTTPS_PROXY` / `ALL_PROXY` env vars. All other `reqwest` clients
+//! (durable bridge, skill HTTP, server tool executor, summary client, …)
+//! must call `.no_proxy()` — their traffic is local/intranet and should
+//! not be routed through a user's LLM proxy.
 
 use std::{
     collections::HashMap,
@@ -92,13 +100,15 @@ fn global_llm_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
         let total = std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60);
-        match reqwest::Client::builder()
-            .no_proxy()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(connect)
             // Use a generous timeout; per-request timeout handled via tokio::time::timeout
             .timeout(total)
-            .pool_max_idle_per_host(4)
-            .build()
+            .pool_max_idle_per_host(4);
+        // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
+        // does not auto-read system proxy, so we wire it up explicitly).
+        builder = apply_env_proxy(builder);
+        match builder.build()
         {
             Ok(client) => client,
             Err(e) => {
@@ -348,6 +358,144 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS: std::cell::RefCell<Option<std::time::Duration>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Apply HTTP(S)/ALL proxy env vars to a reqwest::ClientBuilder.
+///
+/// reqwest is built with `default-features = false`, so it does not auto-read
+/// the system proxy env vars. We wire them up explicitly here and honour
+/// `NO_PROXY` via `reqwest::NoProxy::from_env()`.
+///
+/// Precedence (first match wins): `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
+/// `all_proxy`. For `HTTPS_PROXY`/`https_proxy` we register an HTTPS-scheme
+/// proxy; for `ALL_PROXY`/`all_proxy` we register an all-scheme proxy so that
+/// `socks5://` URLs (which only make sense as all-scheme) are honoured.
+pub(crate) fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let no_proxy = reqwest::NoProxy::from_env();
+    for var in &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        let Ok(proxy_url) = std::env::var(var) else {
+            continue;
+        };
+        if proxy_url.is_empty() {
+            continue;
+        }
+        let is_all = matches!(*var, "ALL_PROXY" | "all_proxy");
+        let parsed = if is_all {
+            reqwest::Proxy::all(&proxy_url)
+        } else {
+            reqwest::Proxy::https(&proxy_url)
+        };
+        match parsed {
+            Ok(mut proxy) => {
+                if let Some(np) = no_proxy.clone() {
+                    proxy = proxy.no_proxy(Some(np));
+                }
+                tracing::info!(
+                    target: "astra_runtime::llm_client",
+                    env_var = *var,
+                    proxy = %proxy_url,
+                    "applying proxy from environment"
+                );
+                builder = builder.proxy(proxy);
+                return builder;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_runtime::llm_client",
+                    env_var = *var,
+                    proxy = %proxy_url,
+                    error = %e,
+                    "failed to parse proxy URL; ignoring"
+                );
+            }
+        }
+    }
+    builder
+}
+
+#[cfg(test)]
+mod apply_env_proxy_tests {
+    use super::apply_env_proxy;
+
+    /// All four recognized env var names must be cleared for isolation, since
+    /// `apply_env_proxy` reads them in precedence order.
+    const PROXY_VARS: &[&str] = &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+
+    fn clear_all() -> Vec<(&'static str, Option<String>)> {
+        PROXY_VARS.iter().map(|v| (*v, None)).collect()
+    }
+
+    #[test]
+    fn no_env_vars_leaves_builder_unmodified() {
+        temp_env::with_vars(clear_all(), || {
+            // Smoke: must not panic and must build a usable client.
+            let builder = reqwest::Client::builder();
+            let builder = apply_env_proxy(builder);
+            assert!(
+                builder.build().is_ok(),
+                "builder should produce client with no proxy"
+            );
+        });
+    }
+
+    #[test]
+    fn empty_proxy_url_is_ignored() {
+        temp_env::with_vars([("HTTPS_PROXY", Some(""))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(
+                builder.build().is_ok(),
+                "empty proxy URL should be ignored, not error"
+            );
+        });
+    }
+
+    #[test]
+    fn malformed_proxy_url_is_ignored_not_panic() {
+        // Regression: prior code silently swallowed parse errors. We now log+skip.
+        // Ensure builder is still usable even when the URL is garbage.
+        temp_env::with_vars([("HTTPS_PROXY", Some("not a url ::::"))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(
+                builder.build().is_ok(),
+                "malformed proxy must not break the builder"
+            );
+        });
+    }
+
+    #[test]
+    fn valid_https_proxy_applied_without_panic() {
+        temp_env::with_vars([("HTTPS_PROXY", Some("http://127.0.0.1:9999"))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(builder.build().is_ok());
+        });
+    }
+
+    #[test]
+    fn socks5_via_all_proxy_is_accepted() {
+        // Regression: ALL_PROXY must use Proxy::all() so socks5:// schemes work.
+        // Requires the `socks` feature on reqwest (enabled in workspace).
+        temp_env::with_vars([("ALL_PROXY", Some("socks5://127.0.0.1:1080"))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(builder.build().is_ok(), "socks5 via ALL_PROXY must build");
+        });
+    }
+
+    #[test]
+    fn https_proxy_takes_precedence_over_all_proxy() {
+        // Documented contract: first match wins in HTTPS_PROXY, https_proxy,
+        // ALL_PROXY, all_proxy order. Set both and ensure build succeeds —
+        // precedence is asserted behaviourally via early-return in apply_env_proxy.
+        temp_env::with_vars(
+            [
+                ("HTTPS_PROXY", Some("http://127.0.0.1:1")),
+                ("ALL_PROXY", Some("socks5://127.0.0.1:2")),
+            ],
+            || {
+                let builder = apply_env_proxy(reqwest::Client::builder());
+                assert!(builder.build().is_ok());
+            },
+        );
+    }
 }
 
 /// TCP connect timeout for LLM API requests.

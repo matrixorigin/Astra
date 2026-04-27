@@ -205,12 +205,12 @@ pub(crate) async fn call_llm_stream(
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
+    let mut client_builder = reqwest::Client::builder()
         .connect_timeout(crate::turn::llm_client::llm_connect_timeout())
-        .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
-        .build()
-        .map_err(|e| e.to_string())?;
+        .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10));
+    // Honour HTTPS_PROXY / https_proxy / ALL_PROXY env vars (same as global_llm_client).
+    client_builder = crate::turn::llm_client::apply_env_proxy(client_builder);
+    let client = client_builder.build().map_err(|e| e.to_string())?;
 
     let messages = consolidate_system_messages(messages);
     if provider_uses_bedrock_converse(provider) {

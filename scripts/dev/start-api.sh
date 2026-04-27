@@ -93,11 +93,14 @@ start_detached() {
 
 # Start server in a detached process so it survives Ctrl+C from parent.
 # Default Rust API address keeps external port 8000 behavior.
+# Only the LLM HTTP client reads HTTPS_PROXY/HTTP_PROXY/ALL_PROXY (see
+# runtime/src/turn/llm_client.rs::apply_env_proxy). All other reqwest clients
+# in the API server call .no_proxy(), because their traffic is local/intranet
+# (edge, db, skill server, durable bridge) and a host-level proxy would break
+# loopback. We blank the env here so no child process accidentally inherits it.
 start_detached env \
-    http_proxy= \
-    https_proxy= \
-    HTTP_PROXY= \
-    HTTPS_PROXY= \
+    HTTPS_PROXY="" HTTP_PROXY="" ALL_PROXY="" \
+    https_proxy="" http_proxy="" all_proxy="" \
     RUST_API_ADDR=0.0.0.0:8000 \
     "$BIN_PATH"
 SETSID_PID=$DETACHED_PID

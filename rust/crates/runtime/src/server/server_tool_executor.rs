@@ -1054,6 +1054,7 @@ impl ServerToolExecutor {
                 .unwrap_or_else(|_| (Vec::new(), Vec::new()));
 
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(15))
             .user_agent("astra-server/0.1.0")
             .build()

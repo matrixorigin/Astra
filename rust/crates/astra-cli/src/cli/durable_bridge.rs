@@ -20,18 +20,14 @@ use std::sync::Arc;
 
 use crate::theme;
 
-/// Build a reqwest client that skips the system proxy for localhost/loopback URLs.
-/// External URLs use the default proxy from `HTTP_PROXY`/`HTTPS_PROXY` env vars.
-fn build_client_for_url(url: &str) -> reqwest::Client {
-    let is_local = url.contains("127.0.0.1")
-        || url.contains("localhost")
-        || url.contains("[::1]")
-        || url.contains("0.0.0.0");
-    let mut builder = reqwest::Client::builder();
-    if is_local {
-        builder = builder.no_proxy();
-    }
-    builder
+/// Build a reqwest client for the durable-task bridge.
+///
+/// Durable-bridge traffic is local-only (CLI ↔ local API server), so we always
+/// skip any system proxy. Only the LLM HTTP client (runtime `llm_client.rs`)
+/// honours env proxy vars.
+fn build_client_for_url(_url: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
