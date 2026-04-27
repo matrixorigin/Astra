@@ -1036,7 +1036,7 @@ fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> S
             for (idx, line) in lines.iter().enumerate() {
                 if normalize_ws(line) == normalized_first {
                     msg.push_str(&format!("  Possible match at line {}\n", idx + 1));
-                    let end = (idx + old_lines.len().min(5)).min(lines.len());
+                    let end = (idx + old_lines.len()).min(lines.len());
                     for (line_offset, line_content) in lines[idx..end].iter().enumerate() {
                         msg.push_str(&format!("  {}: {}\n", idx + line_offset + 1, line_content));
                     }
@@ -1642,6 +1642,22 @@ mod tests {
         );
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert!(content.contains("println!(\"bye\");"), "got: {content}");
+    }
+
+    // Issue #2: whitespace hint should show old_lines.len() context, not min(5)
+    #[test]
+    fn str_replace_not_found_hint_whitespace_branch_shows_full_old_str_span() {
+        // old_str has 8 lines. The whitespace hint should show all 8, not capped at 5.
+        let content =
+            "  fn big() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    f();\n  }\n";
+        let old_str = "fn big() {\n  a();\n  b();\n  c();\n  d();\n  e();\n  f();\n}";
+        let msg = str_replace_not_found_hint("f.txt", content, old_str);
+        assert!(msg.contains("whitespace-normalized"), "got: {msg}");
+        // Should show context through line with "f()" (line 7), not stop at 5 lines
+        assert!(
+            msg.contains("f();"),
+            "should show all old_str lines of context, got: {msg}"
+        );
     }
 
     #[test]

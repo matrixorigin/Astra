@@ -877,6 +877,18 @@ impl ToolExecutor {
                     Err(e) => return format!("Error writing file: {e}"),
                 }
             }
+            if replace_all && norm_count > 1 {
+                self.record_fuzzy_match_event(
+                    &path,
+                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
+                    astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+                );
+                return format!(
+                    "Error: old_str matches {norm_count} occurrences after normalizing curly quotes, \
+                     but the file contains mixed curly quote forms. \
+                     Cannot safely replace_all with inconsistent quoting styles."
+                );
+            }
             self.record_fuzzy_match_event(
                 &path,
                 "none",
@@ -2508,7 +2520,7 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                 if normalize_ws(line) == norm_first {
                     msg.push_str(&format!("  Possible match at line {}\n", i + 1));
                     // Show a few lines of actual content
-                    let end = (i + old_lines.len().min(5)).min(lines.len());
+                    let end = (i + old_lines.len()).min(lines.len());
                     for (j, line_content) in lines[i..end].iter().enumerate() {
                         msg.push_str(&format!("  {}: {}\n", i + j + 1, line_content));
                     }
@@ -2541,7 +2553,7 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
                 // Show context around first match
                 let line_idx = matches[0] - 1;
                 let start = line_idx;
-                let end = (line_idx + old_lines.len() + 1).min(lines.len());
+                let end = (line_idx + old_lines.len()).min(lines.len());
                 msg.push_str("Actual file content:\n");
                 for (j, line_content) in lines[start..end].iter().enumerate() {
                     msg.push_str(&format!("  {}: {}\n", start + j + 1, line_content));
@@ -2552,11 +2564,13 @@ fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
 
     // Strategy 3: If multi-line, check how many lines match
     if old_lines.len() > 1 {
+        let file_line_set: std::collections::HashSet<&str> =
+            lines.iter().map(|l| l.trim()).collect();
         let matching_count = old_lines
             .iter()
             .filter(|ol| {
                 let trimmed = ol.trim();
-                !trimmed.is_empty() && lines.iter().any(|fl| fl.trim() == trimmed)
+                !trimmed.is_empty() && file_line_set.contains(trimmed)
             })
             .count();
         if matching_count > 0 {
@@ -3174,6 +3188,80 @@ type Handler interface {
         );
         let actual = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(actual, "let x = \u{201C}world\u{201D};");
+    }
+
+    // F1: edge_tools whitespace hint should show all old_lines context, not capped at 5
+    #[test]
+    fn str_replace_not_found_hint_whitespace_full_span_edge_tools() {
+        let content =
+            "  fn big() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    f();\n  }\n";
+        let old_str = "fn big() {\n  a();\n  b();\n  c();\n  d();\n  e();\n  f();\n}";
+        let msg = str_replace_not_found_hint(content, old_str);
+        assert!(
+            msg.contains("whitespace-normalized"),
+            "should trigger whitespace hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("f();"),
+            "should show all 8 lines of context (not capped at 5), got: {msg}"
+        );
+    }
+
+    // F2: first-line hint should show exactly old_lines.len() context, not +1
+    #[test]
+    fn str_replace_not_found_hint_first_line_no_extra_line_edge_tools() {
+        let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
+        let old_str = "fn foo() {\n    bar();\n    qux();\n}";
+        let msg = str_replace_not_found_hint(content, old_str);
+        assert!(
+            msg.contains("Actual file content"),
+            "should trigger first-line hint, got: {msg}"
+        );
+        assert!(
+            !msg.contains("footer"),
+            "should not show extra line beyond old_str span, got: {msg}"
+        );
+    }
+
+    // F3: individual-lines check should use HashSet for O(n+m) perf
+    // (This is a correctness test — same behavior, ensures the optimization doesn't break anything)
+    #[test]
+    fn str_replace_not_found_hint_individual_lines_edge_tools() {
+        let msg = str_replace_not_found_hint("aaa\nbbb\nccc\n", "aaa\nXXX\nccc");
+        assert!(
+            msg.contains("lines from old_str exist individually"),
+            "got: {msg}"
+        );
+    }
+
+    // Issue #1: replace_all + mixed curly-quote forms → specific error (not generic hint)
+    #[test]
+    fn str_replace_replace_all_mixed_curly_quotes_gives_specific_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("mixed-curly.txt");
+        // Two occurrences with different curly-quote forms
+        std::fs::write(
+            &file_path,
+            "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done",
+        )
+        .unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "mixed-curly.txt"}));
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "mixed-curly.txt",
+            "old_str": "\"a\"",
+            "new_str": "\"b\"",
+            "replace_all": true
+        }));
+        assert!(
+            result.contains("Error"),
+            "should error on mixed curly-quote forms: {result}"
+        );
+        assert!(
+            result.contains("curly quote"),
+            "error should mention curly quotes, got: {result}"
+        );
     }
 
     #[test]

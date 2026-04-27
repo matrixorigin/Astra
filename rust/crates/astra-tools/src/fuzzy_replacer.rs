@@ -68,7 +68,8 @@ pub fn fuzzy_find_replacement<'a>(
     ];
 
     for (name, strategy_fn) in strategies {
-        let matches = strategy_fn(content, old_str);
+        let mut matches = strategy_fn(content, old_str);
+        matches.dedup();
         if matches.is_empty() {
             continue;
         }
@@ -1040,6 +1041,23 @@ mod tests {
             result.is_none(),
             "should abort on distinct curly-quote forms, got: {result:?}"
         );
+    }
+
+    // ─── Cascade: replace_all with identical duplicate matches ──────────
+    #[test]
+    fn replace_all_with_duplicate_strategy_results_should_succeed() {
+        // Two identical blocks at different positions. line_trimmed_find returns
+        // two results with the same actual string. replace_all should still work
+        // because content.replace(actual, new) handles all occurrences.
+        let content = "  foo()\n  bar()\n\n  foo()\n  bar()";
+        let search = "foo()\nbar()";
+        let result = fuzzy_find_replacement(content, search, true);
+        assert!(
+            result.is_some(),
+            "replace_all should succeed when strategy returns identical matches"
+        );
+        let m = result.unwrap();
+        assert_eq!(m.strategy, "line-trimmed");
     }
 
     // ─── LineTrimmedReplacer ────────────────────────────────────────────────
