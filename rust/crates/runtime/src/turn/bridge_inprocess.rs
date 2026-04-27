@@ -3515,7 +3515,7 @@ mod tests {
         async fn persist_json_artifact(
             &self,
             record: SessionArtifactJsonRecord,
-        ) -> Result<StoredSessionArtifact, String> {
+        ) -> Result<StoredSessionArtifact, astra_services::SessionArtifactStoreError> {
             self.records
                 .lock()
                 .expect("recording store lock")
@@ -3541,7 +3541,8 @@ mod tests {
         async fn load_json_artifact(
             &self,
             _artifact_id: &str,
-        ) -> Result<Option<StoredSessionArtifact>, String> {
+        ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
+        {
             Ok(None)
         }
 
@@ -3549,7 +3550,8 @@ mod tests {
             &self,
             _session_id: &str,
             _artifact_kind: &str,
-        ) -> Result<Option<StoredSessionArtifact>, String> {
+        ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
+        {
             Ok(None)
         }
 
@@ -3558,7 +3560,7 @@ mod tests {
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
-        ) -> Result<Vec<StoredSessionArtifact>, String> {
+        ) -> Result<Vec<StoredSessionArtifact>, astra_services::SessionArtifactStoreError> {
             Ok(Vec::new())
         }
     }

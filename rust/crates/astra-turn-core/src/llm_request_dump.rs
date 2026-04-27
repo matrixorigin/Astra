@@ -131,6 +131,7 @@ impl LlmRequestDump {
             .persist_json_artifact(self.to_remote_artifact_record(user_id))
             .await
             .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 

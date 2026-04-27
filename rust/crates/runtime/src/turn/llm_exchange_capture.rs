@@ -172,6 +172,7 @@ pub(crate) async fn persist_remote_capture(
         ))
         .await
         .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -292,17 +293,17 @@ fn capture_file_path(
     round: u32,
     source: &str,
     outcome: &str,
-) -> PathBuf {
+) -> Result<PathBuf, String> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    astra_services::local_session_artifact_store()
+    let dir = astra_services::local_session_artifact_store()
         .session_dir(session_id)
-        .expect("validated session_id must resolve llm capture dir")
-        .join(format!(
-            "llm_capture_t{turn}_r{round}_{source}_{outcome}_{millis}.json"
-        ))
+        .map_err(|error| format!("resolve capture dir for session {session_id}: {error}"))?;
+    Ok(dir.join(format!(
+        "llm_capture_t{turn}_r{round}_{source}_{outcome}_{millis}.json"
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -327,7 +328,7 @@ fn persist_capture_inner(
 
     let source = sanitize_component(source);
     let outcome = sanitize_component(outcome);
-    let path = capture_file_path(session_id, turn, round, &source, &outcome);
+    let path = capture_file_path(session_id, turn, round, &source, &outcome)?;
     let parent = path
         .parent()
         .ok_or_else(|| format!("capture path has no parent: {}", path.display()))?;
@@ -417,7 +418,7 @@ mod tests {
         async fn persist_json_artifact(
             &self,
             record: SessionArtifactJsonRecord,
-        ) -> Result<StoredSessionArtifact, String> {
+        ) -> Result<StoredSessionArtifact, astra_services::SessionArtifactStoreError> {
             self.records
                 .lock()
                 .expect("recording store lock")
@@ -443,7 +444,8 @@ mod tests {
         async fn load_json_artifact(
             &self,
             _artifact_id: &str,
-        ) -> Result<Option<StoredSessionArtifact>, String> {
+        ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
+        {
             Ok(None)
         }
 
@@ -451,7 +453,8 @@ mod tests {
             &self,
             _session_id: &str,
             _artifact_kind: &str,
-        ) -> Result<Option<StoredSessionArtifact>, String> {
+        ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
+        {
             Ok(None)
         }
 
@@ -460,7 +463,7 @@ mod tests {
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
-        ) -> Result<Vec<StoredSessionArtifact>, String> {
+        ) -> Result<Vec<StoredSessionArtifact>, astra_services::SessionArtifactStoreError> {
             Ok(Vec::new())
         }
     }
@@ -519,6 +522,36 @@ mod tests {
         assert!(!session_full_llm_capture_enabled(Some(&disabled)));
         assert!(!session_full_llm_capture_enabled(Some(&wrong_type)));
         assert!(!session_full_llm_capture_enabled(None));
+    }
+
+    #[test]
+    fn persist_capture_inner_reports_error_for_invalid_session_id() {
+        let temp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let err = persist_capture_inner(
+            "..",
+            0,
+            0,
+            None,
+            "server_loop_host",
+            "gpt-5.4",
+            "openai",
+            &[],
+            &[],
+            None,
+            "ok",
+            json!({}),
+            None,
+        )
+        .expect_err("invalid session_id must not resolve capture dir");
+        assert!(
+            err.contains("session") || err.contains("escape"),
+            "error should mention session rejection, got: {err}"
+        );
+        assert!(
+            err.contains("invalid session ID") || err.contains("must not"),
+            "error should cite the validation failure reason, got: {err}"
+        );
     }
 
     #[test]

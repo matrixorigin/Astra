@@ -757,7 +757,10 @@ pub async fn persist_remote_composite_snapshot_index(
 ) -> Result<StoredSessionArtifact, String> {
     let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
         .map_err(|error| error.to_string())?;
-    store.persist_json_artifact(record).await
+    store
+        .persist_json_artifact(record)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn merge_composite_snapshot_indexes(

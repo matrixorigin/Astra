@@ -584,7 +584,10 @@ pub async fn persist_remote_workspace(
     store: &impl SessionArtifactJsonStore,
 ) -> Result<StoredSessionArtifact, String> {
     let record = to_remote_artifact_record(metadata, user_id).map_err(|error| error.to_string())?;
-    store.persist_json_artifact(record).await
+    store
+        .persist_json_artifact(record)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Write workspace metadata to disk.
@@ -793,7 +796,7 @@ mod tests {
         async fn persist_json_artifact(
             &self,
             record: SessionArtifactJsonRecord,
-        ) -> Result<StoredSessionArtifact, String> {
+        ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
             *self.seen.lock().unwrap() = Some(record.clone());
             Ok(StoredSessionArtifact {
                 artifact_id: "artifact-1".into(),
@@ -812,7 +815,7 @@ mod tests {
         async fn load_json_artifact(
             &self,
             _artifact_id: &str,
-        ) -> Result<Option<StoredSessionArtifact>, String> {
+        ) -> Result<Option<StoredSessionArtifact>, crate::SessionArtifactStoreError> {
             Ok(None)
         }
 
@@ -820,7 +823,7 @@ mod tests {
             &self,
             _session_id: &str,
             _artifact_kind: &str,
-        ) -> Result<Option<StoredSessionArtifact>, String> {
+        ) -> Result<Option<StoredSessionArtifact>, crate::SessionArtifactStoreError> {
             Ok(None)
         }
 
@@ -829,7 +832,7 @@ mod tests {
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
-        ) -> Result<Vec<StoredSessionArtifact>, String> {
+        ) -> Result<Vec<StoredSessionArtifact>, crate::SessionArtifactStoreError> {
             Ok(Vec::new())
         }
     }

@@ -324,10 +324,10 @@ fn session_artifact_not_found() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-fn internal_artifact_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+fn internal_artifact_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new(error)),
+        Json(ErrorResponse::new(error.to_string())),
     )
 }
 

@@ -15,6 +15,45 @@ use serde_json::Value;
 use sqlx::{Row, mysql::MySqlRow, query};
 use uuid::Uuid;
 
+/// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
+/// the previous `Result<_, String>` to preserve sqlx / serde context and to
+/// encode validation / overflow failures as distinct variants callers can
+/// match on.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionArtifactStoreError {
+    /// Session id failed [`crate::session_journal::validate_session_id`]. The
+    /// attached string echoes the validator's reason so existing tests that
+    /// matched on the old stringified error still see the substring.
+    #[error("invalid session_id: {0}")]
+    InvalidSessionId(String),
+
+    /// `artifact_id` was empty or otherwise unusable as a lookup key.
+    #[error("artifact_id must not be empty: {0:?}")]
+    InvalidArtifactId(String),
+
+    /// A relative path under a session directory either escaped the session
+    /// root or contained an unsupported component.
+    #[error("artifact relative path {reason}: {}", path.display())]
+    InvalidRelativePath { path: PathBuf, reason: &'static str },
+
+    /// `serde_json` could not serialize the outbound artifact body.
+    #[error("serialize artifact content: {0}")]
+    Serialize(#[from] serde_json::Error),
+
+    /// `sqlx` returned an error from the underlying database.
+    #[error("database: {0}")]
+    Database(#[from] sqlx::Error),
+
+    /// The `turn` counter exceeded `i32::MAX` and cannot be persisted to the
+    /// `session_artifacts.turn INT` column without data loss.
+    #[error("turn {0} exceeds i32::MAX and cannot be persisted")]
+    TurnOverflow(u32),
+
+    /// The `round` counter exceeded `i32::MAX`.
+    #[error("round {0} exceeds i32::MAX and cannot be persisted")]
+    RoundOverflow(u32),
+}
+
 pub trait SessionArtifactStore {
     fn sessions_root(&self) -> PathBuf;
     fn session_dir(&self, session_id: &str) -> Result<PathBuf, String>;
@@ -66,25 +105,25 @@ pub trait SessionArtifactJsonStore: Send + Sync {
     async fn persist_json_artifact(
         &self,
         record: SessionArtifactJsonRecord,
-    ) -> Result<StoredSessionArtifact, String>;
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
 
     async fn load_json_artifact(
         &self,
         artifact_id: &str,
-    ) -> Result<Option<StoredSessionArtifact>, String>;
+    ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError>;
 
     async fn load_latest_json_artifact(
         &self,
         session_id: &str,
         artifact_kind: &str,
-    ) -> Result<Option<StoredSessionArtifact>, String>;
+    ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError>;
 
     async fn list_json_artifacts(
         &self,
         session_id: &str,
         artifact_kind: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<StoredSessionArtifact>, String>;
+    ) -> Result<Vec<StoredSessionArtifact>, SessionArtifactStoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -114,43 +153,63 @@ impl DatabaseSessionArtifactStore {
     }
 }
 
-fn stored_artifact_from_row(row: &MySqlRow) -> Result<StoredSessionArtifact, String> {
-    let content: Value = serde_json::from_str(
-        row.try_get::<String, _>("content_json")
-            .map_err(|error| error.to_string())?
-            .as_str(),
-    )
-    .map_err(|error| error.to_string())?;
-    let metadata = row
-        .try_get::<Option<String>, _>("metadata_json")
-        .map_err(|error| error.to_string())?
-        .and_then(|value| serde_json::from_str(&value).ok());
+fn validate_session_id(session_id: &str) -> Result<(), SessionArtifactStoreError> {
+    crate::session_journal::validate_session_id(session_id)
+        .map_err(SessionArtifactStoreError::InvalidSessionId)
+}
+
+/// Convert a `u32` logical counter (`turn` / `round`) to an `i32` column
+/// value. `turn`/`round` feed WHERE clauses and ORDER BY in
+/// `session_artifacts`; silent saturation (as elsewhere in the codebase for
+/// array indices) would corrupt ordering and produce collisions, so callers
+/// get a structured overflow error instead.
+fn encode_counter(
+    value: Option<u32>,
+    make_overflow: fn(u32) -> SessionArtifactStoreError,
+) -> Result<Option<i32>, SessionArtifactStoreError> {
+    match value {
+        None => Ok(None),
+        Some(v) => i32::try_from(v).map(Some).map_err(|_| make_overflow(v)),
+    }
+}
+
+fn stored_artifact_from_row(
+    row: &MySqlRow,
+) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+    let artifact_id: String = row.try_get("artifact_id")?;
+    let content_raw: String = row.try_get("content_json")?;
+    let content: Value = serde_json::from_str(&content_raw)?;
+    let metadata = match row.try_get::<Option<String>, _>("metadata_json")? {
+        None => None,
+        Some(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_services::session_artifact_store",
+                    %artifact_id,
+                    error = %error,
+                    "failed to parse metadata_json; dropping to keep read path resilient"
+                );
+                None
+            }
+        },
+    };
 
     Ok(StoredSessionArtifact {
-        artifact_id: row
-            .try_get("artifact_id")
-            .map_err(|error| error.to_string())?,
-        session_id: row
-            .try_get("session_id")
-            .map_err(|error| error.to_string())?,
-        user_id: row.try_get("user_id").map_err(|error| error.to_string())?,
-        artifact_kind: row
-            .try_get("artifact_kind")
-            .map_err(|error| error.to_string())?,
-        source: row.try_get("source").map_err(|error| error.to_string())?,
+        artifact_id,
+        session_id: row.try_get("session_id")?,
+        user_id: row.try_get("user_id")?,
+        artifact_kind: row.try_get("artifact_kind")?,
+        source: row.try_get("source")?,
         turn: row
-            .try_get::<Option<i32>, _>("turn")
-            .map_err(|error| error.to_string())?
+            .try_get::<Option<i32>, _>("turn")?
             .and_then(|value| u32::try_from(value).ok()),
         round: row
-            .try_get::<Option<i32>, _>("round")
-            .map_err(|error| error.to_string())?
+            .try_get::<Option<i32>, _>("round")?
             .and_then(|value| u32::try_from(value).ok()),
         content,
         metadata,
-        created_at: row
-            .try_get("created_at")
-            .map_err(|error| error.to_string())?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -159,15 +218,14 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
     async fn persist_json_artifact(
         &self,
         mut record: SessionArtifactJsonRecord,
-    ) -> Result<StoredSessionArtifact, String> {
-        crate::session_journal::validate_session_id(&record.session_id)?;
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        validate_session_id(&record.session_id)?;
         if record.artifact_id.trim().is_empty() {
             record.artifact_id = Uuid::now_v7().to_string();
         }
 
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
-        let content_json =
-            serde_json::to_string(&record.content).map_err(|error| error.to_string())?;
+        let pool = self.get_pool().await?;
+        let content_json = serde_json::to_string(&record.content)?;
         let metadata_json = record
             .metadata
             .as_ref()
@@ -182,13 +240,18 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .bind(&record.user_id)
         .bind(&record.artifact_kind)
         .bind(record.source.as_deref())
-        .bind(record.turn.map(|v| i32::try_from(v).unwrap_or(i32::MAX)))
-        .bind(record.round.map(|v| i32::try_from(v).unwrap_or(i32::MAX)))
+        .bind(encode_counter(
+            record.turn,
+            SessionArtifactStoreError::TurnOverflow,
+        )?)
+        .bind(encode_counter(
+            record.round,
+            SessionArtifactStoreError::RoundOverflow,
+        )?)
         .bind(&content_json)
         .bind(metadata_json)
         .execute(&pool)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
@@ -197,8 +260,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         )
         .bind(&record.artifact_id)
         .fetch_one(&pool)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         stored_artifact_from_row(&row)
     }
@@ -206,11 +268,13 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
     async fn load_json_artifact(
         &self,
         artifact_id: &str,
-    ) -> Result<Option<StoredSessionArtifact>, String> {
+    ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
         if artifact_id.trim().is_empty() {
-            return Err("artifact_id must not be empty".to_string());
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
         }
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+        let pool = self.get_pool().await?;
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                     content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
@@ -218,8 +282,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         )
         .bind(artifact_id)
         .fetch_optional(&pool)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         row.as_ref().map(stored_artifact_from_row).transpose()
     }
@@ -228,9 +291,9 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         &self,
         session_id: &str,
         artifact_kind: &str,
-    ) -> Result<Option<StoredSessionArtifact>, String> {
-        crate::session_journal::validate_session_id(session_id)?;
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+    ) -> Result<Option<StoredSessionArtifact>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        let pool = self.get_pool().await?;
         let row = query(
              "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                      content_json, CAST(metadata AS CHAR) AS metadata_json, CAST(created_at AS CHAR) AS created_at \
@@ -241,8 +304,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .bind(session_id)
         .bind(artifact_kind)
         .fetch_optional(&pool)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
 
         let Some(row) = row else {
             return Ok(None);
@@ -256,9 +318,9 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         session_id: &str,
         artifact_kind: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<StoredSessionArtifact>, String> {
-        crate::session_journal::validate_session_id(session_id)?;
-        let pool = self.get_pool().await.map_err(|error| error.to_string())?;
+    ) -> Result<Vec<StoredSessionArtifact>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        let pool = self.get_pool().await?;
         let capped_limit = limit.clamp(1, 100) as i64;
         let rows = if let Some(kind) = artifact_kind {
             query(
@@ -272,8 +334,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .bind(kind)
             .bind(capped_limit)
             .fetch_all(&pool)
-            .await
-            .map_err(|error| error.to_string())?
+            .await?
         } else {
             query(
                 "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
@@ -285,8 +346,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .bind(session_id)
             .bind(capped_limit)
             .fetch_all(&pool)
-            .await
-            .map_err(|error| error.to_string())?
+            .await?
         };
 
         rows.iter().map(stored_artifact_from_row).collect()
@@ -421,6 +481,95 @@ mod tests {
         assert!(
             source.contains("ORDER BY created_at DESC, artifact_id DESC LIMIT ?"),
             "artifact listing should return newest artifacts first with a stable bounded order"
+        );
+    }
+
+    #[test]
+    fn error_type_is_thiserror_enum() {
+        let source = include_str!("session_artifact_store.rs");
+        assert!(
+            source.contains("#[derive(Debug, thiserror::Error)]"),
+            "SessionArtifactStoreError must derive thiserror::Error for structured context"
+        );
+        assert!(
+            source.contains("pub enum SessionArtifactStoreError"),
+            "public structured error type must be named SessionArtifactStoreError"
+        );
+    }
+
+    #[test]
+    fn invalid_relative_path_display_preserves_substring() {
+        let err = SessionArtifactStoreError::InvalidRelativePath {
+            path: PathBuf::from("../x"),
+            reason: "must not escape session directory",
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("must not escape"),
+            "InvalidRelativePath display should cite the reason, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn invalid_artifact_id_display_preserves_substring() {
+        let err = SessionArtifactStoreError::InvalidArtifactId(String::new());
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("artifact_id must not be empty"),
+            "InvalidArtifactId display should explain the failure, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn error_is_send_sync_and_static() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<SessionArtifactStoreError>();
+    }
+
+    #[test]
+    fn metadata_parse_failure_drops_value_with_warning() {
+        // Build the forbidden pattern at runtime so this test's source does
+        // not match itself under include_str!.
+        let forbidden = format!(".and_then(|value| serde_json::{}(&value).ok())", "from_str");
+        let source = include_str!("session_artifact_store.rs");
+        assert!(
+            !source.contains(&forbidden),
+            "metadata parse must no longer silently drop failures via .ok()"
+        );
+        assert!(
+            source.contains("tracing::warn!"),
+            "metadata parse failures should be surfaced via tracing::warn!"
+        );
+    }
+
+    #[test]
+    fn encode_counter_errors_on_u32_overflow() {
+        let overflow = u32::MAX;
+        let err = encode_counter(Some(overflow), SessionArtifactStoreError::TurnOverflow)
+            .expect_err("u32::MAX must not silently clamp");
+        match err {
+            SessionArtifactStoreError::TurnOverflow(value) => assert_eq!(value, overflow),
+            other => panic!("expected TurnOverflow, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_counter_round_trips_small_values() {
+        assert_eq!(
+            encode_counter(Some(42_u32), SessionArtifactStoreError::TurnOverflow).unwrap(),
+            Some(42_i32)
+        );
+        assert_eq!(
+            encode_counter(None, SessionArtifactStoreError::TurnOverflow).unwrap(),
+            None
+        );
+        assert_eq!(
+            encode_counter(
+                Some(i32::MAX as u32),
+                SessionArtifactStoreError::TurnOverflow
+            )
+            .unwrap(),
+            Some(i32::MAX)
         );
     }
 }

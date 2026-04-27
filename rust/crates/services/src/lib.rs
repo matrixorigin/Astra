@@ -188,8 +188,8 @@ pub use self_surface::{
 };
 pub use session_artifact_store::{
     DatabaseSessionArtifactStore, LocalSessionArtifactStore, SessionArtifactJsonRecord,
-    SessionArtifactJsonStore, SessionArtifactStore, StoredSessionArtifact,
-    local_session_artifact_store,
+    SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
+    StoredSessionArtifact, local_session_artifact_store,
 };
 pub use session_fork::{
     CrossBranchLearning, DataBranchOptions, ExploreError, ExploreOptions, ExploreResult,
