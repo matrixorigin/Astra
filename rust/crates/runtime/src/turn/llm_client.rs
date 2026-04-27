@@ -736,12 +736,18 @@ fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
             let content = content_text_value(msg.get("content")).unwrap_or_default();
             tool_use_id
                 .map(|tool_use_id| {
+                    // Bedrock's `toolResult.content[].json` field requires a
+                    // JSON object (Document type). Scalars, arrays, strings,
+                    // booleans, and null must use the `text` branch — or
+                    // Bedrock rejects with "messages.N.content.M.toolResult
+                    // .content.0.json is invalid — provide a json object".
                     let result_block = if content.is_empty() {
                         json!({"json": {}})
-                    } else if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
-                        json!({"json": parsed})
                     } else {
-                        json!({"text": content})
+                        match serde_json::from_str::<Value>(&content) {
+                            Ok(parsed) if parsed.is_object() => json!({"json": parsed}),
+                            _ => json!({"text": content}),
+                        }
                     };
                     let mut blocks = vec![json!({
                         "toolResult": {
@@ -4526,6 +4532,89 @@ mod tests {
         );
         assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+    }
+
+    #[test]
+    fn build_bedrock_body_wraps_non_object_tool_content_as_text_not_json() {
+        // Session 28e858fd-... failure: `git rev-list --count main..HEAD`
+        // returned "2\n" which parses as JSON integer 2. The previous code
+        // wrapped it as {"json": 2}, which Bedrock rejects:
+        // "messages.N.content.M.toolResult.content.0.json is invalid —
+        //  provide a json object".
+        // Bedrock's `json` field requires a JSON *object*. Scalars, arrays,
+        // strings, booleans, and null must go through the `text` branch.
+        for (label, content) in [
+            ("integer", "2\n"),
+            ("float", "3.14"),
+            ("bool", "true"),
+            ("null", "null"),
+            ("string", "\"hello\""),
+            ("array", "[1, 2, 3]"),
+        ] {
+            let messages = vec![
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "t", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"}
+                    }]
+                }),
+                json!({"role": "tool", "tool_call_id": "t", "name": "f", "content": content}),
+            ];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "anthropic.claude-3-5-sonnet-v1:0",
+                "bedrock",
+                None,
+                None,
+                false,
+            );
+            let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+            // Bedrock-legal: either `json` with an object, or `text` with a string.
+            // Must NOT be `json` pointing at a non-object value.
+            if let Some(json_val) = result_block.get("json") {
+                assert!(
+                    json_val.is_object(),
+                    "{label}: toolResult.content[].json must be an object, got {json_val:?}"
+                );
+            } else {
+                assert!(
+                    result_block.get("text").is_some(),
+                    "{label}: non-object content must fall through to text, got {result_block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_bedrock_body_keeps_json_object_branch_for_real_objects() {
+        // Regression: ensure the object branch still works (don't overcorrect).
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "t", "type": "function",
+                    "function": {"name": "f", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "t", "name": "f",
+                   "content": "{\"cwd\":\"/tmp\",\"ok\":true}"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+        );
+        let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+        assert!(result_block["json"].is_object(), "{result_block:?}");
+        assert_eq!(result_block["json"]["cwd"], "/tmp");
     }
 
     #[test]
