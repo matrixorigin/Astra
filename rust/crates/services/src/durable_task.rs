@@ -38,17 +38,6 @@ fn build_client_for_url(_url: &str) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-#[cfg(test)]
-mod build_client_for_url_tests {
-    use super::build_client_for_url;
-
-    #[test]
-    fn build_client_for_url_succeeds() {
-        // Smoke: builder with no_proxy + timeouts must not panic.
-        let _ = build_client_for_url("http://127.0.0.1:1");
-    }
-}
-
 /// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
 const MAX_VERIFICATION_HISTORY_ROWS: i64 = 10_000;
 
@@ -7846,5 +7835,11 @@ Time:        3.456 s
             fn_body.contains("Executing") && fn_body.contains("Pending"),
             "resume_task must reset stuck Executing subtasks to Pending"
         );
+    }
+
+    #[test]
+    fn build_client_for_url_succeeds() {
+        // Smoke: builder with no_proxy + timeouts must not panic.
+        let _ = build_client_for_url("http://127.0.0.1:1");
     }
 }
