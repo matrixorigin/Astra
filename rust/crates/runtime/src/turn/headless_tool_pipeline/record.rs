@@ -131,7 +131,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 executed_ms,
                 args_size,
                 execution.result_str.as_str(),
-                args_preview,
+                args_preview.clone(),
                 file_path,
                 args_full,
             ));
@@ -143,13 +143,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             rec.round = Some(self.ctx.llm_round);
         }
-        self.ctx.step_recorder.complete_tool_with_result(
-            &execution.name,
-            is_err,
-            executed_ms,
-            false,
-            &execution.result_str,
-        );
+        self.ctx
+            .step_recorder
+            .complete_tool_with_result_and_metadata(
+                &execution.name,
+                &execution.id,
+                args_preview.as_deref(),
+                is_err,
+                executed_ms,
+                false,
+                &execution.result_str,
+            );
         self.executed_this_turn += 1;
 
         if let Some(sid) = self.ctx.current_session_id {

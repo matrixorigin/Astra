@@ -644,6 +644,29 @@ mod tests {
                 .and_then(Value::as_str),
             Some("semantic_dedup_pre_check")
         );
+        let skipped_output = tool_events[1]
+            .1
+            .as_ref()
+            .and_then(|payload| payload.get("output"))
+            .and_then(Value::as_str)
+            .expect("semantic dedup skip output");
+        assert!(
+            !skipped_output.contains("previous grep output"),
+            "semantic dedup skip must not re-inject prior output into context: {skipped_output}"
+        );
+        assert!(
+            skipped_output.contains("semantically identical"),
+            "semantic dedup skip should keep a bounded reference advisory"
+        );
+        let model_tool_output = harness.messages.last().and_then(|msg| {
+            msg.get("content")
+                .or_else(|| msg.get("output"))
+                .and_then(Value::as_str)
+        });
+        assert!(
+            model_tool_output.is_some_and(|output| !output.contains("previous grep output")),
+            "model-facing duplicate tool message must not replay prior output: {model_tool_output:?}"
+        );
     }
 
     #[tokio::test]

@@ -1536,6 +1536,9 @@ pub enum StepEventType {
     /// Step ended without terminal success/failure, e.g. a visible turn paused,
     /// hit a round budget, or yielded to the next iteration.
     StepIncomplete,
+    /// Step evaluation completed and the runtime decided what to do next.
+    /// This is not a terminal event; terminal status is recorded separately.
+    StepEvaluated,
     StepFailed,
     StepRetried,
 

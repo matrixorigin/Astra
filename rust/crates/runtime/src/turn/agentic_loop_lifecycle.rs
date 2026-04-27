@@ -43,6 +43,9 @@ pub(crate) fn session_turn_number(state: &AgenticLoopState) -> u32 {
 }
 
 pub(crate) fn current_agentic_step(state: &AgenticLoopState) -> u32 {
+    if state.llm_rounds_completed > 0 {
+        return state.llm_rounds_completed;
+    }
     state.max_turns.saturating_sub(state.remaining_turns) as u32
 }
 
@@ -1031,6 +1034,20 @@ mod tests {
 
         assert_eq!(current_agentic_step(&state), 50);
         assert_eq!(session_turn_number(&state), 1);
+    }
+
+    #[test]
+    fn current_agentic_step_uses_actual_llm_rounds_when_available() {
+        let mut state = make_state();
+        state.max_turns = 25;
+        state.remaining_turns = 9;
+        state.llm_rounds_completed = 14;
+
+        assert_eq!(
+            current_agentic_step(&state),
+            14,
+            "agentic_step must not skip when control-only loop iterations consume remaining_turns"
+        );
     }
 
     /// P1-D: Production code must not use unsafe set_var.

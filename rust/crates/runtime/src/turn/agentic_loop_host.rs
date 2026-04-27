@@ -1592,6 +1592,119 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn text_only_final_response_closes_current_step() {
+        let mut host = MockHost::new(vec![text_result("final", 10, 5, Some(30))]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        let terminal_events: Vec<_> = state
+            .step_recorder
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    crate::pipeline::StepEventType::StepCompleted
+                        | crate::pipeline::StepEventType::StepIncomplete
+                        | crate::pipeline::StepEventType::StepFailed
+                        | crate::pipeline::StepEventType::StepRetried
+                )
+            })
+            .collect();
+        assert_eq!(terminal_events.len(), 1, "{terminal_events:?}");
+        assert_eq!(
+            terminal_events[0].event_type,
+            crate::pipeline::StepEventType::StepCompleted
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_round_then_final_text_records_one_terminal_event_per_step() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("bash", "file list")], 20, 10, Some(50)),
+            text_result("done", 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        let mut terminal_counts = std::collections::BTreeMap::new();
+        for event in state.step_recorder.events() {
+            if matches!(
+                event.event_type,
+                crate::pipeline::StepEventType::StepCompleted
+                    | crate::pipeline::StepEventType::StepIncomplete
+                    | crate::pipeline::StepEventType::StepFailed
+                    | crate::pipeline::StepEventType::StepRetried
+            ) {
+                *terminal_counts
+                    .entry(event.step_id.clone())
+                    .or_insert(0usize) += 1;
+            }
+        }
+
+        assert_eq!(
+            terminal_counts.values().copied().collect::<Vec<_>>(),
+            vec![1, 1],
+            "each created step should have exactly one terminal event: {terminal_counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_tool_completion_trace_has_call_id_and_args_preview() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "bash",
+                    json!({"command":"git diff --stat"}),
+                    "diff stat",
+                )],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result("done", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        let completed = state
+            .step_recorder
+            .events()
+            .iter()
+            .find(|event| {
+                event.event_type == crate::pipeline::StepEventType::ToolCallCompleted
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("tool_name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("bash")
+            })
+            .expect("bash ToolCallCompleted event");
+        let payload = completed.payload.as_ref().unwrap();
+        assert!(
+            payload
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "payload should include non-empty call_id: {payload:?}"
+        );
+        assert_eq!(
+            payload
+                .get("args_preview")
+                .and_then(serde_json::Value::as_str),
+            Some("git diff --stat")
+        );
+    }
+
+    #[tokio::test]
     async fn tokens_accumulate_with_preexisting() {
         // Verify += semantics: pre-existing tokens are preserved
         let mut host = MockHost::new(vec![text_result("ok", 100, 50, None)]);

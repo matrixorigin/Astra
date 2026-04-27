@@ -353,17 +353,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         if READ_ONLY_TOOLS.contains(&slot.name.as_str())
-            && let Some((prev_turn, cached_output)) =
+            && let Some((prev_turn, _cached_output)) =
                 self.ctx
                     .semantic_dedup
                     .pre_check_block(&slot.name, &slot.args, self.ctx.turn_index)
         {
+            let args_preview = make_args_preview(&slot.name, &slot.args);
             let body = format!(
-                "{cached_output}\n\n⛔ BLOCKED DUPLICATE: This {} call is semantically \
+                "⛔ BLOCKED DUPLICATE: This {} call is semantically \
                  identical to turn {} — same tool with equivalent arguments. \
-                 Execution was skipped. Use the result above instead of calling again.",
+                 Execution was skipped without replaying the previous output. \
+                 Use the earlier result in the conversation instead of calling again{}.",
                 slot.name,
                 prev_turn + 1,
+                args_preview
+                    .as_deref()
+                    .map(|preview| format!(" (args: {preview})"))
+                    .unwrap_or_default(),
             );
             let (mut tool_msg, tr) =
                 headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
@@ -395,8 +401,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
                     slot.name.clone(),
-                    cached_output.len() as u32,
-                    make_args_preview(&slot.name, &slot.args),
+                    body.len() as u32,
+                    args_preview,
                 ));
             agent_warn!(
                 "dedup",

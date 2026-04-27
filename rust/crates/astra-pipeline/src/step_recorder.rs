@@ -386,7 +386,9 @@ impl StepRecorder {
         elapsed_ms: u64,
         was_cached: bool,
     ) {
-        self.complete_tool_inner(tool_name, is_error, elapsed_ms, was_cached, None);
+        self.complete_tool_inner(
+            tool_name, is_error, elapsed_ms, was_cached, None, None, None,
+        );
     }
 
     /// Record tool execution result with output for crash recovery cache warming.
@@ -400,7 +402,39 @@ impl StepRecorder {
         was_cached: bool,
         output: &str,
     ) {
-        self.complete_tool_inner(tool_name, is_error, elapsed_ms, was_cached, Some(output));
+        self.complete_tool_inner(
+            tool_name,
+            is_error,
+            elapsed_ms,
+            was_cached,
+            Some(output),
+            None,
+            None,
+        );
+    }
+
+    /// Record tool execution result with explicit trace metadata. Use this for
+    /// runtime paths that already know the call id and arguments so payloads stay
+    /// actionable even if slot metadata is incomplete.
+    pub fn complete_tool_with_result_and_metadata(
+        &mut self,
+        tool_name: &str,
+        call_id: &str,
+        args_preview: Option<&str>,
+        is_error: bool,
+        elapsed_ms: u64,
+        was_cached: bool,
+        output: &str,
+    ) {
+        self.complete_tool_inner(
+            tool_name,
+            is_error,
+            elapsed_ms,
+            was_cached,
+            Some(output),
+            Some(call_id),
+            args_preview,
+        );
     }
 
     fn complete_tool_inner(
@@ -410,6 +444,8 @@ impl StepRecorder {
         elapsed_ms: u64,
         was_cached: bool,
         output: Option<&str>,
+        fallback_call_id: Option<&str>,
+        fallback_args_preview: Option<&str>,
     ) {
         let slot_idx = self.slot_counter.saturating_sub(1);
 
@@ -459,11 +495,23 @@ impl StepRecorder {
             "is_error": is_error,
         });
         if let Some((call_id, idem_key, args_preview)) = slot_meta {
-            payload["call_id"] = serde_json::json!(call_id);
+            let call_id = if call_id.is_empty() {
+                fallback_call_id.unwrap_or("")
+            } else {
+                call_id.as_str()
+            };
+            if !call_id.is_empty() {
+                payload["call_id"] = serde_json::json!(call_id);
+            }
             if let Some(key) = idem_key {
                 payload["idempotency_key"] = serde_json::json!(key);
             }
-            if let Some(args_preview) = args_preview {
+            if let Some(args_preview) = args_preview.as_deref().or(fallback_args_preview) {
+                payload["args_preview"] = serde_json::json!(args_preview);
+            }
+        } else if let Some(call_id) = fallback_call_id.filter(|value| !value.is_empty()) {
+            payload["call_id"] = serde_json::json!(call_id);
+            if let Some(args_preview) = fallback_args_preview {
                 payload["args_preview"] = serde_json::json!(args_preview);
             }
         }
@@ -557,7 +605,7 @@ impl StepRecorder {
             } else if is_diverging {
                 StepEventType::DivergenceDetected
             } else {
-                StepEventType::StepCompleted
+                StepEventType::StepEvaluated
             },
             serde_json::json!({
                 "severity": severity,
@@ -1126,6 +1174,38 @@ mod tests {
     }
 
     #[test]
+    fn regression_incomplete_turn_has_single_terminal_event() {
+        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+        rec.begin_tool("read_file", "call-1");
+        rec.complete_tool("read_file", false, 12, false);
+        rec.record_verdict("Healthy", false, false, false, 0);
+
+        rec.end_turn(false);
+
+        let terminal_events: Vec<_> = rec
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    StepEventType::StepCompleted
+                        | StepEventType::StepIncomplete
+                        | StepEventType::StepFailed
+                        | StepEventType::StepRetried
+                )
+            })
+            .collect();
+        assert_eq!(
+            terminal_events.len(),
+            1,
+            "a step must not record both StepCompleted and StepIncomplete: {terminal_events:?}"
+        );
+        assert_eq!(terminal_events[0].event_type, StepEventType::StepIncomplete);
+    }
+
+    #[test]
     fn regression_failed_tool_event_carries_actionable_payload() {
         let mut rec = StepRecorder::new("sess-regression", "task-1");
         rec.begin_turn(0);
@@ -1177,6 +1257,37 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|error| error.contains("old_str not found")),
             "failed event should carry actionable error, got: {payload:?}"
+        );
+    }
+
+    #[test]
+    fn complete_tool_with_metadata_backfills_actionable_payload() {
+        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act(1);
+
+        rec.complete_tool_with_result_and_metadata(
+            "read_file",
+            "call-read-1",
+            Some("src/main.rs"),
+            false,
+            12,
+            false,
+            "file contents",
+        );
+
+        let last = rec.events().last().unwrap();
+        assert_eq!(last.event_type, StepEventType::ToolCallCompleted);
+        let payload = last.payload.as_ref().unwrap();
+        assert_eq!(
+            payload.get("call_id").and_then(serde_json::Value::as_str),
+            Some("call-read-1")
+        );
+        assert_eq!(
+            payload
+                .get("args_preview")
+                .and_then(serde_json::Value::as_str),
+            Some("src/main.rs")
         );
     }
 

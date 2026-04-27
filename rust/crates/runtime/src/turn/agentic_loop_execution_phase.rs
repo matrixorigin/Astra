@@ -427,6 +427,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     turn_result.ttft_ms,
                 );
+                state.step_recorder.end_turn(false);
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
@@ -566,6 +567,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         execution_retry_notice(retry_reason),
                     );
                 }
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("execution_retry"),
+                );
+                state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
@@ -582,6 +590,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
                 state.messages.push(prompt);
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("stop_hook"),
+                );
+                state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
@@ -590,6 +605,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // Without this, simple Q&A turns have llm_rounds=0 in the
             // journal despite the LLM being called.
             record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
+            state.step_recorder.end_turn(true);
 
             observe_turn_end_without_tools(
                 state,
@@ -601,6 +617,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
         }
         AgenticIngestIterationControl::ContinueIterating => {
+            record_early_exit_llm_round(
+                state,
+                &turn_result,
+                prep.turn_start_time,
+                Some("continue"),
+            );
+            state.step_recorder.end_turn(false);
             try_write_heavy_checkpoint(state);
             return Ok(TurnExecutionControl::ContinueLoop);
         }
@@ -654,6 +677,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 ),
             );
         }
+        state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
         return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
@@ -1754,6 +1778,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             prep.turn_start_time,
             turn_result.ttft_ms,
         );
+        state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
