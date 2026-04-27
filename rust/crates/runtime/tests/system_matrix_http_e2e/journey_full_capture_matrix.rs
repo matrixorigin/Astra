@@ -32,8 +32,11 @@ fn read_journal_events(session_id: &str) -> Vec<Value> {
         .expect("journal writer")
         .path()
         .clone();
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read journal {path:?}: {e}"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("read journal {path:?}: {error}"),
+    };
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("valid journal line"))
