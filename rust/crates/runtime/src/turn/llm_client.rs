@@ -4271,7 +4271,8 @@ mod tests {
         assert_eq!(system[1]["cachePoint"]["ttl"], "1h");
         assert_eq!(system[2]["text"], "runtime hints");
         assert!(system.iter().all(|block| {
-            block.get("text")
+            block
+                .get("text")
                 .and_then(Value::as_str)
                 .is_none_or(|text| !text.trim().is_empty())
         }));
