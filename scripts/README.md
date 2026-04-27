@@ -23,7 +23,7 @@ scripts/
 ## Key Scripts
 
 ### `scripts/dev/init.sh`
-Initializes local development configuration and prepares the Rust-first workflow behind `make dev-init`.
+Initializes local development configuration, generating required local secrets in `.env`, and prepares the Rust-first workflow behind `make dev-init`.
 
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.

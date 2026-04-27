@@ -2865,22 +2865,26 @@ impl ServerToolExecutor {
             Ok(prepared) => prepared,
             Err(error) => return error.output,
         };
+        let dry_run = prepared.is_dry_run();
+
+        if dry_run {
+            return prepared.apply().output;
+        }
+
+        let path = prepared.path().to_owned();
+        let new_content_bytes = prepared.new_content_bytes().to_vec();
 
         // Record journal entry
         if let Ok(mut journal) = self.file_journal.lock() {
             let turn_idx = self.journal_turn_index.load(Ordering::Relaxed);
-            journal.record_before_patch(prepared.path(), "server-str-replace", turn_idx);
+            journal.record_before_patch(&path, "server-str-replace", turn_idx);
         }
 
         let result = prepared.apply();
         if !result.is_error
             && let Ok(mut journal) = self.file_journal.lock()
         {
-            journal.record_after(
-                prepared.path(),
-                "server-str-replace",
-                prepared.new_content_bytes(),
-            );
+            journal.record_after(&path, "server-str-replace", &new_content_bytes);
         }
         result.output
     }

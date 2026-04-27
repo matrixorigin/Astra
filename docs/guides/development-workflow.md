@@ -130,8 +130,8 @@ make dev-start
 
 The `dev-init` command automatically:
 - Generates `TOKEN_ENCRYPTION_KEY` if missing
-- Fixes `OPENAI_AKI_KEY` → `OPENAI_API_KEY` typo
-- Validates LLM provider/model configuration
+- Generates `JWT_SECRET_KEY` if missing
+- Generates `CHAT_TURN_BRIDGE_SECRET` if missing or still using the template placeholder
 
 ## Proxy Configuration
 

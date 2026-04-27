@@ -77,7 +77,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Replace an exact string in a file. old_str must match exactly (including whitespace). On mismatch, shows closest matches with line numbers so you can fix and retry. Set dry_run=true to preview the diff without applying.",
+                "description": "Replace a string in a file. Tries an exact match first, then a unique quote/whitespace-aware fuzzy match when old_str differs slightly. On mismatch, shows closest matches with line numbers so you can fix and retry. Set dry_run=true to preview the diff without applying.",
                 "parameters": {
                     "type": "object",
                     "properties": {

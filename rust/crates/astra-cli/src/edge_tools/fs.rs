@@ -770,10 +770,10 @@ impl ToolExecutor {
         let count = content.matches(old_str).count();
         if count == 0 {
             let norm_count = super::fuzzy_replacer::quote_normalized_match_count(&content, old_str);
-            if norm_count > 1 {
+            if norm_count > 1 && !replace_all {
                 self.record_fuzzy_match_event(
                     &path,
-                    "quote-normalized",
+                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
                     astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
                 );
                 return format!(
@@ -786,11 +786,20 @@ impl ToolExecutor {
             if let Some(fuzzy_match) =
                 super::fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
             {
+                let replacement = if fuzzy_match.is_quote_normalized() {
+                    super::fuzzy_replacer::preserve_quote_style(
+                        old_str,
+                        fuzzy_match.actual,
+                        new_str,
+                    )
+                } else {
+                    new_str.to_string()
+                };
                 let actual: &str = &fuzzy_match.actual;
                 let new_content = if replace_all {
-                    content.replace(actual, new_str)
+                    content.replace(actual, &replacement)
                 } else {
-                    content.replacen(actual, new_str, 1)
+                    content.replacen(actual, &replacement, 1)
                 };
                 if dry_run {
                     self.record_fuzzy_match_event(
@@ -807,7 +816,7 @@ impl ToolExecutor {
                 let turn_idx = self
                     .journal_turn_index
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let journal_call_id = if fuzzy_match.strategy == "quote-normalized" {
+                let journal_call_id = if fuzzy_match.is_quote_normalized() {
                     format!("str_replace_quote_norm:{}", path.display())
                 } else {
                     format!("str_replace_fuzzy:{}", path.display())
@@ -826,7 +835,7 @@ impl ToolExecutor {
                         if format_result.is_some() {
                             self.record_write(&path);
                         }
-                        let mut result = if fuzzy_match.strategy == "quote-normalized" {
+                        let mut result = if fuzzy_match.is_quote_normalized() {
                             String::from(
                                 "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
                             )
@@ -837,7 +846,7 @@ impl ToolExecutor {
                             )
                         };
                         let old_lines: Vec<&str> = fuzzy_match.actual.lines().collect();
-                        let new_lines: Vec<&str> = new_str.lines().collect();
+                        let new_lines: Vec<&str> = replacement.lines().collect();
                         if old_lines.len().max(new_lines.len()) <= 10 {
                             for l in &old_lines {
                                 result.push_str(&format!("- {l}\n"));
@@ -3144,6 +3153,27 @@ type Handler interface {
         // Verify actual file content
         let actual = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(actual, "let x = \"world\";");
+    }
+
+    #[test]
+    fn str_replace_preserves_curly_quotes_from_file_on_quote_normalized_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("curly-preserve.rs");
+        std::fs::write(&file_path, "let x = \u{201C}hello\u{201D};").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "curly-preserve.rs"}));
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "curly-preserve.rs",
+            "old_str": "let x = \"hello\";",
+            "new_str": "let x = \"world\";"
+        }));
+        assert!(
+            result.contains("curly quotes"),
+            "should mention normalization: {result}"
+        );
+        let actual = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(actual, "let x = \u{201C}world\u{201D};");
     }
 
     #[test]

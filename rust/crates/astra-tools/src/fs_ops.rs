@@ -10,6 +10,9 @@ use base64::Engine;
 use serde_json::Value;
 
 use crate::code_intel;
+use crate::fuzzy_replacer::{
+    fuzzy_find_replacement, normalize_ws, preserve_quote_style, quote_normalized_match_count,
+};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
@@ -632,8 +635,9 @@ pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
 #[derive(Debug)]
 pub struct PreparedStrReplace {
     path: PathBuf,
-    path_str: String,
     new_content: String,
+    dry_run: bool,
+    success_message: String,
 }
 
 impl PreparedStrReplace {
@@ -645,9 +649,16 @@ impl PreparedStrReplace {
         self.new_content.as_bytes()
     }
 
-    pub fn apply(&self) -> ToolResult {
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    pub fn apply(self) -> ToolResult {
+        if self.dry_run {
+            return ToolResult::text(self.success_message);
+        }
         match std::fs::write(&self.path, &self.new_content) {
-            Ok(()) => ToolResult::text(format!("Successfully replaced text in {}", self.path_str)),
+            Ok(()) => ToolResult::text(self.success_message),
             Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
         }
     }
@@ -677,6 +688,14 @@ pub fn prepare_str_replace(
             ));
         }
     };
+    let replace_all = args
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
         Err(e) => return Err(ToolResult::error(e)),
@@ -689,20 +708,76 @@ pub fn prepare_str_replace(
 
     let count = content.matches(old_str).count();
     if count == 0 {
-        return Err(ToolResult::error(format!(
-            "Error: old_str not found in {path_str}"
+        let normalized_quote_count = quote_normalized_match_count(&content, old_str);
+        if normalized_quote_count > 1 && !replace_all {
+            return Err(ToolResult::error(format!(
+                "Error: old_str found {normalized_quote_count} times in {path_str} after normalizing curly quotes. Make old_str more specific to match exactly once."
+            )));
+        }
+
+        if let Some(fuzzy_match) = fuzzy_find_replacement(&content, old_str, replace_all) {
+            let replacement = if fuzzy_match.is_quote_normalized() {
+                preserve_quote_style(old_str, fuzzy_match.actual, new_str)
+            } else {
+                new_str.to_string()
+            };
+            let new_content = if replace_all {
+                content.replace(fuzzy_match.actual, &replacement)
+            } else {
+                content.replacen(fuzzy_match.actual, &replacement, 1)
+            };
+            let success_message = if dry_run {
+                unified_diff(&content, &new_content, path_str)
+            } else {
+                format!(
+                    "Successfully replaced text in {} (matched via {})",
+                    path_str, fuzzy_match.strategy
+                )
+            };
+            return Ok(PreparedStrReplace {
+                path,
+                new_content,
+                dry_run,
+                success_message,
+            });
+        }
+
+        if replace_all && normalized_quote_count > 1 {
+            return Err(ToolResult::error(format!(
+                "Error: old_str matches {normalized_quote_count} occurrences in {path_str} after normalizing curly quotes, but the file contains mixed curly quote forms. Cannot safely replace_all with inconsistent quoting styles."
+            )));
+        }
+
+        return Err(ToolResult::error(str_replace_not_found_hint(
+            path_str, &content, old_str,
         )));
     }
-    if count > 1 {
+    if count > 1 && !replace_all {
         return Err(ToolResult::error(format!(
             "Error: old_str found {count} times in {path_str}. Make old_str more specific to match exactly once."
         )));
     }
 
+    let new_content = if replace_all {
+        content.replace(old_str, new_str)
+    } else {
+        content.replacen(old_str, new_str, 1)
+    };
+    let success_message = if dry_run {
+        unified_diff(&content, &new_content, path_str)
+    } else if replace_all {
+        format!(
+            "Successfully replaced text in {} ({count} occurrences)",
+            path_str
+        )
+    } else {
+        format!("Successfully replaced text in {}", path_str)
+    };
     Ok(PreparedStrReplace {
         path,
-        path_str: path_str.to_string(),
-        new_content: content.replacen(old_str, new_str, 1),
+        new_content,
+        dry_run,
+        success_message,
     })
 }
 
@@ -942,6 +1017,329 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
         Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
+}
+
+fn str_replace_not_found_hint(path_str: &str, content: &str, old_str: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old_str.lines().collect();
+    let mut msg = format!("Error: old_str not found in {path_str}.\n");
+    let mut has_specific_hint = false;
+
+    let normalized_old = normalize_ws(old_str);
+    let normalized_content = normalize_ws(content);
+    if normalized_content.contains(&normalized_old) {
+        msg.push_str(
+            "Hint: A whitespace-normalized match exists. Check indentation/trailing spaces.\n",
+        );
+        if let Some(first_line) = old_lines.first() {
+            let normalized_first = normalize_ws(first_line);
+            for (idx, line) in lines.iter().enumerate() {
+                if normalize_ws(line) == normalized_first {
+                    msg.push_str(&format!("  Possible match at line {}\n", idx + 1));
+                    let end = (idx + old_lines.len().min(5)).min(lines.len());
+                    for (line_offset, line_content) in lines[idx..end].iter().enumerate() {
+                        msg.push_str(&format!("  {}: {}\n", idx + line_offset + 1, line_content));
+                    }
+                    break;
+                }
+            }
+        }
+        return msg;
+    }
+
+    if let Some(first_line) = old_lines.first() {
+        let needle = first_line.trim();
+        if !needle.is_empty() {
+            let mut matches = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                if line.trim() == needle || line.contains(needle) {
+                    matches.push(idx + 1);
+                    if matches.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+            if !matches.is_empty() {
+                has_specific_hint = true;
+                msg.push_str(&format!(
+                    "Hint: First line of old_str ('{}') found at line(s): {:?}\n",
+                    truncate_chars(needle, 60),
+                    matches
+                ));
+                let line_idx = matches[0] - 1;
+                let start = line_idx;
+                let end = (line_idx + old_lines.len()).min(lines.len());
+                msg.push_str("Actual file content:\n");
+                for (line_offset, line_content) in lines[start..end].iter().enumerate() {
+                    msg.push_str(&format!(
+                        "  {}: {}\n",
+                        start + line_offset + 1,
+                        line_content
+                    ));
+                }
+            }
+        }
+    }
+
+    if old_lines.len() > 1 {
+        let file_line_set: std::collections::HashSet<&str> =
+            lines.iter().map(|l| l.trim()).collect();
+        let matching_count = old_lines
+            .iter()
+            .filter(|old_line| {
+                let trimmed = old_line.trim();
+                !trimmed.is_empty() && file_line_set.contains(trimmed)
+            })
+            .count();
+        if matching_count > 0 {
+            has_specific_hint = true;
+            msg.push_str(&format!(
+                "Hint: {matching_count}/{} lines from old_str exist individually in the file.\n",
+                old_lines.len()
+            ));
+        }
+    }
+
+    if !has_specific_hint {
+        msg.push_str(
+            "Hint: Use read_file with start_line/end_line to verify the exact content before retrying.\n",
+        );
+    }
+    msg
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+const LCS_LINE_LIMIT: usize = 4000;
+
+fn unified_diff(old_content: &str, new_content: &str, path_str: &str) -> String {
+    let filename = Path::new(path_str)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+
+    if old_lines.len().max(new_lines.len()) > LCS_LINE_LIMIT {
+        return unified_diff_simple(old_content, new_content, &filename);
+    }
+
+    let ops = lcs_diff(&old_lines, &new_lines);
+    if ops.is_empty() || ops.iter().all(|op| matches!(op, DiffOp::Equal(..))) {
+        return format!(
+            "[DRY RUN] Preview of changes (not applied):\n--- a/{filename}\n+++ b/{filename}\n(no changes)\n"
+        );
+    }
+
+    let hunks = group_into_hunks(&ops, 3);
+    let mut diff = format!("--- a/{filename}\n+++ b/{filename}\n");
+    for hunk in &hunks {
+        let mut old_start = usize::MAX;
+        let mut old_count = 0;
+        let mut new_start = usize::MAX;
+        let mut new_count = 0;
+        for op in hunk {
+            match op {
+                DiffOp::Equal(o, n, _) => {
+                    old_start = old_start.min(*o);
+                    new_start = new_start.min(*n);
+                    old_count += 1;
+                    new_count += 1;
+                }
+                DiffOp::Delete(o, _) => {
+                    old_start = old_start.min(*o);
+                    old_count += 1;
+                }
+                DiffOp::Insert(n, _) => {
+                    new_start = new_start.min(*n);
+                    new_count += 1;
+                }
+            }
+        }
+        if old_start == usize::MAX {
+            old_start = 0;
+        }
+        if new_start == usize::MAX {
+            new_start = 0;
+        }
+        diff.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start + 1,
+            old_count,
+            new_start + 1,
+            new_count,
+        ));
+        for op in hunk {
+            match op {
+                DiffOp::Equal(_, _, line) => diff.push_str(&format!(" {line}\n")),
+                DiffOp::Delete(_, line) => diff.push_str(&format!("-{line}\n")),
+                DiffOp::Insert(_, line) => diff.push_str(&format!("+{line}\n")),
+            }
+        }
+    }
+    format!("[DRY RUN] Preview of changes (not applied):\n{diff}")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DiffOp<'a> {
+    Equal(usize, usize, &'a str),
+    Delete(usize, &'a str),
+    Insert(usize, &'a str),
+}
+
+fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<DiffOp<'a>> {
+    let m = old.len();
+    let n = new.len();
+    // LCS table
+    let mut table = vec![vec![0u32; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            table[i][j] = if old[i] == new[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    let mut raw = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < m || j < n {
+        if i < m && j < n && old[i] == new[j] {
+            raw.push(DiffOp::Equal(i, j, old[i]));
+            i += 1;
+            j += 1;
+        } else if i < m && (j >= n || table[i + 1][j] >= table[i][j + 1]) {
+            raw.push(DiffOp::Delete(i, old[i]));
+            i += 1;
+        } else {
+            raw.push(DiffOp::Insert(j, new[j]));
+            j += 1;
+        }
+    }
+    // Reorder runs of non-equal ops: deletes before inserts (standard diff convention)
+    let mut ops = Vec::with_capacity(raw.len());
+    let mut idx = 0;
+    while idx < raw.len() {
+        if matches!(raw[idx], DiffOp::Equal(..)) {
+            ops.push(raw[idx]);
+            idx += 1;
+        } else {
+            let run_start = idx;
+            while idx < raw.len() && !matches!(raw[idx], DiffOp::Equal(..)) {
+                idx += 1;
+            }
+            for op in &raw[run_start..idx] {
+                if matches!(op, DiffOp::Delete(..)) {
+                    ops.push(*op);
+                }
+            }
+            for op in &raw[run_start..idx] {
+                if matches!(op, DiffOp::Insert(..)) {
+                    ops.push(*op);
+                }
+            }
+        }
+    }
+    ops
+}
+
+fn group_into_hunks<'a>(ops: &[DiffOp<'a>], context: usize) -> Vec<Vec<DiffOp<'a>>> {
+    let mut hunks: Vec<Vec<DiffOp<'a>>> = Vec::new();
+    let mut change_indices: Vec<usize> = Vec::new();
+    for (idx, op) in ops.iter().enumerate() {
+        if !matches!(op, DiffOp::Equal(..)) {
+            change_indices.push(idx);
+        }
+    }
+    if change_indices.is_empty() {
+        return hunks;
+    }
+    let mut hunk_start = change_indices[0].saturating_sub(context);
+    let mut hunk_end = (change_indices[0] + context + 1).min(ops.len());
+    for &ci in &change_indices[1..] {
+        let cs = ci.saturating_sub(context);
+        let ce = (ci + context + 1).min(ops.len());
+        if cs <= hunk_end {
+            hunk_end = ce;
+        } else {
+            hunks.push(ops[hunk_start..hunk_end].to_vec());
+            hunk_start = cs;
+            hunk_end = ce;
+        }
+    }
+    hunks.push(ops[hunk_start..hunk_end].to_vec());
+    hunks
+}
+
+fn unified_diff_simple(old_content: &str, new_content: &str, filename: &str) -> String {
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+    let max_len = old_lines.len().max(new_lines.len());
+    let mut first_diff = max_len;
+    let mut last_diff = 0;
+    for idx in 0..max_len {
+        let o = old_lines.get(idx).copied().unwrap_or("");
+        let n = new_lines.get(idx).copied().unwrap_or("");
+        if o != n {
+            first_diff = first_diff.min(idx);
+            last_diff = idx;
+        }
+    }
+    let mut diff = format!("--- a/{filename}\n+++ b/{filename}\n");
+    if first_diff > last_diff {
+        return format!("[DRY RUN] Preview of changes (not applied):\n{diff}(no changes)\n");
+    }
+    let context = 3;
+    let start = first_diff.saturating_sub(context);
+    let end = (last_diff + context + 1).min(max_len);
+    diff.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        start + 1,
+        end.min(old_lines.len()).saturating_sub(start),
+        start + 1,
+        end.min(new_lines.len()).saturating_sub(start),
+    ));
+    let mut idx = start;
+    while idx < end {
+        let o = old_lines.get(idx).copied();
+        let n = new_lines.get(idx).copied();
+        match (o, n) {
+            (Some(a), Some(b)) if a == b => {
+                diff.push_str(&format!(" {a}\n"));
+                idx += 1;
+            }
+            _ => {
+                let run_start = idx;
+                while idx < end {
+                    let a = old_lines.get(idx).copied();
+                    let b = new_lines.get(idx).copied();
+                    if matches!((a, b), (Some(x), Some(y)) if x == y) {
+                        break;
+                    }
+                    idx += 1;
+                }
+                for i in run_start..idx {
+                    if let Some(line) = old_lines.get(i) {
+                        diff.push_str(&format!("-{line}\n"));
+                    }
+                }
+                for i in run_start..idx {
+                    if let Some(line) = new_lines.get(i) {
+                        diff.push_str(&format!("+{line}\n"));
+                    }
+                }
+            }
+        }
+    }
+    format!("[DRY RUN] Preview of changes (not applied):\n{diff}")
 }
 
 #[cfg(test)]
@@ -1220,6 +1618,545 @@ mod tests {
         let result = str_replace(tmp.path(), &args);
         assert!(result.is_error);
         assert!(result.output.contains("3 times"));
+    }
+
+    #[test]
+    fn str_replace_falls_back_to_whitespace_normalized_match() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "  fn hello() {\n    println!(\"hi\");\n  }\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "fn hello() {\n  println!(\"hi\");\n}",
+            "new_str": "fn hello() {\n  println!(\"bye\");\n}"
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("line-trimmed"),
+            "expected line-trimmed strategy, got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert!(content.contains("println!(\"bye\");"), "got: {content}");
+    }
+
+    #[test]
+    fn str_replace_not_found_reports_whitespace_hint() {
+        let msg = str_replace_not_found_hint(
+            "f.txt",
+            "  fn hello() {\n    println!(\"hi\");\n  }\n",
+            "fn hello() {\n  println!(\"hi\");\n}",
+        );
+        assert!(msg.contains("whitespace-normalized"), "got: {msg}");
+        assert!(msg.contains("line 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn str_replace_quote_normalized_match_preserves_file_quote_style() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "let x = \u{201C}hello\u{201D};").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "let x = \"hello\";",
+            "new_str": "let x = \"world\";"
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "let x = \u{201C}world\u{201D};");
+    }
+
+    #[test]
+    fn str_replace_dry_run_shows_diff_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "line1\nline2\nline3\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "line2",
+            "new_str": "REPLACED",
+            "dry_run": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("[DRY RUN]"),
+            "got: {}",
+            result.output
+        );
+        assert!(result.output.contains("-line2"), "got: {}", result.output);
+        assert!(
+            result.output.contains("+REPLACED"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn str_replace_replace_all_fuzzy_ambiguous_does_not_partially_apply() {
+        let tmp = TempDir::new().unwrap();
+        let original = "  fn hi() {\n    a();\n  }\n\n\tfn hi() {\n\t  a();\n\t}\n";
+        std::fs::write(tmp.path().join("f.txt"), original).unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "fn hi() {\n  a();\n}",
+            "new_str": "fn bye() {\n  b();\n}",
+            "replace_all": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(result.is_error, "got success: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, original);
+    }
+
+    // ─── Issue #1: replace_all + quote-normalized should replace all ────
+    #[test]
+    fn str_replace_replace_all_quote_normalized_replaces_all_occurrences() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "let a = \u{201C}hello\u{201D};\nlet b = \u{201C}hello\u{201D};\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "\"hello\"",
+            "new_str": "\"world\"",
+            "replace_all": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(
+            content,
+            "let a = \u{201C}world\u{201D};\nlet b = \u{201C}world\u{201D};\n"
+        );
+    }
+
+    // ─── Issue #3: not-found hint O(n*m) → use HashSet ──────────────────
+    #[test]
+    fn str_replace_not_found_hint_first_line_match_branch() {
+        let msg = str_replace_not_found_hint(
+            "f.txt",
+            "fn foo() {\n    bar();\n    baz();\n}\n",
+            "fn foo() {\n    bar();\n    qux();\n}",
+        );
+        assert!(msg.contains("First line"), "got: {msg}");
+        assert!(msg.contains("fn foo()"), "got: {msg}");
+        assert!(msg.contains("Actual file content"), "got: {msg}");
+    }
+
+    #[test]
+    fn str_replace_not_found_hint_generic_fallback() {
+        let msg = str_replace_not_found_hint(
+            "f.txt",
+            "totally different content\nno matches at all\n",
+            "something completely unrelated",
+        );
+        assert!(msg.contains("read_file"), "got: {msg}");
+    }
+
+    #[test]
+    fn str_replace_not_found_hint_individual_lines_branch() {
+        let msg = str_replace_not_found_hint("f.txt", "aaa\nbbb\nccc\n", "aaa\nXXX\nccc");
+        assert!(
+            msg.contains("lines from old_str exist individually"),
+            "got: {msg}"
+        );
+    }
+
+    // ─── Missing coverage: dry_run + fuzzy match ────────────────────────
+    #[test]
+    fn str_replace_dry_run_fuzzy_match_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "  fn hello() {\n    println!(\"hi\");\n  }\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "fn hello() {\n  println!(\"hi\");\n}",
+            "new_str": "fn hello() {\n  println!(\"bye\");\n}",
+            "dry_run": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("[DRY RUN]"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(
+            content, "  fn hello() {\n    println!(\"hi\");\n  }\n",
+            "file should not be modified"
+        );
+    }
+
+    // ─── Missing coverage: replace_all + dry_run ────────────────────────
+    #[test]
+    fn str_replace_replace_all_dry_run_shows_all_changes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "aaa\nbbb\naaa\nbbb\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "aaa",
+            "new_str": "ZZZ",
+            "replace_all": true,
+            "dry_run": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("[DRY RUN]"),
+            "got: {}",
+            result.output
+        );
+        assert!(result.output.contains("-aaa"), "got: {}", result.output);
+        assert!(result.output.contains("+ZZZ"), "got: {}", result.output);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(
+            content, "aaa\nbbb\naaa\nbbb\n",
+            "file should not be modified"
+        );
+    }
+
+    // ─── replace_all exact match (non-fuzzy) ──────────────────────────
+    #[test]
+    fn str_replace_replace_all_exact_match() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "aaa\nbbb\naaa\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "aaa",
+            "new_str": "ZZZ",
+            "replace_all": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("2 occurrences"),
+            "expected occurrence count, got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "ZZZ\nbbb\nZZZ\n");
+    }
+
+    // ─── dry_run + quote-normalized fuzzy match ─────────────────────────
+    #[test]
+    fn str_replace_dry_run_quote_normalized_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "let x = \u{201C}hello\u{201D};").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "let x = \"hello\";",
+            "new_str": "let x = \"world\";",
+            "dry_run": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(!result.is_error, "got error: {}", result.output);
+        assert!(
+            result.output.contains("[DRY RUN]"),
+            "got: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "let x = \u{201C}hello\u{201D};");
+    }
+
+    // ─── not-found hint: empty first line of old_str ────────────────────
+    #[test]
+    fn str_replace_not_found_hint_empty_first_line() {
+        let msg = str_replace_not_found_hint("f.txt", "some content\n", "  \nactual code");
+        assert!(msg.contains("old_str not found"), "got: {msg}");
+    }
+
+    // ─── not-found hint: multiline with zero individual matches ─────────
+    #[test]
+    fn str_replace_not_found_hint_no_individual_line_matches() {
+        let msg =
+            str_replace_not_found_hint("f.txt", "real content here\n", "xxxxxxx\nyyyyyyy\nzzzzzzz");
+        assert!(
+            msg.contains("read_file"),
+            "expected generic fallback, got: {msg}"
+        );
+        assert!(!msg.contains("lines from old_str exist"), "got: {msg}");
+    }
+
+    // ─── unified_diff edge cases ────────────────────────────────────────
+    #[test]
+    fn unified_diff_groups_removed_then_added_lines() {
+        let old = "ctx\nold1\nold2\nctx\n";
+        let new = "ctx\nnew1\nnew2\nctx\n";
+        let diff = unified_diff(old, new, "test.txt");
+        let minus_pos = diff.find("-old1").unwrap();
+        let minus2_pos = diff.find("-old2").unwrap();
+        let plus_pos = diff.find("+new1").unwrap();
+        assert!(
+            minus2_pos < plus_pos,
+            "expected grouped -/+ lines, got:\n{diff}"
+        );
+        assert!(
+            minus2_pos > minus_pos,
+            "minus lines out of order in:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn unified_diff_no_changes_shows_no_changes() {
+        let content = "line1\nline2\n";
+        let diff = unified_diff(content, content, "same.txt");
+        assert!(diff.contains("(no changes)"), "got:\n{diff}");
+    }
+
+    #[test]
+    fn unified_diff_added_lines() {
+        let old = "a\nb\n";
+        let new = "a\nb\nc\n";
+        let diff = unified_diff(old, new, "add.txt");
+        assert!(diff.contains("+c"), "got:\n{diff}");
+    }
+
+    #[test]
+    fn unified_diff_removed_lines() {
+        let old = "a\nb\nc\n";
+        let new = "a\nb\n";
+        let diff = unified_diff(old, new, "rm.txt");
+        assert!(diff.contains("-c"), "got:\n{diff}");
+    }
+
+    #[test]
+    fn unified_diff_includes_context_lines() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let new = "a\nb\nc\nd\nX\nf\ng\nh\n";
+        let diff = unified_diff(old, new, "ctx.txt");
+        assert!(diff.contains(" b"), "expected context before, got:\n{diff}");
+        assert!(diff.contains(" f"), "expected context after, got:\n{diff}");
+        assert!(diff.contains("-e"), "got:\n{diff}");
+        assert!(diff.contains("+X"), "got:\n{diff}");
+    }
+
+    // ─── Issue #1: unified_diff insertion should not shift subsequent lines ──
+    #[test]
+    fn unified_diff_insertion_does_not_shift_subsequent_lines() {
+        let old = "a\nb\nc\nd\n";
+        let new = "a\nb\nINSERTED\nc\nd\n";
+        let diff = unified_diff(old, new, "ins.txt");
+        // Only the inserted line should appear as +, c and d should be context
+        assert!(diff.contains("+INSERTED"), "got:\n{diff}");
+        // c and d must NOT appear as changed lines
+        assert!(
+            !diff.contains("-c"),
+            "c should not be removed, got:\n{diff}"
+        );
+        assert!(
+            !diff.contains("-d"),
+            "d should not be removed, got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn unified_diff_deletion_does_not_shift_subsequent_lines() {
+        let old = "a\nb\nDELETED\nc\nd\n";
+        let new = "a\nb\nc\nd\n";
+        let diff = unified_diff(old, new, "del.txt");
+        assert!(diff.contains("-DELETED"), "got:\n{diff}");
+        assert!(
+            !diff.contains("-c"),
+            "c should not be removed, got:\n{diff}"
+        );
+        assert!(!diff.contains("+c"), "c should not be added, got:\n{diff}");
+    }
+
+    #[test]
+    fn unified_diff_hunk_header_counts_match_actual_lines() {
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "a\nb\nX\nY\nd\ne\n";
+        let diff = unified_diff(old, new, "hdr.txt");
+        // Parse the @@ line and verify counts match actual - and + lines (+ context)
+        for line in diff.lines() {
+            if line.starts_with("@@") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let old_spec = parts[1]; // e.g. "-1,5"
+                let new_spec = parts[2]; // e.g. "+1,6"
+                let old_count: usize = old_spec.split(',').nth(1).unwrap().parse().unwrap();
+                let new_count: usize = new_spec.split(',').nth(1).unwrap().parse().unwrap();
+                // Count actual lines in the hunk
+                let hunk_lines: Vec<&str> = diff
+                    .lines()
+                    .skip_while(|l| !l.starts_with("@@"))
+                    .skip(1)
+                    .collect();
+                let actual_old = hunk_lines
+                    .iter()
+                    .filter(|l| l.starts_with(' ') || l.starts_with('-'))
+                    .count();
+                let actual_new = hunk_lines
+                    .iter()
+                    .filter(|l| l.starts_with(' ') || l.starts_with('+'))
+                    .count();
+                assert_eq!(
+                    old_count, actual_old,
+                    "old count in header ({old_count}) != actual old lines ({actual_old}), diff:\n{diff}"
+                );
+                assert_eq!(
+                    new_count, actual_new,
+                    "new count in header ({new_count}) != actual new lines ({actual_new}), diff:\n{diff}"
+                );
+                break;
+            }
+        }
+    }
+
+    // ─── Issue #2: LCS line-count guard for large files ──────────────────
+    #[test]
+    fn unified_diff_large_file_uses_simple_fallback() {
+        // File exceeds LCS_LINE_LIMIT → falls back to index-aligned diff.
+        let line_count = LCS_LINE_LIMIT + 100;
+        let old_lines: Vec<String> = (0..line_count).map(|i| format!("line {i}")).collect();
+        let mut new_lines = old_lines.clone();
+        new_lines[line_count / 2] = "CHANGED".to_string();
+        let old = old_lines.join("\n");
+        let new = new_lines.join("\n");
+        let start = std::time::Instant::now();
+        let diff = unified_diff(&old, &new, "big.txt");
+        let elapsed = start.elapsed();
+        assert!(
+            diff.contains("[DRY RUN]"),
+            "got:\n{}",
+            &diff[..200.min(diff.len())]
+        );
+        assert!(
+            diff.contains("+CHANGED"),
+            "got:\n{}",
+            &diff[..500.min(diff.len())]
+        );
+        assert!(
+            elapsed.as_millis() < 200,
+            "fallback should be fast, took {}ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn unified_diff_within_lcs_limit_uses_lcs() {
+        // File within limit still gets proper LCS-based diff
+        let old = "a\nb\nc\nd\n";
+        let new = "a\nb\nINSERTED\nc\nd\n";
+        let diff = unified_diff(old, new, "small.txt");
+        assert!(diff.contains("+INSERTED"), "got:\n{diff}");
+        // LCS correctly identifies insertion — c should not appear as changed
+        assert!(
+            !diff.contains("-c"),
+            "LCS should handle insertion correctly, got:\n{diff}"
+        );
+    }
+
+    // ─── Issue #3: pure-insert hunk should reference correct old line ───
+    #[test]
+    fn unified_diff_pure_insert_hunk_references_adjacent_old_line() {
+        // Use a file long enough that context(3) doesn't cover the start
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+        let new = "1\n2\n3\n4\n5\n6\n7\nINSERTED\n8\n9\n10\n";
+        let diff = unified_diff(old, new, "ins.txt");
+        assert!(diff.contains("+INSERTED"), "got:\n{diff}");
+        for line in diff.lines() {
+            if line.starts_with("@@") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let old_spec = parts[1]; // e.g. "-5,6"
+                let old_start: usize = old_spec[1..].split(',').next().unwrap().parse().unwrap();
+                // Insertion is between old line 7 and 8. With context=3, hunk should start
+                // around line 5 (7-3+1), not line 1.
+                assert!(
+                    old_start >= 4,
+                    "old_start should reference nearby context, not line 1, got: {line}"
+                );
+                break;
+            }
+        }
+    }
+
+    // ─── Issue #3: first-line hint context should not show extra line ───
+    #[test]
+    fn str_replace_not_found_hint_first_line_shows_exact_span() {
+        // File has 6 lines; old_str has 3 lines starting at line 2.
+        // Hint should show exactly old_lines.len() lines of context, not +1.
+        let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
+        let old_str = "fn foo() {\n    bar();\n    qux();\n}";
+        let msg = str_replace_not_found_hint("f.txt", content, old_str);
+        // Should show lines 2..5 (4 lines = old_lines.len()), not line 6
+        assert!(msg.contains("Actual file content"), "got: {msg}");
+        assert!(
+            !msg.contains("footer"),
+            "should not show extra line beyond old_str span, got: {msg}"
+        );
+    }
+
+    // ─── truncate_chars ─────────────────────────────────────────────────
+    #[test]
+    fn truncate_chars_short_string_unchanged() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_exact_length_no_ellipsis() {
+        assert_eq!(truncate_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_truncates_with_ellipsis() {
+        assert_eq!(truncate_chars("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_chars_empty_string() {
+        assert_eq!(truncate_chars("", 5), "");
+    }
+
+    // ─── Issue #3: DiffOp should be Copy ────────────────────────────────
+    #[test]
+    fn diff_op_is_copy() {
+        let op = DiffOp::Equal(0, 0, "line");
+        let copy = op;
+        // If DiffOp is not Copy, using `op` after the move would fail to compile.
+        assert!(matches!(op, DiffOp::Equal(0, 0, "line")));
+        assert!(matches!(copy, DiffOp::Equal(0, 0, "line")));
+    }
+
+    // ─── Issue #2: replace_all + mixed curly-quote forms → specific error ──
+    #[test]
+    fn str_replace_replace_all_mixed_curly_quotes_gives_specific_error() {
+        let tmp = TempDir::new().unwrap();
+        // Two occurrences with different curly-quote forms: \u{201C}a\u{201D} vs \u{201C}a\u{201C}
+        std::fs::write(
+            tmp.path().join("f.txt"),
+            "say \u{201C}a\u{201D} and \u{201C}a\u{201C} done",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "\"a\"",
+            "new_str": "\"b\"",
+            "replace_all": true
+        });
+        let result = str_replace(tmp.path(), &args);
+        assert!(
+            result.is_error,
+            "should error on mixed curly-quote forms with replace_all, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("curly quote"),
+            "error should mention curly quotes, got: {}",
+            result.output
+        );
     }
 
     #[test]
