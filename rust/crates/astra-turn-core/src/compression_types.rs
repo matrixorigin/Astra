@@ -13,8 +13,6 @@ pub struct TokenBudget {
     pub max_prompt_tokens: u64,
     /// Last measured prompt tokens from the LLM response.
     pub last_measured_tokens: u64,
-    /// Characters-per-token estimate (for cheap pre-checks).
-    pub chars_per_token: f64,
     /// Current LLM round index (0-based). Used to protect current-round tool
     /// results from compression — they haven't been seen by the LLM yet.
     pub current_round_index: Option<u32>,
@@ -64,56 +62,18 @@ pub struct PipelineOutcome {
     pub budget_satisfied: bool,
 }
 
-impl PipelineOutcome {
-    /// Get all turn indices that were affected by compression.
-    pub fn all_affected_turns(&self) -> Vec<u32> {
-        let mut turns: Vec<u32> = self
-            .layer_results
-            .iter()
-            .flat_map(|(_, result)| result.affected_turns.iter().copied())
-            .collect();
-        turns.sort_unstable();
-        turns.dedup();
-        turns
-    }
-
-    /// Convert to telemetry trace format.
-    pub fn to_compression_trace(
-        &self,
-    ) -> Vec<(
-        String,
-        crate::context_assembly_trace::CompressionMethod,
-        u32,
-    )> {
-        use crate::context_assembly_trace::CompressionMethod;
-
-        self.layer_results
-            .iter()
-            .map(|(name, result)| {
-                let method = match name.as_str() {
-                    "ToolResultTruncation" => CompressionMethod::ToolResultTruncation,
-                    "DuplicateReadElimination" => CompressionMethod::DuplicateReadElimination,
-                    "TieredCompaction" => CompressionMethod::TieredCompaction,
-                    "ReactiveCompact" => CompressionMethod::ReactiveCompact,
-                    _ => CompressionMethod::TieredCompaction,
-                };
-                (name.clone(), method, result.estimated_tokens_freed as u32)
-            })
-            .collect()
-    }
-}
-
 /// A single compression layer.
 pub trait CompressionLayer: Send + Sync {
     /// Human-readable name for logging / audit.
     fn name(&self) -> &str;
 
-    /// Quick estimate of how many tokens this layer *could* free.
-    fn estimate_savings(&self, messages: &[Value], budget: &TokenBudget) -> u64;
-
-    /// Whether this layer should fire given current pressure.
-    fn should_trigger(&self, messages: &[Value], budget: &TokenBudget) -> bool;
+    /// Minimum budget pressure (0.0–1.0) required for this layer to fire.
+    /// The pipeline skips layers whose threshold exceeds the current
+    /// (dynamically adjusted) pressure.
+    fn trigger_pressure(&self) -> f64;
 
     /// Execute compression, mutating the message list in place.
+    /// Returns what changed. The pipeline adjusts the running budget after
+    /// each layer — layers do NOT need to second-guess previous layers.
     fn compress(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> CompressionResult;
 }

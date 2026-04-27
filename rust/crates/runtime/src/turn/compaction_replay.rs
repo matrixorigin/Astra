@@ -20,12 +20,13 @@ use serde_json::Value;
 /// `InterruptionRecord`.
 pub(crate) const MAX_COMPACT_RETRIES: u32 = 3;
 
+/// Fallback context limit when model_context_limit is 0: 128K * 90%.
+const DEFAULT_CONTEXT_LIMIT: u64 = 115_200;
+
 /// Outcome of a compaction-replay attempt.
 #[derive(Debug)]
 #[allow(dead_code)] // Fields consumed by callers and future telemetry.
 pub(crate) struct CompactionReplayResult {
-    /// Whether the compaction freed any tokens at all.
-    pub freed_any: bool,
     /// Estimated tokens freed by the compression pipeline.
     pub tokens_freed: u64,
     /// Number of messages removed.
@@ -102,16 +103,7 @@ impl CompactionEffectivenessTracker {
     }
 }
 
-/// Run the compression pipeline on the message list after a context-window error.
-///
-/// Returns `None` if there are too few messages to compact or if no tokens were
-/// freed (compaction is futile). Returns `Some(result)` with details on success.
-///
-/// The `retry_count` parameter enables tiered escalation:
-/// - retry 1: default pipeline (balanced thresholds)
-/// - retry 2+: aggressive pipeline (lower thresholds, fewer preserved turns)
-///
-/// Test-only helper for first-tier (default pipeline) compaction.
+/// Test-only helper: calls `try_compact_for_retry_tiered` with retry_count=1.
 #[cfg(test)]
 pub(crate) fn try_compact_for_retry(
     messages: &mut Vec<Value>,
@@ -121,6 +113,15 @@ pub(crate) fn try_compact_for_retry(
     try_compact_for_retry_tiered(messages, last_measured_tokens, model_context_limit, 1)
 }
 
+/// Run the compression pipeline on the message list after a context-window error.
+///
+/// Returns `None` if there are too few messages to compact or if no tokens were
+/// freed (compaction is futile). Returns `Some(result)` with details on success.
+///
+/// The `retry_count` parameter enables tiered escalation:
+/// - retry 1: default pipeline (balanced thresholds)
+/// - retry 2: aggressive pipeline (lower thresholds, fewer preserved turns)
+/// - retry 3+: emergency pipeline (absolute last resort)
 pub(crate) fn try_compact_for_retry_tiered(
     messages: &mut Vec<Value>,
     last_measured_tokens: Option<u64>,
@@ -133,22 +134,23 @@ pub(crate) fn try_compact_for_retry_tiered(
 
     // Build a budget that reflects the overflow.
     let measured = last_measured_tokens.unwrap_or_else(|| {
-        let total_chars: usize = messages.iter().map(|m| m.to_string().len()).sum();
-        (total_chars / 4) as u64 // rough ~4 chars/token
+        messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|v| v.as_str()))
+            .map(|s| crate::prompts::estimate_str_tokens(s) as u64)
+            .sum()
     });
 
     let max_tokens = if model_context_limit > 0 {
         model_context_limit
     } else {
-        // Conservative default: assume 128K context, 90% usable for prompt
-        (128_000.0 * 0.9) as u64
+        DEFAULT_CONTEXT_LIMIT
     };
 
     let budget = TokenBudget {
         max_prompt_tokens: max_tokens,
         last_measured_tokens: measured,
-        chars_per_token: 4.0,
-        current_round_index: None, // replay doesn't track round indices
+        current_round_index: None,
     };
 
     if !budget.is_over_budget() && budget.pressure() < 0.85 {
@@ -190,7 +192,6 @@ pub(crate) fn try_compact_for_retry_tiered(
         .collect();
 
     Some(CompactionReplayResult {
-        freed_any: true,
         tokens_freed: outcome.total_tokens_freed,
         messages_removed,
         layer_descriptions,
@@ -261,7 +262,6 @@ mod tests {
         let result = try_compact_for_retry(&mut msgs, Some(200_000), 100_000);
         assert!(result.is_some(), "expected compaction to run");
         let r = result.unwrap();
-        assert!(r.freed_any);
         assert!(r.tokens_freed > 0);
         assert!(
             msgs.len() < original_len || r.messages_removed > 0,
@@ -300,7 +300,6 @@ mod tests {
     #[test]
     fn compaction_summary_format() {
         let result = CompactionReplayResult {
-            freed_any: true,
             tokens_freed: 5000,
             messages_removed: 12,
             layer_descriptions: vec!["ToolResultTruncation: ~2000 tokens".into()],
@@ -385,5 +384,30 @@ mod tests {
         assert_eq!(json["cumulative_tokens_freed"], 5000);
         assert_eq!(json["attempt_count"], 1);
         assert_eq!(json["last_was_insufficient"], true);
+    }
+
+    #[test]
+    fn cjk_content_triggers_compaction_without_measured_tokens() {
+        // CJK chars are ~1.5 tokens each, not 0.75 (3 bytes / 4).
+        // Without measured tokens, the fallback estimation should use
+        // CJK-aware logic so it correctly detects being over budget.
+        let cjk_content = "你好世界".repeat(2000); // 8000 CJK chars ≈ 12000 tokens
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "任务"}),
+            json!({"role": "assistant", "content": &cjk_content, "tool_calls": []}),
+            json!({"role": "user", "content": "继续"}),
+            json!({"role": "assistant", "content": &cjk_content, "tool_calls": []}),
+            json!({"role": "user", "content": "完成"}),
+            json!({"role": "assistant", "content": &cjk_content, "tool_calls": []}),
+        ];
+        // limit = 15K tokens. With naive bytes/4: 3*24K bytes / 4 = 18K → over.
+        // But CJK chars are 3 bytes, so tokens = 3*8000*1.5 = 36K → way over.
+        // Both should trigger, but CJK-aware estimate should be higher.
+        let result = try_compact_for_retry(&mut msgs, None, 15_000);
+        assert!(
+            result.is_some(),
+            "CJK content without measured tokens should trigger compaction"
+        );
     }
 }

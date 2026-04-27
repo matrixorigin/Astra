@@ -813,12 +813,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
         }
 
-        // Compute context pressure from last measured prompt tokens.
+        // Compute context pressure from a fresh estimate that includes
+        // per-message overhead and fixed overhead (system prompt + schemas),
+        // not the stale `last_measured_prompt_tokens` from the previous round.
         let pressure = if state.max_turn_input_tokens > 0 {
-            state
-                .last_measured_prompt_tokens
-                .map(|p| p as f64 / state.max_turn_input_tokens as f64)
-                .unwrap_or(0.0)
+            let fresh_estimate = crate::prompts::estimate_tokens(&state.messages) as u64;
+            fresh_estimate as f64 / state.max_turn_input_tokens as f64
         } else {
             0.0
         };
@@ -853,27 +853,31 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             );
         }
 
+        // Re-estimate pressure after microcompact (messages may have shrunk).
+        let post_mc_tokens = crate::prompts::estimate_tokens(&state.messages) as u64;
+        let post_mc_pressure = if state.max_turn_input_tokens > 0 {
+            post_mc_tokens as f64 / state.max_turn_input_tokens as f64
+        } else {
+            0.0
+        };
+
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
         // the LLM, preventing 413 errors instead of reacting to them.
-        if pressure >= 0.75 {
+        if post_mc_pressure >= 0.75 {
             let budget = super::context_compression::TokenBudget {
                 max_prompt_tokens: state.max_turn_input_tokens,
-                last_measured_tokens: state
-                    .last_measured_prompt_tokens
-                    .unwrap_or(0)
-                    .saturating_sub(mc.tokens_saved as u64 * 4),
-                chars_per_token: 4.0,
+                last_measured_tokens: post_mc_tokens,
                 current_round_index: Some(state.current_round_index),
             };
-            let pipeline = if pressure >= 0.90 {
+            let pipeline = if post_mc_pressure >= 0.90 {
                 super::context_compression::CompressionPipeline::aggressive_pipeline()
             } else {
                 super::context_compression::CompressionPipeline::default_pipeline()
             };
             let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
             if outcome.total_tokens_freed > 0 && !quiet {
-                let tier = if pressure >= 0.90 {
+                let tier = if post_mc_pressure >= 0.90 {
                     "aggressive"
                 } else {
                     "default"
@@ -884,7 +888,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                         "  ⚡ Proactive {} compression: freed ~{} tokens at {:.0}% pressure",
                         tier,
                         outcome.total_tokens_freed,
-                        pressure * 100.0,
+                        post_mc_pressure * 100.0,
                     ),
                 );
             }
@@ -896,19 +900,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // proactively compress before the first LLM call.  This prevents an
     // immediate 413 when resuming from a CompactAndRetry interruption.
     if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let total_chars: usize = state
-            .messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .map(|s| s.len())
-            .sum();
-        let estimated_tokens = total_chars as f64 / 4.0;
+        let estimated_tokens = crate::prompts::estimate_tokens(&state.messages) as f64;
         let estimated_pressure = estimated_tokens / state.max_turn_input_tokens as f64;
         if estimated_pressure >= 0.75 {
             let budget = super::context_compression::TokenBudget {
                 max_prompt_tokens: state.max_turn_input_tokens,
                 last_measured_tokens: estimated_tokens as u64,
-                chars_per_token: 4.0,
                 current_round_index: Some(state.current_round_index),
             };
             let pipeline = if estimated_pressure >= 0.90 {
