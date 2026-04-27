@@ -7,6 +7,7 @@
 
 use super::*;
 use serde::Deserialize;
+use std::time::Instant;
 
 /// OpenAI-compatible chat completion request (subset).
 #[derive(Debug, Deserialize)]
@@ -93,38 +94,35 @@ pub(super) async fn completions_handler(
     })?;
 
     // 3. Build upstream request
-    let mut body = serde_json::json!({
-        "model": resolved.model_name,
-        "messages": request.messages,
-        "max_tokens": request.max_tokens,
-        "temperature": request.temperature,
-        "stream": false,
-    });
+    let body = crate::turn::llm_client::build_provider_request_body(
+        &request.messages,
+        &[],
+        &resolved.model_name,
+        &resolved.provider,
+        Some(request.max_tokens as usize),
+        Some(request.temperature),
+        false,
+    );
 
-    // Anthropic uses max_tokens; OpenAI prefers max_completion_tokens
-    if resolved.provider != "anthropic" && !resolved.model_name.contains("claude") {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("max_tokens");
-        }
-        body["max_completion_tokens"] = serde_json::json!(request.max_tokens);
-    }
-
-    let url = crate::turn::llm_client::llm_completions_url_for_provider(
+    let url = crate::turn::llm_client::llm_request_url_for_provider(
         &resolved.base_url,
         &resolved.provider,
+        &resolved.model_name,
+        false,
     );
 
     let client = &state.http_client;
 
     // 4. Forward to upstream LLM provider
     let mut req = client.post(&url).header("content-type", "application/json");
-    if resolved.provider == "anthropic" {
-        req = req
-            .header("x-api-key", &resolved.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "prompt-caching-2024-07-31");
-    } else {
-        req = req.header("authorization", format!("Bearer {}", resolved.api_key));
+    req = crate::turn::llm_client::apply_provider_auth(
+        req,
+        &resolved.provider,
+        &resolved.api_key,
+        None,
+    );
+    if crate::turn::llm_client::provider_uses_anthropic_messages(&resolved.provider) {
+        req = req.header("anthropic-beta", "prompt-caching-2024-07-31");
     }
 
     let resp: reqwest::Response =
@@ -150,22 +148,25 @@ pub(super) async fn completions_handler(
     })?;
 
     // 5. Extract response and build OpenAI-compatible output
-    let content = upstream["choices"]
-        .as_array()
-        .and_then(|c| c.first())
-        .and_then(|c| c["message"]["content"].as_str())
-        .unwrap_or("")
-        .to_string();
+    let parsed = crate::turn::llm_client::parse_nonstream_response_for_provider(
+        &upstream,
+        &resolved.provider,
+        &resolved.model_name,
+        Instant::now(),
+    );
 
-    let finish_reason = upstream["choices"]
-        .as_array()
-        .and_then(|c| c.first())
-        .and_then(|c| c["finish_reason"].as_str())
-        .unwrap_or("stop")
-        .to_string();
-
-    let prompt_tokens = upstream["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
-    let completion_tokens = upstream["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let content = parsed.full_text;
+    let finish_reason = parsed.finish_reason.unwrap_or_else(|| "stop".to_string());
+    let prompt_tokens = parsed
+        .usage
+        .get("prompt")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = parsed
+        .usage
+        .get("completion")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
 
     Ok(Json(CompletionResponse {
         id: upstream["id"]

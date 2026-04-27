@@ -62,6 +62,29 @@ use super::bridge_llm_stream::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmProviderProtocol {
+    OpenAiCompatible,
+    AnthropicMessages,
+    BedrockConverse,
+}
+
+pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
+    match provider {
+        "anthropic" => LlmProviderProtocol::AnthropicMessages,
+        "bedrock" => LlmProviderProtocol::BedrockConverse,
+        _ => LlmProviderProtocol::OpenAiCompatible,
+    }
+}
+
+pub(crate) fn provider_uses_anthropic_messages(provider: &str) -> bool {
+    llm_provider_protocol(provider) == LlmProviderProtocol::AnthropicMessages
+}
+
+pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
+    llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
+}
+
 /// Global HTTP client for LLM requests (connection pooling, reuse).
 fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -330,28 +353,384 @@ pub(crate) fn llm_total_budget() -> std::time::Duration {
     std::time::Duration::from_secs(s)
 }
 
+#[cfg(test)]
 fn llm_completions_url(base_url: &str, override_url: Option<&str>, provider: &str) -> String {
+    llm_request_url(base_url, override_url, provider, "", true)
+}
+
+fn bedrock_converse_url(base_url: &str, model_name: &str, streaming: bool) -> String {
+    let base = base_url.trim_end_matches('/');
+    let mut url = reqwest::Url::parse(base).unwrap_or_else(|_| {
+        reqwest::Url::parse("http://invalid.local").expect("valid fallback URL")
+    });
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("base URL must support path segments");
+        segments.pop_if_empty();
+        segments.push("model");
+        segments.push(model_name);
+        segments.push(if streaming {
+            "converse-stream"
+        } else {
+            "converse"
+        });
+    }
+    if url.host_str() == Some("invalid.local") {
+        format!(
+            "{base}/model/{model_name}/{}",
+            if streaming {
+                "converse-stream"
+            } else {
+                "converse"
+            }
+        )
+    } else {
+        url.to_string()
+    }
+}
+
+pub(crate) fn llm_request_url(
+    base_url: &str,
+    override_url: Option<&str>,
+    provider: &str,
+    model_name: &str,
+    streaming: bool,
+) -> String {
     override_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| llm_completions_url_for_provider(base_url, provider))
+        .unwrap_or_else(|| llm_request_url_for_provider(base_url, provider, model_name, streaming))
 }
 
 /// Build the default completions URL for a given provider (no override).
 ///
-/// Anthropic uses `/v1/messages`, all others use `/chat/completions`.
-pub(crate) fn llm_completions_url_for_provider(base_url: &str, provider: &str) -> String {
+/// Anthropic uses `/v1/messages`, Bedrock uses `/model/{modelId}/converse`,
+/// all others use `/chat/completions`.
+pub(crate) fn llm_request_url_for_provider(
+    base_url: &str,
+    provider: &str,
+    model_name: &str,
+    streaming: bool,
+) -> String {
     let base = base_url.trim_end_matches('/');
-    if provider == "anthropic" {
-        // Match anthropic_messages_probe_url logic in services/models.rs
-        if base.ends_with("/v1") {
-            format!("{base}/messages")
-        } else {
-            format!("{base}/v1/messages")
+    match llm_provider_protocol(provider) {
+        LlmProviderProtocol::AnthropicMessages => {
+            if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            }
         }
+        LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
+        LlmProviderProtocol::OpenAiCompatible => format!("{base}/chat/completions"),
+    }
+}
+
+fn json_string_to_value_or_string(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+fn content_text_value(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Array(parts)) => {
+            let joined = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn bedrock_cache_point_from_cache_control(cache_control: Option<&Value>) -> Option<Value> {
+    let cache_control = cache_control?;
+    let mut cache_point = Map::new();
+    cache_point.insert("type".to_string(), Value::String("default".to_string()));
+    if let Some(ttl) = cache_control
+        .get("ttl")
+        .and_then(Value::as_str)
+        .filter(|ttl| matches!(*ttl, "5m" | "1h"))
+    {
+        cache_point.insert("ttl".to_string(), Value::String(ttl.to_string()));
+    }
+    Some(json!({ "cachePoint": Value::Object(cache_point) }))
+}
+
+fn bedrock_cache_point_from_block(block: &Value) -> Option<Value> {
+    if let Some(cache_point) = block.get("cachePoint") {
+        return Some(json!({ "cachePoint": cache_point.clone() }));
+    }
+    bedrock_cache_point_from_cache_control(block.get("cache_control"))
+}
+
+fn build_bedrock_text_content_blocks(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => vec![json!({ "text": text })],
+        Some(Value::Array(parts)) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "text": text }));
+                    }
+                } else if let Some(text) = part.as_str() {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "text": text }));
+                    }
+                }
+                if let Some(cache_point) = bedrock_cache_point_from_block(part) {
+                    blocks.push(cache_point);
+                }
+            }
+            blocks
+        }
+        Some(Value::Object(obj)) => {
+            let mut blocks = Vec::new();
+            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    blocks.push(json!({ "text": text }));
+                }
+            }
+            if let Some(cache_point) = bedrock_cache_point_from_block(&Value::Object(obj.clone())) {
+                blocks.push(cache_point);
+            }
+            blocks
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn bedrock_cache_point_from_message_content(content: Option<&Value>) -> Option<Value> {
+    match content {
+        Some(Value::Array(parts)) => parts.iter().rev().find_map(bedrock_cache_point_from_block),
+        Some(Value::Object(obj)) => bedrock_cache_point_from_block(&Value::Object(obj.clone())),
+        _ => None,
+    }
+}
+
+fn build_bedrock_tool_blocks(tool_calls: Option<&Vec<Value>>) -> Vec<Value> {
+    let Some(tool_calls) = tool_calls else {
+        return Vec::new();
+    };
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            let id = tool_call.get("id").and_then(Value::as_str)?;
+            let function = tool_call.get("function")?.as_object()?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            let input = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(json_string_to_value_or_string)
+                .unwrap_or_else(|| json!({}));
+            Some(json!({
+                "toolUse": {
+                    "toolUseId": id,
+                    "name": name,
+                    "input": input,
+                }
+            }))
+        })
+        .collect()
+}
+
+fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+    match role {
+        "tool" => {
+            let tool_use_id = msg.get("tool_call_id").and_then(Value::as_str);
+            let content = content_text_value(msg.get("content")).unwrap_or_default();
+            tool_use_id
+                .map(|tool_use_id| {
+                    let result_block = if content.is_empty() {
+                        json!({"json": {}})
+                    } else if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                        json!({"json": parsed})
+                    } else {
+                        json!({"text": content})
+                    };
+                    let mut blocks = vec![json!({
+                        "toolResult": {
+                            "toolUseId": tool_use_id,
+                            "content": [result_block],
+                        }
+                    })];
+                    if let Some(cache_point) =
+                        bedrock_cache_point_from_message_content(msg.get("content"))
+                    {
+                        blocks.push(cache_point);
+                    }
+                    blocks
+                })
+                .unwrap_or_default()
+        }
+        "assistant" => {
+            let mut blocks = build_bedrock_text_content_blocks(msg.get("content"));
+            blocks.extend(build_bedrock_tool_blocks(
+                msg.get("tool_calls").and_then(Value::as_array),
+            ));
+            blocks
+        }
+        _ => build_bedrock_text_content_blocks(msg.get("content")),
+    }
+}
+
+fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut out = Vec::new();
+    for msg in messages {
+        match msg.get("role").and_then(Value::as_str).unwrap_or_default() {
+            "system" => {
+                system.extend(build_bedrock_text_content_blocks(msg.get("content")));
+            }
+            "tool" => {
+                let content = build_bedrock_message_content(msg);
+                if !content.is_empty() {
+                    out.push(json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+            }
+            "user" | "assistant" => {
+                let content = build_bedrock_message_content(msg);
+                if !content.is_empty() {
+                    out.push(json!({
+                        "role": msg.get("role").and_then(Value::as_str).unwrap_or("user"),
+                        "content": content,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    (system, out)
+}
+
+fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for tool in tools {
+        if let Some(mapped) = (|| {
+            let function = tool.get("function")?.as_object()?;
+            let name = function.get("name").and_then(Value::as_str)?;
+            let input_schema = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let mut tool_spec = Map::new();
+            tool_spec.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(description) = function.get("description").and_then(Value::as_str) {
+                tool_spec.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+            }
+            tool_spec.insert("inputSchema".to_string(), json!({ "json": input_schema }));
+            Some(json!({ "toolSpec": Value::Object(tool_spec) }))
+        })() {
+            out.push(mapped);
+            if let Some(cache_point) =
+                bedrock_cache_point_from_cache_control(tool.get("cache_control"))
+            {
+                out.push(cache_point);
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn build_provider_request_body(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    temperature: Option<f64>,
+    streaming: bool,
+) -> Value {
+    match llm_provider_protocol(provider) {
+        LlmProviderProtocol::BedrockConverse => {
+            let (system, bedrock_messages) = build_bedrock_messages(messages);
+            let mut body = json!({
+                "messages": bedrock_messages,
+            });
+            if !system.is_empty() {
+                body["system"] = Value::Array(system);
+            }
+            let mut inference = Map::new();
+            if let Some(max_out) = max_output_tokens {
+                inference.insert("maxTokens".to_string(), json!(max_out));
+            }
+            if let Some(temp) = temperature {
+                inference.insert("temperature".to_string(), json!(temp));
+            }
+            if !inference.is_empty() {
+                body["inferenceConfig"] = Value::Object(inference);
+            }
+            let bedrock_tools = build_bedrock_tools(tools);
+            if !bedrock_tools.is_empty() {
+                body["toolConfig"] = json!({ "tools": bedrock_tools });
+            }
+            body
+        }
+        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
+            let is_anthropic = provider_uses_anthropic_messages(provider);
+            let mut body = json!({
+                "model": model_name,
+                "messages": messages,
+                "stream": streaming,
+            });
+            if streaming && !is_anthropic {
+                body["stream_options"] = json!({"include_usage": true});
+            }
+            if let Some(max_out) = max_output_tokens {
+                if is_anthropic {
+                    body["max_tokens"] = json!(max_out);
+                } else {
+                    body["max_completion_tokens"] = json!(max_out);
+                }
+            }
+            if let Some(temp) = temperature {
+                body["temperature"] = json!(temp);
+            }
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools.to_vec());
+                if is_anthropic {
+                    body["tool_choice"] = json!({"type": "auto"});
+                } else {
+                    body["tool_choice"] = Value::String("auto".to_string());
+                }
+            }
+            body
+        }
+    }
+}
+
+pub(crate) fn apply_provider_auth(
+    mut req: reqwest::RequestBuilder,
+    provider: &str,
+    api_key: &str,
+    header_overrides: Option<&HashMap<String, String>>,
+) -> reqwest::RequestBuilder {
+    if provider_uses_anthropic_messages(provider) {
+        if !has_llm_auth_override(provider, header_overrides) {
+            req = req.header("x-api-key", api_key);
+        }
+        req.header("anthropic-version", "2023-06-01")
     } else {
-        format!("{base}/chat/completions")
+        if !has_llm_auth_override(provider, header_overrides) {
+            req = req.header("authorization", format!("Bearer {api_key}"));
+        }
+        req
     }
 }
 
@@ -362,15 +741,56 @@ pub(crate) fn llm_completions_url_for_provider(base_url: &str, provider: &str) -
 /// message, concatenates their content with `\n\n`, and places the result
 /// as the first message. All non-system messages keep their original order.
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
-    let mut system_parts: Vec<&str> = Vec::new();
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut system_blocks: Vec<Value> = Vec::new();
+    let mut structured_system = false;
     let mut rest: Vec<Value> = Vec::new();
+
+    let flush_string_parts_into_blocks = |blocks: &mut Vec<Value>, parts: &mut Vec<String>| {
+        for part in parts.drain(..) {
+            if !blocks.is_empty() {
+                blocks.push(json!({"type": "text", "text": "\n\n"}));
+            }
+            blocks.push(json!({"type": "text", "text": part}));
+        }
+    };
 
     for msg in messages {
         if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
-            if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                if !text.is_empty() {
-                    system_parts.push(text);
+            match msg.get("content") {
+                Some(Value::String(text)) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if structured_system {
+                        if !system_blocks.is_empty() {
+                            system_blocks.push(json!({"type": "text", "text": "\n\n"}));
+                        }
+                        system_blocks.push(json!({"type": "text", "text": text}));
+                    } else {
+                        system_parts.push(text.to_string());
+                    }
                 }
+                Some(Value::Array(parts)) => {
+                    structured_system = true;
+                    flush_string_parts_into_blocks(&mut system_blocks, &mut system_parts);
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    if !system_blocks.is_empty() {
+                        system_blocks.push(json!({"type": "text", "text": "\n\n"}));
+                    }
+                    system_blocks.extend(parts.iter().cloned());
+                }
+                Some(other) if !other.is_null() => {
+                    structured_system = true;
+                    flush_string_parts_into_blocks(&mut system_blocks, &mut system_parts);
+                    if !system_blocks.is_empty() {
+                        system_blocks.push(json!({"type": "text", "text": "\n\n"}));
+                    }
+                    system_blocks.push(other.clone());
+                }
+                _ => {}
             }
         } else {
             rest.push(msg.clone());
@@ -378,7 +798,11 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     }
 
     let mut out = Vec::with_capacity(1 + rest.len());
-    if !system_parts.is_empty() {
+    if structured_system {
+        if !system_blocks.is_empty() {
+            out.push(json!({"role": "system", "content": system_blocks}));
+        }
+    } else if !system_parts.is_empty() {
         out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     out.extend(rest);
@@ -543,7 +967,7 @@ fn has_llm_auth_override(
     let Some(header_overrides) = header_overrides else {
         return false;
     };
-    if provider == "anthropic" {
+    if provider_uses_anthropic_messages(provider) {
         header_overrides
             .keys()
             .any(|name| name.eq_ignore_ascii_case("x-api-key"))
@@ -621,38 +1045,24 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     // (e.g. MiniMax) reject system messages after the first position.
     let messages = consolidate_system_messages(messages);
 
-    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+    let use_streaming_endpoint = !provider_uses_bedrock_converse(provider);
+    let body = build_provider_request_body(
+        &messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        None,
+        use_streaming_endpoint,
+    );
 
-    let mut body = json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": true,
-    });
-    // stream_options is OpenAI-only; Anthropic-compatible endpoints
-    // (including MiniMax /anthropic) reject unknown fields.
-    if !is_anthropic {
-        body["stream_options"] = json!({"include_usage": true});
-    }
-
-    if let Some(max_out) = max_output_tokens {
-        if is_anthropic {
-            body["max_tokens"] = json!(max_out);
-        } else {
-            body["max_completion_tokens"] = json!(max_out);
-        }
-    }
-
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        // Anthropic tool_choice is an object, not a string.
-        if is_anthropic {
-            body["tool_choice"] = json!({"type": "auto"});
-        } else {
-            body["tool_choice"] = Value::String("auto".to_string());
-        }
-    }
-
-    let url = llm_completions_url(base_url, completions_url_override, provider);
+    let url = llm_request_url(
+        base_url,
+        completions_url_override,
+        provider,
+        model_name,
+        use_streaming_endpoint,
+    );
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
@@ -724,14 +1134,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
-        if provider == "anthropic" {
-            if !has_llm_auth_override(provider, header_overrides) {
-                req = req.header("x-api-key", api_key);
-            }
-            req = req.header("anthropic-version", "2023-06-01");
-        } else if !has_llm_auth_override(provider, header_overrides) {
-            req = req.header("authorization", format!("Bearer {api_key}"));
-        }
+        req = apply_provider_auth(req, provider, api_key, header_overrides);
         req = apply_llm_header_overrides(req, header_overrides);
         if let Some(timeout) = request_timeout {
             req = req.timeout(timeout);
@@ -750,6 +1153,17 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         if response.status().is_success() {
             // Success — record to cooldown tracker
             cooldown.with(model_key, |c| c.record_success());
+            if provider_uses_bedrock_converse(provider) {
+                let v: Value = response.json().await.map_err(|e| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::StreamTransport,
+                        e.to_string(),
+                    )
+                })?;
+                return Ok(parse_nonstream_response_for_provider(
+                    &v, provider, model_name, started,
+                ));
+            }
             let byte_stream = response.bytes_stream();
             match collect_llm_stream(
                 byte_stream,
@@ -1271,39 +1685,25 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
 
     let messages = consolidate_system_messages(messages);
 
-    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+    let body = build_provider_request_body(
+        &messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        None,
+        false,
+    );
 
-    let mut body = json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": false,
-    });
-    if let Some(max_out) = max_output_tokens {
-        if is_anthropic {
-            body["max_tokens"] = json!(max_out);
-        } else {
-            body["max_completion_tokens"] = json!(max_out);
-        }
-    }
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        if is_anthropic {
-            body["tool_choice"] = json!({"type": "auto"});
-        } else {
-            body["tool_choice"] = Value::String("auto".to_string());
-        }
-    }
-
-    let url = llm_completions_url(base_url, completions_url_override, provider);
+    let url = llm_request_url(
+        base_url,
+        completions_url_override,
+        provider,
+        model_name,
+        false,
+    );
     let mut req = client.post(&url).header("content-type", "application/json");
-    if provider == "anthropic" {
-        if !has_llm_auth_override(provider, header_overrides) {
-            req = req.header("x-api-key", api_key);
-        }
-        req = req.header("anthropic-version", "2023-06-01");
-    } else if !has_llm_auth_override(provider, header_overrides) {
-        req = req.header("authorization", format!("Bearer {api_key}"));
-    }
+    req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
 
     // Apply per-request timeout (overrides the client-level default).
@@ -1348,10 +1748,126 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     let v: Value = resp.json().await.map_err(|e| {
         astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, e.to_string())
     })?;
-    Ok(parse_nonstream_response(&v, model_name, started))
+    Ok(parse_nonstream_response_for_provider(
+        &v, provider, model_name, started,
+    ))
 }
 
-fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> LlmCallResult {
+fn map_bedrock_finish_reason(stop_reason: &str) -> String {
+    match stop_reason {
+        "tool_use" => "tool_calls".to_string(),
+        "max_tokens" => "length".to_string(),
+        "end_turn" => "stop".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_bedrock_nonstream_response(
+    v: &Value,
+    model_name: &str,
+    started: Instant,
+) -> LlmCallResult {
+    let mut full_text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut usage = Map::new();
+
+    if let Some(u) = v.get("usage").and_then(Value::as_object) {
+        if let Some(p) = u.get("inputTokens").and_then(Value::as_i64) {
+            usage.insert("prompt".to_string(), Value::from(p));
+        }
+        if let Some(c) = u.get("outputTokens").and_then(Value::as_i64) {
+            usage.insert("completion".to_string(), Value::from(c));
+        }
+        if let Some(cache_read) = u
+            .get("cacheReadInputTokens")
+            .or_else(|| u.get("cacheReadInputTokensCount"))
+            .and_then(Value::as_i64)
+        {
+            usage.insert(
+                "cache_read_input_tokens".to_string(),
+                Value::from(cache_read),
+            );
+        }
+        if let Some(cache_write) = u
+            .get("cacheWriteInputTokens")
+            .or_else(|| u.get("cacheWriteInputTokensCount"))
+            .and_then(Value::as_i64)
+        {
+            usage.insert(
+                "cache_creation_input_tokens".to_string(),
+                Value::from(cache_write),
+            );
+        }
+        if let Some(t) = u.get("totalTokens").and_then(Value::as_i64) {
+            usage.insert("total".to_string(), Value::from(t));
+        } else if let (Some(p), Some(c)) = (
+            u.get("inputTokens").and_then(Value::as_i64),
+            u.get("outputTokens").and_then(Value::as_i64),
+        ) {
+            usage.insert("total".to_string(), Value::from(p + c));
+        }
+    }
+
+    if let Some(content_blocks) = v
+        .get("output")
+        .and_then(|output| output.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    {
+        for block in content_blocks {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                full_text.push_str(text);
+            }
+            if let Some(reasoning_text) = block
+                .get("reasoningContent")
+                .and_then(|content| content.get("reasoningText"))
+                .and_then(|reasoning_text| reasoning_text.get("text"))
+                .and_then(Value::as_str)
+            {
+                reasoning.push_str(reasoning_text);
+            }
+            if let Some(tool_use) = block.get("toolUse").and_then(Value::as_object) {
+                let id = tool_use
+                    .get("toolUseId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = tool_use
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("_unknown");
+                let arguments = tool_use.get("input").cloned().unwrap_or_else(|| json!({}));
+                tool_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments.to_string(),
+                    }
+                }));
+            }
+        }
+    }
+
+    LlmCallResult {
+        full_text,
+        reasoning,
+        tool_calls,
+        usage,
+        model_used: model_name.to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        finish_reason: v
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .map(map_bedrock_finish_reason),
+    }
+}
+
+fn parse_openai_compatible_nonstream_response(
+    v: &Value,
+    model_name: &str,
+    started: Instant,
+) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
@@ -1425,6 +1941,22 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
+    }
+}
+
+pub(crate) fn parse_nonstream_response_for_provider(
+    v: &Value,
+    provider: &str,
+    model_name: &str,
+    started: Instant,
+) -> LlmCallResult {
+    match llm_provider_protocol(provider) {
+        LlmProviderProtocol::BedrockConverse => {
+            parse_bedrock_nonstream_response(v, model_name, started)
+        }
+        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
+            parse_openai_compatible_nonstream_response(v, model_name, started)
+        }
     }
 }
 
@@ -1856,11 +2388,83 @@ mod tests {
             }],
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
-        let r = parse_nonstream_response(&v, "test-model", Instant::now());
+        let r = parse_nonstream_response_for_provider(&v, "openai", "test-model", Instant::now());
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.usage.get("total").and_then(Value::as_i64), Some(15));
+    }
+
+    #[test]
+    fn parse_bedrock_nonstream_response_extracts_fields() {
+        let v = json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "hello"},
+                        {"reasoningContent": {"reasoningText": {"text": "think"}}},
+                        {"toolUse": {"toolUseId": "t1", "name": "bash", "input": {"cmd": "pwd"}}}
+                    ]
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 15 }
+        });
+        let r = parse_nonstream_response_for_provider(
+            &v,
+            "bedrock",
+            "anthropic.claude-3-5-sonnet-v1:0",
+            Instant::now(),
+        );
+        assert_eq!(r.full_text, "hello");
+        assert_eq!(r.reasoning, "think");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(
+            r.tool_calls[0]["function"]["arguments"].as_str(),
+            Some(r#"{"cmd":"pwd"}"#)
+        );
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(r.usage.get("total").and_then(Value::as_i64), Some(15));
+    }
+
+    #[test]
+    fn parse_bedrock_nonstream_response_extracts_cache_usage() {
+        let v = json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "hello"}]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "cacheReadInputTokens": 8,
+                "cacheWriteInputTokens": 3,
+                "totalTokens": 15
+            }
+        });
+        let r = parse_nonstream_response_for_provider(
+            &v,
+            "bedrock",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            Instant::now(),
+        );
+        assert_eq!(
+            r.usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_i64),
+            Some(8)
+        );
+        assert_eq!(
+            r.usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_i64),
+            Some(3)
+        );
     }
 
     #[tokio::test]
@@ -2905,6 +3509,24 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_system_messages_preserves_structured_blocks() {
+        let msgs = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]
+            }),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        let content = out[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "stable");
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
     fn consolidate_system_messages_no_system() {
         let msgs = vec![json!({"role": "user", "content": "hi"})];
         let out = consolidate_system_messages(&msgs);
@@ -2948,7 +3570,7 @@ mod tests {
     #[test]
     fn for_provider_openai() {
         assert_eq!(
-            llm_completions_url_for_provider("https://api.openai.com/v1", "openai"),
+            llm_request_url_for_provider("https://api.openai.com/v1", "openai", "gpt-4o", true),
             "https://api.openai.com/v1/chat/completions"
         );
     }
@@ -2956,7 +3578,12 @@ mod tests {
     #[test]
     fn for_provider_anthropic_without_v1() {
         assert_eq!(
-            llm_completions_url_for_provider("https://api.minimaxi.com/anthropic", "anthropic"),
+            llm_request_url_for_provider(
+                "https://api.minimaxi.com/anthropic",
+                "anthropic",
+                "claude-3-5-sonnet",
+                true
+            ),
             "https://api.minimaxi.com/anthropic/v1/messages"
         );
     }
@@ -2964,9 +3591,124 @@ mod tests {
     #[test]
     fn for_provider_anthropic_with_v1() {
         assert_eq!(
-            llm_completions_url_for_provider("https://api.anthropic.com/v1", "anthropic"),
+            llm_request_url_for_provider(
+                "https://api.anthropic.com/v1",
+                "anthropic",
+                "claude-3-5-sonnet",
+                true
+            ),
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn for_provider_bedrock_nonstream() {
+        assert_eq!(
+            llm_request_url_for_provider(
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+                "bedrock",
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                false
+            ),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
+        );
+    }
+
+    #[test]
+    fn build_bedrock_body_maps_system_tools_and_tool_results() {
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"cmd\":\"pwd\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_1", "name": "bash", "content": "{\"cwd\":\"/tmp\"}"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run shell",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &tools,
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            Some(128),
+            None,
+            false,
+        );
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["messages"][1]["role"], "assistant");
+        assert_eq!(
+            body["messages"][1]["content"][0]["toolUse"]["toolUseId"],
+            "call_1"
+        );
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(
+            body["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+            "call_1"
+        );
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+    }
+
+    #[test]
+    fn build_bedrock_body_translates_cache_control_to_cache_points() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]
+            }),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "turn prefix"},
+                    {"type": "text", "text": "turn suffix", "cache_control": {"type": "ephemeral"}}
+                ]
+            }),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &tools,
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock",
+            Some(128),
+            None,
+            false,
+        );
+        assert_eq!(body["system"][0]["text"], "stable");
+        assert_eq!(body["system"][1]["cachePoint"]["type"], "default");
+        assert_eq!(body["system"][1]["cachePoint"]["ttl"], "1h");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "turn prefix");
+        assert_eq!(body["messages"][0]["content"][1]["text"], "turn suffix");
+        assert_eq!(
+            body["messages"][0]["content"][2]["cachePoint"]["type"],
+            "default"
+        );
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
+        assert_eq!(body["toolConfig"]["tools"][1]["cachePoint"]["ttl"], "1h");
     }
 
     // ── Golden cases: real provider SSE fixtures ──────────────────────────────

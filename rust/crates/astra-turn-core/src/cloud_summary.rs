@@ -13,7 +13,7 @@
 //!   tests can inject mock responses without a real API.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     cloud_compact_prompt::{
@@ -204,24 +204,77 @@ impl SummaryLlmClient for HttpSummaryClient {
             .build()
             .map_err(|e| e.to_string())?;
 
-        let mut body = serde_json::json!({
-            "model": self.params.model_name,
-            "messages": messages,
-            "stream": false,
-            "max_completion_tokens": self.params.max_output_tokens,
-        });
+        let body = if self.params.provider == "bedrock" {
+            let system = messages
+                .iter()
+                .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
+                .filter_map(|msg| msg.get("content").and_then(Value::as_str))
+                .map(|text| json!({ "text": text }))
+                .collect::<Vec<_>>();
+            let bedrock_messages = messages
+                .iter()
+                .filter(|msg| msg.get("role").and_then(Value::as_str) != Some("system"))
+                .filter_map(|msg| {
+                    let role = msg.get("role").and_then(Value::as_str)?;
+                    let content = msg.get("content").and_then(Value::as_str)?;
+                    Some(json!({
+                        "role": if role == "assistant" { "assistant" } else { "user" },
+                        "content": [{ "text": content }],
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let mut body = json!({
+                "messages": bedrock_messages,
+                "inferenceConfig": {
+                    "maxTokens": self.params.max_output_tokens,
+                }
+            });
+            if !system.is_empty() {
+                body["system"] = Value::Array(system);
+            }
+            body
+        } else if self.params.provider == "anthropic" {
+            json!({
+                "model": self.params.model_name,
+                "messages": messages,
+                "stream": false,
+                "max_tokens": self.params.max_output_tokens,
+            })
+        } else {
+            json!({
+                "model": self.params.model_name,
+                "messages": messages,
+                "stream": false,
+                "max_completion_tokens": self.params.max_output_tokens,
+            })
+        };
 
-        if self.params.provider == "anthropic" || self.params.model_name.contains("claude") {
-            body["max_tokens"] = serde_json::json!(self.params.max_output_tokens);
-            body.as_object_mut()
-                .expect("json object")
-                .remove("max_completion_tokens");
-        }
-
-        let url = format!(
-            "{}/chat/completions",
-            self.params.base_url.trim_end_matches('/')
-        );
+        let url = if self.params.provider == "bedrock" {
+            let mut url = reqwest::Url::parse(self.params.base_url.trim_end_matches('/'))
+                .map_err(|e| e.to_string())?;
+            {
+                let mut segments = url
+                    .path_segments_mut()
+                    .map_err(|_| "invalid Bedrock base_url")?;
+                segments.pop_if_empty();
+                segments.push("model");
+                segments.push(&self.params.model_name);
+                segments.push("converse");
+            }
+            url.to_string()
+        } else if self.params.provider == "anthropic" {
+            let base = self.params.base_url.trim_end_matches('/');
+            if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            }
+        } else {
+            format!(
+                "{}/chat/completions",
+                self.params.base_url.trim_end_matches('/')
+            )
+        };
 
         let mut req = client.post(&url).header("content-type", "application/json");
         if self.params.provider == "anthropic" {
@@ -251,14 +304,27 @@ impl SummaryLlmClient for HttpSummaryClient {
         }
 
         let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let text = if self.params.provider == "bedrock" {
+            json.get("output")
+                .and_then(|output| output.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| block.get("text").and_then(Value::as_str))
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        } else {
+            json.get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
 
         Ok(SummaryResponse {
             text,

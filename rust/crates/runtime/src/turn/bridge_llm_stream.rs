@@ -7,6 +7,7 @@
 //! - Per-model rate-limit cooldown tracking
 //! - Degraded tool-call recovery from XML-like text content
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_stream::stream;
@@ -22,7 +23,8 @@ use crate::bridge::rate_limit_cooldown::{
 use crate::turn::bridge_sse_helpers::render_sse;
 use crate::turn::edge_ledger::ensure_tool_call_ids;
 use crate::turn::llm_client::{
-    LlmCancel, consolidate_system_messages, llm_completions_url_for_provider,
+    LlmCallResult, LlmCancel, apply_provider_auth, build_provider_request_body,
+    consolidate_system_messages, llm_request_url_for_provider, provider_uses_bedrock_converse,
     sleep_ms_or_llm_cancel,
 };
 use futures_util::StreamExt;
@@ -96,6 +98,54 @@ fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
     }
 }
 
+fn synthetic_stream_from_result(
+    mut result: LlmCallResult,
+    model_name: &str,
+) -> impl futures_util::Stream<Item = Bytes> + Send + 'static {
+    ensure_tool_call_ids(&mut result.tool_calls);
+    let mut events = Vec::new();
+    if !result.full_text.is_empty() && result.tool_calls.is_empty() {
+        events.push(render_sse(
+            &json!({"type":"text_delta","content": result.full_text}),
+        ));
+    }
+    if !result.reasoning.is_empty() {
+        events.push(render_sse(
+            &json!({"type":"reasoning_delta","content": result.reasoning}),
+        ));
+    }
+    for tc in &result.tool_calls {
+        if let Some(obj) = tc.as_object() {
+            let mut tc = obj.clone();
+            if let Some(event) = tool_call_start_event(&mut tc) {
+                events.push(render_sse(&event));
+            }
+        }
+    }
+    let prompt = result.usage.get("prompt").and_then(Value::as_i64);
+    let completion = result.usage.get("completion").and_then(Value::as_i64);
+    if prompt.is_some() || completion.is_some() {
+        let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
+        let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
+        events.push(render_sse(&json!({
+            "type": "usage",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cache_read_tokens": cache_read,
+            "cache_creation_tokens": cache_creation,
+        })));
+    }
+    events.push(render_sse(&json!({
+        "type": "_inprocess_summary",
+        "full_text": result.full_text,
+        "reasoning": result.reasoning,
+        "tool_calls": result.tool_calls,
+        "usage": result.usage,
+        "model_used": model_name,
+    })));
+    futures_util::stream::iter(events)
+}
+
 fn turn_timeout_s() -> f64 {
     astra_core::RuntimeLimits::global().turn_timeout_s
 }
@@ -125,7 +175,7 @@ pub(crate) async fn call_llm_stream(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     client_cancel: Option<Arc<CancellationToken>>,
-) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
+) -> Result<Pin<Box<dyn futures_util::Stream<Item = Bytes> + Send + 'static>>, String> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
 
@@ -136,40 +186,36 @@ pub(crate) async fn call_llm_stream(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
     let messages = consolidate_system_messages(messages);
-
-    let mut body = json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": true,
-    });
-    if !is_anthropic {
-        body["stream_options"] = json!({"include_usage": true});
+    if provider_uses_bedrock_converse(provider) {
+        let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
+        let result = crate::turn::llm_client::call_llm_nonstream_fallback(
+            &client,
+            &messages,
+            tools,
+            model_name,
+            api_key,
+            base_url,
+            provider,
+            max_output_tokens,
+            fb_timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok(Box::pin(synthetic_stream_from_result(result, model_name)));
     }
 
-    // Set max output tokens to prevent generation cutoff.
-    // Use provider-appropriate field name.
-    if let Some(max_out) = max_output_tokens {
-        if is_anthropic {
-            body["max_tokens"] = json!(max_out);
-        } else {
-            // OpenAI, DeepSeek, Qwen, etc. use max_completion_tokens (newer)
-            // or max_tokens (legacy). Prefer max_completion_tokens.
-            body["max_completion_tokens"] = json!(max_out);
-        }
-    }
+    let body = build_provider_request_body(
+        &messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        None,
+        true,
+    );
 
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        if is_anthropic {
-            body["tool_choice"] = json!({"type": "auto"});
-        } else {
-            body["tool_choice"] = Value::String("auto".to_string());
-        }
-    }
-
-    let url = llm_completions_url_for_provider(base_url, provider);
+    let url = llm_request_url_for_provider(base_url, provider, model_name, true);
     let req_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
 
     // Total budget guard: abort if retries + cooldown delays exceed the budget.
@@ -195,14 +241,7 @@ pub(crate) async fn call_llm_stream(
         }
 
         let mut req = client.post(&url).header("content-type", "application/json");
-
-        if provider == "anthropic" {
-            req = req
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req = req.header("authorization", format!("Bearer {api_key}"));
-        }
+        req = apply_provider_auth(req, provider, api_key, None);
 
         let request_start = std::time::Instant::now();
         let response = match req.json(&body).send().await {
@@ -304,49 +343,25 @@ pub(crate) async fn call_llm_stream(
                                     .await
                                     {
                                         Ok(mut result) => {
-                                            ensure_tool_call_ids(&mut result.tool_calls);
-                                            full_text = result.full_text.clone();
-                                            reasoning = result.reasoning.clone();
-                                            usage = result.usage.clone();
-                                            tool_calls_map.clear();
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if let Value::Object(m) = tc {
-                                                    tool_calls_map.insert(i, m.clone());
-                                                }
-                                            }
-                                            if !result.full_text.is_empty()
-                                                && result.tool_calls.is_empty()
-                                            {
-                                                yield render_sse(&json!({"type":"text_delta","content": result.full_text}));
-                                            }
-                                            if !result.reasoning.is_empty() {
-                                                yield render_sse(&json!({"type":"reasoning_delta","content": result.reasoning}));
-                                            }
-                                            for tc in &result.tool_calls {
-                                                if let Some(obj) = tc.as_object() {
-                                                    let mut tc = obj.clone();
-                                                    if let Some(event) = tool_call_start_event(&mut tc) {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            }
-                                            let prompt = result.usage.get("prompt").and_then(Value::as_i64);
-                                            let completion = result.usage.get("completion").and_then(Value::as_i64);
-                                            if prompt.is_some() || completion.is_some() {
-                                                let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
-                                                let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
-                                                yield render_sse(&json!({
-                                                    "type": "usage",
-                                                    "prompt_tokens": prompt,
-                                                    "completion_tokens": completion,
-                                                    "cache_read_tokens": cache_read,
-                                                    "cache_creation_tokens": cache_creation,
-                                                }));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            yield render_sse(&json!({"type":"error","message": format!("stream stalled; non-stream recovery failed: {e}")}));
-                                            tool_calls_map.clear();
+                                             ensure_tool_call_ids(&mut result.tool_calls);
+                                             full_text = result.full_text.clone();
+                                             reasoning = result.reasoning.clone();
+                                             usage = result.usage.clone();
+                                             tool_calls_map.clear();
+                                             for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                 if let Value::Object(m) = tc {
+                                                     tool_calls_map.insert(i, m.clone());
+                                                 }
+                                             }
+                                             let synthetic = synthetic_stream_from_result(result, &model_name);
+                                             tokio::pin!(synthetic);
+                                             while let Some(event) = synthetic.next().await {
+                                                 yield event;
+                                             }
+                                         }
+                                         Err(e) => {
+                                             yield render_sse(&json!({"type":"error","message": format!("stream stalled; non-stream recovery failed: {e}")}));
+                                             tool_calls_map.clear();
                                             full_text.clear();
                                             reasoning.clear();
                                         }
@@ -508,7 +523,7 @@ pub(crate) async fn call_llm_stream(
                 }));
             };
 
-            return Ok(out);
+            return Ok(Box::pin(out));
         }
 
         // Non-success: check if retryable (429 rate limit, 5xx server error)

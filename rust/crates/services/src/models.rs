@@ -796,6 +796,19 @@ fn anthropic_messages_probe_url(base_url: Option<&str>) -> String {
     }
 }
 
+fn bedrock_converse_probe_url(base_url: Option<&str>, model_name: &str) -> Option<String> {
+    let base = base_url.map(str::trim).filter(|s| !s.is_empty())?;
+    let mut url = reqwest::Url::parse(base).ok()?;
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.pop_if_empty();
+        segments.push("model");
+        segments.push(model_name);
+        segments.push("converse");
+    }
+    Some(url.to_string())
+}
+
 pub async fn validate_connectivity(
     provider: &str,
     model_name: &str,
@@ -822,9 +835,32 @@ pub async fn validate_connectivity(
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&serde_json::json!({
-                "model": model_name,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}]
+               "model": model_name,
+               "max_tokens": 1,
+               "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await;
+        (send_result, probe)
+    } else if provider == "bedrock" {
+        let Some(probe) = bedrock_converse_probe_url(base_url, model_name) else {
+            return Some(
+                "No base_url for provider 'bedrock'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com."
+                    .to_string(),
+            );
+        };
+        let send_result = client
+            .post(&probe)
+            .header("authorization", format!("Bearer {}", api_key))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"text": "hi"}]
+                }],
+                "inferenceConfig": {
+                    "maxTokens": 1
+                }
             }))
             .send()
             .await;
@@ -1313,6 +1349,19 @@ mod tests {
     #[tokio::test]
     async fn validate_connectivity_unknown_provider_no_base_url_errors() {
         let result = super::validate_connectivity("dashscope", "qwen-plus", "key", None).await;
+        let msg = result.expect("should return an error");
+        assert!(msg.contains("No base_url"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn validate_connectivity_bedrock_no_base_url_errors() {
+        let result = super::validate_connectivity(
+            "bedrock",
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "key",
+            None,
+        )
+        .await;
         let msg = result.expect("should return an error");
         assert!(msg.contains("No base_url"), "got: {msg}");
     }
