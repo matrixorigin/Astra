@@ -1784,6 +1784,7 @@ fn parse_bedrock_nonstream_response(
             .or_else(|| u.get("cacheReadInputTokensCount"))
             .and_then(Value::as_i64)
         {
+            usage.insert("cache_read".to_string(), Value::from(cache_read));
             usage.insert(
                 "cache_read_input_tokens".to_string(),
                 Value::from(cache_read),
@@ -1794,6 +1795,7 @@ fn parse_bedrock_nonstream_response(
             .or_else(|| u.get("cacheWriteInputTokensCount"))
             .and_then(Value::as_i64)
         {
+            usage.insert("cache_creation".to_string(), Value::from(cache_write));
             usage.insert(
                 "cache_creation_input_tokens".to_string(),
                 Value::from(cache_write),
@@ -2453,11 +2455,16 @@ mod tests {
             "anthropic.claude-sonnet-4-20250514-v1:0",
             Instant::now(),
         );
+        assert_eq!(r.usage.get("cache_read").and_then(Value::as_i64), Some(8));
         assert_eq!(
             r.usage
                 .get("cache_read_input_tokens")
                 .and_then(Value::as_i64),
             Some(8)
+        );
+        assert_eq!(
+            r.usage.get("cache_creation").and_then(Value::as_i64),
+            Some(3)
         );
         assert_eq!(
             r.usage

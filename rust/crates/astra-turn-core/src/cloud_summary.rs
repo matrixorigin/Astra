@@ -180,6 +180,90 @@ fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
     ]
 }
 
+fn build_bedrock_summary_body(messages: &[Value], max_output_tokens: usize) -> Value {
+    let system = messages
+        .iter()
+        .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
+        .filter_map(|msg| msg.get("content").and_then(Value::as_str))
+        .map(|text| json!({ "text": text }))
+        .collect::<Vec<_>>();
+    let bedrock_messages = messages
+        .iter()
+        .filter(|msg| msg.get("role").and_then(Value::as_str) != Some("system"))
+        .filter_map(|msg| {
+            let role = msg.get("role").and_then(Value::as_str)?;
+            let content = msg.get("content").and_then(Value::as_str)?;
+            Some(json!({
+                "role": if role == "assistant" { "assistant" } else { "user" },
+                "content": [{ "text": content }],
+            }))
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "messages": bedrock_messages,
+        "inferenceConfig": {
+            "maxTokens": max_output_tokens,
+        }
+    });
+    if !system.is_empty() {
+        body["system"] = Value::Array(system);
+    }
+    body
+}
+
+fn build_summary_request_url(params: &LlmConnParams) -> Result<String, String> {
+    if params.provider == "bedrock" {
+        let mut url = reqwest::Url::parse(params.base_url.trim_end_matches('/'))
+            .map_err(|e| e.to_string())?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| "invalid Bedrock base_url".to_string())?;
+            segments.pop_if_empty();
+            segments.push("model");
+            segments.push(&params.model_name);
+            segments.push("converse");
+        }
+        Ok(url.to_string())
+    } else if params.provider == "anthropic" {
+        let base = params.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            Ok(format!("{base}/messages"))
+        } else {
+            Ok(format!("{base}/v1/messages"))
+        }
+    } else {
+        Ok(format!(
+            "{}/chat/completions",
+            params.base_url.trim_end_matches('/')
+        ))
+    }
+}
+
+fn parse_summary_response_text(provider: &str, json: &Value) -> String {
+    if provider == "bedrock" {
+        json.get("output")
+            .and_then(|output| output.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    } else {
+        json.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP implementation
 // ---------------------------------------------------------------------------
@@ -205,34 +289,7 @@ impl SummaryLlmClient for HttpSummaryClient {
             .map_err(|e| e.to_string())?;
 
         let body = if self.params.provider == "bedrock" {
-            let system = messages
-                .iter()
-                .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
-                .filter_map(|msg| msg.get("content").and_then(Value::as_str))
-                .map(|text| json!({ "text": text }))
-                .collect::<Vec<_>>();
-            let bedrock_messages = messages
-                .iter()
-                .filter(|msg| msg.get("role").and_then(Value::as_str) != Some("system"))
-                .filter_map(|msg| {
-                    let role = msg.get("role").and_then(Value::as_str)?;
-                    let content = msg.get("content").and_then(Value::as_str)?;
-                    Some(json!({
-                        "role": if role == "assistant" { "assistant" } else { "user" },
-                        "content": [{ "text": content }],
-                    }))
-                })
-                .collect::<Vec<_>>();
-            let mut body = json!({
-                "messages": bedrock_messages,
-                "inferenceConfig": {
-                    "maxTokens": self.params.max_output_tokens,
-                }
-            });
-            if !system.is_empty() {
-                body["system"] = Value::Array(system);
-            }
-            body
+            build_bedrock_summary_body(messages, self.params.max_output_tokens)
         } else if self.params.provider == "anthropic" {
             json!({
                 "model": self.params.model_name,
@@ -249,32 +306,7 @@ impl SummaryLlmClient for HttpSummaryClient {
             })
         };
 
-        let url = if self.params.provider == "bedrock" {
-            let mut url = reqwest::Url::parse(self.params.base_url.trim_end_matches('/'))
-                .map_err(|e| e.to_string())?;
-            {
-                let mut segments = url
-                    .path_segments_mut()
-                    .map_err(|_| "invalid Bedrock base_url")?;
-                segments.pop_if_empty();
-                segments.push("model");
-                segments.push(&self.params.model_name);
-                segments.push("converse");
-            }
-            url.to_string()
-        } else if self.params.provider == "anthropic" {
-            let base = self.params.base_url.trim_end_matches('/');
-            if base.ends_with("/v1") {
-                format!("{base}/messages")
-            } else {
-                format!("{base}/v1/messages")
-            }
-        } else {
-            format!(
-                "{}/chat/completions",
-                self.params.base_url.trim_end_matches('/')
-            )
-        };
+        let url = build_summary_request_url(&self.params)?;
 
         let mut req = client.post(&url).header("content-type", "application/json");
         if self.params.provider == "anthropic" {
@@ -304,27 +336,7 @@ impl SummaryLlmClient for HttpSummaryClient {
         }
 
         let json: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let text = if self.params.provider == "bedrock" {
-            json.get("output")
-                .and_then(|output| output.get("message"))
-                .and_then(|message| message.get("content"))
-                .and_then(Value::as_array)
-                .map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter_map(|block| block.get("text").and_then(Value::as_str))
-                        .collect::<String>()
-                })
-                .unwrap_or_default()
-        } else {
-            json.get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
+        let text = parse_summary_response_text(&self.params.provider, &json);
 
         Ok(SummaryResponse {
             text,
@@ -494,6 +506,51 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("some conversation")
+        );
+    }
+
+    #[test]
+    fn build_bedrock_summary_body_and_parse_response() {
+        let messages = build_summary_messages("some conversation");
+        let body = build_bedrock_summary_body(&messages, 321);
+        assert_eq!(body["system"][0]["text"], COMPACT_SYSTEM_PROMPT);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(
+            body["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("some conversation")
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 321);
+
+        let response = json!({
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": "summary line 1"},
+                        {"text": "\nsummary line 2"}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            parse_summary_response_text("bedrock", &response),
+            "summary line 1\nsummary line 2"
+        );
+    }
+
+    #[test]
+    fn build_summary_request_url_supports_bedrock() {
+        let params = LlmConnParams {
+            model_name: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            api_key: "redacted".to_string(),
+            base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            provider: "bedrock".to_string(),
+            max_output_tokens: 128,
+        };
+        assert_eq!(
+            build_summary_request_url(&params).unwrap(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1:0/converse"
         );
     }
 
