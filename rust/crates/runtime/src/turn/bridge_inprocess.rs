@@ -4005,20 +4005,40 @@ mod tests {
     }
 
     #[test]
-    fn build_system_message_claude_model_triggers_anthropic_format() {
-        // Even if provider is not "anthropic", claude model name should trigger it
+    fn build_system_message_bedrock_claude_triggers_anthropic_format() {
         let (msg, _, _) = build_system_message(
             &["bash"],
             "",
             0.8,
             None,
-            &PromptCacheConfig::latch("openrouter", "claude-sonnet-4-20250514"),
+            &PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0"),
         );
 
         let content = msg.get("content").expect("should have content");
         assert!(
             content.is_array(),
-            "claude model should use array content even through non-anthropic provider"
+            "bedrock-hosted claude should use anthropic-style structured content"
+        );
+    }
+
+    #[test]
+    fn build_system_message_openai_claude_keeps_openai_format() {
+        let (msg, dynamic, _) = build_system_message(
+            &["bash"],
+            "",
+            0.8,
+            None,
+            &PromptCacheConfig::latch("openai", "claude-sonnet-4-20250514"),
+        );
+
+        let content = msg.get("content").expect("should have content");
+        assert!(
+            content.is_string(),
+            "explicit openai provider should keep string system content even for Claude-named models"
+        );
+        assert!(
+            dynamic.is_none(),
+            "empty profile should not create dynamic message"
         );
     }
 

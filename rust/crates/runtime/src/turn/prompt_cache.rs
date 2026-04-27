@@ -21,7 +21,11 @@ const MAX_PINNED_CACHE_EDITS_PER_SESSION: usize = 256;
 pub struct PromptCacheConfig {
     /// Whether cache_control annotations are enabled for Anthropic.
     pub cache_enabled: bool,
-    /// Whether the provider supports cache_control (Anthropic/Claude).
+    /// Whether the model should use Anthropic-style internal cache markers.
+    ///
+    /// This includes direct Anthropic models plus Bedrock-hosted Claude models,
+    /// which reuse the same stable-prefix strategy and are translated to
+    /// Bedrock-native `cachePoint` blocks at request-build time.
     pub is_anthropic: bool,
 }
 
@@ -696,6 +700,28 @@ mod tests {
         let original = messages.clone();
         add_message_cache_breakpoint(&mut messages, &cfg);
         assert_eq!(messages, original, "OpenAI should not be annotated");
+    }
+
+    #[test]
+    fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+        let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+        assert!(cfg.cache_enabled);
+        assert!(cfg.is_anthropic);
+    }
+
+    #[test]
+    fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+        let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
+        assert!(cfg.cache_enabled);
+        assert!(!cfg.is_anthropic);
     }
 
     #[test]
