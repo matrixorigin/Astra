@@ -276,12 +276,87 @@ pub fn normalize_tool_arguments(val: &Value) -> Value {
 
 /// Stable key for deduplicating `tool_request` (SSE) vs `tool_call` (same turn).
 pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
-    let normalized = normalize_tool_arguments(args);
+    let (name, normalized) = canonical_read_only_tool_signature(name, args)
+        .unwrap_or_else(|| (name.to_string(), normalize_tool_arguments(args)));
     format!(
         "{}:{}",
         name,
         serde_json::to_string(&normalized).unwrap_or_default()
     )
+}
+
+fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
+    if name == "git_diff" {
+        let mut canonical = serde_json::Map::new();
+        if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+            canonical.insert("staged".to_string(), Value::Bool(true));
+        }
+        if args
+            .get("stat_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            canonical.insert("stat_only".to_string(), Value::Bool(true));
+        }
+        if let Some(base_ref) = args
+            .get("base_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            canonical.insert("base_ref".to_string(), Value::String(base_ref.to_string()));
+        }
+        if let Some(git_ref) = args
+            .get("ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "HEAD")
+        {
+            canonical.insert("ref".to_string(), Value::String(git_ref.to_string()));
+        }
+        if let Some(path) = args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| path.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+        {
+            canonical.insert("path".to_string(), Value::String(path));
+        }
+        return Some(("git_diff".to_string(), Value::Object(canonical)));
+    }
+    if name != "bash" {
+        return None;
+    }
+    let command = args.get("command").and_then(Value::as_str)?.trim();
+    if command
+        .chars()
+        .any(|ch| matches!(ch, '|' | ';' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'))
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.first() == Some(&"git") && parts.get(1) == Some(&"--no-pager") {
+        parts.remove(1);
+    }
+    match parts.as_slice() {
+        ["git", "status"] | ["git", "status", "--short"] | ["git", "status", "--porcelain"] => {
+            Some(("git_status".to_string(), serde_json::json!({})))
+        }
+        ["git", "diff"] => Some(("git_diff".to_string(), serde_json::json!({}))),
+        ["git", "diff", "--stat"] => Some((
+            "git_diff".to_string(),
+            serde_json::json!({"stat_only": true}),
+        )),
+        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => {
+            Some(("git_diff".to_string(), serde_json::json!({"staged": true})))
+        }
+        ["git", "diff", "HEAD"] => Some(("git_diff".to_string(), serde_json::json!({}))),
+        ["git", "diff", "--", path] => Some((
+            "git_diff".to_string(),
+            serde_json::json!({"path": normalize_tool_arguments(&Value::String((*path).to_string()))}),
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +620,34 @@ if let Err(e) = writeln!(file, "{line}") {
         assert_eq!(
             tool_dedup_signature("search", &args1),
             tool_dedup_signature("search", &args2)
+        );
+    }
+
+    #[test]
+    fn tool_dedup_signature_canonicalizes_simple_bash_git_diff() {
+        assert_eq!(
+            tool_dedup_signature("bash", &json!({"command": "git diff"})),
+            tool_dedup_signature("git_diff", &json!({}))
+        );
+        assert_eq!(
+            tool_dedup_signature("bash", &json!({"command": "git diff HEAD"})),
+            tool_dedup_signature("git_diff", &json!({}))
+        );
+        assert_eq!(
+            tool_dedup_signature("bash", &json!({"command": "git --no-pager diff --stat"})),
+            tool_dedup_signature("git_diff", &json!({"stat_only": true}))
+        );
+        assert_eq!(
+            tool_dedup_signature("bash", &json!({"command": "git diff -- src/"})),
+            tool_dedup_signature("git_diff", &json!({"path": "src", "ref": "HEAD"}))
+        );
+    }
+
+    #[test]
+    fn tool_dedup_signature_does_not_canonicalize_compound_bash_commands() {
+        assert_ne!(
+            tool_dedup_signature("bash", &json!({"command": "git diff | head"})),
+            tool_dedup_signature("git_diff", &json!({}))
         );
     }
 

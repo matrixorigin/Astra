@@ -8871,6 +8871,59 @@ diff --git a/src/a.rs b/src/a.rs\n\
     }
 
     #[tokio::test]
+    async fn execute_tool_blocks_name_based_process_kill_for_bash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+            },
+            80,
+            false,
+        );
+
+        let result = host
+            .execute_tool(
+                "bash-pkill-blocked",
+                "bash",
+                &serde_json::json!({"command": "pkill -f http.server"}),
+            )
+            .await;
+
+        assert_eq!(result.status, "error");
+        assert!(
+            result.output.contains(
+                "name-based process killing commands (`pkill` / `killall`) are not allowed"
+            ),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn turn_rollback_read_only_error_does_not_trigger_rollback() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

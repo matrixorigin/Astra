@@ -159,6 +159,7 @@ pub struct ExecutionBudget {
 pub struct ChatRequestData {
     pub message: String,
     pub session_id: Option<String>,
+    pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
     pub llm_token_service: Option<LlmTokenServiceConfig>,
@@ -976,6 +977,7 @@ mod tests {
                 initial_turns: Some(10),
                 hard_turn_limit: Some(18),
             }),
+            full_llm_capture: false,
             explain: false,
             interactive_client: false,
         };
@@ -1009,6 +1011,7 @@ mod tests {
                         initial_turns: Some(25),
                         hard_turn_limit: Some(40),
                     }),
+                    full_llm_capture: false,
                     explain: false,
                     interactive_client: false,
                 },

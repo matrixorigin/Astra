@@ -380,14 +380,10 @@ pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
     reasoning_content: &str,
     force_reasoning_field: bool,
 ) -> Value {
-    let mut msg = if !server_tool_calls.is_empty() {
-        json!({
-            "role": "assistant",
-            "content": Value::Null,
-            "tool_calls": openai_tool_call_entries_from_server(server_tool_calls),
-        })
+    let tool_calls = if !server_tool_calls.is_empty() {
+        openai_tool_call_entries_from_server(server_tool_calls)
     } else {
-        let items: Vec<Value> = edge_round
+        edge_round
             .iter()
             .enumerate()
             .map(|(i, e)| {
@@ -402,13 +398,15 @@ pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
                     }
                 })
             })
-            .collect();
-        json!({
-            "role": "assistant",
-            "content": Value::Null,
-            "tool_calls": items,
-        })
+            .collect()
     };
+    let mut msg = json!({
+        "role": "assistant",
+        "content": Value::Null,
+    });
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = Value::Array(tool_calls);
+    }
     if !reasoning_content.is_empty() {
         if let Some(obj) = msg.as_object_mut() {
             obj.insert(
@@ -917,6 +915,12 @@ mod tests {
         let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
         let tc = msg["tool_calls"].as_array().unwrap();
         assert_eq!(tc[0]["id"], "req-abc");
+    }
+
+    #[test]
+    fn openai_assistant_message_omits_empty_tool_calls() {
+        let msg = openai_assistant_with_tool_calls_message(&[] as &[Value], &[] as &[Row], "");
+        assert!(msg.get("tool_calls").is_none(), "{msg:?}");
     }
 
     #[test]

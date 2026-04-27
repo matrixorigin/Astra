@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::permission_manager::PermissionMode;
 use crate::repl_turn::is_auth_error;
 use astra_thin_client::paths;
@@ -416,6 +417,7 @@ pub(super) async fn execute_cli_command(
                 api,
                 message: &message,
                 model: global_model.as_deref(),
+                provider: None,
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
@@ -825,6 +827,7 @@ pub(super) async fn execute_cli_command(
                 api,
                 message: &message,
                 model: args.model.as_deref().or(global_model.as_deref()),
+                provider: None,
                 explain: explain_mode,
                 render_md,
                 verbose_mode: !quiet,
@@ -989,6 +992,99 @@ pub(super) async fn execute_cli_command(
             } else {
                 print_json_or_raw(&body);
             }
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Capture(SessionCaptureCmd::Latest(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let body = api
+                .get_session_artifact_latest_text(&token, &session_id, &args.artifact_kind)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Capture(SessionCaptureCmd::Download(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let latest_body = api
+                .get_session_artifact_latest_text(&token, &session_id, &args.artifact_kind)
+                .await
+                .map_err(map_thin_err)?;
+            let artifact_id = latest_artifact_id(&latest_body)?;
+            let (bytes, suggested_name) = api
+                .download_session_artifact(&token, &session_id, &artifact_id)
+                .await
+                .map_err(map_thin_err)?;
+            let fallback_name = format!("{}_{}.json", args.artifact_kind, artifact_id);
+            let output_path = resolve_download_output_path(
+                args.output.as_deref(),
+                suggested_name.as_deref().unwrap_or(&fallback_name),
+            );
+            write_downloaded_capture(&output_path, &bytes)?;
+            println!(
+                "{} Saved latest {} for session {} to {}",
+                theme::icon_ok(),
+                args.artifact_kind,
+                session_id,
+                output_path.display()
+            );
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Status(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let trace_state = fetch_session_trace_state(api, Some(&token), &session_id).await?;
+            print_json_or_raw(
+                &serde_json::json!({
+                    "session_id": trace_state.session_id,
+                    "full_llm_capture": trace_state.enabled,
+                })
+                .to_string(),
+            );
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::On(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let trace_state =
+                update_session_trace_state(api, Some(&token), &session_id, true).await?;
+            print_json_or_raw(
+                &serde_json::json!({
+                    "session_id": trace_state.session_id,
+                    "full_llm_capture": trace_state.enabled,
+                })
+                .to_string(),
+            );
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Off(args)))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let session_id =
+                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
+                    .await?;
+            let trace_state =
+                update_session_trace_state(api, Some(&token), &session_id, false).await?;
+            print_json_or_raw(
+                &serde_json::json!({
+                    "session_id": trace_state.session_id,
+                    "full_llm_capture": trace_state.enabled,
+                })
+                .to_string(),
+            );
             Ok(ExitCode::Success)
         }
 
@@ -1281,6 +1377,7 @@ pub(super) async fn run_print_mode(
         api,
         message: &message,
         model,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         verbose_mode: std::env::var("ASTRA_VERBOSE")
@@ -1951,6 +2048,59 @@ fn resolve_api_url_with(
         .unwrap_or_else(|| DEFAULT_API_URL.to_string())
 }
 
+async fn resolve_remote_session_id(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(session_id) => Ok(session_id.to_string()),
+        None => validated_resumable_last_session_id(api, profile)
+            .await
+            .ok_or_else(|| {
+                "No session id provided and no recent resumable session is available".to_string()
+            }),
+    }
+}
+
+fn latest_artifact_id(body: &str) -> Result<String, String> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("Invalid latest artifact response: {error}"))?;
+    json.get("artifact_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "Latest artifact response missing artifact_id".to_string())
+}
+
+fn resolve_download_output_path(
+    output: Option<&std::path::Path>,
+    suggested_name: &str,
+) -> std::path::PathBuf {
+    // Sanitize server-supplied filename: strip directory components and reject traversal.
+    let safe_name = std::path::Path::new(suggested_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("download.json");
+    match output {
+        Some(path) if path.is_dir() => path.join(safe_name),
+        Some(path) => path.to_path_buf(),
+        None => std::path::PathBuf::from(safe_name),
+    }
+}
+
+fn write_downloaded_capture(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
 fn write_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
     let path = settings_path(None)?;
     if let Some(parent) = path.parent() {
@@ -2513,6 +2663,7 @@ mod exit_code_tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            interruption: None,
         }
     }
 
@@ -2806,5 +2957,49 @@ mod api_url_config_tests {
         let settings = astra_dir.join("settings.json");
         let result = read_config_api_url_from(Some(&settings));
         assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn latest_artifact_id_reads_response_shape() {
+        let artifact_id =
+            latest_artifact_id(r#"{"artifact_id":"art-123","artifact_kind":"llm_capture"}"#)
+                .unwrap();
+        assert_eq!(artifact_id, "art-123");
+    }
+
+    #[test]
+    fn resolve_download_output_path_appends_to_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_download_output_path(Some(dir.path()), "capture.json");
+        assert_eq!(resolved, dir.path().join("capture.json"));
+    }
+
+    #[test]
+    fn resolve_download_output_path_strips_path_traversal() {
+        let resolved = resolve_download_output_path(None, "../../.bashrc");
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from(".bashrc"),
+            "path traversal components must be stripped from server-suggested filename"
+        );
+    }
+
+    #[test]
+    fn resolve_download_output_path_strips_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_download_output_path(Some(dir.path()), "/etc/cron.d/backdoor");
+        assert_eq!(
+            resolved,
+            dir.path().join("backdoor"),
+            "absolute path components must be stripped"
+        );
+    }
+
+    #[test]
+    fn write_downloaded_capture_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("capture.json");
+        write_downloaded_capture(&target, br#"{"ok":true}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
     }
 }

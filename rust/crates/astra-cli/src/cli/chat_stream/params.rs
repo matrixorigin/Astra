@@ -62,6 +62,9 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) message: &'a str,
     pub(crate) session_id: Option<&'a str>,
     pub(crate) model: Option<&'a str>,
+    /// Explicit provider hint for provider-specific cache/compaction behavior.
+    /// Prefer this over model-name heuristics when the resolved provider is known.
+    pub(crate) provider: Option<&'a str>,
     pub(crate) explain: ExplainMode,
     pub(crate) render_md: bool,
     pub(crate) history: &'a [(String, String)],
@@ -168,6 +171,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub message: &'a str,
     pub model: Option<&'a str>,
+    pub provider: Option<&'a str>,
     pub explain: ExplainMode,
     pub render_md: bool,
     pub verbose_mode: bool,
@@ -195,6 +199,7 @@ impl<'a> ChatTurnParams<'a> {
             message: ctx.message,
             session_id,
             model: ctx.model,
+            provider: ctx.provider,
             explain: ctx.explain,
             render_md: ctx.render_md,
             history: &[],

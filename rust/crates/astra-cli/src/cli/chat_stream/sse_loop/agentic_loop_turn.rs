@@ -291,6 +291,12 @@ struct PrepareChatTurnRequest<'a> {
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     round_index: u32,
+    /// Authoritative visible-turn number from the outer loop.
+    session_turn: u32,
+    /// Stable bridge turn-chain id reused across retries within the same visible turn.
+    turn_chain_id: Option<&'a str>,
+    /// Stable root user-query event id reused across retries within the same visible turn.
+    user_query_event_id: Option<&'a str>,
     /// Snapshot of session-wide denial pressure (current, max_total) taken at
     /// call time. Published to the observability session so SelfModel can
     /// render it in the system prompt.
@@ -674,6 +680,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     if let Some(root) = payload.as_object_mut() {
         root.insert("round_index".into(), json!(ctx.round_index));
     }
+    inject_bridge_turn_identity(
+        &mut payload,
+        ctx.session_turn,
+        ctx.turn_chain_id,
+        ctx.user_query_event_id,
+    );
+    // The outer agentic loop is the single owner of aggregate turn journal
+    // rows for every LLM round. The bridge may still capture full request /
+    // response payloads for debugging, but it must not emit duplicate
+    // `llm_round` summaries for later rounds.
+    if let Some(root) = payload.as_object_mut() {
+        root.insert("root_turn_journal_owned".into(), json!(true));
+    }
 
     // ─── SelfModel: inject self-awareness text into edge_profile ───
     // Publish fresh denial-pressure + per-tool outcome bias + recent
@@ -848,6 +867,27 @@ fn inject_runtime_turn_overrides(
     }
 }
 
+fn inject_bridge_turn_identity(
+    payload: &mut Value,
+    session_turn: u32,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) {
+    let Some(root) = payload.as_object_mut() else {
+        return;
+    };
+    if session_turn > 0 {
+        root.insert("session_turn".into(), json!(session_turn));
+    }
+    if let Some(turn_chain_id) = turn_chain_id.filter(|value| !value.trim().is_empty()) {
+        root.insert("turn_chain_id".into(), json!(turn_chain_id));
+    }
+    if let Some(user_query_event_id) = user_query_event_id.filter(|value| !value.trim().is_empty())
+    {
+        root.insert("user_query_event_id".into(), json!(user_query_event_id));
+    }
+}
+
 // `load_skill_instructions_text` removed — skill activation now goes through
 // the `skill` tool in the agentic loop, not through proactive payload injection.
 
@@ -919,6 +959,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
         Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for round budget directives.
     pub round_index: u32,
+    pub session_turn: u32,
+    pub turn_chain_id: Option<&'a str>,
+    pub user_query_event_id: Option<&'a str>,
     /// Optional shared observability hub for reading the auto-tuning feedback
     /// window when publishing SelfModel inputs. Threaded through so the
     /// per-turn ingest can attach `recent_signals` to the session without
@@ -1047,6 +1090,9 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_cache,
         previous_confidence_fallback,
         round_index,
+        session_turn,
+        turn_chain_id,
+        user_query_event_id,
         observability_hub,
     } = ctx;
 
@@ -1095,6 +1141,9 @@ pub(crate) async fn fetch_chat_turn_sse(
             skill_allowed_tools,
             previous_confidence_fallback,
             round_index,
+            session_turn,
+            turn_chain_id,
+            user_query_event_id,
             denial_pressure: perm_manager.denial_pressure(),
             recent_rejections: perm_manager.recent_rejections(),
             observability_hub,
@@ -1214,6 +1263,15 @@ mod tests {
         assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
         assert_eq!(payload["effort"], json!("high"));
         assert_eq!(payload["agent_type"], json!("coder"));
+    }
+
+    #[test]
+    fn inject_bridge_turn_identity_adds_authoritative_ids() {
+        let mut payload = json!({});
+        super::inject_bridge_turn_identity(&mut payload, 2, Some("root-chain"), Some("root-query"));
+        assert_eq!(payload["session_turn"], json!(2));
+        assert_eq!(payload["turn_chain_id"], json!("root-chain"));
+        assert_eq!(payload["user_query_event_id"], json!("root-query"));
     }
     #[test]
     fn msg_content_extracts_string_and_array_formats() {

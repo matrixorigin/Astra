@@ -521,6 +521,9 @@ pub fn build_turn_complete_event_from_bridge_state(
             .and_then(serde_json::Value::as_object)
             .map(normalize_execution_state)
             .map(serde_json::Value::Object),
+        latest_assistant_turn(bridge_state)
+            .map(|(assistant_text, _)| assistant_text)
+            .as_deref(),
     );
     if let Some(suggestion) = latest_user_message
         .and_then(|user_message| build_followup_suggestion(bridge_state, user_message))
@@ -914,6 +917,10 @@ mod tests {
             bridge_state.as_object().expect("object"),
             None,
             Some("Fix the bug"),
+        );
+        assert_eq!(
+            event.get("assistant_text"),
+            Some(&serde_json::json!("Patched and verified."))
         );
         assert_eq!(
             event.get("followup_suggestion"),

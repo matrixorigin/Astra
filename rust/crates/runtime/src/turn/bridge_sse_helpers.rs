@@ -75,8 +75,43 @@ pub(crate) fn apply_forward_llm_sse_event(
             }
             Ok(vec![])
         }
-        "text_delta" | "reasoning_delta" | "reasoning_done" | "tool_call_start" | "usage"
-        | "error" | "error_message" => Ok(vec![render_sse(event)]),
+        "text_delta" => {
+            loop_text.push_str(event.get("content").and_then(Value::as_str).unwrap_or(""));
+            Ok(vec![render_sse(event)])
+        }
+        "reasoning_delta" => {
+            loop_reasoning.push_str(event.get("content").and_then(Value::as_str).unwrap_or(""));
+            Ok(vec![render_sse(event)])
+        }
+        "tool_call_start" => {
+            loop_tool_calls.push(json!({
+                "id": event.get("call_id").cloned().unwrap_or(Value::Null),
+                "type": "function",
+                "function": {
+                    "name": event.get("tool").cloned().unwrap_or(Value::Null),
+                    "arguments": event.get("arguments").cloned().unwrap_or(Value::Null),
+                }
+            }));
+            Ok(vec![render_sse(event)])
+        }
+        "usage" => {
+            for key in [
+                "prompt_tokens",
+                "completion_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+                "prompt",
+                "completion",
+                "cache_read",
+                "cache_creation",
+            ] {
+                if let Some(value) = event.get(key).cloned() {
+                    usage.insert(key.to_string(), value);
+                }
+            }
+            Ok(vec![render_sse(event)])
+        }
+        "reasoning_done" | "error" | "error_message" => Ok(vec![render_sse(event)]),
         "warning" => Ok(vec![render_sse(event)]),
         _ => Ok(vec![]),
     }
@@ -245,7 +280,61 @@ mod tests {
         )
         .unwrap();
         assert!(!saw);
+        assert_eq!(text, "hi");
         assert_eq!(result.len(), 1, "text_delta should produce 1 SSE frame");
+    }
+
+    #[test]
+    fn apply_forward_accumulates_partial_stream_state() {
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = Map::new();
+        let mut model = String::new();
+
+        apply_forward_llm_sse_event(
+            &json!({"type": "reasoning_delta", "content": "think"}),
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tool_calls,
+            &mut usage,
+            &mut model,
+        )
+        .unwrap();
+        apply_forward_llm_sse_event(
+            &json!({
+                "type": "tool_call_start",
+                "tool": "bash",
+                "call_id": "call-1",
+                "arguments": "{\"command\":\"pwd\"}"
+            }),
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tool_calls,
+            &mut usage,
+            &mut model,
+        )
+        .unwrap();
+        apply_forward_llm_sse_event(
+            &json!({"type": "usage", "prompt_tokens": 11, "completion_tokens": 4}),
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tool_calls,
+            &mut usage,
+            &mut model,
+        )
+        .unwrap();
+
+        assert!(!saw);
+        assert_eq!(reasoning, "think");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(usage["prompt_tokens"], 11);
+        assert_eq!(usage["completion_tokens"], 4);
     }
 
     #[test]

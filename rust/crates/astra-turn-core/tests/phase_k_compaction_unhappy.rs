@@ -43,7 +43,7 @@ fn tool_result(call_id: &str, content: &str) -> Value {
 #[test]
 fn phase_k_empty_history_is_noop() {
     let mut messages: Vec<Value> = vec![];
-    let stats = compact_tool_results(&mut messages, Some(3));
+    let stats = compact_tool_results(&mut messages, Some(3), Default::default());
     assert_eq!(stats.results_compacted, 0);
     assert!(messages.is_empty());
 }
@@ -54,7 +54,7 @@ fn phase_k_assistant_without_tool_calls_does_not_panic() {
         json!({"role": "assistant", "content": "plain text reply"}),
         json!({"role": "user", "content": "thanks"}),
     ];
-    let stats = compact_tool_results(&mut messages, Some(0));
+    let stats = compact_tool_results(&mut messages, Some(0), Default::default());
     assert_eq!(stats.results_compacted, 0);
 }
 
@@ -65,7 +65,7 @@ fn phase_k_malformed_tool_calls_field_tolerated() {
         json!({"role": "assistant", "content": null, "tool_calls": "not-an-array"}),
         tool_result("c1", &big),
     ];
-    let stats = compact_tool_results(&mut messages, Some(0));
+    let stats = compact_tool_results(&mut messages, Some(0), Default::default());
     // Orphan tool_result with no assistant mapping → stays put.
     assert_eq!(stats.results_compacted, 0);
     assert_eq!(messages[1]["content"], big);
@@ -99,8 +99,8 @@ fn phase_k_adaptive_high_pressure_compacts_more_aggressively_than_low() {
 
     let mut low = build();
     let mut high = build();
-    let low_stats = compact_tool_results_adaptive(&mut low, 0.1);
-    let high_stats = compact_tool_results_adaptive(&mut high, 0.95);
+    let low_stats = compact_tool_results_adaptive(&mut low, 0.1, Default::default());
+    let high_stats = compact_tool_results_adaptive(&mut high, 0.95, Default::default());
 
     assert!(
         high_stats.results_compacted >= low_stats.results_compacted,
@@ -118,7 +118,7 @@ fn phase_k_adaptive_zero_pressure_preserves_all_small_results() {
         tool_result("c1", &small),
         tool_result("c2", &small),
     ];
-    let stats = compact_tool_results_adaptive(&mut messages, 0.0);
+    let stats = compact_tool_results_adaptive(&mut messages, 0.0, Default::default());
     assert_eq!(
         stats.results_compacted, 0,
         "zero pressure + tiny total must not compact"
@@ -138,7 +138,7 @@ fn phase_k_interleaved_user_messages_do_not_break_indexing() {
         assistant_with_tools(&[("c3", "read_file")]),
         tool_result("c3", &big),
     ];
-    let stats = compact_tool_results(&mut messages, Some(1));
+    let stats = compact_tool_results(&mut messages, Some(1), Default::default());
     assert!(stats.results_compacted >= 1);
     // c3 (most recent compactable) must be preserved.
     let last = messages.last().unwrap();
@@ -182,7 +182,7 @@ fn phase_k_state_aware_pins_active_files() {
         tool_result("c8", &big),
     ];
 
-    let _ = compact_tool_results_state_aware(&mut messages, 0.9, &facts, 5);
+    let _ = compact_tool_results_state_aware(&mut messages, 0.9, &facts, 5, Default::default());
 
     // c1 references /active.rs — must be preserved regardless of age.
     let c1_content = messages[1]["content"].as_str().unwrap_or("");
@@ -205,7 +205,7 @@ fn phase_k_persisted_markers_never_compact_even_under_pressure() {
         tool_result("c1", &persisted),
         tool_result("c2", &live),
     ];
-    let stats = compact_tool_results_adaptive(&mut messages, 0.99);
+    let stats = compact_tool_results_adaptive(&mut messages, 0.99, Default::default());
     // c1 is persisted → never compact. c2 may or may not compact under keep
     // default=6 and small count, but the guarantee here is the persisted one
     // stays intact.

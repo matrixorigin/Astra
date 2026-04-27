@@ -32,6 +32,48 @@ pub(crate) fn is_delegation_call(tool_call: &Value) -> bool {
     tool_call_name(tool_call) == Some(DELEGATE_TOOL_NAME)
 }
 
+fn source_agent_alias_candidates(source_agent_id: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(source_agent_id).chain(match source_agent_id {
+        "orchestrator" => Some("main"),
+        "main" => Some("orchestrator"),
+        _ => None,
+    })
+}
+
+async fn execute_delegation_with_source_agent_fallback(
+    engine: &crate::server::delegation_engine::DelegationEngine,
+    request: astra_services::coordination::DelegationRequest,
+    source_agent_id: &str,
+    forward_headers: &std::collections::HashMap<String, String>,
+    llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
+) -> Result<astra_services::coordination::DelegationResult, String> {
+    let candidates: Vec<&str> = source_agent_alias_candidates(source_agent_id).collect();
+    let mut last_err = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        match engine
+            .execute_with_forward_headers(
+                request.clone(),
+                candidate,
+                None,
+                forward_headers.clone(),
+                llm_token_service.cloned(),
+            )
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(err)
+                if err.contains("source agent")
+                    && err.contains("not registered")
+                    && index + 1 < candidates.len() =>
+            {
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("source agent '{source_agent_id}' not registered")))
+}
+
 pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -663,15 +705,14 @@ pub(crate) async fn partition_and_execute_delegations(
                                     .and_then(|v| v.as_str().map(String::from))
                                     .unwrap_or_else(|| format!("{s:?}").to_lowercase())
                             });
-                    match engine
-                        .execute_with_forward_headers(
-                            request,
-                            source_agent_id,
-                            None,
-                            forward_headers.clone(),
-                            llm_token_service.cloned(),
-                        )
-                        .await
+                    match execute_delegation_with_source_agent_fallback(
+                        engine,
+                        request,
+                        source_agent_id,
+                        forward_headers,
+                        llm_token_service,
+                    )
+                    .await
                     {
                         Ok(result) => {
                             let succeeded =
@@ -1455,6 +1496,7 @@ mod tests {
     }
 
     fn make_partition_engine(
+        root_agent_id: &str,
         agent_ids: &[&str],
     ) -> crate::server::delegation_engine::DelegationEngine {
         use crate::server::delegation_engine::{
@@ -1463,6 +1505,11 @@ mod tests {
         use crate::server::run_engine::RunEngine;
 
         let mut registry = AgentProfileRegistry::new();
+        let _ = registry.register(AgentProfile::new(
+            root_agent_id,
+            &root_agent_id.to_uppercase(),
+            AgentTier::Orchestrator,
+        ));
         for agent_id in agent_ids {
             let _ = registry.register(AgentProfile::new(
                 agent_id,
@@ -1481,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_separates_delegate_from_regular_calls() {
-        let engine = make_partition_engine(&["coder"]);
+        let engine = make_partition_engine("main", &["coder"]);
         let tool_calls = vec![
             json!({
                 "id": "call_delegate",
@@ -1526,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_handles_all_delegate_calls() {
-        let engine = make_partition_engine(&["coder", "reviewer"]);
+        let engine = make_partition_engine("orchestrator", &["coder", "reviewer"]);
         let tool_calls = vec![
             json!({
                 "id": "d1",
@@ -1544,7 +1591,7 @@ mod tests {
             "run-1",
             "sess-1",
             0,
-            "orchestrator",
+            "main",
             None,
             &std::collections::HashMap::new(),
             None,
@@ -1560,7 +1607,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_handles_invalid_delegation_args_gracefully() {
-        let engine = make_partition_engine(&[]);
+        let engine = make_partition_engine("main", &[]);
         let tool_calls = vec![json!({
             "id": "bad_call",
             "function": {"name": "delegate", "arguments": "not valid json!!!"}
@@ -1589,6 +1636,41 @@ mod tests {
                 .contains("Invalid delegation request")
         );
         assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partition_preserves_target_not_registered_error_after_source_alias_retry() {
+        let engine = make_partition_engine("main", &[]);
+        let tool_calls = vec![json!({
+            "id": "missing_target",
+            "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
+        })];
+
+        let (delegation_results, remaining) = partition_and_execute_delegations(
+            &tool_calls,
+            &engine,
+            "run-1",
+            "sess-1",
+            0,
+            "orchestrator",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            &RequestConstraints::default(),
+            &astra_core::SkillSearchSettings::default(),
+            None,
+        )
+        .await;
+
+        assert_eq!(delegation_results.len(), 1);
+        assert!(remaining.is_empty());
+        assert!(
+            delegation_results[0]
+                .summary
+                .contains("target agent 'coder' not registered"),
+            "{:?}",
+            delegation_results[0]
+        );
     }
 
     #[tokio::test]
@@ -1631,6 +1713,48 @@ mod tests {
         assert!(
             state.tool_results.is_empty(),
             "no synthetic delegation result should be injected when delegate is disallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn intercept_delegations_retries_root_agent_aliases() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
+        let mut state = make_state();
+        state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"])));
+
+        let turn_result = HostTurnResult {
+            accum: crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                has_tool_calls: true,
+                tool_calls: vec![json!({
+                    "id": "call_delegate",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate",
+                        "arguments": "{\"task\":\"write tests\",\"agents\":[\"coder\"]}"
+                    }
+                })],
+                ..crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(10),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        };
+
+        let valid_tool_names = host.valid_tool_names().clone();
+        let result =
+            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
+                .await;
+
+        assert!(result.intercepted_any);
+        assert!(result.effective_tool_calls.is_empty());
+        assert_eq!(state.tool_results.len(), 1);
+        assert!(
+            state.tool_results[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Delegation"),
+            "{:?}",
+            state.tool_results
         );
     }
 }

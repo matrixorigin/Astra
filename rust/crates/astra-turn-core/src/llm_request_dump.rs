@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -54,17 +55,37 @@ impl LlmRequestDump {
         })
     }
 
+    pub fn to_remote_artifact_record(&self, user_id: &str) -> SessionArtifactJsonRecord {
+        SessionArtifactJsonRecord {
+            artifact_id: String::new(),
+            session_id: self.session_id.clone(),
+            user_id: user_id.to_string(),
+            artifact_kind: "llm_request_dump".to_string(),
+            source: Some("llm_request_dump".to_string()),
+            turn: None,
+            round: u32::try_from(self.round).ok(),
+            content: self.to_json(),
+            metadata: Some(json!({
+                "agent_id": self.agent_id,
+                "model": self.model,
+                "provider": self.provider,
+                "error_preview": truncate_chars(&self.error, ERROR_PREVIEW_MAX_CHARS),
+            })),
+        }
+    }
+
     /// Write to local file under the session directory.
     /// Returns the path on success.
     pub fn write_local(&self) -> Option<String> {
-        let home = std::env::var("HOME").ok()?;
-        let dir = format!("{home}/.astra/sessions/{}", self.session_id);
+        let dir = astra_services::local_session_artifact_store()
+            .session_dir(&self.session_id)
+            .ok()?;
         std::fs::create_dir_all(&dir).ok()?;
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let path = format!("{dir}/llm_error_{ts}.json");
+        let path = dir.join(format!("llm_error_{ts}.json"));
         let content = serde_json::to_string_pretty(&self.to_json()).ok()?;
         std::fs::write(&path, content).ok()?;
-        Some(path)
+        Some(path.display().to_string())
     }
 
     /// Persist as an auxiliary event to the cloud DB (fire-and-forget).
@@ -100,6 +121,17 @@ impl LlmRequestDump {
             }
         });
     }
+
+    pub async fn persist_remote(
+        &self,
+        user_id: &str,
+        store: &dyn SessionArtifactJsonStore,
+    ) -> Result<(), String> {
+        store
+            .persist_json_artifact(self.to_remote_artifact_record(user_id))
+            .await
+            .map(|_| ())
+    }
 }
 
 /// Build a dump from the current bridge state.
@@ -131,6 +163,7 @@ pub fn build_llm_request_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalDirGuard;
 
     #[test]
     fn truncate_chars_keeps_short_strings() {
@@ -175,5 +208,46 @@ mod tests {
         assert_eq!(j["round"], 2);
         assert!(j["error"].as_str().unwrap().contains("reasoning_content"));
         assert!(j["messages"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn remote_artifact_record_uses_dump_kind() {
+        let dump = build_llm_request_dump(
+            "sess-1",
+            Some("test-agent"),
+            "kimi-k2.5",
+            "moonshot",
+            "LLM error 400",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            2,
+            Some(8192),
+        );
+        let record = dump.to_remote_artifact_record("user-1");
+        assert_eq!(record.artifact_kind, "llm_request_dump");
+        assert_eq!(record.round, Some(2));
+        assert_eq!(record.metadata.as_ref().unwrap()["model"], "kimi-k2.5");
+    }
+
+    #[test]
+    fn write_local_uses_session_artifact_root_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let dump = build_llm_request_dump(
+            "sess-1",
+            Some("test-agent"),
+            "kimi-k2.5",
+            "moonshot",
+            "LLM error 400",
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            0,
+            Some(1024),
+        );
+        let path = dump.write_local().expect("dump path");
+        assert!(
+            path.starts_with(&*temp.path().join("sess-1").to_string_lossy()),
+            "{path}"
+        );
     }
 }

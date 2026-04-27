@@ -305,10 +305,17 @@ pub(crate) async fn stream_chat_sse(
     } else {
         RuntimeLimits::global().max_turns
     };
-    let step_recorder = StepRecorder::with_persistence(
-        current_session_id.as_deref().unwrap_or("ephemeral"),
-        step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
-    );
+    let step_recorder = if let Some(session_id) = current_session_id.as_deref() {
+        StepRecorder::with_persistence(
+            session_id,
+            step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
+        )
+    } else {
+        StepRecorder::new(
+            "ephemeral",
+            step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),
+        )
+    };
     let mut local_discovered_skills = HashSet::new();
     let discovered_skills = match p.discovered_skills.as_deref_mut() {
         Some(shared) => std::mem::take(shared),
@@ -493,6 +500,13 @@ pub(crate) async fn stream_chat_sse(
             forced_execution_retry: false,
             forced_execution_escalation: false,
             forced_parallel_batching: false,
+            forced_round_budget_phase1: false,
+            forced_round_budget_phase2: false,
+            forced_redundant_reads_corrective: false,
+            forced_cache_waste_corrective: false,
+            forced_exploration_family_corrective: false,
+            forced_exploration_family_phase2: false,
+            exploration_family_corrective_family: None,
             nudge_count: 0,
             guardrail_tuner: astra_runtime::guardrail_tuning::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
@@ -600,6 +614,10 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        compact_strategy:
+            astra_runtime::turn::microcompact::CompactStrategy::from_provider_and_model(
+                p.provider, p.model,
+            ),
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
@@ -607,6 +625,8 @@ pub(crate) async fn stream_chat_sse(
         // after state.turn += 1, so add 1 here to keep llm_round.turn
         // consistent with the turn event's turn number.
         session_turn: p.turn_index + 1,
+        bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
+        bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
         turn_event_buffer: None,
     };
 
@@ -702,6 +722,7 @@ pub(crate) async fn stream_chat_sse(
             .map(|b| b.drain())
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
+        interruption: state.interruption.as_ref().map(|i| i.to_json()),
     });
     Ok(result)
 }

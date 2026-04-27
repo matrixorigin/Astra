@@ -135,6 +135,92 @@ impl SessionFacts {
 // ── Injection ────────────────────────────────────────────────────────────────
 
 impl SessionFacts {
+    /// Deterministic working-set injection for cross-turn continuity.
+    ///
+    /// Field order is stable by design so prefix-cache providers can reuse the
+    /// surrounding prompt while still preserving the facts the model needs to
+    /// stay oriented after compaction.
+    pub fn to_working_set_injection(&self, current_goal: &str) -> String {
+        let mut out = String::from("[working-set:v1]\n");
+        let goal = if let Some(plan) = &self.plan_state {
+            plan.goal.trim()
+        } else {
+            current_goal.trim()
+        };
+        writeln!(out, "goal: {}", truncate_or_none(goal, 240)).ok();
+
+        let pending = self
+            .plan_state
+            .as_ref()
+            .and_then(|plan| plan.current_subtask.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate(value, 200))
+            .unwrap_or_else(|| "none".to_string());
+        writeln!(out, "pending_work: {pending}").ok();
+
+        out.push_str("active_files:\n");
+        if self.active_files.is_empty() {
+            out.push_str("- none\n");
+        } else {
+            let mut files: Vec<&FileEntry> = self.active_files.iter().collect();
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            for file in files.into_iter().take(12) {
+                writeln!(
+                    out,
+                    "- {} [{} t{}]",
+                    truncate(&file.path, 160),
+                    file.last_action,
+                    file.turn
+                )
+                .ok();
+            }
+        }
+
+        out.push_str("recent_tools:\n");
+        if self.recent_tool_calls.is_empty() {
+            out.push_str("- none\n");
+        } else {
+            for tool in self.recent_tool_calls.iter().rev().take(6).rev() {
+                writeln!(
+                    out,
+                    "- {} [{} t{}]",
+                    tool.name,
+                    if tool.ok { "ok" } else { "error" },
+                    tool.turn
+                )
+                .ok();
+            }
+        }
+
+        out.push_str("tool_risks:\n");
+        if self.blocked_tools.is_empty() && self.error_state.total_errors == 0 {
+            out.push_str("- none\n");
+        } else {
+            if !self.blocked_tools.is_empty() {
+                let mut blocked = self.blocked_tools.clone();
+                blocked.sort();
+                writeln!(out, "- blocked: {}", blocked.join(", ")).ok();
+            }
+            if self.error_state.total_errors > 0 {
+                let last = self
+                    .error_state
+                    .last_error
+                    .as_deref()
+                    .map(|err| truncate(err, 180))
+                    .unwrap_or_else(|| "unknown".to_string());
+                writeln!(
+                    out,
+                    "- errors: {} total, last: {}",
+                    self.error_state.total_errors, last
+                )
+                .ok();
+            }
+        }
+
+        out
+    }
+
     /// Serialize to injection format (~150 tokens).
     pub fn to_injection(&self) -> String {
         let mut out = String::from("# System State\n");
@@ -187,6 +273,20 @@ impl SessionFacts {
         self.active_files
             .iter()
             .any(|f| f.path == path && f.turn >= cutoff)
+    }
+
+    /// Check whether a file path is explicitly referenced by pending plan work.
+    pub fn is_pending_relevant_file(&self, path: &str) -> bool {
+        let Some(plan) = &self.plan_state else {
+            return false;
+        };
+        let Some(subtask) = plan.current_subtask.as_deref() else {
+            return false;
+        };
+        if path.is_empty() {
+            return false;
+        }
+        subtask.contains(path)
     }
 }
 
@@ -251,6 +351,14 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let boundary = s.floor_char_boundary(max);
         format!("{}…", &s[..boundary])
+    }
+}
+
+fn truncate_or_none(s: &str, max: usize) -> String {
+    if s.is_empty() {
+        "none".to_string()
+    } else {
+        truncate(s, max)
     }
 }
 
@@ -460,6 +568,25 @@ mod tests {
     }
 
     #[test]
+    fn pending_relevant_file_matches_current_subtask() {
+        let facts = SessionFacts {
+            plan_state: Some(PlanFact {
+                goal: "fix compaction".to_string(),
+                completed: 1,
+                total: 3,
+                current_subtask: Some(
+                    "preserve rust/crates/runtime/src/server/run_lifecycle.rs while validating"
+                        .to_string(),
+                ),
+            }),
+            ..Default::default()
+        };
+
+        assert!(facts.is_pending_relevant_file("rust/crates/runtime/src/server/run_lifecycle.rs"));
+        assert!(!facts.is_pending_relevant_file("rust/crates/runtime/src/other.rs"));
+    }
+
+    #[test]
     fn to_injection_format() {
         let facts = SessionFacts {
             turn: 5,
@@ -483,6 +610,74 @@ mod tests {
         assert!(injection.contains("write src/main.rs (t5)"));
         assert!(injection.contains("Errors: 1 total, last: compile error"));
         assert!(injection.contains("Blocked tools: web_fetch"));
+    }
+
+    #[test]
+    fn working_set_injection_has_stable_order_and_preserves_key_facts() {
+        let facts = SessionFacts {
+            turn: 5,
+            active_files: vec![
+                FileEntry {
+                    path: "src/z.rs".to_string(),
+                    last_action: "read".to_string(),
+                    turn: 4,
+                },
+                FileEntry {
+                    path: "src/a.rs".to_string(),
+                    last_action: "write".to_string(),
+                    turn: 5,
+                },
+            ],
+            recent_tool_calls: vec![
+                ToolFact {
+                    name: "read_file".to_string(),
+                    ok: true,
+                    turn: 4,
+                },
+                ToolFact {
+                    name: "str_replace".to_string(),
+                    ok: false,
+                    turn: 5,
+                },
+            ],
+            plan_state: Some(PlanFact {
+                goal: "fix context continuity".to_string(),
+                completed: 1,
+                total: 3,
+                current_subtask: Some("add canonical working set".to_string()),
+            }),
+            blocked_tools: vec!["str_replace".to_string(), "web_fetch".to_string()],
+            error_state: ErrorFact {
+                total_errors: 2,
+                last_error: Some("old_str not found".to_string()),
+                last_error_turn: Some(5),
+            },
+            estimated_tokens: 0,
+        };
+
+        let injection = facts.to_working_set_injection("fallback goal");
+        assert!(injection.starts_with("[working-set:v1]\n"));
+        assert!(injection.contains("goal: fix context continuity\n"));
+        assert!(injection.contains("pending_work: add canonical working set\n"));
+        assert!(
+            injection.find("- src/a.rs").unwrap() < injection.find("- src/z.rs").unwrap(),
+            "active files should be sorted for deterministic rendering: {injection}"
+        );
+        assert!(injection.contains("- read_file [ok t4]"));
+        assert!(injection.contains("- str_replace [error t5]"));
+        assert!(injection.contains("- blocked: str_replace, web_fetch"));
+        assert!(injection.contains("- errors: 2 total, last: old_str not found"));
+    }
+
+    #[test]
+    fn working_set_injection_uses_none_placeholders_for_empty_sections() {
+        let facts = SessionFacts::default();
+        let injection = facts.to_working_set_injection("");
+        assert!(injection.contains("goal: none\n"));
+        assert!(injection.contains("pending_work: none\n"));
+        assert!(injection.contains("active_files:\n- none\n"));
+        assert!(injection.contains("recent_tools:\n- none\n"));
+        assert!(injection.contains("tool_risks:\n- none\n"));
     }
 
     #[test]

@@ -240,7 +240,7 @@ pub(super) async fn handle_slash_command(
             }
         }
 
-        "/session" => handle_session_command(arg, state),
+        "/session" => handle_session_command(arg, api, profile, state, token).await,
 
         "/config" => slash_config::handle_config_command(arg),
 

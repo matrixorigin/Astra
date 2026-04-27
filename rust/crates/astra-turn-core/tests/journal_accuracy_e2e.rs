@@ -109,6 +109,7 @@ fn make_eval(success: bool, quality: f64) -> astra_turn_core::evaluation::TurnEv
         quality,
         confidence: 0.8,
         signals: vec![],
+        thresholds: astra_turn_core::evaluation::EvaluationThresholds::default(),
     }
 }
 

@@ -1181,6 +1181,7 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
                 .iter()
                 .map(|tool| tool.tool_name.clone())
                 .collect(),
+            selection_scope: "latest_round".to_string(),
             rejected_tools: trace.tools.tools_rejected.len(),
             strategy: trace.tools.selection_strategy.clone(),
             confidence: trace.tools.selection_confidence,

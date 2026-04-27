@@ -842,6 +842,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
     // Fallback for subcommands and special cases not in registry
     match command {
         "/session history" | "/session errors" | "/session export" => Some("<session_id|prefix>"),
+        "/session trace" => Some("[status|on|off] [session_id]"),
         "/session fork" => Some("[parent_id] [label]"),
         "/grep files" => Some("<glob>"),
         "/grep review" => Some("<pattern>"),

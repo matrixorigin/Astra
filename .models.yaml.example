@@ -6,6 +6,29 @@
 # Load into the running server:
 #   astra-admin model load .models.yaml
 
+# ── AWS Bedrock / Claude via Converse ───────────────────────
+# Current Astra Bedrock integration expects a Bedrock bearer token
+# (for example AWS_BEARER_TOKEN_BEDROCK), not raw AWS access key/secret.
+- name: us.anthropic.claude-opus-4-6-v1
+  provider: bedrock
+  api_key: ABSK-your-bedrock-bearer-token
+  base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+  description: "Anthropic Claude Opus 4.6 via Amazon Bedrock Converse"
+  tags: [code, chat, reasoning]
+  context_window: 1000000
+  max_completion_tokens: 131072
+  supported_parameters: [tools]
+
+- name: us.anthropic.claude-sonnet-4-6-v1
+  provider: bedrock
+  api_key: ABSK-your-bedrock-bearer-token
+  base_url: https://bedrock-runtime.us-east-1.amazonaws.com
+  description: "Anthropic Claude Sonnet 4.6 via Amazon Bedrock Converse"
+  tags: [code, chat, reasoning]
+  context_window: 1000000
+  max_completion_tokens: 65536
+  supported_parameters: [tools]
+
 # ── Alibaba DashScope / Qwen ───────────────────────────────
 - name: qwen-plus
   provider: openai

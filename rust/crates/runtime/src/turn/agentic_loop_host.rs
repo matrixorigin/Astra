@@ -378,6 +378,7 @@ pub struct EvaluationPersistenceContext {
 pub struct ContextTracePersistenceContext {
     pub user_id: String,
     pub event_service: DatabaseEventService,
+    pub artifact_store: astra_services::DatabaseSessionArtifactStore,
     pub agent_id: String,
 }
 
@@ -411,6 +412,41 @@ pub struct StallTrackingState {
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
     pub forced_parallel_batching: bool,
+    /// Whether the round-budget convergence guard injected its phase-1
+    /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
+    /// crosses the effective round-budget hard limit; it tells the model
+    /// to produce a final answer next round and (in the runtime) restricts
+    /// all tools so the next round must be text-only. One-shot per turn.
+    pub forced_round_budget_phase1: bool,
+    /// Whether the round-budget guard escalated to phase-2 (hard abort).
+    /// Set when phase-1 fired and the model still attempted tool calls on
+    /// the very next round. One-shot per turn.
+    pub forced_round_budget_phase2: bool,
+    /// Whether the redundant-reads mid-loop corrective injected a guidance
+    /// message this loop. Fires when the model has re-read overlapping line
+    /// ranges of the same file enough times to cross
+    /// `REDUNDANT_READS_MIDLOOP_THRESHOLD` without any intervening
+    /// workspace mutation. One-shot per turn — escalation is via the
+    /// existing post-mortem `EvalSignal::RedundantOverlappingReads`.
+    pub forced_redundant_reads_corrective: bool,
+    /// Whether the repeated-cache-waste mid-loop corrective injected a
+    /// guidance message this loop. Fires when the model keeps reissuing
+    /// identical tool calls that are served from cache instead of reusing
+    /// the earlier result. One-shot per turn.
+    pub forced_cache_waste_corrective: bool,
+    /// Whether a broad exploration-family corrective injected a guidance
+    /// message and restricted the dominant low-yield family this loop. Fires
+    /// when consecutive multi-call rounds stay inside the same exploratory
+    /// family (diff/search/read). One-shot per turn.
+    pub forced_exploration_family_corrective: bool,
+    /// Whether the exploration-family corrective escalated to a stronger
+    /// convergence directive after the model spent a later round attempting
+    /// ONLY tools from the already-restricted family. One-shot per turn.
+    pub forced_exploration_family_phase2: bool,
+    /// Dominant exploratory family currently under runtime correction. Used
+    /// to detect whether later blocked rounds are simply retrying the same
+    /// low-yield path instead of switching families or synthesizing.
+    pub exploration_family_corrective_family: Option<String>,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -703,6 +739,9 @@ pub struct AgenticLoopState {
     /// Used for facts-first anchor, injection, compaction, and microcompact pin list.
     pub session_facts: crate::turn::cloud::session_facts::SessionFacts,
 
+    /// Provider-aware compaction strategy for microcompact placeholders.
+    pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
+
     // ── Approval checkpoint persistence ──
     /// Approval overrides synchronized from CLI's PermissionManager before each turn.
     /// Written to HeavyCheckpoint so approval decisions survive session restarts.
@@ -719,6 +758,12 @@ pub struct AgenticLoopState {
     /// Session-level turn number (1-based). Set by the CLI from ReplState.turn
     /// so that llm_round journal events carry the correct turn number.
     pub session_turn: u32,
+    /// Optional authoritative bridge turn-chain id propagated by outer loops.
+    /// When present, all `/chat/turn` retries within the same visible turn
+    /// should reuse this id instead of generating a fresh bridge-local value.
+    pub bridge_turn_chain_id: Option<String>,
+    /// Optional authoritative root user-query event id propagated by outer loops.
+    pub bridge_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 }
@@ -808,7 +853,8 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         } = match prepare_turn_iteration(host, state, turn_index).await? {
             PreparedTurnIteration::Ready(prep) => prep,
             PreparedTurnIteration::Finished(outcome) => {
-                if matches!(outcome, AgenticLoopOutcome::Completed) && !state.final_text.is_empty()
+                if matches!(outcome, AgenticLoopOutcome::Completed)
+                    && (!state.final_text.is_empty() || state.interruption.is_some())
                 {
                     finalize_and_render(host, state).await;
                 }
@@ -1056,10 +1102,13 @@ pub fn make_test_loop_state() -> AgenticLoopState {
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
+        compact_strategy: Default::default(),
         approval_overrides: None,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
         session_turn: 0,
+        bridge_turn_chain_id: None,
+        bridge_user_query_event_id: None,
         turn_event_buffer: None,
     }
 }
@@ -1258,6 +1307,30 @@ pub(crate) mod tests {
         }
     }
 
+    fn tool_preamble_result(
+        preamble: &str,
+        tool_calls: Vec<Value>,
+        edge_tools: Vec<EdgeToolExecResult>,
+        prompt: u64,
+        completion: u64,
+        ttft: Option<u64>,
+    ) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                full_text: preamble.to_string(),
+                has_tool_calls: true,
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                tool_calls,
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: ttft,
+            edge_tool_round: edge_tools,
+            error_kind: None,
+        }
+    }
+
     pub(crate) fn make_edge_tool(name: &str, output: &str) -> EdgeToolExecResult {
         EdgeToolExecResult {
             request_id: format!("req-{name}"),
@@ -1374,10 +1447,13 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         }
     }
@@ -1538,6 +1614,119 @@ pub(crate) mod tests {
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn text_only_final_response_closes_current_step() {
+        let mut host = MockHost::new(vec![text_result("final", 10, 5, Some(30))]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        let terminal_events: Vec<_> = state
+            .step_recorder
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    crate::pipeline::StepEventType::StepCompleted
+                        | crate::pipeline::StepEventType::StepIncomplete
+                        | crate::pipeline::StepEventType::StepFailed
+                        | crate::pipeline::StepEventType::StepRetried
+                )
+            })
+            .collect();
+        assert_eq!(terminal_events.len(), 1, "{terminal_events:?}");
+        assert_eq!(
+            terminal_events[0].event_type,
+            crate::pipeline::StepEventType::StepCompleted
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_round_then_final_text_records_one_terminal_event_per_step() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("bash", "file list")], 20, 10, Some(50)),
+            text_result("done", 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        let mut terminal_counts = std::collections::BTreeMap::new();
+        for event in state.step_recorder.events() {
+            if matches!(
+                event.event_type,
+                crate::pipeline::StepEventType::StepCompleted
+                    | crate::pipeline::StepEventType::StepIncomplete
+                    | crate::pipeline::StepEventType::StepFailed
+                    | crate::pipeline::StepEventType::StepRetried
+            ) {
+                *terminal_counts
+                    .entry(event.step_id.clone())
+                    .or_insert(0usize) += 1;
+            }
+        }
+
+        assert_eq!(
+            terminal_counts.values().copied().collect::<Vec<_>>(),
+            vec![1, 1],
+            "each created step should have exactly one terminal event: {terminal_counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_tool_completion_trace_has_call_id_and_args_preview() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool_with_args(
+                    "bash",
+                    json!({"command":"git diff --stat"}),
+                    "diff stat",
+                )],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result("done", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        let completed = state
+            .step_recorder
+            .events()
+            .iter()
+            .find(|event| {
+                event.event_type == crate::pipeline::StepEventType::ToolCallCompleted
+                    && event
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("tool_name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("bash")
+            })
+            .expect("bash ToolCallCompleted event");
+        let payload = completed.payload.as_ref().unwrap();
+        assert!(
+            payload
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "payload should include non-empty call_id: {payload:?}"
+        );
+        assert_eq!(
+            payload
+                .get("args_preview")
+                .and_then(serde_json::Value::as_str),
+            Some("git diff --stat")
+        );
     }
 
     #[tokio::test]
@@ -1859,11 +2048,16 @@ pub(crate) mod tests {
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
+        state.final_text = "changes look good".to_string();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert_eq!(state.max_turns, 2);
+        assert!(
+            !state.final_text.contains("changes look good"),
+            "budget exhaustion must overwrite stale success-shaped text"
+        );
         assert!(
             state
                 .final_text
@@ -1875,6 +2069,114 @@ pub(crate) mod tests {
                 .iter()
                 .filter_map(|message| message.get("content").and_then(Value::as_str))
                 .any(|content| content.contains("Budget review"))
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_tool_churn_budget_exhaustion_is_partial_and_bounded() {
+        let large_bash_diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n{}",
+            "+ changed from bash git diff\n".repeat(4_000)
+        );
+        let large_structured_diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n{}",
+            "+ changed from structured git_diff\n".repeat(4_000)
+        );
+        let mut host = MockHost::new(vec![
+            tool_preamble_result(
+                "The changes look good; I will just inspect the diff.",
+                vec![json!({
+                    "id": "req-bash",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\":\"git diff -- src/\"}"
+                    }
+                })],
+                vec![make_edge_tool_with_args(
+                    "bash",
+                    json!({"command": "git diff -- src/"}),
+                    &large_bash_diff,
+                )],
+                90_000,
+                200,
+                Some(20),
+            ),
+            tool_preamble_result(
+                "Everything appears fixed after the diff.",
+                vec![json!({
+                    "id": "req-git_diff",
+                    "type": "function",
+                    "function": {
+                        "name": "git_diff",
+                        "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+                    }
+                })],
+                vec![make_edge_tool_with_args(
+                    "git_diff",
+                    json!({"path": "src", "ref": "HEAD"}),
+                    &large_structured_diff,
+                )],
+                95_000,
+                250,
+                Some(25),
+            ),
+            text_result("should never run", 10, 5, Some(20)),
+        ])
+        .with_valid_tools(&["bash", "git_diff"]);
+        let mut state = make_state();
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+        state.final_text = "stale success from a previous turn".to_string();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(host.current_turn, 2);
+        assert!(state.interruption.is_some(), "budget exhaustion is partial");
+        assert!(
+            state.final_text.contains("Turn budget exhausted"),
+            "budget exhaustion should surface resumable partial status"
+        );
+        assert!(
+            !state.final_text.contains("stale success")
+                && !state.final_text.contains("changes look good")
+                && !state.final_text.contains("Everything appears fixed"),
+            "tool-call preambles and stale success text must not become final output"
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+
+        let tool_contents: Vec<&str> = state
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect();
+        assert_eq!(tool_contents.len(), 2);
+        // After folding, each tool result should be well below the original 50 000-char payloads.
+        // The observed folded sizes are ~922–1096 chars (FOLD_KEEP_CHARS=200 plus annotation
+        // and line-boundary overhead).  Using 1500 as a generous ceiling keeps the assertion
+        // coupled to realistic folding output rather than the old 18_500 that would silently
+        // pass even if folding regressed entirely.
+        const FOLD_BOUND_CHARS: usize = 1_500;
+        assert!(
+            tool_contents
+                .iter()
+                .all(|content| content.chars().count() <= FOLD_BOUND_CHARS),
+            "large diff/read outputs should be folded before replaying into the next prompt: {:?}",
+            tool_contents
+                .iter()
+                .map(|content| content.chars().count())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            tool_contents
+                .iter()
+                .any(|content| content.contains("truncated"))
+                || tool_contents
+                    .iter()
+                    .any(|content| content.contains("elided")),
+            "bounded tool messages should explain that output was folded"
         );
     }
 
@@ -2657,7 +2959,8 @@ pub(crate) mod tests {
         assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has`backtick`"));
         assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has\nnewline"));
         assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has\ttab"));
-        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string(&"a".repeat(129))); // too long
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string(&"a".repeat(129)));
+        // too long
     }
 
     #[test]
@@ -7650,8 +7953,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .iter()
             .filter(|m| {
                 m.get("role").and_then(Value::as_str) == Some("tool")
-                    && m.get("content").and_then(Value::as_str)
-                        == Some("[Previous tool output cleared]")
+                    && m.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(astra_turn_core::microcompact::is_cleared_content)
             })
             .count();
 

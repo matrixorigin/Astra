@@ -632,6 +632,7 @@ mod tests {
                     quality: 0.20,
                     confidence: 0.72,
                     signals: Vec::new(),
+                    thresholds: astra_turn_core::evaluation::EvaluationThresholds::default(),
                 },
                 2,
                 1,

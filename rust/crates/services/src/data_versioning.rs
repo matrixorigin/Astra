@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 use std::collections::{HashMap, HashSet};
 
+use crate::SessionArtifactStore;
+
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool,
     composite_snapshot::{CompositeSnapshot, CompositeSnapshotIndex, StateDiff},
@@ -102,10 +104,9 @@ struct LineageContributionContext {
 }
 
 fn composite_snapshots_json_path(session_id: &str) -> std::path::PathBuf {
-    crate::session_journal::local_sessions_dir()
-        .join(session_id)
-        .join("step_checkpoints")
-        .join("composite_snapshots.json")
+    crate::local_session_artifact_store()
+        .session_path(session_id, "step_checkpoints/composite_snapshots.json")
+        .expect("validated session_id must resolve data-versioning snapshot path")
 }
 
 fn read_composite_snapshot_index_local(

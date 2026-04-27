@@ -85,6 +85,32 @@ pub(crate) fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Optio
     Some(event)
 }
 
+fn streamed_suffix(already_streamed: &str, recovered_full: &str) -> Option<String> {
+    if recovered_full.is_empty() {
+        None
+    } else if already_streamed.is_empty() {
+        Some(recovered_full.to_string())
+    } else {
+        recovered_full
+            .strip_prefix(already_streamed)
+            .filter(|suffix| !suffix.is_empty())
+            .map(ToString::to_string)
+    }
+}
+
+fn tool_call_start_already_emitted(
+    existing_tool_calls: &std::collections::HashMap<usize, Map<String, Value>>,
+    index: usize,
+) -> bool {
+    existing_tool_calls
+        .get(&index)
+        .and_then(|tc| tc.get("function"))
+        .and_then(Value::as_object)
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.is_empty())
+}
+
 /// Per-model rate-limit cooldown tracker (global singleton).
 pub(crate) fn rate_limit_cooldown() -> &'static PerModelCooldown {
     static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
@@ -296,6 +322,7 @@ pub(crate) async fn call_llm_stream(
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
                 let mut made_progress = false;
+                let mut had_terminal_error = false;
 
                 let sse = crate::turn::llm_client::parse_openai_sse_json_stream(byte_stream);
                 tokio::pin!(sse);
@@ -325,9 +352,9 @@ pub(crate) async fn call_llm_stream(
                                         idle.as_millis(),
                                         made_progress
                                     );
-                                    tool_calls_map.clear();
-                                    full_text.clear();
-                                    reasoning.clear();
+                                    let streamed_text = full_text.clone();
+                                    let streamed_reasoning = reasoning.clone();
+                                    let existing_tool_calls = tool_calls_map.clone();
                                     let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
                                     match crate::turn::llm_client::call_llm_nonstream_fallback(
                                         &client_for_fallback,
@@ -343,25 +370,82 @@ pub(crate) async fn call_llm_stream(
                                     .await
                                     {
                                         Ok(mut result) => {
-                                             ensure_tool_call_ids(&mut result.tool_calls);
-                                             full_text = result.full_text.clone();
-                                             reasoning = result.reasoning.clone();
-                                             usage = result.usage.clone();
-                                             tool_calls_map.clear();
-                                             for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                 if let Value::Object(m) = tc {
-                                                     tool_calls_map.insert(i, m.clone());
-                                                 }
-                                             }
-                                             let synthetic = synthetic_stream_from_result(result, &model_name);
-                                             tokio::pin!(synthetic);
-                                             while let Some(event) = synthetic.next().await {
-                                                 yield event;
-                                             }
-                                         }
-                                         Err(e) => {
-                                             yield render_sse(&json!({"type":"error","message": format!("stream stalled; non-stream recovery failed: {e}")}));
-                                             tool_calls_map.clear();
+                                            ensure_tool_call_ids(&mut result.tool_calls);
+                                            full_text = result.full_text.clone();
+                                            reasoning = result.reasoning.clone();
+                                            usage = result.usage.clone();
+                                            tool_calls_map.clear();
+                                            for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                if let Value::Object(m) = tc {
+                                                    tool_calls_map.insert(i, m.clone());
+                                                }
+                                            }
+                                            if result.tool_calls.is_empty()
+                                                && let Some(suffix) =
+                                                    streamed_suffix(&streamed_text, &result.full_text)
+                                            {
+                                                yield render_sse(
+                                                    &json!({"type":"text_delta","content": suffix}),
+                                                );
+                                            }
+                                            if let Some(suffix) =
+                                                streamed_suffix(&streamed_reasoning, &result.reasoning)
+                                            {
+                                                yield render_sse(
+                                                    &json!({"type":"reasoning_delta","content": suffix}),
+                                                );
+                                            }
+                                            for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                if tool_call_start_already_emitted(
+                                                    &existing_tool_calls,
+                                                    i,
+                                                ) {
+                                                    continue;
+                                                }
+                                                if let Some(obj) = tc.as_object() {
+                                                    let mut tc = obj.clone();
+                                                    if let Some(event) = tool_call_start_event(&mut tc)
+                                                    {
+                                                        yield render_sse(&event);
+                                                    }
+                                                }
+                                            }
+                                            let prompt =
+                                                result.usage.get("prompt").and_then(Value::as_i64);
+                                            let completion = result
+                                                .usage
+                                                .get("completion")
+                                                .and_then(Value::as_i64);
+                                            if prompt.is_some() || completion.is_some() {
+                                                let cache_read = result
+                                                    .usage
+                                                    .get("cache_read")
+                                                    .and_then(Value::as_i64);
+                                                let cache_creation = result
+                                                    .usage
+                                                    .get("cache_creation")
+                                                    .and_then(Value::as_i64);
+                                                yield render_sse(&json!({
+                                                    "type": "usage",
+                                                    "prompt_tokens": prompt,
+                                                    "completion_tokens": completion,
+                                                    "cache_read_tokens": cache_read,
+                                                    "cache_creation_tokens": cache_creation,
+                                                }));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            had_terminal_error = true;
+                                            yield render_sse(&Value::Object(
+                                                crate::build_stream_error_event(
+                                                    &format!(
+                                                        "stream stalled; non-stream recovery failed: {e}"
+                                                    ),
+                                                    "stream_idle",
+                                                    true,
+                                                ),
+                                            ));
+                                            tool_calls_map.clear();
                                             full_text.clear();
                                             reasoning.clear();
                                         }
@@ -373,14 +457,105 @@ pub(crate) async fn call_llm_stream(
                             let chunk = match item {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    astra_core::agent_warn!(
-                                        "llm",
-                                        "in-process stream transport error: {e}"
-                                    );
-                                    yield render_sse(&json!({"type":"error","message": format!("LLM stream transport error: {e}")}));
-                                    tool_calls_map.clear();
-                                    full_text.clear();
-                                    reasoning.clear();
+                                    if made_progress {
+                                        astra_core::agent_warn!(
+                                            "llm",
+                                            "in-process stream transport error after progress: {e} — attempting non-stream fallback"
+                                        );
+                                        let streamed_text = full_text.clone();
+                                        let streamed_reasoning = reasoning.clone();
+                                        let existing_tool_calls = tool_calls_map.clone();
+                                        let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
+                                        match crate::turn::llm_client::call_llm_nonstream_fallback(
+                                            &client_for_fallback,
+                                            &messages_for_fallback,
+                                            &tools_for_fallback,
+                                            &model_name,
+                                            &api_key_for_fallback,
+                                            &base_url_for_fallback,
+                                            &provider_for_fallback,
+                                            max_out_for_fallback,
+                                            fb_timeout,
+                                        )
+                                        .await
+                                        {
+                                            Ok(mut result) => {
+                                                ensure_tool_call_ids(&mut result.tool_calls);
+                                                full_text = result.full_text.clone();
+                                                reasoning = result.reasoning.clone();
+                                                usage = result.usage.clone();
+                                                tool_calls_map.clear();
+                                                for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                    if let Value::Object(m) = tc {
+                                                        tool_calls_map.insert(i, m.clone());
+                                                    }
+                                                }
+                                                if result.tool_calls.is_empty()
+                                                    && let Some(suffix) = streamed_suffix(&streamed_text, &result.full_text)
+                                                {
+                                                    yield render_sse(&json!({"type":"text_delta","content": suffix}));
+                                                }
+                                                if let Some(suffix) = streamed_suffix(&streamed_reasoning, &result.reasoning) {
+                                                    yield render_sse(&json!({"type":"reasoning_delta","content": suffix}));
+                                                }
+                                                for (i, tc) in result.tool_calls.iter().enumerate() {
+                                                    if tool_call_start_already_emitted(&existing_tool_calls, i) {
+                                                        continue;
+                                                    }
+                                                    if let Some(obj) = tc.as_object() {
+                                                        let mut tc = obj.clone();
+                                                        if let Some(event) = tool_call_start_event(&mut tc) {
+                                                            yield render_sse(&event);
+                                                        }
+                                                    }
+                                                }
+                                                let prompt = result.usage.get("prompt").and_then(Value::as_i64);
+                                                let completion = result.usage.get("completion").and_then(Value::as_i64);
+                                                if prompt.is_some() || completion.is_some() {
+                                                    let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
+                                                    let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
+                                                    yield render_sse(&json!({
+                                                        "type": "usage",
+                                                        "prompt_tokens": prompt,
+                                                        "completion_tokens": completion,
+                                                        "cache_read_tokens": cache_read,
+                                                        "cache_creation_tokens": cache_creation,
+                                                    }));
+                                                }
+                                            }
+                                            Err(error) => {
+                                                had_terminal_error = true;
+                                                yield render_sse(&Value::Object(
+                                                    crate::build_stream_error_event(
+                                                        &format!(
+                                                            "stream transport failed; non-stream recovery failed: {error}"
+                                                        ),
+                                                        "stream_transport",
+                                                        true,
+                                                    ),
+                                                ));
+                                                tool_calls_map.clear();
+                                                full_text.clear();
+                                                reasoning.clear();
+                                            }
+                                        }
+                                    } else {
+                                        astra_core::agent_warn!(
+                                            "llm",
+                                            "in-process stream transport error: {e}"
+                                        );
+                                        had_terminal_error = true;
+                                        yield render_sse(&Value::Object(
+                                            crate::build_stream_error_event(
+                                                &format!("LLM stream transport error: {e}"),
+                                                "stream_transport",
+                                                true,
+                                            ),
+                                        ));
+                                        tool_calls_map.clear();
+                                        full_text.clear();
+                                        reasoning.clear();
+                                    }
                                     break;
                                 }
                             };
@@ -495,6 +670,10 @@ pub(crate) async fn call_llm_stream(
                     }
                 }
 
+                if had_terminal_error {
+                    return;
+                }
+
                 // Emit final summary as a special internal event (not forwarded to client)
                 let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
                 sorted_tcs.sort_by_key(|(idx, _)| *idx);
@@ -594,6 +773,16 @@ pub(crate) async fn call_llm_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::response::Response;
+    use axum::routing::post;
+    use futures_util::StreamExt;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn is_valid_tool_name_rejects_xml_artifacts() {
@@ -683,6 +872,291 @@ mod tests {
         assert!(
             body.contains("total_budget") || body.contains("budget"),
             "call_llm_stream must check total budget to prevent unbounded blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_omits_empty_assistant_tool_calls_in_request_body() {
+        #[derive(Clone, Default, Debug)]
+        struct Capture {
+            messages: Vec<Value>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<Mutex<Capture>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            capture.lock().expect("capture lock").messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {payload}\n\ndata: {done}\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("response")
+        }
+
+        async fn spawn_test_server(app: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("server");
+            });
+            format!("http://{addr}")
+        }
+
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let app = Router::new()
+            .route("/chat/completions", post(handler))
+            .with_state(capture.clone());
+        let base = spawn_test_server(app).await;
+        let messages = vec![
+            json!({"role":"assistant","content":"Done.","tool_calls":[]}),
+            json!({"role":"user","content":"hi"}),
+        ];
+
+        let stream = call_llm_stream(
+            &messages,
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("stream");
+        let _: Vec<_> = stream.collect().await;
+
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(seen.messages.len(), 2);
+        assert!(seen.messages[0].get("tool_calls").is_none(), "{seen:?}");
+    }
+
+    #[derive(Clone)]
+    struct TransportFallbackHits {
+        stream_hits: Arc<AtomicU32>,
+        fallback_hits: Arc<AtomicU32>,
+    }
+
+    async fn spawn_raw_partial_transport_server(
+        hits: TransportFallbackHits,
+        fallback_status: u16,
+        fallback_body: &'static str,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw mock llm listener");
+        let addr = listener.local_addr().expect("raw local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..read]);
+                    let is_stream = req.contains("\"stream\":true");
+                    if is_stream {
+                        hits.stream_hits.fetch_add(1, Ordering::SeqCst);
+                        let partial = format!(
+                            "data: {}\n\n",
+                            json!({"choices":[{"delta":{"content":"partial"}}]})
+                        );
+                        let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunk}"
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write partial stream response");
+                        let _ = socket.shutdown().await;
+                    } else {
+                        hits.fallback_hits.fetch_add(1, Ordering::SeqCst);
+                        let status_text = if fallback_status == 200 {
+                            "OK"
+                        } else {
+                            "Internal Server Error"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {fallback_status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
+                            fallback_body.len()
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write fallback response");
+                        let _ = socket.shutdown().await;
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_falls_back_after_partial_stream_transport_error() {
+        let hits = TransportFallbackHits {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server(
+            hits.clone(),
+            200,
+            r#"{"choices":[{"message":{"content":"from-transport-fallback"}}]}"#,
+        )
+        .await;
+        let stream = call_llm_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("bridge stream");
+        let body = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>();
+        assert!(
+            !body.contains("\"type\":\"error\""),
+            "transport-after-progress should recover via fallback instead of emitting an error: {body}"
+        );
+        assert!(
+            body.contains("from-transport-fallback"),
+            "fallback content should reach the client: {body}"
+        );
+        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_transport_fallback_failure_emits_structured_error_code() {
+        let hits = TransportFallbackHits {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server(
+            hits.clone(),
+            500,
+            r#"{"error":{"message":"fallback transport recovery failed"}}"#,
+        )
+        .await;
+        let stream = call_llm_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("bridge stream");
+        let body = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>();
+        assert!(
+            body.contains("\"content\":\"partial\""),
+            "partial streamed text should still reach the client before the failure: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"stream_transport\""),
+            "transport fallback failure should emit a structured stream_transport code: {body}"
+        );
+        assert!(
+            body.contains("\"retryable\":true"),
+            "transport fallback failure should stay retryable: {body}"
+        );
+        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_transport_fallback_emits_only_missing_text_suffix() {
+        let hits = TransportFallbackHits {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server(
+            hits,
+            200,
+            r#"{"choices":[{"message":{"content":"partial done"}}]}"#,
+        )
+        .await;
+        let stream = call_llm_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("bridge stream");
+        let body = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>();
+        let stitched_text = body
+            .split("\n\n")
+            .filter_map(|frame| frame.trim().strip_prefix("data: "))
+            .filter_map(|json_line| serde_json::from_str::<Value>(json_line).ok())
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("text_delta"))
+            .filter_map(|event| {
+                event
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<String>();
+        assert_eq!(
+            stitched_text, "partial done",
+            "fallback should only emit the missing suffix, not duplicate already-streamed text: {body}"
+        );
+    }
+
+    #[test]
+    fn bridge_fallback_paths_emit_only_missing_suffix() {
+        let source = include_str!("bridge_llm_stream.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        let suffix_calls = production
+            .matches("streamed_suffix(&streamed_text, &result.full_text)")
+            .count();
+        assert!(
+            suffix_calls >= 2,
+            "both idle and transport fallback paths should emit only the missing text suffix"
         );
     }
 }

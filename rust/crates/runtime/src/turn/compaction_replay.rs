@@ -270,6 +270,21 @@ mod tests {
     }
 
     #[test]
+    fn compaction_replay_sanitizes_empty_assistant_tool_calls() {
+        let mut msgs = make_messages(8);
+        let result = try_compact_for_retry(&mut msgs, Some(200_000), 100_000);
+        assert!(result.is_some(), "expected compaction to run");
+        let first_assistant = msgs
+            .iter()
+            .find(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("assistant message");
+        assert!(
+            first_assistant.get("tool_calls").is_none(),
+            "{first_assistant:?}"
+        );
+    }
+
+    #[test]
     fn compaction_frees_tokens_without_measured() {
         let mut msgs = make_messages(20);
         // No measured tokens — should estimate from content

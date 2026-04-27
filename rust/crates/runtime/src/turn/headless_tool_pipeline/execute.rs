@@ -12,6 +12,7 @@ use super::super::headless_tool_stderr_lines::{
 use super::super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 use super::*;
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
+use crate::turn::edge_prompt_context::make_args_preview;
 use crate::turn::tool_result_semantics::is_tool_error;
 
 /// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
@@ -76,10 +77,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         } else {
             None
         };
-        self.ctx.step_recorder.begin_tool_with_key(
+        let args_preview = make_args_preview(&execution.name, &execution.args);
+        self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
             &execution.name,
             &execution.id,
             tool_idem_key.as_deref(),
+            args_preview.as_deref(),
         );
 
         if let Some(emitter) = self.ctx.progress_emitter {

@@ -1,6 +1,7 @@
 use crate::pipeline::step_checkpoint;
 use crate::pipeline::step_protocol::StepCheckpoint;
 use crate::{EventCreateRequestData, EventService};
+use astra_services::SessionArtifactStore;
 
 use super::agentic_adaptive_tuning::{
     record_loop_completion_feedback, record_new_evolution_promotion_events,
@@ -82,7 +83,13 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
         return;
     };
 
-    persist_context_trace_to_workspace_if_present(session_id.clone(), signal.clone()).await;
+    persist_context_trace_to_workspace_if_present(
+        session_id.clone(),
+        persistence.user_id.clone(),
+        persistence.artifact_store.clone(),
+        signal.clone(),
+    )
+    .await;
 
     let mut metadata = match serde_json::to_value(&signal) {
         Ok(value) => value,
@@ -155,26 +162,47 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
 
 async fn persist_context_trace_to_workspace_if_present(
     session_id: String,
+    user_id: String,
+    artifact_store: astra_services::DatabaseSessionArtifactStore,
     signal: astra_services::session_workspace::ContextTraceSignal,
 ) {
     let workspace_session_id = session_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let workspace_path =
-            astra_services::session_workspace::workspace_dir_for(&workspace_session_id)
-                .join("workspace.yaml");
-        if !workspace_path.is_file() {
-            return Ok(());
-        }
-        let mut workspace =
-            astra_services::session_workspace::read_workspace(&workspace_session_id)?;
-        workspace.last_context_trace = Some(signal);
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
-    })
+    let result = tokio::task::spawn_blocking(
+        move || -> std::io::Result<Option<astra_services::session_workspace::WorkspaceMetadata>> {
+            let workspace_path =
+                astra_services::session_workspace::workspace_dir_for(&workspace_session_id)
+                    .join("workspace.yaml");
+            if !workspace_path.is_file() {
+                return Ok(None);
+            }
+            let mut workspace =
+                astra_services::session_workspace::read_workspace(&workspace_session_id)?;
+            workspace.last_context_trace = Some(signal);
+            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            astra_services::session_workspace::write_workspace(&workspace)?;
+            Ok(Some(workspace))
+        },
+    )
     .await;
 
     match result {
-        Ok(Ok(())) => {}
+        Ok(Ok(Some(workspace))) => {
+            if let Err(err) = astra_services::session_workspace::persist_remote_workspace(
+                &workspace,
+                &user_id,
+                &artifact_store,
+            )
+            .await
+            {
+                astra_core::agent_warn!(
+                    "context-trace",
+                    "Failed to persist remote workspace trace for {}: {}",
+                    session_id,
+                    err
+                );
+            }
+        }
+        Ok(Ok(None)) => {}
         Ok(Err(err)) => {
             astra_core::agent_warn!(
                 "context-trace",
@@ -191,6 +219,67 @@ async fn persist_context_trace_to_workspace_if_present(
                 err
             );
         }
+    }
+}
+
+fn persist_remote_composite_snapshot_index_blocking(
+    state: &AgenticLoopState,
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+    source: &str,
+) {
+    let Some(persistence) = state.telemetry.context_trace_persistence.clone() else {
+        return;
+    };
+    let session_id = session_id.to_string();
+    let session_id_for_log = session_id.clone();
+    let index = index.clone();
+    let future = async move {
+        astra_services::session_restore::persist_remote_composite_snapshot_index(
+            &session_id,
+            &persistence.user_id,
+            &index,
+            &persistence.artifact_store,
+        )
+        .await
+        .map(|_| ())
+    };
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| runtime.block_on(future))
+            .map_err(|error| error.to_string())
+            .and_then(|result| result),
+    };
+    if let Err(error) = result {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Failed to {source} for {session_id_for_log}: {error}"
+        );
+    }
+}
+
+async fn persist_remote_composite_snapshot_index_if_present(
+    state: &AgenticLoopState,
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+    source: &str,
+) {
+    let Some(persistence) = state.telemetry.context_trace_persistence.clone() else {
+        return;
+    };
+    if let Err(error) = astra_services::session_restore::persist_remote_composite_snapshot_index(
+        session_id,
+        &persistence.user_id,
+        index,
+        &persistence.artifact_store,
+    )
+    .await
+    .map(|_| ())
+    {
+        astra_core::agent_warn!("checkpoint", "Failed to {source} for {session_id}: {error}");
     }
 }
 
@@ -270,6 +359,12 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         // checkpoint can re-attempt without referencing a half-written index.
         return;
     }
+    persist_remote_composite_snapshot_index_blocking(
+        state,
+        sid,
+        &index,
+        "persist remote composite snapshot index",
+    );
 
     state.last_composite_snapshot = Some(snapshot);
     state.stall.last_heavy_checkpoint = Some(cp);
@@ -351,6 +446,14 @@ pub(crate) async fn build_full_composite_snapshot(
             "checkpoint",
             "Failed to write composite snapshot index: {e}"
         );
+    } else {
+        persist_remote_composite_snapshot_index_if_present(
+            state,
+            sid,
+            &index,
+            "persist remote composite snapshot index",
+        )
+        .await;
     }
 
     state.last_composite_snapshot = Some(snapshot.clone());
@@ -462,11 +565,35 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     state
         .messages
         .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m));
+    reset_per_turn_corrective_state(state);
+    if state.final_text.trim().is_empty()
+        && let Some(interruption) = state.interruption.as_ref()
+    {
+        state.final_text = interruption.user_message.clone();
+        state.final_text_streamed = false;
+    }
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
         state.final_text_streamed = true;
     }
+}
+
+fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
+    state.stall.forced_factual_retry = false;
+    state.stall.forced_execution_retry = false;
+    state.stall.forced_execution_escalation = false;
+    state.stall.forced_parallel_batching = false;
+    state.stall.forced_round_budget_phase1 = false;
+    state.stall.forced_round_budget_phase2 = false;
+    state.stall.forced_redundant_reads_corrective = false;
+    state.stall.forced_cache_waste_corrective = false;
+    state.stall.forced_exploration_family_corrective = false;
+    state.stall.forced_exploration_family_phase2 = false;
+    state.stall.exploration_family_corrective_family = None;
+    // Clear tool restrictions injected by exploration-family correctives so
+    // they don't leak into the next user turn.
+    state.restricted_tools.clear();
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records
@@ -513,14 +640,17 @@ fn update_session_facts_from_turn(state: &mut super::agentic_loop_host::AgenticL
                 state.max_turns.saturating_sub(state.remaining_turns),
                 state.total_prompt as usize,
             );
-            // Use home dir for absolute path, consistent with other session file writes.
-            let base = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            let path = base.join(format!(".astra/sessions/{sid}/session-memory.md"));
-            if let Err(e) = crate::turn::cloud::session_memory_extract::write_session_memory_file(
-                &path,
-                &l1_content,
-            ) {
-                tracing::debug!(session_id = %sid, error = %e, "error-triggered L1 write failed (non-fatal)");
+            if let Ok(path) = astra_services::local_session_artifact_store()
+                .session_path(sid, "session-memory.md")
+            {
+                if let Err(e) =
+                    crate::turn::cloud::session_memory_extract::write_session_memory_file(
+                        &path,
+                        &l1_content,
+                    )
+                {
+                    tracing::debug!(session_id = %sid, error = %e, "error-triggered L1 write failed (non-fatal)");
+                }
             }
         }
     }
@@ -559,12 +689,16 @@ mod tests {
         assert!(outcome.is_ok(), "loop should complete: {:?}", outcome);
 
         assert!(
-            state.stall.forced_execution_retry,
-            "guard must have fired on the deferring round"
+            host.turn_count() == 2,
+            "guard must have fired on the deferring round to force a second LLM pass"
         );
         assert_eq!(
             state.final_text, "Done.",
             "second LLM response should win after the forced retry"
+        );
+        assert!(
+            !state.stall.forced_execution_retry,
+            "completion should reset one-shot retry state so it does not leak into the next user turn"
         );
 
         let leftover = state
@@ -629,7 +763,6 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must terminate: {:?}", outcome);
-        assert!(state.stall.forced_execution_retry);
         // Second defer becomes the final text — guard did not fire again.
         assert_eq!(state.final_text, "确认后我再执行。");
         assert_eq!(
@@ -637,6 +770,121 @@ mod tests {
             2,
             "exactly 2 LLM rounds, no infinite loop"
         );
+        assert!(
+            !state.stall.forced_execution_retry,
+            "completion should clear the one-shot retry flag after the turn ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_strips_all_correctives_and_resets_one_shot_flags() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "Done.".into();
+        state.messages.extend([
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold retry", crate::turn::agentic_loop_execution_phase::EXECUTION_RETRY_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold escalation", crate::turn::agentic_loop_execution_phase::EXECUTION_ESCALATION_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold batching", crate::turn::agentic_loop_execution_phase::PARALLEL_BATCHING_FORCE_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold round budget", crate::turn::agentic_loop_execution_phase::ROUND_BUDGET_PHASE1_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold redundant reads", crate::turn::agentic_loop_execution_phase::REDUNDANT_READS_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{}\nold cache waste", crate::turn::agentic_loop_execution_phase::CACHE_WASTE_MARKER),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "{}\nold exploration family churn",
+                    crate::turn::agentic_loop_execution_phase::EXPLORATION_FAMILY_MARKER
+                ),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "{}\nold exploration family phase2",
+                    crate::turn::agentic_loop_execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
+                ),
+            }),
+        ]);
+        state.stall.forced_factual_retry = true;
+        state.stall.forced_execution_retry = true;
+        state.stall.forced_execution_escalation = true;
+        state.stall.forced_parallel_batching = true;
+        state.stall.forced_round_budget_phase1 = true;
+        state.stall.forced_round_budget_phase2 = true;
+        state.stall.forced_redundant_reads_corrective = true;
+        state.stall.forced_cache_waste_corrective = true;
+        state.stall.forced_exploration_family_corrective = true;
+        state.stall.forced_exploration_family_phase2 = true;
+        state.stall.exploration_family_corrective_family = Some("diff".into());
+        state.restricted_tools.insert("git_diff".into());
+        state.restricted_tools.insert("git_log".into());
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(
+            state.messages.iter().all(|m| {
+                !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m)
+            }),
+            "completed turns should not retain stale runtime corrective messages: {:#?}",
+            state.messages
+        );
+        assert!(!state.stall.forced_factual_retry);
+        assert!(!state.stall.forced_execution_retry);
+        assert!(!state.stall.forced_execution_escalation);
+        assert!(!state.stall.forced_parallel_batching);
+        assert!(!state.stall.forced_round_budget_phase1);
+        assert!(!state.stall.forced_round_budget_phase2);
+        assert!(!state.stall.forced_redundant_reads_corrective);
+        assert!(!state.stall.forced_cache_waste_corrective);
+        assert!(!state.stall.forced_exploration_family_corrective);
+        assert!(!state.stall.forced_exploration_family_phase2);
+        assert!(state.stall.exploration_family_corrective_family.is_none());
+        assert!(
+            state.restricted_tools.is_empty(),
+            "restricted_tools must be cleared across turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_surfaces_interruption_when_final_text_is_empty() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text.clear();
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 4,
+                remaining_turns: 0,
+                error_detail: None,
+            },
+        ));
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(
+            state.final_text.contains("budget_exhausted"),
+            "interrupted tool-only turns must not persist an empty or success-shaped final answer"
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 
     #[tokio::test]
@@ -666,6 +914,35 @@ mod tests {
         assert_eq!(state.final_text, "Final answer");
         assert_eq!(host.rendered_final_text.len(), 1);
         assert_eq!(host.rendered_final_text[0], "Final answer");
+    }
+
+    #[test]
+    fn context_trace_workspace_persistence_pushes_remote_workspace_artifact() {
+        let source = include_str!("agentic_loop_finalization.rs");
+        let start = source
+            .find("async fn persist_context_trace_to_workspace_if_present")
+            .expect("workspace trace persistence helper");
+        let end = source
+            .find("/// Best-effort heavy checkpoint write.")
+            .expect("workspace trace helper end marker");
+        let snippet = &source[start..end];
+        assert!(
+            snippet.contains("persist_remote_workspace"),
+            "context trace workspace persistence should publish remote workspace artifacts"
+        );
+        assert!(
+            snippet.contains("artifact_store"),
+            "context trace workspace persistence should receive an artifact store"
+        );
+    }
+
+    #[test]
+    fn composite_snapshot_index_persistence_pushes_remote_artifact() {
+        let source = include_str!("agentic_loop_finalization.rs");
+        assert!(
+            source.contains("persist_remote_composite_snapshot_index"),
+            "composite snapshot writes should publish a remote index artifact"
+        );
     }
 
     // ─── E2E: auto-reflection is wired into run_agentic_loop_impl ──────────

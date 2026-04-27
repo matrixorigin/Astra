@@ -47,6 +47,7 @@ pub(crate) fn build_legacy_context_trace_signal(
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: tools_available.min(u32::MAX as usize) as u32,
             selected_tools,
+            selection_scope: "latest_round".to_string(),
             rejected_tools: tools_available.saturating_sub(unique_selected),
             strategy: "inprocess_bridge".to_string(),
             confidence: selection_confidence,

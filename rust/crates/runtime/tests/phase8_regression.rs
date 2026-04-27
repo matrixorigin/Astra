@@ -519,8 +519,13 @@ mod divergence_detection {
 
     #[test]
     fn turn_complete_event_healthy() {
-        let event =
-            astra_runtime::build_turn_complete_event(true, false, &DivergenceStatus::Healthy, None);
+        let event = astra_runtime::build_turn_complete_event(
+            true,
+            false,
+            &DivergenceStatus::Healthy,
+            None,
+            None,
+        );
         assert_eq!(event.get("has_tool_calls").unwrap(), true);
         assert!(event.get("divergence_detected").is_none());
     }
@@ -531,6 +536,7 @@ mod divergence_detection {
             true,
             false,
             &DivergenceStatus::Diverging(4),
+            None,
             None,
         );
         // Divergence should force has_tool_calls to false
@@ -545,6 +551,7 @@ mod divergence_detection {
             true,
             false,
             &DivergenceStatus::Exploring(2),
+            None,
             None,
         );
         // Exploring does NOT stop tool calls — only Diverging does

@@ -44,6 +44,7 @@ impl CompressionPipeline {
 
     /// Run all layers in order, stopping early if budget is satisfied.
     pub fn run(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> PipelineOutcome {
+        astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
         let mut outcome = PipelineOutcome {
             layer_results: Vec::new(),
             total_tokens_freed: 0,
@@ -171,6 +172,7 @@ impl CompressionPipeline {
         messages: &mut Vec<Value>,
         budget: &TokenBudget,
     ) -> PipelineOutcome {
+        astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
         let mut total_freed: u64 = 0;
         let mut layer_results = Vec::new();
         let excess = budget.excess_tokens();
@@ -975,6 +977,20 @@ mod tests {
         let outcome = pipeline.compress_if_needed(&mut msgs, &b);
         assert!(outcome.total_tokens_freed > 0);
         assert!(!outcome.layer_results.is_empty());
+    }
+
+    #[test]
+    fn pipeline_sanitizes_empty_assistant_tool_calls() {
+        let pipeline = CompressionPipeline::default_pipeline();
+        let mut msgs = vec![
+            json!({"role": "assistant", "content": "done", "tool_calls": []}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        let b = budget(80_000, 40_000);
+
+        let _ = pipeline.compress_if_needed(&mut msgs, &b);
+
+        assert!(msgs[0].get("tool_calls").is_none(), "{msgs:?}");
     }
 
     #[test]

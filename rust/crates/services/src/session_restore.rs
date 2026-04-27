@@ -17,9 +17,17 @@
 use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::{
+    SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore,
+    StoredSessionArtifact,
+};
+
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
+pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
 
 // ─── Restored Session State ─────────────────────────────────────────────────
 
@@ -231,6 +239,83 @@ impl HybridRestoreService {
         session_id: &str,
     ) -> Option<super::session_workspace::WorkspaceMetadata> {
         super::session_workspace::read_workspace(session_id).ok()
+    }
+
+    /// Try restoring workspace metadata from remote session artifacts.
+    async fn restore_cloud_workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CloudWorkspaceArtifact>, String> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        crate::session_journal::validate_session_id(session_id)?;
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            "SELECT user_id, content_json \
+             FROM session_artifacts \
+             WHERE session_id = ? AND artifact_kind = ? \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(super::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let metadata_json: String = row
+            .try_get("content_json")
+            .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
+        let metadata =
+            serde_json::from_str::<super::session_workspace::WorkspaceMetadata>(&metadata_json)
+                .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
+        let user_id: String = row.try_get("user_id").unwrap_or_default();
+
+        Ok(Some(CloudWorkspaceArtifact { metadata, user_id }))
+    }
+
+    async fn restore_cloud_composite_snapshot_index(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<astra_core::composite_snapshot::CompositeSnapshotIndex>, String> {
+        let pool = match &self.pool {
+            Some(pool) => pool,
+            None => return Ok(None),
+        };
+        crate::session_journal::validate_session_id(session_id)?;
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            "SELECT content_json \
+             FROM session_artifacts \
+             WHERE session_id = ? AND artifact_kind = ? \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let index_json: String = row
+            .try_get("content_json")
+            .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
+        let mut index = serde_json::from_str::<
+            astra_core::composite_snapshot::CompositeSnapshotIndex,
+        >(&index_json)
+        .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
+        index.normalize_versions();
+        Ok(Some(index))
     }
 
     /// Restore from MatrixOne agent_sessions table.
@@ -638,10 +723,72 @@ fn read_composite_snapshot_index_local(
 }
 
 fn composite_snapshots_json_path(session_id: &str) -> PathBuf {
-    crate::session_journal::local_sessions_dir()
-        .join(session_id)
-        .join("step_checkpoints")
-        .join("composite_snapshots.json")
+    crate::local_session_artifact_store()
+        .session_path(session_id, "step_checkpoints/composite_snapshots.json")
+        .expect("validated session_id must resolve composite snapshot path")
+}
+
+fn composite_snapshot_index_to_remote_artifact_record(
+    session_id: &str,
+    user_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
+    Ok(SessionArtifactJsonRecord {
+        artifact_id: String::new(),
+        session_id: session_id.to_string(),
+        user_id: user_id.to_string(),
+        artifact_kind: COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND.to_string(),
+        source: Some("composite_snapshot_index".to_string()),
+        turn: index.snapshots.last().map(|snapshot| snapshot.turn),
+        round: None,
+        content: serde_json::to_value(index)?,
+        metadata: Some(json!({
+            "snapshot_count": index.snapshots.len(),
+            "latest_version": index.current_version(),
+        })),
+    })
+}
+
+pub async fn persist_remote_composite_snapshot_index(
+    session_id: &str,
+    user_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+    store: &impl SessionArtifactJsonStore,
+) -> Result<StoredSessionArtifact, String> {
+    let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
+        .map_err(|error| error.to_string())?;
+    store.persist_json_artifact(record).await
+}
+
+fn merge_composite_snapshot_indexes(
+    local: astra_core::composite_snapshot::CompositeSnapshotIndex,
+    remote: astra_core::composite_snapshot::CompositeSnapshotIndex,
+) -> astra_core::composite_snapshot::CompositeSnapshotIndex {
+    let mut merged = BTreeMap::new();
+    for snapshot in local.snapshots {
+        merged.insert(snapshot.snapshot_id.clone(), snapshot);
+    }
+    for snapshot in remote.snapshots {
+        merged.insert(snapshot.snapshot_id.clone(), snapshot);
+    }
+    let mut snapshots: Vec<_> = merged.into_values().collect();
+    snapshots.sort_by(|left, right| {
+        (
+            left.version == 0,
+            left.version,
+            left.created_at.as_str(),
+            left.snapshot_id.as_str(),
+        )
+            .cmp(&(
+                right.version == 0,
+                right.version,
+                right.created_at.as_str(),
+                right.snapshot_id.as_str(),
+            ))
+    });
+    let mut index = astra_core::composite_snapshot::CompositeSnapshotIndex { snapshots };
+    index.normalize_versions();
+    index
 }
 
 /// Parse checkpoint number from a heavy checkpoint filename ref (e.g. `000005-heavy.json`).
@@ -672,6 +819,45 @@ fn recent_tools_from_context_trace(
     tools
 }
 
+fn parse_local_checkpoint_entries(local_entries: &[String]) -> Vec<RestoredCheckpoint> {
+    local_entries
+        .iter()
+        .filter_map(|entry| {
+            let parts: Vec<&str> = entry.splitn(3, " - ").collect();
+            if parts.len() >= 3 {
+                let number: u32 = parts[0].trim().parse().ok()?;
+                let turn_str = parts[1].trim().strip_prefix("Turn ")?.trim();
+                let turn: u32 = turn_str.parse().ok()?;
+                let title = parts[2].trim().to_string();
+                Some(RestoredCheckpoint {
+                    number,
+                    turn,
+                    title,
+                    summary: String::new(),
+                    total_tokens: 0,
+                    contract_state_json: None,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn merge_checkpoints(
+    local: Vec<RestoredCheckpoint>,
+    cloud: Vec<RestoredCheckpoint>,
+) -> Vec<RestoredCheckpoint> {
+    let mut merged = BTreeMap::new();
+    for checkpoint in local {
+        merged.insert(checkpoint.number, checkpoint);
+    }
+    for checkpoint in cloud {
+        merged.insert(checkpoint.number, checkpoint);
+    }
+    merged.into_values().collect()
+}
+
 #[derive(Debug, Clone, Default)]
 struct LocalJournalSummary {
     turn_count: u32,
@@ -680,6 +866,12 @@ struct LocalJournalSummary {
     recent_tools: Vec<String>,
     model: Option<String>,
     last_status: String,
+}
+
+#[derive(Debug, Clone)]
+struct CloudWorkspaceArtifact {
+    metadata: super::session_workspace::WorkspaceMetadata,
+    user_id: String,
 }
 
 fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
@@ -735,6 +927,48 @@ fn summarize_local_journal(session_id: &str) -> Option<LocalJournalSummary> {
     }
 
     Some(summary)
+}
+
+fn restored_session_from_workspace(
+    ws: super::session_workspace::WorkspaceMetadata,
+    local_journal: Option<&LocalJournalSummary>,
+    recent_tools: Vec<String>,
+    learning_snapshot_json: Option<String>,
+    checkpoint_count: u32,
+    restored_from_cloud: bool,
+) -> RestoredSession {
+    let turn_count = local_journal
+        .map(|summary| ws.turn_count.max(summary.turn_count))
+        .unwrap_or(ws.turn_count);
+    let total_tokens_in = local_journal
+        .map(|summary| ws.total_tokens_in.max(summary.total_tokens_in))
+        .unwrap_or(ws.total_tokens_in);
+    let total_tokens_out = local_journal
+        .map(|summary| ws.total_tokens_out.max(summary.total_tokens_out))
+        .unwrap_or(ws.total_tokens_out);
+
+    RestoredSession {
+        session_id: ws.session_id.clone(),
+        turn_count,
+        total_tokens_in,
+        total_tokens_out,
+        recent_tools,
+        learning_snapshot_json,
+        checkpoint_count,
+        last_status: ws.status,
+        git_branch: ws.git_branch,
+        model: Some(ws.model),
+        title: None,
+        restored_from_cloud,
+        executing_plan_json: ws.executing_plan_json,
+        plan_goal: ws.plan_goal,
+        plan_config_json: ws.plan_config_json,
+        plan_execution_rounds: ws.plan_execution_rounds,
+        contract_json: ws.contract_json,
+        plan_corrections: ws.plan_corrections,
+        last_context_trace: ws.last_context_trace,
+        ..Default::default()
+    }
 }
 
 fn cloud_heavy_payload(root: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -817,38 +1051,55 @@ impl SessionRestoreService for HybridRestoreService {
                 .map(|v| v.len() as u32)
                 .unwrap_or(0);
 
-            return Ok(Some(RestoredSession {
-                session_id: session_id.to_string(),
-                turn_count: local_journal.as_ref().map_or(ws.turn_count, |summary| {
-                    ws.turn_count.max(summary.turn_count)
-                }),
-                total_tokens_in: local_journal
-                    .as_ref()
-                    .map_or(ws.total_tokens_in, |summary| {
-                        ws.total_tokens_in.max(summary.total_tokens_in)
-                    }),
-                total_tokens_out: local_journal
-                    .as_ref()
-                    .map_or(ws.total_tokens_out, |summary| {
-                        ws.total_tokens_out.max(summary.total_tokens_out)
-                    }),
+            return Ok(Some(restored_session_from_workspace(
+                ws,
+                local_journal.as_ref(),
                 recent_tools,
-                learning_snapshot_json: learning,
-                checkpoint_count: ckpt_count,
-                last_status: ws.status,
-                git_branch: ws.git_branch,
-                model: Some(ws.model),
-                title: None,
-                restored_from_cloud: false,
-                executing_plan_json: ws.executing_plan_json,
-                plan_goal: ws.plan_goal,
-                plan_config_json: ws.plan_config_json,
-                plan_execution_rounds: ws.plan_execution_rounds,
-                contract_json: ws.contract_json,
-                plan_corrections: ws.plan_corrections,
-                last_context_trace: ws.last_context_trace,
-                ..Default::default()
-            }));
+                learning,
+                ckpt_count,
+                false,
+            )));
+        }
+
+        if let Some(ws) = self.restore_cloud_workspace(session_id).await? {
+            let mut recent_tools = self
+                .restore_recent_tools(session_id)
+                .await
+                .unwrap_or_default();
+            if recent_tools.is_empty() {
+                recent_tools =
+                    recent_tools_from_context_trace(ws.metadata.last_context_trace.as_ref());
+            }
+            if recent_tools.is_empty()
+                && let Some(summary) = local_journal.as_ref()
+            {
+                recent_tools = summary.recent_tools.clone();
+            }
+
+            let learning = if ws.user_id.is_empty() {
+                None
+            } else {
+                self.restore_learning(&ws.user_id, "default")
+                    .await
+                    .unwrap_or(None)
+            };
+            let local_ckpt_count = super::session_checkpoint::read_checkpoint_index(session_id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+            let cloud_ckpt_count = self
+                .cloud_checkpoints(session_id)
+                .await
+                .map(|v| v.len() as u32)
+                .unwrap_or(local_ckpt_count);
+
+            return Ok(Some(restored_session_from_workspace(
+                ws.metadata,
+                local_journal.as_ref(),
+                recent_tools,
+                learning,
+                cloud_ckpt_count.max(local_ckpt_count),
+                true,
+            )));
         }
 
         if let Some(summary) = local_journal {
@@ -880,7 +1131,6 @@ impl SessionRestoreService for HybridRestoreService {
     }
 
     async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
-        // Try local first
         let local_entries = super::session_checkpoint::read_checkpoint_index(session_id)
             .unwrap_or_else(|e| {
                 astra_core::agent_warn!(
@@ -889,36 +1139,18 @@ impl SessionRestoreService for HybridRestoreService {
                 );
                 Vec::new()
             });
-
-        if !local_entries.is_empty() {
-            // Parse the index entries (format: "NNN - Turn NN - title")
-            let ckpts = local_entries
-                .iter()
-                .filter_map(|entry| {
-                    let parts: Vec<&str> = entry.splitn(3, " - ").collect();
-                    if parts.len() >= 3 {
-                        let number: u32 = parts[0].trim().parse().ok()?;
-                        let turn_str = parts[1].trim().strip_prefix("Turn ")?.trim();
-                        let turn: u32 = turn_str.parse().ok()?;
-                        let title = parts[2].trim().to_string();
-                        Some(RestoredCheckpoint {
-                            number,
-                            turn,
-                            title,
-                            summary: String::new(),
-                            total_tokens: 0,
-                            contract_state_json: None,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            return Ok(ckpts);
-        }
-
-        // Fall back to cloud
-        self.cloud_checkpoints(session_id).await
+        let local = parse_local_checkpoint_entries(&local_entries);
+        let cloud = self
+            .cloud_checkpoints(session_id)
+            .await
+            .unwrap_or_else(|e| {
+                astra_core::agent_warn!(
+                    "restore",
+                    "failed to read cloud checkpoints for {session_id}: {e}"
+                );
+                Vec::new()
+            });
+        Ok(merge_checkpoints(local, cloud))
     }
 
     async fn restore_to_checkpoint(
@@ -1021,7 +1253,7 @@ impl SessionRestoreService for HybridRestoreService {
         snapshot_id: &str,
         selector: &astra_core::composite_snapshot::RestoreSelector,
     ) -> Result<Option<RestoredCompositeState>, String> {
-        let index = read_composite_snapshot_index_local(session_id)?;
+        let index = self.list_composite_snapshots(session_id).await?;
         let Some(snapshot) = index
             .snapshots
             .iter()
@@ -1080,7 +1312,19 @@ impl SessionRestoreService for HybridRestoreService {
         &self,
         session_id: &str,
     ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-        read_composite_snapshot_index_local(session_id)
+        let local = read_composite_snapshot_index_local(session_id)?;
+        let remote = self
+            .restore_cloud_composite_snapshot_index(session_id)
+            .await
+            .unwrap_or_else(|error| {
+                astra_core::agent_warn!(
+                    "restore",
+                    "failed to read remote composite snapshot index for {session_id}: {error}"
+                );
+                None
+            })
+            .unwrap_or_default();
+        Ok(merge_composite_snapshot_indexes(local, remote))
     }
 }
 
@@ -1927,6 +2171,74 @@ mod tests {
         assert_eq!(restored.total_tokens_out, 2_855);
     }
 
+    #[test]
+    fn restore_session_checks_remote_workspace_before_cloud_session_fallback() {
+        let source = include_str!("session_restore.rs");
+        let remote_idx = source
+            .find("if let Some(ws) = self.restore_cloud_workspace(session_id).await?")
+            .expect("remote workspace restore branch");
+        let cloud_idx = source
+            .find("self.restore_cloud_session(session_id).await")
+            .expect("cloud session fallback");
+        assert!(
+            remote_idx < cloud_idx,
+            "restore_session should attempt remote workspace metadata before falling back to agent_sessions-only cloud restore"
+        );
+    }
+
+    #[test]
+    fn restore_cloud_workspace_reads_workspace_artifacts() {
+        let source = include_str!("session_restore.rs");
+        let start = source
+            .find("async fn restore_cloud_workspace")
+            .expect("restore_cloud_workspace function");
+        let end = source
+            .find("    /// Restore from MatrixOne agent_sessions table.")
+            .expect("restore_cloud_workspace end marker");
+        let snippet = &source[start..end];
+        assert!(
+            snippet.contains("FROM session_artifacts"),
+            "remote workspace restore should read from the session_artifacts store"
+        );
+        assert!(
+            snippet.contains("WORKSPACE_METADATA_ARTIFACT_KIND"),
+            "remote workspace restore should use the dedicated workspace artifact kind"
+        );
+        assert!(
+            snippet.contains("ORDER BY created_at DESC LIMIT 1"),
+            "remote workspace restore should load the latest workspace artifact"
+        );
+    }
+
+    #[test]
+    fn restore_cloud_composite_snapshot_index_reads_session_artifacts() {
+        let source = include_str!("session_restore.rs");
+        let start = source
+            .find("async fn restore_cloud_composite_snapshot_index")
+            .expect("restore_cloud_composite_snapshot_index function");
+        let end = source
+            .find("    /// Restore from MatrixOne agent_sessions table.")
+            .expect("restore_cloud_composite_snapshot_index end marker");
+        let snippet = &source[start..end];
+        assert!(
+            snippet.contains("FROM session_artifacts"),
+            "remote composite snapshot index restore should read from session_artifacts"
+        );
+        assert!(
+            snippet.contains("COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND"),
+            "remote composite snapshot index restore should use the dedicated artifact kind"
+        );
+    }
+
+    #[test]
+    fn restore_to_composite_snapshot_uses_merged_snapshot_listing() {
+        let source = include_str!("session_restore.rs");
+        assert!(
+            source.contains("let index = self.list_composite_snapshots(session_id).await?;"),
+            "composite snapshot restore should use merged local+remote snapshot listings"
+        );
+    }
+
     // ── Restored session field coverage ──
 
     #[test]
@@ -1965,6 +2277,78 @@ mod tests {
         ];
         assert!(ckpts[0].turn < ckpts[1].turn);
         assert!(ckpts[0].total_tokens < ckpts[1].total_tokens);
+    }
+
+    #[test]
+    fn parse_local_checkpoint_entries_reads_index_format() {
+        let parsed = parse_local_checkpoint_entries(&[
+            "001 - Turn 5 - First checkpoint".to_string(),
+            "002 - Turn 9 - Second checkpoint".to_string(),
+        ]);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].number, 1);
+        assert_eq!(parsed[0].turn, 5);
+        assert_eq!(parsed[0].title, "First checkpoint");
+    }
+
+    #[test]
+    fn merge_checkpoints_prefers_cloud_metadata_for_same_number() {
+        let local = vec![RestoredCheckpoint {
+            number: 3,
+            turn: 10,
+            title: "Local title".into(),
+            summary: String::new(),
+            total_tokens: 0,
+            contract_state_json: None,
+        }];
+        let cloud = vec![RestoredCheckpoint {
+            number: 3,
+            turn: 10,
+            title: "Cloud title".into(),
+            summary: "Rich summary".into(),
+            total_tokens: 1234,
+            contract_state_json: Some("{\"contract\":true}".into()),
+        }];
+
+        let merged = merge_checkpoints(local, cloud);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].title, "Cloud title");
+        assert_eq!(merged[0].summary, "Rich summary");
+        assert_eq!(merged[0].total_tokens, 1234);
+        assert_eq!(
+            merged[0].contract_state_json.as_deref(),
+            Some("{\"contract\":true}")
+        );
+    }
+
+    #[test]
+    fn merge_composite_snapshot_indexes_prefers_remote_snapshot_for_same_id() {
+        let local = astra_core::composite_snapshot::CompositeSnapshotIndex {
+            snapshots: vec![astra_core::composite_snapshot::CompositeSnapshot {
+                snapshot_id: "snap-1".into(),
+                session_id: "s1".into(),
+                turn: 2,
+                created_at: "2025-01-01T00:00:00Z".into(),
+                version: 1,
+                label: Some("local".into()),
+                refs: vec![],
+            }],
+        };
+        let remote = astra_core::composite_snapshot::CompositeSnapshotIndex {
+            snapshots: vec![astra_core::composite_snapshot::CompositeSnapshot {
+                snapshot_id: "snap-1".into(),
+                session_id: "s1".into(),
+                turn: 2,
+                created_at: "2025-01-01T00:00:01Z".into(),
+                version: 1,
+                label: Some("remote".into()),
+                refs: vec![],
+            }],
+        };
+
+        let merged = merge_composite_snapshot_indexes(local, remote);
+        assert_eq!(merged.snapshots.len(), 1);
+        assert_eq!(merged.snapshots[0].label.as_deref(), Some("remote"));
     }
 
     #[tokio::test]
@@ -2571,6 +2955,7 @@ mod tests {
             tool_selection: Some(session_workspace::ContextTraceToolSelection {
                 tools_available: 8,
                 selected_tools: vec!["bash".into(), "grep".into(), "bash".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 0,
                 strategy: "recent_tools".into(),
                 confidence: 0.91,

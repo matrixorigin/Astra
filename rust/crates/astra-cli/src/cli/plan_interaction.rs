@@ -1119,7 +1119,8 @@ pub async fn handle_plan_mode_input(
         }
 
         match parse_plan_response(&full_text) {
-            Ok(plan) => {
+            Ok(mut plan) => {
+                plan::normalize_simple_greenfield_plan(&plan_state.goal, &mut plan);
                 plan_state.set_plan(plan);
                 let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
@@ -2685,7 +2686,7 @@ async fn expand_outline_to_plan(
 
 /// Accept a generated plan: store it, journal it, record a session turn, and prompt for execution.
 async fn accept_generated_plan(
-    plan: astra_services::task_orchestrator::TaskPlan,
+    mut plan: astra_services::task_orchestrator::TaskPlan,
     token: Option<&str>,
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
@@ -2695,6 +2696,7 @@ async fn accept_generated_plan(
     let Some(plan_state) = state.plan_mode.as_mut() else {
         return Ok(PlanInputResult::Handled);
     };
+    plan::normalize_simple_greenfield_plan(&plan_state.goal, &mut plan);
     plan_state.set_plan(plan);
     let _ = plan_state.save_to_file(&PlanModeState::state_path());
 

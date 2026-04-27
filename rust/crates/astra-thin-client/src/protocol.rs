@@ -269,6 +269,7 @@ pub enum StreamEvent {
         raw: Value,
     },
     TurnComplete {
+        assistant_text: Option<String>,
         followup_suggestion: Option<String>,
         raw: Value,
     },
@@ -439,6 +440,7 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             raw,
         },
         "turn_complete" => StreamEvent::TurnComplete {
+            assistant_text: optional_str(&obj, "assistant_text"),
             followup_suggestion: optional_str(&obj, "followup_suggestion"),
             raw,
         },
@@ -866,14 +868,17 @@ mod tests {
     fn classify_turn_complete_warning_and_explain() {
         match classify_stream_event(serde_json::json!({
             "type": "turn_complete",
+            "assistant_text": "Recovered final text",
             "followup_suggestion": "Try /plan"
         }))
         .unwrap()
         {
             StreamEvent::TurnComplete {
+                assistant_text,
                 followup_suggestion,
                 raw,
             } => {
+                assert_eq!(assistant_text.as_deref(), Some("Recovered final text"));
                 assert_eq!(followup_suggestion.as_deref(), Some("Try /plan"));
                 assert_eq!(raw["type"], "turn_complete");
             }

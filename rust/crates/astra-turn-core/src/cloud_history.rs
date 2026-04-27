@@ -6,6 +6,7 @@ pub fn compact_cloud_loop_history(
     keep_recent: usize,
 ) -> Vec<Value> {
     let mut compacted = history.to_vec();
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(&mut compacted);
     let tool_indices = compacted
         .iter()
         .enumerate()
@@ -116,5 +117,23 @@ mod tests {
                 .unwrap()
                 .contains("[compacted]")
         );
+    }
+
+    #[test]
+    fn omits_empty_assistant_tool_calls() {
+        let history = vec![json!({"role": "assistant", "content": "done", "tool_calls": []})];
+        let result = compact_cloud_loop_history(&history, 50, 0);
+        assert!(result[0].get("tool_calls").is_none(), "{result:?}");
+    }
+
+    #[test]
+    fn preserves_non_empty_assistant_tool_calls() {
+        let history = vec![json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+        })];
+        let result = compact_cloud_loop_history(&history, 50, 0);
+        assert_eq!(result[0]["tool_calls"][0]["function"]["name"], "bash");
     }
 }

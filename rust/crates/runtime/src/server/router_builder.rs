@@ -146,6 +146,22 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/activity",
             get(session_handlers::session_activity_handler),
         )
+        .route(
+            "/sessions/{session_id}/artifacts",
+            get(session_handlers::list_session_artifacts_handler),
+        )
+        .route(
+            "/sessions/{session_id}/artifacts/latest/{artifact_kind}",
+            get(session_handlers::get_latest_session_artifact_handler),
+        )
+        .route(
+            "/sessions/{session_id}/artifacts/{artifact_id}",
+            get(session_handlers::get_session_artifact_handler),
+        )
+        .route(
+            "/sessions/{session_id}/artifacts/{artifact_id}/download",
+            get(session_handlers::download_session_artifact_handler),
+        )
         .route("/admin/init", post(admin_handlers::admin_init_handler))
         .route(
             "/admin/audit",
@@ -680,6 +696,9 @@ mod tests {
             "/approval/respond",
             "/chat/ws",
             "/sessions",
+            "/sessions/{session_id}/artifacts",
+            "/sessions/{session_id}/artifacts/latest/{artifact_kind}",
+            "/sessions/{session_id}/artifacts/{artifact_id}/download",
             "/admin/init",
             "/skills",
             "/evaluation/drift",

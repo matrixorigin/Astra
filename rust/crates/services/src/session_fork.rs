@@ -8,6 +8,7 @@
 //! Layers 5.1–5.4 add data-branching, multi-session exploration, tuning experiments,
 //! and cross-branch learning aggregation on top of the base fork primitive.
 
+use crate::SessionArtifactStore;
 use crate::session_journal::{
     JournalEvent, JournalEventType, JournalWriter, SessionLineage, journal_file_path, read_journal,
     validate_session_id,
@@ -191,7 +192,7 @@ pub fn fork_local_session(opts: ForkSessionOptions) -> Result<ForkSessionResult,
     // context (heavy checkpoints contain the full messages array).
     // Skip composite_snapshots.json (index file, not a checkpoint).
     {
-        let sessions_dir = crate::session_journal::local_sessions_dir();
+        let sessions_dir = crate::local_session_artifact_store().sessions_root();
         let parent_cp_dir = sessions_dir.join(&parent).join("step_checkpoints");
         if parent_cp_dir.is_dir() {
             let new_cp_dir = sessions_dir.join(&new_id).join("step_checkpoints");

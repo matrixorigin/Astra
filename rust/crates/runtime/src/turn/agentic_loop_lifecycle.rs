@@ -43,6 +43,9 @@ pub(crate) fn session_turn_number(state: &AgenticLoopState) -> u32 {
 }
 
 pub(crate) fn current_agentic_step(state: &AgenticLoopState) -> u32 {
+    if state.llm_rounds_completed > 0 {
+        return state.llm_rounds_completed;
+    }
     state.max_turns.saturating_sub(state.remaining_turns) as u32
 }
 
@@ -92,7 +95,7 @@ fn bash_command_looks_mutating(command: &str) -> bool {
     crate::bash_intent::bash_command_looks_mutating(command)
 }
 
-fn extract_bash_command(args: Option<&str>) -> Option<String> {
+pub(crate) fn extract_bash_command(args: Option<&str>) -> Option<String> {
     let args = args?;
     let value = serde_json::from_str::<Value>(args).ok()?;
     let command = value.get("command").and_then(Value::as_str)?;
@@ -424,10 +427,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 ResumeAction::ContinueImmediately,
                 interruption_state_summary(state, None),
             ));
-            if state.final_text.trim().is_empty() {
-                state.final_text = budget_exhaustion_completion_text(state);
-                state.final_text_streamed = false;
-            }
+            state.final_text = budget_exhaustion_completion_text(state);
+            state.final_text_streamed = false;
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
@@ -521,7 +522,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     state.remaining_turns = state.remaining_turns.saturating_sub(1);
-    state.step_recorder.begin_turn(turn_index as u32);
+    state.step_recorder.begin_turn_with_context(
+        session_turn_number(state).saturating_sub(1),
+        turn_index as u32,
+    );
 
     if let Some(ref mut adapter) = state.tactical_adapter {
         adapter.reset_turn();
@@ -725,6 +729,19 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if turn_index > 0 {
+        const WORKING_SET_HEADER: &str = "[working-set:v1]\n";
+        state.messages.retain(|m| {
+            m.get("role").and_then(Value::as_str) != Some("system")
+                || !m
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.starts_with(WORKING_SET_HEADER))
+        });
+        state.messages.push(serde_json::json!({
+            "role": "system",
+            "content": state.session_facts.to_working_set_injection(&state.message),
+        }));
+
         const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
         state.messages.retain(|m| {
             m.get("role").and_then(Value::as_str) != Some("system")
@@ -795,15 +812,21 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
         // Adaptive microcompact: scale aggressiveness with context pressure.
         // Use state-aware variant when SessionFacts has active files (pin list).
+        let strategy = state.compact_strategy;
         let mc = if !state.session_facts.active_files.is_empty() {
             super::microcompact::compact_tool_results_state_aware(
                 &mut state.messages,
                 pressure,
                 &state.session_facts,
                 5,
+                strategy,
             )
         } else {
-            super::microcompact::compact_tool_results_adaptive(&mut state.messages, pressure)
+            super::microcompact::compact_tool_results_adaptive(
+                &mut state.messages,
+                pressure,
+                strategy,
+            )
         };
         if mc.results_compacted > 0 && !quiet {
             host.emit_headless_line(
@@ -964,6 +987,42 @@ mod tests {
         assert_eq!(host.injected_schemas[0], expected);
     }
 
+    #[tokio::test]
+    async fn prepare_turn_injects_single_canonical_working_set() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.message = "continue fixing context continuity".to_string();
+        state
+            .session_facts
+            .active_files
+            .push(crate::turn::cloud::session_facts::FileEntry {
+                path: "src/main.rs".to_string(),
+                last_action: "write".to_string(),
+                turn: 1,
+            });
+
+        let _ = prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .expect("prepare turn");
+        let _ = prepare_turn_iteration(&mut host, &mut state, 2)
+            .await
+            .expect("prepare next turn");
+
+        let working_sets: Vec<_> = state
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
+            .filter(|content| content.starts_with("[working-set:v1]\n"))
+            .collect();
+        assert_eq!(
+            working_sets.len(),
+            1,
+            "working set injection should be replaced, not accumulated"
+        );
+        assert!(working_sets[0].contains("goal: continue fixing context continuity"));
+        assert!(working_sets[0].contains("- src/main.rs [write t1]"));
+    }
+
     #[test]
     fn session_turn_number_prefers_explicit_outer_turn_over_agentic_step() {
         let mut state = make_state();
@@ -973,6 +1032,20 @@ mod tests {
 
         assert_eq!(current_agentic_step(&state), 50);
         assert_eq!(session_turn_number(&state), 1);
+    }
+
+    #[test]
+    fn current_agentic_step_uses_actual_llm_rounds_when_available() {
+        let mut state = make_state();
+        state.max_turns = 25;
+        state.remaining_turns = 9;
+        state.llm_rounds_completed = 14;
+
+        assert_eq!(
+            current_agentic_step(&state),
+            14,
+            "agentic_step must not skip when control-only loop iterations consume remaining_turns"
+        );
     }
 
     /// P1-D: Production code must not use unsafe set_var.

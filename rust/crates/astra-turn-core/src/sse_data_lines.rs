@@ -41,6 +41,22 @@ fn process_trimmed_line(line: &str) -> LineAction {
     handle_data_payload(rest)
 }
 
+fn process_trimmed_line_strict(line: &str) -> Result<LineAction, String> {
+    let Some(rest) = line.strip_prefix("data: ") else {
+        return Ok(LineAction::Skip);
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(LineAction::Skip);
+    }
+    if rest == "[DONE]" {
+        return Ok(LineAction::Done);
+    }
+    serde_json::from_str::<Value>(rest)
+        .map(LineAction::Json)
+        .map_err(|e| format!("invalid JSON in SSE data line: {e}"))
+}
+
 /// Parse `data:` JSON payloads (and `data: [DONE]`) from lines inside one blank-line-delimited SSE
 /// event block (the same framing as [`super::sse_blocks`] and [`super::chat_turn_sse_dispatch::ChatTurnSseFramer`]).
 pub fn json_events_from_sse_event_block(block: &str) -> SseJsonDrain {
@@ -95,6 +111,44 @@ pub fn finish_sse_data_buffer(buf: &mut String) -> SseJsonDrain {
     }
     buf.clear();
     out
+}
+
+/// Strict variant of [`drain_sse_data_lines`] that surfaces invalid `data:` JSON instead of skipping it.
+pub fn validated_drain_sse_data_lines(
+    buf: &mut String,
+    utf8_chunk: &str,
+) -> Result<SseJsonDrain, String> {
+    buf.push_str(utf8_chunk);
+    let mut out = SseJsonDrain::default();
+    while let Some(newline) = buf.find('\n') {
+        let line: String = buf.drain(..=newline).collect();
+        match process_trimmed_line_strict(line.trim())? {
+            LineAction::Json(v) => out.events.push(v),
+            LineAction::Done => {
+                out.stream_finished = true;
+                break;
+            }
+            LineAction::Skip => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Strict variant of [`finish_sse_data_buffer`] that surfaces invalid trailing `data:` JSON.
+pub fn validated_finish_sse_data_buffer(buf: &mut String) -> Result<SseJsonDrain, String> {
+    let line = buf.trim();
+    if line.is_empty() {
+        buf.clear();
+        return Ok(SseJsonDrain::default());
+    }
+    let mut out = SseJsonDrain::default();
+    match process_trimmed_line_strict(line)? {
+        LineAction::Json(v) => out.events.push(v),
+        LineAction::Done => out.stream_finished = true,
+        LineAction::Skip => {}
+    }
+    buf.clear();
+    Ok(out)
 }
 
 /// One-shot parse of a full SSE body (e.g. HTTP response text) including a final partial line.
@@ -244,6 +298,20 @@ mod tests {
     #[test]
     fn validated_json_events_from_block_rejects_invalid_payload() {
         let r = validated_json_events_from_sse_block("data: not-json\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn validated_drain_rejects_invalid_payload() {
+        let mut buf = String::new();
+        let r = validated_drain_sse_data_lines(&mut buf, "data: not-json\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn validated_finish_rejects_invalid_payload() {
+        let mut buf = "data: not-json".to_string();
+        let r = validated_finish_sse_data_buffer(&mut buf);
         assert!(r.is_err());
     }
 

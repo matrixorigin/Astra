@@ -57,6 +57,8 @@ astra journal digest --format text
 - **`aggregates`**: `session_start_count`, `session_end_count`, `turn_count`, `turn_error_count`, `compact_count`, `stall_count`, `error_event_count`, `total_tokens_in`, `total_tokens_out`, `total_duration_ms`, `total_tool_calls`, `tool_calls_failed`, `avg_tokens_in`, `avg_tokens_out`, `avg_duration_ms`.
 - **`turns`**: per-turn `seq` (1-based chronological index), `turn_id` (session turn counter when present), `tokens_in` / `tokens_out`, `duration_ms`, `ttft_ms`, `context_ms`, `selector_ms`, `selector_strategy`, `tools_selected_count`, `tools_used_count`, `selected_skills`, `tool_calls_ok`, `tool_calls_fail`, `user_input_preview`, `budget_pressure`.
 - **`compaction_events`**, **`stalls`**, **`turn_errors`**, **`other_errors`**: structured side events; cite `ts`, `turn`, and `detail` from JSON.
+- **`failed_tool_calls`**: per-call details for every failed tool call. Each entry has `seq` (turn sequence), `turn_id`, `tool`, `error_category` (`safety_guard` / `permission_denied` / `tool_error` / `unknown`), `error_preview` (first ~200 chars), `args_preview`. Only present in `--focus all` (default). Use this to identify false positives and error patterns without re-parsing raw JSONL.
+- **`aggregates.safety_guard_blocks`**: count of tool calls blocked by a safety guard. Non-zero means the agent hit safety walls — check `failed_tool_calls` for details.
 
 ### Resolve TARGET when not using default session
 
@@ -170,6 +172,9 @@ Session stuck/looping?
 │  ├─ name_stall → Agent cycling through same tool types
 │  └─ divergence → Agent exploring endlessly without progress
 ├─ No StallDetected but looping?
+│  ├─ safety_guard_blocks > 0 AND user keeps saying "not working"?
+│  │  └─ Verification gap: agent can't confirm output → rewrites from scratch
+│  │     → Check Phase 2E for false positive patterns
 │  └─ Stall detector window too wide (default 6)
 │
 Session producing wrong results?
@@ -199,6 +204,65 @@ For each TurnGuard correction in the journal, evaluate:
 
 ---
 
+## Phase 2E: Tool Failure Forensics (when `tool_calls_failed > 0`)
+
+Run this phase whenever `aggregates.tool_calls_failed > 0`. It uses the `failed_tool_calls` array from the digest — no raw JSONL parsing needed.
+
+### 2E.1 Safety Guard Analysis
+
+If `aggregates.safety_guard_blocks > 0`:
+
+1. List all `failed_tool_calls` where `error_category == "safety_guard"`.
+2. For each, extract the guard name from `error_preview` (e.g. `shell_obfuscation`, `interpreter_stdin`).
+3. Check `args_preview` to determine if the block was a **true positive** (genuinely dangerous) or **false positive** (legitimate command misclassified).
+
+**Common false positive patterns**:
+| Pattern | Example | Root Cause | Status |
+|---------|---------|------------|--------|
+| `grep 'foo\|bar'` in multi-segment command | `ls && grep 'a\|b' file` | `\|` matched `\|sh` substring in pipe-to-shell check | ✅ Fixed in `permission_manager.rs` |
+| `node -e "..."` with JS template literals | `node -e "const x = \`hi\`"` | Backticks in double quotes = bash command substitution | ⚠️ By design — use single quotes |
+| `python3 -c "..."` with `$()` | `python3 -c "page.$('sel')"` | `$()` in double quotes = bash command substitution | ⚠️ By design — use single quotes |
+
+**If false positive**: note the guard name and args pattern. This is a bug to fix in `safety_middleware.rs` or `permission_manager.rs`.
+
+**If true positive**: note what the agent was trying to do and suggest a safer alternative.
+
+### 2E.2 Permission Denied Analysis
+
+If any `failed_tool_calls` have `error_category == "permission_denied"`:
+
+1. Check if the agent retried the same tool after denial (look at subsequent `tool_groups` in the same turn).
+2. Check if the agent adapted (used a different tool or approach).
+3. If the agent kept retrying without adaptation → **blind retry loop** (see 2D.4).
+
+### 2E.3 Tool Error Cascade
+
+Build a timeline of `tool_error` failures:
+
+```
+Turn seq | Tool | Error preview | Next action
+---------|------|---------------|------------
+```
+
+Look for:
+- Same tool failing repeatedly → tool is broken or args are wrong
+- Error → rewrite from scratch → same error → **rewrite loop** (agent can't verify)
+- Error → compaction → same error → **compaction-induced amnesia**
+
+### 2E.4 Verification Gap Detection
+
+A **verification gap** occurs when the agent cannot confirm its output works:
+- Safety guards block all verification commands (grep, node -e, playwright)
+- No browser automation available for HTML/JS output
+- Agent declares success based on file existence, not functional testing
+
+Signs in the digest:
+- `safety_guard_blocks > 0` AND `tool_calls_failed / total_tool_calls > 0.15`
+- Multiple turns with same `user_input_preview` pattern ("不行", "还是不行", "打开没东西")
+- `tokens_in` growing monotonically without compaction (agent rewrites instead of fixing)
+
+---
+
 ## Phase 3: Optional deep dive (only if user needs message-level proof)
 
 - **Heavy checkpoints**: `~/.astra/sessions/<SESSION_ID>/step_checkpoints/*-heavy.json` — OpenAI-style messages the model saw.
@@ -225,9 +289,9 @@ When heavy checkpoints exist and FOCUS=debug:
 Keep the report compact and grounded in digest JSON.
 
 1. **Session**: `session_id` from digest; note `journal_file` path.
-2. **Headline metrics**: copy key fields from `aggregates`.
+2. **Headline metrics**: copy key fields from `aggregates`; flag `safety_guard_blocks > 0`.
 3. **Notable turns**: at most 3 entries, cite `seq` and `turn_id`.
-4. **Issues**: bullet list tied to digest evidence (stalls, errors, token spikes, missing compactions).
+4. **Issues**: bullet list tied to digest evidence (stalls, errors, token spikes, missing compactions, safety guard false positives from `failed_tool_calls`).
 5. **Recommendations**: 3–5 actionable items.
 
 ### Debug Report (FOCUS=debug)

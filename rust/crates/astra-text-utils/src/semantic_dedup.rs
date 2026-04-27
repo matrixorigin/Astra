@@ -74,14 +74,24 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 num_str
             ))
         }
-        // Git: key on ref (staged flag changes output semantically)
+        // Git diff: output semantics depend on ref/base_ref, staged mode,
+        // stat_only, and optional path scoping.
         "git_diff" => {
             let git_ref = arg_str(args, "ref").unwrap_or("HEAD");
             let base_ref = arg_str(args, "base_ref").unwrap_or("");
             let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+            let stat_only = args
+                .get("stat_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = arg_str(args, "path").unwrap_or("");
             Some(format!(
-                "git_diff:{}..{}:staged={}",
-                base_ref, git_ref, staged
+                "git_diff:{}..{}:staged={}:stat_only={}:path={}",
+                base_ref,
+                git_ref,
+                staged,
+                stat_only,
+                normalize_path(path)
             ))
         }
         "git_log" => {
@@ -119,7 +129,8 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 stat
             ))
         }
-        // Non-cacheable tools (bash, write_file, web_fetch, etc.) — no semantic key
+        "bash" => semantic_bash_git_key(args),
+        // Non-cacheable tools (write_file, web_fetch, most bash commands, etc.) — no semantic key
         // Analysis tools: key on target symbol/file
         "symbols" | "find_definition" | "find_references" => {
             let path = arg_str(args, "file").or_else(|| arg_str(args, "path"))?;
@@ -181,6 +192,39 @@ fn normalize_path(path: &str) -> String {
 
 fn normalize_repo(repo: &str) -> String {
     repo.trim().to_lowercase().trim_end_matches('/').to_string()
+}
+
+fn semantic_bash_git_key(args: &Value) -> Option<String> {
+    let command = arg_str(args, "command")?.trim();
+    if command
+        .chars()
+        .any(|ch| matches!(ch, '|' | ';' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'))
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.first() == Some(&"git") && parts.get(1) == Some(&"--no-pager") {
+        parts.remove(1);
+    }
+    match parts.as_slice() {
+        ["git", "status"] | ["git", "status", "--short"] | ["git", "status", "--porcelain"] => {
+            Some("git_status".to_string())
+        }
+        ["git", "diff"] | ["git", "diff", "HEAD"] => {
+            Some("git_diff:..HEAD:staged=false:stat_only=false:path=".to_string())
+        }
+        ["git", "diff", "--stat"] => {
+            Some("git_diff:..HEAD:staged=false:stat_only=true:path=".to_string())
+        }
+        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => {
+            Some("git_diff:..HEAD:staged=true:stat_only=false:path=".to_string())
+        }
+        ["git", "diff", "--", path] => Some(format!(
+            "git_diff:..HEAD:staged=false:stat_only=false:path={}",
+            normalize_path(path)
+        )),
+        _ => None,
+    }
 }
 
 // ─── Tier 3: Output Similarity ───────────────────────────────────────────────
@@ -582,6 +626,36 @@ mod tests {
     }
 
     #[test]
+    fn git_diff_stat_only_differs_from_full_patch() {
+        let k1 = semantic_call_key("git_diff", &json!({"stat_only": true}));
+        let k2 = semantic_call_key("git_diff", &json!({}));
+        assert_ne!(
+            k1, k2,
+            "stat-only diff must not share a semantic cache key with full patch output"
+        );
+    }
+
+    #[test]
+    fn git_diff_path_filter_differs_from_repo_wide_diff() {
+        let k1 = semantic_call_key("git_diff", &json!({"path": "src/a.rs"}));
+        let k2 = semantic_call_key("git_diff", &json!({}));
+        assert_ne!(
+            k1, k2,
+            "path-scoped diff must not share a semantic cache key with repo-wide diff"
+        );
+    }
+
+    #[test]
+    fn git_diff_different_paths_do_not_collide() {
+        let k1 = semantic_call_key("git_diff", &json!({"path": "src/a.rs"}));
+        let k2 = semantic_call_key("git_diff", &json!({"path": "src/b.rs"}));
+        assert_ne!(
+            k1, k2,
+            "different git_diff path filters must stay distinct for cache safety"
+        );
+    }
+
+    #[test]
     fn git_status_always_same_key() {
         let k1 = semantic_call_key("git_status", &json!({}));
         let k2 = semantic_call_key("git_status", &json!({"extra": "ignored"}));
@@ -589,8 +663,27 @@ mod tests {
     }
 
     #[test]
-    fn bash_returns_none() {
+    fn bash_non_git_returns_none() {
         assert!(semantic_call_key("bash", &json!({"command": "ls"})).is_none());
+    }
+
+    #[test]
+    fn bash_git_diff_shares_git_diff_semantic_key() {
+        let bash = semantic_call_key("bash", &json!({"command": "git --no-pager diff"}));
+        let structured = semantic_call_key("git_diff", &json!({}));
+        assert_eq!(bash, structured);
+
+        let bash_head = semantic_call_key("bash", &json!({"command": "git diff HEAD"}));
+        assert_eq!(bash_head, structured);
+
+        let bash_path = semantic_call_key("bash", &json!({"command": "git diff -- src/"}));
+        let structured_path = semantic_call_key("git_diff", &json!({"path": "src", "ref": "HEAD"}));
+        assert_eq!(bash_path, structured_path);
+    }
+
+    #[test]
+    fn bash_compound_git_diff_is_not_canonicalized() {
+        assert!(semantic_call_key("bash", &json!({"command": "git diff | head"})).is_none());
     }
 
     #[test]

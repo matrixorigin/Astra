@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
-use astra_sandbox::{CommandRisk, analyze_command_risks};
+use astra_sandbox::{CommandRisk, analyze_command_risks, is_rm_catastrophic_rm_path};
 
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
@@ -115,10 +115,6 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     }
     let lower = cmd.to_ascii_lowercase();
     let blocked_substrings = [
-        "rm -rf",
-        "rm -fr",
-        "\nrm ",
-        " rmdir ",
         "mkfs",
         "mkswap",
         " wipefs",
@@ -143,21 +139,12 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             ));
         }
     }
-    // Every `rm` form is blocked here (including `rm -r`, `rm -f`, flags-only variants): never
-    // treat recursive remove as "safe" — use structured file/delete tools instead.
-    if lower.starts_with("rm ")
-        || lower.contains("; rm ")
-        || lower.contains("&& rm ")
-        || lower.contains("| rm ")
+    // Path-aware rm -rf: block only catastrophic targets, let permission layer handle the rest.
+    if (lower.contains("rm -rf") || lower.contains("rm -fr")) && is_rm_catastrophic_rm_path(&lower)
     {
-        return Err("Error: `rm` is blocked in execute_bash — use structured file tools".into());
-    }
-    if lower.starts_with("rmdir")
-        || lower.contains("; rmdir")
-        || lower.contains("&& rmdir")
-        || lower.contains("| rmdir")
-    {
-        return Err("Error: `rmdir` is blocked in execute_bash — use structured file tools".into());
+        return Err(
+            "Error: rm -rf targeting root/home/system path is blocked in execute_bash".into(),
+        );
     }
     if (lower.contains("curl ") || lower.contains("wget "))
         && (lower.contains("| bash")
@@ -179,9 +166,10 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
             // Intentionally still allowed: benign redirects / `$(...)` are common in build scripts;
             // AST marks them aggressively; blocking would break typical `cargo`/`make` usage.
             CommandRisk::OutputRedirection | CommandRisk::CommandSubstitution => {}
+            // PrivilegeEscalation (sudo, doas) is handled by the permission layer as Ask.
+            CommandRisk::PrivilegeEscalation => {}
             // Fail closed on every other sandbox-reported risk (eval, process substitution, etc.).
             CommandRisk::RemoteCodeExecution
-            | CommandRisk::PrivilegeEscalation
             | CommandRisk::ProcessControl
             | CommandRisk::EnvManipulation
             | CommandRisk::ZshDangerous(_)
@@ -195,6 +183,7 @@ pub fn validate_execute_bash_command(command: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `true` if an `rm -rf` / `rm -fr` command targets a catastrophic path
 struct GrepRequest<'a> {
     workspace_root: &'a Path,
     target: &'a str,
@@ -221,8 +210,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     let timeout_secs = args
         .get("timeout")
         .and_then(|v| v.as_f64())
-        .unwrap_or(30.0)
-        .clamp(0.1, 120.0);
+        .unwrap_or(120.0)
+        .clamp(0.1, 600.0);
 
     if let Err(reason) = validate_execute_bash_command(command) {
         return ToolResult::error(reason);
@@ -3282,21 +3271,51 @@ printf 'probe.txt:1:needle\n'
         assert!(validate_execute_bash_command("  \t").is_err());
     }
 
+    // ── rm path-aware validation ──────────────────────────────────────────────
+
     #[test]
-    fn validate_execute_bash_rejects_destructive_rm_rf() {
-        assert!(validate_execute_bash_command("rm -rf ./build").is_err());
+    fn validate_bash_rm_rf_root_paths_blocked() {
+        // Catastrophic paths: always blocked
+        assert!(validate_execute_bash_command("rm -rf /").is_err());
+        assert!(validate_execute_bash_command("rm -rf /*").is_err());
+        assert!(validate_execute_bash_command("rm -fr /").is_err());
+        assert!(validate_execute_bash_command("rm -rf ~").is_err());
+        assert!(validate_execute_bash_command("rm -rf ~/").is_err());
+        assert!(validate_execute_bash_command("rm -rf $HOME").is_err());
+        assert!(validate_execute_bash_command("rm -rf /etc").is_err());
+        assert!(validate_execute_bash_command("rm -rf /usr").is_err());
     }
 
     #[test]
-    fn validate_execute_bash_rejects_rm_recursive_even_if_substring_order_differs() {
-        assert!(validate_execute_bash_command("rm -r ./build").is_err());
-        assert!(validate_execute_bash_command("rm ./build").is_err());
+    fn validate_bash_rm_rf_project_relative_allowed() {
+        // Project-relative rm -rf: should pass validation (permission layer handles Ask)
+        assert!(validate_execute_bash_command("rm -rf ./build").is_ok());
+        assert!(validate_execute_bash_command("rm -rf node_modules").is_ok());
+        assert!(validate_execute_bash_command("rm -rf dist/").is_ok());
+        assert!(validate_execute_bash_command("rm -rf target/debug").is_ok());
+        assert!(validate_execute_bash_command("rm -fr .cache").is_ok());
     }
 
     #[test]
-    fn validate_execute_bash_rejects_rmdir() {
-        assert!(validate_execute_bash_command("rmdir empty_dir").is_err());
-        assert!(validate_execute_bash_command("true && rmdir x").is_err());
+    fn validate_bash_rm_single_file_allowed() {
+        // Simple rm of a single file: should pass
+        assert!(validate_execute_bash_command("rm temp.txt").is_ok());
+        assert!(validate_execute_bash_command("rm -f output.log").is_ok());
+        assert!(validate_execute_bash_command("rm ./scratch.rs").is_ok());
+    }
+
+    #[test]
+    fn validate_bash_rmdir_allowed() {
+        // rmdir only removes empty dirs — safe
+        assert!(validate_execute_bash_command("rmdir empty_dir").is_ok());
+        assert!(validate_execute_bash_command("true && rmdir x").is_ok());
+    }
+
+    #[test]
+    fn validate_bash_sudo_passes_to_permission_layer() {
+        // sudo should pass tool validation — permission layer handles Ask
+        assert!(validate_execute_bash_command("sudo apt install build-essential").is_ok());
+        assert!(validate_execute_bash_command("sudo systemctl restart nginx").is_ok());
     }
 
     #[test]
@@ -3536,6 +3555,43 @@ printf 'probe.txt:1:needle\n'
         assert!(glob_matches_path("**/*.{ts,tsx}", "src/app/main.ts"));
         assert!(glob_matches_path("**/*.{ts,tsx}", "src/app/main.tsx"));
         assert!(!glob_matches_path("**/*.{ts,tsx}", "src/app/main.js"));
+    }
+
+    // ── bash timeout defaults ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bash_default_timeout_is_120s() {
+        // Verify the default timeout is 120s (not 30s) by checking a command
+        // that takes >30s but <120s completes successfully.
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "sleep 35 && echo done"}),
+        )
+        .await;
+        assert!(
+            result.output.contains("done"),
+            "command should complete with 120s default timeout, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_max_timeout_is_600s() {
+        // Verify timeout=500 is accepted (was clamped to 120 before)
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "echo ok", "timeout": 500}),
+        )
+        .await;
+        assert!(
+            result.output.contains("ok"),
+            "timeout=500 should be accepted, got: {}",
+            result.output
+        );
     }
 
     // ── background process warning ────────────────────────────────────────────

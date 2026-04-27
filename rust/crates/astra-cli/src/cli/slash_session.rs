@@ -9,6 +9,7 @@ use astra_services::{ForkSessionOptions, fork_local_session, session_journal, se
 use chrono::{DateTime, Utc};
 
 use super::*;
+use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::repl_runtime;
 use crate::tool_call_groups;
 
@@ -679,7 +680,32 @@ pub(super) fn resolve_journal_target_session(
     }
 }
 
-pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
+async fn resolve_remote_trace_target(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &ReplState,
+    requested: &str,
+) -> Result<String, String> {
+    match requested.trim() {
+        value if !value.is_empty() => Ok(value.to_string()),
+        _ => match state.session_id.as_deref() {
+            Some(session_id) if !session_id.trim().is_empty() => Ok(session_id.to_string()),
+            _ => validated_resumable_last_session_id(api, profile)
+                .await
+                .ok_or_else(|| {
+                    "  No active session and no recent resumable session is available.".to_string()
+                }),
+        },
+    }
+}
+
+pub(super) async fn handle_session_command(
+    arg: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut ReplState,
+    token: Option<&str>,
+) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
         None => (arg.trim(), ""),
@@ -752,10 +778,53 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · fork · cleanup · verify · drift"
+                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · fork · cleanup · verify · drift · trace [on|off|status]"
                     .dim()
             );
             eprintln!();
+        }
+        "trace" => {
+            let Some(tok) = token else {
+                eprintln!("{}", "  Not logged in. Use /login.".yellow());
+                return;
+            };
+            let (mode, session_arg) = match sub_arg.find(char::is_whitespace) {
+                Some(pos) => (sub_arg[..pos].trim(), sub_arg[pos..].trim()),
+                None => (sub_arg.trim(), ""),
+            };
+            let session_id =
+                match resolve_remote_trace_target(api, profile, state, session_arg).await {
+                    Ok(session_id) => session_id,
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        return;
+                    }
+                };
+            let trace_state = match mode {
+                "" | "status" => fetch_session_trace_state(api, Some(tok), &session_id).await,
+                "on" => update_session_trace_state(api, Some(tok), &session_id, true).await,
+                "off" => update_session_trace_state(api, Some(tok), &session_id, false).await,
+                _ => {
+                    eprintln!(
+                        "{}",
+                        "  Usage: /session trace [status|on|off] [session_id]".dim()
+                    );
+                    return;
+                }
+            };
+            match trace_state {
+                Ok(trace_state) => {
+                    let icon = if trace_state.enabled { "🔎" } else { "○" };
+                    let state_label = if trace_state.enabled { "ON" } else { "OFF" };
+                    eprintln!(
+                        "  {} Full trace {} for session {}",
+                        icon.cyan(),
+                        state_label.cyan(),
+                        trace_state.session_id.as_str().cyan()
+                    );
+                }
+                Err(err) => eprintln!("  {} {}", theme::icon_err(), err.red()),
+            }
         }
         "fork" => {
             let (parent_id, label) = match parse_fork_source(sub_arg, state) {
@@ -1892,6 +1961,20 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     tokens_freed,
                                 );
                             }
+                            session_journal::JournalEventType::LlmRequestFull => {
+                                eprintln!(
+                                    "  {} 📥 T{} full LLM request captured",
+                                    ts_short.dim(),
+                                    evt.turn.unwrap_or(0),
+                                );
+                            }
+                            session_journal::JournalEventType::LlmResponseFull => {
+                                eprintln!(
+                                    "  {} 📤 T{} full LLM response captured",
+                                    ts_short.dim(),
+                                    evt.turn.unwrap_or(0),
+                                );
+                            }
                         }
                     }
                     // Summary stats
@@ -2213,7 +2296,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|adaptive|analyze] …"
+                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|trace|adaptive|analyze] …"
                     .dim()
             );
         }
@@ -5382,7 +5465,7 @@ pub(super) async fn handle_resume_command(
 mod resume_tests {
     use super::*;
     use astra_services::session_journal::{self, JournalDirGuard};
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{body_json, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, JournalDirGuard) {
@@ -5647,5 +5730,48 @@ mod resume_tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn session_trace_on_uses_active_session_and_preserves_metadata() {
+        let session_id = format!("trace-active-{}", uuid::Uuid::new_v4());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "metadata": {
+                    "owner": "alice"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .and(body_json(serde_json::json!({
+                "metadata": {
+                    "owner": "alice",
+                    "full_llm_capture": true
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "metadata": {
+                    "owner": "alice",
+                    "full_llm_capture": true
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = ReplState::default();
+        state.session_id = Some(session_id.clone());
+
+        handle_session_command("trace on", &api, None, &mut state, Some("test-token")).await;
     }
 }

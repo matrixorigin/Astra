@@ -2139,6 +2139,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::ConfidenceDiagnosisRecorded => "confidence_diagnosis_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
         JournalEventType::LlmRound => "llm_round",
+        JournalEventType::LlmRequestFull => "llm_request_full",
+        JournalEventType::LlmResponseFull => "llm_response_full",
     }
     .to_string()
 }

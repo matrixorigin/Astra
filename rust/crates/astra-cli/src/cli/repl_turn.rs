@@ -694,6 +694,56 @@ fn is_low_information_followup(line: &str) -> bool {
     has_deictic_reference || has_question_shape || short_ascii_action
 }
 
+fn is_greeting_like_message(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "hey!"
+            | "hello!"
+            | "hi!"
+            | "good morning"
+            | "good afternoon"
+            | "good evening"
+    ) || matches!(trimmed, "你好" | "您好" | "嗨" | "哈喽")
+}
+
+fn session_goal_candidate(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || is_greeting_like_message(trimmed)
+        || is_low_information_followup(trimmed)
+    {
+        return None;
+    }
+
+    Some(truncate_chars(trimmed, 220))
+}
+
+fn session_goal_is_placeholder(goal: &str) -> bool {
+    let trimmed = goal.trim();
+    trimmed.is_empty() || is_greeting_like_message(trimmed)
+}
+
+fn maybe_update_session_goal(state: &mut ReplState, line: &str) {
+    let Some(candidate) = session_goal_candidate(line) else {
+        return;
+    };
+
+    match state.session_goal.as_deref() {
+        None => state.session_goal = Some(candidate),
+        Some(existing) if session_goal_is_placeholder(existing) => {
+            state.session_goal = Some(candidate);
+        }
+        Some(_) => {}
+    }
+}
+
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
     let mut lines = Vec::new();
     let mut total_chars = 0usize;
@@ -880,6 +930,7 @@ async fn maybe_auto_compact(
         message: prompts::COMPACT_SUMMARY_REQUEST,
         session_id: state.session_id.as_deref(),
         model: state.model.as_deref(),
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &state.history,
@@ -1157,6 +1208,7 @@ async fn run_chat_turn(
             message,
             session_id,
             model: state.model.as_deref(),
+            provider: None,
             explain: state.explain,
             render_md: true,
             history: &state.history,
@@ -1203,6 +1255,61 @@ async fn run_chat_turn(
             TurnAttempt::Interrupted
         }
     }
+}
+
+/// Build a compact tool-call summary for cross-turn context continuity.
+///
+/// Appended to the assistant text in history so the next turn's prompt
+/// contains file paths and tool outcomes from the previous turn — without
+/// storing the full tool_call / tool_result messages.
+fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord]) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+
+    // Collect unique file paths (preserving first-seen order).
+    let mut files: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for r in records {
+        if let Some(fp) = r.file_path.as_deref() {
+            if !files.contains(&fp) {
+                files.push(fp);
+            }
+        }
+        if !r.ok && !failed.contains(&r.name.as_str()) {
+            failed.push(&r.name);
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !files.is_empty() {
+        if files.len() <= 15 {
+            parts.push(format!("files: {}", files.join(", ")));
+        } else {
+            let shown: Vec<&str> = files[..15].to_vec();
+            parts.push(format!(
+                "files: {} (+{} more)",
+                shown.join(", "),
+                files.len() - 15
+            ));
+        }
+    }
+    if !failed.is_empty() {
+        parts.push(format!("failed: {}", failed.join(", ")));
+    }
+    let tool_count = records.len();
+    parts.push(format!("tool_calls: {tool_count}"));
+
+    format!("\n\n[Turn context: {}]", parts.join(" | "))
+}
+
+/// Build the text stored in history: assistant response + optional tool summary.
+fn build_history_text(full_text: &str, records: &[session_journal::ToolCallRecord]) -> String {
+    let summary = build_turn_tool_summary(records);
+    if summary.is_empty() {
+        return full_text.to_string();
+    }
+    format!("{full_text}{summary}")
 }
 
 /// After `state.turn` has been incremented: journal turn row, workspace + checkpoints,
@@ -1277,6 +1384,12 @@ fn commit_turn_journal_workspace_and_sidecars(
         turn_event.total_tool_ms = Some(tool_ms);
         if let Some(dur) = turn_event.duration_ms {
             turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
+        }
+        if let Some(interruption) = result.interruption.as_ref() {
+            turn_event.metadata = Some(merge_interruption_metadata(
+                turn_event.metadata.take(),
+                interruption,
+            ));
         }
 
         // Store for /turn command
@@ -1578,6 +1691,28 @@ fn commit_turn_journal_workspace_and_sidecars(
     }
 }
 
+fn merge_interruption_metadata(
+    existing: Option<serde_json::Value>,
+    interruption: &serde_json::Value,
+) -> serde_json::Value {
+    let mut metadata = match existing {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(value) => {
+            let mut map = serde_json::Map::new();
+            map.insert("previous_metadata".into(), value);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    metadata.insert("partial".into(), serde_json::json!(true));
+    metadata.insert("interrupted".into(), serde_json::json!(true));
+    if let Some(kind) = interruption.get("kind").and_then(|value| value.as_str()) {
+        metadata.insert("interruption_kind".into(), serde_json::json!(kind));
+    }
+    metadata.insert("interruption".into(), interruption.clone());
+    serde_json::Value::Object(metadata)
+}
+
 /// Routing + turn quality for journal fields and `ToolSelector::record_outcome`.
 pub(super) struct ReplTurnLearningSnapshot {
     pub routing: astra_runtime::pipeline::routing::RoutingDecision,
@@ -1590,7 +1725,10 @@ pub(super) fn analyze_repl_turn_learning(
     recent_tools: &[String],
     result: &StreamResult,
 ) -> ReplTurnLearningSnapshot {
-    use astra_runtime::pipeline::evaluation::evaluate_tool_call_records;
+    use astra_runtime::pipeline::evaluation::{
+        TurnEvaluationTelemetry, current_evaluation_thresholds,
+        evaluate_tool_call_records_with_thresholds_and_telemetry,
+    };
     use astra_runtime::pipeline::routing::RoutingEngine;
     let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
 
@@ -1598,13 +1736,45 @@ pub(super) fn analyze_repl_turn_learning(
         v.severity.eq_ignore_ascii_case("warning") || v.severity.eq_ignore_ascii_case("critical")
     });
 
-    let eval = evaluate_tool_call_records(
+    let mut first_round_prompt_tokens: Option<u64> = None;
+    let mut max_round_prompt_tokens: Option<u64> = None;
+    for event in &result.turn_observability_events {
+        if event.event_type != session_journal::JournalEventType::LlmRound {
+            continue;
+        }
+        let source = event
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("source"))
+            .and_then(serde_json::Value::as_str);
+        if source != Some("agentic_loop") {
+            continue;
+        }
+        let Some(tokens_in) = event.tokens_in else {
+            continue;
+        };
+        first_round_prompt_tokens.get_or_insert(tokens_in);
+        max_round_prompt_tokens = Some(
+            max_round_prompt_tokens
+                .map(|current| current.max(tokens_in))
+                .unwrap_or(tokens_in),
+        );
+    }
+
+    let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
         line,
         recent_tools,
         &result.tool_call_records,
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
+        current_evaluation_thresholds(),
+        TurnEvaluationTelemetry {
+            llm_rounds: result.llm_rounds,
+            prompt_tokens: Some(result.prompt_tokens),
+            first_round_prompt_tokens,
+            max_round_prompt_tokens,
+        },
     );
 
     ReplTurnLearningSnapshot { routing, eval }
@@ -1717,16 +1887,13 @@ fn apply_turn_success_sync(
         super::repl_ui::clear_followup_prompt_hint();
     }
 
-    // Capture session goal from the first substantive user message.
-    if state.session_goal.is_none() && !line.trim().is_empty() {
-        let goal: String = line.trim().chars().take(220).collect();
-        state.session_goal = Some(goal);
-    }
+    maybe_update_session_goal(state, line);
     // New user input invalidates redo stack (history diverged)
     state.redo_stack.clear();
-    state
-        .history
-        .push((line.to_string(), result.full_text.clone()));
+    state.history.push((
+        line.to_string(),
+        build_history_text(&result.full_text, &result.tool_call_records),
+    ));
     state.recent_tools = result.tools_used.clone();
 
     // Persist tool health for cross-session error budgets
@@ -3470,6 +3637,13 @@ mod tests {
         );
         assert_eq!(
             trace
+                .tool_selection
+                .as_ref()
+                .map(|selection| selection.selection_scope.as_str()),
+            Some("latest_round")
+        );
+        assert_eq!(
+            trace
                 .memory
                 .as_ref()
                 .map(|memory| memory.selected_memory_ids.len()),
@@ -3493,6 +3667,7 @@ mod tests {
             tool_selection: Some(ContextTraceToolSelection {
                 tools_available: 8,
                 selected_tools: vec!["lsp".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 2,
                 strategy: "code-intel".into(),
                 confidence: 0.9,
@@ -3784,6 +3959,31 @@ mod tests {
         let effective_no_goal = build_effective_line("sure", &state_no_goal);
         assert!(effective_no_goal.contains("[Active task attachment]"));
         assert!(!effective_no_goal.contains("Session goal:"));
+    }
+
+    #[test]
+    fn maybe_update_session_goal_promotes_substantive_goal_after_greeting() {
+        let mut state = ReplState::default();
+
+        maybe_update_session_goal(&mut state, "hi");
+        assert!(state.session_goal.is_none());
+
+        maybe_update_session_goal(&mut state, "review local changes");
+        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
+    }
+
+    #[test]
+    fn maybe_update_session_goal_replaces_placeholder_but_preserves_real_goal() {
+        let mut state = ReplState {
+            session_goal: Some("hi".to_string()),
+            ..ReplState::default()
+        };
+
+        maybe_update_session_goal(&mut state, "review local changes");
+        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
+
+        maybe_update_session_goal(&mut state, "investigate auth refresh drift");
+        assert_eq!(state.session_goal.as_deref(), Some("review local changes"));
     }
 
     #[test]
@@ -4208,6 +4408,7 @@ mod tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            interruption: None,
         }
     }
 
@@ -4235,6 +4436,77 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn analyze_repl_turn_learning_flags_llm_round_churn() {
+        let llm_round_event = |round: u32, tokens_in: u64| {
+            let mut event = session_journal::JournalEvent::base_public(
+                session_journal::JournalEventType::LlmRound,
+                Some("sess-1"),
+            );
+            event.turn = Some(2);
+            event.round = Some(round);
+            event.tokens_in = Some(tokens_in);
+            event.metadata = Some(serde_json::json!({
+                "source": "agentic_loop",
+            }));
+            event
+        };
+        let mut result = stub_stream_result("");
+        result.tools_used = vec!["git_diff".into()];
+        result.tool_calls_count = 1;
+        result.prompt_tokens = 136_947;
+        result.llm_rounds = Some(9);
+        result.turn_observability_events =
+            vec![llm_round_event(0, 9_401), llm_round_event(7, 20_954)];
+        result.tool_call_records = vec![session_journal::ToolCallRecord {
+            name: "git_diff".into(),
+            ok: true,
+            ms: 12,
+            error: None,
+            input_bytes: Some(16),
+            output_bytes: Some(240),
+            args_preview: None,
+            result_preview: Some("diff".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            ..Default::default()
+        }];
+
+        let learning = analyze_repl_turn_learning("review local changes", 2, &[], &result);
+        assert!(
+            learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::LlmRoundChurn {
+                    rounds: 9,
+                    prompt_tokens: 136_947,
+                }
+            )),
+            "expected llm_round_churn signal, got {:?}",
+            learning.eval.signals
+        );
+        assert!(
+            learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::PromptGrowthChurn {
+                    first_prompt_tokens: 9_401,
+                    max_prompt_tokens: 20_954,
+                    delta_tokens: 11_553,
+                }
+            )),
+            "expected prompt_growth_churn signal, got {:?}",
+            learning.eval.signals
+        );
+        assert!(
+            !learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::AllToolsHealthy
+            )),
+            "llm-round churn must revoke all_tools_healthy: {:?}",
+            learning.eval.signals
+        );
     }
 
     #[test]
@@ -4380,6 +4652,173 @@ mod tests {
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
         assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn interrupted_success_turn_is_marked_partial_in_journal() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-turn-partial-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 7,
+            ..Default::default()
+        };
+        let mut result = stub_stream_result(
+            "[budget_exhausted] 3 tool call(s) completed. You can continue in the next message.",
+        );
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "tool_calls_completed": 3,
+            "user_message": "[budget_exhausted] 3 tool call(s) completed. You can continue in the next message."
+        }));
+        result.tool_calls_count = 3;
+
+        let learning = analyze_repl_turn_learning("continue", state.turn, &[], &result);
+        commit_turn_journal_workspace_and_sidecars(
+            &mut state,
+            "continue",
+            &result,
+            &learning,
+            Instant::now(),
+        );
+
+        let event = state.last_turn_event.as_ref().expect("turn event");
+        let metadata = event.metadata.as_ref().expect("partial metadata");
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["interrupted"], true);
+        assert_eq!(metadata["interruption_kind"], "budget_exhausted");
+        assert_eq!(metadata["interruption"]["resumable"], true);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let persisted = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("persisted turn event");
+        assert_eq!(persisted.metadata.as_ref().unwrap()["partial"], true);
+    }
+
+    #[test]
+    fn interruption_metadata_preserves_non_object_previous_metadata() {
+        let interruption = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+        });
+
+        let metadata =
+            merge_interruption_metadata(Some(serde_json::json!("legacy-metadata")), &interruption);
+
+        assert_eq!(metadata["previous_metadata"], "legacy-metadata");
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["interruption_kind"], "budget_exhausted");
+        assert_eq!(metadata["interruption"]["resumable"], true);
+    }
+
+    #[test]
+    fn interrupted_turn_replay_persists_observability_and_context_trace() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-turn-replay-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 4,
+            ..Default::default()
+        };
+        let partial_text =
+            "[budget_exhausted] 2 tool call(s) completed. You can continue in the next message.";
+        let mut result = stub_stream_result(partial_text);
+        result.prompt_tokens = 12_345;
+        result.completion_tokens = 234;
+        result.llm_rounds = Some(2);
+        result.tool_calls_count = 2;
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "tool_calls_completed": 2,
+            "user_message": partial_text,
+        }));
+        let mut llm_round = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::LlmRound,
+            Some(&sid),
+        );
+        llm_round.turn = Some(4);
+        llm_round.round = Some(1);
+        llm_round.tokens_in = Some(12_345);
+        llm_round.tokens_out = Some(234);
+        llm_round.metadata = Some(serde_json::json!({
+            "source": "agentic_loop",
+            "finish_reason": "tool_calls",
+        }));
+        result.turn_observability_events = vec![llm_round];
+        result.pending_context_assembly_trace = Some((
+            99,
+            serde_json::json!({
+                "turn_id": "turn-99",
+                "tools": {
+                    "tools_selected": [
+                        {"tool_name": "git_diff"},
+                        {"tool_name": "read_file"}
+                    ]
+                },
+                "token_budget": {"total_used": 12_345}
+            }),
+        ));
+
+        let learning = analyze_repl_turn_learning("continue", state.turn, &[], &result);
+        commit_turn_journal_workspace_and_sidecars(
+            &mut state,
+            "continue",
+            &result,
+            &learning,
+            Instant::now(),
+        );
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let llm_round = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::LlmRound)
+            .expect("persisted llm_round event");
+        assert_eq!(llm_round.turn, Some(4));
+        assert_eq!(llm_round.round, Some(1));
+        assert_eq!(
+            llm_round.metadata.as_ref().unwrap()["source"],
+            "agentic_loop"
+        );
+
+        let turn_event = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("persisted turn event");
+        assert_eq!(turn_event.turn, Some(4));
+        assert_eq!(turn_event.assistant_output.as_deref(), Some(partial_text));
+        let metadata = turn_event.metadata.as_ref().expect("turn metadata");
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["interruption_kind"], "budget_exhausted");
+        assert_eq!(metadata["interruption"]["tool_calls_completed"], 2);
+
+        let assembly_event = events
+            .iter()
+            .find(|event| {
+                event.event_type == session_journal::JournalEventType::ContextAssemblyRecorded
+            })
+            .expect("persisted context assembly event");
+        assert_eq!(assembly_event.turn, Some(4));
+        assert_eq!(
+            assembly_event.metadata.as_ref().unwrap()["trace_recorded"],
+            true
+        );
+        assert_eq!(
+            assembly_event.metadata.as_ref().unwrap()["turn_id"],
+            "turn-99"
+        );
+        assert_eq!(assembly_event.metadata.as_ref().unwrap()["tool_count"], 2);
+        assert_eq!(
+            assembly_event.metadata.as_ref().unwrap()["total_tokens"],
+            12_345
+        );
     }
 
     #[test]
@@ -5275,5 +5714,335 @@ mod tests {
         assert_eq!(super::stall_type_confidence("skill_lockou"), 0.0);
         // Underscore suffix must not match — only exact or colon suffix.
         assert_eq!(super::stall_type_confidence("skill_lockout_v2"), 0.0);
+    }
+
+    // ── tool summary for cross-turn context ───────────────────────────────────
+
+    fn make_record(
+        name: &str,
+        ok: bool,
+        file_path: Option<&str>,
+    ) -> session_journal::ToolCallRecord {
+        session_journal::ToolCallRecord {
+            name: name.into(),
+            ok,
+            file_path: file_path.map(|s| s.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tool_summary_empty_when_no_tools() {
+        let summary = super::build_turn_tool_summary(&[]);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn tool_summary_lists_files_touched() {
+        let records = vec![
+            make_record("read_file", true, Some("src/main.rs")),
+            make_record("str_replace", true, Some("src/main.rs")),
+            make_record("read_file", true, Some("src/lib.rs")),
+        ];
+        let summary = super::build_turn_tool_summary(&records);
+        assert!(
+            summary.contains("src/main.rs"),
+            "should list files: {summary}"
+        );
+        assert!(
+            summary.contains("src/lib.rs"),
+            "should list files: {summary}"
+        );
+        // Deduped
+        assert_eq!(
+            summary.matches("src/main.rs").count(),
+            1,
+            "should dedup: {summary}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_shows_failed_tools() {
+        let records = vec![
+            make_record("read_file", false, Some("src/missing.rs")),
+            make_record("bash", true, None),
+        ];
+        let summary = super::build_turn_tool_summary(&records);
+        assert!(
+            summary.contains("read_file") && summary.contains("fail"),
+            "should show failures: {summary}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_appended_to_history() {
+        let records = vec![
+            make_record("read_file", true, Some("src/main.rs")),
+            make_record("str_replace", true, Some("src/main.rs")),
+        ];
+        let full_text = "## Done\nFixed the bug.".to_string();
+        let history_text = super::build_history_text(&full_text, &records);
+        assert!(
+            history_text.starts_with("## Done"),
+            "original text preserved"
+        );
+        assert!(
+            history_text.contains("src/main.rs"),
+            "summary appended: {history_text}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_not_appended_when_no_tools() {
+        let full_text = "Just a text response.".to_string();
+        let history_text = super::build_history_text(&full_text, &[]);
+        assert_eq!(history_text, full_text, "no summary when no tools");
+    }
+
+    // ── multi-turn simulation: real session scenarios ─────────────────────────
+
+    /// Simulate the exact scenario from session 15a5eb62 (glm-5.1):
+    /// Turn 1: simple chat (no tools)
+    /// Turn 2: code review with skill + git_diff + read_file (3 tool calls)
+    /// Turn 3: "修复和优化" — model needs paths from Turn 2
+    ///
+    /// BEFORE fix: Turn 3 prompt had zero file paths from Turn 2.
+    /// AFTER fix: Turn 3 prompt should contain file paths from Turn 2's tool summary.
+    #[test]
+    fn multi_turn_path_continuity_review_then_fix() {
+        let mut history: Vec<(String, String)> = Vec::new();
+
+        // ── Turn 1: simple chat ──
+        let t1_text = "I can help you with that project.";
+        let t1_records: Vec<session_journal::ToolCallRecord> = vec![];
+        history.push((
+            "hello".into(),
+            super::build_history_text(t1_text, &t1_records),
+        ));
+
+        // ── Turn 2: code review (skill + git_diff + read_file) ──
+        let t2_text = "## Code Review\n\n**permission_manager.rs:978** — boundary check incomplete\n**safety_middleware.rs:8** — missing UPDATE keyword\n**journal_digest.rs:241** — use enum instead of String";
+        let t2_records = vec![
+            make_record("skill", true, None),
+            make_record("git_diff", true, None),
+            make_record("git_diff", true, None),
+            make_record(
+                "read_file",
+                true,
+                Some("rust/crates/astra-cli/src/cli/permission_manager.rs"),
+            ),
+            make_record(
+                "read_file",
+                true,
+                Some("rust/crates/astra-turn-core/src/safety_middleware.rs"),
+            ),
+            make_record(
+                "read_file",
+                true,
+                Some("rust/crates/astra-cli/src/cli/journal_digest.rs"),
+            ),
+            make_record("grep", true, None),
+        ];
+        history.push((
+            "review latest commit".into(),
+            super::build_history_text(t2_text, &t2_records),
+        ));
+
+        // ── Turn 3: model sees the prompt ──
+        let messages = super::history_as_messages(&history);
+        // Add current user message
+        let current = "修复和优化";
+        let mut full_messages = messages;
+        full_messages.push(serde_json::json!({"role": "user", "content": current}));
+
+        // The assistant message from Turn 2 should contain the tool summary
+        let t2_assistant = full_messages[3]["content"].as_str().unwrap();
+
+        // CRITICAL: model can now see the full file paths from Turn 2
+        assert!(
+            t2_assistant.contains("rust/crates/astra-cli/src/cli/permission_manager.rs"),
+            "Turn 3 prompt must contain permission_manager.rs full path.\nActual Turn 2 assistant:\n{t2_assistant}"
+        );
+        assert!(
+            t2_assistant.contains("rust/crates/astra-turn-core/src/safety_middleware.rs"),
+            "Turn 3 prompt must contain safety_middleware.rs full path.\nActual Turn 2 assistant:\n{t2_assistant}"
+        );
+        assert!(
+            t2_assistant.contains("rust/crates/astra-cli/src/cli/journal_digest.rs"),
+            "Turn 3 prompt must contain journal_digest.rs full path.\nActual Turn 2 assistant:\n{t2_assistant}"
+        );
+
+        // The review text only had short names — the summary provides full paths
+        assert!(
+            !t2_text.contains("rust/crates/"),
+            "review text itself should NOT have full paths (that's the whole problem)"
+        );
+    }
+
+    /// Simulate 4 turns with increasing complexity:
+    /// Turn 1: review (7 tools, 3 files)
+    /// Turn 2: fix (18 tools, 3 files, 2 failures)
+    /// Turn 3: review changes (3 tools)
+    /// Turn 4: optimize (7 tools, 1 file)
+    /// Verify Turn 4 can see all prior file paths.
+    #[test]
+    fn four_turn_session_context_accumulation() {
+        let mut history: Vec<(String, String)> = Vec::new();
+
+        // Turn 1
+        let t1_records = vec![
+            make_record("skill", true, None),
+            make_record("git_diff", true, None),
+            make_record("read_file", true, Some("src/cli/permission_manager.rs")),
+            make_record("read_file", false, Some("src/safety_middleware.rs")),
+            make_record("grep", true, None),
+        ];
+        history.push((
+            "review latest commit".into(),
+            super::build_history_text(
+                "## Review\nIssues found in permission_manager.rs",
+                &t1_records,
+            ),
+        ));
+
+        // Turn 2
+        let t2_records = vec![
+            make_record("read_file", true, Some("src/cli/permission_manager.rs")),
+            make_record("read_file", true, Some("src/safety_middleware.rs")),
+            make_record("str_replace", true, Some("src/cli/permission_manager.rs")),
+            make_record("str_replace", true, Some("src/safety_middleware.rs")),
+            make_record("str_replace", true, Some("src/cli/journal_digest.rs")),
+            make_record("bash", true, None),
+            make_record("bash", false, None),
+        ];
+        history.push((
+            "修复和优化".into(),
+            super::build_history_text("## Done\nFixed 3 files.", &t2_records),
+        ));
+
+        // Turn 3
+        let t3_records = vec![
+            make_record("skill", true, None),
+            make_record("git_diff", true, None),
+        ];
+        history.push((
+            "review changes".into(),
+            super::build_history_text(
+                "## Review\nLGTM. Suggest adding Default to ErrorCategory.",
+                &t3_records,
+            ),
+        ));
+
+        // Turn 4 prompt
+        let messages = super::history_as_messages(&history);
+        let mut full_messages = messages;
+        full_messages.push(serde_json::json!({"role": "user", "content": "按照建议优化"}));
+
+        // Turn 4 should see file paths from ALL prior turns
+        let all_text: String = full_messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // From Turn 1
+        assert!(
+            all_text.contains("src/cli/permission_manager.rs"),
+            "Turn 1 path visible"
+        );
+        // From Turn 2
+        assert!(
+            all_text.contains("src/cli/journal_digest.rs"),
+            "Turn 2 path visible"
+        );
+        assert!(
+            all_text.contains("src/safety_middleware.rs"),
+            "Turn 2 path visible"
+        );
+        // Turn 1 failure visible
+        assert!(
+            all_text.contains("failed: read_file"),
+            "Turn 1 failure visible"
+        );
+        // Turn 2 failure visible
+        assert!(all_text.contains("failed: bash"), "Turn 2 failure visible");
+    }
+
+    /// Verify the summary doesn't bloat context excessively.
+    /// With 20 unique files across 50 tool calls, summary should be < 2KB.
+    /// Files beyond 15 are truncated with "(+N more)".
+    #[test]
+    fn tool_summary_stays_compact_under_heavy_load() {
+        let mut records = Vec::new();
+        for i in 0..50 {
+            let file = format!("src/module_{}/file_{}.rs", i / 5, i % 5);
+            records.push(make_record(
+                if i % 3 == 0 {
+                    "read_file"
+                } else {
+                    "str_replace"
+                },
+                i % 7 != 0,
+                Some(&file),
+            ));
+        }
+        let summary = super::build_turn_tool_summary(&records);
+        assert!(
+            summary.len() < 2048,
+            "summary should be compact, got {} bytes: {summary}",
+            summary.len()
+        );
+        // First 15 files shown
+        assert!(summary.contains("src/module_0/file_0.rs"));
+        // Truncation indicator
+        assert!(
+            summary.contains("more)"),
+            "should truncate beyond 15 files: {summary}"
+        );
+    }
+
+    /// Verify that compaction + tool summary works together.
+    /// After compaction, the summary from the compacted turn should still be
+    /// in the compacted summary text (since it's part of the assistant text).
+    #[test]
+    fn tool_summary_survives_in_compacted_history() {
+        let mut history: Vec<(String, String)> = Vec::new();
+
+        // Simulate a compacted entry (empty user = compacted)
+        history.push((
+            String::new(),
+            "[Prior context — 3 turns compacted]\nUser worked on fixing permission_manager.rs and safety_middleware.rs.\n\n[Turn context: files: src/permission_manager.rs, src/safety_middleware.rs | tool_calls: 12]".into(),
+        ));
+
+        // Recent turn
+        let records = vec![
+            make_record("read_file", true, Some("src/journal_digest.rs")),
+            make_record("str_replace", true, Some("src/journal_digest.rs")),
+        ];
+        history.push((
+            "add Default derive".into(),
+            super::build_history_text("Added #[derive(Default)] to ErrorCategory.", &records),
+        ));
+
+        let messages = super::history_as_messages(&history);
+        let mut full = messages;
+        full.push(serde_json::json!({"role": "user", "content": "run tests"}));
+
+        let all_text: String = full
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Compacted summary preserves old file paths
+        assert!(
+            all_text.contains("src/permission_manager.rs"),
+            "compacted paths visible"
+        );
+        // Recent turn has new paths
+        assert!(
+            all_text.contains("src/journal_digest.rs"),
+            "recent paths visible"
+        );
     }
 }

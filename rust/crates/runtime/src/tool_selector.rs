@@ -920,6 +920,8 @@ impl LlmToolSelector {
     /// Make a lightweight SSE call and collect the full response text.
     /// Returns (text, tokens_in, tokens_out).
     async fn call_llm(&self, messages: Vec<Value>) -> Result<(String, u64, u64), String> {
+        let mut messages = messages;
+        crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
         let mut payload = serde_json::json!({
             "messages": messages,
         });
@@ -1443,6 +1445,16 @@ mod tests {
     fn parse_malformed_json_returns_empty() {
         let names = parse_tool_names_from_llm("[github_list_prs]");
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn tool_selector_strips_empty_assistant_tool_calls_before_payload() {
+        let mut messages = vec![
+            serde_json::json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+        crate::turn::llm_client::strip_empty_assistant_tool_calls(&mut messages);
+        assert!(messages[0].get("tool_calls").is_none(), "{messages:?}");
     }
 
     // ── Catalog summary ──

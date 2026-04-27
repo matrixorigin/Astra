@@ -31,6 +31,7 @@ pub mod runs;
 pub mod sandbox;
 pub mod self_surface;
 pub mod session_analytics;
+pub mod session_artifact_store;
 pub mod session_audit;
 pub mod session_checkpoint;
 pub mod session_fork;
@@ -184,6 +185,11 @@ pub use self_surface::{
     SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport,
     SelfSurfaceService, SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView,
     ToolFailureView, ToolHealthView, TraceSurface, VerificationSurface,
+};
+pub use session_artifact_store::{
+    DatabaseSessionArtifactStore, LocalSessionArtifactStore, SessionArtifactJsonRecord,
+    SessionArtifactJsonStore, SessionArtifactStore, StoredSessionArtifact,
+    local_session_artifact_store,
 };
 pub use session_fork::{
     CrossBranchLearning, DataBranchOptions, ExploreError, ExploreOptions, ExploreResult,
