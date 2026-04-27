@@ -303,6 +303,22 @@ impl std::fmt::Display for CommandRisk {
 mod tests {
     use super::*;
 
+    /// Drift guard: sandbox command tests must not re-introduce raw unsafe
+    /// env mutation. Use `temp_env::with_vars` so env state is restored via
+    /// RAII even when a test panics.
+    #[test]
+    fn command_tests_use_temp_env_not_unsafe_set_var() {
+        let unsafe_open = format!("{}{}", "unsafe", " { ");
+        let std_env = format!("{}{}", "std::", "env::");
+        let sentinel_set = format!("{unsafe_open}{std_env}set_{}", "var");
+        let sentinel_remove = format!("{unsafe_open}{std_env}remove_{}", "var");
+        let source = include_str!("command.rs");
+        assert!(
+            !source.contains(&sentinel_set) && !source.contains(&sentinel_remove),
+            "command tests must use temp_env::with_vars instead of raw unsafe env mutation"
+        );
+    }
+
     // ── Environment filtering ────────────────────────────────────────────
 
     #[test]
@@ -325,17 +341,18 @@ mod tests {
         let mut p = SandboxPolicy::strict("/tmp");
         p.env_allowlist = Some(vec!["MY_VAR".to_string()]);
 
-        // Set a test var
-        unsafe { std::env::set_var("MY_VAR", "test_value") };
-        unsafe { std::env::set_var("SECRET_KEY", "should_be_filtered") };
-
-        let env = filter_environment(&p);
-        assert!(env.contains_key("PATH")); // baseline
-        assert!(env.contains_key("MY_VAR")); // allowlisted
-        assert!(!env.contains_key("SECRET_KEY")); // filtered
-
-        unsafe { std::env::remove_var("MY_VAR") };
-        unsafe { std::env::remove_var("SECRET_KEY") };
+        temp_env::with_vars(
+            [
+                ("MY_VAR", Some("test_value")),
+                ("SECRET_KEY", Some("should_be_filtered")),
+            ],
+            || {
+                let env = filter_environment(&p);
+                assert!(env.contains_key("PATH")); // baseline
+                assert!(env.contains_key("MY_VAR")); // allowlisted
+                assert!(!env.contains_key("SECRET_KEY")); // filtered
+            },
+        );
     }
 
     #[test]
@@ -522,18 +539,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = SandboxPolicy::for_project(dir.path());
 
-        unsafe { std::env::set_var("TEST_SANDBOX_VAR", "visible") };
+        temp_env::with_var("TEST_SANDBOX_VAR", Some("visible"), || {
+            let mut cmd = Command::new("env");
+            sandbox_command(&p, &mut cmd).unwrap();
+            let output = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let mut cmd = Command::new("env");
-        sandbox_command(&p, &mut cmd).unwrap();
-        let output = cmd.output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Standard mode without allowlist allows all vars, but env is cleared
-        // and re-populated, so TEST_SANDBOX_VAR should be present
-        assert!(stdout.contains("PATH="), "PATH should be in env");
-
-        unsafe { std::env::remove_var("TEST_SANDBOX_VAR") };
+            // Standard mode without allowlist allows all vars, but env is cleared
+            // and re-populated, so TEST_SANDBOX_VAR should be present
+            assert!(stdout.contains("PATH="), "PATH should be in env");
+        });
     }
 
     // ── Zsh dangerous patterns ──────────────────────────────────────────
