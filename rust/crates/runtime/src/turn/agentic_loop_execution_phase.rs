@@ -567,6 +567,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         execution_retry_notice(retry_reason),
                     );
                 }
+                // Intentionally skip record_verdict: no evaluation happened, only
+                // StepIncomplete is emitted as the terminal event.
                 record_early_exit_llm_round(
                     state,
                     &turn_result,
@@ -590,6 +592,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
                 state.messages.push(prompt);
+                // Intentionally skip record_verdict: no evaluation happened, only
+                // StepIncomplete is emitted as the terminal event.
                 record_early_exit_llm_round(
                     state,
                     &turn_result,
@@ -617,6 +621,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
         }
         AgenticIngestIterationControl::ContinueIterating => {
+            // Intentionally skip record_verdict: no evaluation happened, only
+            // StepIncomplete is emitted as the terminal event.
             record_early_exit_llm_round(
                 state,
                 &turn_result,

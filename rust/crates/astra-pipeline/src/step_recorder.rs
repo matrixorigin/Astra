@@ -632,8 +632,15 @@ impl StepRecorder {
     }
 
     /// Finalize the current turn's step.
+    ///
+    /// **Idempotent guard**: if `completed_at` is already set, this is a no-op.
+    /// This prevents duplicate terminal events when multiple code paths could
+    /// reach `end_turn` (e.g., rate-limit early exit + tool phase fallback).
     pub fn end_turn(&mut self, completed: bool) {
         if let Some(ref mut step) = self.current_step {
+            if step.execution.completed_at.is_some() {
+                return; // already finalized — idempotent guard
+            }
             if completed {
                 step.execution.status = StepStatus::Completed;
             }

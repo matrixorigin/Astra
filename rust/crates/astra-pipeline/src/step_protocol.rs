@@ -1537,7 +1537,10 @@ pub enum StepEventType {
     /// hit a round budget, or yielded to the next iteration.
     StepIncomplete,
     /// Step evaluation completed and the runtime decided what to do next.
-    /// This is not a terminal event; terminal status is recorded separately.
+    /// This is not a terminal event; terminal status is recorded separately
+    /// via `StepCompleted` or `StepIncomplete` (from `end_turn()`).
+    /// Early-exit paths that skip evaluation (retry, stop_hook, continue)
+    /// intentionally omit `StepEvaluated` and emit only `StepIncomplete`.
     StepEvaluated,
     StepFailed,
     StepRetried,

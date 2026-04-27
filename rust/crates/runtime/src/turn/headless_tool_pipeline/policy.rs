@@ -353,7 +353,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         if READ_ONLY_TOOLS.contains(&slot.name.as_str())
-            && let Some((prev_turn, _cached_output)) =
+            && let Some((prev_turn, cached_output)) =
                 self.ctx
                     .semantic_dedup
                     .pre_check_block(&slot.name, &slot.args, self.ctx.turn_index)
@@ -401,7 +401,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
                     slot.name.clone(),
-                    body.len() as u32,
+                    cached_output.len() as u32,
                     args_preview,
                 ));
             agent_warn!(
