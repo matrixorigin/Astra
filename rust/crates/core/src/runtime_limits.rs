@@ -65,7 +65,7 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_turns: 50,
+            max_turns: 150,
             plan_subtask_max_turns: 0,
             max_tool_rounds: MAX_TOOL_ROUNDS_DEFAULT, // Single source of truth
             turn_timeout_s: 300.0,

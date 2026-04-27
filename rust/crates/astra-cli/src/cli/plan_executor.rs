@@ -2634,6 +2634,7 @@ mod tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            interruption: None,
         }
     }
 
@@ -3652,6 +3653,7 @@ All acceptance checks pass:
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: Some(3),
+            interruption: None,
         };
 
         let mut turn_evt = session_journal::JournalEvent::turn(

@@ -3025,6 +3025,20 @@ impl JournalEvent {
     ) -> Self {
         let mut evt = Self::base(JournalEventType::ContextAssemblyRecorded, session_id);
         evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "trace_recorded": true,
+            "trace_kind": "context_assembly",
+            "turn_id": trace.get("turn_id").and_then(|value| value.as_str()),
+            "tool_count": trace
+                .get("tools")
+                .and_then(|tools| tools.get("tools_selected"))
+                .and_then(|selected| selected.as_array())
+                .map(Vec::len),
+            "total_tokens": trace
+                .get("token_budget")
+                .and_then(|budget| budget.get("total_used"))
+                .and_then(|value| value.as_u64()),
+        }));
         evt.context_assembly_trace = Some(trace);
         evt
     }
@@ -3480,6 +3494,26 @@ mod approval_tests {
                 .and_then(serde_json::Value::as_str),
             Some("write_file")
         );
+    }
+
+    #[test]
+    fn context_assembly_recorded_carries_metadata_summary() {
+        let evt = JournalEvent::context_assembly_recorded(
+            Some("sess"),
+            3,
+            serde_json::json!({
+                "turn_id": "turn-3",
+                "tools": {"tools_selected": [{"tool_name": "read_file"}]},
+                "token_budget": {"total_used": 1234}
+            }),
+        );
+
+        assert!(evt.context_assembly_trace.is_some());
+        let metadata = evt.metadata.as_ref().expect("context metadata");
+        assert_eq!(metadata["trace_recorded"], true);
+        assert_eq!(metadata["turn_id"], "turn-3");
+        assert_eq!(metadata["tool_count"], 1);
+        assert_eq!(metadata["total_tokens"], 1234);
     }
 }
 

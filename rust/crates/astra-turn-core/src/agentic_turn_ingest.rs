@@ -180,11 +180,10 @@ pub fn ingest_agentic_turn_stream(
     }
     let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
 
-    // Always preserve LLM text output. When tool calls follow, the text is
-    // intermediate (e.g. partial analysis before more tool use). The last
-    // round's text wins as the final answer; intermediate text is accumulated
-    // so it isn't lost if the session ends mid-loop.
-    if !snap.full_text.is_empty() {
+    // Only text-only responses are final answers. Text that accompanies tool
+    // calls is an intermediate preamble; surfacing it as `final_text` makes
+    // interrupted/budget-exhausted turns look successfully completed.
+    if !snap.full_text.is_empty() && !round_has_edge_work {
         *st.final_text = snap.full_text.to_string();
     }
 
@@ -685,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_turn_draft_text_preserves_intermediate_output() {
+    fn tool_turn_draft_text_does_not_become_final_output() {
         let tcs = vec![json!({"name": "bash", "arguments": {}})];
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
@@ -713,9 +712,10 @@ mod tests {
             pack.ingest_mut(),
         );
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
-        // Intermediate text is preserved so it isn't lost if the session
-        // ends mid-loop (e.g. on error or force-stop after tool calls).
-        assert_eq!(pack.final_text, "intermediate analysis before tool calls");
+        assert_eq!(
+            pack.final_text, "previous stable answer",
+            "tool-call preambles are intermediate and must not overwrite the user-visible final answer"
+        );
     }
 
     // ─── Factual retry injection tests ──────────────────────────────────────

@@ -1385,6 +1385,12 @@ fn commit_turn_journal_workspace_and_sidecars(
         if let Some(dur) = turn_event.duration_ms {
             turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
         }
+        if let Some(interruption) = result.interruption.as_ref() {
+            turn_event.metadata = Some(merge_interruption_metadata(
+                turn_event.metadata.take(),
+                interruption,
+            ));
+        }
 
         // Store for /turn command
         state.last_turn_event = Some(turn_event.clone());
@@ -1683,6 +1689,28 @@ fn commit_turn_journal_workspace_and_sidecars(
         // main checkpoint's `cp.summary` when the interval fires, so we
         // skip the duplicate event.
     }
+}
+
+fn merge_interruption_metadata(
+    existing: Option<serde_json::Value>,
+    interruption: &serde_json::Value,
+) -> serde_json::Value {
+    let mut metadata = match existing {
+        Some(serde_json::Value::Object(map)) => map,
+        Some(value) => {
+            let mut map = serde_json::Map::new();
+            map.insert("previous_metadata".into(), value);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    metadata.insert("partial".into(), serde_json::json!(true));
+    metadata.insert("interrupted".into(), serde_json::json!(true));
+    if let Some(kind) = interruption.get("kind").and_then(|value| value.as_str()) {
+        metadata.insert("interruption_kind".into(), serde_json::json!(kind));
+    }
+    metadata.insert("interruption".into(), interruption.clone());
+    serde_json::Value::Object(metadata)
 }
 
 /// Routing + turn quality for journal fields and `ToolSelector::record_outcome`.
@@ -4380,6 +4408,7 @@ mod tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            interruption: None,
         }
     }
 
@@ -4623,6 +4652,68 @@ mod tests {
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
         assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn interrupted_success_turn_is_marked_partial_in_journal() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-turn-partial-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 7,
+            ..Default::default()
+        };
+        let mut result = stub_stream_result(
+            "[budget_exhausted] 3 tool call(s) completed. You can continue in the next message.",
+        );
+        result.interruption = Some(serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "tool_calls_completed": 3,
+            "user_message": "[budget_exhausted] 3 tool call(s) completed. You can continue in the next message."
+        }));
+        result.tool_calls_count = 3;
+
+        let learning = analyze_repl_turn_learning("continue", state.turn, &[], &result);
+        commit_turn_journal_workspace_and_sidecars(
+            &mut state,
+            "continue",
+            &result,
+            &learning,
+            Instant::now(),
+        );
+
+        let event = state.last_turn_event.as_ref().expect("turn event");
+        let metadata = event.metadata.as_ref().expect("partial metadata");
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["interrupted"], true);
+        assert_eq!(metadata["interruption_kind"], "budget_exhausted");
+        assert_eq!(metadata["interruption"]["resumable"], true);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let persisted = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("persisted turn event");
+        assert_eq!(persisted.metadata.as_ref().unwrap()["partial"], true);
+    }
+
+    #[test]
+    fn interruption_metadata_preserves_non_object_previous_metadata() {
+        let interruption = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+        });
+
+        let metadata =
+            merge_interruption_metadata(Some(serde_json::json!("legacy-metadata")), &interruption);
+
+        assert_eq!(metadata["previous_metadata"], "legacy-metadata");
+        assert_eq!(metadata["partial"], true);
+        assert_eq!(metadata["interruption_kind"], "budget_exhausted");
+        assert_eq!(metadata["interruption"]["resumable"], true);
     }
 
     #[test]

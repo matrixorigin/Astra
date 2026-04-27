@@ -121,6 +121,9 @@ pub(crate) struct StreamResult {
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
+    /// Structured interruption context when the runtime completed the turn
+    /// partially (for example due to budget exhaustion after tool progress).
+    pub(crate) interruption: Option<serde_json::Value>,
 }
 
 impl StreamResult {

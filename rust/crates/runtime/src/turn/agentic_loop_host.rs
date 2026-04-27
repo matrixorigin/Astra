@@ -853,7 +853,8 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         } = match prepare_turn_iteration(host, state, turn_index).await? {
             PreparedTurnIteration::Ready(prep) => prep,
             PreparedTurnIteration::Finished(outcome) => {
-                if matches!(outcome, AgenticLoopOutcome::Completed) && !state.final_text.is_empty()
+                if matches!(outcome, AgenticLoopOutcome::Completed)
+                    && (!state.final_text.is_empty() || state.interruption.is_some())
                 {
                     finalize_and_render(host, state).await;
                 }
@@ -2023,11 +2024,16 @@ pub(crate) mod tests {
         };
         state.max_turns = 2;
         state.remaining_turns = 2;
+        state.final_text = "changes look good".to_string();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert_eq!(state.max_turns, 2);
+        assert!(
+            !state.final_text.contains("changes look good"),
+            "budget exhaustion must overwrite stale success-shaped text"
+        );
         assert!(
             state
                 .final_text

@@ -566,6 +566,12 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
         .messages
         .retain(|m| !crate::turn::agentic_loop_execution_phase::is_execution_corrective_message(m));
     reset_per_turn_corrective_state(state);
+    if state.final_text.trim().is_empty()
+        && let Some(interruption) = state.interruption.as_ref()
+    {
+        state.final_text = interruption.user_message.clone();
+        state.final_text_streamed = false;
+    }
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
@@ -853,6 +859,32 @@ mod tests {
             state.restricted_tools.is_empty(),
             "restricted_tools must be cleared across turns"
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_surfaces_interruption_when_final_text_is_empty() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text.clear();
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 4,
+                remaining_turns: 0,
+                error_detail: None,
+            },
+        ));
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(
+            state.final_text.contains("budget_exhausted"),
+            "interrupted tool-only turns must not persist an empty or success-shaped final answer"
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 
     #[tokio::test]

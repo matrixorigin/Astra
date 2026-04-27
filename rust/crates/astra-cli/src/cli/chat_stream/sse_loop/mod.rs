@@ -722,6 +722,7 @@ pub(crate) async fn stream_chat_sse(
             .map(|b| b.drain())
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
+        interruption: state.interruption.as_ref().map(|i| i.to_json()),
     });
     Ok(result)
 }

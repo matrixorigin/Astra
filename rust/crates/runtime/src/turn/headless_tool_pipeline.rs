@@ -644,6 +644,16 @@ mod tests {
                 .and_then(Value::as_str),
             Some("semantic_dedup_pre_check")
         );
+        assert!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("args_preview"))
+                .and_then(Value::as_str)
+                .is_some_and(|preview| preview.contains("headless")),
+            "semantic dedup skip should carry structured args_preview: {:?}",
+            tool_events[1].1
+        );
         let skipped_output = tool_events[1]
             .1
             .as_ref()

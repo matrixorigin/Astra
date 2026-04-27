@@ -513,6 +513,17 @@ fn bridge_root_turn_journal_owned(
         .unwrap_or(false)
 }
 
+fn bridge_should_create_turn_event_buffer(
+    full_llm_capture: bool,
+    root_runtime_owns_turn_journal: bool,
+) -> bool {
+    full_llm_capture || !root_runtime_owns_turn_journal
+}
+
+fn bridge_should_record_llm_round(root_runtime_owns_turn_journal: bool) -> bool {
+    !root_runtime_owns_turn_journal
+}
+
 fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
     tool_calls
         .iter()
@@ -866,7 +877,10 @@ impl InProcessChatTurnBridge {
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             let run_id = uuid::Uuid::new_v4().to_string();
-            let mut turn_event_buffer = (!root_runtime_owns_turn_journal).then(|| {
+            let mut turn_event_buffer = bridge_should_create_turn_event_buffer(
+                full_llm_capture,
+                root_runtime_owns_turn_journal,
+            ).then(|| {
                 TurnEventBuffer::begin_turn_with_round(
                     (!session_id.is_empty()).then_some(session_id.as_str()),
                     trace_turn,
@@ -2565,7 +2579,9 @@ impl InProcessChatTurnBridge {
                     Some(trace_correlation.as_capture_trace()),
                 )
                 .await;
-                if let Some(buf) = turn_event_buffer.as_mut() {
+                if bridge_should_record_llm_round(root_runtime_owns_turn_journal)
+                    && let Some(buf) = turn_event_buffer.as_mut()
+                {
                     buf.record_llm_round(LlmRoundRecord {
                         ttft_ms: None,
                         duration_ms: round_ms as u64,
@@ -2865,7 +2881,7 @@ impl InProcessChatTurnBridge {
                     Err(error) => {
                         astra_core::agent_warn!(
                             "bridge",
-                            "failed to create journal writer for llm_round flush: session={} error={}",
+                            "failed to create journal writer for turn event buffer flush: session={} error={}",
                             journal_sid,
                             error
                         );
@@ -2876,7 +2892,7 @@ impl InProcessChatTurnBridge {
                     if let Err(error) = turn_event_buffer.flush(&writer) {
                         astra_core::agent_warn!(
                             "bridge",
-                            "failed to flush llm_round events: session={} error={}",
+                            "failed to flush turn event buffer: session={} error={}",
                             journal_sid,
                             error
                         );
@@ -6454,6 +6470,112 @@ mod tests {
             &payload_owned,
             false
         ));
+    }
+
+    #[test]
+    fn root_owned_bridge_keeps_full_capture_but_suppresses_llm_round_summary() {
+        assert!(
+            bridge_should_create_turn_event_buffer(true, true),
+            "root-owned turns still need a buffer for llm_request_full/llm_response_full"
+        );
+        assert!(
+            !bridge_should_record_llm_round(true),
+            "aggregate llm_round rows are owned by the root loop"
+        );
+        assert!(
+            !bridge_should_create_turn_event_buffer(false, true),
+            "without full capture the bridge has nothing to journal for root-owned turns"
+        );
+        assert!(
+            bridge_should_record_llm_round(false),
+            "standalone bridge calls still own their llm_round summary"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn root_owned_bridge_full_capture_flushes_once_without_llm_round() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = format!("root-owned-capture-{}", uuid::Uuid::new_v4());
+        let trace = BridgeTraceCorrelation {
+            session_turn_source: "header".to_string(),
+            turn_chain_id: "chain-root-owned".to_string(),
+            user_query_event_id: "user-query-root-owned".to_string(),
+        };
+        let mut turn_event_buffer = bridge_should_create_turn_event_buffer(true, true)
+            .then(|| TurnEventBuffer::begin_turn_with_round(Some(&session_id), 7, 3));
+
+        record_full_llm_request_event(
+            &mut turn_event_buffer,
+            true,
+            &session_id,
+            7,
+            &trace,
+            "bridge_inprocess",
+            "gpt-5",
+            "openai",
+            1,
+            &[json!({"role": "user", "content": "inspect"})],
+            &[],
+            Some(1024),
+        );
+        if bridge_should_record_llm_round(true)
+            && let Some(buf) = turn_event_buffer.as_mut()
+        {
+            buf.record_llm_round(LlmRoundRecord {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                cache_read_tokens: 0,
+                ttft_ms: None,
+                duration_ms: 1,
+                tool_calls_returned: 0,
+                tool_call_names: Vec::new(),
+                finish_reason: Some("stop".to_string()),
+                agentic_step: Some(3),
+                source: Some("bridge_inprocess".to_string()),
+                run_id: None,
+                tool_calls: None,
+            });
+        }
+        record_full_llm_response_event(
+            &mut turn_event_buffer,
+            true,
+            &session_id,
+            7,
+            &trace,
+            "bridge_inprocess",
+            "gpt-5",
+            "openai",
+            1,
+            "ok",
+            json!({"content": "done"}),
+        );
+        let writer = JournalWriter::new(&session_id).unwrap();
+        turn_event_buffer.as_mut().unwrap().flush(&writer).unwrap();
+        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::LlmRequestFull)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::LlmResponseFull)
+                .count(),
+            1
+        );
+        assert!(
+            events.iter().all(|event| event.event_type
+                != astra_services::session_journal::JournalEventType::LlmRound),
+            "root-owned bridge flush must not double-write aggregate llm_round rows"
+        );
     }
 
     #[test]

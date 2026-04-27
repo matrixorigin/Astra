@@ -2663,6 +2663,7 @@ mod exit_code_tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            interruption: None,
         }
     }
 

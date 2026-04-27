@@ -129,7 +129,8 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
                 stat
             ))
         }
-        // Non-cacheable tools (bash, write_file, web_fetch, etc.) — no semantic key
+        "bash" => semantic_bash_git_key(args),
+        // Non-cacheable tools (write_file, web_fetch, most bash commands, etc.) — no semantic key
         // Analysis tools: key on target symbol/file
         "symbols" | "find_definition" | "find_references" => {
             let path = arg_str(args, "file").or_else(|| arg_str(args, "path"))?;
@@ -191,6 +192,39 @@ fn normalize_path(path: &str) -> String {
 
 fn normalize_repo(repo: &str) -> String {
     repo.trim().to_lowercase().trim_end_matches('/').to_string()
+}
+
+fn semantic_bash_git_key(args: &Value) -> Option<String> {
+    let command = arg_str(args, "command")?.trim();
+    if command
+        .chars()
+        .any(|ch| matches!(ch, '|' | ';' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'))
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.first() == Some(&"git") && parts.get(1) == Some(&"--no-pager") {
+        parts.remove(1);
+    }
+    match parts.as_slice() {
+        ["git", "status"] | ["git", "status", "--short"] | ["git", "status", "--porcelain"] => {
+            Some("git_status".to_string())
+        }
+        ["git", "diff"] | ["git", "diff", "HEAD"] => {
+            Some("git_diff:..HEAD:staged=false:stat_only=false:path=".to_string())
+        }
+        ["git", "diff", "--stat"] => {
+            Some("git_diff:..HEAD:staged=false:stat_only=true:path=".to_string())
+        }
+        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => {
+            Some("git_diff:..HEAD:staged=true:stat_only=false:path=".to_string())
+        }
+        ["git", "diff", "--", path] => Some(format!(
+            "git_diff:..HEAD:staged=false:stat_only=false:path={}",
+            normalize_path(path)
+        )),
+        _ => None,
+    }
 }
 
 // ─── Tier 3: Output Similarity ───────────────────────────────────────────────
@@ -629,8 +663,27 @@ mod tests {
     }
 
     #[test]
-    fn bash_returns_none() {
+    fn bash_non_git_returns_none() {
         assert!(semantic_call_key("bash", &json!({"command": "ls"})).is_none());
+    }
+
+    #[test]
+    fn bash_git_diff_shares_git_diff_semantic_key() {
+        let bash = semantic_call_key("bash", &json!({"command": "git --no-pager diff"}));
+        let structured = semantic_call_key("git_diff", &json!({}));
+        assert_eq!(bash, structured);
+
+        let bash_head = semantic_call_key("bash", &json!({"command": "git diff HEAD"}));
+        assert_eq!(bash_head, structured);
+
+        let bash_path = semantic_call_key("bash", &json!({"command": "git diff -- src/"}));
+        let structured_path = semantic_call_key("git_diff", &json!({"path": "src", "ref": "HEAD"}));
+        assert_eq!(bash_path, structured_path);
+    }
+
+    #[test]
+    fn bash_compound_git_diff_is_not_canonicalized() {
+        assert!(semantic_call_key("bash", &json!({"command": "git diff | head"})).is_none());
     }
 
     #[test]

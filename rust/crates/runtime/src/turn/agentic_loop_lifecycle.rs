@@ -427,10 +427,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 ResumeAction::ContinueImmediately,
                 interruption_state_summary(state, None),
             ));
-            if state.final_text.trim().is_empty() {
-                state.final_text = budget_exhaustion_completion_text(state);
-                state.final_text_streamed = false;
-            }
+            state.final_text = budget_exhaustion_completion_text(state);
+            state.final_text_streamed = false;
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,

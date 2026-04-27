@@ -65,10 +65,16 @@ fn trace_short_circuit_tool_skip(
     tool_name: &str,
     reason: &str,
     idempotency_key: Option<&str>,
+    args_preview: Option<&str>,
     output: Option<&str>,
     was_cached: bool,
 ) {
-    step_recorder.begin_tool_with_key(tool_name, tool_id, idempotency_key);
+    step_recorder.begin_tool_with_key_and_args_preview(
+        tool_name,
+        tool_id,
+        idempotency_key,
+        args_preview,
+    );
     step_recorder.skip_tool_with_reason(tool_name, reason, was_cached, output);
 }
 
@@ -86,6 +92,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &slot.name,
             "turn_budget_exhausted",
             None,
+            make_args_preview(&slot.name, &slot.args).as_deref(),
             Some(&body),
             false,
         );
@@ -134,6 +141,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &slot.name,
             "unknown_tool",
             None,
+            make_args_preview(&slot.name, &slot.args).as_deref(),
             Some(&err_msg),
             false,
         );
@@ -230,6 +238,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &slot.name,
                 skip_reason,
                 Some(&idem_key.cache_key()),
+                args_preview.as_deref(),
                 None,
                 skip_reason == REASON_REPEATED_CACHE_HIT_SUPPRESSED,
             );
@@ -391,6 +400,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &slot.name,
                 "semantic_dedup_pre_check",
                 Some(&idem_key.cache_key()),
+                args_preview.as_deref(),
                 Some(&body),
                 false,
             );
@@ -471,6 +481,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &execution.name,
                 "unknown_tool",
                 None,
+                make_args_preview(&execution.name, &execution.args).as_deref(),
                 Some(&err_msg),
                 false,
             );

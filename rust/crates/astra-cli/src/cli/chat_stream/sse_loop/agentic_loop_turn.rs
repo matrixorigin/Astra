@@ -686,13 +686,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.turn_chain_id,
         ctx.user_query_event_id,
     );
-    // Only mark root_turn_journal_owned when this is the first round of the
-    // root turn — sub-turns (round > 0) must not claim ownership of the
-    // root journal.
-    if ctx.round_index == 0 {
-        if let Some(root) = payload.as_object_mut() {
-            root.insert("root_turn_journal_owned".into(), json!(true));
-        }
+    // The outer agentic loop is the single owner of aggregate turn journal
+    // rows for every LLM round. The bridge may still capture full request /
+    // response payloads for debugging, but it must not emit duplicate
+    // `llm_round` summaries for later rounds.
+    if let Some(root) = payload.as_object_mut() {
+        root.insert("root_turn_journal_owned".into(), json!(true));
     }
 
     // ─── SelfModel: inject self-awareness text into edge_profile ───
