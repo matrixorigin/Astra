@@ -451,6 +451,10 @@ fn content_text_value(content: Option<&Value>) -> Option<String> {
     }
 }
 
+fn is_nonblank_text(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
 fn bedrock_cache_point_from_cache_control(cache_control: Option<&Value>) -> Option<Value> {
     let cache_control = cache_control?;
     let mut cache_point = Map::new();
@@ -474,16 +478,16 @@ fn bedrock_cache_point_from_block(block: &Value) -> Option<Value> {
 
 fn build_bedrock_text_content_blocks(content: Option<&Value>) -> Vec<Value> {
     match content {
-        Some(Value::String(text)) if !text.is_empty() => vec![json!({ "text": text })],
+        Some(Value::String(text)) if is_nonblank_text(text) => vec![json!({ "text": text })],
         Some(Value::Array(parts)) => {
             let mut blocks = Vec::new();
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
+                    if is_nonblank_text(text) {
                         blocks.push(json!({ "text": text }));
                     }
                 } else if let Some(text) = part.as_str() {
-                    if !text.is_empty() {
+                    if is_nonblank_text(text) {
                         blocks.push(json!({ "text": text }));
                     }
                 }
@@ -496,7 +500,7 @@ fn build_bedrock_text_content_blocks(content: Option<&Value>) -> Vec<Value> {
         Some(Value::Object(obj)) => {
             let mut blocks = Vec::new();
             if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                if !text.is_empty() {
+                if is_nonblank_text(text) {
                     blocks.push(json!({ "text": text }));
                 }
             }
@@ -507,6 +511,15 @@ fn build_bedrock_text_content_blocks(content: Option<&Value>) -> Vec<Value> {
         }
         _ => Vec::new(),
     }
+}
+
+fn bedrock_system_has_text(blocks: &[Value]) -> bool {
+    blocks.iter().any(|block| {
+        block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(is_nonblank_text)
+    })
 }
 
 fn bedrock_cache_point_from_message_content(content: Option<&Value>) -> Option<Value> {
@@ -663,7 +676,7 @@ pub(crate) fn build_provider_request_body(
             let mut body = json!({
                 "messages": bedrock_messages,
             });
-            if !system.is_empty() {
+            if bedrock_system_has_text(&system) {
                 body["system"] = Value::Array(system);
             }
             let mut inference = Map::new();
@@ -3716,6 +3729,61 @@ mod tests {
         );
         assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
         assert_eq!(body["toolConfig"]["tools"][1]["cachePoint"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn build_bedrock_body_skips_whitespace_only_system_blocks() {
+        let messages = consolidate_system_messages(&[
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]
+            }),
+            json!({"role": "system", "content": "runtime hints"}),
+            json!({"role": "user", "content": "hello"}),
+        ]);
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock",
+            Some(128),
+            None,
+            false,
+        );
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system[0]["text"], "stable");
+        assert_eq!(system[1]["cachePoint"]["ttl"], "1h");
+        assert_eq!(system[2]["text"], "runtime hints");
+        assert!(system.iter().all(|block| {
+            block.get("text")
+                .and_then(Value::as_str)
+                .is_none_or(|text| !text.trim().is_empty())
+        }));
+    }
+
+    #[test]
+    fn build_bedrock_body_omits_cachepoint_only_system() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [
+                    {"cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]
+            }),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock",
+            Some(128),
+            None,
+            false,
+        );
+        assert!(body.get("system").is_none());
     }
 
     // ── Golden cases: real provider SSE fixtures ──────────────────────────────

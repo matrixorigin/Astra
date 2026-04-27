@@ -185,6 +185,7 @@ fn build_bedrock_summary_body(messages: &[Value], max_output_tokens: usize) -> V
         .iter()
         .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
         .filter_map(|msg| msg.get("content").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
         .map(|text| json!({ "text": text }))
         .collect::<Vec<_>>();
     let bedrock_messages = messages
@@ -537,6 +538,17 @@ mod tests {
             parse_summary_response_text("bedrock", &response),
             "summary line 1\nsummary line 2"
         );
+    }
+
+    #[test]
+    fn build_bedrock_summary_body_omits_blank_system() {
+        let messages = vec![
+            json!({"role": "system", "content": "   \n\t"}),
+            json!({"role": "user", "content": "some conversation"}),
+        ];
+        let body = build_bedrock_summary_body(&messages, 321);
+        assert!(body.get("system").is_none());
+        assert_eq!(body["messages"][0]["role"], "user");
     }
 
     #[test]
