@@ -214,6 +214,22 @@ fn build_bug_report(state: &ReplState) -> String {
 mod tests {
     use super::*;
 
+    /// Drift guard: slash_bug tests must not re-introduce raw unsafe env
+    /// mutation. Use `temp_env::with_var` so env state is restored via RAII
+    /// even when a test panics.
+    #[test]
+    fn slash_bug_tests_use_temp_env_not_unsafe_set_var() {
+        let unsafe_open = format!("{}{}", "unsafe", " { ");
+        let std_env = format!("{}{}", "std::", "env::");
+        let sentinel_set = format!("{unsafe_open}{std_env}set_{}", "var");
+        let sentinel_remove = format!("{unsafe_open}{std_env}remove_{}", "var");
+        let source = include_str!("slash_bug.rs");
+        assert!(
+            !source.contains(&sentinel_set) && !source.contains(&sentinel_remove),
+            "slash_bug tests must use temp_env::with_var instead of raw unsafe env mutation"
+        );
+    }
+
     fn test_state() -> ReplState {
         let mut s = ReplState::default();
         s.model = Some("gpt-4o".to_string());
@@ -264,22 +280,22 @@ mod tests {
 
     #[test]
     fn bug_report_redacts_api_key() {
-        unsafe { std::env::set_var("MO_API_KEY", "sk-secret-key-12345") };
-        let report = build_bug_report(&test_state());
-        assert!(
-            !report.contains("sk-secret-key-12345"),
-            "API key must be redacted"
-        );
-        assert!(report.contains("[REDACTED"));
-        unsafe { std::env::remove_var("MO_API_KEY") };
+        temp_env::with_var("MO_API_KEY", Some("sk-secret-key-12345"), || {
+            let report = build_bug_report(&test_state());
+            assert!(
+                !report.contains("sk-secret-key-12345"),
+                "API key must be redacted"
+            );
+            assert!(report.contains("[REDACTED"));
+        });
     }
 
     #[test]
     fn bug_report_shows_non_sensitive_env() {
-        unsafe { std::env::set_var("MO_MODEL", "claude-sonnet-4") };
-        let report = build_bug_report(&test_state());
-        assert!(report.contains("claude-sonnet-4"));
-        unsafe { std::env::remove_var("MO_MODEL") };
+        temp_env::with_var("MO_MODEL", Some("claude-sonnet-4"), || {
+            let report = build_bug_report(&test_state());
+            assert!(report.contains("claude-sonnet-4"));
+        });
     }
 
     #[test]
