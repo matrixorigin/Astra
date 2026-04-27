@@ -216,6 +216,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 .as_micros()
         );
 
+        // Resolve per-model workflow-guard policy before `effective_model` is
+        // consumed by `.with_model(...)` below.
+        let resolved_tool_policy = crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .resolve_for_model(effective_model.as_deref());
+
         // Build the host for the sub-run.
         let mut builder = ServerAgenticLoopHostBuilder::new(
             self.matrixone.clone(),
@@ -311,12 +317,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(crate::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
-            max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_tools_per_turn(),
+            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

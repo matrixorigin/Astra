@@ -1918,6 +1918,10 @@ impl AgenticRunLifecycleService {
             cancel_token,
         );
 
+        let resolved_tool_policy = crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .resolve_for_model(request.model.as_deref());
+
         AgenticLoopState {
             messages: vec![user_message],
             tool_results: Vec::new(),
@@ -1946,12 +1950,15 @@ impl AgenticRunLifecycleService {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
-            max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_tools_per_turn(),
+            // Per-model workflow-guard policy (see
+            // `ToolSelectionConfig::resolve_for_model`). Built-in profiles
+            // give stronger models (opus/sonnet-4) more rope than haiku.
+            // Security guards (shell_obfuscation, destructive_sql) are
+            // unaffected and stay uniform across models.
+            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
@@ -3371,6 +3378,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.request_constraints.allowed_skills.as_ref(),
         )?;
 
+        // Sub-agent / delegation path: model comes from the agent profile
+        // override, not a request field.
+        let resolved_tool_policy = crate::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .resolve_for_model(config.agent_profile.model_override.as_deref());
+
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
             tool_results: Vec::new(),
@@ -3401,12 +3414,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
-            max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_tools_per_turn(),
+            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

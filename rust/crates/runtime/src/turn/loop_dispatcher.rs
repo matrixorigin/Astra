@@ -295,6 +295,8 @@ mod tests {
                 .tool_selection
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
+            repeated_cache_hit_suppression: 3,
+            max_consecutive_empty_name: 3,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),

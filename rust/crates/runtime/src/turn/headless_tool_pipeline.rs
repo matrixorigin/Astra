@@ -90,6 +90,10 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub call_counts: &'a mut HashMap<String, u32>,
     pub max_identical_calls: u32,
     pub max_tools_per_turn: u32,
+    /// Consecutive cache-hit suppression cap (was `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD`).
+    pub repeated_cache_hit_suppression: u32,
+    /// Headless-round abort cap for consecutive empty-name calls (was `MAX_CONSECUTIVE_EMPTY_NAME`).
+    pub max_consecutive_empty_name: u32,
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
     pub term: &'a mut dyn HeadlessRoundTerminal,
@@ -170,10 +174,6 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
-    /// After this many consecutive empty-name tool calls in one headless round,
-    /// stop processing — the model is stuck emitting malformed calls.
-    const MAX_CONSECUTIVE_EMPTY_NAME: u32 = 3;
-
     pub(crate) fn new(ctx: HeadlessToolExecutionCtx<'a, E>, consumed_edge: Vec<bool>) -> Self {
         Self {
             ctx,
@@ -396,6 +396,8 @@ mod tests {
         tool_call_records: Vec<ToolCallRecord>,
         tool_event_hooks: ToolEventHookRegistry,
         term: NoopHeadlessTerminal,
+        repeated_cache_hit_suppression: u32,
+        max_consecutive_empty_name: u32,
     }
 
     impl PipelineHarness {
@@ -426,6 +428,10 @@ mod tests {
                 tool_call_records: Vec::new(),
                 tool_event_hooks: ToolEventHookRegistry::default(),
                 term: NoopHeadlessTerminal,
+                // Tests assume the legacy threshold of 2 unless they override.
+                // Production runs derive these from the per-model policy.
+                repeated_cache_hit_suppression: 2,
+                max_consecutive_empty_name: 3,
             }
         }
 
@@ -462,6 +468,8 @@ mod tests {
                     call_counts: &mut self.call_counts,
                     max_identical_calls: 2,
                     max_tools_per_turn: 15,
+                    repeated_cache_hit_suppression: self.repeated_cache_hit_suppression,
+                    max_consecutive_empty_name: self.max_consecutive_empty_name,
                     tool_call_records: &mut self.tool_call_records,
                     tool_event_hooks: &self.tool_event_hooks,
                     term: &mut self.term,

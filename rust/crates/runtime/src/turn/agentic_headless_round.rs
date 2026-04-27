@@ -50,6 +50,11 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub call_counts: &'a mut HashMap<String, u32>,
     pub max_identical_calls: u32,
     pub max_tools_per_turn: u32,
+    /// Mirrors `AgenticLoopState::repeated_cache_hit_suppression`; threaded
+    /// into the downstream `HeadlessToolExecutionCtx`.
+    pub repeated_cache_hit_suppression: u32,
+    /// Mirrors `AgenticLoopState::max_consecutive_empty_name`.
+    pub max_consecutive_empty_name: u32,
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
     pub term: &'a mut dyn HeadlessRoundTerminal,
@@ -177,6 +182,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         call_counts,
         max_identical_calls,
         max_tools_per_turn,
+        repeated_cache_hit_suppression,
+        max_consecutive_empty_name,
         tool_call_records,
         tool_event_hooks,
         term,
@@ -230,6 +237,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             call_counts,
             max_identical_calls,
             max_tools_per_turn,
+            repeated_cache_hit_suppression,
+            max_consecutive_empty_name,
             tool_call_records,
             tool_event_hooks,
             term,

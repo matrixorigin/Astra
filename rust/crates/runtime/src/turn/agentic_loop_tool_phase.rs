@@ -799,6 +799,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             call_counts: &mut state.call_counts,
             max_identical_calls: state.max_identical_tool_calls,
             max_tools_per_turn: state.max_tools_per_turn,
+            repeated_cache_hit_suppression: state.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: state.max_consecutive_empty_name,
             tool_call_records: &mut state.stall.tool_call_records,
             tool_event_hooks: &state.skills.tool_event_hooks,
             term: &mut term_adapter,

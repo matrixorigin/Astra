@@ -594,6 +594,13 @@ pub struct AgenticLoopState {
     pub max_identical_tool_calls: u32,
     /// Resolved max tool calls per turn (from config, computed once at init).
     pub max_tools_per_turn: u32,
+    /// Consecutive cache-hit suppression cap before the pipeline switches
+    /// from soft-hint to hard-refusal. Replaces the former hardcoded
+    /// `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` (was 2).
+    pub repeated_cache_hit_suppression: u32,
+    /// Headless-round abort cap for consecutive empty-name tool calls.
+    /// Replaces the former hardcoded `MAX_CONSECUTIVE_EMPTY_NAME` (was 3).
+    pub max_consecutive_empty_name: u32,
 
     // ── Sub-states ──
     pub skills: SkillState,
@@ -1020,14 +1027,28 @@ mod synthesise_finish_reason_tests {
     }
 }
 
-/// Extract repository name from a git remote URL.
 /// **Test-only.** Build a minimal [`AgenticLoopState`] suitable for driving
 /// the mock-LLM path in integration tests (feature `bridge-e2e-hooks`).
 ///
 /// All fields use safe defaults; tests should mutate the returned state
 /// directly (e.g. push into `messages`, set `llm_rounds_completed`).
+///
+/// Delegates to [`make_test_loop_state_for_model`] with `None`, which
+/// resolves workflow-guard thresholds from the global config defaults.
 #[cfg(feature = "bridge-e2e-hooks")]
 pub fn make_test_loop_state() -> AgenticLoopState {
+    make_test_loop_state_for_model(None)
+}
+
+/// **Test-only.** Like [`make_test_loop_state`], but resolves workflow-guard
+/// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
+/// [`crate::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
+/// request carrying a specific model id sees that model's profile.
+#[cfg(feature = "bridge-e2e-hooks")]
+pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
+    let policy = crate::runtime_config::RuntimeConfig::load()
+        .tool_selection
+        .resolve_for_model(model);
     AgenticLoopState {
         messages: Vec::new(),
         tool_results: Vec::new(),
@@ -1056,12 +1077,10 @@ pub fn make_test_loop_state() -> AgenticLoopState {
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(0.95),
         call_counts: HashMap::new(),
-        max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .effective_max_identical_calls(),
-        max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .effective_max_tools_per_turn(),
+        max_identical_tool_calls: policy.max_identical_tool_calls,
+        max_tools_per_turn: policy.max_tools_per_turn,
+        repeated_cache_hit_suppression: policy.repeated_cache_hit_suppression,
+        max_consecutive_empty_name: policy.max_consecutive_empty_name,
         stall: Default::default(),
         telemetry: Default::default(),
         skills: SkillState {
@@ -1407,6 +1426,8 @@ pub(crate) mod tests {
             max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_tools_per_turn(),
+            repeated_cache_hit_suppression: 3,
+            max_consecutive_empty_name: 3,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

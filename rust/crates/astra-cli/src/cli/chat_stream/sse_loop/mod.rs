@@ -87,6 +87,12 @@ pub(crate) async fn stream_chat_sse(
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     let term_width = terminal_width_usize();
+    // Capture the model id up front for later `resolve_for_model` calls —
+    // `p.model` (Option<&str>) gets consumed into `host.model` below.
+    let model_id_for_policy = p.model;
+    let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+        .tool_selection
+        .resolve_for_model(model_id_for_policy);
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
@@ -358,9 +364,7 @@ pub(crate) async fn stream_chat_sse(
         root_send_message_context,
         repl_turn_index: p.turn_index,
         tool_cache: crate::stream_render::EdgeToolCache::new(
-            astra_runtime::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
+            resolved_tool_policy.max_identical_tool_calls,
         ),
     };
 
@@ -482,12 +486,10 @@ pub(crate) async fn stream_chat_sse(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),
         call_counts: HashMap::new(),
-        max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .effective_max_identical_calls(),
-        max_tools_per_turn: astra_runtime::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .effective_max_tools_per_turn(),
+        max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
+        max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
+        repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
+        max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),

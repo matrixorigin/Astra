@@ -24,7 +24,8 @@ use crate::turn::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
-const REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD: usize = 2;
+// `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` moved into `EffectiveToolPolicy`
+// as `repeated_cache_hit_suppression`; read from `ctx` on every call.
 const REASON_DUPLICATE_WITHIN_TURN: &str = "duplicate_within_turn";
 const REASON_REPEATED_CACHE_HIT_SUPPRESSED: &str = "repeated_cache_hit_suppressed";
 
@@ -153,7 +154,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // Track unknown tool as a failure so ToolHealthTracker can deprioritize
         // after CONSECUTIVE_FAILURE_THRESHOLD hits (prevents infinite retry loops).
         self.ctx.turn_guard.health.record_failure(&slot.name);
-        if self.consecutive_empty_name >= Self::MAX_CONSECUTIVE_EMPTY_NAME {
+        if self.consecutive_empty_name >= self.ctx.max_consecutive_empty_name {
             agent_warn!(
                 "step",
                 "Aborting headless tool round after {} consecutive empty-name tool calls",
@@ -202,7 +203,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .turn_guard
                     .health
                     .cache_hits_for_signature(&call_sig);
-                let body = if prior_cache_hits >= REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD {
+                let body = if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                     skip_reason = REASON_REPEATED_CACHE_HIT_SUPPRESSED;
                     format!(
                         "⛔ Repeated cached read suppressed: this exact {} request has already \
@@ -273,7 +274,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .turn_guard
                 .health
                 .cache_hits_for_signature(&call_sig);
-            if prior_cache_hits >= REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD {
+            if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                 let body = format!(
                     "⛔ Repeated cached read suppressed: this exact {} request has already \
                      been served from cache {} time(s). Use the earlier cached result in the \

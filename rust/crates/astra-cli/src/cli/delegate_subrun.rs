@@ -204,6 +204,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             astra_runtime::turn::microcompact::CompactStrategy::from_provider_hint(
                 effective_model.as_deref().unwrap_or(""),
             );
+        // Resolve per-model workflow-guard policy up front; `effective_model`
+        // is moved into the SubRunHost below.
+        let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .resolve_for_model(effective_model.as_deref());
 
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
@@ -247,9 +252,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             progress_tx: self.progress_tx.clone(),
             agent_id: profile.agent_id.clone(),
             tool_cache: super::stream_render::EdgeToolCache::new(
-                astra_runtime::runtime_config::RuntimeConfig::load()
-                    .tool_selection
-                    .effective_max_identical_calls(),
+                resolved_tool_policy.max_identical_tool_calls,
             ),
         };
 
@@ -325,12 +328,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_identical_calls(),
-            max_tools_per_turn: astra_runtime::runtime_config::RuntimeConfig::load()
-                .tool_selection
-                .effective_max_tools_per_turn(),
+            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
+            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
+            repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
+            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
