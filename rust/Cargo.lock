@@ -173,6 +173,7 @@ dependencies = [
  "serial_test",
  "sha2",
  "sqlx",
+ "temp-env",
  "tempfile",
  "termimad",
  "thiserror 1.0.69",
@@ -386,6 +387,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tar",
+ "temp-env",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -406,6 +408,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "temp-env",
  "tempfile",
  "tokio",
  "tracing",
@@ -5292,6 +5295,16 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
+]
+
+[[package]]
+name = "temp-env"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
+dependencies = [
+ "futures",
+ "parking_lot",
 ]
 
 [[package]]
