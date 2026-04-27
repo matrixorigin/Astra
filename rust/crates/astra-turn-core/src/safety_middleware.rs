@@ -443,10 +443,17 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
 
     // 4. Command substitution / backticks — dynamic execution hidden in arguments
     if check_command_substitution(command) {
-        return Some(
-            "shell command contains command substitution (`$(...)` or backticks), which can execute hidden commands dynamically"
-                .to_string(),
-        );
+        let hint = if command_has_interpreter_inline_code(command) {
+            ". For `node -e` / `python3 -c` with template literals or `$(...)`, \
+             use single quotes around the code argument (e.g. `node -e '...'`) \
+             or write the script to a file first"
+        } else {
+            ""
+        };
+        return Some(format!(
+            "shell command contains command substitution (`$(...)` or backticks), \
+             which can execute hidden commands dynamically{hint}"
+        ));
     }
 
     // 5. Inline interpreter execution check removed.
@@ -478,13 +485,9 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 9. Backslash-escaped whitespace — can alter shell tokenization
-    if check_backslash_escaped_whitespace(command) {
-        return Some(
-            "shell command contains backslash-escaped whitespace that can alter command parsing"
-                .to_string(),
-        );
-    }
+    // 9. (Removed) Backslash-escaped whitespace check was too strict — `cp my\ file.txt dest/`
+    // is standard shell idiom for spaces in filenames. The permission layer handles suspicious
+    // commands via Ask.
 
     // 10. /proc/*/environ access — can expose sensitive environment variables
     if check_proc_environ_access(command) {
@@ -624,6 +627,20 @@ fn check_command_substitution(command: &str) -> bool {
     }
 
     false
+}
+
+/// Detect `node -e "..."` / `python3 -c "..."` patterns where the inline
+/// code argument is double-quoted (making `$()` and backticks dangerous).
+fn command_has_interpreter_inline_code(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let interpreters = [
+        "node -e ",
+        "node -e\"",
+        "nodejs -e ",
+        "python3 -c ",
+        "python -c ",
+    ];
+    interpreters.iter().any(|pat| lower.contains(pat))
 }
 
 /// Check if command has backticks outside of single quotes
@@ -1134,37 +1151,6 @@ fn check_carriage_return_attack(command: &str) -> bool {
         if ch == '\r' && !in_double_quote {
             return true;
         }
-    }
-
-    false
-}
-
-fn check_backslash_escaped_whitespace(command: &str) -> bool {
-    let chars: Vec<char> = command.chars().collect();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut i = 0usize;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '\\' && !in_single_quote {
-            if !in_double_quote && matches!(chars.get(i + 1), Some(' ' | '\t')) {
-                return true;
-            }
-            i += 2;
-            continue;
-        }
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            i += 1;
-            continue;
-        }
-        if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            i += 1;
-            continue;
-        }
-        i += 1;
     }
 
     false
@@ -1770,6 +1756,35 @@ mod tests {
     }
 
     #[test]
+    fn node_e_backtick_error_includes_single_quote_hint() {
+        // When node -e code uses backticks (JS template literals) inside double
+        // quotes, the error should guide the LLM to use single quotes or a file.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"node -e "const x = `hello`; console.log(x)""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("single quotes") || reason.contains("write the script to a file")
+        ));
+    }
+
+    #[test]
+    fn python_c_dollar_paren_error_includes_single_quote_hint() {
+        // When python3 -c code uses $() inside double quotes, guide the LLM.
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"python3 -c "import os; os.system($(get_cmd))""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("single quotes") || reason.contains("write the script to a file")
+        ));
+    }
+
+    #[test]
     fn middleware_allows_env_wrapped_python_inline_exec() {
         // Inline interpreter execution is now allowed (user reviews during approval)
         let decision = evaluate_tool_safety_request(
@@ -1919,14 +1934,15 @@ mod tests {
     }
 
     #[test]
-    fn middleware_blocks_backslash_escaped_whitespace() {
+    fn middleware_allows_backslash_escaped_whitespace_in_filenames() {
+        // `cp my\ file.txt dest/` is standard shell idiom for spaces in filenames
         let decision =
-            evaluate_tool_safety_request("bash", &json!({"command": r"echo\ test /tmp/file"}));
-        assert!(matches!(
-            decision,
-            SafetyMiddlewareDecision::Deny(reason)
-                if reason.contains("shell_obfuscation") && reason.contains("backslash-escaped whitespace")
-        ));
+            evaluate_tool_safety_request("bash", &json!({"command": r"cp my\ file.txt dest/"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": r"cat my\ doc\ v2.txt"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]

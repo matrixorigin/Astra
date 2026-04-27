@@ -24,13 +24,14 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::rate_limit_cooldown::{PerModelCooldown, RateLimitAction};
+use crate::bridge::rate_limit_cooldown::RateLimitAction;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
     TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop_tool_support::edge_tool_status_exit_code;
+use crate::turn::bridge_llm_stream::rate_limit_cooldown;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
@@ -38,7 +39,7 @@ use crate::turn::llm_client::{
     sleep_ms_or_llm_cancel,
 };
 use crate::turn::prompt_cache::{
-    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    PromptCacheConfig, annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
     build_system_message_with_dynamic_sections,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
@@ -46,13 +47,6 @@ use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
-
-// ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
-/// Per-model rate-limit cooldown tracker (shared with llm_client).
-fn rate_limit_cooldown() -> &'static PerModelCooldown {
-    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(PerModelCooldown::new)
-}
 
 fn request_aware_summary_http_client() -> Result<reqwest::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
@@ -76,6 +70,161 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
         (None, Some(t)) => LlmCancel::Token(t.as_ref()),
         (None, None) => LlmCancel::None,
     }
+}
+
+fn record_full_llm_request_event(
+    state: &mut AgenticLoopState,
+    full_llm_capture: bool,
+    session_id: &str,
+    source: &str,
+    model: &str,
+    provider: &str,
+    attempt: u32,
+    messages: &[Value],
+    tools: &[Value],
+    max_output_tokens: Option<usize>,
+) {
+    if session_id.is_empty() || !full_llm_capture {
+        return;
+    }
+    let Some(buf) = state.turn_event_buffer.as_mut() else {
+        return;
+    };
+    let round = buf.current_round();
+    let trace = crate::turn::llm_exchange_capture::CaptureTrace {
+        session_turn_source: Some("state"),
+        turn_chain_id: None,
+        user_query_event_id: None,
+    };
+    let mut evt = astra_services::session_journal::JournalEvent::llm_request_full(
+        Some(session_id),
+        state.session_turn,
+        round,
+        json!({
+            "source": source,
+            "model": model,
+            "provider": provider,
+            "attempt": attempt,
+            "trace": {
+                "session_turn": state.session_turn,
+                "round": round,
+                "session_turn_source": trace.session_turn_source,
+                "turn_chain_id": trace.turn_chain_id,
+                "user_query_event_id": trace.user_query_event_id,
+            },
+            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
+                messages,
+                tools,
+                max_output_tokens,
+            ),
+        }),
+    );
+    evt.offset_ms = Some(buf.offset_ms());
+    buf.record(evt);
+}
+
+fn record_full_llm_response_event(
+    state: &mut AgenticLoopState,
+    full_llm_capture: bool,
+    session_id: &str,
+    source: &str,
+    model: &str,
+    provider: &str,
+    attempt: u32,
+    outcome: &str,
+    response: Value,
+) {
+    if session_id.is_empty() || !full_llm_capture {
+        return;
+    }
+    let Some(buf) = state.turn_event_buffer.as_mut() else {
+        return;
+    };
+    let round = buf.current_round();
+    let trace = crate::turn::llm_exchange_capture::CaptureTrace {
+        session_turn_source: Some("state"),
+        turn_chain_id: None,
+        user_query_event_id: None,
+    };
+    let mut evt = astra_services::session_journal::JournalEvent::llm_response_full(
+        Some(session_id),
+        state.session_turn,
+        round,
+        json!({
+            "source": source,
+            "model": model,
+            "provider": provider,
+            "attempt": attempt,
+            "trace": {
+                "session_turn": state.session_turn,
+                "round": round,
+                "session_turn_source": trace.session_turn_source,
+                "turn_chain_id": trace.turn_chain_id,
+                "user_query_event_id": trace.user_query_event_id,
+            },
+            "response": crate::turn::llm_exchange_capture::build_capture_response_json(
+                outcome,
+                response,
+            ),
+        }),
+    );
+    evt.offset_ms = Some(buf.offset_ms());
+    buf.record(evt);
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn mock_error_kind_from_str(kind: &str) -> astra_core::ErrorKind {
+    match kind {
+        "rate_limit" => astra_core::ErrorKind::RateLimit,
+        "server_error" => astra_core::ErrorKind::ServerError,
+        "auth" => astra_core::ErrorKind::Auth,
+        "context_window" => astra_core::ErrorKind::ContextWindow,
+        "invalid_request" => astra_core::ErrorKind::InvalidRequest,
+        "stream_idle" => astra_core::ErrorKind::StreamIdle,
+        "stream_transport" => astra_core::ErrorKind::StreamTransport,
+        "budget_exhausted" => astra_core::ErrorKind::BudgetExhausted,
+        "tool_rounds_exhausted" => astra_core::ErrorKind::ToolRoundsExhausted,
+        "network" => astra_core::ErrorKind::Network,
+        "tool_not_found" => astra_core::ErrorKind::ToolNotFound,
+        "tool_invalid_args" => astra_core::ErrorKind::ToolInvalidArgs,
+        "tool_timeout" => astra_core::ErrorKind::ToolTimeout,
+        "tool_unavailable" => astra_core::ErrorKind::ToolUnavailable,
+        "resource_limit" => astra_core::ErrorKind::ResourceLimit,
+        "cancelled" => astra_core::ErrorKind::Cancelled,
+        _ => astra_core::ErrorKind::Unknown,
+    }
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn mock_round_error(round: &Value) -> Option<astra_core::ClassifiedError> {
+    let error = round.get("error")?.as_object()?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("mock LLM round failed");
+    let kind = error
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(mock_error_kind_from_str)
+        .unwrap_or(astra_core::ErrorKind::Unknown);
+    let classified = astra_core::ClassifiedError::new(kind, message.to_string());
+    if let Some(details) = error.get("details").filter(|details| details.is_object()) {
+        Some(classified.with_details_json(details.to_string()))
+    } else {
+        Some(classified)
+    }
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String> {
+    let details = error.details_json.as_deref()?;
+    let value: Value = serde_json::from_str(details).ok()?;
+    value
+        .get("partial_full_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +525,8 @@ pub struct ServerAgenticLoopHost {
     server_side_tools: bool,
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
+    /// `true` when this session explicitly requests full LLM request/response capture.
+    full_llm_capture: bool,
 
     // ── Tool execution ──
     #[allow(dead_code)] // used in Step 3: wire edge tool delivery via ledger
@@ -435,6 +586,7 @@ pub struct ServerAgenticLoopHostBuilder {
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
     interactive_client: bool,
+    full_llm_capture: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
@@ -467,6 +619,7 @@ impl ServerAgenticLoopHostBuilder {
             session_id,
             progress_broadcaster: None,
             interactive_client: false,
+            full_llm_capture: false,
             event_tx: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
@@ -530,6 +683,11 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_interactive_client(mut self, interactive_client: bool) -> Self {
         self.interactive_client = interactive_client;
+        self
+    }
+
+    pub fn with_full_llm_capture(mut self, full_llm_capture: bool) -> Self {
+        self.full_llm_capture = full_llm_capture;
         self
     }
 
@@ -608,6 +766,7 @@ impl ServerAgenticLoopHostBuilder {
             selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
+            full_llm_capture: self.full_llm_capture,
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
@@ -775,7 +934,10 @@ impl ServerAgenticLoopHost {
     /// cache-annotated system messages, tool schemas and message list that a
     /// real LLM call would receive, emits SSE events, optionally records a
     /// [`CapturedLlmRequest`] for test assertion, and returns a [`HostTurnResult`]
-    /// as if a real LLM responded.
+    /// as if a real LLM responded. Test rounds may also inject failures with
+    /// `{ "error": { "message": "...", "kind": "...", "details": { ... } } }`
+    /// so HTTP E2E can validate error-path artifact publication without a flaky
+    /// real-provider dependency.
     #[cfg(feature = "bridge-e2e-hooks")]
     async fn execute_mock_turn(
         &mut self,
@@ -802,7 +964,89 @@ impl ServerAgenticLoopHost {
         let mut annotated_tools = edge_tools_snapshot.clone();
         annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
         let mut annotated_messages = state.messages.clone();
-        add_message_cache_breakpoint(&mut annotated_messages, &cache_cfg);
+        apply_anthropic_cache_metadata(&mut annotated_messages, &cache_cfg, &self.session_id);
+        let (provider, model) = self
+            .mock_provider
+            .clone()
+            .unwrap_or_else(|| ("openai".to_string(), "server-loop-mock".to_string()));
+        let mut capture_messages = system_msgs.clone();
+        capture_messages.extend(annotated_messages.clone());
+
+        // Record the captured request before tool delivery (so assertions see
+        // a deterministic view even if tool ledger introduces delays).
+        if let Some(cap) = &self.llm_request_capture {
+            let turn_index = state.llm_rounds_completed as usize;
+            let captured = build_captured_llm_request(
+                turn_index,
+                provider.clone(),
+                model.clone(),
+                &cache_cfg,
+                &system_msgs,
+                &annotated_tools,
+                &annotated_messages,
+                &system_prompt_breakdown,
+            );
+            if let Ok(mut guard) = cap.lock() {
+                guard.push(captured);
+            }
+        }
+
+        if let Some(error) = mock_round_error(round) {
+            if let Some(partial_text) = mock_round_partial_text(&error) {
+                self.emit_event(json!({ "type": "text_delta", "content": partial_text }));
+            }
+            if !self.session_id.is_empty() {
+                let mut artifact_store =
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+                if let Some(pool) = self.shared_pool.clone() {
+                    artifact_store = artifact_store.with_pool(pool);
+                }
+                let outcome = if error.kind == astra_core::ErrorKind::ContextWindow {
+                    "context_window_error"
+                } else {
+                    "error"
+                };
+                crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                    "server_loop_host mock error capture",
+                    self.full_llm_capture,
+                    Some(&artifact_store),
+                    &self.session_id,
+                    &self.user_id,
+                    state.session_turn,
+                    state.llm_rounds_completed,
+                    None,
+                    "server_loop_host",
+                    &model,
+                    &provider,
+                    &capture_messages,
+                    &annotated_tools,
+                    None,
+                    outcome,
+                    llm_capture_error_response(&error),
+                    Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                        session_turn_source: Some("state"),
+                        turn_chain_id: None,
+                        user_query_event_id: None,
+                    }),
+                )
+                .await;
+            }
+            if error.kind == astra_core::ErrorKind::ContextWindow {
+                let accum = ChatTurnSseAccum {
+                    error_message: Some(error.message.clone()),
+                    system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
+                    system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
+                    ..Default::default()
+                };
+                return Ok(HostTurnResult {
+                    accum,
+                    ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
+                    edge_tool_round: Vec::new(),
+                    error_kind: Some(astra_core::ErrorKind::ContextWindow),
+                });
+            }
+            return Err(error);
+        }
 
         let (full_text, reasoning, tool_calls, usage) =
             crate::turn::bridge_e2e_hooks::parse_llm_round(round);
@@ -844,29 +1088,6 @@ impl ServerAgenticLoopHost {
             "cache_creation_tokens": cache_creation,
         }));
 
-        // Record the captured request before tool delivery (so assertions see
-        // a deterministic view even if tool ledger introduces delays).
-        if let Some(cap) = &self.llm_request_capture {
-            let turn_index = state.llm_rounds_completed as usize;
-            let (provider, model) = self
-                .mock_provider
-                .clone()
-                .unwrap_or_else(|| (String::new(), String::new()));
-            let captured = build_captured_llm_request(
-                turn_index,
-                provider,
-                model,
-                &cache_cfg,
-                &system_msgs,
-                &annotated_tools,
-                &annotated_messages,
-                &system_prompt_breakdown,
-            );
-            if let Ok(mut guard) = cap.lock() {
-                guard.push(captured);
-            }
-        }
-
         let edge_tool_round =
             if !self.server_side_tools && self.event_tx.is_some() && !tool_calls.is_empty() {
                 self.deliver_edge_tools_via_ledger(&tool_calls).await
@@ -888,6 +1109,49 @@ impl ServerAgenticLoopHost {
             system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
             ..Default::default()
         };
+
+        if !self.session_id.is_empty() {
+            let mut artifact_store =
+                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+            if let Some(pool) = self.shared_pool.clone() {
+                artifact_store = artifact_store.with_pool(pool);
+            }
+            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                "server_loop_host mock success capture",
+                self.full_llm_capture,
+                Some(&artifact_store),
+                &self.session_id,
+                &self.user_id,
+                state.session_turn,
+                state.llm_rounds_completed,
+                None,
+                "server_loop_host",
+                &model,
+                &provider,
+                &capture_messages,
+                &annotated_tools,
+                None,
+                "success",
+                json!({
+                    "finish_reason": if tool_calls.is_empty() { "stop" } else { "tool_calls" },
+                    "full_text": full_text.clone(),
+                    "reasoning": accum.reasoning_content.clone(),
+                    "tool_calls": tool_calls.clone(),
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "cache_read_tokens": cache_read,
+                        "cache_creation_tokens": cache_creation,
+                    },
+                }),
+                Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                    session_turn_source: Some("state"),
+                    turn_chain_id: None,
+                    user_query_event_id: None,
+                }),
+            )
+            .await;
+        }
 
         state.final_text_streamed = !full_text.is_empty();
         state.final_text = full_text;
@@ -1698,8 +1962,8 @@ impl ServerAgenticLoopHost {
             llm_messages.push(listing.clone());
         }
 
-        // Add cache breakpoint on the last conversation message for Anthropic.
-        add_message_cache_breakpoint(&mut llm_messages, cache_cfg);
+        // Add Anthropic protocol-level prompt-cache metadata on the request clone.
+        apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, &self.session_id);
 
         llm_messages
     }
@@ -1963,12 +2227,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(interaction_mode, &final_tools);
 
-        let llm_cancel = llm_cancel_for_state(state);
-
         // Output token escalation: if finish_reason is "length", retry once
         // with a higher max_output_tokens (up to 4× the initial budget).
         let mut effective_max_output = max_output_tokens;
+        let mut attempt_in_round = 0_u32;
         let result = loop {
+            record_full_llm_request_event(
+                state,
+                self.full_llm_capture,
+                &self.session_id,
+                "server_loop_host",
+                &llm_cfg.model_name,
+                &llm_cfg.provider,
+                attempt_in_round,
+                &llm_messages,
+                &final_tools,
+                Some(effective_max_output),
+            );
+            let llm_cancel = llm_cancel_for_state(state);
             let r = call_llm_and_collect_with_request_overrides(
                 &llm_messages,
                 &final_tools,
@@ -1990,6 +2266,68 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let r = match r {
                 Ok(r) => r,
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
+                    record_full_llm_response_event(
+                        state,
+                        self.full_llm_capture,
+                        &self.session_id,
+                        "server_loop_host",
+                        &llm_cfg.model_name,
+                        &llm_cfg.provider,
+                        attempt_in_round,
+                        "context_window_error",
+                        llm_capture_error_response(e),
+                    );
+                    if !self.session_id.is_empty() {
+                        let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
+                            self.matrixone.clone(),
+                        );
+                        if let Some(pool) = self.shared_pool.clone() {
+                            artifact_store = artifact_store.with_pool(pool);
+                        }
+                        let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
+                            &self.session_id,
+                            None,
+                            &llm_cfg.model_name,
+                            &llm_cfg.provider,
+                            &e.message,
+                            &llm_messages,
+                            &final_tools,
+                            i64::from(state.llm_rounds_completed),
+                            Some(effective_max_output),
+                        );
+                        if let Err(error) =
+                            dump.persist_remote(&self.user_id, &artifact_store).await
+                        {
+                            astra_core::agent_error!(
+                                "llm-dump",
+                                "server_loop_host context window dump persist failed: {error}"
+                            );
+                        }
+                        crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                            "server_loop_host context window capture",
+                            self.full_llm_capture,
+                            Some(&artifact_store),
+                            &self.session_id,
+                            &self.user_id,
+                            state.session_turn,
+                            state.llm_rounds_completed,
+                            None,
+                            "server_loop_host",
+                            &llm_cfg.model_name,
+                            &llm_cfg.provider,
+                            &llm_messages,
+                            &final_tools,
+                            Some(effective_max_output),
+                            "context_window_error",
+                            llm_capture_error_response(e),
+                            Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                                session_turn_source: Some("state"),
+                                turn_chain_id: None,
+                                user_query_event_id: None,
+                            }),
+                        )
+                        .await;
+                    }
                     let accum = ChatTurnSseAccum {
                         error_message: Some(e.message.clone()),
                         system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
@@ -2005,14 +2343,103 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         error_kind: Some(astra_core::ErrorKind::ContextWindow),
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    record_full_llm_response_event(
+                        state,
+                        self.full_llm_capture,
+                        &self.session_id,
+                        "server_loop_host",
+                        &llm_cfg.model_name,
+                        &llm_cfg.provider,
+                        attempt_in_round,
+                        "error",
+                        llm_capture_error_response(&e),
+                    );
+                    if !self.session_id.is_empty() {
+                        let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
+                            self.matrixone.clone(),
+                        );
+                        if let Some(pool) = self.shared_pool.clone() {
+                            artifact_store = artifact_store.with_pool(pool);
+                        }
+                        let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
+                            &self.session_id,
+                            None,
+                            &llm_cfg.model_name,
+                            &llm_cfg.provider,
+                            &e.message,
+                            &llm_messages,
+                            &final_tools,
+                            i64::from(state.llm_rounds_completed),
+                            Some(effective_max_output),
+                        );
+                        if let Err(error) =
+                            dump.persist_remote(&self.user_id, &artifact_store).await
+                        {
+                            astra_core::agent_error!(
+                                "llm-dump",
+                                "server_loop_host error dump persist failed: {error}"
+                            );
+                        }
+                        crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                            "server_loop_host error capture",
+                            self.full_llm_capture,
+                            Some(&artifact_store),
+                            &self.session_id,
+                            &self.user_id,
+                            state.session_turn,
+                            state.llm_rounds_completed,
+                            None,
+                            "server_loop_host",
+                            &llm_cfg.model_name,
+                            &llm_cfg.provider,
+                            &llm_messages,
+                            &final_tools,
+                            Some(effective_max_output),
+                            "error",
+                            llm_capture_error_response(&e),
+                            Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                                session_turn_source: Some("state"),
+                                turn_chain_id: None,
+                                user_query_event_id: None,
+                            }),
+                        )
+                        .await;
+                    }
+                    return Err(e);
+                }
             };
+
+            record_full_llm_response_event(
+                state,
+                self.full_llm_capture,
+                &self.session_id,
+                "server_loop_host",
+                &llm_cfg.model_name,
+                &llm_cfg.provider,
+                attempt_in_round,
+                if r.finish_reason.as_deref() == Some("length")
+                    && effective_max_output < max_output_tokens * 4
+                {
+                    "length_retry"
+                } else {
+                    "success"
+                },
+                json!({
+                    "finish_reason": r.finish_reason.clone(),
+                    "full_text": r.full_text.clone(),
+                    "reasoning": r.reasoning.clone(),
+                    "tool_calls": r.tool_calls.clone(),
+                    "usage": r.usage.clone(),
+                }),
+            );
 
             if r.finish_reason.as_deref() == Some("length")
                 && effective_max_output < max_output_tokens * 4
             {
                 let prev = effective_max_output;
                 effective_max_output = (effective_max_output * 2).min(max_output_tokens * 4);
+                attempt_in_round = attempt_in_round.saturating_add(1);
                 astra_core::agent_warn!(
                     "llm",
                     "output truncated (finish_reason=length), escalating max_output_tokens {} → {}",
@@ -2023,6 +2450,44 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             break r;
         };
+
+        if !self.session_id.is_empty() {
+            let mut artifact_store =
+                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+            if let Some(pool) = self.shared_pool.clone() {
+                artifact_store = artifact_store.with_pool(pool);
+            }
+            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                "server_loop_host success capture",
+                self.full_llm_capture,
+                Some(&artifact_store),
+                &self.session_id,
+                &self.user_id,
+                state.session_turn,
+                state.llm_rounds_completed,
+                None,
+                "server_loop_host",
+                &llm_cfg.model_name,
+                &llm_cfg.provider,
+                &llm_messages,
+                &final_tools,
+                Some(effective_max_output),
+                "success",
+                json!({
+                    "finish_reason": result.finish_reason.clone(),
+                    "full_text": result.full_text.clone(),
+                    "reasoning": result.reasoning.clone(),
+                    "tool_calls": result.tool_calls.clone(),
+                    "usage": result.usage.clone(),
+                }),
+                Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                    session_turn_source: Some("state"),
+                    turn_chain_id: None,
+                    user_query_event_id: None,
+                }),
+            )
+            .await;
+        }
 
         // ── 4. Emit SSE events for client ───────────────────────────────
         if !result.full_text.is_empty() {
@@ -2140,7 +2605,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             json!({"role": "system", "content": request.system_prompt}),
             json!({"role": "user", "content": request.user_prompt}),
         ];
-        let result = call_llm_and_collect_with_request_overrides(
+        let result = match call_llm_and_collect_with_request_overrides(
             &reflection_messages,
             &[],
             &llm_cfg.model_name,
@@ -2154,7 +2619,98 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             llm_cfg.completions_url_override.as_deref(),
             llm_cfg.request_timeout,
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if !self.session_id.is_empty() {
+                    let mut artifact_store =
+                        astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+                    if let Some(pool) = self.shared_pool.clone() {
+                        artifact_store = artifact_store.with_pool(pool);
+                    }
+                    let dump = astra_turn_core::llm_request_dump::build_llm_request_dump(
+                        &self.session_id,
+                        None,
+                        &llm_cfg.model_name,
+                        &llm_cfg.provider,
+                        &error.message,
+                        &reflection_messages,
+                        &[],
+                        i64::from(state.llm_rounds_completed),
+                        request.max_output_tokens,
+                    );
+                    if let Err(error) = dump.persist_remote(&self.user_id, &artifact_store).await {
+                        astra_core::agent_error!(
+                            "llm-dump",
+                            "server_loop_reflection error dump persist failed: {error}"
+                        );
+                    }
+                    crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                        "server_loop_reflection error capture",
+                        self.full_llm_capture,
+                        Some(&artifact_store),
+                        &self.session_id,
+                        &self.user_id,
+                        state.session_turn,
+                        state.llm_rounds_completed,
+                        None,
+                        "server_loop_reflection",
+                        &llm_cfg.model_name,
+                        &llm_cfg.provider,
+                        &reflection_messages,
+                        &[],
+                        request.max_output_tokens,
+                        "error",
+                        llm_capture_error_response(&error),
+                        Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                            session_turn_source: Some("state"),
+                            turn_chain_id: None,
+                            user_query_event_id: None,
+                        }),
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
+        if !self.session_id.is_empty() {
+            let mut artifact_store =
+                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+            if let Some(pool) = self.shared_pool.clone() {
+                artifact_store = artifact_store.with_pool(pool);
+            }
+            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                "server_loop_reflection success capture",
+                self.full_llm_capture,
+                Some(&artifact_store),
+                &self.session_id,
+                &self.user_id,
+                state.session_turn,
+                state.llm_rounds_completed,
+                None,
+                "server_loop_reflection",
+                &llm_cfg.model_name,
+                &llm_cfg.provider,
+                &reflection_messages,
+                &[],
+                request.max_output_tokens,
+                "success",
+                json!({
+                    "finish_reason": result.finish_reason.clone(),
+                    "full_text": result.full_text.clone(),
+                    "reasoning": result.reasoning.clone(),
+                    "tool_calls": result.tool_calls.clone(),
+                    "usage": result.usage.clone(),
+                }),
+                Some(crate::turn::llm_exchange_capture::CaptureTrace {
+                    session_turn_source: Some("state"),
+                    turn_chain_id: None,
+                    user_query_event_id: None,
+                }),
+            )
+            .await;
+        }
         let accum = Self::result_to_accum(&result);
 
         if accum.has_tool_calls {
@@ -2316,6 +2872,20 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
     }
 }
 
+fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
+    let mut response = json!({
+        "error": error.message,
+        "kind": error.kind.to_string(),
+    });
+    if let Some(details_json) = error.details_json.as_deref()
+        && let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json)
+        && let Some(response_object) = response.as_object_mut()
+    {
+        response_object.extend(details);
+    }
+    response
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2326,6 +2896,8 @@ mod tests {
     use crate::turn::cloud::summary::SummaryLlmClient;
     use crate::turn::edge_ledger::{approval_callback_key, tool_callback_key};
     use crate::turn::sse_stream_host::EdgeToolExecResult;
+    #[cfg(feature = "bridge-e2e-hooks")]
+    use astra_services::SessionArtifactStore;
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings {
@@ -2374,6 +2946,103 @@ mod tests {
             }
         }));
         tools
+    }
+
+    #[test]
+    fn llm_request_dump_failures_are_not_silently_ignored() {
+        let source = include_str!("server_loop_host.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        for context in [
+            "server_loop_host context window dump persist failed",
+            "server_loop_host error dump persist failed",
+            "server_loop_reflection error dump persist failed",
+        ] {
+            let start = production
+                .find(context)
+                .expect("dump logging context should exist");
+            let window_start = start.saturating_sub(480);
+            let window = &production[window_start..production.len().min(start + 120)];
+            assert!(
+                window.contains("if let Err(error)")
+                    && window.contains("dump.persist_remote(&self.user_id, &artifact_store).await"),
+                "{context} should handle dump.persist_remote failures explicitly"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_error_paths_publish_remote_llm_capture_artifacts() {
+        let source = include_str!("server_loop_host.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        for context in [
+            "server_loop_host context window capture",
+            "server_loop_host error capture",
+            "server_loop_reflection error capture",
+        ] {
+            let start = production
+                .find(context)
+                .expect("capture context should exist");
+            let window = &production[start..production.len().min(start + 220)];
+            assert!(
+                window.contains("Some(&artifact_store)"),
+                "{context} should publish a remote llm_capture artifact, not local-only capture"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_capture_error_response_includes_partial_details() {
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "LLM stream transport error: connection reset",
+        )
+        .with_details_json(
+            json!({
+                "partial_full_text": "half answer",
+                "usage": { "prompt": 10, "completion": 4 }
+            })
+            .to_string(),
+        );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["partial_full_text"].as_str(), Some("half answer"));
+        assert_eq!(response["usage"]["prompt"].as_i64(), Some(10));
+        assert_eq!(response["kind"].as_str(), Some("stream_transport"));
+    }
+
+    #[test]
+    fn server_loop_error_captures_use_structured_error_response() {
+        let source = include_str!("server_loop_host.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        assert!(
+            production.contains("llm_capture_error_response(e)"),
+            "context-window captures should route through the structured error response helper"
+        );
+        assert!(
+            production.contains("llm_capture_error_response(&e)"),
+            "generic server-loop error captures should route through the structured error response helper"
+        );
+        assert!(
+            production.contains("llm_capture_error_response(&error)"),
+            "reflection error captures should route through the structured error response helper"
+        );
+    }
+
+    #[test]
+    fn server_loop_uses_shared_rate_limit_cooldown_singleton() {
+        let source = include_str!("server_loop_host.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        assert!(
+            production.contains("use crate::turn::bridge_llm_stream::rate_limit_cooldown;"),
+            "server-loop should reuse the shared llm_client/bridge rate-limit cooldown singleton"
+        );
+        assert!(
+            !production.contains("static COOLDOWN: OnceLock<PerModelCooldown>"),
+            "server-loop should not keep a separate cooldown singleton disconnected from llm_client"
+        );
     }
 
     #[test]
@@ -3135,11 +3804,120 @@ mod tests {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy: Default::default(),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct GatewayState {
+        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        status: axum::http::StatusCode,
+        response: Value,
+    }
+
+    async fn spawn_gateway(
+        status: axum::http::StatusCode,
+        response: Value,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Router,
+            body::Bytes,
+            extract::State,
+            http::header,
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+        use tokio::net::TcpListener;
+
+        fn build_streaming_gateway_body(response: &Value) -> String {
+            let content = response["choices"]
+                .as_array()
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let finish_reason = response["choices"]
+                .as_array()
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("finish_reason"))
+                .cloned()
+                .unwrap_or_else(|| json!("stop"));
+            let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
+            format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content": content}}]}),
+                json!({"choices":[{"delta":{},"finish_reason": finish_reason}],"usage": usage}),
+            )
+        }
+
+        async fn handler(State(state): State<GatewayState>, body: Bytes) -> Response {
+            let payload: Value = serde_json::from_slice(&body).expect("gateway request json");
+            state.requests.lock().await.push(payload.clone());
+            let wants_stream = payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if state.status.is_success() && wants_stream {
+                (
+                    state.status,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    build_streaming_gateway_body(&state.response),
+                )
+                    .into_response()
+            } else {
+                (state.status, axum::Json(state.response.clone())).into_response()
+            }
+        }
+
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/gateway/chat/completions", post(handler))
+            .with_state(GatewayState {
+                requests: requests.clone(),
+                status,
+                response,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("gateway server should run");
+        });
+        (
+            format!("http://{addr}/gateway/chat/completions"),
+            requests,
+            server,
+        )
+    }
+
+    fn read_journal_events(session_id: &str) -> Vec<Value> {
+        let path = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer")
+            .path()
+            .clone();
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<Value>(line).expect("journal event json"))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read journal: {error}"),
         }
     }
 
@@ -3531,6 +4309,362 @@ mod tests {
         .expect("resolve via llm token service gateway");
         assert_eq!(resolved.model_name, "gpt-4o-mini");
         assert!(resolved.request_timeout.is_none());
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_turn_persists_local_llm_capture_when_session_capture_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000125";
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-capture".to_string(),
+            session_id.to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_full_llm_capture(true)
+        .with_test_llm_rounds(vec![json!({
+            "full_text": "captured reply",
+            "usage": { "prompt_tokens": 7, "completion_tokens": 9 }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.message = "capture this turn".to_string();
+
+        host.run_one_mock_turn_for_test(&mut state)
+            .await
+            .expect("mock turn");
+
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session dir");
+        let files: Vec<_> = std::fs::read_dir(session_dir)
+            .expect("capture dir")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|name| name.contains("llm_capture_t0_r0_server_loop_host_success")),
+            "expected local llm capture file, got {files:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000126";
+        let (gateway_url, requests, server) = spawn_gateway(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [
+                    {
+                        "message": { "content": "journal capture reply" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
+            }),
+        )
+        .await;
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-journal".to_string(),
+            session_id.to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_full_llm_capture(true)
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: gateway_url,
+            timeout_ms: Some(2000),
+        }))
+        .build();
+        let mut state = create_test_state();
+        state.session_turn = 1;
+        state.turn_event_buffer =
+            Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some(session_id), 1));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "capture this turn"}));
+        state.message = "capture this turn".to_string();
+
+        host.execute_turn(&mut state).await.expect("execute turn");
+
+        state
+            .turn_event_buffer
+            .as_mut()
+            .expect("turn event buffer")
+            .flush(
+                &astra_services::session_journal::JournalWriter::new(session_id)
+                    .expect("journal writer"),
+            )
+            .expect("flush journal");
+
+        let journal = read_journal_events(session_id);
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert_eq!(
+            llm_events.len(),
+            2,
+            "expected request+response events: {journal:?}"
+        );
+        assert_eq!(
+            llm_events[0].get("type").and_then(Value::as_str),
+            Some("llm_request_full")
+        );
+        assert_eq!(
+            llm_events[1].get("type").and_then(Value::as_str),
+            Some("llm_response_full")
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request"]["messages"][0]["role"].as_str(),
+            Some("system")
+        );
+        assert!(
+            llm_events[0]["metadata"]["request"]["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|msg| msg["role"] == "user"))
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["outcome"].as_str(),
+            Some("success")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["finish_reason"].as_str(),
+            Some("stop")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
+            Some("journal capture reply")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["usage"]["completion"].as_i64(),
+            Some(5)
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["trace"]["session_turn_source"].as_str(),
+            Some("state")
+        );
+        assert!(
+            llm_events[0]["metadata"]["trace"]["turn_chain_id"].is_null(),
+            "server-loop trace should not fabricate bridge correlation ids"
+        );
+
+        let gateway_requests = requests.lock().await;
+        assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000127";
+        let (gateway_url, _requests, server) = spawn_gateway(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": {"message": "upstream exploded"}}),
+        )
+        .await;
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-journal".to_string(),
+            session_id.to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_full_llm_capture(true)
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: gateway_url,
+            timeout_ms: Some(2000),
+        }))
+        .build();
+        let mut state = create_test_state();
+        state.session_turn = 1;
+        state.turn_event_buffer =
+            Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some(session_id), 1));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "capture this failed turn"}));
+        state.message = "capture this failed turn".to_string();
+
+        let error = match host.execute_turn(&mut state).await {
+            Ok(_) => panic!("execute turn should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::ServerError);
+
+        state
+            .turn_event_buffer
+            .as_mut()
+            .expect("turn event buffer")
+            .flush(
+                &astra_services::session_journal::JournalWriter::new(session_id)
+                    .expect("journal writer"),
+            )
+            .expect("flush journal");
+
+        let journal = read_journal_events(session_id);
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert_eq!(
+            llm_events.len(),
+            2,
+            "expected request+error events: {journal:?}"
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["outcome"].as_str(),
+            Some("error")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["kind"].as_str(),
+            Some("server_error")
+        );
+        assert!(
+            llm_events[1]["metadata"]["response"]["response"]["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("LLM error 500")),
+            "expected stored error payload: {}",
+            llm_events[1]
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["trace"]["session_turn_source"].as_str(),
+            Some("state")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_turn_does_not_persist_full_journal_events_when_session_capture_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000128";
+        let (gateway_url, requests, server) = spawn_gateway(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [
+                    {
+                        "message": { "content": "journal capture reply" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
+            }),
+        )
+        .await;
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-journal".to_string(),
+            session_id.to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: gateway_url,
+            timeout_ms: Some(2000),
+        }))
+        .build();
+        let mut state = create_test_state();
+        state.session_turn = 1;
+        state.turn_event_buffer =
+            Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some(session_id), 1));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "capture disabled should stay quiet"}));
+        state.message = "capture disabled should stay quiet".to_string();
+
+        host.execute_turn(&mut state).await.expect("execute turn");
+
+        state
+            .turn_event_buffer
+            .as_mut()
+            .expect("turn event buffer")
+            .flush(
+                &astra_services::session_journal::JournalWriter::new(session_id)
+                    .expect("journal writer"),
+            )
+            .expect("flush journal");
+
+        let journal = read_journal_events(session_id);
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert!(
+            llm_events.is_empty(),
+            "capture-disabled run should not emit full LLM journal events: {journal:?}"
+        );
+
+        let gateway_requests = requests.lock().await;
+        assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
+
+        server.abort();
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_turn_can_inject_error_with_structured_details() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-capture".to_string(),
+            "".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_test_llm_rounds(vec![json!({
+            "error": {
+                "message": "synthetic streamed failure",
+                "kind": "stream_transport",
+                "details": {
+                    "partial_full_text": "half answer",
+                    "usage": { "prompt": 17, "completion": 3 }
+                }
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.message = "fail this turn".to_string();
+
+        let error = match host.run_one_mock_turn_for_test(&mut state).await {
+            Ok(_) => panic!("mock round should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+        assert_eq!(error.message, "synthetic streamed failure");
+        let details: Value =
+            serde_json::from_str(error.details_json.as_deref().expect("details json")).unwrap();
+        assert_eq!(details["partial_full_text"].as_str(), Some("half answer"));
+        assert_eq!(details["usage"]["prompt"].as_i64(), Some(17));
     }
 
     #[tokio::test]

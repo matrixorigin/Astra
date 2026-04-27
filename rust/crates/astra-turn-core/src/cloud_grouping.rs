@@ -82,13 +82,15 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
                     .push(msg.clone());
             }
             "assistant" => {
+                let sanitized =
+                    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_cloned(msg);
                 if let Some(round) = current_round.as_mut() {
-                    round.assistant_message = Some(msg.clone());
+                    round.assistant_message = Some(sanitized);
                 } else {
                     // assistant without a preceding user (shouldn't happen, but handle it)
                     current_round = Some(ApiRound {
                         user_messages: Vec::new(),
-                        assistant_message: Some(msg.clone()),
+                        assistant_message: Some(sanitized),
                         tool_messages: Vec::new(),
                     });
                 }
@@ -209,6 +211,17 @@ mod tests {
                 restored.get("content").unwrap().as_str()
             );
         }
+    }
+
+    #[test]
+    fn grouping_omits_empty_assistant_tool_calls() {
+        let msgs = vec![
+            user("q"),
+            json!({"role": "assistant", "content": "a", "tool_calls": []}),
+        ];
+        let (_, rounds) = group_by_api_round(&msgs);
+        let assistant = rounds[0].assistant_message.as_ref().unwrap();
+        assert!(assistant.get("tool_calls").is_none(), "{assistant:?}");
     }
 
     #[test]

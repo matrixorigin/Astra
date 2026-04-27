@@ -14,6 +14,94 @@ fn sse_text_response(text: &str, session_id: &str) -> String {
     )
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let app = Router::new().route(
+        "/chat/turn",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                sse_text_response("Hello!", "sess-step-adopt"),
+            )
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+    let selector = tool_selector::TfIdfSelector::new(registry);
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let skill_search = astra_core::SkillSearchSettings::default();
+
+    let result = stream_chat_sse(ChatTurnParams {
+        api: &api,
+        token: "fake-token",
+        message: "hi",
+        session_id: None,
+        model: None,
+        provider: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        render_policy: crate::stream_render::RenderPolicy::Silent,
+        selector: &selector,
+        recent_tools: &[],
+        tool_health_entries: &[],
+        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+        plan_only_chat: false,
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        approval_request_tx: None,
+        mcp_manager: None,
+        skill_search: &skill_search,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+        messaging_metrics: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        root_mailbox_slot: None,
+        observability_hub: None,
+        observability_session: None,
+        file_journal: None,
+        file_state: None,
+        database_snapshot_journal: None,
+        git_stash_journal: None,
+        git_commit_journal: None,
+        git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
+        turn_index: 0,
+        evolution_service: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.session_id.as_deref(), Some("sess-step-adopt"));
+
+    let adopted_path = temp
+        .path()
+        .join("sess-step-adopt")
+        .join("step_events.jsonl");
+    let ephemeral_path = temp.path().join("ephemeral").join("step_events.jsonl");
+    let adopted_events = std::fs::read_to_string(&adopted_path)
+        .expect("step events should persist under adopted session");
+
+    assert!(!adopted_events.trim().is_empty());
+    assert!(adopted_events.contains("\"step_id\":\"sess-step-adopt-turn-0-step-0\""));
+    assert!(
+        !ephemeral_path.exists(),
+        "new-session first turn must not persist step events under ephemeral/"
+    );
+}
+
 #[tokio::test]
 async fn stream_chat_sse_simple_text_response() {
     let app = Router::new().route(
@@ -38,6 +126,7 @@ async fn stream_chat_sse_simple_text_response() {
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -86,6 +175,96 @@ async fn stream_chat_sse_simple_text_response() {
 }
 
 #[tokio::test]
+async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace() {
+    #[derive(Clone)]
+    struct MockState {
+        turn_payloads: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    let state = MockState {
+        turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let app = Router::new().route(
+        "/chat/turn",
+        post({
+            let state = state.clone();
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let state = state.clone();
+                async move {
+                    state.turn_payloads.lock().await.push(body);
+                    (
+                        [("content-type", "text/event-stream")],
+                        sse_text_response("Hello!", "sess-traced"),
+                    )
+                }
+            }
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+    let selector = tool_selector::TfIdfSelector::new(registry);
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let skill_search = astra_core::SkillSearchSettings::default();
+
+    let result = stream_chat_sse(ChatTurnParams {
+        api: &api,
+        token: "fake-token",
+        message: "hi",
+        session_id: Some("sess-traced"),
+        model: None,
+        provider: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        render_policy: crate::stream_render::RenderPolicy::Silent,
+        selector: &selector,
+        recent_tools: &[],
+        tool_health_entries: &[],
+        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+        plan_only_chat: false,
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        approval_request_tx: None,
+        mcp_manager: None,
+        skill_search: &skill_search,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+        messaging_metrics: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        root_mailbox_slot: None,
+        observability_hub: None,
+        observability_session: None,
+        file_journal: None,
+        file_state: None,
+        database_snapshot_journal: None,
+        git_stash_journal: None,
+        git_commit_journal: None,
+        git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
+        turn_index: 0,
+        evolution_service: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.session_id.as_deref(), Some("sess-traced"));
+
+    let payloads = state.turn_payloads.lock().await;
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["session_id"], serde_json::json!("sess-traced"));
+}
+
+#[tokio::test]
 async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     let app = Router::new().route(
         "/chat/turn",
@@ -129,6 +308,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             message: "hi",
             session_id,
             model: None,
+            provider: None,
             explain: ExplainMode::Off,
             render_md: false,
             history: &[],
@@ -214,6 +394,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -327,6 +508,7 @@ async fn stream_chat_sse_api_error_propagated() {
         message: "hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -414,6 +596,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         message: "run echo hi",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -524,6 +707,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         message: "write inside a transaction",
         session_id: None,
         model: None,
+        provider: None,
         explain: ExplainMode::Off,
         render_md: false,
         history: &[],
@@ -610,4 +794,125 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         .expect("committed boundary metadata");
     assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
     assert_eq!(committed["transaction_id"].as_str(), Some("tx-e2e"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_retries() {
+    #[derive(Clone)]
+    struct StreamingMockState {
+        call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        turn_payloads: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        tool_results: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    let state = StreamingMockState {
+        call_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        tool_results: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route(
+            "/chat/turn",
+            post({
+                let state = state.clone();
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let state = state.clone();
+                    async move {
+                        state.turn_payloads.lock().await.push(body);
+                        let n = state
+                            .call_count
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let response = if n == 0 {
+                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-turn-identity\"}\n\n\
+                             data: {\"type\":\"tool_request\",\"request_id\":\"tr-turn-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\"}}\n\n\
+                             data: [DONE]\n\n"
+                                .to_string()
+                        } else {
+                            sse_text_response("Done!", "sess-turn-identity")
+                        };
+                        ([("content-type", "text/event-stream")], response)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/tools/result",
+            post({
+                let state = state.clone();
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let state = state.clone();
+                    async move {
+                        state.tool_results.lock().await.push(body);
+                        axum::Json(serde_json::json!({ "ok": true }))
+                    }
+                }
+            }),
+        );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+    let selector = tool_selector::TfIdfSelector::new(registry);
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let skill_search = astra_core::SkillSearchSettings::default();
+    let result = stream_chat_sse(ChatTurnParams {
+        api: &api,
+        token: "fake-token",
+        message: "review local changes",
+        session_id: None,
+        model: None,
+        provider: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        render_policy: crate::stream_render::RenderPolicy::Silent,
+        selector: &selector,
+        recent_tools: &[],
+        tool_health_entries: &[],
+        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+        plan_only_chat: false,
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        approval_request_tx: None,
+        mcp_manager: None,
+        skill_search: &skill_search,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+        messaging_metrics: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        root_mailbox_slot: None,
+        observability_hub: None,
+        observability_session: None,
+        file_journal: None,
+        file_state: None,
+        database_snapshot_journal: None,
+        git_stash_journal: None,
+        git_commit_journal: None,
+        git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
+        turn_index: 0,
+        evolution_service: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.full_text, "Done!");
+
+    let payloads = state.turn_payloads.lock().await;
+    assert_eq!(payloads.len(), 2, "expected two /chat/turn payloads");
+    assert_eq!(payloads[0]["session_turn"], serde_json::json!(1));
+    assert_eq!(payloads[1]["session_turn"], serde_json::json!(1));
+    assert_eq!(payloads[0]["turn_chain_id"], payloads[1]["turn_chain_id"]);
+    assert_eq!(
+        payloads[0]["user_query_event_id"],
+        payloads[1]["user_query_event_id"]
+    );
 }

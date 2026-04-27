@@ -24,15 +24,26 @@ use crate::turn::tool_result_semantics::tool_dedup_signature;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
+const REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD: usize = 2;
+const REASON_DUPLICATE_WITHIN_TURN: &str = "duplicate_within_turn";
+const REASON_REPEATED_CACHE_HIT_SUPPRESSED: &str = "repeated_cache_hit_suppressed";
 
 fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
+    step_recorder: &mut crate::pipeline::step_recorder::StepRecorder,
     quiet: bool,
     term: &mut dyn HeadlessRoundTerminal,
     messages: &mut Vec<Value>,
     tool_results: &mut Vec<Value>,
     tool_call_records: &mut Vec<ToolCallRecord>,
 ) {
+    step_recorder.begin_tool_with_key(blocked.name, blocked.id, None);
+    step_recorder.skip_tool_with_reason(
+        blocked.name,
+        blocked.reason_code,
+        false,
+        Some(&blocked.err_msg),
+    );
     if !quiet && let Some(status_line) = blocked.status_line {
         term.emit_line(HeadlessStderrStyle::Yellow, status_line);
     }
@@ -48,6 +59,25 @@ fn emit_blocked_tool_result(
     ));
 }
 
+fn trace_short_circuit_tool_skip(
+    step_recorder: &mut crate::pipeline::step_recorder::StepRecorder,
+    tool_id: &str,
+    tool_name: &str,
+    reason: &str,
+    idempotency_key: Option<&str>,
+    args_preview: Option<&str>,
+    output: Option<&str>,
+    was_cached: bool,
+) {
+    step_recorder.begin_tool_with_key_and_args_preview(
+        tool_name,
+        tool_id,
+        idempotency_key,
+        args_preview,
+    );
+    step_recorder.skip_tool_with_reason(tool_name, reason, was_cached, output);
+}
+
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) fn emit_turn_budget_stub(&mut self, slot: &HeadlessResolvedToolSlot) {
         let body = format!(
@@ -55,6 +85,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
              Skipping this call. Prioritize the most important remaining \
              tools in your next response — do not repeat all skipped calls.",
             max_tools_per_turn = self.ctx.max_tools_per_turn,
+        );
+        trace_short_circuit_tool_skip(
+            self.ctx.step_recorder,
+            &slot.id,
+            &slot.name,
+            "turn_budget_exhausted",
+            None,
+            make_args_preview(&slot.name, &slot.args).as_deref(),
+            Some(&body),
+            false,
         );
         let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
         self.ctx.messages.push(tool_msg);
@@ -94,6 +134,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &slot.id,
             &slot.name,
             self.ctx.valid_tool_names,
+        );
+        trace_short_circuit_tool_skip(
+            self.ctx.step_recorder,
+            &slot.id,
+            &slot.name,
+            "unknown_tool",
+            None,
+            make_args_preview(&slot.name, &slot.args).as_deref(),
+            Some(&err_msg),
+            false,
         );
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(err_tr);
@@ -144,15 +194,36 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         *count += 1;
         if *count > self.ctx.max_identical_calls {
             let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
+            let mut skip_reason = REASON_DUPLICATE_WITHIN_TURN;
+            let args_preview = make_args_preview(&slot.name, &slot.args);
             if let Some(_cached) = self.ctx.idempotency_cache.check(&idem_key) {
-                let body = format!(
-                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
-                     The result is already in this conversation from an earlier call. \
-                     Do NOT call this tool again with the same arguments.",
-                    *count, self.ctx.max_identical_calls
-                );
-                let (tool_msg, tr) =
-                    headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+                let prior_cache_hits = self
+                    .ctx
+                    .turn_guard
+                    .health
+                    .cache_hits_for_signature(&call_sig);
+                let body = if prior_cache_hits >= REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD {
+                    skip_reason = REASON_REPEATED_CACHE_HIT_SUPPRESSED;
+                    format!(
+                        "⛔ Repeated cached read suppressed: this exact {} request has already \
+                         been served from cache {} time(s). Use the earlier cached result in the \
+                         conversation instead of calling again; if you need different evidence, \
+                         change the arguments.",
+                        slot.name, prior_cache_hits
+                    )
+                } else {
+                    format!(
+                        "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                         The result is already in this conversation from an earlier call. \
+                         Do NOT call this tool again with the same arguments.",
+                        *count, self.ctx.max_identical_calls
+                    )
+                };
+                let (tool_msg, tr) = if skip_reason == REASON_REPEATED_CACHE_HIT_SUPPRESSED {
+                    openai_tool_roundtrip_values(&slot.id, &slot.name, &body)
+                } else {
+                    headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body)
+                };
                 self.ctx.messages.push(tool_msg);
                 self.ctx.tool_results.push(tr);
             } else {
@@ -161,13 +232,25 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.messages.push(tool_msg);
                 self.ctx.tool_results.push(tr);
             }
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &slot.id,
+                &slot.name,
+                skip_reason,
+                Some(&idem_key.cache_key()),
+                args_preview.as_deref(),
+                None,
+                skip_reason == REASON_REPEATED_CACHE_HIT_SUPPRESSED,
+            );
             self.ctx
                 .tool_call_records
                 .push(journal_record_duplicate_within_turn(
                     slot.name.clone(),
-                    make_args_preview(&slot.name, &slot.args),
+                    args_preview,
                 ));
-            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&slot.name, &call_sig);
             agent_warn!(
                 "dedup",
                 "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
@@ -183,6 +266,48 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if READ_ONLY_TOOLS.contains(&slot.name.as_str())
             && let Some(cached) = self.ctx.idempotency_cache.check(&idem_key)
         {
+            let cache_key = idem_key.cache_key();
+            let args_preview = make_args_preview(&slot.name, &slot.args);
+            let prior_cache_hits = self
+                .ctx
+                .turn_guard
+                .health
+                .cache_hits_for_signature(&call_sig);
+            if prior_cache_hits >= REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD {
+                let body = format!(
+                    "⛔ Repeated cached read suppressed: this exact {} request has already \
+                     been served from cache {} time(s). Use the earlier cached result in the \
+                     conversation instead of calling again; if you need different evidence, \
+                     change the arguments.",
+                    slot.name, prior_cache_hits
+                );
+                let (tool_msg, tr) = openai_tool_roundtrip_values(&slot.id, &slot.name, &body);
+                self.ctx.messages.push(tool_msg);
+                self.ctx.tool_results.push(tr);
+                self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+                    &slot.name,
+                    &slot.id,
+                    Some(&cache_key),
+                    args_preview.as_deref(),
+                );
+                self.ctx.step_recorder.skip_tool_with_reason(
+                    &slot.name,
+                    REASON_REPEATED_CACHE_HIT_SUPPRESSED,
+                    true,
+                    Some(&body),
+                );
+                self.ctx
+                    .turn_guard
+                    .record_cache_hit_for_signature(&slot.name, &call_sig);
+                self.ctx
+                    .tool_call_records
+                    .push(journal_record_cross_turn_cache_hit(
+                        slot.name.clone(),
+                        body.len() as u32,
+                        args_preview,
+                    ));
+                return HeadlessPipelineStage::ShortCircuit;
+            }
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
                     HeadlessStderrStyle::Dim,
@@ -212,20 +337,26 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
-            let cache_key = idem_key.cache_key();
+            self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+                &slot.name,
+                &slot.id,
+                Some(&cache_key),
+                args_preview.as_deref(),
+            );
+            self.ctx.step_recorder.record_cache_hit_with_reason(
+                &slot.name,
+                cached.clone(),
+                "cached_cross_turn",
+            );
             self.ctx
-                .step_recorder
-                .begin_tool_with_key(&slot.name, &slot.id, Some(&cache_key));
-            self.ctx
-                .step_recorder
-                .record_cache_hit(&slot.name, cached.clone());
-            self.ctx.turn_guard.record_cache_hit(&slot.name);
+                .turn_guard
+                .record_cache_hit_for_signature(&slot.name, &call_sig);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
                     slot.name.clone(),
                     cached.output.len() as u32,
-                    make_args_preview(&slot.name, &slot.args),
+                    args_preview,
                 ));
             return HeadlessPipelineStage::ShortCircuit;
         }
@@ -236,12 +367,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .semantic_dedup
                     .pre_check_block(&slot.name, &slot.args, self.ctx.turn_index)
         {
+            let args_preview = make_args_preview(&slot.name, &slot.args);
             let body = format!(
-                "{cached_output}\n\n⛔ BLOCKED DUPLICATE: This {} call is semantically \
+                "⛔ BLOCKED DUPLICATE: This {} call is semantically \
                  identical to turn {} — same tool with equivalent arguments. \
-                 Execution was skipped. Use the result above instead of calling again.",
+                 Execution was skipped without replaying the previous output. \
+                 Use the earlier result in the conversation instead of calling again{}.",
                 slot.name,
                 prev_turn + 1,
+                args_preview
+                    .as_deref()
+                    .map(|preview| format!(" (args: {preview})"))
+                    .unwrap_or_default(),
             );
             let (mut tool_msg, tr) =
                 headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
@@ -257,13 +394,25 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
-            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &slot.id,
+                &slot.name,
+                "semantic_dedup_pre_check",
+                Some(&idem_key.cache_key()),
+                args_preview.as_deref(),
+                Some(&body),
+                false,
+            );
+            self.ctx
+                .turn_guard
+                .record_cache_hit_for_signature(&slot.name, &call_sig);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
                     slot.name.clone(),
                     cached_output.len() as u32,
-                    make_args_preview(&slot.name, &slot.args),
+                    args_preview,
                 ));
             agent_warn!(
                 "dedup",
@@ -278,22 +427,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if let Some(failure_count) =
             should_block_from_outcome_memory(&self.ctx.turn_guard.health, &call_sig)
         {
-            let err_msg = format!(
-                "blocked_tool: Outcome memory blocked '{}' with identical arguments: \
-                 this canonical call failed {} recent time(s) with no intervening success. \
-                 Change the arguments, use a different tool, or explain why a retry is necessary.",
-                slot.name, failure_count
-            );
+            let (reason_code, err_msg, status_line) =
+                outcome_memory_block_message(&slot.name, &slot.args, failure_count);
             emit_blocked_tool_result(
                 HeadlessBlockedTool {
                     id: &slot.id,
                     name: &slot.name,
                     args: &slot.args,
+                    reason_code,
                     err_msg: err_msg.clone(),
                     journal_reason: err_msg.clone(),
                     early_exit_ms: 0,
-                    status_line: Some(format!("  ⚠ Outcome-memory block: {}", slot.name)),
+                    status_line: Some(status_line),
                 },
+                self.ctx.step_recorder,
                 self.ctx.quiet,
                 self.ctx.term,
                 self.ctx.messages,
@@ -327,6 +474,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &execution.id,
                 &execution.name,
                 self.ctx.valid_tool_names,
+            );
+            trace_short_circuit_tool_skip(
+                self.ctx.step_recorder,
+                &execution.id,
+                &execution.name,
+                "unknown_tool",
+                None,
+                make_args_preview(&execution.name, &execution.args).as_deref(),
+                Some(&err_msg),
+                false,
             );
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
@@ -365,11 +522,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     id: &execution.id,
                     name: &execution.name,
                     args: &execution.args,
+                    reason_code: "restricted_tool",
                     journal_reason: err_msg.clone(),
                     err_msg,
                     early_exit_ms: execution.early_exit_ms,
                     status_line: Some(format!("  ⚠ Blocked restricted tool: {}", execution.name)),
                 },
+                self.ctx.step_recorder,
                 self.ctx.quiet,
                 self.ctx.term,
                 self.ctx.messages,
@@ -408,11 +567,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         id: &execution.id,
                         name: &execution.name,
                         args: &execution.args,
+                        reason_code: "permission_denied",
                         err_msg,
                         journal_reason: reason,
                         early_exit_ms: execution.early_exit_ms,
                         status_line: Some(format!("  🔒 Permission denied: {}", execution.name)),
                     },
+                    self.ctx.step_recorder,
                     self.ctx.quiet,
                     self.ctx.term,
                     self.ctx.messages,
@@ -441,6 +602,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             id: &execution.id,
                             name: &execution.name,
                             args: &execution.args,
+                            reason_code: "pre_tool_hook_blocked",
                             journal_reason: err_msg.clone(),
                             err_msg,
                             early_exit_ms: execution.early_exit_ms,
@@ -449,6 +611,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                                 execution.name, reason
                             )),
                         },
+                        self.ctx.step_recorder,
                         self.ctx.quiet,
                         self.ctx.term,
                         self.ctx.messages,
@@ -498,4 +661,40 @@ fn should_block_from_outcome_memory(
         return None;
     }
     Some(recent.len())
+}
+
+fn outcome_memory_block_message(
+    tool_name: &str,
+    args: &Value,
+    failure_count: usize,
+) -> (&'static str, String, String) {
+    if tool_name == "str_replace" {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown path>");
+        let msg = format!(
+            "blocked_tool: str_replace recovery required for {path}: this exact edit failed \
+             {failure_count} recent time(s). Do not repeat the same old_str. First read_file \
+             the target range to verify exact bytes, then retry once with the verified old_str; \
+             if the edit is still ambiguous, use multi_edit/write_file with the current file \
+             content instead."
+        );
+        return (
+            "str_replace_recovery_required",
+            msg,
+            format!("  ⚠ str_replace recovery required: {path}"),
+        );
+    }
+
+    (
+        "outcome_memory_blocked",
+        format!(
+            "blocked_tool: Outcome memory blocked '{tool_name}' with identical arguments: \
+             this canonical call failed {failure_count} recent time(s) with no intervening \
+             success. Change the arguments, use a different tool, or explain why a retry is \
+             necessary."
+        ),
+        format!("  ⚠ Outcome-memory block: {tool_name}"),
+    )
 }

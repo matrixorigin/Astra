@@ -427,13 +427,15 @@ fn build_runtime_turn_evaluation_event(
     state: &AgenticLoopState,
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
-    let eval = crate::pipeline::evaluation::evaluate_tool_call_records(
+    let eval_thresholds = crate::pipeline::evaluation::current_evaluation_thresholds();
+    let eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        eval_thresholds,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
@@ -578,6 +580,8 @@ async fn configure_runtime_controllers(
     let context_trace_persistence = shared_pool.map(|pool| ContextTracePersistenceContext {
         user_id: user_id.to_string(),
         event_service: build_runtime_event_service(matrixone, Some(pool)),
+        artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())
+            .with_pool(pool.clone()),
         agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.to_string(),
     });
     initialize_runtime_controllers(
@@ -1162,6 +1166,34 @@ fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String>
     None
 }
 
+fn build_run_turn_complete_event_with_interruption(
+    total_tool_calls: u32,
+    final_text: &str,
+    interruption: Option<&crate::turn::interruption::InterruptionRecord>,
+) -> Value {
+    let execution_state = interruption.map(|record| {
+        serde_json::json!({
+            "status": "interrupted",
+            "interrupted": true,
+            "interruption_kind": record.kind.label(),
+            "resume_action": &record.resume_action,
+            "resumable": record.kind.is_resumable(),
+            "has_checkpoint": record.has_checkpoint,
+            "tool_calls_completed": record.tool_calls_completed,
+            "turns_completed": record.turns_completed,
+            "remaining_turns": record.remaining_turns,
+            "error_detail": record.error_detail,
+        })
+    });
+    Value::Object(astra_turn_core::complete::build_turn_complete_event(
+        total_tool_calls > 0,
+        interruption.is_some(),
+        &crate::turn::stall::DivergenceStatus::Healthy,
+        execution_state,
+        (!final_text.is_empty()).then_some(final_text),
+    ))
+}
+
 // ─── Run State ──────────────────────────────────────────────────────────────
 
 /// Status of a single agentic run.
@@ -1275,7 +1307,7 @@ fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
         .filter(|event| {
             matches!(
                 event.get("event_type").and_then(Value::as_str),
-                Some("run_error" | "run_finished")
+                Some("text_done" | "run_error" | "run_interrupted" | "run_finished")
             )
         })
         .cloned()
@@ -1558,17 +1590,45 @@ impl AgenticRunLifecycleService {
         } else {
             match loop_outcome {
                 Ok(AgenticLoopOutcome::Completed) => {
-                    if !loop_state.final_text.is_empty() {
+                    if let Some(interruption) = loop_state.interruption.as_ref() {
+                        let interruption_json = interruption.to_json();
+                        if !loop_state.final_text.is_empty() {
+                            events.push(json!({
+                                "event_type": "text_done",
+                                "data": {
+                                    "full_text": loop_state.final_text.clone(),
+                                    "partial": true,
+                                    "interruption": interruption_json.clone(),
+                                }
+                            }));
+                        }
                         events.push(json!({
-                        "event_type": "text_done",
-                        "data": { "full_text": loop_state.final_text.clone() }
+                            "event_type": "run_interrupted",
+                            "data": interruption_json.clone(),
                         }));
+                        let mut finished = usage;
+                        finished["interrupted"] = Value::Bool(true);
+                        finished["interruption_kind"] =
+                            Value::String(interruption.kind.label().to_string());
+                        finished["resumable"] = Value::Bool(interruption.kind.is_resumable());
+                        events.push(json!({
+                            "event_type": "run_finished",
+                            "data": finished,
+                        }));
+                        (RunStatus::Paused, Some(interruption.user_message.clone()))
+                    } else {
+                        if !loop_state.final_text.is_empty() {
+                            events.push(json!({
+                            "event_type": "text_done",
+                            "data": { "full_text": loop_state.final_text.clone() }
+                            }));
+                        }
+                        events.push(json!({
+                            "event_type": "run_finished",
+                            "data": usage,
+                        }));
+                        (RunStatus::Completed, None)
                     }
-                    events.push(json!({
-                        "event_type": "run_finished",
-                        "data": usage,
-                    }));
-                    (RunStatus::Completed, None)
                 }
                 Ok(AgenticLoopOutcome::Cancelled) => unreachable!("handled by cancellation gate"),
                 Ok(AgenticLoopOutcome::Error(e)) => {
@@ -1726,6 +1786,7 @@ impl AgenticRunLifecycleService {
         )
         .with_model(request.model.clone())
         .with_llm_token_service(request.llm_token_service.clone())
+        .with_full_llm_capture(request.full_llm_capture)
         .with_edge_tools(edge_tools)
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
@@ -1953,10 +2014,15 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy: crate::turn::microcompact::CompactStrategy::from_provider_hint(
+                request.model.as_deref().unwrap_or(""),
+            ),
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         }
     }
@@ -2650,6 +2716,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+            // In streaming mode, `text_delta` events were already sent to the client
+            // in real-time via `event_tx`. Exclude them from `streamed_final_events`
+            // to avoid double-emission. Terminal events (text_done, run_finished, etc.)
+            // are added by `finalize_run_events` and must still be sent.
+            let streamed_final_events = super::run_handlers::transform_stream_run_events_for_client(
+                &bg_run_id,
+                final_events
+                    .iter()
+                    .filter(|e| {
+                        e.get("type").and_then(serde_json::Value::as_str) != Some("text_delta")
+                    })
+                    .cloned()
+                    .collect(),
+            );
             persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
             let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
             all_events.append(&mut final_events);
@@ -2705,6 +2785,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
+            for event in streamed_final_events {
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+
             // Persist usage unconditionally — cancelled runs still consumed tokens
             // and must have accurate usage in durable store for billing/audit.
             if let Some(engine) = &run_engine {
@@ -2736,13 +2822,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Emit turn_complete event so clients (HTTP SSE, WebSocket) know the turn is done.
-            let turn_complete = astra_turn_core::complete::build_turn_complete_event(
-                state.total_tool_calls > 0,
-                false,
-                &crate::turn::stall::DivergenceStatus::Healthy,
-                None,
-            );
-            let _ = event_tx.try_send(Value::Object(turn_complete));
+            let _ = event_tx
+                .send(build_run_turn_complete_event_with_interruption(
+                    state.total_tool_calls,
+                    &state.final_text,
+                    state.interruption.as_ref(),
+                ))
+                .await;
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
             drop(event_tx);
@@ -3213,6 +3299,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         use crate::turn::turn_guard::TurnGuard;
 
         // Build edge profile from agent's system prompt and metadata.
+        let compact_strategy = crate::turn::microcompact::CompactStrategy::from_provider_hint(
+            config.agent_profile.model_override.as_deref().unwrap_or(""),
+        );
         let mut edge_profile = Map::new();
         if let Some(prompt) = &config.agent_profile.system_prompt {
             edge_profile.insert(
@@ -3386,10 +3475,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
+            compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
+            bridge_turn_chain_id: None,
+            bridge_user_query_event_id: None,
             turn_event_buffer: None,
         };
 
@@ -3407,6 +3499,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 None,
             )
             .with_cancel_token(config.cancel_token.clone());
+            if let Some(pool) = self.shared_pool.as_ref() {
+                executor = executor.with_workspace_artifact_store(
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                        .with_pool(pool.clone()),
+                );
+            }
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -3466,20 +3564,27 @@ impl SubRunExecutor for ServerSubRunExecutor {
         learning_stack.save_with_active_canary(active_canary);
 
         match outcome {
-            Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: STATUS_COMPLETED.to_string(),
-                output: if loop_state.final_text.is_empty() {
-                    None
+            Ok(AgenticLoopOutcome::Completed) => {
+                let status = if loop_state.interruption.is_some() {
+                    STATUS_PAUSED
                 } else {
-                    Some(loop_state.final_text)
-                },
-                error: None,
-                prompt_tokens: loop_state.total_prompt,
-                completion_tokens: loop_state.total_completion,
-                tool_calls: loop_state.total_tool_calls,
-            }),
+                    STATUS_COMPLETED
+                };
+                Ok(astra_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: status.to_string(),
+                    output: if loop_state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(loop_state.final_text)
+                    },
+                    error: None,
+                    prompt_tokens: loop_state.total_prompt,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
             Ok(AgenticLoopOutcome::Cancelled) => {
                 // Cancelled via pause_flag — report as "paused" so the
                 // delegation engine can distinguish from hard errors.
@@ -3599,6 +3704,57 @@ mod tests {
             extract_prev_assistant_text(&messages).as_deref(),
             Some("real answer")
         );
+    }
+
+    #[test]
+    fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
+        let event =
+            build_run_turn_complete_event_with_interruption(0, "recovered final answer", None);
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["assistant_text"], "recovered final answer");
+        assert_eq!(event["has_tool_calls"], false);
+    }
+
+    #[test]
+    fn build_run_turn_complete_event_omits_empty_assistant_text() {
+        let event = build_run_turn_complete_event_with_interruption(1, "", None);
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["has_tool_calls"], true);
+        assert!(event.get("assistant_text").is_none());
+    }
+
+    #[test]
+    fn build_run_turn_complete_event_marks_interrupted_turns() {
+        let interruption = crate::turn::interruption::InterruptionRecord::new(
+            crate::turn::interruption::InterruptionKind::BudgetExhausted,
+            crate::turn::interruption::ResumeAction::ContinueImmediately,
+            crate::turn::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 7,
+                turns_completed: 15,
+                remaining_turns: 0,
+                error_detail: Some("Round budget hard-limit reached".to_string()),
+            },
+        );
+
+        let event = build_run_turn_complete_event_with_interruption(
+            7,
+            "[Round budget hard-limit reached]",
+            Some(&interruption),
+        );
+
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["has_tool_calls"], false);
+        assert_eq!(event["stall_detected"], true);
+        assert_eq!(event["execution_state"]["status"], "interrupted");
+        assert_eq!(event["execution_state"]["interrupted"], true);
+        assert_eq!(
+            event["execution_state"]["interruption_kind"],
+            "budget_exhausted"
+        );
+        assert_eq!(event["execution_state"]["tool_calls_completed"], 7);
+        assert_eq!(event["execution_state"]["remaining_turns"], 0);
+        assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
     }
 
     #[test]
@@ -3746,6 +3902,7 @@ mod tests {
         ChatRequestData {
             message: message.to_string(),
             session_id: None,
+            full_llm_capture: false,
             agent_id: None,
             model: None,
             llm_token_service: None,
@@ -4200,6 +4357,48 @@ mod tests {
     }
 
     #[test]
+    fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() {
+        let svc = test_service();
+        let request = test_request("partial");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
+        state.final_text = "[Round budget hard-limit reached]".to_string();
+        state.interruption = Some(crate::turn::interruption::InterruptionRecord::new(
+            crate::turn::interruption::InterruptionKind::BudgetExhausted,
+            crate::turn::interruption::ResumeAction::ContinueImmediately,
+            crate::turn::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 5,
+                turns_completed: 15,
+                remaining_turns: 0,
+                error_detail: Some("Round budget hard-limit reached".to_string()),
+            },
+        ));
+
+        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Completed),
+            vec![],
+            &state,
+        );
+
+        assert_eq!(status, RunStatus::Paused);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget"))
+        );
+        assert_eq!(events[0]["event_type"], "text_done");
+        assert_eq!(events[0]["data"]["partial"], true);
+        assert_eq!(
+            events[0]["data"]["interruption"]["kind"],
+            "budget_exhausted"
+        );
+        assert_eq!(events[1]["event_type"], "run_interrupted");
+        assert_eq!(events[2]["event_type"], "run_finished");
+        assert_eq!(events[2]["data"]["interrupted"], true);
+        assert_eq!(events[2]["data"]["interruption_kind"], "budget_exhausted");
+    }
+
+    #[test]
     fn merge_cancelled_run_events_preserves_order_and_usage() {
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let cancel_token = Arc::new(CancellationToken::new());
@@ -4238,14 +4437,16 @@ mod tests {
     fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
         let events = vec![
             json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+            json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
             json!({"event_type": "run_error", "data": {"error": "boom"}}),
             json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
         ];
 
         let persisted = terminal_events_for_persistence(&events);
-        assert_eq!(persisted.len(), 2);
-        assert_eq!(persisted[0]["event_type"], "run_error");
-        assert_eq!(persisted[1]["event_type"], "run_finished");
+        assert_eq!(persisted.len(), 3);
+        assert_eq!(persisted[0]["event_type"], "text_done");
+        assert_eq!(persisted[1]["event_type"], "run_error");
+        assert_eq!(persisted[2]["event_type"], "run_finished");
     }
 
     #[tokio::test]
@@ -4539,6 +4740,7 @@ mod tests {
         let req = ChatRequestData {
             message: "hi".into(),
             session_id: None,
+            full_llm_capture: false,
             agent_id: None,
             model: None,
             llm_token_service: None,
@@ -4665,6 +4867,7 @@ mod tests {
         let req = ChatRequestData {
             message: "hi".into(),
             session_id: None,
+            full_llm_capture: false,
             agent_id: None,
             model: None,
             llm_token_service: None,
@@ -5169,6 +5372,39 @@ mod tests {
         assert_eq!(status.status, durable.status);
         assert_eq!(status.waiting_for, durable.waiting_for);
         assert_eq!(status.events_count, durable.events.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn stream_run_cache_miss_replays_durable_text_done() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine
+            .start_run("run-durable-text", "user-1", "session-1")
+            .await
+            .expect("start durable run");
+        engine
+            .append_event(
+                "run-durable-text",
+                json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
+            )
+            .await
+            .expect("persist text_done");
+        engine
+            .append_event(
+                "run-durable-text",
+                json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
+            )
+            .await
+            .expect("persist run_finished");
+
+        let events = ok(svc
+            .stream_run("run-durable-text".into(), "user-1".into(), 1)
+            .await);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event_type"], "text_done");
+        assert_eq!(events[0]["data"]["full_text"], "durable final answer");
+        assert_eq!(events[1]["event_type"], "run_finished");
     }
 
     #[tokio::test]
@@ -5878,6 +6114,30 @@ mod tests {
         assert!(
             fn_body.contains("STATUS_WAITING"),
             "cancel_run durable fallback must include STATUS_WAITING"
+        );
+    }
+
+    #[test]
+    fn configure_runtime_controllers_wires_context_trace_artifact_store() {
+        let source = include_str!("run_lifecycle.rs");
+        assert!(
+            source.contains(
+                "artifact_store: astra_services::DatabaseSessionArtifactStore::new(matrixone.clone())"
+            ),
+            "context trace persistence should construct a remote workspace artifact store"
+        );
+        assert!(
+            source.contains(".with_pool(pool.clone())"),
+            "context trace artifact persistence should reuse the shared MatrixOne pool"
+        );
+    }
+
+    #[test]
+    fn server_tool_executor_is_wired_with_workspace_artifact_store() {
+        let source = include_str!("run_lifecycle.rs");
+        assert!(
+            source.contains(".with_workspace_artifact_store("),
+            "server run lifecycle should inject a workspace artifact store into ServerToolExecutor"
         );
     }
 }

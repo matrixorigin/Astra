@@ -62,13 +62,14 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
     };
     let verdict_warning =
         crate::server::run_lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
-    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records(
+    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        crate::pipeline::evaluation::current_evaluation_thresholds(),
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,
@@ -815,37 +816,40 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // Record LLM round in the turn event buffer and advance the round counter.
     // Also post-process new ToolCallRecords to set batch_id and parallel flags.
     let new_records_start = evo_records_before;
-    let new_records = &mut state.stall.tool_call_records[new_records_start..];
-    if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
-        let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
-        let has_parallel = new_records
-            .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
-            .count()
-            > 1;
-        for rec in new_records.iter_mut() {
-            if rec.is_synthetic_placeholder() {
-                continue;
-            }
-            rec.batch_id = batch_id.clone();
-            if has_parallel {
-                rec.parallel = Some(true);
-            }
-        }
-        // B4: Inject positive reinforcement when LLM successfully batched tools.
-        if has_parallel {
-            let parallel_count = new_records
+    let round_tool_calls = {
+        let new_records = &mut state.stall.tool_call_records[new_records_start..];
+        if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
+            let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
+            let has_parallel = new_records
                 .iter()
                 .filter(|r| !r.is_synthetic_placeholder())
-                .count();
-            state.messages.push(serde_json::json!({
-                "role": "system",
-                "content": format!(
-                    "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
-                )
-            }));
+                .count()
+                > 1;
+            for rec in new_records.iter_mut() {
+                if rec.is_synthetic_placeholder() {
+                    continue;
+                }
+                rec.batch_id = batch_id.clone();
+                if has_parallel {
+                    rec.parallel = Some(true);
+                }
+            }
+            // B4: Inject positive reinforcement when LLM successfully batched tools.
+            if has_parallel {
+                let parallel_count = new_records
+                    .iter()
+                    .filter(|r| !r.is_synthetic_placeholder())
+                    .count();
+                state.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
+                    )
+                }));
+            }
         }
-    }
+        new_records.to_vec()
+    };
 
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
@@ -886,6 +890,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             agentic_step: Some(agentic_step),
             source: Some("agentic_loop".into()),
             run_id,
+            tool_calls: Some(round_tool_calls),
         });
     }
 

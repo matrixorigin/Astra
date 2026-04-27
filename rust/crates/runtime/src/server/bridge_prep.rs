@@ -29,6 +29,12 @@ pub(super) struct ChatTurnRequestBody {
     model: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_state: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_turn: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_chain_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_query_event_id: Option<serde_json::Value>,
     /// Forward-compatible: preserves unknown fields through round-trip.
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
@@ -90,6 +96,28 @@ impl ChatTurnRequestBody {
         self.execution_state.as_ref()?.as_object()
     }
 
+    fn explicit_session_turn(&self) -> Option<u32> {
+        self.session_turn
+            .as_ref()?
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+    }
+
+    fn explicit_turn_chain_id(&self) -> Option<&str> {
+        self.turn_chain_id
+            .as_ref()?
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    fn explicit_user_query_event_id(&self) -> Option<&str> {
+        self.user_query_event_id
+            .as_ref()?
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+    }
+
     fn user_query(&self) -> String {
         extract_latest_user_query(self.messages_slice())
     }
@@ -120,6 +148,7 @@ fn extract_tool_name(tool: &serde_json::Value) -> Option<&str> {
 pub(super) struct PreparedChatTurnBridgeRequest {
     pub(super) body: Bytes,
     pub(super) trusted_session_id: Option<String>,
+    pub(super) full_llm_capture: Option<bool>,
     pub(super) session_turn: Option<String>,
     pub(super) turn_chain_id: Option<String>,
     pub(super) user_query_event_id: Option<String>,
@@ -137,6 +166,7 @@ impl PreparedChatTurnBridgeRequest {
         Self {
             body,
             trusted_session_id: None,
+            full_llm_capture: None,
             session_turn: None,
             turn_chain_id: None,
             user_query_event_id: None,
@@ -171,6 +201,47 @@ fn validate_session_id_shape(
     Ok(())
 }
 
+#[derive(Clone)]
+struct ExplicitBridgeTurnIdentity {
+    session_turn: u32,
+    turn_chain_id: String,
+    user_query_event_id: String,
+}
+
+fn validate_explicit_turn_identity(
+    request: &ChatTurnRequestBody,
+) -> Result<Option<ExplicitBridgeTurnIdentity>, (StatusCode, Json<ErrorResponse>)> {
+    let any_present = request.session_turn.is_some()
+        || request.turn_chain_id.is_some()
+        || request.user_query_event_id.is_some();
+    if !any_present {
+        return Ok(None);
+    }
+    let Some(session_turn) = request.explicit_session_turn() else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "session_turn must be a positive integer when explicit bridge identity is provided",
+        ));
+    };
+    let Some(turn_chain_id) = request.explicit_turn_chain_id() else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "turn_chain_id must be a non-empty string when explicit bridge identity is provided",
+        ));
+    };
+    let Some(user_query_event_id) = request.explicit_user_query_event_id() else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "user_query_event_id must be a non-empty string when explicit bridge identity is provided",
+        ));
+    };
+    Ok(Some(ExplicitBridgeTurnIdentity {
+        session_turn,
+        turn_chain_id: turn_chain_id.to_string(),
+        user_query_event_id: user_query_event_id.to_string(),
+    }))
+}
+
 pub(super) async fn prepare_chat_turn_bridge_body(
     state: &AppState,
     user: &AuthUserRecord,
@@ -181,9 +252,10 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
     validate_session_id_shape(&request)?;
+    let explicit_turn_identity = validate_explicit_turn_identity(&request)?;
 
     // ── Session resolution ──────────────────────────────────────────────
-    let (trusted_session_id, trusted_session_created_at) =
+    let (trusted_session_id, trusted_session_created_at, full_llm_capture) =
         if let Some(session_id) = request.session_id_str().map(String::from) {
             let session = state
                 .session_service
@@ -193,10 +265,13 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             (
                 Some(session_id),
                 normalize_session_created_at_for_bridge(&session.created_at),
+                crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                    &session.metadata,
+                )),
             )
         } else if let Some(session_id) = trusted_session_id_override {
             request.set_session_id(session_id);
-            (Some(session_id.to_string()), None)
+            (Some(session_id.to_string()), None, false)
         } else {
             let agent_id = request.agent_id_str();
             let metadata = agent_id.as_ref().map(|agent_id| {
@@ -221,7 +296,13 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             let created_session_created_at =
                 normalize_session_created_at_for_bridge(&session.created_at);
             request.set_session_id(&created_session_id);
-            (Some(created_session_id), created_session_created_at)
+            (
+                Some(created_session_id),
+                created_session_created_at,
+                crate::turn::llm_exchange_capture::session_full_llm_capture_enabled(Some(
+                    &session.metadata,
+                )),
+            )
         };
 
     if let (Some(session_id), Some(created_at)) = (
@@ -235,9 +316,14 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         if let Some(session_id) = trusted_session_id.as_deref() {
             let messages = request.messages_slice();
             let has_tool_results = request.has_tool_results();
-            let (chain_id, event_id, session_turn) =
-                prepare_chat_turn_bridge_identifiers(state, session_id, messages, has_tool_results)
-                    .await;
+            let (chain_id, event_id, session_turn) = prepare_chat_turn_bridge_identifiers(
+                state,
+                session_id,
+                messages,
+                has_tool_results,
+                explicit_turn_identity.as_ref(),
+            )
+            .await;
             (
                 Some(chain_id),
                 Some(event_id),
@@ -278,6 +364,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         .map(|body| PreparedChatTurnBridgeRequest {
             body,
             trusted_session_id,
+            full_llm_capture: full_llm_capture.then_some(true),
             session_turn,
             turn_chain_id,
             user_query_event_id,
@@ -354,7 +441,31 @@ async fn prepare_chat_turn_bridge_identifiers(
     session_id: &str,
     messages: &[serde_json::Value],
     has_tool_results: bool,
+    explicit_identity: Option<&ExplicitBridgeTurnIdentity>,
 ) -> (String, String, u32) {
+    if let Some(identity) = explicit_identity {
+        let now = current_unix_seconds();
+        let mut cache = state.chat_turn_bridge_cache.lock().await;
+        let mut updated_entry = cache.get(session_id, now).unwrap_or_default();
+        updated_entry.insert(
+            "turn_chain_id".to_string(),
+            serde_json::Value::String(identity.turn_chain_id.clone()),
+        );
+        updated_entry.insert(
+            "user_query_event_id".to_string(),
+            serde_json::Value::String(identity.user_query_event_id.clone()),
+        );
+        updated_entry.insert(
+            "session_turn".to_string(),
+            serde_json::json!(identity.session_turn),
+        );
+        cache.insert(session_id.to_string(), updated_entry, now);
+        return (
+            identity.turn_chain_id.clone(),
+            identity.user_query_event_id.clone(),
+            identity.session_turn,
+        );
+    }
     let inferred_session_turn = infer_bridge_session_turn(state, session_id).await;
     let now = current_unix_seconds();
     let mut cache = state.chat_turn_bridge_cache.lock().await;
@@ -540,10 +651,15 @@ fn same_tool_names(left: &[serde_json::Value], right: &[serde_json::Value]) -> b
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use axum::{Json, http::StatusCode};
     use serde_json::json;
     use std::sync::Arc;
 
-    use crate::{AppState, AuthUserRecord, HealthChecker, ServiceInfo};
+    use crate::{
+        AppState, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
+        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
+        SessionService, SessionUpdateRequestData,
+    };
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -566,6 +682,94 @@ mod tests {
 
     fn tool_value(name: &str) -> serde_json::Value {
         json!({ "function": { "name": name } })
+    }
+
+    #[derive(Clone)]
+    struct CaptureEnabledSessionService;
+
+    #[async_trait]
+    impl SessionService for CaptureEnabledSessionService {
+        async fn create_session(
+            &self,
+            user_id: String,
+            request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionRecord {
+                session_id: "capture-created".to_string(),
+                user_id,
+                agent_id: request.agent_id,
+                title: Some("Created".to_string()),
+                metadata: serde_json::Map::from_iter([(
+                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    json!(true),
+                )]),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionRecord {
+                session_id,
+                user_id,
+                agent_id: None,
+                title: Some("Existing".to_string()),
+                metadata: serde_json::Map::from_iter([(
+                    crate::turn::llm_exchange_capture::FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+                    json!(true),
+                )]),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn update_session(
+            &self,
+            session_id: String,
+            user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id).await
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            Ok(())
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionActivityRecord {
+                session_id: String::new(),
+                activities: vec![],
+                total: 0,
+            })
+        }
     }
 
     // ── normalize_session_created_at_for_bridge ──────────────────────
@@ -708,6 +912,82 @@ mod tests {
         assert_eq!(prepared.session_turn.as_deref(), Some("6"));
         assert_eq!(prepared.turn_chain_id.as_deref(), Some("chain-6"));
         assert_eq!(prepared.user_query_event_id.as_deref(), Some("query-6"));
+    }
+
+    #[tokio::test]
+    async fn prepare_body_prefers_explicit_payload_turn_identity() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let now = current_unix_seconds();
+        {
+            let mut cache = state.chat_turn_bridge_cache.lock().await;
+            let mut entry = serde_json::Map::new();
+            entry.insert("turn_chain_id".to_string(), json!("cached-chain"));
+            entry.insert("user_query_event_id".to_string(), json!("cached-query"));
+            entry.insert("session_turn".to_string(), json!(9));
+            cache.insert("bound-session".to_string(), entry, now);
+        }
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "session_turn": 2,
+                "turn_chain_id": "root-chain",
+                "user_query_event_id": "root-query",
+                "messages": [{"role": "user", "content": "review local changes"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let prepared =
+            prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+                .expect("explicit identity should prepare");
+
+        assert_eq!(prepared.session_turn.as_deref(), Some("2"));
+        assert_eq!(prepared.turn_chain_id.as_deref(), Some("root-chain"));
+        assert_eq!(prepared.user_query_event_id.as_deref(), Some("root-query"));
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_partial_explicit_turn_identity() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "session_turn": 2,
+                "messages": [{"role": "user", "content": "review local changes"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let error =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+            {
+                Ok(_) => panic!("partial identity should be rejected"),
+                Err(error) => error,
+            };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn prepare_body_propagates_full_capture_flag_from_session_metadata() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(CaptureEnabledSessionService));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "session_id": "capture-session",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let prepared = prepare_chat_turn_bridge_body(&state, &test_user(), body, None)
+            .await
+            .expect("session metadata should be available");
+
+        assert_eq!(
+            prepared.trusted_session_id.as_deref(),
+            Some("capture-session")
+        );
+        assert_eq!(prepared.full_llm_capture, Some(true));
     }
 
     // ── same_tool_names ─────────────────────────────────────────────

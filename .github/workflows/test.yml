@@ -183,13 +183,11 @@ jobs:
       MATRIXONE_PORT: "6001"
       MATRIXONE_USER: root
       MATRIXONE_PASSWORD: "111"
-      ASTRA_DATABASE: astra_runtime
-      ASTRA_DATABASE_PREFIX: "test_"
       ASTRA_AUTO_CREATE_DATABASE: "1"
       JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
       SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
       TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
-      ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+      ASTRA_BRIDGE_TEST_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
       CHAT_TURN_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key

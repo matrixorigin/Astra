@@ -65,7 +65,7 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_turns: 50,
+            max_turns: 150,
             plan_subtask_max_turns: 0,
             max_tool_rounds: MAX_TOOL_ROUNDS_DEFAULT, // Single source of truth
             turn_timeout_s: 300.0,
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn defaults_match_original_constants() {
         let d = RuntimeLimits::default();
-        assert_eq!(d.max_turns, 50);
+        assert_eq!(d.max_turns, 150);
         assert_eq!(d.plan_subtask_max_turns, 0);
         assert_eq!(d.max_tool_rounds, 100);
         assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);

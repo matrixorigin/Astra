@@ -418,6 +418,53 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn get_session_artifact_latest_text(
+        &self,
+        token: &str,
+        session_id: &str,
+        artifact_kind: &str,
+    ) -> Result<String, ThinClientError> {
+        let path = paths::session_artifact_latest(session_id, artifact_kind).ok_or_else(|| {
+            ThinClientError::InvalidInput(format!("invalid artifact_kind: {artifact_kind}"))
+        })?;
+        let url = self.url(&path)?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
+    pub async fn download_session_artifact(
+        &self,
+        token: &str,
+        session_id: &str,
+        artifact_id: &str,
+    ) -> Result<(Vec<u8>, Option<String>), ThinClientError> {
+        let path = paths::session_artifact_download(session_id, artifact_id).ok_or_else(|| {
+            ThinClientError::InvalidInput(format!("invalid artifact_id: {artifact_id}"))
+        })?;
+        let url = self.url(&path)?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        let status = resp.status();
+        let filename = attachment_filename(resp.headers());
+        let bytes = resp.bytes().await?;
+        if !status.is_success() {
+            return Err(ThinClientError::Api {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok((bytes.to_vec(), filename))
+    }
+
     pub async fn post_session_replay_json(
         &self,
         token: &str,
@@ -1444,6 +1491,30 @@ impl ThinClient {
     }
 }
 
+fn attachment_filename(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::CONTENT_DISPOSITION)?.to_str().ok()?;
+    let filename = value
+        .split(';')
+        .map(str::trim)
+        .find_map(|segment| segment.strip_prefix("filename="))?
+        .trim_matches('"')
+        .trim();
+    if filename.is_empty() {
+        return None;
+    }
+    // Strip control characters and cap length for safety.
+    let sanitized: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(255)
+        .collect();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,6 +1610,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["session_id"], "new");
+    }
+
+    #[tokio::test]
+    async fn wiremock_get_session_artifact_latest_text() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/s-1/artifacts/latest/llm_capture"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "artifact_id": "art-1",
+                "artifact_kind": "llm_capture"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let body = client
+            .get_session_artifact_latest_text("tok", "s-1", "llm_capture")
+            .await
+            .unwrap();
+        assert!(body.contains("\"artifact_id\":\"art-1\""));
+    }
+
+    #[tokio::test]
+    async fn wiremock_download_session_artifact_reads_filename() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/s-1/artifacts/art-1/download"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-disposition",
+                        "attachment; filename=\"llm_capture_art-1.json\"",
+                    )
+                    .set_body_string("{\"artifact_id\":\"art-1\"}"),
+            )
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let (bytes, filename) = client
+            .download_session_artifact("tok", "s-1", "art-1")
+            .await
+            .unwrap();
+        assert_eq!(filename.as_deref(), Some("llm_capture_art-1.json"));
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "{\"artifact_id\":\"art-1\"}"
+        );
     }
 
     #[tokio::test]
@@ -2235,5 +2356,44 @@ mod tests {
             body.contains(".timeout("),
             "get_authed_path_text must apply a per-request .timeout()"
         );
+    }
+
+    #[test]
+    fn attachment_filename_parses_normal_filename() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"capture_2024.json\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            attachment_filename(&headers),
+            Some("capture_2024.json".to_string())
+        );
+    }
+
+    #[test]
+    fn attachment_filename_caps_length() {
+        let long_name = "a".repeat(300);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{long_name}\"")
+                .parse()
+                .unwrap(),
+        );
+        let result = attachment_filename(&headers).unwrap();
+        assert_eq!(result.len(), 255);
+    }
+
+    #[test]
+    fn attachment_filename_returns_none_for_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"\"".parse().unwrap(),
+        );
+        assert_eq!(attachment_filename(&headers), None);
     }
 }

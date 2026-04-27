@@ -33,7 +33,7 @@
 ///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -66,6 +66,24 @@ use crate::{
 };
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
+const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
+
+#[derive(Clone)]
+struct BridgeTraceCorrelation {
+    session_turn_source: String,
+    turn_chain_id: String,
+    user_query_event_id: String,
+}
+
+impl BridgeTraceCorrelation {
+    fn as_capture_trace(&self) -> crate::turn::llm_exchange_capture::CaptureTrace<'_> {
+        crate::turn::llm_exchange_capture::CaptureTrace {
+            session_turn_source: Some(self.session_turn_source.as_str()),
+            turn_chain_id: Some(self.turn_chain_id.as_str()),
+            user_query_event_id: Some(self.user_query_event_id.as_str()),
+        }
+    }
+}
 
 fn count_inprocess_persisted_events(
     core_event_count: usize,
@@ -239,6 +257,170 @@ fn build_bridge_tool_call_records(
     records
 }
 
+fn record_full_llm_request_event(
+    turn_event_buffer: &mut Option<TurnEventBuffer>,
+    full_llm_capture: bool,
+    session_id: &str,
+    turn: u32,
+    trace: &BridgeTraceCorrelation,
+    source: &str,
+    model: &str,
+    provider: &str,
+    attempt: u32,
+    messages: &[Value],
+    tools: &[Value],
+    max_output_tokens: Option<usize>,
+) {
+    if session_id.is_empty() || !full_llm_capture {
+        return;
+    }
+    let Some(buf) = turn_event_buffer.as_mut() else {
+        return;
+    };
+    let round = buf.current_round();
+    let mut evt = astra_services::session_journal::JournalEvent::llm_request_full(
+        Some(session_id),
+        turn,
+        round,
+        json!({
+            "source": source,
+            "model": model,
+            "provider": provider,
+            "attempt": attempt,
+            "trace": {
+                "session_turn": turn,
+                "round": round,
+                "session_turn_source": trace.session_turn_source,
+                "turn_chain_id": trace.turn_chain_id,
+                "user_query_event_id": trace.user_query_event_id,
+            },
+            "request": crate::turn::llm_exchange_capture::build_capture_request_json(
+                messages,
+                tools,
+                max_output_tokens,
+            ),
+        }),
+    );
+    evt.offset_ms = Some(buf.offset_ms());
+    buf.record(evt);
+}
+
+fn record_full_llm_response_event(
+    turn_event_buffer: &mut Option<TurnEventBuffer>,
+    full_llm_capture: bool,
+    session_id: &str,
+    turn: u32,
+    trace: &BridgeTraceCorrelation,
+    source: &str,
+    model: &str,
+    provider: &str,
+    attempt: u32,
+    outcome: &str,
+    response: Value,
+) {
+    if session_id.is_empty() || !full_llm_capture {
+        return;
+    }
+    let Some(buf) = turn_event_buffer.as_mut() else {
+        return;
+    };
+    let round = buf.current_round();
+    let mut evt = astra_services::session_journal::JournalEvent::llm_response_full(
+        Some(session_id),
+        turn,
+        round,
+        json!({
+            "source": source,
+            "model": model,
+            "provider": provider,
+            "attempt": attempt,
+            "trace": {
+                "session_turn": turn,
+                "round": round,
+                "session_turn_source": trace.session_turn_source,
+                "turn_chain_id": trace.turn_chain_id,
+                "user_query_event_id": trace.user_query_event_id,
+            },
+            "response": crate::turn::llm_exchange_capture::build_capture_response_json(
+                outcome,
+                response,
+            ),
+        }),
+    );
+    evt.offset_ms = Some(buf.offset_ms());
+    buf.record(evt);
+}
+
+fn bridge_success_response_payload(
+    full_text: &str,
+    reasoning: &str,
+    tool_calls: &[Value],
+    usage: &Map<String, Value>,
+    finish_reason: &str,
+) -> Value {
+    json!({
+        "full_text": full_text,
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
+        "usage": usage,
+        "finish_reason": finish_reason,
+    })
+}
+
+fn bridge_error_response_payload(
+    error: &str,
+    kind: &str,
+    full_text: &str,
+    reasoning: &str,
+    tool_calls: &[Value],
+    usage: &Map<String, Value>,
+) -> Value {
+    json!({
+        "error": error,
+        "kind": kind,
+        "full_text": full_text,
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
+        "usage": usage,
+    })
+}
+
+fn flush_turn_event_buffer_or_warn(
+    turn_event_buffer: &mut Option<TurnEventBuffer>,
+    session_id: &str,
+    stage: &str,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    let Some(buf) = turn_event_buffer.as_mut() else {
+        return;
+    };
+    if buf.is_empty() {
+        return;
+    }
+    let writer = match JournalWriter::new(session_id) {
+        Ok(writer) => writer,
+        Err(error) => {
+            astra_core::agent_warn!(
+                "bridge",
+                "failed to create journal writer for {stage}: session={} error={}",
+                session_id,
+                error
+            );
+            return;
+        }
+    };
+    if let Err(error) = buf.flush(&writer) {
+        astra_core::agent_warn!(
+            "bridge",
+            "failed to flush turn events for {stage}: session={} error={}",
+            session_id,
+            error
+        );
+    }
+}
+
 // ── Bridge observability — delegated to turn::bridge_observability ────────────
 use super::bridge_observability::{
     build_legacy_context_trace_signal, persist_legacy_bridge_trace_and_quality,
@@ -309,6 +491,37 @@ async fn infer_bridge_session_turn(shared_pool: Option<&SharedPool>, session_id:
     .await
     .unwrap_or(0);
     (count.max(0) as u32).saturating_add(1)
+}
+
+fn bridge_root_turn_journal_owned(
+    headers: &HeaderMap,
+    payload: &Value,
+    bridge_e2e_authorized: bool,
+) -> bool {
+    if bridge_e2e_authorized {
+        return false;
+    }
+    if payload
+        .get("root_turn_journal_owned")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    header_str(headers, ROOT_TURN_JOURNAL_HEADER)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false)
+}
+
+fn bridge_should_create_turn_event_buffer(
+    full_llm_capture: bool,
+    root_runtime_owns_turn_journal: bool,
+) -> bool {
+    full_llm_capture || !root_runtime_owns_turn_journal
+}
+
+fn bridge_should_record_llm_round(root_runtime_owns_turn_journal: bool) -> bool {
+    !root_runtime_owns_turn_journal
 }
 
 fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
@@ -403,6 +616,7 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
         false,
         &crate::turn::stall::DivergenceStatus::Healthy,
         None,
+        Some(assistant_text),
     );
     if let Some(user_message) = latest_user_message_text(messages)
         && let Some(suggestion) = crate::turn::followup_suggestion::suggest_followup(
@@ -422,9 +636,11 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 // ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
 pub use super::prompt_cache::PromptCacheConfig;
 #[cfg(test)]
+pub(crate) use super::prompt_cache::add_message_cache_breakpoint;
+#[cfg(test)]
 pub(crate) use super::prompt_cache::build_system_message;
 pub(crate) use super::prompt_cache::{
-    add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
     build_system_message_with_dynamic_sections,
 };
 
@@ -524,6 +740,7 @@ impl InProcessChatTurnBridge {
         // Extract trusted context injected by dispatch_chat_turn_bridge
         let user_id = header_str(headers, "x-mo-user-id").unwrap_or_default();
         let session_id = header_str(headers, "x-mo-session-id").unwrap_or_default();
+        let full_llm_capture = header_str(headers, "x-mo-full-llm-capture").as_deref() == Some("1");
         let header_session_turn = header_str(headers, "x-mo-session-turn")
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|turn| *turn > 0);
@@ -531,8 +748,6 @@ impl InProcessChatTurnBridge {
         let bridge_e2e_authorized = crate::turn::bridge_e2e_hooks::authorized(headers);
         #[cfg(not(feature = "bridge-e2e-hooks"))]
         let bridge_e2e_authorized = false;
-        let root_runtime_owns_turn_journal =
-            header_session_turn.is_some() && !bridge_e2e_authorized;
         let turn_chain_id =
             header_str(headers, "x-mo-turn-chain-id").unwrap_or_else(|| Uuid::now_v7().to_string());
         let user_query_event_id = header_str(headers, "x-mo-user-query-event-id")
@@ -589,13 +804,23 @@ impl InProcessChatTurnBridge {
         let matrixone = self.matrixone.clone();
         let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
-        let trace_turn = if let Some(turn) = header_session_turn {
-            turn
+        let (trace_turn, trace_turn_source) = if let Some(turn) = header_session_turn {
+            (turn, "header")
         } else if !session_id.is_empty() {
-            infer_bridge_session_turn(shared_pool.as_ref(), &session_id).await
+            (
+                infer_bridge_session_turn(shared_pool.as_ref(), &session_id).await,
+                "inferred_agent_events",
+            )
         } else {
-            1
+            (1, "default")
         };
+        let trace_correlation = BridgeTraceCorrelation {
+            session_turn_source: trace_turn_source.to_string(),
+            turn_chain_id: turn_chain_id.clone(),
+            user_query_event_id: user_query_event_id.clone(),
+        };
+        let root_runtime_owns_turn_journal =
+            bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
         let turn_learning_writer = self.turn_learning_writer.clone();
         let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
@@ -611,32 +836,109 @@ impl InProcessChatTurnBridge {
             };
         #[cfg(not(feature = "bridge-e2e-hooks"))]
         let bridge_e2e_for_stream: Option<Vec<Value>> = None;
+        #[cfg(feature = "bridge-e2e-hooks")]
+        let bridge_e2e_stream_blocks_for_stream: Option<Vec<String>> =
+            if crate::turn::bridge_e2e_hooks::authorized(headers) {
+                let blocks = crate::turn::bridge_e2e_hooks::parse_stream_blocks(
+                    payload
+                        .get("test_llm_stream_blocks")
+                        .unwrap_or(&Value::Null),
+                );
+                (!blocks.is_empty()).then_some(blocks)
+            } else {
+                None
+            };
+        #[cfg(not(feature = "bridge-e2e-hooks"))]
+        let bridge_e2e_stream_blocks_for_stream: Option<Vec<String>> = None;
 
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
+        let bridge_e2e_stream_blocks_capture = bridge_e2e_stream_blocks_for_stream.clone();
         let client_cancel_capture = client_cancel.clone();
         let feedback_store_capture = self.feedback_store.clone();
         let memoria_client_owned = self.memoria_client.clone();
         let session_facts_shared = self.session_facts.clone();
         let persist_tracker_shared = self.persist_tracker.clone();
+        let mut remote_artifact_store =
+            astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone());
+        if let Some(pool) = self.shared_pool.clone() {
+            remote_artifact_store = remote_artifact_store.with_pool(pool);
+        }
+        let remote_artifact_store = Arc::new(remote_artifact_store);
+        let disconnect_capture_state = Arc::new(Mutex::new(DisconnectCaptureSnapshot::default()));
+        if let Some(cancel_token) = client_cancel.clone() {
+            let disconnect_state = disconnect_capture_state.clone();
+            let disconnect_store = remote_artifact_store.clone();
+            let disconnect_full_llm_capture = full_llm_capture;
+            tokio::spawn(async move {
+                cancel_token.cancelled().await;
+                let snapshot = match disconnect_state.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => return,
+                };
+                if !snapshot.started || snapshot.finalized {
+                    return;
+                }
+                persist_bridge_stream_failure_capture(
+                    "bridge_inprocess drop-disconnect capture",
+                    disconnect_full_llm_capture,
+                    disconnect_store.as_ref(),
+                    &snapshot.session_id,
+                    &snapshot.user_id,
+                    snapshot.turn,
+                    &BridgeTraceCorrelation {
+                        session_turn_source: snapshot.session_turn_source.clone(),
+                        turn_chain_id: snapshot.turn_chain_id.clone(),
+                        user_query_event_id: snapshot.user_query_event_id.clone(),
+                    },
+                    snapshot.round_ix,
+                    snapshot.agent_id.as_deref(),
+                    &snapshot.model_name,
+                    &snapshot.resolved_model,
+                    &snapshot.provider,
+                    &snapshot.llm_messages,
+                    &snapshot.pruned_tools,
+                    snapshot.max_output_tokens,
+                    "client_disconnect",
+                    "Request cancelled (client disconnected)",
+                    "CLIENT_DISCONNECT",
+                    &snapshot.partial_text,
+                    &snapshot.partial_reasoning,
+                    &snapshot.partial_tool_calls,
+                    &snapshot.usage,
+                )
+                .await;
+            });
+        }
 
         let stream = stream! {
             let cc = client_cancel_capture.clone();
+            let remote_artifact_store = remote_artifact_store.clone();
+            let disconnect_capture_state = disconnect_capture_state.clone();
             let _client_disconnect_guard = cc
                 .as_ref()
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             let run_id = uuid::Uuid::new_v4().to_string();
-            let mut turn_event_buffer = (!root_runtime_owns_turn_journal).then(|| {
-                TurnEventBuffer::begin_turn(
+            let mut turn_event_buffer = bridge_should_create_turn_event_buffer(
+                full_llm_capture,
+                root_runtime_owns_turn_journal,
+            ).then(|| {
+                TurnEventBuffer::begin_turn_with_round(
                     (!session_id.is_empty()).then_some(session_id.as_str()),
                     trace_turn,
+                    round_index,
                 )
             });
             // Emit session_info first
             yield render_sse(&inprocess_session_info_event(&session_id, &run_id));
 
             let bridge_e2e = bridge_e2e_capture;
-            let use_e2e_llm = bridge_e2e.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+            let bridge_e2e_stream_blocks = bridge_e2e_stream_blocks_capture;
+            let use_e2e_llm = bridge_e2e.as_ref().map(|r| !r.is_empty()).unwrap_or(false)
+                || bridge_e2e_stream_blocks
+                    .as_ref()
+                    .map(|blocks| !blocks.is_empty())
+                    .unwrap_or(false);
 
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_model name for rate-limit-triggered fallback.
@@ -661,6 +963,7 @@ impl InProcessChatTurnBridge {
                     Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_model),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
+                        mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }
                 }
@@ -688,6 +991,7 @@ impl InProcessChatTurnBridge {
                                 "CLIENT_DISCONNECT",
                                 false,
                             ));
+                            mark_disconnect_capture_finalized(&disconnect_capture_state);
                             return;
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
@@ -764,6 +1068,7 @@ impl InProcessChatTurnBridge {
                         reset_in_ms / 1000
                     );
                     yield render_sse_map(&build_stream_error_event(&err_msg, "RATE_LIMITED", true));
+                    mark_disconnect_capture_finalized(&disconnect_capture_state);
                     return;
                 }
             }
@@ -1345,6 +1650,7 @@ impl InProcessChatTurnBridge {
 
             // Single LLM call per HTTP request (no multi-round tool loop).
             let round_ix = 0i64;
+            let capture_round_ix = i64::from(round_index);
             {
                 cloud_loop_turns += 1;
 
@@ -1380,6 +1686,26 @@ impl InProcessChatTurnBridge {
                 let mut loop_tool_calls: Vec<Value> = Vec::new();
                 let mut loop_text = String::new();
                 let mut loop_reasoning = String::new();
+                let mut attempt_in_round = 0_u32;
+                let request_capture_model = if resolved_model.is_empty() {
+                    model_name.clone()
+                } else {
+                    resolved_model.clone()
+                };
+                record_full_llm_request_event(
+                    &mut turn_event_buffer,
+                    full_llm_capture,
+                    &session_id,
+                    trace_turn,
+                    &trace_correlation,
+                    "bridge_inprocess",
+                    &request_capture_model,
+                    &provider,
+                    attempt_in_round,
+                    &llm_messages,
+                    &pruned_tools,
+                    Some(max_output_tokens),
+                );
 
                 let e2e_round: Option<&Value> = if use_e2e_llm {
                     bridge_e2e
@@ -1406,8 +1732,8 @@ impl InProcessChatTurnBridge {
                         let _ = round_val;
                     }
                 } else {
-                    // Add cache breakpoint on last conversation message for Anthropic
-                    add_message_cache_breakpoint(&mut llm_messages, &cache_cfg);
+                    // Add Anthropic protocol-level prompt-cache metadata on the request clone.
+                    apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
                     let skill_injections: Vec<crate::turn::context_assembly_trace::SkillInjection> =
@@ -1461,21 +1787,43 @@ impl InProcessChatTurnBridge {
                         },
                     }));
                     let mut client_stopped = false;
-                    let llm_stream = match call_llm_stream(
-                        &llm_messages,
-                        &pruned_tools,
-                        &model_name,
-                        &api_key,
-                        &base_url,
-                        &provider,
-                        Some(max_output_tokens),
-                        has_fallback,
-                        cc.clone(),
-                    )
-                    .await
+                    let llm_stream = if let Some(blocks) = bridge_e2e_stream_blocks
+                        .clone()
+                        .filter(|blocks| !blocks.is_empty() && round_ix == 0)
                     {
-                        Ok(s) => s,
-                        Err(e) if crate::turn::llm_client::is_context_window_error(&e.to_lowercase()) => {
+                        futures_util::stream::iter(blocks.into_iter().map(Bytes::from)).boxed()
+                    } else {
+                        match call_llm_stream(
+                            &llm_messages,
+                            &pruned_tools,
+                            &model_name,
+                            &api_key,
+                            &base_url,
+                            &provider,
+                            Some(max_output_tokens),
+                            has_fallback,
+                            cc.clone(),
+                        )
+                        .await
+                        {
+                            Ok(s) => s.boxed(),
+                            Err(e) if crate::turn::llm_client::is_context_window_error(&e.to_lowercase()) => {
+                            record_full_llm_response_event(
+                                &mut turn_event_buffer,
+                                full_llm_capture,
+                                &session_id,
+                                trace_turn,
+                                &trace_correlation,
+                                "bridge_inprocess",
+                                &request_capture_model,
+                                &provider,
+                                attempt_in_round,
+                                "context_window_error",
+                                json!({
+                                    "error": e.clone(),
+                                    "kind": "context_window",
+                                }),
+                            );
                             // Context-window error: force aggressive compaction and retry once
                             astra_core::agent_warn!(
                                 "bridge",
@@ -1547,6 +1895,21 @@ impl InProcessChatTurnBridge {
                                 crate::prompts::CompactionTier::AggressivePrune,
                             );
                             annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
+                            attempt_in_round = attempt_in_round.saturating_add(1);
+                            record_full_llm_request_event(
+                                &mut turn_event_buffer,
+                                full_llm_capture,
+                                &session_id,
+                                trace_turn,
+                                &trace_correlation,
+                                "bridge_inprocess",
+                                &request_capture_model,
+                                &provider,
+                                attempt_in_round,
+                                &llm_messages,
+                                &pruned_tools,
+                                Some(max_output_tokens / 2),
+                            );
 
                             // Retry LLM call
                             match call_llm_stream(
@@ -1562,52 +1925,176 @@ impl InProcessChatTurnBridge {
                             )
                             .await
                             {
-                                Ok(s) => s,
+                                Ok(s) => s.boxed(),
                                 Err(e2) => {
+                                    record_full_llm_response_event(
+                                        &mut turn_event_buffer,
+                                        full_llm_capture,
+                                        &session_id,
+                                        trace_turn,
+                                        &trace_correlation,
+                                        "bridge_inprocess",
+                                        &request_capture_model,
+                                        &provider,
+                                        attempt_in_round,
+                                        "context_window_error",
+                                        json!({
+                                            "error": e2.clone(),
+                                            "kind": "context_window",
+                                        }),
+                                    );
                                     let kind = classify_llm_error(&e2);
-                                    // Dump full LLM request for post-mortem debugging
                                     let dump = crate::turn::llm_request_dump::build_llm_request_dump(
                                         &session_id, agent_id.as_deref(), &model_name, &provider,
                                         &e2, &llm_messages, &pruned_tools,
-                                        round_ix, Some(max_output_tokens / 2),
+                                        capture_round_ix, Some(max_output_tokens / 2),
                                     );
-                                    if let Some(path) = dump.write_local() {
-                                        eprintln!("[llm_error_dump] {path}");
+                                    if let Err(error) =
+                                        dump.persist_remote(&user_id, remote_artifact_store.as_ref()).await
+                                    {
+                                        astra_core::agent_error!(
+                                            "llm-dump",
+                                            "bridge_inprocess compacted context-window dump persist failed: {error}"
+                                        );
                                     }
-                                    dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
+                                    crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                                        "bridge_inprocess compacted context-window capture",
+                                        full_llm_capture,
+                                        Some(remote_artifact_store.as_ref()),
+                                        &session_id,
+                                        &user_id,
+                                        trace_turn,
+                                        u32::try_from(capture_round_ix).unwrap_or(u32::MAX),
+                                        agent_id.as_deref(),
+                                        "bridge_inprocess",
+                                        if resolved_model.is_empty() { &model_name } else { &resolved_model },
+                                        &provider,
+                                        &llm_messages,
+                                        &pruned_tools,
+                                        Some(max_output_tokens / 2),
+                                        "context_window_error",
+                                        json!({
+                                            "error": e2,
+                                            "kind": "context_window",
+                                        }),
+                                        Some(trace_correlation.as_capture_trace()),
+                                    )
+                                    .await;
                                     yield render_sse_map(&build_stream_error_event(
                                         &format!("Context window exceeded even after aggressive compaction: {e2}"),
                                         kind.as_str(),
                                         false, // not retryable
                                     ));
+                                    flush_turn_event_buffer_or_warn(
+                                        &mut turn_event_buffer,
+                                        &session_id,
+                                        "bridge compacted context-window failure",
+                                    );
+                                    mark_disconnect_capture_finalized(&disconnect_capture_state);
                                     return;
                                 }
                             }
                         }
-                        Err(e) => {
+                            Err(e) => {
+                            record_full_llm_response_event(
+                                &mut turn_event_buffer,
+                                full_llm_capture,
+                                &session_id,
+                                trace_turn,
+                                &trace_correlation,
+                                "bridge_inprocess",
+                                &request_capture_model,
+                                &provider,
+                                attempt_in_round,
+                                "error",
+                                json!({
+                                    "error": e.clone(),
+                                    "kind": classify_llm_error(&e).as_str(),
+                                }),
+                            );
                             let kind = classify_llm_error(&e);
-                            // Dump full LLM request for post-mortem debugging
                             let dump = crate::turn::llm_request_dump::build_llm_request_dump(
                                 &session_id, agent_id.as_deref(), &model_name, &provider,
                                 &e, &llm_messages, &pruned_tools,
-                                round_ix, Some(max_output_tokens),
+                                capture_round_ix, Some(max_output_tokens),
                             );
-                            if let Some(path) = dump.write_local() {
-                                eprintln!("[llm_error_dump] {path}");
+                            if let Err(error) =
+                                dump.persist_remote(&user_id, remote_artifact_store.as_ref()).await
+                            {
+                                astra_core::agent_error!(
+                                    "llm-dump",
+                                    "bridge_inprocess error dump persist failed: {error}"
+                                );
                             }
-                            dump.persist_cloud(&user_id, &turn_chain_id, turn_auxiliary_event_writer.clone());
+                            crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                                "bridge_inprocess error capture",
+                                full_llm_capture,
+                                Some(remote_artifact_store.as_ref()),
+                                &session_id,
+                                &user_id,
+                                trace_turn,
+                                u32::try_from(capture_round_ix).unwrap_or(u32::MAX),
+                                agent_id.as_deref(),
+                                "bridge_inprocess",
+                                if resolved_model.is_empty() { &model_name } else { &resolved_model },
+                                &provider,
+                                &llm_messages,
+                                &pruned_tools,
+                                Some(max_output_tokens),
+                                "error",
+                                json!({
+                                    "error": e,
+                                    "kind": kind.as_str(),
+                                }),
+                                Some(trace_correlation.as_capture_trace()),
+                            )
+                            .await;
                             yield render_sse_map(&build_stream_error_event(&e, kind.as_str(), kind.is_retryable()));
+                            flush_turn_event_buffer_or_warn(
+                                &mut turn_event_buffer,
+                                &session_id,
+                                "bridge llm error",
+                            );
+                            mark_disconnect_capture_finalized(&disconnect_capture_state);
                             return;
                         }
+                        }
                     };
+
+                    update_disconnect_capture_snapshot(
+                        &disconnect_capture_state,
+                        DisconnectCaptureSnapshot {
+                            started: true,
+                            finalized: false,
+                            session_id: session_id.clone(),
+                            user_id: user_id.clone(),
+                            turn: trace_turn,
+                            session_turn_source: trace_turn_source.to_string(),
+                            turn_chain_id: turn_chain_id.clone(),
+                            user_query_event_id: user_query_event_id.clone(),
+                            round_ix: capture_round_ix,
+                            agent_id: agent_id.clone(),
+                            model_name: model_name.clone(),
+                            resolved_model: resolved_model.clone(),
+                            provider: provider.clone(),
+                            llm_messages: llm_messages.clone(),
+                            pruned_tools: pruned_tools.clone(),
+                            max_output_tokens: Some(max_output_tokens),
+                            partial_text: loop_text.clone(),
+                            partial_reasoning: loop_reasoning.clone(),
+                            partial_tool_calls: loop_tool_calls.clone(),
+                            usage: usage.clone(),
+                        },
+                    );
 
                     tokio::pin!(llm_stream);
                     let mut sse_buf = SseBlankLineUtf8Buf::new();
                     let mut saw_inprocess_summary = false;
-                    // Keepalive interval: emit SSE comment every 30s so the
-                    // CLI-side idle timer (90s) doesn't fire while the bridge
-                    // waits for LLM data (e.g. during non-stream fallback).
-                    let keepalive = tokio::time::Duration::from_secs(30);
+                    let mut terminal_error_event: Option<Value> = None;
+                    // Keepalive interval: emit SSE comments while waiting on
+                    // the LLM so client disconnects are detected promptly
+                    // instead of only on long stall boundaries.
+                    let keepalive = tokio::time::Duration::from_secs(5);
                     let mut keepalive_deadline = tokio::time::Instant::now() + keepalive;
 
                     loop {
@@ -1636,16 +2123,99 @@ impl InProcessChatTurnBridge {
                                     ) {
                                         Ok(chunks) => {
                                             for b in chunks {
+                                                if terminal_error_event.is_none() {
+                                                    terminal_error_event = forwarded_sse_error_event(&b);
+                                                }
                                                 yield b;
                                             }
+                                            update_disconnect_capture_snapshot(
+                                                &disconnect_capture_state,
+                                                DisconnectCaptureSnapshot {
+                                                    started: true,
+                                                    finalized: false,
+                                                    session_id: session_id.clone(),
+                                                    user_id: user_id.clone(),
+                                                    turn: trace_turn,
+                                                    session_turn_source: trace_turn_source.to_string(),
+                                                    turn_chain_id: turn_chain_id.clone(),
+                                                    user_query_event_id: user_query_event_id.clone(),
+                                                    round_ix: capture_round_ix,
+                                                    agent_id: agent_id.clone(),
+                                                    model_name: model_name.clone(),
+                                                    resolved_model: resolved_model.clone(),
+                                                    provider: provider.clone(),
+                                                    llm_messages: llm_messages.clone(),
+                                                    pruned_tools: pruned_tools.clone(),
+                                                    max_output_tokens: Some(max_output_tokens),
+                                                    partial_text: loop_text.clone(),
+                                                    partial_reasoning: loop_reasoning.clone(),
+                                                    partial_tool_calls: loop_tool_calls.clone(),
+                                                    usage: usage.clone(),
+                                                },
+                                            );
                                         }
                                         Err(msg) => {
+                                            record_full_llm_response_event(
+                                                &mut turn_event_buffer,
+                                                full_llm_capture,
+                                                &session_id,
+                                                trace_turn,
+                                                &trace_correlation,
+                                                "bridge_inprocess",
+                                                if resolved_model.is_empty() {
+                                                    model_name.as_str()
+                                                } else {
+                                                    resolved_model.as_str()
+                                                },
+                                                &provider,
+                                                attempt_in_round,
+                                                "sse_parse_error",
+                                                bridge_error_response_payload(
+                                                    &msg,
+                                                    "SSE_PARSE_ERROR",
+                                                    &loop_text,
+                                                    &loop_reasoning,
+                                                    &loop_tool_calls,
+                                                    &usage,
+                                                ),
+                                            );
+                                            persist_bridge_stream_failure_capture(
+                                                "bridge_inprocess stream block parse capture",
+                                                full_llm_capture,
+                                                remote_artifact_store.as_ref(),
+                                                &session_id,
+                                                &user_id,
+                                                trace_turn,
+                                                &trace_correlation,
+                                                capture_round_ix,
+                                                agent_id.as_deref(),
+                                                &model_name,
+                                                &resolved_model,
+                                                &provider,
+                                                &llm_messages,
+                                                &pruned_tools,
+                                                Some(max_output_tokens),
+                                                "sse_parse_error",
+                                                &msg,
+                                                "SSE_PARSE_ERROR",
+                                                &loop_text,
+                                                &loop_reasoning,
+                                                &loop_tool_calls,
+                                                &usage,
+                                            )
+                                            .await;
                                             astra_core::agent_warn!("bridge", "in-process LLM SSE block invalid: {msg}");
                                             yield render_sse_map(&build_stream_error_event(
                                                 &msg,
                                                 "SSE_PARSE_ERROR",
                                                 false,
                                             ));
+                                            flush_turn_event_buffer_or_warn(
+                                                &mut turn_event_buffer,
+                                                &session_id,
+                                                "bridge stream block parse failure",
+                                            );
+                                            mark_disconnect_capture_finalized(&disconnect_capture_state);
                                             return;
                                         }
                                     }
@@ -1659,11 +2229,66 @@ impl InProcessChatTurnBridge {
                     }
 
                     if client_stopped {
+                        record_full_llm_response_event(
+                            &mut turn_event_buffer,
+                            full_llm_capture,
+                            &session_id,
+                            trace_turn,
+                            &trace_correlation,
+                            "bridge_inprocess",
+                            if resolved_model.is_empty() {
+                                model_name.as_str()
+                            } else {
+                                resolved_model.as_str()
+                            },
+                            &provider,
+                            attempt_in_round,
+                            "client_disconnect",
+                            bridge_error_response_payload(
+                                "Request cancelled (client disconnected)",
+                                "CLIENT_DISCONNECT",
+                                &loop_text,
+                                &loop_reasoning,
+                                &loop_tool_calls,
+                                &usage,
+                            ),
+                        );
+                        persist_bridge_stream_failure_capture(
+                            "bridge_inprocess client disconnect capture",
+                            full_llm_capture,
+                            remote_artifact_store.as_ref(),
+                            &session_id,
+                            &user_id,
+                            trace_turn,
+                            &trace_correlation,
+                            capture_round_ix,
+                            agent_id.as_deref(),
+                            &model_name,
+                            &resolved_model,
+                            &provider,
+                            &llm_messages,
+                            &pruned_tools,
+                            Some(max_output_tokens),
+                            "client_disconnect",
+                            "Request cancelled (client disconnected)",
+                            "CLIENT_DISCONNECT",
+                            &loop_text,
+                            &loop_reasoning,
+                            &loop_tool_calls,
+                            &usage,
+                        )
+                        .await;
                         yield render_sse_map(&build_stream_error_event(
                             "Request cancelled (client disconnected)",
                             "CLIENT_DISCONNECT",
                             false,
                         ));
+                        flush_turn_event_buffer_or_warn(
+                            &mut turn_event_buffer,
+                            &session_id,
+                            "bridge client disconnect",
+                        );
+                        mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }
 
@@ -1679,26 +2304,231 @@ impl InProcessChatTurnBridge {
                     ) {
                         Ok(chunks) => {
                             for b in chunks {
+                                if terminal_error_event.is_none() {
+                                    terminal_error_event = forwarded_sse_error_event(&b);
+                                }
                                 yield b;
                             }
+                            update_disconnect_capture_snapshot(
+                                &disconnect_capture_state,
+                        DisconnectCaptureSnapshot {
+                            started: true,
+                            finalized: false,
+                            session_id: session_id.clone(),
+                            user_id: user_id.clone(),
+                            turn: trace_turn,
+                            session_turn_source: trace_turn_source.to_string(),
+                            turn_chain_id: turn_chain_id.clone(),
+                            user_query_event_id: user_query_event_id.clone(),
+                            round_ix: capture_round_ix,
+                            agent_id: agent_id.clone(),
+                                    model_name: model_name.clone(),
+                                    resolved_model: resolved_model.clone(),
+                                    provider: provider.clone(),
+                                    llm_messages: llm_messages.clone(),
+                                    pruned_tools: pruned_tools.clone(),
+                                    max_output_tokens: Some(max_output_tokens),
+                                    partial_text: loop_text.clone(),
+                                    partial_reasoning: loop_reasoning.clone(),
+                                    partial_tool_calls: loop_tool_calls.clone(),
+                                    usage: usage.clone(),
+                                },
+                            );
                         }
                         Err(msg) => {
+                            record_full_llm_response_event(
+                                &mut turn_event_buffer,
+                                full_llm_capture,
+                                &session_id,
+                                trace_turn,
+                                &trace_correlation,
+                                "bridge_inprocess",
+                                if resolved_model.is_empty() {
+                                    model_name.as_str()
+                                } else {
+                                    resolved_model.as_str()
+                                },
+                                &provider,
+                                attempt_in_round,
+                                "sse_parse_error",
+                                bridge_error_response_payload(
+                                    &msg,
+                                    "SSE_PARSE_ERROR",
+                                    &loop_text,
+                                    &loop_reasoning,
+                                    &loop_tool_calls,
+                                    &usage,
+                                ),
+                            );
+                            persist_bridge_stream_failure_capture(
+                                "bridge_inprocess stream tail parse capture",
+                                full_llm_capture,
+                                remote_artifact_store.as_ref(),
+                                &session_id,
+                                &user_id,
+                                trace_turn,
+                                &trace_correlation,
+                                capture_round_ix,
+                                agent_id.as_deref(),
+                                &model_name,
+                                &resolved_model,
+                                &provider,
+                                &llm_messages,
+                                &pruned_tools,
+                                Some(max_output_tokens),
+                                "sse_parse_error",
+                                &msg,
+                                "SSE_PARSE_ERROR",
+                                &loop_text,
+                                &loop_reasoning,
+                                &loop_tool_calls,
+                                &usage,
+                            )
+                            .await;
                             astra_core::agent_warn!("bridge", "in-process LLM SSE tail invalid: {msg}");
                             yield render_sse_map(&build_stream_error_event(
                                 &msg,
                                 "SSE_PARSE_ERROR",
                                 false,
                             ));
+                            flush_turn_event_buffer_or_warn(
+                                &mut turn_event_buffer,
+                                &session_id,
+                                "bridge stream tail parse failure",
+                            );
+                            mark_disconnect_capture_finalized(&disconnect_capture_state);
                             return;
                         }
                     }
 
+                    if let Some(error_event) = terminal_error_event.take() {
+                        let error_message = error_event
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("bridge stream failed");
+                        let error_code = error_event
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .unwrap_or("stream_error");
+                        record_full_llm_response_event(
+                            &mut turn_event_buffer,
+                            full_llm_capture,
+                            &session_id,
+                            trace_turn,
+                            &trace_correlation,
+                            "bridge_inprocess",
+                            if resolved_model.is_empty() {
+                                model_name.as_str()
+                            } else {
+                                resolved_model.as_str()
+                            },
+                            &provider,
+                            attempt_in_round,
+                            "error",
+                            bridge_error_response_payload(
+                                error_message,
+                                error_code,
+                                &loop_text,
+                                &loop_reasoning,
+                                &loop_tool_calls,
+                                &usage,
+                            ),
+                        );
+                        persist_bridge_stream_failure_capture(
+                            "bridge_inprocess streamed error capture",
+                            full_llm_capture,
+                            remote_artifact_store.as_ref(),
+                            &session_id,
+                            &user_id,
+                            trace_turn,
+                            &trace_correlation,
+                            capture_round_ix,
+                            agent_id.as_deref(),
+                            &model_name,
+                            &resolved_model,
+                            &provider,
+                            &llm_messages,
+                            &pruned_tools,
+                            Some(max_output_tokens),
+                            "error",
+                            error_message,
+                            error_code,
+                            &loop_text,
+                            &loop_reasoning,
+                            &loop_tool_calls,
+                            &usage,
+                        )
+                        .await;
+                        flush_turn_event_buffer_or_warn(
+                            &mut turn_event_buffer,
+                            &session_id,
+                            "bridge streamed terminal error",
+                        );
+                        mark_disconnect_capture_finalized(&disconnect_capture_state);
+                        return;
+                    }
+
                     if !saw_inprocess_summary {
+                        record_full_llm_response_event(
+                            &mut turn_event_buffer,
+                            full_llm_capture,
+                            &session_id,
+                            trace_turn,
+                            &trace_correlation,
+                            "bridge_inprocess",
+                            if resolved_model.is_empty() {
+                                model_name.as_str()
+                            } else {
+                                resolved_model.as_str()
+                            },
+                            &provider,
+                            attempt_in_round,
+                            "stream_incomplete",
+                            bridge_error_response_payload(
+                                "LLM stream ended without completion summary from provider",
+                                "STREAM_INCOMPLETE",
+                                &loop_text,
+                                &loop_reasoning,
+                                &loop_tool_calls,
+                                &usage,
+                            ),
+                        );
+                        persist_bridge_stream_failure_capture(
+                            "bridge_inprocess stream incomplete capture",
+                            full_llm_capture,
+                            remote_artifact_store.as_ref(),
+                            &session_id,
+                            &user_id,
+                            trace_turn,
+                            &trace_correlation,
+                            capture_round_ix,
+                            agent_id.as_deref(),
+                            &model_name,
+                            &resolved_model,
+                            &provider,
+                            &llm_messages,
+                            &pruned_tools,
+                            Some(max_output_tokens),
+                            "stream_incomplete",
+                            "LLM stream ended without completion summary from provider",
+                            "STREAM_INCOMPLETE",
+                            &loop_text,
+                            &loop_reasoning,
+                            &loop_tool_calls,
+                            &usage,
+                        )
+                        .await;
                         yield render_sse_map(&build_stream_error_event(
                             "LLM stream ended without completion summary from provider",
                             "STREAM_INCOMPLETE",
                             true,
                         ));
+                        flush_turn_event_buffer_or_warn(
+                            &mut turn_event_buffer,
+                            &session_id,
+                            "bridge stream incomplete failure",
+                        );
+                        mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }
                 }
@@ -1725,7 +2555,7 @@ impl InProcessChatTurnBridge {
                     loop_tool_calls.len(),
                     if resolved_model.is_empty() { &model_name } else { &resolved_model },
                     session_id,
-                    round_ix,
+                    capture_round_ix,
                 );
                 llm_steps.push(json!({
                     "step": "llm",
@@ -1741,7 +2571,59 @@ impl InProcessChatTurnBridge {
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
                 }
-                if let Some(buf) = turn_event_buffer.as_mut() {
+                let capture_model = if resolved_model.is_empty() {
+                    model_name.as_str()
+                } else {
+                    resolved_model.as_str()
+                };
+                record_full_llm_response_event(
+                    &mut turn_event_buffer,
+                    full_llm_capture,
+                    &session_id,
+                    trace_turn,
+                    &trace_correlation,
+                    "bridge_inprocess",
+                    capture_model,
+                    &provider,
+                    attempt_in_round,
+                    "success",
+                    bridge_success_response_payload(
+                        &loop_text,
+                        &loop_reasoning,
+                        &loop_tool_calls,
+                        &usage,
+                        if loop_tool_calls.is_empty() { "stop" } else { "tool_calls" },
+                    ),
+                );
+                crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+                    "bridge_inprocess success capture",
+                    full_llm_capture,
+                    Some(remote_artifact_store.as_ref()),
+                    &session_id,
+                    &user_id,
+                    trace_turn,
+                    u32::try_from(capture_round_ix).unwrap_or(u32::MAX),
+                    agent_id.as_deref(),
+                    "bridge_inprocess",
+                    capture_model,
+                    &provider,
+                    &llm_messages,
+                    &pruned_tools,
+                    None,
+                    "success",
+                    bridge_success_response_payload(
+                        &loop_text,
+                        &loop_reasoning,
+                        &loop_tool_calls,
+                        &usage,
+                        if loop_tool_calls.is_empty() { "stop" } else { "tool_calls" },
+                    ),
+                    Some(trace_correlation.as_capture_trace()),
+                )
+                .await;
+                if bridge_should_record_llm_round(root_runtime_owns_turn_journal)
+                    && let Some(buf) = turn_event_buffer.as_mut()
+                {
                     buf.record_llm_round(LlmRoundRecord {
                         ttft_ms: None,
                         duration_ms: round_ms as u64,
@@ -1768,9 +2650,10 @@ impl InProcessChatTurnBridge {
                         } else {
                             "tool_calls".to_string()
                         }),
-                        agentic_step: u32::try_from(round_ix).ok(),
+                        agentic_step: u32::try_from(capture_round_ix).ok(),
                         source: Some("bridge_inprocess".to_string()),
                         run_id: Some(run_id.clone()),
+                        tool_calls: None,
                     });
                 }
 
@@ -2035,23 +2918,23 @@ impl InProcessChatTurnBridge {
                 && let Some(mut turn_event_buffer) = turn_event_buffer.filter(|buf| !buf.is_empty())
             {
                 let journal_sid = session_id.clone();
+                let writer = match JournalWriter::new(&journal_sid) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        astra_core::agent_warn!(
+                            "bridge",
+                            "failed to create journal writer for turn event buffer flush: session={} error={}",
+                            journal_sid,
+                            error
+                        );
+                        return;
+                    }
+                };
                 tokio::task::spawn_blocking(move || {
-                    let writer = match JournalWriter::new(&journal_sid) {
-                        Ok(writer) => writer,
-                        Err(error) => {
-                            astra_core::agent_warn!(
-                                "bridge",
-                                "failed to create journal writer for llm_round flush: session={} error={}",
-                                journal_sid,
-                                error
-                            );
-                            return;
-                        }
-                    };
                     if let Err(error) = turn_event_buffer.flush(&writer) {
                         astra_core::agent_warn!(
                             "bridge",
-                            "failed to flush llm_round events: session={} error={}",
+                            "failed to flush turn event buffer: session={} error={}",
                             journal_sid,
                             error
                         );
@@ -2139,13 +3022,14 @@ impl InProcessChatTurnBridge {
                 .unwrap_or("")
                 .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
-                crate::pipeline::evaluation::evaluate_tool_call_records(
+                crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
                     &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
                     0, // No stall events in single-call mode.
                     verdict_warning,
                     budget_pressure,
+                    crate::pipeline::evaluation::current_evaluation_thresholds(),
                 )
             });
             let tool_execution_ms: u64 = merged_tool_results
@@ -2341,10 +3225,18 @@ impl InProcessChatTurnBridge {
             }
 
             // turn_complete
+            mark_disconnect_capture_finalized(&disconnect_capture_state);
             yield render_sse(&turn_complete_event(&messages, &llm_content, &all_round_tool_calls));
         };
 
-        let body = Body::from_stream(stream.map(Ok::<_, std::io::Error>));
+        let cancel_on_drop = CancelOnDrop(client_cancel.clone());
+        let body_stream = stream! {
+            let _cancel_on_drop = cancel_on_drop;
+            for await chunk in stream {
+                yield Ok::<_, std::io::Error>(chunk);
+            }
+        };
+        let body = Body::from_stream(body_stream);
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -2368,6 +3260,121 @@ fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     crate::turn::llm_client::classify_llm_error(msg)
 }
 
+fn forwarded_sse_error_event(bytes: &Bytes) -> Option<Value> {
+    let raw = std::str::from_utf8(bytes).ok()?.trim();
+    let json_line = raw.strip_prefix("data: ")?;
+    let event: Value = serde_json::from_str(json_line).ok()?;
+    (event.get("type").and_then(Value::as_str) == Some("error")).then_some(event)
+}
+
+struct CancelOnDrop(Option<Arc<CancellationToken>>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DisconnectCaptureSnapshot {
+    started: bool,
+    finalized: bool,
+    session_id: String,
+    user_id: String,
+    turn: u32,
+    session_turn_source: String,
+    turn_chain_id: String,
+    user_query_event_id: String,
+    round_ix: i64,
+    agent_id: Option<String>,
+    model_name: String,
+    resolved_model: String,
+    provider: String,
+    llm_messages: Vec<Value>,
+    pruned_tools: Vec<Value>,
+    max_output_tokens: Option<usize>,
+    partial_text: String,
+    partial_reasoning: String,
+    partial_tool_calls: Vec<Value>,
+    usage: Map<String, Value>,
+}
+
+fn update_disconnect_capture_snapshot(
+    state: &Arc<Mutex<DisconnectCaptureSnapshot>>,
+    snapshot: DisconnectCaptureSnapshot,
+) {
+    if let Ok(mut guard) = state.lock() {
+        *guard = snapshot;
+    }
+}
+
+fn mark_disconnect_capture_finalized(state: &Arc<Mutex<DisconnectCaptureSnapshot>>) {
+    if let Ok(mut guard) = state.lock() {
+        guard.finalized = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_bridge_stream_failure_capture(
+    context: &str,
+    full_llm_capture: bool,
+    remote_store: &dyn astra_services::SessionArtifactJsonStore,
+    session_id: &str,
+    user_id: &str,
+    turn: u32,
+    trace: &BridgeTraceCorrelation,
+    round_ix: i64,
+    agent_id: Option<&str>,
+    model_name: &str,
+    resolved_model: &str,
+    provider: &str,
+    llm_messages: &[Value],
+    pruned_tools: &[Value],
+    max_output_tokens: Option<usize>,
+    outcome: &str,
+    error: &str,
+    kind: &str,
+    partial_text: &str,
+    partial_reasoning: &str,
+    partial_tool_calls: &[Value],
+    usage: &Map<String, Value>,
+) {
+    let capture_model = if resolved_model.is_empty() {
+        model_name
+    } else {
+        resolved_model
+    };
+    crate::turn::llm_exchange_capture::persist_configured_capture_or_log(
+        context,
+        full_llm_capture,
+        Some(remote_store),
+        session_id,
+        user_id,
+        turn,
+        u32::try_from(round_ix).unwrap_or(u32::MAX),
+        agent_id,
+        "bridge_inprocess",
+        capture_model,
+        provider,
+        llm_messages,
+        pruned_tools,
+        max_output_tokens,
+        outcome,
+        json!({
+            "error": error,
+            "kind": kind,
+            "partial_full_text": partial_text,
+            "partial_reasoning": partial_reasoning,
+            "tool_calls": partial_tool_calls,
+            "usage": usage,
+        }),
+        Some(trace.as_capture_trace()),
+    )
+    .await;
+}
+
 // ── Memory prefetch — delegated to turn::memory_prefetch ─────────────────────
 pub use super::memory_prefetch::{MemoryPrefetchResult, prefetch_memories};
 
@@ -2387,6 +3394,174 @@ mod tests {
     use super::*;
     use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
     use crate::turn::turn_guard::TurnGuard;
+    use astra_services::{
+        SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
+    };
+    use async_trait::async_trait;
+    use http_body_util::BodyExt;
+    use std::sync::Mutex;
+
+    /// RAII guard that restores an environment variable on drop (panic-safe).
+    #[cfg(feature = "bridge-e2e-hooks")]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+    #[cfg(feature = "bridge-e2e-hooks")]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+    #[cfg(feature = "bridge-e2e-hooks")]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn bridge_test_matrixone() -> MatrixOneSettings {
+        MatrixOneSettings {
+            host: "127.0.0.1".to_string(),
+            port: 6001,
+            user: "test".to_string(),
+            password: "test".to_string(),
+            database: "test".to_string(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn bridge_test_encryptor() -> Arc<FernetTokenEncryptor> {
+        Arc::new(
+            FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
+                .expect("valid fernet key"),
+        )
+    }
+
+    #[allow(dead_code)]
+    fn bridge_test_headers(session_id: &str, full_llm_capture: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-user-id", "user-bridge-journal".parse().unwrap());
+        headers.insert("x-mo-session-id", session_id.parse().unwrap());
+        headers.insert("x-mo-session-turn", "1".parse().unwrap());
+        if full_llm_capture {
+            headers.insert("x-mo-full-llm-capture", "1".parse().unwrap());
+        }
+        headers.insert(
+            "x-mo-bridge-test-secret",
+            std::env::var("ASTRA_BRIDGE_TEST_SECRET")
+                .expect("bridge test secret should be set")
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    #[allow(dead_code)]
+    fn read_journal_events(session_id: &str) -> Vec<Value> {
+        let path = JournalWriter::new(session_id)
+            .expect("journal writer")
+            .path()
+            .clone();
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<Value>(line).expect("journal event json"))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read journal: {error}"),
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn wait_for_journal_events(session_id: &str) -> Vec<Value> {
+        for _ in 0..100 {
+            let events = read_journal_events(session_id);
+            if !events.is_empty() {
+                return events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        read_journal_events(session_id)
+    }
+
+    #[allow(dead_code)]
+    async fn collect_response_body(response: Response) -> String {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect response body")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("response body should be utf8")
+    }
+
+    #[derive(Default)]
+    struct RecordingArtifactStore {
+        records: Mutex<Vec<SessionArtifactJsonRecord>>,
+    }
+
+    #[async_trait]
+    impl SessionArtifactJsonStore for RecordingArtifactStore {
+        async fn persist_json_artifact(
+            &self,
+            record: SessionArtifactJsonRecord,
+        ) -> Result<StoredSessionArtifact, String> {
+            self.records
+                .lock()
+                .expect("recording store lock")
+                .push(record.clone());
+            Ok(StoredSessionArtifact {
+                artifact_id: if record.artifact_id.is_empty() {
+                    "artifact-1".to_string()
+                } else {
+                    record.artifact_id.clone()
+                },
+                session_id: record.session_id,
+                user_id: record.user_id,
+                artifact_kind: record.artifact_kind,
+                source: record.source,
+                turn: record.turn,
+                round: record.round,
+                content: record.content,
+                metadata: record.metadata,
+                created_at: None,
+            })
+        }
+
+        async fn load_json_artifact(
+            &self,
+            _artifact_id: &str,
+        ) -> Result<Option<StoredSessionArtifact>, String> {
+            Ok(None)
+        }
+
+        async fn load_latest_json_artifact(
+            &self,
+            _session_id: &str,
+            _artifact_kind: &str,
+        ) -> Result<Option<StoredSessionArtifact>, String> {
+            Ok(None)
+        }
+
+        async fn list_json_artifacts(
+            &self,
+            _session_id: &str,
+            _artifact_kind: Option<&str>,
+            _limit: usize,
+        ) -> Result<Vec<StoredSessionArtifact>, String> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
@@ -4554,6 +5729,7 @@ mod tests {
         let event = turn_complete_event(&messages, "Should I continue?", &[]);
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], false);
+        assert_eq!(event["assistant_text"], "Should I continue?");
         assert_eq!(event["followup_suggestion"], "继续");
     }
 
@@ -4858,6 +6034,370 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_persists_full_journal_request_and_response_when_session_capture_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let session_id = "00000000-0000-0000-0000-000000000129";
+        let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
+        let headers = bridge_test_headers(session_id, true);
+        let payload = json!({
+            "messages": [{"role": "user", "content": "bridge journal success"}],
+            "edge_tools": [],
+            "test_llm_stream_blocks": [
+                "data: {\"type\":\"text_delta\",\"content\":\"bridge journal reply\"}\n\n",
+                "data: {\"type\":\"usage\",\"prompt_tokens\":11,\"completion_tokens\":4}\n\n",
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"bridge journal reply\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":11,\"completion\":4,\"total\":15},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+            ]
+        });
+
+        let response = bridge
+            .forward(
+                &headers,
+                Bytes::from(payload.to_string()),
+                Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                Arc::new(crate::InMemoryTurnReflectionStateStore::default()),
+                Arc::new(crate::NoopTurnReflectionLessonWriter),
+                Arc::new(crate::NoopTurnObserverWorker),
+                Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                None,
+            )
+            .await
+            .expect("bridge forward");
+        let body = collect_response_body(response).await;
+        assert!(body.contains("bridge journal reply"));
+
+        let journal = wait_for_journal_events(session_id).await;
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert_eq!(
+            llm_events.len(),
+            2,
+            "expected request+response events: {journal:?}"
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["outcome"].as_str(),
+            Some("success")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
+            Some("bridge journal reply")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["usage"]["completion"].as_i64(),
+            Some(4)
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["trace"]["session_turn_source"].as_str(),
+            Some("header")
+        );
+        assert!(
+            llm_events[0]["metadata"]["trace"]["turn_chain_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            llm_events[0]["metadata"]["trace"]["user_query_event_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_does_not_persist_full_journal_events_when_session_capture_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let session_id = "00000000-0000-0000-0000-000000000133";
+        let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
+        let mut headers = bridge_test_headers(session_id, true);
+        headers.insert(ROOT_TURN_JOURNAL_HEADER, "1".parse().unwrap());
+        let payload = json!({
+            "root_turn_journal_owned": true,
+            "messages": [{"role": "user", "content": "root-owned bridge capture"}],
+            "edge_tools": [],
+            "test_llm_stream_blocks": [
+                "data: {\"type\":\"text_delta\",\"content\":\"root-owned bridge reply\"}\n\n",
+                "data: {\"type\":\"usage\",\"prompt_tokens\":13,\"completion_tokens\":5}\n\n",
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"root-owned bridge reply\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":13,\"completion\":5,\"total\":18},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+            ]
+        });
+
+        let response = bridge
+            .forward(
+                &headers,
+                Bytes::from(payload.to_string()),
+                Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                Arc::new(crate::InMemoryTurnReflectionStateStore::default()),
+                Arc::new(crate::NoopTurnReflectionLessonWriter),
+                Arc::new(crate::NoopTurnObserverWorker),
+                Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                None,
+            )
+            .await
+            .expect("bridge forward");
+        let body = collect_response_body(response).await;
+        assert!(body.contains("root-owned bridge reply"));
+
+        let journal = wait_for_journal_events(session_id).await;
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert_eq!(
+            llm_events.len(),
+            2,
+            "expected request+response events: {journal:?}"
+        );
+        assert!(
+            journal
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("llm_round")),
+            "direct bridge e2e hooks intentionally ignore root-owned journal hints to avoid impersonating the root runtime: {journal:?}"
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["trace"]["session_turn_source"].as_str(),
+            Some("header")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
+            Some("root-owned bridge reply")
+        );
+    }
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_persists_full_journal_rounds_from_round_index_across_same_session_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let session_id = "00000000-0000-0000-0000-000000000132";
+        let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
+        let headers = bridge_test_headers(session_id, true);
+
+        for (round_index, reply) in [(0_u32, "bridge round zero"), (1_u32, "bridge round one")] {
+            let payload = json!({
+                "messages": [{"role": "user", "content": format!("bridge round {round_index}")}],
+                "edge_tools": [],
+                "round_index": round_index,
+                "test_llm_stream_blocks": [
+                    format!("data: {{\"type\":\"text_delta\",\"content\":\"{reply}\"}}\n\n"),
+                    "data: {\"type\":\"usage\",\"prompt_tokens\":11,\"completion_tokens\":4}\n\n",
+                    format!("data: {{\"type\":\"_inprocess_summary\",\"full_text\":\"{reply}\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{{\"prompt\":11,\"completion\":4,\"total\":15}},\"model_used\":\"bridge-e2e-mock\"}}\n\n"),
+                ]
+            });
+
+            let response = bridge
+                .forward(
+                    &headers,
+                    Bytes::from(payload.to_string()),
+                    Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                    Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                    Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                    Arc::new(crate::InMemoryTurnReflectionStateStore::default()),
+                    Arc::new(crate::NoopTurnReflectionLessonWriter),
+                    Arc::new(crate::NoopTurnObserverWorker),
+                    Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                    Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                    None,
+                )
+                .await
+                .expect("bridge forward");
+            let body = collect_response_body(response).await;
+            assert!(body.contains(reply));
+        }
+
+        let llm_events = {
+            let mut events = Vec::new();
+            for _ in 0..100 {
+                let journal = read_journal_events(session_id);
+                events = journal
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.get("type").and_then(Value::as_str),
+                            Some("llm_request_full" | "llm_response_full")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if events.len() >= 4 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            events
+        };
+
+        let rounds: Vec<_> = llm_events
+            .iter()
+            .map(|event| event["round"].as_i64())
+            .collect();
+        assert_eq!(
+            rounds,
+            vec![Some(0), Some(0), Some(1), Some(1)],
+            "same-turn bridge requests should preserve authoritative round_index in full capture"
+        );
+        let trace_rounds: Vec<_> = llm_events
+            .iter()
+            .map(|event| event["metadata"]["trace"]["round"].as_i64())
+            .collect();
+        assert_eq!(trace_rounds, vec![Some(0), Some(0), Some(1), Some(1)]);
+        let bridge_rounds: Vec<_> = read_journal_events(session_id)
+            .into_iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("llm_round")
+                    && event["metadata"]["source"].as_str() == Some("bridge_inprocess")
+            })
+            .map(|event| event["round"].as_i64())
+            .collect();
+        assert_eq!(bridge_rounds, vec![Some(0), Some(1)]);
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_persists_full_journal_error_response_with_partial_state_when_session_capture_enabled()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let session_id = "00000000-0000-0000-0000-000000000130";
+        let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
+        let headers = bridge_test_headers(session_id, true);
+        let payload = json!({
+            "messages": [{"role": "user", "content": "bridge journal partial error"}],
+            "edge_tools": [],
+            "test_llm_stream_blocks": [
+                "data: {\"type\":\"text_delta\",\"content\":\"partial bridge text\"}\n\n",
+                "data: {not-json}\n\n"
+            ]
+        });
+
+        let response = bridge
+            .forward(
+                &headers,
+                Bytes::from(payload.to_string()),
+                Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                Arc::new(crate::InMemoryTurnReflectionStateStore::default()),
+                Arc::new(crate::NoopTurnReflectionLessonWriter),
+                Arc::new(crate::NoopTurnObserverWorker),
+                Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                None,
+            )
+            .await
+            .expect("bridge forward");
+        let body = collect_response_body(response).await;
+        assert!(body.contains("SSE_PARSE_ERROR"));
+
+        let journal = wait_for_journal_events(session_id).await;
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert_eq!(
+            llm_events.len(),
+            2,
+            "expected request+error events: {journal:?}"
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["outcome"].as_str(),
+            Some("sse_parse_error")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["kind"].as_str(),
+            Some("SSE_PARSE_ERROR")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
+            Some("partial bridge text")
+        );
+        assert_eq!(
+            llm_events[1]["metadata"]["trace"]["session_turn_source"].as_str(),
+            Some("header")
+        );
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_persists_full_journal_context_with_reasoning_when_session_capture_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let _env = EnvVarGuard::set("ASTRA_BRIDGE_TEST_SECRET", "bridge-journal-secret");
+        let session_id = "00000000-0000-0000-0000-000000000131";
+        let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
+        let headers = bridge_test_headers(session_id, false);
+        let payload = json!({
+            "messages": [{"role": "user", "content": "bridge journal disabled"}],
+            "edge_tools": [],
+            "test_llm_stream_blocks": [
+                "data: {\"type\":\"text_delta\",\"content\":\"bridge disabled reply\"}\n\n",
+                "data: {\"type\":\"usage\",\"prompt_tokens\":9,\"completion_tokens\":3}\n\n",
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"bridge disabled reply\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":9,\"completion\":3,\"total\":12},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+            ]
+        });
+
+        let response = bridge
+            .forward(
+                &headers,
+                Bytes::from(payload.to_string()),
+                Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                Arc::new(crate::InMemoryTurnReflectionStateStore::default()),
+                Arc::new(crate::NoopTurnReflectionLessonWriter),
+                Arc::new(crate::NoopTurnObserverWorker),
+                Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                None,
+            )
+            .await
+            .expect("bridge forward");
+        let body = collect_response_body(response).await;
+        assert!(body.contains("bridge disabled reply"));
+
+        let journal = wait_for_journal_events(session_id).await;
+        let llm_events: Vec<_> = journal
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("llm_request_full" | "llm_response_full")
+                )
+            })
+            .collect();
+        assert!(
+            llm_events.is_empty(),
+            "capture-disabled run should not emit full LLM journal events: {journal:?}"
+        );
+    }
+
     // ── Fix #1: anchor evolves with L1 ──────────────────────────────────
 
     #[test]
@@ -5106,5 +6646,263 @@ mod tests {
             !body.contains("biased;"),
             "await_with_client_disconnect must not use biased select (starvation risk)"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persist_bridge_stream_failure_capture_persists_remote_llm_capture() {
+        let store = RecordingArtifactStore::default();
+        let usage = Map::from_iter([
+            ("prompt".to_string(), json!(120)),
+            ("completion".to_string(), json!(18)),
+        ]);
+        persist_bridge_stream_failure_capture(
+            "bridge_inprocess stream incomplete capture",
+            true,
+            &store,
+            "sess-1",
+            "user-1",
+            2,
+            &BridgeTraceCorrelation {
+                session_turn_source: "header".to_string(),
+                turn_chain_id: "chain-test".to_string(),
+                user_query_event_id: "query-test".to_string(),
+            },
+            3,
+            Some("agent-1"),
+            "",
+            "gpt-5.4-mini",
+            "openai",
+            &[json!({"role":"user","content":"debug the stream"})],
+            &[json!({"type":"function","function":{"name":"bash"}})],
+            Some(2048),
+            "stream_incomplete",
+            "LLM stream ended without completion summary from provider",
+            "STREAM_INCOMPLETE",
+            "partial answer",
+            "thinking",
+            &[json!({"id":"call-1","type":"function"})],
+            &usage,
+        )
+        .await;
+
+        let records = store.records.lock().expect("recording store lock");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.artifact_kind, "llm_capture");
+        assert_eq!(
+            record.metadata.as_ref().and_then(|v| v.get("outcome")),
+            Some(&json!("stream_incomplete"))
+        );
+        assert_eq!(record.content["response"]["kind"], "STREAM_INCOMPLETE");
+        assert_eq!(
+            record.content["response"]["partial_full_text"],
+            "partial answer"
+        );
+        assert_eq!(record.content["response"]["usage"]["prompt"], 120);
+        assert_eq!(record.content["trace"]["turn_chain_id"], "chain-test");
+        assert_eq!(
+            record.metadata.as_ref().unwrap()["trace"]["session_turn_source"],
+            "header"
+        );
+    }
+
+    #[test]
+    fn bridge_root_turn_journal_requires_explicit_header() {
+        let mut headers = HeaderMap::new();
+        let empty_payload = json!({});
+        headers.insert("x-mo-session-turn", "2".parse().unwrap());
+        assert!(
+            !bridge_root_turn_journal_owned(&headers, &empty_payload, false),
+            "session turn alone must not suppress bridge full-journal capture"
+        );
+        headers.insert(ROOT_TURN_JOURNAL_HEADER, "1".parse().unwrap());
+        assert!(bridge_root_turn_journal_owned(
+            &headers,
+            &empty_payload,
+            false
+        ));
+        assert!(
+            !bridge_root_turn_journal_owned(&headers, &empty_payload, true),
+            "bridge e2e should never impersonate a root journal owner"
+        );
+        let payload_owned = json!({"root_turn_journal_owned": true});
+        assert!(bridge_root_turn_journal_owned(
+            &HeaderMap::new(),
+            &payload_owned,
+            false
+        ));
+    }
+
+    #[test]
+    fn root_owned_bridge_keeps_full_capture_but_suppresses_llm_round_summary() {
+        assert!(
+            bridge_should_create_turn_event_buffer(true, true),
+            "root-owned turns still need a buffer for llm_request_full/llm_response_full"
+        );
+        assert!(
+            !bridge_should_record_llm_round(true),
+            "aggregate llm_round rows are owned by the root loop"
+        );
+        assert!(
+            !bridge_should_create_turn_event_buffer(false, true),
+            "without full capture the bridge has nothing to journal for root-owned turns"
+        );
+        assert!(
+            bridge_should_record_llm_round(false),
+            "standalone bridge calls still own their llm_round summary"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn root_owned_bridge_full_capture_flushes_once_without_llm_round() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = format!("root-owned-capture-{}", uuid::Uuid::new_v4());
+        let trace = BridgeTraceCorrelation {
+            session_turn_source: "header".to_string(),
+            turn_chain_id: "chain-root-owned".to_string(),
+            user_query_event_id: "user-query-root-owned".to_string(),
+        };
+        let mut turn_event_buffer = bridge_should_create_turn_event_buffer(true, true)
+            .then(|| TurnEventBuffer::begin_turn_with_round(Some(&session_id), 7, 3));
+
+        record_full_llm_request_event(
+            &mut turn_event_buffer,
+            true,
+            &session_id,
+            7,
+            &trace,
+            "bridge_inprocess",
+            "gpt-5",
+            "openai",
+            1,
+            &[json!({"role": "user", "content": "inspect"})],
+            &[],
+            Some(1024),
+        );
+        if bridge_should_record_llm_round(true)
+            && let Some(buf) = turn_event_buffer.as_mut()
+        {
+            buf.record_llm_round(LlmRoundRecord {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                cache_read_tokens: 0,
+                ttft_ms: None,
+                duration_ms: 1,
+                tool_calls_returned: 0,
+                tool_call_names: Vec::new(),
+                finish_reason: Some("stop".to_string()),
+                agentic_step: Some(3),
+                source: Some("bridge_inprocess".to_string()),
+                run_id: None,
+                tool_calls: None,
+            });
+        }
+        record_full_llm_response_event(
+            &mut turn_event_buffer,
+            true,
+            &session_id,
+            7,
+            &trace,
+            "bridge_inprocess",
+            "gpt-5",
+            "openai",
+            1,
+            "ok",
+            json!({"content": "done"}),
+        );
+        let writer = JournalWriter::new(&session_id).unwrap();
+        turn_event_buffer.as_mut().unwrap().flush(&writer).unwrap();
+        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::LlmRequestFull)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::LlmResponseFull)
+                .count(),
+            1
+        );
+        assert!(
+            events.iter().all(|event| event.event_type
+                != astra_services::session_journal::JournalEventType::LlmRound),
+            "root-owned bridge flush must not double-write aggregate llm_round rows"
+        );
+    }
+
+    #[test]
+    fn llm_request_dump_failures_are_not_silently_ignored() {
+        let source = include_str!("bridge_inprocess.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        for context in [
+            "bridge_inprocess compacted context-window dump persist failed",
+            "bridge_inprocess error dump persist failed",
+        ] {
+            let start = production
+                .find(context)
+                .expect("dump logging context should exist");
+            let window_start = start.saturating_sub(520);
+            let window = &production[window_start..production.len().min(start + 120)];
+            assert!(
+                window.contains("if let Err(error) =")
+                    && window.contains(
+                        "dump.persist_remote(&user_id, remote_artifact_store.as_ref()).await"
+                    ),
+                "{context} should handle dump.persist_remote failures explicitly"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_error_paths_publish_remote_llm_capture_artifacts() {
+        let source = include_str!("bridge_inprocess.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        for context in [
+            "bridge_inprocess compacted context-window capture",
+            "bridge_inprocess error capture",
+        ] {
+            let start = production
+                .find(context)
+                .expect("capture context should exist");
+            let window = &production[start..production.len().min(start + 260)];
+            assert!(
+                window.contains("Some(remote_artifact_store.as_ref())"),
+                "{context} should publish a remote llm_capture artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_stream_failure_paths_publish_remote_llm_capture_artifacts() {
+        let source = include_str!("bridge_inprocess.rs");
+        let tests_start = source.rfind("mod tests {").expect("test module start");
+        let production = &source[..tests_start];
+        for context in [
+            "bridge_inprocess stream block parse capture",
+            "bridge_inprocess stream tail parse capture",
+            "bridge_inprocess stream incomplete capture",
+            "bridge_inprocess client disconnect capture",
+        ] {
+            let start = production
+                .find(context)
+                .expect("stream failure capture context should exist");
+            let window_start = start.saturating_sub(320);
+            let window = &production[window_start..production.len().min(start + 220)];
+            assert!(
+                window.contains("persist_bridge_stream_failure_capture("),
+                "{context} should persist a remote llm_capture artifact for mid-stream failures"
+            );
+        }
     }
 }

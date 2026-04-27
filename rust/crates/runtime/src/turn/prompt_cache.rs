@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 
 use crate::prompts;
 
+const DEFAULT_CACHE_EDIT_PIN_KEY: &str = "__default__";
+const MAX_PINNED_CACHE_EDIT_SESSIONS: usize = 1024;
+const MAX_PINNED_CACHE_EDITS_PER_SESSION: usize = 256;
+
 // ── PromptCacheConfig ────────────────────────────────────────────────────────
 
 /// Configuration for provider-specific prompt caching.
@@ -26,7 +30,13 @@ impl PromptCacheConfig {
     pub fn latch(provider: &str, model_name: &str) -> Self {
         let cache_enabled = !std::env::var("MO_PROMPT_CACHE_DISABLED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+        let provider_strategy =
+            astra_turn_core::microcompact::ProviderCacheStrategy::from_provider_and_model(
+                Some(provider),
+                Some(model_name),
+            );
+        let is_anthropic = provider_strategy.prompt_cache_protocol
+            == astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl;
         Self {
             cache_enabled,
             is_anthropic,
@@ -64,6 +74,11 @@ struct CachedSections {
 fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
     static CACHE: OnceLock<Mutex<HashMap<u64, CachedSections>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pinned_cache_edits() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static PINS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    PINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn section_cache_key(
@@ -299,6 +314,172 @@ pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &P
     }
 }
 
+/// Add Anthropic protocol-level cache metadata for cached micro-compaction.
+///
+/// This mirrors Claude Code's API-layer approach: request messages are annotated
+/// with `cache_reference` / `cache_edits` while the persisted local conversation
+/// remains unchanged. Existing `cache_control` placement is preserved at exactly
+/// one message-level breakpoint.
+pub(crate) fn apply_anthropic_cache_metadata(
+    messages: &mut [Value],
+    cache_cfg: &PromptCacheConfig,
+    session_id: &str,
+) {
+    if !cache_cfg.should_annotate() || messages.is_empty() {
+        return;
+    }
+
+    add_message_cache_breakpoint(messages, cache_cfg);
+
+    let new_deletes = collect_cleared_tool_result_refs(messages);
+    let pinned_deletes = pin_and_merge_cache_edits(session_id, &new_deletes);
+    insert_cache_edits_block(messages, &pinned_deletes);
+    add_tool_result_cache_references(messages);
+}
+
+fn collect_cleared_tool_result_refs(messages: &[Value]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+        if content == crate::turn::cloud::analytics::MICRO_COMPACT_STUB
+            || astra_turn_core::microcompact::is_cleared_content(content)
+        {
+            refs.push(tool_call_id.to_string());
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn pin_and_merge_cache_edits(session_id: &str, new_deletes: &[String]) -> Vec<String> {
+    let key = if session_id.is_empty() {
+        DEFAULT_CACHE_EDIT_PIN_KEY
+    } else {
+        session_id
+    };
+    let Ok(mut pins) = pinned_cache_edits().lock() else {
+        return new_deletes.to_vec();
+    };
+    if !pins.contains_key(key)
+        && pins.len() >= MAX_PINNED_CACHE_EDIT_SESSIONS
+        && let Some(evict_key) = pins
+            .keys()
+            .find(|existing| existing.as_str() != key)
+            .cloned()
+    {
+        pins.remove(&evict_key);
+    }
+    let entry = pins.entry(key.to_string()).or_default();
+    for delete_ref in new_deletes {
+        if !entry.contains(delete_ref) {
+            entry.push(delete_ref.clone());
+        }
+    }
+    entry.sort();
+    entry.dedup();
+    if entry.len() > MAX_PINNED_CACHE_EDITS_PER_SESSION {
+        let excess = entry.len() - MAX_PINNED_CACHE_EDITS_PER_SESSION;
+        entry.drain(0..excess);
+    }
+    entry.clone()
+}
+
+fn insert_cache_edits_block(messages: &mut [Value], delete_refs: &[String]) {
+    if delete_refs.is_empty() {
+        return;
+    }
+    let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return;
+    };
+    ensure_content_array(last_user);
+    let Some(content) = last_user.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    content.retain(|block| block.get("type").and_then(Value::as_str) != Some("cache_edits"));
+    content.push(json!({
+        "type": "cache_edits",
+        "edits": delete_refs
+            .iter()
+            .map(|cache_reference| json!({
+                "type": "delete",
+                "cache_reference": cache_reference,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+}
+
+fn add_tool_result_cache_references(messages: &mut [Value]) {
+    let Some(last_cc_idx) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, msg)| message_has_cache_control(msg))
+        .map(|(idx, _)| idx)
+    else {
+        return;
+    };
+
+    for msg in messages.iter_mut().take(last_cc_idx) {
+        if msg.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        if let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
+            msg["cache_reference"] = Value::String(tool_call_id.to_string());
+        }
+    }
+}
+
+fn ensure_content_array(msg: &mut Value) {
+    if msg.get("content").is_some_and(Value::is_array) {
+        return;
+    }
+    let text = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    msg["content"] = json!([{ "type": "text", "text": text }]);
+}
+
+fn message_has_cache_control(msg: &Value) -> bool {
+    if msg.get("cache_control").is_some() {
+        return true;
+    }
+    msg.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .get("cache_control")
+                    .map(|cc| !cc.is_null())
+                    .unwrap_or(false)
+            })
+        })
+}
+
+#[cfg(test)]
+fn clear_anthropic_cache_edit_pins_for_tests(session_id: &str) {
+    let key = if session_id.is_empty() {
+        DEFAULT_CACHE_EDIT_PIN_KEY
+    } else {
+        session_id
+    };
+    if let Ok(mut pins) = pinned_cache_edits().lock() {
+        pins.remove(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +512,15 @@ mod tests {
         // Both in low bucket should match
         let k_low2 = section_cache_key(&["bash"], None, 0.1);
         assert_eq!(k_low, k_low2);
+    }
+
+    #[test]
+    fn prompt_cache_latch_prefers_provider_over_claude_named_model() {
+        let openai_proxy = PromptCacheConfig::latch("openai", "claude-sonnet-4");
+        assert!(!openai_proxy.is_anthropic);
+
+        let anthropic_provider = PromptCacheConfig::latch("anthropic", "gpt-4o");
+        assert!(anthropic_provider.is_anthropic);
     }
 
     #[test]
@@ -506,5 +696,109 @@ mod tests {
         let original = messages.clone();
         add_message_cache_breakpoint(&mut messages, &cfg);
         assert_eq!(messages, original, "OpenAI should not be annotated");
+    }
+
+    #[test]
+    fn anthropic_cache_metadata_inserts_deduped_cache_edits_and_references() {
+        clear_anthropic_cache_edit_pins_for_tests("session-a");
+        let cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let mut messages = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tool-1",
+                "content": "full cached tool output"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tool-2",
+                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB
+            }),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        let original_tool_content = messages[1]["content"].clone();
+        apply_anthropic_cache_metadata(&mut messages, &cfg, "session-a");
+
+        assert_eq!(
+            messages[1]["content"], original_tool_content,
+            "request annotation must not rewrite full local tool content"
+        );
+        assert_eq!(messages[1]["cache_reference"], "tool-1");
+        assert_eq!(messages[2]["cache_reference"], "tool-2");
+
+        let user_blocks = messages[3]["content"]
+            .as_array()
+            .expect("user content blocks");
+        let cache_edits = user_blocks
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("cache_edits"))
+            .expect("cache_edits block");
+        assert_eq!(
+            cache_edits["edits"],
+            json!([{ "type": "delete", "cache_reference": "tool-2" }])
+        );
+        let cache_control_blocks = user_blocks
+            .iter()
+            .filter(|block| block.get("cache_control").is_some())
+            .count();
+        assert_eq!(
+            cache_control_blocks, 1,
+            "there must be exactly one message-level cache_control marker"
+        );
+    }
+
+    #[test]
+    fn anthropic_cache_edits_are_pinned_across_requests_for_session() {
+        clear_anthropic_cache_edit_pins_for_tests("session-pinned");
+        let cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let mut first = vec![
+            json!({
+                "role": "tool",
+                "tool_call_id": "tool-1",
+                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB
+            }),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        apply_anthropic_cache_metadata(&mut first, &cfg, "session-pinned");
+
+        let mut second = vec![json!({"role": "user", "content": "later"})];
+        apply_anthropic_cache_metadata(&mut second, &cfg, "session-pinned");
+
+        let blocks = second[0]["content"].as_array().expect("content blocks");
+        let cache_edits = blocks
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("cache_edits"))
+            .expect("pinned cache_edits block");
+        assert_eq!(
+            cache_edits["edits"],
+            json!([{ "type": "delete", "cache_reference": "tool-1" }])
+        );
+    }
+
+    #[test]
+    fn anthropic_cache_metadata_noop_for_openai() {
+        clear_anthropic_cache_edit_pins_for_tests("session-openai");
+        let cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: false,
+        };
+        let mut messages = vec![
+            json!({
+                "role": "tool",
+                "tool_call_id": "tool-1",
+                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB
+            }),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let original = messages.clone();
+        apply_anthropic_cache_metadata(&mut messages, &cfg, "session-openai");
+        assert_eq!(messages, original);
     }
 }

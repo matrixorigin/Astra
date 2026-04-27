@@ -9,7 +9,15 @@
 //! - Foundation for checkpoint-based rewind
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::PathBuf;
+
+use crate::{
+    SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore,
+    StoredSessionArtifact,
+};
+
+pub const WORKSPACE_METADATA_ARTIFACT_KIND: &str = "workspace_metadata";
 
 fn is_zero(v: &usize) -> bool {
     *v == 0
@@ -21,6 +29,8 @@ pub struct ContextTraceToolSelection {
     pub tools_available: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selection_scope: String,
     #[serde(default)]
     pub rejected_tools: usize,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -120,7 +130,12 @@ impl ContextTraceSignal {
         }
         if let Some(selection) = self.tool_selection.as_ref() {
             if !selection.selected_tools.is_empty() {
-                parts.push(format!("tools: {}", selection.selected_tools.join(", ")));
+                let label = if selection.selection_scope.is_empty() {
+                    "tools".to_string()
+                } else {
+                    format!("tools[{}]", selection.selection_scope)
+                };
+                parts.push(format!("{label}: {}", selection.selected_tools.join(", ")));
             }
             if !selection.strategy.is_empty() {
                 parts.push(format!(
@@ -542,6 +557,36 @@ impl WorkspaceMetadata {
     }
 }
 
+pub fn to_remote_artifact_record(
+    metadata: &WorkspaceMetadata,
+    user_id: &str,
+) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
+    Ok(SessionArtifactJsonRecord {
+        artifact_id: String::new(),
+        session_id: metadata.session_id.clone(),
+        user_id: user_id.to_string(),
+        artifact_kind: WORKSPACE_METADATA_ARTIFACT_KIND.to_string(),
+        source: Some("workspace_metadata".to_string()),
+        turn: Some(metadata.turn_count),
+        round: None,
+        content: serde_json::to_value(metadata)?,
+        metadata: Some(json!({
+            "model": metadata.model,
+            "status": metadata.status,
+            "git_branch": metadata.git_branch,
+        })),
+    })
+}
+
+pub async fn persist_remote_workspace(
+    metadata: &WorkspaceMetadata,
+    user_id: &str,
+    store: &impl SessionArtifactJsonStore,
+) -> Result<StoredSessionArtifact, String> {
+    let record = to_remote_artifact_record(metadata, user_id).map_err(|error| error.to_string())?;
+    store.persist_json_artifact(record).await
+}
+
 /// Write workspace metadata to disk.
 pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let dir = workspace_dir(&metadata.session_id);
@@ -595,7 +640,9 @@ fn workspace_dir(session_id: &str) -> PathBuf {
         crate::session_journal::validate_session_id(session_id).is_ok(),
         "unsafe session ID passed to workspace_dir: {session_id}"
     );
-    crate::session_journal::local_sessions_dir().join(session_id)
+    crate::local_session_artifact_store()
+        .session_dir(session_id)
+        .expect("validated session_id must resolve workspace dir")
 }
 
 /// Get the workspace directory path (public, for use by checkpoint module).
@@ -733,6 +780,59 @@ fn extract_last_compact_summary(session_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct RecordingArtifactStore {
+        seen: Arc<Mutex<Option<SessionArtifactJsonRecord>>>,
+    }
+
+    #[async_trait]
+    impl SessionArtifactJsonStore for RecordingArtifactStore {
+        async fn persist_json_artifact(
+            &self,
+            record: SessionArtifactJsonRecord,
+        ) -> Result<StoredSessionArtifact, String> {
+            *self.seen.lock().unwrap() = Some(record.clone());
+            Ok(StoredSessionArtifact {
+                artifact_id: "artifact-1".into(),
+                session_id: record.session_id,
+                user_id: record.user_id,
+                artifact_kind: record.artifact_kind,
+                source: record.source,
+                turn: record.turn,
+                round: record.round,
+                content: record.content,
+                metadata: record.metadata,
+                created_at: Some("2026-04-25T14:00:00Z".into()),
+            })
+        }
+
+        async fn load_json_artifact(
+            &self,
+            _artifact_id: &str,
+        ) -> Result<Option<StoredSessionArtifact>, String> {
+            Ok(None)
+        }
+
+        async fn load_latest_json_artifact(
+            &self,
+            _session_id: &str,
+            _artifact_kind: &str,
+        ) -> Result<Option<StoredSessionArtifact>, String> {
+            Ok(None)
+        }
+
+        async fn list_json_artifacts(
+            &self,
+            _session_id: &str,
+            _artifact_kind: Option<&str>,
+            _limit: usize,
+        ) -> Result<Vec<StoredSessionArtifact>, String> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn new_workspace_has_correct_defaults() {
@@ -825,6 +925,37 @@ mod tests {
     }
 
     #[test]
+    fn workspace_remote_artifact_record_uses_workspace_kind() {
+        let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
+        ws.record_turn(100, 50);
+        let record = to_remote_artifact_record(&ws, "user-1").unwrap();
+        assert_eq!(record.session_id, "sess-1");
+        assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.artifact_kind, WORKSPACE_METADATA_ARTIFACT_KIND);
+        assert_eq!(record.source.as_deref(), Some("workspace_metadata"));
+        assert_eq!(record.turn, Some(1));
+        assert_eq!(record.content["cwd"], "/home/user");
+        assert_eq!(record.metadata.as_ref().unwrap()["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn persist_remote_workspace_uses_workspace_record() {
+        let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
+        ws.record_turn(100, 50);
+        let store = RecordingArtifactStore::default();
+
+        let stored = persist_remote_workspace(&ws, "user-1", &store)
+            .await
+            .unwrap();
+        let seen = store.seen.lock().unwrap().clone().expect("captured record");
+
+        assert_eq!(seen.artifact_kind, WORKSPACE_METADATA_ARTIFACT_KIND);
+        assert_eq!(seen.turn, Some(1));
+        assert_eq!(stored.artifact_id, "artifact-1");
+        assert_eq!(stored.content["session_id"], "sess-1");
+    }
+
+    #[test]
     fn workspace_context_trace_signal_round_trip() {
         let mut ws = WorkspaceMetadata::with_context("sess-trace", "gpt-4", "/tmp", Some("main"));
         ws.last_context_trace = Some(ContextTraceSignal {
@@ -833,6 +964,7 @@ mod tests {
             tool_selection: Some(ContextTraceToolSelection {
                 tools_available: 12,
                 selected_tools: vec!["lsp".into(), "view".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 4,
                 strategy: "code-intel".into(),
                 confidence: 0.91,
@@ -875,6 +1007,30 @@ mod tests {
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.last_context_trace, ws.last_context_trace);
+    }
+
+    #[test]
+    fn context_trace_preview_labels_tool_selection_scope() {
+        let trace = ContextTraceSignal {
+            turn_id: "turn-7".into(),
+            captured_at: None,
+            tool_selection: Some(ContextTraceToolSelection {
+                tools_available: 4,
+                selected_tools: vec!["lsp".into()],
+                selection_scope: "latest_round".into(),
+                rejected_tools: 1,
+                strategy: "code-intel".into(),
+                confidence: 0.88,
+                latency_ms: 9,
+            }),
+            memory: None,
+            history: None,
+            budget: None,
+            timing: None,
+            explanations: Vec::new(),
+        };
+
+        assert!(trace.preview().contains("tools[latest_round]: lsp"));
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! non-empty value and send the same value as header `x-mo-bridge-test-secret` on `POST /chat/turn`
 //! (forwarded to the in-process bridge). Body field `test_llm_rounds` is a JSON array of objects:
 //! `{ "full_text"?, "reasoning"?, "tool_calls"?, "usage"? }` — same shape as the internal
-//! `_inprocess_summary` payload. **Never** enable the feature or set the env var in production.
+//! `_inprocess_summary` payload. For streaming-failure E2E, body field `test_llm_stream_blocks`
+//! may contain raw SSE blocks (strings) that are fed directly into the bridge's in-process stream
+//! parser. **Never** enable the feature or set the env var in production.
 
 use axum::http::HeaderMap;
 use serde_json::{Map, Value};
@@ -51,6 +53,18 @@ pub fn parse_llm_round(v: &Value) -> (String, String, Vec<Value>, Map<String, Va
     (full_text, reasoning, tool_calls, usage)
 }
 
+pub fn parse_stream_blocks(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +103,18 @@ mod tests {
         assert!(ft.is_empty());
         assert!(tc.is_empty());
         assert!(u.is_empty());
+    }
+
+    #[test]
+    fn parse_stream_blocks_reads_strings_only() {
+        let blocks = parse_stream_blocks(&json!([
+            "data: {\"type\":\"text_delta\",\"content\":\"hi\"}\n\n",
+            7,
+            "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"hi\"}\n\n"
+        ]));
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("\"text_delta\""));
+        assert!(blocks[1].contains("\"_inprocess_summary\""));
     }
 
     // --- authorized ---

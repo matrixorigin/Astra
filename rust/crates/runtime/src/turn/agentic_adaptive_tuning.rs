@@ -53,6 +53,50 @@ fn shrink_u32_budget(current: u32, percent: u32, floor: u32) -> u32 {
         .max(floor)
 }
 
+fn looks_like_code_review_query(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    ["review", "diff", "change", "pull request", "pr"]
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
+
+fn looks_like_debug_query(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "bug", "error", "crash", "debug", "issue", "problem", "wrong", "fail", "broken",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+fn fallback_scenario_from_routing(
+    message: &str,
+    task_profile: crate::turn::chat_turn_heuristics::TaskExecutionProfile,
+    task_type: crate::pipeline::routing::TaskType,
+) -> Option<crate::user_profile::Scenario> {
+    if !task_profile.mutates_workspace && looks_like_code_review_query(message) {
+        return Some(crate::user_profile::Scenario::CodeReview);
+    }
+    if !task_profile.mutates_workspace && looks_like_debug_query(message) {
+        return Some(crate::user_profile::Scenario::Debugging);
+    }
+
+    match task_type {
+        crate::pipeline::routing::TaskType::Code | crate::pipeline::routing::TaskType::Mutate
+            if task_profile.mutates_workspace =>
+        {
+            Some(crate::user_profile::Scenario::Implementation)
+        }
+        crate::pipeline::routing::TaskType::Code
+        | crate::pipeline::routing::TaskType::Reasoning
+        | crate::pipeline::routing::TaskType::Fetch
+        | crate::pipeline::routing::TaskType::Mutate => {
+            Some(crate::user_profile::Scenario::Exploration)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn apply_tactical_actions(
     state: &mut AgenticLoopState,
     step_actions: &[crate::liquid::tactical::TacticalAction],
@@ -247,16 +291,9 @@ pub(crate) fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     if let Some((scenario, confidence)) = detector.detect() {
         profile.apply_scenario(scenario);
         profile.confidence = profile.confidence.min(confidence.lower);
-    } else if let Some(scenario) = match routing.task_type {
-        crate::pipeline::routing::TaskType::Code | crate::pipeline::routing::TaskType::Mutate => {
-            Some(crate::user_profile::Scenario::Implementation)
-        }
-        crate::pipeline::routing::TaskType::Reasoning
-        | crate::pipeline::routing::TaskType::Fetch => {
-            Some(crate::user_profile::Scenario::Exploration)
-        }
-        _ => None,
-    } {
+    } else if let Some(scenario) =
+        fallback_scenario_from_routing(&state.message, state.task_profile, routing.task_type)
+    {
         profile.apply_scenario(scenario);
     }
 
@@ -1113,4 +1150,56 @@ fn write_session_journal_event(
         return;
     };
     let _ = writer.append(&event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fallback_scenario_from_routing;
+    use crate::pipeline::routing::TaskType;
+    use crate::turn::chat_turn_heuristics::infer_task_execution_profile;
+    use crate::user_profile::Scenario;
+
+    #[test]
+    fn review_like_analysis_query_prefers_code_review_over_implementation_fallback() {
+        let task_profile = infer_task_execution_profile("review local changes");
+        assert!(!task_profile.mutates_workspace);
+        assert_eq!(
+            fallback_scenario_from_routing("review local changes", task_profile, TaskType::Code),
+            Some(Scenario::CodeReview)
+        );
+    }
+
+    #[test]
+    fn mutating_query_keeps_implementation_fallback() {
+        let task_profile = infer_task_execution_profile("fix the bug");
+        assert!(task_profile.mutates_workspace);
+        assert_eq!(
+            fallback_scenario_from_routing("fix the bug", task_profile, TaskType::Code),
+            Some(Scenario::Implementation)
+        );
+    }
+
+    #[test]
+    fn non_mutating_code_query_without_review_intent_falls_back_to_exploration() {
+        let task_profile = infer_task_execution_profile("explain the auth flow");
+        assert!(!task_profile.mutates_workspace);
+        assert_eq!(
+            fallback_scenario_from_routing("explain the auth flow", task_profile, TaskType::Code),
+            Some(Scenario::Exploration)
+        );
+    }
+
+    #[test]
+    fn debug_like_analysis_query_prefers_debugging_over_exploration_fallback() {
+        let task_profile = infer_task_execution_profile("why is this test failing");
+        assert!(!task_profile.mutates_workspace);
+        assert_eq!(
+            fallback_scenario_from_routing(
+                "why is this test failing",
+                task_profile,
+                TaskType::Code
+            ),
+            Some(Scenario::Debugging)
+        );
+    }
 }

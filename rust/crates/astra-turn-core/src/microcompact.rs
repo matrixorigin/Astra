@@ -17,6 +17,254 @@ use serde_json::Value;
 /// Placeholder that replaces cleared tool result content.
 pub const CLEARED_PLACEHOLDER: &str = "[Previous tool output cleared]";
 
+/// Maximum length for the normalized args preview in the placeholder.
+const ARGS_PREVIEW_MAX: usize = 120;
+
+/// Provider-aware compaction strategy.
+///
+/// Controls how cleared tool results are replaced:
+/// - `Normalized`: stable `key=value` placeholder (OpenAI/GLM/DeepSeek — prefix caching)
+/// - `Minimal`: shortest possible placeholder (Anthropic — protocol-level caching)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactStrategy {
+    /// `[Cleared: tool_name key=value — re-run if needed]`
+    /// Stable, normalized args (no raw JSON). Good for prefix-caching providers.
+    #[default]
+    Normalized,
+    /// `[Cleared]`
+    /// Minimal placeholder. Anthropic uses cache_control at the protocol layer,
+    /// so placeholder content doesn't affect cache hits.
+    Minimal,
+}
+
+/// Provider prompt-cache protocol class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCacheProtocol {
+    /// Provider benefits from stable deterministic prompt prefixes.
+    #[default]
+    Prefix,
+    /// Provider supports Anthropic-style `cache_control`, `cache_reference`,
+    /// and `cache_edits` request metadata.
+    AnthropicCacheControl,
+}
+
+/// Explicit cache/compaction capabilities derived from the selected provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCacheStrategy {
+    pub prompt_cache_protocol: PromptCacheProtocol,
+    pub compact_strategy: CompactStrategy,
+    pub supports_cache_control: bool,
+    /// Capability flag consumed by API-layer request annotation code.
+    pub supports_cache_reference: bool,
+    /// Capability flag consumed by API-layer request annotation code.
+    pub supports_cache_edits: bool,
+}
+
+impl Default for ProviderCacheStrategy {
+    fn default() -> Self {
+        Self {
+            prompt_cache_protocol: PromptCacheProtocol::Prefix,
+            compact_strategy: CompactStrategy::Normalized,
+            supports_cache_control: false,
+            supports_cache_reference: false,
+            supports_cache_edits: false,
+        }
+    }
+}
+
+impl ProviderCacheStrategy {
+    /// Derive provider cache capabilities from a provider or model hint.
+    ///
+    /// This is intentionally capability-shaped rather than placeholder-shaped:
+    /// OpenAI-compatible providers keep stable local placeholders for prefix
+    /// caching, while Anthropic-compatible providers prefer protocol-level
+    /// cache metadata and minimal local mutation.
+    pub fn from_provider_hint(provider_or_model: &str) -> Self {
+        let lower = provider_or_model.to_ascii_lowercase();
+        if lower.contains("claude") || lower.contains("anthropic") {
+            Self {
+                prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
+                compact_strategy: CompactStrategy::Minimal,
+                supports_cache_control: true,
+                supports_cache_reference: true,
+                supports_cache_edits: true,
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    /// Derive provider cache capabilities with an explicit provider taking
+    /// precedence over model name. This avoids misclassifying OpenAI-compatible
+    /// proxies that serve Claude-named models.
+    pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
+        if let Some(provider) = provider.filter(|value| !value.trim().is_empty()) {
+            let from_provider = Self::from_provider_hint(provider);
+            // If the provider is explicitly Anthropic, trust it.
+            if from_provider.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
+                return from_provider;
+            }
+            // If the provider is a known non-Anthropic API (OpenAI, Gemini, etc.),
+            // respect that even when the model name contains "claude" — the caller
+            // is explicitly routing through a non-Anthropic endpoint.
+            // Unknown providers (e.g. openrouter, litellm) fall through to model
+            // detection so that Claude models served via proxy get the right protocol.
+            let lower = provider.to_ascii_lowercase();
+            let is_known_non_anthropic = lower.contains("openai")
+                || lower.contains("gemini")
+                || lower.contains("google")
+                || lower.contains("mistral")
+                || lower.contains("cohere")
+                || lower.contains("groq")
+                || lower.contains("together")
+                || lower.contains("deepseek")
+                || lower.contains("qwen")
+                || lower.contains("ollama");
+            if is_known_non_anthropic {
+                return from_provider;
+            }
+        }
+        model.map(Self::from_provider_hint).unwrap_or_default()
+    }
+}
+
+impl CompactStrategy {
+    /// Derive strategy from provider/model name.
+    /// Anthropic (claude) → Minimal; everything else → Normalized.
+    pub fn from_provider_hint(provider_or_model: &str) -> Self {
+        ProviderCacheStrategy::from_provider_hint(provider_or_model).compact_strategy
+    }
+
+    /// Derive strategy from explicit provider plus model fallback.
+    pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
+        ProviderCacheStrategy::from_provider_and_model(provider, model).compact_strategy
+    }
+}
+
+/// Returns `true` if content looks like a cleared placeholder (any variant).
+pub fn is_cleared_content(content: &str) -> bool {
+    content == CLEARED_PLACEHOLDER || content == "[Cleared]" || content.starts_with("[Cleared: ")
+}
+
+/// Stable arg keys worth preserving in the normalized placeholder.
+/// These identify *what* was accessed, not *how* (command content is volatile).
+const STABLE_ARG_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "pattern",
+    "symbol_name",
+    "symbol",
+    "url",
+    "query",
+    "glob",
+    "ref",
+    "commit",
+];
+
+/// Extract normalized `key=value` pairs from JSON args string.
+/// Only keeps stable keys, truncates long values.
+fn normalize_args(raw: &str) -> String {
+    let Ok(obj) = serde_json::from_str::<serde_json::Map<String, Value>>(raw) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for key in STABLE_ARG_KEYS {
+        if let Some(val) = obj.get(*key) {
+            let v = match val {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            // Truncate long values (e.g. long file paths are fine, but cap at 80)
+            let v = if v.len() > 80 {
+                format!("{}…", &v[..80])
+            } else {
+                v
+            };
+            let part = format!("{key}={v}");
+            len += part.len() + 1;
+            if len > ARGS_PREVIEW_MAX {
+                break;
+            }
+            parts.push(part);
+        }
+    }
+    parts.join(" ")
+}
+
+/// Tool call metadata extracted from assistant messages (owned strings to avoid borrow issues).
+struct ToolCallMaps {
+    id_to_name: std::collections::HashMap<String, String>,
+    id_to_args: std::collections::HashMap<String, String>,
+}
+
+/// Build owned tool_call_id → (name, args) maps from assistant messages.
+fn build_tool_call_maps(messages: &[Value]) -> ToolCallMaps {
+    let mut id_to_name = std::collections::HashMap::new();
+    let mut id_to_args = std::collections::HashMap::new();
+    for msg in messages.iter() {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for tc in calls {
+            if let (Some(id), Some(name)) = (
+                tc.get("id").and_then(Value::as_str),
+                tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str),
+            ) {
+                id_to_name.insert(id.to_string(), name.to_string());
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                {
+                    id_to_args.insert(id.to_string(), args.to_string());
+                }
+            }
+        }
+    }
+    ToolCallMaps {
+        id_to_name,
+        id_to_args,
+    }
+}
+
+impl ToolCallMaps {
+    /// Build the cleared placeholder for a given tool_call_id, respecting strategy.
+    fn cleared_placeholder(&self, call_id: &str, strategy: CompactStrategy) -> String {
+        match strategy {
+            CompactStrategy::Minimal => "[Cleared]".to_string(),
+            CompactStrategy::Normalized => {
+                let Some(name) = self.id_to_name.get(call_id) else {
+                    return CLEARED_PLACEHOLDER.to_string();
+                };
+                let preview = self
+                    .id_to_args
+                    .get(call_id)
+                    .map(|args| normalize_args(args))
+                    .unwrap_or_default();
+                if preview.is_empty() {
+                    format!("[Cleared: {name} — re-run if needed]")
+                } else {
+                    format!("[Cleared: {name} {preview} — re-run if needed]")
+                }
+            }
+        }
+    }
+
+    /// Borrow id_to_name as &str refs for is_compactable_tool_result.
+    fn name_ref_map(&self) -> std::collections::HashMap<&str, &str> {
+        self.id_to_name
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+}
+
 /// Marker for tool results persisted to disk by `tool_result_storage`.
 /// These contain a file reference the LLM needs to re-read the output.
 const PERSISTED_TAG: &str = "<persisted-output>";
@@ -131,21 +379,31 @@ fn estimate_tokens(s: &str) -> usize {
 /// Compact old tool results in the message history.
 ///
 /// Returns the number of tool results compacted and estimated tokens saved.
-pub fn compact_tool_results(messages: &mut [Value], keep_recent: Option<usize>) -> CompactStats {
+pub fn compact_tool_results(
+    messages: &mut [Value],
+    keep_recent: Option<usize>,
+    strategy: CompactStrategy,
+) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = keep_recent
         .map(|k| AdaptiveCompactConfig {
             keep_recent: k,
             token_budget: TOKEN_BUDGET,
         })
         .unwrap_or_default();
-    compact_tool_results_with_config(messages, &config)
+    compact_tool_results_with_config(messages, &config, strategy)
 }
 
 /// Pressure-adaptive variant: compact with parameters derived from context
 /// pressure so that high-pressure turns free more headroom.
-pub fn compact_tool_results_adaptive(messages: &mut [Value], pressure: f64) -> CompactStats {
+pub fn compact_tool_results_adaptive(
+    messages: &mut [Value],
+    pressure: f64,
+    strategy: CompactStrategy,
+) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_config(messages, &config)
+    compact_tool_results_with_config(messages, &config, strategy)
 }
 
 /// State-aware variant: uses `SessionFacts.active_files` as a pin list.
@@ -156,9 +414,11 @@ pub fn compact_tool_results_state_aware(
     pressure: f64,
     facts: &crate::cloud_session_facts::SessionFacts,
     pin_turns: u32,
+    strategy: CompactStrategy,
 ) -> CompactStats {
+    crate::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
     let config = AdaptiveCompactConfig::from_pressure(pressure);
-    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns)
+    compact_tool_results_with_pin_list(messages, &config, facts, pin_turns, strategy)
 }
 
 fn compact_tool_results_with_pin_list(
@@ -166,27 +426,12 @@ fn compact_tool_results_with_pin_list(
     config: &AdaptiveCompactConfig,
     facts: &crate::cloud_session_facts::SessionFacts,
     pin_turns: u32,
+    strategy: CompactStrategy,
 ) -> CompactStats {
     let keep = config.keep_recent;
 
-    // Build tool_call_id → tool_name mapping
-    let mut id_to_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for msg in messages.iter() {
-        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-            if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
-                for tc in calls {
-                    if let (Some(id), Some(name)) = (
-                        tc.get("id").and_then(Value::as_str),
-                        tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str),
-                    ) {
-                        id_to_name.insert(id, name);
-                    }
-                }
-            }
-        }
-    }
+    let maps = build_tool_call_maps(messages);
+    let id_to_name = maps.name_ref_map();
 
     // Collect compactable results, split into pinned vs unpinned
     let mut unpinned: Vec<(usize, usize)> = Vec::new();
@@ -195,14 +440,14 @@ fn compact_tool_results_with_pin_list(
             continue;
         }
         let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
-        if content.len() < MIN_COMPACT_SIZE || content == CLEARED_PLACEHOLDER {
+        if content.len() < MIN_COMPACT_SIZE || is_cleared_content(content) {
             continue;
         }
         // Check if this result's file is in the active pin list
         let file_path = extract_file_path_from_tool_result(msg, &id_to_name);
         let is_pinned = file_path
             .as_deref()
-            .map(|p| facts.is_active_file(p, pin_turns))
+            .map(|p| facts.is_active_file(p, pin_turns) || facts.is_pending_relevant_file(p))
             .unwrap_or(false);
         if !is_pinned {
             unpinned.push((i, estimate_tokens(content)));
@@ -239,7 +484,11 @@ fn compact_tool_results_with_pin_list(
     for &(idx, tokens) in unpinned.iter().take(to_compact) {
         stats.tokens_saved += tokens;
         stats.results_compacted += 1;
-        messages[idx]["content"] = Value::String(CLEARED_PLACEHOLDER.to_string());
+        let call_id = messages[idx]
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        messages[idx]["content"] = Value::String(maps.cleared_placeholder(call_id, strategy));
     }
 
     stats
@@ -299,27 +548,12 @@ fn extract_file_path_from_tool_result(
 fn compact_tool_results_with_config(
     messages: &mut [Value],
     config: &AdaptiveCompactConfig,
+    strategy: CompactStrategy,
 ) -> CompactStats {
     let keep = config.keep_recent;
 
-    // Build tool_call_id → tool_name mapping from assistant messages.
-    let mut id_to_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for msg in messages.iter() {
-        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-            if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
-                for tc in calls {
-                    if let (Some(id), Some(name)) = (
-                        tc.get("id").and_then(Value::as_str),
-                        tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str),
-                    ) {
-                        id_to_name.insert(id, name);
-                    }
-                }
-            }
-        }
-    }
+    let maps = build_tool_call_maps(messages);
+    let id_to_name = maps.name_ref_map();
 
     // Collect (index, content_tokens) of compactable tool result messages.
     let compactable: Vec<(usize, usize)> = messages
@@ -330,7 +564,7 @@ fn compact_tool_results_with_config(
                 return None;
             }
             let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
-            if content.len() < MIN_COMPACT_SIZE || content == CLEARED_PLACEHOLDER {
+            if content.len() < MIN_COMPACT_SIZE || is_cleared_content(content) {
                 return None;
             }
             Some((i, estimate_tokens(content)))
@@ -370,7 +604,11 @@ fn compact_tool_results_with_config(
     for &(idx, tokens) in compactable.iter().take(to_compact) {
         stats.tokens_saved += tokens;
         stats.results_compacted += 1;
-        messages[idx]["content"] = Value::String(CLEARED_PLACEHOLDER.to_string());
+        let call_id = messages[idx]
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        messages[idx]["content"] = Value::String(maps.cleared_placeholder(call_id, strategy));
     }
 
     stats
@@ -429,6 +667,14 @@ mod tests {
         json!({"role": "tool", "tool_call_id": id, "content": content})
     }
 
+    /// Check if a message's content is a cleared placeholder (old or enhanced).
+    fn content_is_cleared(msg: &Value) -> bool {
+        msg.get("content")
+            .and_then(Value::as_str)
+            .map(super::is_cleared_content)
+            .unwrap_or(false)
+    }
+
     #[test]
     fn estimate_tokens_reasonable_for_code() {
         // Typical code: ~4 bytes/token. 1000 bytes → ~250 tokens.
@@ -455,12 +701,24 @@ mod tests {
             tool_result("c5", &big),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(2));
+        let stats = compact_tool_results(&mut messages, Some(2), Default::default());
 
         assert_eq!(stats.results_compacted, 3);
-        assert_eq!(messages[2]["content"], CLEARED_PLACEHOLDER);
-        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER);
-        assert_eq!(messages[4]["content"], CLEARED_PLACEHOLDER);
+        assert!(
+            content_is_cleared(&messages[2]),
+            "expected cleared at [2], got: {:?}",
+            messages[2]["content"]
+        );
+        assert!(
+            content_is_cleared(&messages[3]),
+            "expected cleared at [3], got: {:?}",
+            messages[3]["content"]
+        );
+        assert!(
+            content_is_cleared(&messages[4]),
+            "expected cleared at [4], got: {:?}",
+            messages[4]["content"]
+        );
         assert_eq!(messages[6]["content"], big); // recent kept
         assert_eq!(messages[7]["content"], big);
     }
@@ -483,7 +741,7 @@ mod tests {
             tool_result("c3", &huge),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(6));
+        let stats = compact_tool_results(&mut messages, Some(6), Default::default());
 
         // Should compact at least 1 to get under budget
         assert!(
@@ -492,7 +750,10 @@ mod tests {
             stats.results_compacted
         );
         // c3 (most recent) should be preserved
-        assert_ne!(messages[3]["content"], CLEARED_PLACEHOLDER);
+        assert!(
+            !content_is_cleared(&messages[3]),
+            "expected NOT cleared at [3]"
+        );
     }
 
     #[test]
@@ -507,10 +768,13 @@ mod tests {
 
         // With keep=6 (default), count-based won't trigger (1 < 6).
         // Token-based wants to clear, but min(n, len-1) = min(1, 0) = 0.
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
 
         assert_eq!(stats.results_compacted, 0);
-        assert_ne!(messages[1]["content"], CLEARED_PLACEHOLDER);
+        assert!(
+            !content_is_cleared(&messages[1]),
+            "expected NOT cleared at [1]"
+        );
     }
 
     // ── Safety: non-compactable tools ────────────────────────────────────
@@ -535,7 +799,7 @@ mod tests {
             tool_result("c6", &big),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(0));
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
 
         assert_eq!(stats.results_compacted, 1); // only read_file
         assert_eq!(messages[1]["content"], big); // bash
@@ -543,7 +807,11 @@ mod tests {
         assert_eq!(messages[3]["content"], big); // write_file
         assert_eq!(messages[4]["content"], big); // str_replace
         assert_eq!(messages[5]["content"], big); // delegate
-        assert_eq!(messages[6]["content"], CLEARED_PLACEHOLDER); // read_file
+        assert!(
+            content_is_cleared(&messages[6]),
+            "expected cleared at [6], got: {:?}",
+            messages[6]["content"]
+        ); // read_file
     }
 
     #[test]
@@ -551,7 +819,7 @@ mod tests {
         let big = "x".repeat(1000);
         let mut messages = vec![tool_result("orphan", &big)];
 
-        let stats = compact_tool_results(&mut messages, Some(0));
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
         assert_eq!(stats.results_compacted, 0);
         assert_eq!(messages[0]["content"], big);
     }
@@ -569,7 +837,7 @@ mod tests {
             tool_result("c1", &persisted),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(0));
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
 
         assert_eq!(stats.results_compacted, 0);
         assert!(
@@ -590,7 +858,7 @@ mod tests {
             tool_result("c2", "also short"),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(0));
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
         assert_eq!(stats.results_compacted, 0);
     }
 
@@ -602,7 +870,7 @@ mod tests {
             json!({"role": "assistant", "content": &big}),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(0));
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
         assert_eq!(stats.results_compacted, 0);
         assert_eq!(messages[0]["content"], big);
         assert_eq!(messages[1]["content"], big);
@@ -617,10 +885,14 @@ mod tests {
             tool_result("c2", &big),
         ];
 
-        compact_tool_results(&mut messages, Some(0));
-        assert_eq!(messages[1]["content"], CLEARED_PLACEHOLDER);
+        compact_tool_results(&mut messages, Some(0), Default::default());
+        assert!(
+            content_is_cleared(&messages[1]),
+            "expected cleared at [1], got: {:?}",
+            messages[1]["content"]
+        );
 
-        let stats = compact_tool_results(&mut messages, Some(0));
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
         assert_eq!(stats.results_compacted, 0); // already cleared
     }
 
@@ -633,7 +905,7 @@ mod tests {
             tool_result("c2", &small),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(5));
+        let stats = compact_tool_results(&mut messages, Some(5), Default::default());
         assert_eq!(stats.results_compacted, 0); // 2 results < keep=5, tokens < budget
     }
 
@@ -690,7 +962,7 @@ mod tests {
         ];
 
         // Before iteration 2: run microcompact
-        let stats = compact_tool_results(&mut messages, None); // default keep=6
+        let stats = compact_tool_results(&mut messages, None, Default::default()); // default keep=6
 
         // 15 compactable (11 read_file + 4 grep), skill is NOT compactable.
         // Count-based: 15 - 6 = 9 to compact.
@@ -698,7 +970,10 @@ mod tests {
         assert_eq!(stats.results_compacted, 9);
 
         // Skill output preserved (not compactable)
-        assert_ne!(messages[2]["content"], CLEARED_PLACEHOLDER);
+        assert!(
+            !content_is_cleared(&messages[2]),
+            "expected NOT cleared at [2]"
+        );
         assert!(messages[2]["content"].as_str().unwrap().contains("Review"));
 
         // Most recent 6 compactable results preserved
@@ -709,12 +984,26 @@ mod tests {
         // Last 6: indices for r10, r11, g1, g2, g3, g4
 
         // Verify oldest are cleared
-        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER); // r1
-        assert_eq!(messages[4]["content"], CLEARED_PLACEHOLDER); // r2
+        assert!(
+            content_is_cleared(&messages[3]),
+            "expected cleared at [3], got: {:?}",
+            messages[3]["content"]
+        ); // r1
+        assert!(
+            content_is_cleared(&messages[4]),
+            "expected cleared at [4], got: {:?}",
+            messages[4]["content"]
+        ); // r2
 
         // Verify newest are kept
-        assert_ne!(messages[17]["content"], CLEARED_PLACEHOLDER); // g4
-        assert_ne!(messages[16]["content"], CLEARED_PLACEHOLDER); // g3
+        assert!(
+            !content_is_cleared(&messages[17]),
+            "expected NOT cleared at [17]"
+        ); // g4
+        assert!(
+            !content_is_cleared(&messages[16]),
+            "expected NOT cleared at [16]"
+        ); // g3
 
         // Token savings: 9 results * ~240 tokens each ≈ 2160
         assert!(
@@ -743,7 +1032,7 @@ mod tests {
             tool_result("r4", &large_file),
         ];
 
-        let stats = compact_tool_results(&mut messages, None); // keep=6
+        let stats = compact_tool_results(&mut messages, None, Default::default()); // keep=6
 
         // Count-based: 4 < 6 → 0. But token-based: 4*4K = 16K > 12K → must clear some.
         assert!(
@@ -753,13 +1042,21 @@ mod tests {
         );
 
         // Most recent should be preserved
-        assert_ne!(messages[4]["content"], CLEARED_PLACEHOLDER); // r4 (newest)
+        assert!(
+            !content_is_cleared(&messages[4]),
+            "expected NOT cleared at [4]"
+        ); // r4 (newest)
 
         // Total remaining tokens should be under budget
         let remaining_tokens: usize = messages
             .iter()
             .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-            .filter(|m| m.get("content").and_then(Value::as_str) != Some(CLEARED_PLACEHOLDER))
+            .filter(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .map(|c| !super::is_cleared_content(c))
+                    .unwrap_or(true)
+            })
             .map(|m| estimate_tokens(m.get("content").and_then(Value::as_str).unwrap_or("")))
             .sum();
         assert!(
@@ -790,18 +1087,26 @@ mod tests {
             tool_result("g1", &big),
         ];
 
-        let stats = compact_tool_results(&mut messages, Some(1));
+        let stats = compact_tool_results(&mut messages, Some(1), Default::default());
 
         // 3 compactable (r1, r2, g1), keep 1 → compact 2 (r1, r2)
         assert_eq!(stats.results_compacted, 2);
-        assert_eq!(messages[1]["content"], CLEARED_PLACEHOLDER); // r1 compacted
+        assert!(
+            content_is_cleared(&messages[1]),
+            "expected cleared at [1], got: {:?}",
+            messages[1]["content"]
+        ); // r1 compacted
         assert!(
             messages[2]["content"]
                 .as_str()
                 .unwrap()
                 .contains("test result")
         ); // bash preserved!
-        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER); // r2 compacted
+        assert!(
+            content_is_cleared(&messages[3]),
+            "expected cleared at [3], got: {:?}",
+            messages[3]["content"]
+        ); // r2 compacted
         assert_eq!(messages[4]["content"], big); // g1 kept (most recent compactable)
     }
 
@@ -871,7 +1176,7 @@ mod tests {
         ];
 
         // Run compaction (simulating what happens before round 3)
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
 
         // Should compact some old read_file results
         assert!(stats.results_compacted > 0, "should compact old file reads");
@@ -954,7 +1259,12 @@ mod tests {
         // 6. Cleared results have placeholder, not deleted
         let cleared: Vec<&Value> = messages
             .iter()
-            .filter(|m| m.get("content").and_then(Value::as_str) == Some(CLEARED_PLACEHOLDER))
+            .filter(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .map(super::is_cleared_content)
+                    .unwrap_or(false)
+            })
             .collect();
         assert!(!cleared.is_empty(), "some results should be cleared");
         for msg in &cleared {
@@ -996,7 +1306,7 @@ mod tests {
         ];
 
         // Compact after round 1 — 4 compactable, under keep=6, no compaction
-        let s1 = compact_tool_results(&mut messages, None);
+        let s1 = compact_tool_results(&mut messages, None, Default::default());
         assert_eq!(s1.results_compacted, 0);
 
         // Round 2: 4 more reads (total 8 compactable > keep=6)
@@ -1014,11 +1324,22 @@ mod tests {
         ]);
 
         // Compact after round 2 — 8 compactable, clear oldest 2
-        let s2 = compact_tool_results(&mut messages, None);
+        let s2 = compact_tool_results(&mut messages, None, Default::default());
         assert_eq!(s2.results_compacted, 2);
-        assert_eq!(messages[2]["content"], CLEARED_PLACEHOLDER); // c1
-        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER); // c2
-        assert_ne!(messages[4]["content"], CLEARED_PLACEHOLDER); // c3 kept
+        assert!(
+            content_is_cleared(&messages[2]),
+            "expected cleared at [2], got: {:?}",
+            messages[2]["content"]
+        ); // c1
+        assert!(
+            content_is_cleared(&messages[3]),
+            "expected cleared at [3], got: {:?}",
+            messages[3]["content"]
+        ); // c2
+        assert!(
+            !content_is_cleared(&messages[4]),
+            "expected NOT cleared at [4]"
+        ); // c3 kept
 
         // Round 3: 3 more reads (total 9 non-cleared compactable > keep=6)
         messages.push(assistant_with_tools(&[
@@ -1033,17 +1354,28 @@ mod tests {
         ]);
 
         // Compact after round 3 — should clear more old ones, NOT re-clear c1/c2
-        let s3 = compact_tool_results(&mut messages, None);
+        let s3 = compact_tool_results(&mut messages, None, Default::default());
         assert!(s3.results_compacted > 0, "should compact more old results");
         // c1, c2 already cleared — should still be placeholder (idempotent)
-        assert_eq!(messages[2]["content"], CLEARED_PLACEHOLDER);
-        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER);
+        assert!(
+            content_is_cleared(&messages[2]),
+            "expected cleared at [2], got: {:?}",
+            messages[2]["content"]
+        );
+        assert!(
+            content_is_cleared(&messages[3]),
+            "expected cleared at [3], got: {:?}",
+            messages[3]["content"]
+        );
         // Total non-cleared compactable should be <= KEEP_RECENT
         let live = messages
             .iter()
             .filter(|m| {
                 m.get("role").and_then(Value::as_str) == Some("tool")
-                    && m.get("content").and_then(Value::as_str) != Some(CLEARED_PLACEHOLDER)
+                    && m.get("content")
+                        .and_then(Value::as_str)
+                        .map(|c| !super::is_cleared_content(c))
+                        .unwrap_or(true)
                     && m.get("content")
                         .and_then(Value::as_str)
                         .map_or(false, |c| c.len() >= MIN_COMPACT_SIZE)
@@ -1079,13 +1411,13 @@ mod tests {
 
         // 4 compactable < keep=6, so count-based won't trigger.
         // Token-based: 4 × 3000 = 12000 = TOKEN_BUDGET. Condition is >, not >=.
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
         assert_eq!(
             stats.results_compacted, 0,
             "exactly at budget should not trigger (> not >=)"
         );
         for m in &messages[2..6] {
-            assert_ne!(m["content"], CLEARED_PLACEHOLDER);
+            assert!(!content_is_cleared(m), "expected NOT cleared");
         }
     }
 
@@ -1124,7 +1456,7 @@ mod tests {
             tool_result("c14", &big),
         ];
 
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
 
         // bash results must NEVER be compacted
         for id in ["c2", "c5", "c8"] {
@@ -1190,7 +1522,7 @@ mod tests {
             tool_result("c8", &big),
         ];
 
-        compact_tool_results(&mut messages, None);
+        compact_tool_results(&mut messages, None, Default::default());
 
         // Stub must survive untouched
         assert_eq!(
@@ -1236,7 +1568,7 @@ mod tests {
             tool_result("c10", &big),
         ];
 
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
         assert!(stats.results_compacted > 0);
 
         // Both persisted results must survive
@@ -1295,12 +1627,12 @@ mod tests {
 
             // Run microcompact before each iteration (except first)
             if iter > 0 {
-                compact_tool_results(&mut messages, None);
+                compact_tool_results(&mut messages, None, Default::default());
             }
         }
 
         // Final compaction
-        compact_tool_results(&mut messages, None);
+        compact_tool_results(&mut messages, None, Default::default());
 
         // Structural integrity: every tool result has tool_call_id and content
         let tool_msgs: Vec<&Value> = messages
@@ -1325,11 +1657,7 @@ mod tests {
                     .iter()
                     .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some(id.as_str()))
                     .unwrap();
-                assert_ne!(
-                    m["content"], CLEARED_PLACEHOLDER,
-                    "bash {} must survive",
-                    id
-                );
+                assert!(!content_is_cleared(m), "bash {} must survive", id);
             }
         }
 
@@ -1346,7 +1674,12 @@ mod tests {
         // Some compaction must have happened
         let cleared_count = tool_msgs
             .iter()
-            .filter(|m| m.get("content").and_then(Value::as_str) == Some(CLEARED_PLACEHOLDER))
+            .filter(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .map(super::is_cleared_content)
+                    .unwrap_or(false)
+            })
             .count();
         assert!(cleared_count > 0, "stress test should trigger compaction");
     }
@@ -1364,7 +1697,7 @@ mod tests {
         ];
 
         // Should not panic on array content
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
         // Array content treated as size 0 → skipped
         assert!(
             messages[2]["content"].is_array(),
@@ -1391,7 +1724,7 @@ mod tests {
         ];
 
         // Should not panic
-        let stats = compact_tool_results(&mut messages, None);
+        let stats = compact_tool_results(&mut messages, None, Default::default());
         assert_eq!(stats.results_compacted, 0, "empty/null/single under keep");
         assert_eq!(messages[2]["content"], "");
         assert!(messages[3]["content"].is_null());
@@ -1444,8 +1777,8 @@ mod tests {
         ];
         let mut msgs_high = msgs_low.clone();
 
-        let stats_low = compact_tool_results_adaptive(&mut msgs_low, 0.3);
-        let stats_high = compact_tool_results_adaptive(&mut msgs_high, 0.92);
+        let stats_low = compact_tool_results_adaptive(&mut msgs_low, 0.3, Default::default());
+        let stats_high = compact_tool_results_adaptive(&mut msgs_high, 0.92, Default::default());
 
         assert!(
             stats_high.results_compacted > stats_low.results_compacted,
@@ -1506,10 +1839,12 @@ mod tests {
         }
 
         let mut msgs_normal = msgs.clone();
-        let stats_normal = compact_tool_results_adaptive(&mut msgs_normal, 0.80);
+        let stats_normal =
+            compact_tool_results_adaptive(&mut msgs_normal, 0.80, Default::default());
 
         let mut msgs_aware = msgs;
-        let stats_aware = compact_tool_results_state_aware(&mut msgs_aware, 0.80, &facts, 5);
+        let stats_aware =
+            compact_tool_results_state_aware(&mut msgs_aware, 0.80, &facts, 5, Default::default());
 
         // State-aware should compact fewer (pinned file preserved)
         // The important.rs file (turn 9, within 5-turn window) should be pinned
@@ -1528,8 +1863,8 @@ mod tests {
             .unwrap()
             .as_str()
             .unwrap();
-        assert_ne!(
-            content, CLEARED_PLACEHOLDER,
+        assert!(
+            !super::is_cleared_content(content),
             "pinned file should NOT be cleared"
         );
 
@@ -1545,6 +1880,62 @@ mod tests {
             "state-aware ({}) should compact ≤ normal ({})",
             stats_aware.results_compacted,
             stats_normal.results_compacted
+        );
+    }
+
+    #[test]
+    fn state_aware_pins_pending_task_relevant_files() {
+        use crate::cloud_session_facts::{PlanFact, SessionFacts};
+
+        let facts = SessionFacts {
+            turn: 10,
+            plan_state: Some(PlanFact {
+                goal: "finish compaction".to_string(),
+                completed: 1,
+                total: 2,
+                current_subtask: Some("preserve src/pending.rs while editing".to_string()),
+            }),
+            ..Default::default()
+        };
+        let big = "x".repeat(2000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                ("c1", "read_file", r#"{"path":"src/pending.rs"}"#),
+                ("c2", "read_file", r#"{"path":"src/old.rs"}"#),
+                ("c3", "read_file", r#"{"path":"src/other.rs"}"#),
+            ]),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "read_file",
+                "content": format!("src/pending.rs\n{big}")
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c2",
+                "name": "read_file",
+                "content": format!("src/old.rs\n{big}")
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "c3",
+                "name": "read_file",
+                "content": format!("src/other.rs\n{big}")
+            }),
+        ];
+
+        let stats =
+            compact_tool_results_state_aware(&mut messages, 0.95, &facts, 5, Default::default());
+
+        assert!(stats.results_compacted > 0);
+        let pending = messages[1]["content"].as_str().unwrap();
+        assert!(
+            pending.starts_with("src/pending.rs"),
+            "pending-task-relevant file result must remain intact, got: {pending}"
+        );
+        assert!(
+            !super::is_cleared_content(pending),
+            "pending-task-relevant file result must not be compacted"
         );
     }
 
@@ -1569,15 +1960,414 @@ mod tests {
         }
 
         let mut msgs_normal = msgs.clone();
-        let stats_normal = compact_tool_results_adaptive(&mut msgs_normal, 0.80);
+        let stats_normal =
+            compact_tool_results_adaptive(&mut msgs_normal, 0.80, Default::default());
 
         let mut msgs_aware = msgs;
-        let stats_aware = compact_tool_results_state_aware(&mut msgs_aware, 0.80, &facts, 5);
+        let stats_aware =
+            compact_tool_results_state_aware(&mut msgs_aware, 0.80, &facts, 5, Default::default());
 
         // With no active files, nothing is pinned — should compact same amount
         assert_eq!(
             stats_normal.results_compacted,
             stats_aware.results_compacted
         );
+    }
+
+    #[test]
+    fn compact_tool_results_omits_empty_assistant_tool_calls() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "done", "tool_calls": []}),
+            json!({"role": "tool", "content": "src/main.rs\n".to_string() + &"x".repeat(500), "tool_call_id": "c1", "name": "read_file"}),
+        ];
+
+        let _ = compact_tool_results(&mut messages, Some(0), Default::default());
+
+        assert!(messages[0].get("tool_calls").is_none(), "{messages:?}");
+    }
+
+    // ── Enhanced cleared placeholder tests ────────────────────────────────
+
+    /// Helper: assistant message with tool calls that include arguments.
+    fn assistant_with_tool_args(calls: &[(&str, &str, &str)]) -> Value {
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .map(
+                |(id, name, args)| json!({"id": id, "function": {"name": name, "arguments": args}}),
+            )
+            .collect();
+        json!({"role": "assistant", "content": "", "tool_calls": tool_calls})
+    }
+
+    #[test]
+    fn cleared_placeholder_contains_tool_name() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tools(&[("c1", "read_file"), ("c2", "grep")]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        compact_tool_results(&mut messages, Some(0), Default::default());
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        let c2 = messages[2]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("read_file"),
+            "cleared placeholder should contain tool name, got: {c1}"
+        );
+        assert!(
+            c2.contains("grep"),
+            "cleared placeholder should contain tool name, got: {c2}"
+        );
+    }
+
+    #[test]
+    fn cleared_placeholder_contains_args_preview() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[(
+                "c1",
+                "read_file",
+                r#"{"path":"rust/crates/astra-tools/src/shell_ops.rs","start_line":189}"#,
+            )]),
+            tool_result("c1", &big),
+        ];
+
+        compact_tool_results(&mut messages, Some(0), Default::default());
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("shell_ops.rs"),
+            "cleared placeholder should contain file path from args, got: {c1}"
+        );
+    }
+
+    #[test]
+    fn cleared_placeholder_contains_args_for_bash() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[(
+                "c1",
+                "grep",
+                r#"{"pattern":"is_rm_catastrophic","path":"crates/"}"#,
+            )]),
+            tool_result("c1", &big),
+        ];
+
+        compact_tool_results(&mut messages, Some(0), Default::default());
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("is_rm_catastrophic"),
+            "cleared placeholder should contain grep pattern, got: {c1}"
+        );
+    }
+
+    #[test]
+    fn cleared_placeholder_still_detected_as_cleared() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tools(&[("c1", "read_file"), ("c2", "read_file")]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        compact_tool_results(&mut messages, Some(0), Default::default());
+
+        // After first compaction, run again — should not re-compact already cleared
+        let stats = compact_tool_results(&mut messages, Some(0), Default::default());
+        assert_eq!(
+            stats.results_compacted, 0,
+            "already-cleared results should not be re-compacted"
+        );
+    }
+
+    #[test]
+    fn cleared_placeholder_adaptive_also_enhanced() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                ("c1", "read_file", r#"{"path":"src/main.rs"}"#),
+                ("c2", "read_file", r#"{"path":"src/lib.rs"}"#),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        // pressure 0.95 → keep=1, so c1 gets compacted
+        compact_tool_results_adaptive(&mut messages, 0.95, Default::default());
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("read_file"),
+            "adaptive compact should also use enhanced placeholder, got: {c1}"
+        );
+        assert!(
+            c1.contains("main.rs"),
+            "adaptive compact should include args preview, got: {c1}"
+        );
+    }
+
+    #[test]
+    fn cleared_placeholder_state_aware_also_enhanced() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                ("c1", "read_file", r#"{"path":"src/lib.rs"}"#),
+                ("c2", "read_file", r#"{"path":"src/main.rs"}"#),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        let facts = crate::cloud_session_facts::SessionFacts::default();
+        // pressure 0.95 → keep=1, so c1 gets compacted
+        compact_tool_results_state_aware(&mut messages, 0.95, &facts, 5, Default::default());
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("read_file"),
+            "state-aware compact should also use enhanced placeholder, got: {c1}"
+        );
+    }
+
+    #[test]
+    fn cleared_placeholder_truncates_long_args() {
+        let big = "x".repeat(1000);
+        let long_args =
+            r#"{"command":"cd /home/user/very/long/path/to/project && grep -rn 'some_very_long_pattern_that_goes_on_and_on' src/ tests/ docs/ --include='*.rs' --include='*.toml' 2>/dev/null | head -50"}"#.to_string();
+        let mut messages = vec![
+            assistant_with_tool_args(&[("c1", "grep", &long_args)]),
+            tool_result("c1", &big),
+        ];
+
+        compact_tool_results(&mut messages, Some(0), Default::default());
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.len() < 300,
+            "cleared placeholder should be compact, got {} chars: {c1}",
+            c1.len()
+        );
+    }
+
+    // ── Provider-aware strategy tests ──
+
+    #[test]
+    fn strategy_from_provider_hint() {
+        assert_eq!(
+            CompactStrategy::from_provider_hint("claude-sonnet-4-20250514"),
+            CompactStrategy::Minimal
+        );
+        assert_eq!(
+            CompactStrategy::from_provider_hint("anthropic"),
+            CompactStrategy::Minimal
+        );
+        assert_eq!(
+            CompactStrategy::from_provider_hint("gpt-4o"),
+            CompactStrategy::Normalized
+        );
+        assert_eq!(
+            CompactStrategy::from_provider_hint("glm-4-plus"),
+            CompactStrategy::Normalized
+        );
+        assert_eq!(
+            CompactStrategy::from_provider_hint("deepseek-chat"),
+            CompactStrategy::Normalized
+        );
+        assert_eq!(
+            CompactStrategy::from_provider_hint(""),
+            CompactStrategy::Normalized
+        );
+    }
+
+    #[test]
+    fn provider_cache_strategy_exposes_provider_capabilities() {
+        let anthropic = ProviderCacheStrategy::from_provider_hint("anthropic/claude-sonnet-4");
+        assert_eq!(
+            anthropic.prompt_cache_protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert_eq!(anthropic.compact_strategy, CompactStrategy::Minimal);
+        assert!(anthropic.supports_cache_control);
+        assert!(anthropic.supports_cache_reference);
+        assert!(anthropic.supports_cache_edits);
+
+        let openai = ProviderCacheStrategy::from_provider_hint("openai/gpt-4o");
+        assert_eq!(openai.prompt_cache_protocol, PromptCacheProtocol::Prefix);
+        assert_eq!(openai.compact_strategy, CompactStrategy::Normalized);
+        assert!(!openai.supports_cache_control);
+        assert!(!openai.supports_cache_reference);
+        assert!(!openai.supports_cache_edits);
+    }
+
+    #[test]
+    fn explicit_provider_takes_precedence_over_claude_named_model() {
+        // Known non-Anthropic providers override model name
+        assert_eq!(
+            CompactStrategy::from_provider_and_model(Some("openai"), Some("claude-sonnet-4")),
+            CompactStrategy::Normalized
+        );
+        assert_eq!(
+            ProviderCacheStrategy::from_provider_and_model(Some("anthropic"), Some("gpt-4o"))
+                .prompt_cache_protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+        // Unknown proxy providers (openrouter, litellm) fall through to model detection
+        assert_eq!(
+            ProviderCacheStrategy::from_provider_and_model(
+                Some("openrouter"),
+                Some("claude-sonnet-4-20250514")
+            )
+            .prompt_cache_protocol,
+            PromptCacheProtocol::AnthropicCacheControl
+        );
+    }
+
+    #[test]
+    fn minimal_strategy_produces_short_placeholder() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                ("c1", "read_file", r#"{"path":"src/main.rs"}"#),
+                ("c2", "read_file", r#"{"path":"src/lib.rs"}"#),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        compact_tool_results_adaptive(&mut messages, 0.95, CompactStrategy::Minimal);
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert_eq!(
+            c1, "[Cleared]",
+            "Minimal strategy should produce short placeholder"
+        );
+    }
+
+    #[test]
+    fn normalized_strategy_includes_key_value_args() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                ("c1", "read_file", r#"{"path":"src/main.rs"}"#),
+                ("c2", "read_file", r#"{"path":"src/lib.rs"}"#),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        compact_tool_results_adaptive(&mut messages, 0.95, CompactStrategy::Normalized);
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("read_file"),
+            "should contain tool name, got: {c1}"
+        );
+        assert!(
+            c1.contains("path=src/main.rs"),
+            "should contain normalized args, got: {c1}"
+        );
+        // Must NOT contain raw JSON
+        assert!(
+            !c1.contains('{'),
+            "should not contain raw JSON braces, got: {c1}"
+        );
+    }
+
+    #[test]
+    fn normalized_strategy_omits_volatile_command_field() {
+        let big = "x".repeat(1000);
+        // web_fetch is compactable; url and query are stable keys
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                (
+                    "c1",
+                    "web_fetch",
+                    r#"{"url":"https://example.com","query":"test"}"#,
+                ),
+                ("c2", "web_fetch", r#"{"url":"https://other.com"}"#),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+        ];
+
+        compact_tool_results_adaptive(&mut messages, 0.95, CompactStrategy::Normalized);
+
+        let c1 = messages[1]["content"].as_str().unwrap();
+        assert!(
+            c1.contains("url=https://example.com"),
+            "should contain url, got: {c1}"
+        );
+        assert!(c1.contains("query=test"), "should contain query, got: {c1}");
+    }
+
+    #[test]
+    fn normalized_strategy_excludes_raw_json_and_volatile_fields() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            assistant_with_tool_args(&[
+                (
+                    "transient-call-id-123",
+                    "read_file",
+                    r#"{"request_id":"req-123","call_id":"call-volatile","timestamp":"2026-04-27T00:51:35+08:00","path":"src/main.rs","command":"cat src/main.rs","old_str":"secret_old","new_str":"secret_new"}"#,
+                ),
+                ("c2", "read_file", r#"{"path":"src/lib.rs"}"#),
+            ]),
+            tool_result("transient-call-id-123", &big),
+            tool_result("c2", &big),
+        ];
+
+        compact_tool_results_adaptive(&mut messages, 0.95, CompactStrategy::Normalized);
+
+        let placeholder = messages[1]["content"].as_str().unwrap();
+        assert!(placeholder.contains("path=src/main.rs"));
+        for forbidden in [
+            "{",
+            "}",
+            "request_id",
+            "req-123",
+            "call-volatile",
+            "timestamp",
+            "2026-04-27",
+            "command",
+            "cat src/main.rs",
+            "old_str",
+            "secret_old",
+            "new_str",
+            "secret_new",
+            "transient-call-id-123",
+        ] {
+            assert!(
+                !placeholder.contains(forbidden),
+                "normalized placeholder must exclude volatile/raw field `{forbidden}`, got: {placeholder}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_strategy_is_deterministic_across_json_key_order() {
+        let a =
+            super::normalize_args(r#"{"timestamp":"t1","pattern":"TODO","path":"src/main.rs"}"#);
+        let b =
+            super::normalize_args(r#"{"path":"src/main.rs","pattern":"TODO","timestamp":"t2"}"#);
+
+        assert_eq!(a, "path=src/main.rs pattern=TODO");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn normalize_args_extracts_stable_keys() {
+        let result = super::normalize_args(r#"{"path":"src/main.rs","content":"some data"}"#);
+        assert_eq!(result, "path=src/main.rs");
+
+        let result = super::normalize_args(r#"{"pattern":"TODO","path":"src/"}"#);
+        assert!(result.contains("path=src/"));
+        assert!(result.contains("pattern=TODO"));
+
+        // Invalid JSON returns empty
+        let result = super::normalize_args("not json");
+        assert!(result.is_empty());
     }
 }

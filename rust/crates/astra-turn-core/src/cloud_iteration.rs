@@ -77,7 +77,7 @@ pub fn plan_cloud_loop_iteration_ext(
         let mut history_message = json!({
             "role": "assistant",
             "content": Value::Null,
-            "tool_calls": assistant_message.get("tool_calls").cloned().unwrap_or_else(|| json!([])),
+            "tool_calls": tool_entries.clone(),
         });
         if let Some(reasoning) = loop_reasoning.filter(|value| !value.is_empty()) {
             history_message["reasoning_content"] = Value::String(reasoning.to_string());

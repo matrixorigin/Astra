@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::sse_blocks::SseBlankLineUtf8Buf;
 use super::sse_data_lines::{
-    drain_sse_data_lines, finish_sse_data_buffer, json_events_from_sse_event_block,
+    json_events_from_sse_event_block, validate_sse_event_block_json,
+    validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
 use crate::bridge::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
@@ -207,6 +208,29 @@ pub(crate) struct LlmCallResult {
     pub finish_reason: Option<String>,
 }
 
+fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
+    !result.full_text.is_empty()
+        || !result.reasoning.is_empty()
+        || !result.tool_calls.is_empty()
+        || !result.usage.is_empty()
+        || result.finish_reason.is_some()
+}
+
+fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
+    if !llm_result_has_partial_signal(result) {
+        return None;
+    }
+    serde_json::to_string(&json!({
+        "partial_full_text": result.full_text,
+        "partial_reasoning": result.reasoning,
+        "tool_calls": result.tool_calls,
+        "usage": result.usage,
+        "finish_reason": result.finish_reason,
+        "model_used": result.model_used,
+    }))
+    .ok()
+}
+
 #[allow(dead_code)] // May be used for per-request timeout in the future
 fn turn_timeout_s() -> f64 {
     astra_core::RuntimeLimits::global().turn_timeout_s
@@ -355,12 +379,13 @@ pub(crate) fn llm_completions_url_for_provider(base_url: &str, provider: &str) -
     }
 }
 
-/// Merge all system-role messages into a single leading system message.
+/// Strip empty `tool_calls: []` from assistant messages in-place.
 ///
-/// Some providers (e.g. MiniMax) reject conversations where system messages
-/// appear after the first position. This function collects every system
-/// message, concatenates their content with `\n\n`, and places the result
-/// as the first message. All non-system messages keep their original order.
+/// Thin wrapper around the canonical implementation in `astra_turn_core`.
+pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
+    astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
+}
+
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut rest: Vec<Value> = Vec::new();
@@ -383,7 +408,8 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     }
     out.extend(rest);
 
-    // Sanitize assistant messages: fix tool_calls with empty function names.
+    // Sanitize assistant messages: remove empty tool_calls arrays and fix
+    // tool_calls with empty function names.
     // Some providers (e.g. MiniMax) reject messages containing tool_calls
     // where the function name is empty (can happen when skill interception
     // captures a call before the streaming name chunk arrives).
@@ -400,11 +426,16 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
         })
         .collect();
 
+    strip_empty_assistant_tool_calls(&mut out);
+
     for msg in &mut out {
         if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
         }
-        let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let Some(tcs) = obj.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
         };
         for tc in tcs.iter_mut() {
@@ -669,6 +700,15 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     // parallel tests (and to ensure consistent timeouts across retries).
     let idle_pre = stream_idle_timeout();
     let idle_post = stream_idle_timeout_after_progress();
+    let attach_partial_details = |error: astra_core::ClassifiedError,
+                                  partial: &LlmCallResult|
+     -> astra_core::ClassifiedError {
+        if let Some(details_json) = llm_result_details_json(partial) {
+            error.with_details_json(details_json)
+        } else {
+            error
+        }
+    };
 
     for attempt in 0..=max_retries {
         // Extend retries if TPM exhaustion was detected (account-level limit)
@@ -762,36 +802,82 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(StreamCollectError::Cancelled) => {
-                    return Err(astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::Cancelled,
-                        "LLM call cancelled",
+                Err(StreamCollectError::Cancelled { partial }) => {
+                    return Err(attach_partial_details(
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "LLM call cancelled",
+                        ),
+                        &partial,
                     ));
                 }
-                Err(StreamCollectError::Transport(e)) => {
-                    last_err = format!("LLM stream transport error: {e}");
+                Err(StreamCollectError::Transport { error, partial }) => {
+                    last_err = format!("LLM stream transport error: {error}");
                     last_kind = astra_core::ErrorKind::StreamTransport;
+                    if let Some(details_json) = llm_result_details_json(&partial) {
+                        let elapsed = started.elapsed();
+                        if elapsed > total_budget {
+                            return Err(astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::BudgetExhausted,
+                                format!(
+                                    "LLM total budget exhausted ({:.0}s) after stream transport error",
+                                    total_budget.as_secs_f64()
+                                ),
+                            )
+                            .with_details_json(details_json));
+                        }
+                        let remaining = total_budget.saturating_sub(elapsed);
+                        let fb_timeout = llm_fallback_timeout().min(remaining);
+                        astra_core::agent_warn!(
+                            "llm",
+                            "stream transport error after partial output — attempting non-stream fallback (timeout {}s)",
+                            fb_timeout.as_secs()
+                        );
+                        return call_llm_nonstream_fallback_with_request_overrides(
+                            client,
+                            &messages,
+                            tools,
+                            model_name,
+                            api_key,
+                            base_url,
+                            provider,
+                            max_output_tokens,
+                            fb_timeout,
+                            header_overrides,
+                            completions_url_override,
+                            request_timeout,
+                        )
+                        .await
+                        .map_err(|error| error.with_details_json(details_json));
+                    }
                     continue;
                 }
                 Err(StreamCollectError::IdleTimeout {
                     elapsed_ms,
                     made_progress,
+                    partial,
                 }) => {
                     if cancel.is_triggered() {
-                        return Err(astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::Cancelled,
-                            "LLM call cancelled",
+                        return Err(attach_partial_details(
+                            astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::Cancelled,
+                                "LLM call cancelled",
+                            ),
+                            &partial,
                         ));
                     }
                     // Check total budget before attempting retry/fallback.
                     let elapsed = started.elapsed();
                     if elapsed > total_budget {
-                        return Err(astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::BudgetExhausted,
-                            format!(
-                                "LLM total budget exhausted ({:.0}s) after stream idle timeout",
-                                total_budget.as_secs_f64()
+                        return Err(attach_partial_details(
+                            astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::BudgetExhausted,
+                                format!(
+                                    "LLM total budget exhausted ({:.0}s) after stream idle timeout",
+                                    total_budget.as_secs_f64()
+                                ),
                             ),
+                            &partial,
                         ));
                     }
 
@@ -838,7 +924,8 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                         completions_url_override,
                         request_timeout,
                     )
-                    .await;
+                    .await
+                    .map_err(|error| attach_partial_details(error, &partial));
                 }
             }
         }
@@ -986,6 +1073,27 @@ async fn collect_llm_stream(
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
+    let partial_result = |full_text: &String,
+                          reasoning: &String,
+                          tool_calls_map: &HashMap<usize, Map<String, Value>>,
+                          usage: &Map<String, Value>,
+                          finish_reason: &Option<String>| {
+        let mut sorted_tcs: Vec<_> = tool_calls_map.iter().collect();
+        sorted_tcs.sort_by_key(|(idx, _)| **idx);
+        let tool_calls = sorted_tcs
+            .into_iter()
+            .map(|(_, value)| Value::Object(value.clone()))
+            .collect();
+        LlmCallResult {
+            full_text: full_text.clone(),
+            reasoning: reasoning.clone(),
+            tool_calls,
+            usage: usage.clone(),
+            model_used: model_name.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            finish_reason: finish_reason.clone(),
+        }
+    };
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
@@ -993,13 +1101,28 @@ async fn collect_llm_stream(
         let idle = if made_progress { idle_post } else { idle_pre };
         let item = tokio::select! {
             biased;
-            _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled),
+            _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled {
+                partial: partial_result(
+                    &full_text,
+                    &reasoning,
+                    &tool_calls_map,
+                    &usage,
+                    &finish_reason,
+                ),
+            }),
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
                     return Err(StreamCollectError::IdleTimeout {
                         elapsed_ms: idle.as_millis() as u64,
                         made_progress,
+                        partial: partial_result(
+                            &full_text,
+                            &reasoning,
+                            &tool_calls_map,
+                            &usage,
+                            &finish_reason,
+                        ),
                     });
                 }
             },
@@ -1007,7 +1130,18 @@ async fn collect_llm_stream(
         let Some(item) = item else { break };
         let chunk = match item {
             Ok(v) => v,
-            Err(e) => return Err(StreamCollectError::Transport(e)),
+            Err(error) => {
+                return Err(StreamCollectError::Transport {
+                    error,
+                    partial: partial_result(
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage,
+                        &finish_reason,
+                    ),
+                });
+            }
         };
         // Parse usage from any chunk
         if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
@@ -1057,9 +1191,18 @@ async fn collect_llm_stream(
         {
             accumulated_bytes += content.len();
             if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
-                return Err(StreamCollectError::Transport(format!(
-                    "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
-                )));
+                return Err(StreamCollectError::Transport {
+                    error: format!(
+                        "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
+                    ),
+                    partial: partial_result(
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage,
+                        &finish_reason,
+                    ),
+                });
             }
             full_text.push_str(content);
             made_progress = true;
@@ -1071,9 +1214,18 @@ async fn collect_llm_stream(
         {
             accumulated_bytes += r.len();
             if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
-                return Err(StreamCollectError::Transport(format!(
-                    "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
-                )));
+                return Err(StreamCollectError::Transport {
+                    error: format!(
+                        "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
+                    ),
+                    partial: partial_result(
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage,
+                        &finish_reason,
+                    ),
+                });
             }
             reasoning.push_str(r);
             made_progress = true;
@@ -1126,9 +1278,18 @@ async fn collect_llm_stream(
                     if let Some(args) = func.get("arguments").and_then(Value::as_str) {
                         accumulated_bytes += args.len();
                         if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
-                            return Err(StreamCollectError::Transport(format!(
-                                "stream tool-call arguments exceeded {MAX_STREAM_ACCUMULATION_BYTES} byte limit"
-                            )));
+                            return Err(StreamCollectError::Transport {
+                                error: format!(
+                                    "stream tool-call arguments exceeded {MAX_STREAM_ACCUMULATION_BYTES} byte limit"
+                                ),
+                                partial: partial_result(
+                                    &full_text,
+                                    &reasoning,
+                                    &tool_calls_map,
+                                    &usage,
+                                    &finish_reason,
+                                ),
+                            });
                         }
                         let existing = f
                             .entry("arguments".to_string())
@@ -1191,11 +1352,15 @@ enum StreamCollectError {
     IdleTimeout {
         elapsed_ms: u64,
         made_progress: bool,
+        partial: LlmCallResult,
     },
     /// Byte stream error from the HTTP client (e.g. reset, TLS failure).
-    Transport(String),
+    Transport {
+        error: String,
+        partial: LlmCallResult,
+    },
     /// [`LlmCancel`] fired during collection.
-    Cancelled,
+    Cancelled { partial: LlmCallResult },
 }
 
 /// For `tokio::select!`: completes when `cancel` fires, or never if `cancel` is `None`.
@@ -1444,6 +1609,10 @@ pub(crate) fn parse_openai_sse_json_stream(
                 }
             };
             for block in sse_in.push_lossy_bytes(&bytes) {
+                if let Err(error) = validate_sse_event_block_json(&block) {
+                    yield Err(error);
+                    return;
+                }
                 let d = json_events_from_sse_event_block(&block);
                 for v in d.events {
                     yield Ok(v);
@@ -1454,14 +1623,26 @@ pub(crate) fn parse_openai_sse_json_stream(
             }
         }
         let mut buf = sse_in.into_inner();
-        let tail = drain_sse_data_lines(&mut buf, "");
+        let tail = match validated_drain_sse_data_lines(&mut buf, "") {
+            Ok(value) => value,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
         for v in tail.events {
             yield Ok(v);
         }
         if tail.stream_finished {
             return;
         }
-        let fin = finish_sse_data_buffer(&mut buf);
+        let fin = match validated_finish_sse_data_buffer(&mut buf) {
+            Ok(value) => value,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
         for v in fin.events {
             yield Ok(v);
         }
@@ -1484,6 +1665,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Set thread-local stream idle timeouts for the duration of a test.
     /// Returns a guard that resets them on drop.
@@ -1740,6 +1922,67 @@ mod tests {
         assert_eq!(seen.model.as_deref(), Some("gpt-5-mini"));
     }
 
+    #[tokio::test]
+    async fn call_llm_and_collect_omits_empty_assistant_tool_calls_in_request_body() {
+        #[derive(Clone, Default, Debug)]
+        struct Capture {
+            messages: Vec<Value>,
+        }
+
+        async fn gateway_handler(
+            State(capture): State<Arc<Mutex<Capture>>>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            capture.lock().expect("capture lock").messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(body))
+                .expect("gateway response")
+        }
+
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let app = Router::new()
+            .route("/chat/completions", post(gateway_handler))
+            .with_state(capture.clone());
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![
+            json!({"role":"assistant","content":"Done.","tool_calls":[]}),
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"c1","name":"bash","content":"ok"}),
+            json!({"role":"user","content":"hi"}),
+        ];
+
+        let result = call_llm_and_collect(
+            &messages,
+            &[],
+            "gpt-5-mini",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("llm ok");
+
+        assert_eq!(result.full_text, "ok");
+        let seen = capture.lock().expect("capture lock").clone();
+        assert_eq!(seen.messages.len(), 4);
+        assert!(seen.messages[0].get("tool_calls").is_none(), "{seen:?}");
+        assert_eq!(
+            seen.messages[1]["tool_calls"][0]["function"]["name"].as_str(),
+            Some("bash")
+        );
+    }
+
     #[test]
     fn classify_llm_error_categories() {
         use astra_core::ErrorKind;
@@ -1926,6 +2169,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_openai_sse_json_stream_invalid_block_errors() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from("data: {\"x\":1}\n\ndata: not-json\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), json!({"x": 1}));
+        let err = st
+            .next()
+            .await
+            .expect("invalid block item")
+            .expect_err("parse error");
+        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_invalid_tail_errors() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: not-json"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let err = st
+            .next()
+            .await
+            .expect("invalid tail item")
+            .expect_err("parse error");
+        assert!(err.contains("invalid JSON in SSE data line"), "{err}");
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn parse_openai_sse_json_stream_tail_flush_without_final_blank_line() {
         let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from("data: {\"z\":9}"))];
         let st = parse_openai_sse_json_stream(stream::iter(parts));
@@ -1957,9 +2230,36 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(res, Err(StreamCollectError::Transport(_))),
+            matches!(res, Err(StreamCollectError::Transport { .. })),
             "expected transport error, got: {res:?}"
         );
+        unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
+    async fn collect_llm_stream_transport_after_partial_carries_partial_result() {
+        unsafe { std::env::set_var("MO_STREAM_IDLE_TIMEOUT_MS", "60000") };
+        let err = sample_reqwest_stream_error().await;
+        let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n"))), Err(err)]);
+        let res = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+        )
+        .await
+        .expect_err("transport error");
+        match res {
+            StreamCollectError::Transport { partial, .. } => {
+                assert_eq!(partial.full_text, "partial");
+                assert_eq!(partial.model_used, "test-model");
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
     }
 
@@ -2114,16 +2414,17 @@ mod tests {
             stream_idle_timeout_after_progress(),
         )
         .await;
-        assert!(
-            matches!(
-                res,
-                Err(StreamCollectError::IdleTimeout {
-                    made_progress: true,
-                    ..
-                })
-            ),
-            "expected idle timeout after partial output, got: {res:?}"
-        );
+        match res.expect_err("idle timeout after partial output") {
+            StreamCollectError::IdleTimeout {
+                made_progress,
+                partial,
+                ..
+            } => {
+                assert!(made_progress, "partial output should mark progress");
+                assert_eq!(partial.full_text, "partial");
+            }
+            other => panic!("expected idle timeout after partial output, got {other:?}"),
+        }
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS") };
     }
@@ -2151,7 +2452,7 @@ mod tests {
         flag_signal.store(true, Ordering::SeqCst);
         let res = handle.await.expect("join");
         assert!(
-            matches!(res, Err(StreamCollectError::Cancelled)),
+            matches!(res, Err(StreamCollectError::Cancelled { .. })),
             "expected cancel, got: {res:?}"
         );
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
@@ -2180,7 +2481,7 @@ mod tests {
         token.cancel();
         let res = handle.await.expect("join");
         assert!(
-            matches!(res, Err(StreamCollectError::Cancelled)),
+            matches!(res, Err(StreamCollectError::Cancelled { .. })),
             "expected cancel, got: {res:?}"
         );
         unsafe { std::env::remove_var("MO_STREAM_IDLE_TIMEOUT_MS") };
@@ -2211,7 +2512,7 @@ mod tests {
         token.cancel();
         let res = handle.await.expect("join");
         assert!(
-            matches!(res, Err(StreamCollectError::Cancelled)),
+            matches!(res, Err(StreamCollectError::Cancelled { .. })),
             "expected cancel, got: {res:?}"
         );
         assert!(!flag_for_join.load(Ordering::SeqCst));
@@ -2234,6 +2535,65 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock serve");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
+    async fn spawn_raw_partial_transport_server(
+        state: StreamIdleHit,
+        fallback_status: u16,
+        fallback_body: &'static str,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw mock llm listener");
+        let addr = listener.local_addr().expect("raw local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..read]);
+                    let is_stream = req.contains("\"stream\":true");
+                    if is_stream {
+                        state.stream_hits.fetch_add(1, Ordering::SeqCst);
+                        let partial = format!(
+                            "data: {}\n\n",
+                            json!({"choices":[{"delta":{"content":"partial"}}]})
+                        );
+                        let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunk}"
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write partial stream response");
+                        let _ = socket.shutdown().await;
+                    } else {
+                        state.fallback_hits.fetch_add(1, Ordering::SeqCst);
+                        let status_text = if fallback_status == 200 {
+                            "OK"
+                        } else {
+                            "Internal Server Error"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {fallback_status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
+                            fallback_body.len()
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write fallback response");
+                        let _ = socket.shutdown().await;
+                    }
+                });
+            }
         });
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         format!("http://{addr}")
@@ -2337,6 +2697,32 @@ mod tests {
                 .body(Body::from(
                     r#"{"choices":[{"message":{"content":"from-fallback"}}]}"#,
                 ))
+                .unwrap()
+        }
+    }
+
+    async fn mock_stream_idle_after_partial_then_fallback_fails(
+        State(state): State<StreamIdleHit>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if is_stream {
+            state.stream_hits.fetch_add(1, Ordering::SeqCst);
+            let partial = json!({"choices":[{"delta":{"content":"partial"}}]});
+            let body_stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+                format!("data: {partial}\n\n"),
+            ))])
+            .chain(stream::pending::<Result<Bytes, std::io::Error>>());
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(body_stream))
+                .unwrap()
+        } else {
+            state.fallback_hits.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(500)
+                .body(Body::from("fallback exploded"))
                 .unwrap()
         }
     }
@@ -2731,6 +3117,112 @@ mod tests {
 
     #[tokio::test]
     #[serial(stream_idle_env)]
+    async fn call_llm_and_collect_preserves_partial_stream_details_when_fallback_fails() {
+        let _guard = set_test_stream_timeouts(10, Some(10));
+        let state = StreamIdleHit {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(mock_stream_idle_after_partial_then_fallback_fails),
+            )
+            .with_state(state.clone());
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("fallback should fail");
+        let details_json = error
+            .details_json
+            .as_deref()
+            .expect("partial stream details should be attached");
+        let details: Value = serde_json::from_str(details_json).expect("details json");
+        assert_eq!(details["partial_full_text"], "partial");
+        assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_falls_back_after_partial_stream_transport_error() {
+        let state = StreamIdleHit {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server(
+            state.clone(),
+            200,
+            r#"{"choices":[{"message":{"content":"from-transport-fallback"}}]}"#,
+        )
+        .await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let res = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect("transport fallback succeeds");
+        assert_eq!(res.full_text, "from-transport-fallback");
+        assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_preserves_partial_stream_details_when_transport_fallback_fails() {
+        let state = StreamIdleHit {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server(
+            state.clone(),
+            500,
+            r#"{"error":"transport fallback exploded"}"#,
+        )
+        .await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("transport fallback should fail");
+        let details_json = error
+            .details_json
+            .as_deref()
+            .expect("partial stream details should be attached");
+        let details: Value = serde_json::from_str(details_json).expect("details json");
+        assert_eq!(details["partial_full_text"], "partial");
+        assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial(stream_idle_env)]
     async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
         let _guard = set_test_stream_timeouts(10, None);
         let hits = Arc::new(AtomicU32::new(0));
@@ -2943,6 +3435,28 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(tc_name, "_unknown");
+    }
+
+    #[test]
+    fn consolidate_omits_empty_tool_calls_arrays() {
+        let msgs = vec![
+            json!({"role": "system", "content": "be helpful"}),
+            json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
+        ];
+        let out = consolidate_system_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert!(out[1].get("tool_calls").is_none(), "{out:?}");
+    }
+
+    #[test]
+    fn strip_empty_assistant_tool_calls_only_removes_empty_arrays() {
+        let mut msgs = vec![
+            json!({"role": "assistant", "content": "Done.", "tool_calls": []}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
+        ];
+        strip_empty_assistant_tool_calls(&mut msgs);
+        assert!(msgs[0].get("tool_calls").is_none(), "{msgs:?}");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "bash");
     }
 
     #[test]

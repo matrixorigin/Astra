@@ -172,13 +172,15 @@ fn validate_checkpoint_version(
 
 /// Extract the turn number to resume from (based on cursor progress).
 fn extract_resume_turn(heavy: &HeavyCheckpoint) -> u32 {
-    // Parse turn number from step_id format: "session-turn-N"
+    // Parse turn number from step_id formats like "session-turn-N" and
+    // "session-turn-N-step-M".
     let step_id = &heavy.light.step_id;
-    if let Some(turn_str) = step_id.rsplit('-').next() {
-        turn_str.parse().unwrap_or(0)
-    } else {
-        0
-    }
+    step_id
+        .split("-turn-")
+        .nth(1)
+        .and_then(|suffix| suffix.split('-').next())
+        .and_then(|turn| turn.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Replay step events from JSONL to warm the idempotency cache.
@@ -449,6 +451,13 @@ mod tests {
     #[test]
     fn extract_resume_turn_from_step_id() {
         let heavy = make_heavy_checkpoint(7, vec![], vec![]);
+        assert_eq!(extract_resume_turn(&heavy), 7);
+    }
+
+    #[test]
+    fn extract_resume_turn_from_unique_step_id() {
+        let mut heavy = make_heavy_checkpoint(7, vec![], vec![]);
+        heavy.light.step_id = "session-turn-7-step-42".to_string();
         assert_eq!(extract_resume_turn(&heavy), 7);
     }
 

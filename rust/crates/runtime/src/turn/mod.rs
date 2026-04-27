@@ -84,6 +84,7 @@ pub mod implicit_feedback {
 }
 pub mod interruption;
 pub(crate) mod llm_client;
+pub(crate) mod llm_exchange_capture;
 pub mod llm_request_dump;
 pub mod loop_dispatcher;
 pub mod memory_prefetch;

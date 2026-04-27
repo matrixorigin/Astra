@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use astra_services::SessionArtifactStore;
+
 use super::super::agentic_headless_round::HeadlessStderrStyle;
 use super::super::headless_tool_assembly::{
     READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
@@ -74,7 +76,9 @@ fn maybe_persist_model_tool_result(
     model_result_str: String,
 ) -> String {
     if let Some(sid) = current_session_id {
-        let session_dir = astra_services::session_journal::local_sessions_dir().join(sid);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(sid)
+            .expect("validated session_id must resolve tool-result session dir");
         match super::super::tool_result_storage::maybe_persist_tool_result(
             &session_dir,
             id,
@@ -127,7 +131,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 executed_ms,
                 args_size,
                 execution.result_str.as_str(),
-                args_preview,
+                args_preview.clone(),
                 file_path,
                 args_full,
             ));
@@ -139,13 +143,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             rec.round = Some(self.ctx.llm_round);
         }
-        self.ctx.step_recorder.complete_tool_with_result(
-            &execution.name,
-            is_err,
-            executed_ms,
-            false,
-            &execution.result_str,
-        );
+        self.ctx
+            .step_recorder
+            .complete_tool_with_result_and_metadata(
+                &execution.name,
+                &execution.id,
+                args_preview.as_deref(),
+                is_err,
+                executed_ms,
+                false,
+                &execution.result_str,
+            );
         self.executed_this_turn += 1;
 
         if let Some(sid) = self.ctx.current_session_id {

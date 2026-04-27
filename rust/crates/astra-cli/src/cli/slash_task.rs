@@ -276,6 +276,7 @@ pub(super) async fn handle_task_command(
                     message: &prompt,
                     session_id: bg_session_id.as_deref(),
                     model: bg_model.as_deref(),
+                    provider: None,
                     explain: ExplainMode::Off,
                     render_md: false,
                     history: &bg_history,

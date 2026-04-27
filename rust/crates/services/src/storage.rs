@@ -850,6 +850,26 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    query(
+        "CREATE TABLE IF NOT EXISTS session_artifacts (
+            artifact_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            artifact_kind VARCHAR(64) NOT NULL,
+            source VARCHAR(64) NULL,
+            turn INT NULL,
+            round INT NULL,
+            content_json LONGTEXT NOT NULL,
+            metadata JSON NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_session_artifacts_session_kind_created (session_id, artifact_kind, created_at),
+            INDEX idx_session_artifacts_session_source_created (session_id, source, created_at),
+            INDEX idx_session_artifacts_user_created (user_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Step Protocol idempotency cache
     query(
         "CREATE TABLE IF NOT EXISTS step_idempotency_cache (

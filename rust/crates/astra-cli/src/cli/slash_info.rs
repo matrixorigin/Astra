@@ -1239,6 +1239,7 @@ pub(super) async fn handle_info_command(
                 message: &prompt,
                 session_id: state.session_id.as_deref(),
                 model: state.model.as_deref(),
+                provider: None,
                 explain: state.explain,
                 render_md: true,
                 history: &state.history,

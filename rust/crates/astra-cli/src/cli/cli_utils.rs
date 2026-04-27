@@ -172,6 +172,85 @@ pub(super) async fn validated_resumable_last_session_id(
     }
 }
 
+pub(super) const FULL_LLM_CAPTURE_METADATA_KEY: &str = "full_llm_capture";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionTraceState {
+    pub session_id: String,
+    pub enabled: bool,
+}
+
+fn session_metadata_object(
+    session: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match session.get("metadata") {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::Map::new()),
+        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err("session metadata must be a JSON object".to_string()),
+    }
+}
+
+fn session_trace_state_from_value(
+    session: &serde_json::Value,
+) -> Result<SessionTraceState, String> {
+    let session_id = session
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "session response is missing session_id".to_string())?
+        .to_string();
+    let metadata = session_metadata_object(session)?;
+    let enabled = metadata
+        .get(FULL_LLM_CAPTURE_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(SessionTraceState {
+        session_id,
+        enabled,
+    })
+}
+
+pub(super) async fn fetch_session_trace_state(
+    api: &astra_thin_client::ThinClient,
+    bearer_override: Option<&str>,
+    session_id: &str,
+) -> Result<SessionTraceState, String> {
+    let session = api
+        .get_session(bearer_override, session_id)
+        .await
+        .map_err(map_thin_err)?;
+    session_trace_state_from_value(&session)
+}
+
+pub(super) async fn update_session_trace_state(
+    api: &astra_thin_client::ThinClient,
+    bearer_override: Option<&str>,
+    session_id: &str,
+    enabled: bool,
+) -> Result<SessionTraceState, String> {
+    let session = api
+        .get_session(bearer_override, session_id)
+        .await
+        .map_err(map_thin_err)?;
+    let mut metadata = session_metadata_object(&session)?;
+    metadata.insert(
+        FULL_LLM_CAPTURE_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    let updated = api
+        .update_session(
+            bearer_override,
+            session_id,
+            &astra_thin_client::SessionUpdateRequest {
+                title: None,
+                metadata: Some(metadata),
+                status: None,
+            },
+        )
+        .await
+        .map_err(map_thin_err)?;
+    session_trace_state_from_value(&updated)
+}
+
 pub(super) fn read_api_error(status: u16, body: &str) -> String {
     // Try to extract user-friendly message from JSON error response
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
@@ -948,6 +1027,87 @@ mod tests {
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
             Some(session_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_session_trace_state_defaults_to_disabled() {
+        let session_id = format!("trace-status-{}", uuid::Uuid::new_v4());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "metadata": {
+                    "owner": "alice"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = fetch_session_trace_state(&api, Some("test-token"), &session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            SessionTraceState {
+                session_id,
+                enabled: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_trace_state_preserves_existing_metadata() {
+        let session_id = format!("trace-update-{}", uuid::Uuid::new_v4());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "metadata": {
+                    "owner": "alice",
+                    "priority": 7
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/sessions/{session_id}")))
+            .and(header_exists("authorization"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "metadata": {
+                    "owner": "alice",
+                    "priority": 7,
+                    "full_llm_capture": true
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "metadata": {
+                    "owner": "alice",
+                    "priority": 7,
+                    "full_llm_capture": true
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = update_session_trace_state(&api, Some("test-token"), &session_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            SessionTraceState {
+                session_id,
+                enabled: true,
+            }
         );
     }
 

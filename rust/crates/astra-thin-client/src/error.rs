@@ -19,6 +19,8 @@ pub enum ThinClientError {
     },
     #[error("SSE parse error: {0}")]
     SseParse(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("expected JSON object in SSE data line, got: {0}")]
     InvalidSseJson(serde_json::Value),
     #[error("JSON error: {0}")]

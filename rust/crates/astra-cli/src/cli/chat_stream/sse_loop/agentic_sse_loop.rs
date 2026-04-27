@@ -116,6 +116,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
     pub(crate) llm_rounds: Option<u32>,
+    pub(crate) interruption: Option<serde_json::Value>,
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
@@ -180,6 +181,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         pending_context_assembly_trace,
         turn_observability_events,
         llm_rounds,
+        interruption,
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
@@ -245,6 +247,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         pending_context_assembly_trace,
         turn_observability_events,
         llm_rounds,
+        interruption,
     }
 }
 #[cfg(test)]
@@ -296,6 +299,7 @@ mod tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            interruption: None,
         }
     }
 

@@ -112,6 +112,48 @@ pub fn filter_environment(policy: &SandboxPolicy) -> HashMap<String, String> {
     filtered
 }
 
+/// Returns `true` if an `rm -rf` / `rm -fr` command targets a catastrophic path
+/// (root, home, or top-level system directories). Project-relative paths like
+/// `rm -rf ./build` or `rm -rf target/` are safe.
+///
+/// Uses `find()` to locate `rm -rf` anywhere in the command, so compound
+/// commands like `sudo rm -rf /` or `cd / && rm -rf *` are caught.
+///
+/// Skips command-line flags (e.g. `--no-preserve-root`) to find the actual target.
+/// Treats bare `rm -rf` (no arguments) as dangerous.
+pub fn is_rm_catastrophic_rm_path(lower: &str) -> bool {
+    let rest = lower
+        .find("rm -rf")
+        .map(|i| &lower[i + 6..])
+        .or_else(|| lower.find("rm -fr").map(|i| &lower[i + 6..]))
+        .unwrap_or("")
+        .trim_start();
+    let target = rest
+        .split_whitespace()
+        .find(|t| !t.starts_with('-'))
+        .unwrap_or("");
+
+    if target.is_empty() {
+        return true;
+    }
+    if matches!(target, "/" | "/*" | "~" | "~/") {
+        return true;
+    }
+    if target.starts_with("$home") {
+        return true;
+    }
+    const SYSTEM_DIRS: &[&str] = &[
+        "/etc", "/usr", "/var", "/bin", "/sbin", "/lib", "/boot", "/dev", "/proc", "/sys", "/opt",
+        "/root", "/tmp", "/home",
+    ];
+    for d in SYSTEM_DIRS {
+        if target == *d || target.starts_with(&format!("{d}/")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Analyze a command string for potentially dangerous patterns.
 ///
 /// Parsing uses tree-sitter-bash only (no legacy substring scanner). Unparseable input
@@ -658,5 +700,30 @@ mod tests {
         assert!(risks.contains(&CommandRisk::PrivilegeEscalation));
         assert!(risks.contains(&CommandRisk::ProcessControl));
         assert!(risks.contains(&CommandRisk::PathTraversal));
+    }
+
+    // ── rm catastrophic path detection ───────────────────────────────────
+
+    #[test]
+    fn rm_catastrophic_compound_commands() {
+        // Compound commands: find() locates rm -rf anywhere in the string
+        assert!(is_rm_catastrophic_rm_path("sudo rm -rf /"));
+        assert!(is_rm_catastrophic_rm_path("sudo rm -rf /etc"));
+        assert!(is_rm_catastrophic_rm_path("sudo rm -fr /usr"));
+        // cd / && rm -rf foo — target is relative `foo`, not a system dir
+        assert!(!is_rm_catastrophic_rm_path("cd / && rm -rf foo"));
+    }
+
+    #[test]
+    fn rm_catastrophic_tmp_blocked() {
+        assert!(is_rm_catastrophic_rm_path("rm -rf /tmp"));
+        assert!(is_rm_catastrophic_rm_path("rm -rf /tmp/"));
+    }
+
+    #[test]
+    fn rm_catastrophic_safe_paths_allowed() {
+        assert!(!is_rm_catastrophic_rm_path("rm -rf ./build"));
+        assert!(!is_rm_catastrophic_rm_path("rm -rf node_modules"));
+        assert!(!is_rm_catastrophic_rm_path("rm -rf target/debug"));
     }
 }

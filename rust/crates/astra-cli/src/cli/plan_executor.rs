@@ -634,6 +634,311 @@ fn truncate_one_line(s: &str, max: usize) -> String {
     }
 }
 
+const BROWSER_VERIFICATION_CRITERION_ID: &str = "browser_verification_evidence";
+
+fn merge_verification_reports(
+    primary: Option<astra_services::verification::SubtaskVerificationReport>,
+    secondary: Option<astra_services::verification::SubtaskVerificationReport>,
+) -> Option<astra_services::verification::SubtaskVerificationReport> {
+    match (primary, secondary) {
+        (None, None) => None,
+        (Some(report), None) | (None, Some(report)) => Some(report),
+        (Some(mut left), Some(right)) => {
+            left.all_required_passed &= right.all_required_passed;
+            left.results.extend(right.results);
+            if left.timestamp.is_empty() {
+                left.timestamp = right.timestamp;
+            }
+            Some(left)
+        }
+    }
+}
+
+fn report_contains_browser_verification_gap(
+    report: &astra_services::verification::SubtaskVerificationReport,
+) -> bool {
+    report
+        .results
+        .iter()
+        .any(|r| !r.passed && r.criterion_id == BROWSER_VERIFICATION_CRITERION_ID)
+}
+
+fn failed_verification_status(
+    durable: Option<&durable_bridge::DurableTaskState>,
+    subtask_id: &str,
+    browser_verification_gap: bool,
+) -> (TaskStatus, bool, bool) {
+    match durable {
+        Some(durable) => {
+            let retries_exhausted = durable_bridge::subtask_retries_exhausted(durable, subtask_id);
+            if retries_exhausted {
+                let status = if browser_verification_gap {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                };
+                (status, true, false)
+            } else {
+                (TaskStatus::Pending, false, true)
+            }
+        }
+        None if browser_verification_gap => (TaskStatus::Failed, true, false),
+        None => (TaskStatus::Pending, false, true),
+    }
+}
+
+fn annotate_plan_subtask_event(event: &mut session_journal::JournalEvent, subtask_id: &str) {
+    if matches!(
+        event.event_type,
+        session_journal::JournalEventType::LlmRound
+            | session_journal::JournalEventType::Turn
+            | session_journal::JournalEventType::TurnError
+    ) {
+        event.plan_subtask_id = Some(subtask_id.to_string());
+    }
+}
+
+fn compact_subtask_history_entry(
+    subtask_id: &str,
+    title: &str,
+    assistant_text: &str,
+    result: &StreamResult,
+) -> (String, String) {
+    let user_msg = format!("Completed prior plan subtask [{subtask_id}]: {title}");
+    let summary = if assistant_text.trim().is_empty() {
+        "No final assistant summary was produced.".to_string()
+    } else {
+        truncate_one_line(assistant_text.trim(), 220)
+    };
+    let mut assistant_msg = format!("Outcome: {summary}");
+    let mut seen = std::collections::HashSet::new();
+    let tools: Vec<String> = result
+        .tools_used
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .filter(|name| seen.insert((*name).clone()))
+        .take(4)
+        .cloned()
+        .collect();
+    if !tools.is_empty() {
+        assistant_msg.push_str(&format!("\nTools used: {}", tools.join(", ")));
+        if result.tool_calls_count > tools.len() as u32 {
+            assistant_msg.push_str(&format!(
+                " (+{} more)",
+                result.tool_calls_count - tools.len() as u32
+            ));
+        }
+    }
+    (user_msg, assistant_msg)
+}
+
+fn final_text_claims_acceptance_checks_pass(text: &str) -> bool {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)acceptance\s+(checks?|criteria|tests?)\s+.{0,20}(pass|satisfied|met|succeed|verified|complete)").unwrap()
+    });
+    re.is_match(text)
+}
+
+fn tool_record_has_verificationish_evidence(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if !record.ok || record.is_synthetic_placeholder() {
+        return false;
+    }
+    match record.name.as_str() {
+        "read_file" | "grep" | "rg" | "view" | "glob" => true,
+        "bash" => {
+            let command = extract_bash_command(record.args_full.as_deref())
+                .or_else(|| extract_bash_command(record.args_preview.as_deref()))
+                .or_else(|| record.args_preview.clone())
+                .unwrap_or_default()
+                .to_lowercase();
+            [
+                "grep ", "grep -", "cat ", "head ", "tail ", "wc ", "test ", "curl ", "ls ",
+            ]
+            .iter()
+            .any(|needle| command.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+fn sanitize_unverified_acceptance_claims(
+    assistant_text: &str,
+    tool_call_records: &[astra_services::session_journal::ToolCallRecord],
+) -> String {
+    if !final_text_claims_acceptance_checks_pass(assistant_text)
+        || tool_call_records
+            .iter()
+            .any(tool_record_has_verificationish_evidence)
+    {
+        return assistant_text.to_string();
+    }
+
+    let implementation_summary = ["**Implementation summary:**", "**Implemented:**"]
+        .iter()
+        .find_map(|marker| {
+            assistant_text
+                .find(marker)
+                .map(|idx| assistant_text[idx..].trim())
+        })
+        .filter(|summary| !summary.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate_one_line(assistant_text.trim(), 320));
+
+    format!(
+        "Implementation completed. Automated verification will determine whether the acceptance checks pass.\n\n{implementation_summary}"
+    )
+}
+
+fn browser_verification_gap_report(
+    subtask: &astra_services::task_orchestrator::SubtaskPlan,
+    result: &StreamResult,
+) -> Option<astra_services::verification::SubtaskVerificationReport> {
+    use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
+
+    if !astra_runtime::plan_decompose::subtask_requires_browser_verification(subtask) {
+        return None;
+    }
+    if result
+        .tool_call_records
+        .iter()
+        .any(tool_record_has_browser_verification_evidence)
+    {
+        return None;
+    }
+
+    Some(SubtaskVerificationReport {
+        subtask_id: subtask.id.clone(),
+        all_required_passed: false,
+        results: vec![VerificationResult {
+            criterion_id: BROWSER_VERIFICATION_CRITERION_ID.into(),
+            passed: false,
+            evidence: format!(
+                "Browser/UI verification was required, but no browser-capable evidence was recorded. {}",
+                summarize_browser_verification_observed_evidence(&result.tool_call_records)
+            ),
+            expected: "real browser-capable verification evidence (for example Playwright/Selenium/Puppeteer/Cypress, browser screenshot, or browser DOM dump after page execution)".into(),
+            duration_ms: 0,
+            error: None,
+        }],
+        timestamp: String::new(),
+    })
+}
+
+fn summarize_browser_verification_observed_evidence(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> String {
+    let snippets: Vec<String> = records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .take(5)
+        .map(|record| {
+            if record.name == "bash" {
+                let command = extract_bash_command(record.args_full.as_deref())
+                    .or_else(|| extract_bash_command(record.args_preview.as_deref()))
+                    .or_else(|| record.args_preview.clone())
+                    .unwrap_or_else(|| "<missing bash command>".into());
+                truncate_one_line(&command, 48)
+            } else if let Some(args) = record.args_preview.as_deref() {
+                format!("{} {}", record.name, truncate_one_line(args, 48))
+            } else {
+                record.name.clone()
+            }
+        })
+        .collect();
+
+    if snippets.is_empty() {
+        "No tool evidence was recorded for this turn.".into()
+    } else {
+        format!(
+            "Observed only non-browser evidence: {}",
+            snippets.join("; ")
+        )
+    }
+}
+
+fn tool_record_has_browser_verification_evidence(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if !record.ok || record.is_synthetic_placeholder() {
+        return false;
+    }
+
+    let name = record.name.to_lowercase();
+    if [
+        "playwright",
+        "selenium",
+        "puppeteer",
+        "cypress",
+        "chromedriver",
+        "geckodriver",
+        "webdriver",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+    {
+        return true;
+    }
+
+    if record.name == "bash" {
+        let command = extract_bash_command(record.args_full.as_deref())
+            .or_else(|| extract_bash_command(record.args_preview.as_deref()));
+        if command
+            .as_deref()
+            .is_some_and(bash_command_has_browser_verification_evidence)
+        {
+            return true;
+        }
+    }
+
+    [
+        record.args_full.as_deref(),
+        record.args_preview.as_deref(),
+        record.result_full.as_deref(),
+        record.result_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(text_has_browser_verification_evidence)
+}
+
+fn extract_bash_command(args: Option<&str>) -> Option<String> {
+    let args = args?;
+    let value = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    let command = value.get("command").and_then(serde_json::Value::as_str)?;
+    Some(command.to_string())
+}
+
+fn bash_command_has_browser_verification_evidence(command: &str) -> bool {
+    text_has_browser_verification_evidence(command)
+}
+
+fn text_has_browser_verification_evidence(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "playwright",
+        "selenium",
+        "puppeteer",
+        "cypress",
+        "chromium",
+        "google-chrome",
+        "chrome --headless",
+        "chrome-headless",
+        "firefox --headless",
+        "webkit",
+        "chromedriver",
+        "geckodriver",
+        "--screenshot",
+        "--dump-dom",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
@@ -1336,6 +1641,7 @@ async fn plan_executor_task(
                     message: &prompt,
                     session_id: ctx.session_id.as_deref(),
                     model: ctx.model.as_deref(),
+                    provider: None,
                     explain: crate::ExplainMode::Off,
                     render_md: false,
                     history: &ctx.history,
@@ -1384,16 +1690,16 @@ async fn plan_executor_task(
             match turn_result {
                 Ok(result) => {
                     ctx.turn += 1;
+                    let assistant_text = sanitize_unverified_acceptance_claims(
+                        &result.full_text,
+                        &result.tool_call_records,
+                    );
 
                     // Flush turn observability events (llm_round, tool timing)
                     // so plan executor turns are visible in the journal.
                     for evt in &result.turn_observability_events {
                         let mut e = evt.clone();
-                        // Inject subtask_id into llm_round events so they can be
-                        // correlated with the subtask that produced them.
-                        if e.event_type == session_journal::JournalEventType::LlmRound {
-                            e.plan_subtask_id = Some(next_id.to_string());
-                        }
+                        annotate_plan_subtask_event(&mut e, next_id);
                         emit_event(&update_tx, &ctx, e);
                     }
 
@@ -1404,15 +1710,43 @@ async fn plan_executor_task(
                             ctx.turn,
                             ctx.model.as_deref(),
                             &prompt,
-                            &result.full_text,
+                            &assistant_text,
                             result.tool_calls_count,
                             result.prompt_tokens,
                             result.completion_tokens,
                             subtask_start.elapsed().as_millis() as u64,
                         )
+                        .with_tool_selection(
+                            result.tools_selected.clone(),
+                            result.selected_skills.clone(),
+                            result.tools_used.clone(),
+                            result.budget_used,
+                        )
                         .with_tool_calls(result.tool_call_records.clone())
-                        .with_ttft(result.ttft_ms);
+                        .with_budget_pressure(result.budget_pressure)
+                        .with_ttft(result.ttft_ms)
+                        .with_context_time(result.context_ms)
+                        .with_selector_strategy(result.selector_strategy.clone())
+                        .with_selector_time(result.selector_ms)
+                        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
+                        .with_selector_learning_telemetry(
+                            result.selector_confidence,
+                            result.routing_domain_hint.clone(),
+                            result.entity_learn_skipped_no_domain,
+                        )
+                        .with_memoria_time(result.memoria_ms)
+                        .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
                         turn_event.llm_rounds = result.llm_rounds;
+                        let tool_ms: u64 = result
+                            .tool_call_records
+                            .iter()
+                            .filter(|r| !r.is_synthetic_placeholder())
+                            .map(|r| r.ms)
+                            .sum();
+                        turn_event.total_tool_ms = Some(tool_ms);
+                        if let Some(dur) = turn_event.duration_ms {
+                            turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
+                        }
                         // Attach per-turn git snapshot.
                         let git_root = ctx
                             .session_id
@@ -1424,13 +1758,14 @@ async fn plan_executor_task(
                         let (git_head, git_branch) =
                             super::cli_utils::git_snapshot(git_root.as_deref());
                         turn_event = turn_event.with_git_snapshot(git_head, git_branch);
+                        annotate_plan_subtask_event(&mut turn_event, next_id);
                         emit_event(&update_tx, &ctx, turn_event);
                     }
 
                     // Send turn result back to REPL for token accounting
                     let _ = update_tx.send(PlanUpdate::SubtaskTurnResult {
                         subtask_id: next_id.clone(),
-                        full_text: result.full_text.clone(),
+                        full_text: assistant_text.clone(),
                         prompt_tokens: result.prompt_tokens,
                         completion_tokens: result.completion_tokens,
                         tool_calls_count: result.tool_calls_count,
@@ -1438,10 +1773,13 @@ async fn plan_executor_task(
                     });
 
                     // Accumulate conversation history so subsequent subtasks have context
-                    ctx.history.push((prompt.clone(), result.full_text.clone()));
+                    let (history_user_msg, history_assistant_msg) =
+                        compact_subtask_history_entry(next_id, &title, &assistant_text, &result);
+                    ctx.history
+                        .push((history_user_msg.clone(), history_assistant_msg.clone()));
                     let _ = update_tx.send(PlanUpdate::HistoryEntry {
-                        user_msg: prompt.clone(),
-                        assistant_msg: result.full_text.clone(),
+                        user_msg: history_user_msg,
+                        assistant_msg: history_assistant_msg,
                     });
 
                     // Emit subtask turn journal event + cloud ingestion
@@ -1471,16 +1809,31 @@ async fn plan_executor_task(
 
                     // Update session ID if the LLM allocated one
                     if result.session_id.is_some() && ctx.session_id.is_none() {
-                        ctx.session_id = result.session_id;
+                        ctx.session_id = result.session_id.clone();
                     }
 
                     // Run verification
-                    let (verification_passed, verification_report) =
+                    let browser_guard_report = ctx
+                        .plan
+                        .subtasks
+                        .iter()
+                        .find(|subtask| subtask.id == *next_id)
+                        .and_then(|subtask| browser_verification_gap_report(subtask, &result));
+                    let (durable_verification_passed, durable_verification_report) =
                         if let Some(ref mut durable) = ctx.durable_task_state {
                             durable_bridge::on_subtask_complete(durable, next_id).await
                         } else {
                             (true, None)
                         };
+                    let verification_report = merge_verification_reports(
+                        durable_verification_report,
+                        browser_guard_report,
+                    );
+                    let verification_passed = verification_report
+                        .as_ref()
+                        .map_or(durable_verification_passed, |report| {
+                            report.all_required_passed
+                        });
                     // Capture a structured retry hint from the report before we
                     // forward it on the channel — surfaces *which* acceptance
                     // check failed (criterion id + expected vs evidence) to the
@@ -1493,7 +1846,10 @@ async fn plan_executor_task(
                         None
                     };
                     let mut verifier_retry_pending = false;
-                    if let Some(report) = verification_report {
+                    let browser_verification_gap = verification_report
+                        .as_ref()
+                        .is_some_and(report_contains_browser_verification_gap);
+                    if let Some(report) = verification_report.clone() {
                         let _ = update_tx.send(PlanUpdate::VerificationReport(report));
                     }
 
@@ -1569,30 +1925,36 @@ async fn plan_executor_task(
                                     (s.retry_count, s.max_retries, hint)
                                 })
                                 .unwrap_or((0, 0, None));
-                            if durable_bridge::subtask_retries_exhausted(durable, next_id) {
+                            let (failure_status, retries_exhausted, retry_pending) =
+                                failed_verification_status(
+                                    ctx.durable_task_state.as_ref(),
+                                    next_id,
+                                    browser_verification_gap,
+                                );
+                            if retries_exhausted {
                                 sink.subtask_verification_failed(
                                     next_id,
                                     &title,
                                     true,
                                     attempt,
                                     max_retries,
-                                    failure_hint,
+                                    verifier_retry_hint.clone().or(failure_hint),
                                 );
-                                st.status = TaskStatus::Completed;
+                                st.status = failure_status;
                                 let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
                                     id: next_id.clone(),
-                                    status: TaskStatus::Completed,
+                                    status: st.status,
                                 });
-                            } else {
+                            } else if retry_pending {
                                 sink.subtask_verification_failed(
                                     next_id,
                                     &title,
                                     false,
                                     attempt,
                                     max_retries,
-                                    failure_hint,
+                                    verifier_retry_hint.clone().or(failure_hint),
                                 );
-                                st.status = TaskStatus::Pending;
+                                st.status = failure_status;
                                 verifier_retry_pending = true;
                             }
                             let event = session_journal::JournalEvent::verification_completed(
@@ -1605,8 +1967,22 @@ async fn plan_executor_task(
                             );
                             emit_event(&update_tx, &ctx, event);
                         } else {
-                            sink.subtask_verification_failed(next_id, &title, false, 0, 0, None);
-                            st.status = TaskStatus::Pending;
+                            let (failure_status, retries_exhausted, _) =
+                                failed_verification_status(None, next_id, browser_verification_gap);
+                            let failure_hint = verifier_retry_hint.clone();
+                            sink.subtask_verification_failed(
+                                next_id,
+                                &title,
+                                retries_exhausted,
+                                1,
+                                1,
+                                failure_hint,
+                            );
+                            st.status = failure_status;
+                            let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                                id: next_id.clone(),
+                                status: st.status,
+                            });
                         }
                     }
                     // After the mutable borrow of `ctx.plan.subtasks` ends,
@@ -1632,6 +2008,7 @@ async fn plan_executor_task(
                         &mut event,
                         &failure.partial,
                     );
+                    annotate_plan_subtask_event(&mut event, next_id);
                     emit_event(&update_tx, &ctx, event);
 
                     // Bail immediately on authentication/credential errors — retrying is pointless.
@@ -2220,6 +2597,696 @@ mod tests {
         );
     }
 
+    fn stub_stream_result_with_records(
+        full_text: &str,
+        tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
+    ) -> StreamResult {
+        StreamResult {
+            session_id: None,
+            run_id: None,
+            full_text: full_text.to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            tool_calls_count: tool_call_records.len() as u32,
+            tools_selected: Vec::new(),
+            selected_skills: Vec::new(),
+            tools_used: tool_call_records.iter().map(|r| r.name.clone()).collect(),
+            tool_call_records,
+            budget_used: 0,
+            budget_pressure: 0.0,
+            stall_events: Vec::new(),
+            verdict_events: Vec::new(),
+            step_recorder_summary: None,
+            tool_health_export: Vec::new(),
+            last_heavy_checkpoint: None,
+            ttft_ms: None,
+            context_ms: None,
+            selector_strategy: None,
+            selector_ms: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            memoria_ms: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            interruption: None,
+        }
+    }
+
+    #[test]
+    fn compact_subtask_history_entry_avoids_replaying_full_prompt_and_result() {
+        let long_result = format!(
+            "Implemented the shooter game systems. {}",
+            "Detailed explanation ".repeat(40)
+        );
+        let result = stub_stream_result_with_records(
+            &long_result,
+            vec![
+                astra_services::session_journal::ToolCallRecord {
+                    name: "read_file".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "write_file".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "bash".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "grep".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "bash".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let (user_msg, assistant_msg) = compact_subtask_history_entry(
+            "build-game",
+            "Build shooter game",
+            &long_result,
+            &result,
+        );
+
+        assert_eq!(
+            user_msg,
+            "Completed prior plan subtask [build-game]: Build shooter game"
+        );
+        assert!(assistant_msg.contains("Outcome: Implemented the shooter game systems."));
+        assert!(assistant_msg.contains("Tools used: read_file, write_file, bash, grep"));
+        assert!(
+            assistant_msg.contains("(+1 more)"),
+            "history should summarize extra tool calls instead of replaying them verbatim: {assistant_msg}"
+        );
+        assert!(
+            assistant_msg.len() < long_result.len(),
+            "history entry should be materially shorter than the original result"
+        );
+    }
+
+    #[test]
+    fn compact_subtask_history_entry_deduplicates_non_consecutive_tools() {
+        let result = stub_stream_result_with_records(
+            "Done.",
+            vec![
+                astra_services::session_journal::ToolCallRecord {
+                    name: "read_file".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "bash".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "read_file".into(),
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "bash".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let (_, assistant_msg) = compact_subtask_history_entry("s1", "Step", "Done.", &result);
+        assert!(
+            assistant_msg.contains("Tools used: read_file, bash"),
+            "non-consecutive duplicates should be deduplicated: {assistant_msg}"
+        );
+        assert!(
+            assistant_msg.contains("(+2 more)"),
+            "extra calls beyond unique set should be counted: {assistant_msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_unverified_acceptance_claims_rewrites_write_only_claims() {
+        let assistant_text = "\
+All acceptance checks pass:
+
+| Check | Result |
+|---|---|
+| `Particle` in effects.js | ✅ 3 matches |
+
+**Implementation summary:**
+- Added particles.
+";
+        let sanitized = sanitize_unverified_acceptance_claims(
+            assistant_text,
+            &[astra_services::session_journal::ToolCallRecord {
+                name: "write_file".into(),
+                ok: true,
+                ..Default::default()
+            }],
+        );
+
+        assert!(
+            sanitized.contains(
+                "Automated verification will determine whether the acceptance checks pass"
+            ),
+            "write-only turns should not keep self-reported acceptance-check success: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("**Implementation summary:**"),
+            "sanitization should preserve the implementation summary: {sanitized}"
+        );
+        assert!(
+            !sanitized.starts_with("All acceptance checks pass"),
+            "sanitization should strip the fabricated acceptance-check lead: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_unverified_acceptance_claims_preserves_verified_text() {
+        let assistant_text = "All acceptance checks pass after grep verification.";
+        let sanitized = sanitize_unverified_acceptance_claims(
+            assistant_text,
+            &[astra_services::session_journal::ToolCallRecord {
+                name: "grep".into(),
+                ok: true,
+                ..Default::default()
+            }],
+        );
+        assert_eq!(sanitized, assistant_text);
+    }
+
+    #[test]
+    fn sanitize_unverified_acceptance_claims_catches_synonym_evasion() {
+        let write_only = &[astra_services::session_journal::ToolCallRecord {
+            name: "write_file".into(),
+            ok: true,
+            ..Default::default()
+        }];
+        for phrase in [
+            "All acceptance criteria satisfied.",
+            "Acceptance tests all passed.",
+            "The acceptance check has been verified.",
+            "Acceptance criteria met.",
+            "Acceptance checks succeeded.",
+        ] {
+            let sanitized = sanitize_unverified_acceptance_claims(phrase, write_only);
+            assert!(
+                sanitized.contains("Automated verification"),
+                "should catch evasion phrase: {phrase}"
+            );
+        }
+    }
+
+    fn bash_tool_record(command: &str) -> astra_services::session_journal::ToolCallRecord {
+        astra_services::session_journal::ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(serde_json::json!({ "command": command }).to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn browser_verification_gap_report_rejects_curl_only_checks() {
+        let subtask = astra_services::task_orchestrator::SubtaskPlan {
+            id: "browser-check".into(),
+            title: "Test game in browser".into(),
+            description: Some("Open the page and verify movement works in the browser.".into()),
+            ..Default::default()
+        };
+        let result = stub_stream_result_with_records(
+            "Tested the game and it is fully functional.",
+            vec![
+                bash_tool_record("python3 -m http.server 8000"),
+                bash_tool_record("curl --noproxy '*' http://127.0.0.1:8000"),
+                bash_tool_record("ps -ef | grep http.server"),
+            ],
+        );
+
+        let report = super::browser_verification_gap_report(&subtask, &result)
+            .expect("browser-only verification gap should fail");
+        assert!(
+            super::report_contains_browser_verification_gap(&report),
+            "report should tag the browser-verification criterion: {report:?}"
+        );
+        let hint = super::render_verifier_failure_hint(&report).expect("retry hint");
+        assert!(
+            hint.contains("browser_verification_evidence"),
+            "hint should surface the synthetic criterion id: {hint}"
+        );
+        assert!(
+            hint.contains("curl --nop"),
+            "hint should include the observed non-browser evidence from the real failure shape: {hint}"
+        );
+    }
+
+    #[test]
+    fn browser_verification_gap_report_accepts_playwright_evidence() {
+        let subtask = astra_services::task_orchestrator::SubtaskPlan {
+            id: "browser-check".into(),
+            title: "Test game in browser".into(),
+            description: Some("Open the page and verify movement works in the browser.".into()),
+            ..Default::default()
+        };
+        let result = stub_stream_result_with_records(
+            "Verified in browser with Playwright.",
+            vec![bash_tool_record("npx playwright test tests/game.spec.ts")],
+        );
+
+        assert!(
+            super::browser_verification_gap_report(&subtask, &result).is_none(),
+            "real browser-capable evidence should satisfy the guard"
+        );
+    }
+
+    fn stub_durable_task_state(
+        subtask_id: &str,
+        retry_count: u32,
+        max_retries: u32,
+    ) -> durable_bridge::DurableTaskState {
+        use astra_services::durable_task::{
+            ContractStatus, DurableSubtask, DurableTaskLifecycle, SubtaskExecutionContext,
+            SubtaskStage, TaskContract, TaskDeliveryReport, TaskResumeContext, TaskScope,
+        };
+        use astra_services::task_orchestrator::TaskPlan;
+        use astra_services::{ContractAmendment, SubtaskVerificationReport, VerificationResult};
+        struct StubLifecycle;
+        #[async_trait::async_trait]
+        impl DurableTaskLifecycle for StubLifecycle {
+            async fn create_contract(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &TaskPlan,
+                _: TaskScope,
+            ) -> Result<TaskContract, String> {
+                Err("stub".into())
+            }
+            async fn amend_contract(
+                &self,
+                _: &str,
+                _: ContractAmendment,
+            ) -> Result<TaskContract, String> {
+                Err("stub".into())
+            }
+            async fn get_contract(&self, _: &str) -> Result<Option<TaskContract>, String> {
+                Ok(None)
+            }
+            async fn begin_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskExecutionContext, String> {
+                Err("stub".into())
+            }
+            async fn complete_subtask_execution(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn fail_subtask(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn verify_subtask(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<SubtaskVerificationReport, String> {
+                Err("stub".into())
+            }
+            async fn verify_global(&self, _: &str) -> Result<Vec<VerificationResult>, String> {
+                Err("stub".into())
+            }
+            async fn pause_task(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn resume_task(&self, _: &str, _: &str) -> Result<TaskResumeContext, String> {
+                Err("stub".into())
+            }
+            async fn deliver_task(&self, _: &str) -> Result<TaskDeliveryReport, String> {
+                Err("stub".into())
+            }
+            async fn snapshot_task_state(&self, _: &str) -> Result<String, String> {
+                Err("stub".into())
+            }
+            async fn rollback_task(&self, _: &str, _: &str) -> Result<(), String> {
+                Err("stub".into())
+            }
+        }
+
+        durable_bridge::DurableTaskState {
+            contract: TaskContract {
+                contract_id: "contract-1".into(),
+                task_id: "task-1".into(),
+                goal: "goal".into(),
+                scope: TaskScope::default(),
+                subtasks: vec![DurableSubtask {
+                    id: subtask_id.into(),
+                    title: "browser task".into(),
+                    stage: SubtaskStage::VerificationFailed { results: vec![] },
+                    retry_count,
+                    max_retries,
+                    ..Default::default()
+                }],
+                global_verification: vec![],
+                version: 1,
+                status: ContractStatus::Active,
+                created_at: String::new(),
+                updated_at: String::new(),
+                domain_hint: None,
+                task_type: None,
+                last_global_results: vec![],
+            },
+            lifecycle: Arc::new(StubLifecycle),
+            last_report: None,
+        }
+    }
+
+    #[test]
+    fn failed_verification_status_fails_browser_gap_without_durable() {
+        let (status, retries_exhausted, retry_pending) =
+            super::failed_verification_status(None, "browser-check", true);
+        assert_eq!(status, TaskStatus::Failed);
+        assert!(retries_exhausted);
+        assert!(!retry_pending);
+    }
+
+    #[test]
+    fn failed_verification_status_fails_browser_gap_after_durable_retries_exhausted() {
+        let durable = stub_durable_task_state("browser-check", 2, 2);
+        let (status, retries_exhausted, retry_pending) =
+            super::failed_verification_status(Some(&durable), "browser-check", true);
+        assert_eq!(status, TaskStatus::Failed);
+        assert!(retries_exhausted);
+        assert!(!retry_pending);
+    }
+
+    #[test]
+    fn failed_verification_status_preserves_existing_force_complete_for_non_browser_failures() {
+        let durable = stub_durable_task_state("subtask-1", 2, 2);
+        let (status, retries_exhausted, retry_pending) =
+            super::failed_verification_status(Some(&durable), "subtask-1", false);
+        assert_eq!(status, TaskStatus::Completed);
+        assert!(retries_exhausted);
+        assert!(!retry_pending);
+    }
+
+    #[test]
+    fn failed_verification_status_retries_when_budget_remains() {
+        let durable = stub_durable_task_state("browser-check", 1, 2);
+        let (status, retries_exhausted, retry_pending) =
+            super::failed_verification_status(Some(&durable), "browser-check", true);
+        assert_eq!(status, TaskStatus::Pending);
+        assert!(!retries_exhausted);
+        assert!(retry_pending);
+    }
+
+    #[tokio::test]
+    async fn spawn_plan_executor_marks_browser_subtask_failed_in_real_turn_flow() {
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::TfIdfSelector;
+        use tokio::time::{Duration, Instant, sleep};
+
+        let mock = super::super::mock_llm::MockLlmServer::start(
+            super::super::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .expect("mock llm server");
+        let mut ctx = test_background_plan_context(None, None, None);
+        ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
+        ctx.plan = TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "browser-check".into(),
+                title: "Test game in browser".into(),
+                description: Some(
+                    "Open the page in a browser and verify the gameplay loop works.".into(),
+                ),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+
+        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
+            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
+        );
+        let mut handle = spawn_plan_executor(ctx, selector);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_browser_report = false;
+        let mut saw_failed_status = false;
+        let mut saw_completed_status = false;
+
+        while Instant::now() < deadline {
+            let mut drained_any = false;
+            while let Some(update) = handle.try_recv() {
+                drained_any = true;
+                match update {
+                    PlanUpdate::VerificationReport(report)
+                        if super::report_contains_browser_verification_gap(&report) =>
+                    {
+                        saw_browser_report = true;
+                    }
+                    PlanUpdate::SubtaskStatusSync { id, status } if id == "browser-check" => {
+                        if status == TaskStatus::Failed {
+                            saw_failed_status = true;
+                            let _ = handle.send_command(PlanCommand::Cancel);
+                        }
+                        if status == TaskStatus::Completed {
+                            saw_completed_status = true;
+                        }
+                    }
+                    PlanUpdate::SubtaskCompleted { id, .. } if id == "browser-check" => {
+                        saw_completed_status = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_failed_status && handle.is_finished() {
+                break;
+            }
+            if !drained_any {
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        assert!(
+            saw_browser_report,
+            "real plan executor flow should surface a browser verification failure report"
+        );
+        assert!(
+            saw_failed_status,
+            "real plan executor flow should mark the browser subtask failed"
+        );
+        assert!(
+            !saw_completed_status,
+            "browser-only verification gap must not surface as completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_plan_executor_tags_real_turn_event_with_subtask_id() {
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::TfIdfSelector;
+        use tokio::time::{Duration, Instant, sleep};
+
+        let mock = super::super::mock_llm::MockLlmServer::start(
+            super::super::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .expect("mock llm server");
+        let mut ctx = test_background_plan_context(None, None, None);
+        ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
+        ctx.plan = TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "write-summary".into(),
+                title: "Write summary".into(),
+                description: Some("Summarize the work in plain text.".into()),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+
+        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
+            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
+        );
+        let mut handle = spawn_plan_executor(ctx, selector);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_tagged_turn = false;
+
+        while Instant::now() < deadline {
+            let mut drained_any = false;
+            while let Some(update) = handle.try_recv() {
+                drained_any = true;
+                if let PlanUpdate::JournalEvent(event) = update
+                    && event.event_type == session_journal::JournalEventType::Turn
+                    && event.plan_subtask_id.as_deref() == Some("write-summary")
+                {
+                    saw_tagged_turn = true;
+                    let _ = handle.send_command(PlanCommand::Cancel);
+                    break;
+                }
+            }
+            if saw_tagged_turn && handle.is_finished() {
+                break;
+            }
+            if !drained_any {
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        assert!(
+            saw_tagged_turn,
+            "real plan executor flow should tag turn events with the active subtask id"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_plan_executor_tags_real_turn_error_event_with_subtask_id() {
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::TfIdfSelector;
+        use tokio::time::{Duration, Instant, sleep};
+
+        let mock = super::super::mock_llm::MockLlmServer::start(
+            super::super::mock_llm::MockScenario::Fail,
+        )
+        .await
+        .expect("mock llm server");
+        let mut ctx = test_background_plan_context(None, None, None);
+        ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
+        ctx.plan = TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "failing-step".into(),
+                title: "Failing step".into(),
+                description: Some("Trigger a failing turn.".into()),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        };
+
+        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
+            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
+        );
+        let mut handle = spawn_plan_executor(ctx, selector);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_tagged_turn_error = false;
+
+        while Instant::now() < deadline {
+            let mut drained_any = false;
+            while let Some(update) = handle.try_recv() {
+                drained_any = true;
+                if let PlanUpdate::JournalEvent(event) = update
+                    && event.event_type == session_journal::JournalEventType::TurnError
+                    && event.plan_subtask_id.as_deref() == Some("failing-step")
+                {
+                    saw_tagged_turn_error = true;
+                    let _ = handle.send_command(PlanCommand::Cancel);
+                    break;
+                }
+            }
+            if saw_tagged_turn_error && handle.is_finished() {
+                break;
+            }
+            if !drained_any {
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        assert!(
+            saw_tagged_turn_error,
+            "real plan executor flow should tag turn_error events with the active subtask id"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_plan_executor_emits_compact_history_entries_between_subtasks() {
+        use astra_runtime::tool_registry::ToolRegistry;
+        use astra_runtime::tool_selector::TfIdfSelector;
+        use tokio::time::{Duration, Instant, sleep};
+
+        let mock = super::super::mock_llm::MockLlmServer::start(
+            super::super::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .expect("mock llm server");
+        let mut ctx = test_background_plan_context(None, None, None);
+        ctx.api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("thin client");
+        ctx.plan = TaskPlan {
+            subtasks: vec![
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "create-game".into(),
+                    title: "Create shooter game".into(),
+                    description: Some(
+                        "Build the initial shooter game skeleton in tmp/shooter-game.".into(),
+                    ),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "add-ui".into(),
+                    title: "Add game UI".into(),
+                    description: Some("Add HUD and restart flow.".into()),
+                    status: TaskStatus::Pending,
+                    depends_on: vec!["create-game".into()],
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+
+        let selector: Box<dyn astra_runtime::tool_selector::ToolSelector> = Box::new(
+            TfIdfSelector::new(ToolRegistry::new(crate::edge_tools::all_tool_schemas())),
+        );
+        let mut handle = spawn_plan_executor(ctx, selector);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut compact_history: Option<(String, String)> = None;
+
+        while Instant::now() < deadline {
+            let mut drained_any = false;
+            while let Some(update) = handle.try_recv() {
+                drained_any = true;
+                if let PlanUpdate::HistoryEntry {
+                    user_msg,
+                    assistant_msg,
+                } = update
+                {
+                    compact_history = Some((user_msg, assistant_msg));
+                    let _ = handle.send_command(PlanCommand::Cancel);
+                    break;
+                }
+            }
+            if compact_history.is_some() && handle.is_finished() {
+                break;
+            }
+            if !drained_any {
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        let (user_msg, assistant_msg) =
+            compact_history.expect("real plan executor flow should emit a history entry");
+        assert!(
+            user_msg.starts_with("Completed prior plan subtask ["),
+            "history should use the compact completed-subtask prefix: {user_msg}"
+        );
+        assert!(
+            user_msg.contains("Create shooter game") || user_msg.contains("Add game UI"),
+            "history should reference the completed subtask title: {user_msg}"
+        );
+        assert!(
+            !user_msg.contains("Execute this subtask:"),
+            "history should not replay the raw subtask prompt: {user_msg}"
+        );
+        assert!(
+            assistant_msg.starts_with("Outcome:"),
+            "history should emit a compact outcome summary: {assistant_msg}"
+        );
+    }
+
     #[test]
     fn turn_retry_counts_in_context_starts_empty() {
         let ctx = test_background_plan_context(None, None, None);
@@ -2333,6 +3400,7 @@ mod tests {
             agentic_step: None,
             source: None,
             run_id: None,
+            tool_calls: None,
         });
         let events = buf.drain();
         assert_eq!(events.len(), 1);
@@ -2379,6 +3447,7 @@ mod tests {
                 agentic_step: None,
                 source: None,
                 run_id: None,
+                tool_calls: None,
             });
         }
         // Emit observability events first (mirrors Ok(result) branch).
@@ -2443,6 +3512,7 @@ mod tests {
             agentic_step: None,
             source: None,
             run_id: None,
+            tool_calls: None,
         });
 
         // Simulate the plan_executor emit loop: inject subtask_id on LlmRound events.
@@ -2464,6 +3534,40 @@ mod tests {
             Some(subtask_id),
             "llm_round must carry plan_subtask_id"
         );
+    }
+
+    #[test]
+    fn turn_and_turn_error_events_carry_subtask_id() {
+        use astra_services::session_journal::JournalEventType;
+
+        let subtask_id = "create-index-html";
+
+        let mut turn_evt = session_journal::JournalEvent::turn(
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            "response",
+            2,
+            1000,
+            40,
+            2000,
+        );
+        annotate_plan_subtask_event(&mut turn_evt, subtask_id);
+        assert_eq!(turn_evt.event_type, JournalEventType::Turn);
+        assert_eq!(turn_evt.plan_subtask_id.as_deref(), Some(subtask_id));
+
+        let mut turn_error_evt = session_journal::JournalEvent::turn_error(
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            "boom",
+            0,
+        );
+        annotate_plan_subtask_event(&mut turn_error_evt, subtask_id);
+        assert_eq!(turn_error_evt.event_type, JournalEventType::TurnError);
+        assert_eq!(turn_error_evt.plan_subtask_id.as_deref(), Some(subtask_id));
     }
 
     /// Verify that the turn event emitted by plan executor carries ttft_ms from the first llm round.
@@ -2499,6 +3603,121 @@ mod tests {
             Some(1750),
             "turn event must carry ttft_ms"
         );
+    }
+
+    #[test]
+    fn turn_event_carries_tool_selection_and_budget_telemetry() {
+        let result = StreamResult {
+            session_id: None,
+            run_id: None,
+            full_text: "done".into(),
+            prompt_tokens: 123,
+            completion_tokens: 45,
+            cache_read_tokens: 17,
+            cache_creation_tokens: 9,
+            tool_calls_count: 2,
+            tools_selected: vec!["read_file".into(), "write_file".into()],
+            selected_skills: vec!["debug".into()],
+            tools_used: vec!["read_file".into(), "write_file".into()],
+            tool_call_records: vec![
+                astra_services::session_journal::ToolCallRecord {
+                    name: "read_file".into(),
+                    ok: true,
+                    ms: 11,
+                    ..Default::default()
+                },
+                astra_services::session_journal::ToolCallRecord {
+                    name: "write_file".into(),
+                    ok: true,
+                    ms: 19,
+                    ..Default::default()
+                },
+            ],
+            budget_used: 321,
+            budget_pressure: 0.75,
+            stall_events: Vec::new(),
+            verdict_events: Vec::new(),
+            step_recorder_summary: None,
+            tool_health_export: Vec::new(),
+            last_heavy_checkpoint: None,
+            ttft_ms: Some(1500),
+            context_ms: Some(220),
+            selector_strategy: Some("tfidf".into()),
+            selector_ms: Some(18),
+            selector_tokens_in: 777,
+            selector_tokens_out: 33,
+            memoria_ms: Some(12),
+            selector_confidence: Some(0.42),
+            routing_domain_hint: Some("frontend".into()),
+            entity_learn_skipped_no_domain: false,
+            pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: Some(3),
+            interruption: None,
+        };
+
+        let mut turn_evt = session_journal::JournalEvent::turn(
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            &result.full_text,
+            result.tool_calls_count,
+            result.prompt_tokens,
+            result.completion_tokens,
+            2000,
+        )
+        .with_tool_selection(
+            result.tools_selected.clone(),
+            result.selected_skills.clone(),
+            result.tools_used.clone(),
+            result.budget_used,
+        )
+        .with_tool_calls(result.tool_call_records.clone())
+        .with_budget_pressure(result.budget_pressure)
+        .with_ttft(result.ttft_ms)
+        .with_context_time(result.context_ms)
+        .with_selector_strategy(result.selector_strategy.clone())
+        .with_selector_time(result.selector_ms)
+        .with_selector_tokens(result.selector_tokens_in, result.selector_tokens_out)
+        .with_selector_learning_telemetry(
+            result.selector_confidence,
+            result.routing_domain_hint.clone(),
+            result.entity_learn_skipped_no_domain,
+        )
+        .with_memoria_time(result.memoria_ms)
+        .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
+        turn_evt.llm_rounds = result.llm_rounds;
+        let tool_ms: u64 = result
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .map(|r| r.ms)
+            .sum();
+        turn_evt.total_tool_ms = Some(tool_ms);
+        if let Some(dur) = turn_evt.duration_ms {
+            turn_evt.total_llm_ms = Some(dur.saturating_sub(tool_ms));
+        }
+
+        assert_eq!(
+            turn_evt.tools_selected,
+            Some(vec!["read_file".into(), "write_file".into()])
+        );
+        assert_eq!(turn_evt.selected_skills, Some(vec!["debug".into()]));
+        assert_eq!(turn_evt.budget_used, Some(321));
+        assert_eq!(turn_evt.budget_pressure, Some(0.75));
+        assert_eq!(turn_evt.cache_read_tokens, Some(17));
+        assert_eq!(turn_evt.cache_creation_tokens, Some(9));
+        assert_eq!(turn_evt.context_ms, Some(220));
+        assert_eq!(turn_evt.selector_strategy.as_deref(), Some("tfidf"));
+        assert_eq!(turn_evt.selector_ms, Some(18));
+        assert_eq!(turn_evt.selector_tokens_in, Some(777));
+        assert_eq!(turn_evt.selector_tokens_out, Some(33));
+        assert_eq!(turn_evt.memoria_ms, Some(12));
+        assert_eq!(turn_evt.selector_confidence, Some(0.42));
+        assert_eq!(turn_evt.routing_domain_hint.as_deref(), Some("frontend"));
+        assert_eq!(turn_evt.total_tool_ms, Some(30));
+        assert_eq!(turn_evt.total_llm_ms, Some(1970));
     }
 
     /// Verify that is_credential_error correctly identifies auth failures.

@@ -2,7 +2,7 @@
 
 use crate::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub const SCHEMA_VERSION: &str = "astra-journal-digest-v1";
@@ -80,6 +80,10 @@ pub struct JournalDigest {
     pub turn_errors: Vec<TurnErrRow>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub other_errors: Vec<SideEvent>,
+    /// Per-call details for every failed tool call across all turns.
+    /// Enables forensic analysis without re-parsing raw JSONL.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_tool_calls: Vec<FailedToolCall>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +100,9 @@ pub struct Aggregates {
     pub total_duration_ms: u64,
     pub total_tool_calls: u64,
     pub tool_calls_failed: u64,
+    /// Tool calls blocked by a safety guard (shell_obfuscation, dangerous command, etc.).
+    /// Subset of `tool_calls_failed`. Non-zero means the agent hit safety walls.
+    pub safety_guard_blocks: u64,
     pub avg_tokens_in: f64,
     pub avg_tokens_out: f64,
     pub avg_duration_ms: f64,
@@ -229,6 +236,24 @@ pub struct TurnErrRow {
     pub error: String,
 }
 
+/// Summary of a single failed tool call, surfaced for forensic analysis.
+#[derive(Serialize)]
+pub struct FailedToolCall {
+    /// Turn sequence number (1-based).
+    pub seq: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<u32>,
+    /// Tool name (e.g. "bash", "write_file").
+    pub tool: String,
+    /// Coarse error category for failed tool calls.
+    pub error_category: ErrorCategory,
+    /// First ~200 chars of the error message.
+    pub error_preview: String,
+    /// First ~80 chars of the tool arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_preview: Option<String>,
+}
+
 fn preview(s: Option<&String>, max: usize) -> String {
     let Some(s) = s.map(String::as_str) else {
         return String::new();
@@ -285,6 +310,51 @@ fn skill_reentry_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) ->
 
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+/// Error categories for failed tool calls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    /// Blocked by safety guard (shell obfuscation, dangerous patterns).
+    SafetyGuard,
+    /// Permission denied by security policy.
+    PermissionDenied,
+    /// General tool execution error.
+    ToolError,
+    /// Unknown or unrecognized error.
+    #[default]
+    Unknown,
+}
+
+impl std::fmt::Display for ErrorCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorCategory::SafetyGuard => write!(f, "safety_guard"),
+            ErrorCategory::PermissionDenied => write!(f, "permission_denied"),
+            ErrorCategory::ToolError => write!(f, "tool_error"),
+            ErrorCategory::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Classify a tool failure error message into a coarse category.
+fn classify_tool_error(error: &str) -> ErrorCategory {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("safety guard") || lower.contains("shell_obfuscation") {
+        ErrorCategory::SafetyGuard
+    } else if lower.contains("dangerous command")
+        || lower.contains("dangerous pattern")
+        || lower.contains("permission denied")
+        || lower.contains("denied by rule")
+        || lower.contains("blocked by default")
+    {
+        ErrorCategory::PermissionDenied
+    } else if lower.contains("error:") || lower.contains("failed:") {
+        ErrorCategory::ToolError
+    } else {
+        ErrorCategory::Unknown
+    }
 }
 
 fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
@@ -354,12 +424,14 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
     let mut tool_calls_failed: u64 = 0;
+    let mut safety_guard_blocks: u64 = 0;
     let mut turn_error_count = 0usize;
     let mut compact_count = 0usize;
     let mut stall_count = 0usize;
     let mut error_event_count = 0usize;
     let mut session_start_count = 0usize;
     let mut session_end_count = 0usize;
+    let mut failed_tool_calls: Vec<FailedToolCall> = Vec::new();
 
     // Prefetch data extracted from ContextAssemblyRecorded events, keyed by turn number.
     let mut llm_rounds_by_turn: std::collections::HashMap<u32, Vec<LlmRoundRow>> =
@@ -380,6 +452,32 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 };
                 total_tool_calls += effective_total;
                 tool_calls_failed += u64::from(fail_c);
+                // Count safety guard blocks regardless of focus level.
+                if let Some(calls) = ev.tool_calls.as_ref() {
+                    for call in calls.iter().filter(|c| !c.ok) {
+                        if classify_tool_error(call.error.as_deref().unwrap_or(""))
+                            == ErrorCategory::SafetyGuard
+                        {
+                            safety_guard_blocks += 1;
+                        }
+                    }
+                }
+                // Collect per-call failure details for forensics (All focus only).
+                if matches!(focus, DigestFocus::All) {
+                    if let Some(calls) = ev.tool_calls.as_ref() {
+                        for call in calls.iter().filter(|c| !c.ok) {
+                            let err = call.error.as_deref().unwrap_or("");
+                            failed_tool_calls.push(FailedToolCall {
+                                seq,
+                                turn_id: ev.turn,
+                                tool: call.name.clone(),
+                                error_category: classify_tool_error(err),
+                                error_preview: preview(Some(&err.to_string()), 200),
+                                args_preview: call.args_preview.clone(),
+                            });
+                        }
+                    }
+                }
                 if let Some(ti) = ev.tokens_in {
                     total_tokens_in += ti;
                 }
@@ -602,6 +700,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             total_duration_ms,
             total_tool_calls,
             tool_calls_failed,
+            safety_guard_blocks,
             avg_tokens_in,
             avg_tokens_out,
             avg_duration_ms,
@@ -630,6 +729,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         interruptions,
         turn_errors,
         other_errors,
+        failed_tool_calls,
     })
 }
 
@@ -1300,5 +1400,99 @@ mod tests {
             "head must be None or valid hex"
         );
         let _ = branch; // may or may not be None depending on test environment
+    }
+
+    #[test]
+    fn digest_surfaces_failed_tool_calls_with_categories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-failed-tools-00000000-0000-0000-0000-000000000010";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":false,"ms":0,"error":"Error: blocked by safety guard 'shell_obfuscation': shell command contains command substitution","args_preview":"node -e \"const x = hi\""},{"name":"bash","ok":false,"ms":0,"error":"Error: Dangerous command\nSafe alternative: ...","args_preview":"ls && grep file"},{"name":"write_file","ok":true,"ms":5,"args_preview":"/tmp/out.txt"}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.aggregates.tool_calls_failed, 2);
+        assert_eq!(d.aggregates.safety_guard_blocks, 1);
+        assert_eq!(d.failed_tool_calls.len(), 2);
+
+        let safety = d
+            .failed_tool_calls
+            .iter()
+            .find(|f| f.error_category == ErrorCategory::SafetyGuard)
+            .expect("safety_guard entry");
+        assert_eq!(safety.tool, "bash");
+        assert_eq!(safety.seq, 1);
+        assert!(safety.error_preview.contains("shell_obfuscation"));
+        assert_eq!(
+            safety.args_preview.as_deref(),
+            Some("node -e \"const x = hi\"")
+        );
+
+        let perm = d
+            .failed_tool_calls
+            .iter()
+            .find(|f| f.error_category == ErrorCategory::PermissionDenied)
+            .expect("permission_denied entry");
+        assert_eq!(perm.tool, "bash");
+        assert!(perm.error_preview.contains("Dangerous command"));
+    }
+
+    #[test]
+    fn digest_safety_guard_blocks_zero_when_no_failures() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-no-failures-00000000-0000-0000-0000-000000000011";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":true,"ms":10}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.aggregates.safety_guard_blocks, 0);
+        assert!(d.failed_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn digest_failed_tool_calls_empty_in_summary_focus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-summary-focus-00000000-0000-0000-0000-000000000012";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":false,"ms":0,"error":"Error: blocked by safety guard 'shell_obfuscation': test"}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::Summary).expect("digest");
+        // Summary focus omits per-call details
+        assert!(d.failed_tool_calls.is_empty());
+        // But aggregate counts still work
+        assert_eq!(d.aggregates.tool_calls_failed, 1);
+    }
+
+    #[test]
+    fn digest_safety_guard_blocks_counted_in_summary_focus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-summary-sgb-00000000-0000-0000-0000-000000000013";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"bash","ok":false,"ms":0,"error":"Error: blocked by safety guard 'shell_obfuscation': test"}]}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::Summary).expect("digest");
+        // safety_guard_blocks must be counted even in Summary focus
+        assert_eq!(d.aggregates.safety_guard_blocks, 1);
+        // per-call details still omitted
+        assert!(d.failed_tool_calls.is_empty());
     }
 }

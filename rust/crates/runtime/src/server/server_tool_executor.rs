@@ -1023,6 +1023,8 @@ pub struct ServerToolExecutor {
     self_mod_mutation_counter: Mutex<(u32, u32)>,
     /// Shared default executor for delegating common tool logic.
     default_executor: DefaultToolExecutor,
+    /// Optional remote workspace artifact store for publishing workspace metadata.
+    workspace_artifact_store: Option<astra_services::DatabaseSessionArtifactStore>,
 }
 
 impl ServerToolExecutor {
@@ -1110,6 +1112,7 @@ impl ServerToolExecutor {
             self_mod_pinned_tools: Mutex::new(pinned_tools),
             self_mod_deprioritized_tools: Mutex::new(deprioritized_tools),
             self_mod_mutation_counter: Mutex::new((0, 0)),
+            workspace_artifact_store: None,
         }
     }
 
@@ -1134,6 +1137,39 @@ impl ServerToolExecutor {
     ) -> Self {
         self.default_executor = self.default_executor.with_cancel_token(token);
         self
+    }
+
+    pub fn with_workspace_artifact_store(
+        mut self,
+        store: astra_services::DatabaseSessionArtifactStore,
+    ) -> Self {
+        self.workspace_artifact_store = Some(store);
+        self
+    }
+
+    fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
+        let Some(store) = self.workspace_artifact_store.clone() else {
+            return Ok(());
+        };
+        let workspace = astra_services::session_workspace::read_workspace(&self.session_id)
+            .map_err(|error| format!("{source}: {error}"))?;
+        let user_id = self.user_id.clone();
+        let future = async move {
+            astra_services::session_workspace::persist_remote_workspace(
+                &workspace, &user_id, &store,
+            )
+            .await
+            .map(|_| ())
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?
+                .block_on(future),
+        }
+        .map_err(|error| format!("{source}: {error}"))
     }
 
     /// Set the edge connection pool for remote tool routing.
@@ -2390,6 +2426,15 @@ impl ServerToolExecutor {
             })
             .to_string();
         }
+        if let Err(error) = self.publish_current_workspace("server_tool_executor:adjust_config") {
+            session.restore_rollback_snapshot(&session_snapshot);
+            return json!({
+                "error": "failed_to_publish_workspace_artifact",
+                "path": path,
+                "detail": error,
+            })
+            .to_string();
+        }
 
         counter.1 += 1;
         self.record_adjust_config_rollback(path.to_string(), old_value.clone(), session_snapshot);
@@ -2442,6 +2487,16 @@ impl ServerToolExecutor {
             *deprioritized = original_deprioritized;
             return json!({
                 "error": "failed_to_persist_tool_preferences",
+                "detail": error,
+                "tool": tool,
+            })
+            .to_string();
+        }
+        if let Err(error) = self.publish_current_workspace("server_tool_executor:prioritize_tool") {
+            *pinned = original_pinned;
+            *deprioritized = original_deprioritized;
+            return json!({
+                "error": "failed_to_publish_workspace_artifact",
                 "detail": error,
                 "tool": tool,
             })
@@ -2507,6 +2562,17 @@ impl ServerToolExecutor {
             })
             .to_string();
         }
+        if let Err(error) = self.publish_current_workspace("server_tool_executor:deprioritize_tool")
+        {
+            *pinned = original_pinned;
+            *deprioritized = original_deprioritized;
+            return json!({
+                "error": "failed_to_publish_workspace_artifact",
+                "detail": error,
+                "tool": tool,
+            })
+            .to_string();
+        }
 
         let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
         if changed {
@@ -2553,6 +2619,14 @@ impl ServerToolExecutor {
         {
             return json!({
                 "error": "failed_to_persist_goal",
+                "detail": error,
+                "goal": goal,
+            })
+            .to_string();
+        }
+        if let Err(error) = self.publish_current_workspace("server_tool_executor:set_goal") {
+            return json!({
+                "error": "failed_to_publish_workspace_artifact",
                 "detail": error,
                 "goal": goal,
             })
@@ -2700,6 +2774,24 @@ impl ServerToolExecutor {
                     }
                 }
                 let success = !restored.is_empty() && failed.is_empty();
+                if !restored.is_empty()
+                    && failed.is_empty()
+                    && let Err(error) = self
+                        .publish_current_workspace("server_tool_executor:rollback_session_state")
+                {
+                    return json!({
+                        "success": false,
+                        "scope": scope,
+                        "turn_index": turn_index,
+                        "restored": restored,
+                        "failed": [{
+                            "error": error,
+                            "kind": "workspace_artifact_publish"
+                        }],
+                        "summary": "Restored session state locally but failed to publish workspace artifact",
+                    })
+                    .to_string();
+                }
                 let summary = if plan.is_empty() {
                     format!(
                         "No recorded session-state rollback handles found for turn {turn_index}"
@@ -3412,6 +3504,34 @@ esac
         exec.set_observability_session(session.clone());
         exec.set_turn_index(turn_index);
         (exec, dir, session_id, session)
+    }
+
+    #[test]
+    fn session_state_tools_publish_workspace_artifacts() {
+        let source = include_str!("server_tool_executor.rs");
+        assert!(
+            source.contains("publish_current_workspace(\"server_tool_executor:adjust_config\")"),
+            "adjust_config should publish remote workspace artifacts"
+        );
+        assert!(
+            source.contains("publish_current_workspace(\"server_tool_executor:prioritize_tool\")"),
+            "prioritize_tool should publish remote workspace artifacts"
+        );
+        assert!(
+            source
+                .contains("publish_current_workspace(\"server_tool_executor:deprioritize_tool\")"),
+            "deprioritize_tool should publish remote workspace artifacts"
+        );
+        assert!(
+            source.contains("publish_current_workspace(\"server_tool_executor:set_goal\")"),
+            "set_goal should publish remote workspace artifacts"
+        );
+        assert!(
+            source.contains(
+                "publish_current_workspace(\"server_tool_executor:rollback_session_state\")"
+            ),
+            "rollback_session_state should publish remote workspace artifacts after local restore"
+        );
     }
 
     #[derive(Clone)]

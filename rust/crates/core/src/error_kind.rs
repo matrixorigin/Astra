@@ -237,6 +237,8 @@ impl ErrorKind {
 pub struct ClassifiedError {
     pub kind: ErrorKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details_json: Option<String>,
 }
 
 impl ClassifiedError {
@@ -244,7 +246,14 @@ impl ClassifiedError {
         Self {
             kind,
             message: message.into(),
+            details_json: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_details_json(mut self, details_json: impl Into<String>) -> Self {
+        self.details_json = Some(details_json.into());
+        self
     }
 
     /// Structured feedback suitable for appending to conversation history.
@@ -277,11 +286,19 @@ impl From<String> for ClassifiedError {
             let tag = &rest[..bracket_end];
             if let Some(kind) = ErrorKind::parse_tag(tag) {
                 let message = rest[bracket_end + 1..].trim_start().to_string();
-                return Self { kind, message };
+                return Self {
+                    kind,
+                    message,
+                    details_json: None,
+                };
             }
         }
         let kind = crate::classify_tool_output(&s);
-        Self { kind, message: s }
+        Self {
+            kind,
+            message: s,
+            details_json: None,
+        }
     }
 }
 

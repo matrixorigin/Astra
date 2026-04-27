@@ -209,8 +209,101 @@ pub(super) async fn resume_run_handler(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
     use super::*;
+    use async_trait::async_trait;
+    use axum::{
+        Json,
+        body::{self, Body},
+        http::{HeaderMap, Request, StatusCode},
+    };
     use serde_json::json;
+    use tokio::sync::Mutex as TokioMutex;
+    use tower::util::ServiceExt;
+
+    use crate::{
+        AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData,
+        AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
+        build_app,
+    };
+
+    #[derive(Clone)]
+    struct StubHealthChecker;
+
+    #[async_trait]
+    impl HealthChecker for StubHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubAuthService;
+
+    #[async_trait]
+    impl AuthService for StubAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn current_user(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+            if headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer good-token")
+            {
+                Ok(AuthUserRecord {
+                    user_id: "u1".to_string(),
+                    username: "test-user".to_string(),
+                    email: "u1@example.test".to_string(),
+                    display_name: None,
+                })
+            } else {
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse::new("Not authenticated".to_string())),
+                ))
+            }
+        }
+    }
+
+    fn test_matrixone() -> astra_core::MatrixOneSettings {
+        astra_core::MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 6001,
+            user: "root".into(),
+            password: "root".into(),
+            database: "astra_test".into(),
+        }
+    }
 
     #[test]
     fn transform_stream_run_events_for_client_uses_client_protocol_shape() {
@@ -344,6 +437,93 @@ mod tests {
         assert_eq!(
             transformed[1],
             json!({"type": "run_resumed", "run_id": "run-123", "index": 3})
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_run_http_replays_durable_text_done_after_cache_eviction() {
+        use crate::server::run_engine::RunEngine;
+        use crate::server::run_lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-durable-http", "u1", "session-http")
+            .await
+            .expect("start durable run");
+        engine
+            .append_event(
+                "run-durable-http",
+                json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
+            )
+            .await
+            .expect("persist text_done");
+        engine
+            .append_event(
+                "run-durable-http",
+                json!({"event_type": "run_finished", "data": {"prompt_tokens": 2, "completion_tokens": 1}}),
+            )
+            .await
+            .expect("persist run_finished");
+        engine
+            .persist_status("run-durable-http", astra_core::STATUS_COMPLETED, None, None)
+            .await
+            .expect("mark completed");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_run_engine(engine);
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/run-durable-http/stream?last_index=1")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(
+            text.contains("\"type\":\"text_done\""),
+            "durable replay should keep final answer event: {text}"
+        );
+        assert!(
+            text.contains("\"full_text\":\"durable final answer\""),
+            "durable replay should expose final answer text to the client: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"usage\""),
+            "run_finished usage should still be transformed for the client: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"run_finished\""),
+            "terminal lifecycle event should still reach the client: {text}"
         );
     }
 }

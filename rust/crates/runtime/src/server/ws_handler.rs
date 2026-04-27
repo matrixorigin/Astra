@@ -38,7 +38,7 @@
 
 #[cfg(test)]
 use super::chat_handlers::is_session_service_unconfigured_error;
-use super::chat_handlers::resolve_or_create_chat_session_id;
+use super::chat_handlers::resolve_or_create_chat_session;
 use super::header_utils::collect_forward_headers;
 use super::http_types::merge_plan_subtask_context;
 use super::run_handlers::transform_stream_run_events_for_client_with_pending;
@@ -666,7 +666,7 @@ async fn handle_chat_message(
         is_plan_subtask,
     );
     request.forward_headers = ws_forward_headers(conn);
-    request.session_id = match resolve_or_create_chat_session_id(
+    let resolved = match resolve_or_create_chat_session(
         state,
         &conn.user,
         request.session_id.take(),
@@ -675,14 +675,14 @@ async fn handle_chat_message(
     )
     .await
     {
-        Ok(session_id) => {
-            if let Some(session_id) = session_id.as_ref() {
+        Ok(resolved) => {
+            if let Some(session_id) = resolved.session_id.as_ref() {
                 conn.session_id = Some(session_id.clone());
             }
             if should_clear_pending_session_id {
                 conn.pending_session_id = None;
             }
-            session_id
+            resolved
         }
         Err((status, err)) => {
             if should_clear_pending_session_id {
@@ -692,6 +692,8 @@ async fn handle_chat_message(
             return;
         }
     };
+    request.session_id = resolved.session_id;
+    request.full_llm_capture = resolved.full_llm_capture;
 
     // Try RunLifecycleService first (server-side agentic loop)
     match state
@@ -956,6 +958,7 @@ fn build_ws_chat_request(
     astra_services::runs::ChatRequestData {
         message: content.to_string(),
         session_id,
+        full_llm_capture: false,
         agent_id,
         model,
         llm_token_service: None,
@@ -1903,6 +1906,12 @@ fn apply_prepared_headers(
     set_header!(routing_meta_b64, "x-mo-routing-meta-b64");
     set_header!(force_intent, "x-mo-force-intent");
     set_header!(execution_state_b64, "x-mo-execution-state-b64");
+    if prepared.full_llm_capture == Some(true) {
+        headers.insert(
+            HeaderName::from_static("x-mo-full-llm-capture"),
+            HeaderValue::from_static("1"),
+        );
+    }
 
     if let Some(changed) = prepared.tools_changed {
         headers.insert(
@@ -2797,6 +2806,7 @@ mod tests {
         let prepared = PreparedChatTurnBridgeRequest {
             body: Bytes::new(),
             trusted_session_id: Some("sess-1".into()),
+            full_llm_capture: None,
             session_turn: Some("4".into()),
             turn_chain_id: Some("run-1".into()),
             user_query_event_id: None,
@@ -2887,6 +2897,7 @@ mod tests {
         let prepared = PreparedChatTurnBridgeRequest {
             body: Bytes::new(),
             trusted_session_id: Some("sess-1".into()),
+            full_llm_capture: None,
             session_turn: Some("4".into()),
             turn_chain_id: None,
             user_query_event_id: None,
@@ -3114,6 +3125,52 @@ mod tests {
             ]
         );
         assert!(!saw_turn_complete);
+        assert_eq!(terminal_error, None);
+    }
+
+    #[test]
+    fn process_bridge_stream_event_preserves_turn_complete_assistant_text() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-42".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-9".into()),
+            bridge_prepared_run_id: None,
+        };
+        let mut suppress = false;
+        let mut saw_turn_complete = false;
+        let mut terminal_error = None;
+
+        let processed = process_bridge_stream_event(
+            &mut conn,
+            serde_json::json!({
+                "type": "turn_complete",
+                "assistant_text": "recovered final text",
+                "has_tool_calls": false
+            }),
+            None,
+            &mut suppress,
+            &mut saw_turn_complete,
+            &mut terminal_error,
+        );
+
+        assert!(processed.pre_messages.is_empty());
+        assert_eq!(
+            processed.raw_event,
+            Some(serde_json::json!({
+                "type": "turn_complete",
+                "assistant_text": "recovered final text",
+                "has_tool_calls": false
+            }))
+        );
+        assert!(saw_turn_complete);
         assert_eq!(terminal_error, None);
     }
 
@@ -3533,6 +3590,7 @@ mod tests {
         PreparedChatTurnBridgeRequest {
             body: Bytes::from("{}"),
             trusted_session_id: Some("s1".into()),
+            full_llm_capture: Some(true),
             session_turn: Some("4".into()),
             turn_chain_id: Some("tc1".into()),
             user_query_event_id: Some("uqe1".into()),
@@ -3549,6 +3607,7 @@ mod tests {
         PreparedChatTurnBridgeRequest {
             body: Bytes::from("{}"),
             trusted_session_id: None,
+            full_llm_capture: None,
             session_turn: None,
             turn_chain_id: None,
             user_query_event_id: None,
@@ -3568,6 +3627,7 @@ mod tests {
         apply_prepared_headers(&mut headers, &prepared);
 
         assert_eq!(headers.get("x-mo-session-id").unwrap(), "s1");
+        assert_eq!(headers.get("x-mo-full-llm-capture").unwrap(), "1");
         assert_eq!(headers.get("x-mo-session-turn").unwrap(), "4");
         assert_eq!(headers.get("x-mo-turn-chain-id").unwrap(), "tc1");
         assert_eq!(headers.get("x-mo-user-query-event-id").unwrap(), "uqe1");

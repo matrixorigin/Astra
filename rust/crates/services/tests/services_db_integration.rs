@@ -22,19 +22,23 @@ use astra_services::session_audit::{
     SessionAuditService,
 };
 use astra_services::session_restore::{
-    HybridRestoreService, SessionRestoreService, pull_step_checkpoint_from_cloud,
+    COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
+    persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
     push_checkpoint_to_cloud, push_context_trace_signal_to_cloud, push_session_state_to_cloud,
     push_step_checkpoint_to_cloud,
 };
-use astra_services::session_workspace::{ContextTraceSignal, ContextTraceToolSelection};
+use astra_services::session_workspace::{
+    ContextTraceSignal, ContextTraceToolSelection, WorkspaceMetadata, persist_remote_workspace,
+};
 use astra_services::{
     AdminAuditFilter, AdminAuditReader, DatabaseAdminAuditReader, DatabaseDecisionService,
-    DatabaseEventService, DatabaseMarketplaceStatsService, DatabaseSessionService,
-    DatabaseSkillService, DecisionListFilter, DecisionService, DurableTaskLifecycle,
-    EventCreateRequestData, EventListFilter, EventService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
-    MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
-    MatrixOneSyncService, SessionListFilter, SessionService, SkillSearchQuery, SkillService,
-    StagedMutationState, StateSyncService, ensure_core_schema,
+    DatabaseEventService, DatabaseMarketplaceStatsService, DatabaseSessionArtifactStore,
+    DatabaseSessionService, DatabaseSkillService, DecisionListFilter, DecisionService,
+    DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
+    MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
+    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService,
+    SessionArtifactJsonStore, SessionArtifactStore, SessionListFilter, SessionService,
+    SkillSearchQuery, SkillService, StagedMutationState, StateSyncService, ensure_core_schema,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -479,6 +483,10 @@ async fn cleanup_restore_fixture(
     session_ids: &[String],
 ) {
     for sid in session_ids {
+        let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
+            .bind(sid)
+            .execute(pool)
+            .await;
         let _ = sqlx::query("DELETE FROM session_sync_log WHERE session_id = ?")
             .bind(sid)
             .execute(pool)
@@ -502,6 +510,88 @@ async fn cleanup_restore_fixture(
     .bind(user_id)
     .execute(pool)
     .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_SERVICES_DB_IT=1 and live MatrixOne"]
+async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timestamps() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let older_id = Uuid::now_v7().to_string();
+    let newer_id = loop {
+        let candidate = Uuid::now_v7().to_string();
+        if candidate > older_id {
+            break candidate;
+        }
+    };
+    let tied_ts = "2026-10-01 12:34:56.123456";
+
+    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'artifact-ordering', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    for (artifact_id, turn, marker) in [(&older_id, 1_i32, "older"), (&newer_id, 2_i32, "newer")] {
+        sqlx::query(
+            "INSERT INTO session_artifacts \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, created_at) \
+             VALUES (?, ?, ?, 'llm_capture', 'ordering_probe', ?, 0, ?, CAST(? AS JSON), ?)",
+        )
+        .bind(artifact_id)
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(turn)
+        .bind(
+            serde_json::json!({
+                "response": { "full_text": marker }
+            })
+            .to_string(),
+        )
+        .bind(serde_json::json!({ "marker": marker }).to_string())
+        .bind(tied_ts)
+        .execute(&pool)
+        .await
+        .expect("insert session artifact");
+    }
+
+    let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
+    let latest = store
+        .load_latest_json_artifact(&session_id, "llm_capture")
+        .await
+        .expect("load latest artifact")
+        .expect("latest artifact row");
+    assert_eq!(
+        latest.artifact_id, newer_id,
+        "latest artifact selection must stay deterministic when created_at ties"
+    );
+    assert_eq!(
+        latest.content["response"]["full_text"].as_str(),
+        Some("newer"),
+        "latest artifact should surface the newest payload under a tied timestamp"
+    );
+
+    let listed = store
+        .list_json_artifacts(&session_id, Some("llm_capture"), 10)
+        .await
+        .expect("list session artifacts");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].artifact_id, newer_id,
+        "artifact lists should use the same stable latest-first ordering"
+    );
+    assert_eq!(listed[1].artifact_id, older_id);
+
+    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -1626,6 +1716,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 8,
             selected_tools: vec!["view".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 1,
             strategy: "selector".into(),
             confidence: 0.92,
@@ -1643,6 +1734,7 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 6,
             selected_tools: vec!["grep".into(), "view".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 0,
             strategy: "fallback".into(),
             confidence: 0.88,
@@ -1862,6 +1954,7 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
             tool_selection: Some(ContextTraceToolSelection {
                 tools_available: 8,
                 selected_tools: vec!["view".into()],
+                selection_scope: "latest_round".into(),
                 rejected_tools: 0,
                 strategy: "prune-test".into(),
                 confidence: 0.9,
@@ -1928,6 +2021,247 @@ async fn session_sync_log_prune_partitions_by_sync_type_on_live_matrixone() {
     assert_eq!(
         total_success_count, 202,
         "high-volume context_trace success logs must not evict rarer sync types"
+    );
+
+    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_SERVICES_DB_IT=1 and live MatrixOne"]
+async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+
+    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+
+    let mut workspace = WorkspaceMetadata::with_context(
+        &session_id,
+        "gpt-5.4",
+        "/srv/remote-agent",
+        Some("feature/remote-workspace"),
+    );
+    workspace.record_turn(120, 45);
+    workspace.plan_goal = Some("prove remote workspace restore".into());
+    workspace.plan_execution_rounds = 3;
+    workspace.last_context_trace = Some(ContextTraceSignal {
+        turn_id: "turn-remote-workspace".into(),
+        captured_at: Some("2026-09-07T10:00:00Z".into()),
+        tool_selection: Some(ContextTraceToolSelection {
+            tools_available: 12,
+            selected_tools: vec!["bash".into(), "rg".into()],
+            selection_scope: "latest_round".into(),
+            rejected_tools: 0,
+            strategy: "artifact-restore".into(),
+            confidence: 0.98,
+            latency_ms: 4,
+        }),
+        memory: None,
+        history: None,
+        budget: None,
+        timing: None,
+        explanations: vec!["restored from remote workspace artifact".into()],
+    });
+
+    let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
+    persist_remote_workspace(&workspace, &user_id, &artifact_store)
+        .await
+        .expect("persist remote workspace");
+
+    let artifact_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'workspace_metadata'",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load session_artifacts count")
+    .try_get("c")
+    .expect("session_artifacts count");
+    assert_eq!(artifact_count, 1);
+
+    let restore = HybridRestoreService::new(pool.clone());
+    let restored = restore
+        .restore_session(&session_id)
+        .await
+        .expect("restore session")
+        .expect("session restored from remote workspace artifact");
+
+    assert!(restored.restored_from_cloud);
+    assert_eq!(restored.turn_count, 1);
+    assert_eq!(restored.total_tokens_in, 120);
+    assert_eq!(restored.total_tokens_out, 45);
+    assert_eq!(
+        restored.recent_tools,
+        vec!["bash".to_string(), "rg".to_string()]
+    );
+    assert_eq!(
+        restored.git_branch.as_deref(),
+        Some("feature/remote-workspace")
+    );
+    assert_eq!(restored.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(
+        restored.plan_goal.as_deref(),
+        Some("prove remote workspace restore")
+    );
+    assert_eq!(restored.plan_execution_rounds, 3);
+    assert_eq!(
+        restored
+            .last_context_trace
+            .as_ref()
+            .map(|trace| trace.turn_id.as_str()),
+        Some("turn-remote-workspace")
+    );
+
+    cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_SERVICES_DB_IT=1 and live MatrixOne"]
+async fn remote_composite_snapshot_index_restores_without_local_index_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+
+    cleanup_restore_fixture(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+
+    let local_index_path = astra_services::local_session_artifact_store()
+        .session_path(&session_id, "step_checkpoints/composite_snapshots.json")
+        .expect("composite snapshot index path");
+    assert!(
+        !local_index_path.exists(),
+        "fixture should prove remote composite snapshot restore without local composite_snapshots.json"
+    );
+
+    push_session_state_to_cloud(
+        &pool,
+        &session_id,
+        &user_id,
+        None,
+        Some("prove remote composite snapshot restore"),
+        None,
+        0,
+        Some("feature/remote-composite"),
+        Some("gpt-5.4"),
+    )
+    .await
+    .expect("push session state");
+    push_checkpoint_to_cloud(
+        &pool,
+        &session_id,
+        &user_id,
+        &astra_services::session_checkpoint::Checkpoint {
+            number: 3,
+            turn: 7,
+            title: "remote composite checkpoint".into(),
+            summary: "checkpoint only exists in MatrixOne".into(),
+            tools_used: vec!["bash".into(), "rg".into()],
+            total_tokens: 321,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: Some(r#"{"mode":"remote-composite"}"#.into()),
+        },
+    )
+    .await
+    .expect("push checkpoint");
+
+    let data_snapshot = astra_services::DataSnapshotRef {
+        snapshot_name: format!("snapshot-{session_id}"),
+        databases: vec!["app_db".into()],
+        timestamp: Some("2026-09-08T10:00:00Z".into()),
+        branch_name: Some("feature/remote-composite".into()),
+    };
+    let mut composite_snapshot =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&session_id, 7)
+            .label("remote-composite")
+            .session_state("000003-heavy.json")
+            .data_snapshot(data_snapshot.clone())
+            .git_commit("0123456789abcdef0123456789abcdef01234567")
+            .workspace_state(&session_id)
+            .build();
+    let mut index = astra_services::CompositeSnapshotIndex::default();
+    index
+        .append(&mut composite_snapshot)
+        .expect("append composite snapshot");
+
+    let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
+    persist_remote_composite_snapshot_index(&session_id, &user_id, &index, &artifact_store)
+        .await
+        .expect("persist remote composite snapshot index");
+
+    let artifact_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS c FROM session_artifacts WHERE session_id = ? AND artifact_kind = ?",
+    )
+    .bind(&session_id)
+    .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("load composite snapshot artifact count")
+    .try_get("c")
+    .expect("decode composite snapshot artifact count");
+    assert_eq!(artifact_count, 1);
+
+    let restore = HybridRestoreService::new(pool.clone());
+    let listed = restore
+        .list_composite_snapshots(&session_id)
+        .await
+        .expect("list composite snapshots");
+    assert_eq!(listed.snapshots.len(), 1);
+    assert_eq!(listed.current_version(), 1);
+    assert_eq!(
+        listed.snapshots[0].snapshot_id,
+        composite_snapshot.snapshot_id
+    );
+    assert_eq!(
+        listed.snapshots[0].label.as_deref(),
+        Some("remote-composite")
+    );
+    assert_eq!(listed.snapshots[0].turn, 7);
+
+    let restored = restore
+        .restore_to_composite_snapshot(
+            &session_id,
+            &composite_snapshot.snapshot_id,
+            &astra_core::composite_snapshot::RestoreSelector::default(),
+        )
+        .await
+        .expect("restore composite snapshot")
+        .expect("composite snapshot restored");
+
+    assert_eq!(
+        restored.snapshot.snapshot_id,
+        composite_snapshot.snapshot_id
+    );
+    assert!(
+        restored
+            .restored_dimensions
+            .iter()
+            .any(|dim| dim == "session"),
+        "remote composite snapshot restore should recover the session-state dimension"
+    );
+    assert_eq!(
+        restored.git_commit_to_checkout.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(
+        restored.data_snapshot_to_restore.as_ref(),
+        Some(&data_snapshot)
+    );
+
+    let session = restored.session.expect("session restored from checkpoint");
+    assert_eq!(session.turn_count, 7);
+    assert_eq!(session.total_tokens_in, 321);
+    assert_eq!(session.checkpoint_count, 3);
+    assert_eq!(
+        session.contract_json.as_deref(),
+        Some(r#"{"mode":"remote-composite"}"#)
+    );
+    assert_eq!(
+        session.plan_goal.as_deref(),
+        Some("prove remote composite snapshot restore")
     );
 
     cleanup_restore_fixture(&pool, &user_id, &[session_id]).await;
@@ -2035,6 +2369,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         tool_selection: Some(ContextTraceToolSelection {
             tools_available: 8,
             selected_tools: vec!["rg".into(), "view".into()],
+            selection_scope: "latest_round".into(),
             rejected_tools: 1,
             strategy: "lazy-create".into(),
             confidence: 0.95,
